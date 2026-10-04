@@ -1,0 +1,8 @@
+[package]
+name = "nexus-fakes"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Shared deterministic test doubles over the P2 synchronous ports. Std only.
+nexus-core = { path = "../nexus-core" }
