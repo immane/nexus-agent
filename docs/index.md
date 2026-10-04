@@ -4,7 +4,43 @@ Nexus Agent is a Rust coding agent designed around very fast startup, low resour
 
 ## Implementation Status
 
-The repository currently contains engineering guidance, the [MIT license](../LICENSE), and this documentation foundation. No Rust workspace, agent runtime, provider adapter, tool executor, or TUI has been implemented. There are no measured performance results or verified provider/platform compatibility claims yet.
+M0 exists as test-only wiring, validated on macOS and Linux (container);
+no bare-metal Linux run yet.
+`cargo build --workspace --release` produces two release binaries over one
+shared runtime: `nexus-headless` (1,006,464 bytes macOS / 1,169,136 bytes
+Linux) and `nexus-tui` (1,502,336 bytes macOS / 1,719,984 bytes Linux),
+both driven by scripted fakes (`nexus-fakes`) through the
+same `nexus-runtime` policy boundary. The repository also contains
+engineering guidance and the [MIT license](../LICENSE). There are no real
+provider adapters, no coding tools beyond fakes, no external plugins, and
+persistence is an in-memory ephemeral store that self-identifies as
+non-durable. `cargo test --workspace` passes (137 tests, 0 failures) on
+both platforms; `cargo fmt --check` and clippy are clean on both
+(Linux: 6.12.76-linuxkit aarch64 container, rustc 1.99.0 stable).
+
+Only macOS baselines exist (Mac16,10 Apple M4, Darwin 25.3.0 arm64,
+rustc 1.94.0, default release profile, no crate features; `n=50` per mode
+via `tools/perf/startup.py`, spawn-to-exit wall time, not first-interactive):
+`nexus-headless "hello"` warm p50 4.7 ms / p95 6.0 ms / max 7.0 ms and
+unprepared-cache p50 4.9 ms / p95 5.9 ms / max 10.8 ms; `nexus-tui`
+(non-terminal fallback transcript; no PTY here) warm p50 5.4 ms / p95
+11.1 ms / max 11.3 ms and unprepared-cache p50 5.0 ms / p95 10.4 ms / max
+38.7 ms. One `/usr/bin/time -l` run each: max RSS 1,998,848 bytes
+(headless) / 2,195,456 bytes (TUI), 0 page faults. The "cold" runs used no
+cache purge, so they are unprepared-cache runs, not genuinely cold. There
+are no PTY/TUI-readiness, idle-CPU, streaming, or dispatch-overhead numbers
+yet. Linux numbers (same harness and method, release build in-container):
+`nexus-headless "hello"` warm p50 2.0 ms / p95 2.0 ms / max 2.1 ms
+(`n=50`) and genuinely cold via `drop_caches` p50 2.8 ms / p95 19.8 ms /
+max 21.2 ms (`n=20`); `nexus-tui` bare warm p50 2.0 ms / p95 5.0 ms / max
+37.5 ms (`n=50`) and genuinely cold p50 6.5-6.8 ms / p95 ~70-73 ms / max up
+to 169 ms (two `n=20` runs). Linux child max RSS ≈ 12 MB by the harness;
+`time -v` on a cold TUI launch reports 2,136 KB (one anomalous 514 MB
+harness reading during the first cold batch did not reproduce and is
+discarded with this note). Known limits: ephemeral-only storage, no real
+provider/plugin support, `RunFinished(Failed)` carries no provider detail,
+disconnect surfaces as `LimitReached`, and CJK width handling is
+approximate. No verified provider/platform compatibility claims beyond this.
 
 ## Document Status and Authority
 
@@ -56,6 +92,8 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 | [02 - Workflow](tasks/02-workflow.md) | Orchestration steps, handoffs, and verification loops | Draft task plan |
 | [03 - Subagents](tasks/03-subagents.md) | Logical roles mapped to `explore` and `general` subagents | Draft task plan |
 | [04 - M0 gates](tasks/04-m0-gates.md) | Entry/exit criteria and completion evidence | Draft task plan |
+| [05 - TUI brief](tasks/05-tui-brief.md) | Grok Build / Pi interaction research for P5B | Draft research brief |
+| [06 - M0 lock](tasks/06-m0-lock.md) | Accepted M0 semantics for P2-P5 (P0 exit) | Accepted for M0; test-only |
 
 ## Reading Order
 

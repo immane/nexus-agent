@@ -10,7 +10,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 [Documentation](docs/index.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
 > [!IMPORTANT]
-> Nexus Agent is currently in the **design and contract stage**. There is no Rust workspace, runnable agent, installable release, or benchmark result yet. The diagrams and capabilities below describe the proposed architecture, not implemented features.
+> Nexus Agent has an M0 **test-only implementation** (scripted fakes, ephemeral store; no real providers, tools, or plugins). macOS and Linux (container) baselines exist; no bare-metal Linux or PTY first-interactive numbers yet. The diagrams and capabilities below describe the proposed architecture, not stable features.
 
 ## Design Goals
 
@@ -174,13 +174,13 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] MIT license and confirmed project direction.
 - [x] Draft architecture, performance, security, and interface contracts.
 - [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
-- [ ] Review and accept the minimal implementation contracts.
-- [ ] Build a testable core/runtime and minimal frontend.
-- [ ] Establish Linux and macOS startup and resource baselines.
-- [ ] Implement coding tools and mainstream model adapters.
+- [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
+- [x] Build a testable core/runtime and minimal frontend (137 workspace tests pass on macOS and Linux).
+- [x] Establish Linux and macOS startup and resource baselines (spawn-to-exit; PTY first-interactive still open).
+- [ ] Implement coding tools and mainstream model adapters (scripted fakes only).
 - [ ] Add bounded external-plugin interoperability and session recovery.
 
-Windows and untrusted-plugin isolation are separate follow-up work. There are no installation or build commands yet because no executable implementation exists.
+Windows and untrusted-plugin isolation are separate follow-up work. Build the M0 test-only binaries with `cargo build --workspace --release` (produces `nexus-headless` and `nexus-tui`); there is no installable release yet.
 
 ## Documentation and Contributions
 

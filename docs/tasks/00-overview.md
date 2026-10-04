@@ -23,6 +23,8 @@ Out of scope for Phase 1: real model adapters, relay execution, external plugin 
 | [02 - Workflow](02-workflow.md) | Orchestration steps, handoffs, and verification loops. |
 | [03 - Subagents](03-subagents.md) | Logical roles mapped to available `explore` and `general` subagents. |
 | [04 - M0 gates](04-m0-gates.md) | Entry/exit criteria and completion evidence. |
+| [05 - TUI brief](05-tui-brief.md) | Grok Build / Pi interaction research for P5B. |
+| [06 - M0 lock](06-m0-lock.md) | Accepted M0 semantics for P2-P5 (P0 exit). |
 
 ## Operating Rules
 
