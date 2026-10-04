@@ -1,0 +1,43 @@
+[package]
+name = "nexus-tui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "nexus-tui"
+path = "src/main.rs"
+
+[lib]
+name = "nexus_tui"
+path = "src/lib.rs"
+
+[dependencies]
+# Core domain types (ids, commands, events, limits): the TUI owns
+# presentation state only and submits typed commands over this boundary.
+nexus-core = { path = "../nexus-core" }
+# Single-run runtime handle: the ONLY execution/policy path. The TUI calls
+# `Runtime::handle` with typed commands and never invokes providers/tools.
+nexus-runtime = { path = "../nexus-runtime" }
+# Scripted fakes, used ONLY by the `nexus-tui` binary demo wiring
+# (self-identifying M0-test stand-in, never real configuration).
+nexus-fakes = { path = "../nexus-fakes" }
+# Rationale: ratatui is the ONE terminal library for M0. Immediate-mode
+# rendering over a single crossterm backend covers the fixed composer,
+# bounded viewport, approval card, and footer with no extra fullscreen
+# framework (no multi-panel, theming, or marketplace layers). Version 0.26
+# matches the offline-cached crates. `default-features = false` plus only
+# the `crossterm` backend keeps the dependency closure minimal; crossterm
+# itself is reached solely through ratatui's re-export (`ratatui::crossterm`)
+# so there is exactly one terminal dependency. Its `TestBackend` gives
+# deterministic renderer tests without a PTY.
+ratatui = { version = "0.26", default-features = false, features = ["crossterm"] }
+# `crossterm` 0.27 is ratatui 0.26's backend driver (same version it
+# depends on, so Cargo unifies them): raw-mode/alternate-screen setup and
+# key-event input only. All drawing goes through ratatui; there is still
+# exactly one terminal UI library, not two competing frameworks.
+crossterm = { version = "0.27" }
+# Minimal async driver for the BINARY demo loop only (the library stays
+# sync): `rt` (current-thread executor driving the runtime handle),
+# `time` (refresh ticks and bounded drains), `sync` (already the runtime's
+# channel types), `macros` (`select!` only). Mirrors nexus-runtime's set.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
