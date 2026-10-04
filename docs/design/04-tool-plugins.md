@@ -9,7 +9,7 @@ Status: Draft design. A plugin is an independently registered capability, not ne
 | Built-in Rust tool | Compiled into the host and registered through the tool port | Direct calls and lowest transport overhead; changing code requires rebuilding |
 | External tool plugin | Separately launched program connected through a transport adapter | Cross-language extensibility; additional startup, process, and serialization costs |
 
-Both paths implement the [tool contract](../contracts/02-tool.md). Built-in tools must not serialize their calls through an external protocol just to look like plugins.
+Both paths implement the [tool contract](../contracts/02-tool.md). Built-in tools must not serialize their calls through an external protocol just to look like plugins. Pi keeps fast in-process extensions alongside MCP for the same reason; only the transport cost differs, not the policy boundary. See the [Pi reference](10-pi-reference.md).
 
 A Rust trait is an in-process implementation interface, not a cross-language ABI. Python, Go, JavaScript, Rust executables, or other programs can participate if they implement a supported language-neutral protocol and their runtime is available.
 

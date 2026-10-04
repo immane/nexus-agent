@@ -29,6 +29,7 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 | [07 - TUI and headless frontends](design/07-tui.md) | Grok Build-style layout, approvals, history, and script entry point | Draft design; product defaults accepted |
 | [08 - API relay](design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries | Draft design; integration scope accepted |
 | [09 - Implementation readiness](design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review | Draft engineering gates |
+| [10 - Pi architecture reference](design/10-pi-reference.md) | Observed Pi patterns adopted in principle and explicitly excluded | Draft reference note |
 
 ## Contracts
 
@@ -46,6 +47,16 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 - [00 - Project foundation](design/decisions/00-project-foundation.md): accepted project direction.
 - [01 - First-release defaults](design/decisions/01-first-release-defaults.md): accepted permissions, UI, sessions, entry points, authentication, relay scope, and code-simplicity requirements.
 
+## Phase 1 Tasks
+
+| Document | Purpose | Status |
+| --- | --- | --- |
+| [00 - Overview](tasks/00-overview.md) | M0 scope, task map, and operating rules | Draft task plan |
+| [01 - Pipeline](tasks/01-pipeline.md) | Stage order, dependencies, and parallel lanes | Draft task plan |
+| [02 - Workflow](tasks/02-workflow.md) | Orchestration steps, handoffs, and verification loops | Draft task plan |
+| [03 - Subagents](tasks/03-subagents.md) | Logical roles mapped to `explore` and `general` subagents | Draft task plan |
+| [04 - M0 gates](tasks/04-m0-gates.md) | Entry/exit criteria and completion evidence | Draft task plan |
+
 ## Reading Order
 
 1. Read the overview and accepted decisions for confirmed scope and defaults.
@@ -55,4 +66,4 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 
 ## Before Implementation
 
-Follow [implementation readiness](design/09-implementation-readiness.md). Review the relevant draft contracts before relying on their detailed semantics; accepted product defaults do not automatically accept every proposed interface. Select the toolchain and dependency features for M0, then choose storage/schema/external-protocol details before their respective integrations. Establish Linux and macOS reference environments for measurements. Do not add placeholder crates, runbooks, or validators just because a document mentions a future component.
+Follow [implementation readiness](design/09-implementation-readiness.md) and the [Phase 1 task plan](tasks/00-overview.md). Review the relevant draft contracts before relying on their detailed semantics; accepted product defaults do not automatically accept every proposed interface. Select the toolchain and dependency features for M0, then choose storage/schema/external-protocol details before their respective integrations. Establish Linux and macOS reference environments for measurements. Do not add placeholder crates, runbooks, or validators just because a document mentions a future component.

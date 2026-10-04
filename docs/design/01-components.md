@@ -43,7 +43,7 @@ Avoid an application-wide mutable object shared by every component. Prefer messa
 
 Provider, tool, and frontend command/event contracts are the first public boundaries. Session storage is a separate port. Workflow and context-selection policies should remain independently testable modules; introduce public replacement interfaces when a concrete extension needs them.
 
-All replacement paths must obey common runtime invariants. Do not expose arbitrary hooks that let extensions skip authorization, inject terminal outcomes, or change another run's state.
+All replacement paths must obey common runtime invariants. Do not expose arbitrary hooks that let extensions skip authorization, inject terminal outcomes, or change another run's state. Pi's narrow hooks (`beforeToolCall`/`afterToolCall`, `transformContext`, `shouldStopAfterTurn`) are the right scale to imitate; its broader extension reach into UI and commands is explicitly out of scope. See the [Pi reference](10-pi-reference.md).
 
 API relay belongs to the provider port, not the tool port. A registered provider plugin may reuse a protocol adapter against an existing relay endpoint; future local relay executors stay behind that boundary. MCP tool interoperability does not define the provider-plugin ABI or process protocol.
 

@@ -42,7 +42,7 @@ Use the same runtime, providers, tools, storage policy, and default permissions 
 
 Structured output must keep diagnostics separate from event/result data, with no terminal escapes or mixed progress banners. Headless mode is not an automatic approval mode: without an explicitly configured approval handler, a confirmation-required call is denied rather than hanging or silently executing.
 
-Do not add a daemon or internal HTTP service just to expose the runtime. A future remote frontend needs its own explicit transport and authentication design.
+Do not add a daemon or internal HTTP service just to expose the runtime. A future remote frontend needs its own explicit transport and authentication design. Pi's interactive, print/JSON, RPC, and SDK modes over one agent support the same direction; its RPC backpressure practice applies to our structured output. See the [Pi reference](10-pi-reference.md).
 
 ## Acceptance Checks
 
@@ -54,3 +54,4 @@ Check offline interactive startup, fixed input visibility, bounded scrollback wo
 - [Execution](02-execution.md)
 - [Performance](05-performance.md)
 - [Security](06-security.md)
+- [Pi architecture reference](10-pi-reference.md)

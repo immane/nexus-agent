@@ -13,7 +13,7 @@ Use a small set of adapters sharing HTTP, streaming, and serialization infrastru
 | Anthropic Messages | Content blocks, tool use/results, and Messages streaming |
 | Gemini native APIs | Native content/function representations and continuation requirements |
 
-Do not create a dependency on a vendor SDK merely to serialize a small protocol. A dedicated SDK remains an option when it provides a demonstrated correctness or maintenance benefit.
+Do not create a dependency on a vendor SDK merely to serialize a small protocol. A dedicated SDK remains an option when it provides a demonstrated correctness or maintenance benefit. Pi's unified `pi-ai` layer with dynamic key resolution is a supporting precedent for one shared protocol/HTTP infrastructure with per-profile credentials. See the [Pi reference](10-pi-reference.md).
 
 Cloud platforms with additional signing, routing, or authentication requirements may need separate adapters. A configurable base URL alone does not make those platforms compatible.
 
