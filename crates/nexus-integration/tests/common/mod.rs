@@ -128,20 +128,30 @@ pub fn flood_turn(fragments: usize, candidates: Vec<CallCandidate>) -> Vec<Provi
     turn
 }
 
-/// Drains both channels until the terminal control event, then collects any
-/// still-buffered data events without blocking.
+/// Drains both channels until the terminal control event, then collects every
+/// still-buffered event from BOTH channels without blocking.
+///
+/// The post-terminal drain is deliberate: the runtime publishes its terminal
+/// event last, so any event still buffered after it (or any duplicate
+/// terminal) must be collected instead of hiding behind the first terminal.
+/// A first-terminal break followed by a data-only drain would silently miss a
+/// duplicate `RunFinished` on the control channel.
 pub async fn drain_until_finished(
     data: &mut tokio::sync::mpsc::Receiver<RunEvent>,
     control: &mut tokio::sync::mpsc::Receiver<RunEvent>,
 ) -> (Vec<RunEvent>, Vec<RunEvent>, RunFinished) {
     let mut datas = Vec::new();
     let mut controls = Vec::new();
+    let mut data_open = true;
     let finished = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             tokio::select! {
-                event = data.recv() => {
-                    if let Some(event) = event {
-                        datas.push(event);
+                event = data.recv(), if data_open => {
+                    match event {
+                        Some(event) => datas.push(event),
+                        // A closed presentation channel must not spin the
+                        // select loop; the control terminal is still required.
+                        None => data_open = false,
                     }
                 }
                 event = control.recv() => {
@@ -164,8 +174,31 @@ pub async fn drain_until_finished(
     })
     .await
     .expect("run reaches terminal promptly");
-    while let Ok(event) = data.try_recv() {
-        datas.push(event);
+    // Non-blocking drain of both channels until dry across two consecutive
+    // quiet passes separated by a scheduler yield. All runtime sends precede
+    // `RunFinished` in the driver, but a concurrently scheduled publisher
+    // (for example a control-outbox flusher or a duplicate terminal) could
+    // otherwise hide behind the first terminal or behind a single dry pass.
+    // The round cap keeps a misbehaving producer from looping the helper.
+    let mut quiet_passes = 0;
+    let mut rounds = 0;
+    while quiet_passes < 2 && rounds < 64 {
+        rounds += 1;
+        let mut drained = false;
+        while let Ok(event) = data.try_recv() {
+            datas.push(event);
+            drained = true;
+        }
+        while let Ok(event) = control.try_recv() {
+            controls.push(event);
+            drained = true;
+        }
+        if drained {
+            quiet_passes = 0;
+        } else {
+            quiet_passes += 1;
+            tokio::task::yield_now().await;
+        }
     }
     (datas, controls, finished)
 }
@@ -239,4 +272,132 @@ pub fn count_payload(
         .chain(control.iter())
         .filter(|event| matches(event.payload()))
         .count()
+}
+
+/// Counts terminal `RunFinished` events across both channels. Values above
+/// one are always a runtime defect, never a consumer allowance.
+pub fn terminal_count(data: &[RunEvent], control: &[RunEvent]) -> usize {
+    count_payload(data, control, |payload| {
+        matches!(payload, EventPayload::RunFinished(_))
+    })
+}
+
+/// Asserts exactly one terminal event exists across both channels. A
+/// first-terminal break without a full drain could hide a duplicate.
+pub fn assert_single_terminal(data: &[RunEvent], control: &[RunEvent]) {
+    let terminals = terminal_count(data, control);
+    assert_eq!(
+        terminals, 1,
+        "exactly one terminal RunFinished across both channels, saw {terminals}"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_core::{AssistantText, PersistenceState, RunOutcome, TurnId, UsageFinality};
+
+    fn envelope(run: &str, seq: u64, payload: EventPayload) -> RunEvent {
+        RunEvent::new(
+            SessionId::new("sess-1").expect("valid"),
+            nexus_core::RunId::new(run).expect("valid"),
+            seq,
+            payload,
+        )
+    }
+
+    fn text_payload(text: &str) -> EventPayload {
+        EventPayload::AssistantTextDelta(
+            AssistantText::new(TurnId::new("t1-0").expect("valid"), "item-0", text)
+                .expect("fragment builds"),
+        )
+    }
+
+    fn terminal_payload(outcome: RunOutcome) -> EventPayload {
+        EventPayload::RunFinished(
+            RunFinished::new(outcome, PersistenceState::Ephemeral, None)
+                .expect("terminal record builds"),
+        )
+    }
+
+    /// Regression for the helper bug: after the first terminal, events still
+    /// buffered on EITHER channel must be collected. The old helper drained
+    /// only the data channel, so a duplicate terminal on control vanished and
+    /// duplicate-terminal defects were untestable.
+    #[test]
+    fn drain_until_finished_collects_post_terminal_events_on_both_channels() {
+        let rt = test_rt();
+        rt.block_on(async {
+            let (data_tx, mut data_rx) = tokio::sync::mpsc::channel(8);
+            let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(8);
+
+            data_tx
+                .send(envelope("run-1", 0, text_payload("before")))
+                .await
+                .expect("data send");
+            control_tx
+                .send(envelope(
+                    "run-1",
+                    1,
+                    EventPayload::RunStarted {
+                        request: RequestId::new("req-1").expect("valid"),
+                    },
+                ))
+                .await
+                .expect("started send");
+            control_tx
+                .send(envelope(
+                    "run-1",
+                    2,
+                    terminal_payload(RunOutcome::Completed),
+                ))
+                .await
+                .expect("terminal send");
+            // Post-terminal traffic: a trailing usage update plus a duplicate
+            // terminal. Both must be observed by a full drain.
+            control_tx
+                .send(envelope(
+                    "run-1",
+                    3,
+                    EventPayload::UsageUpdated(Usage::new(None, None, UsageFinality::Final)),
+                ))
+                .await
+                .expect("post-terminal usage send");
+            control_tx
+                .send(envelope(
+                    "run-1",
+                    4,
+                    terminal_payload(RunOutcome::Cancelled),
+                ))
+                .await
+                .expect("duplicate terminal send");
+            data_tx
+                .send(envelope("run-1", 5, text_payload("after")))
+                .await
+                .expect("post-terminal data send");
+            drop(data_tx);
+            drop(control_tx);
+
+            let (data, control, finished) =
+                drain_until_finished(&mut data_rx, &mut control_rx).await;
+
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert_eq!(data.len(), 2, "both data events collected: {data:?}");
+            assert_eq!(
+                control.len(),
+                4,
+                "all control events collected: {control:?}"
+            );
+            assert_eq!(
+                terminal_count(&data, &control),
+                2,
+                "the duplicate terminal is visible to the assertion helpers"
+            );
+            assert_eq!(
+                control.last().expect("control events").seq(),
+                4,
+                "the drain reached the true end of the control channel"
+            );
+        });
+    }
 }

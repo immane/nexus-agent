@@ -190,7 +190,16 @@ fn text_batching_preserves_content_and_order() {
                 item_key: "item-1".to_owned(),
                 assembled_bytes: 7,
             },
-            ProviderEvent::ToolCallReady(common::candidate("host_read", r#"{"path":"src"}"#)),
+            // The candidate must carry the same turn-local item key as its
+            // progress; the default `candidate` helper would reuse the text
+            // key `item-0`, which the protocol correctly rejects as a
+            // text/call key collision.
+            ProviderEvent::ToolCallReady(common::candidate_with(
+                "item-1",
+                "prov-ref-1",
+                "host_read",
+                r#"{"path":"src"}"#,
+            )),
             ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
                 nexus_core::FinishReason::ToolCalls,
                 nexus_core::Usage::new(None, None, nexus_core::UsageFinality::Final),
@@ -242,7 +251,15 @@ fn prompt_cancellation_under_output_load() {
         let script = vec![
             common::flood_turn(
                 1_500,
-                vec![common::candidate("host_read", r#"{"path":"src"}"#)],
+                // The flood alternates text keys `item-0`/`item-1`, so the
+                // candidate must use a distinct turn-local item key; the
+                // default helper key `item-0` is a protocol collision.
+                vec![common::candidate_with(
+                    "item-2",
+                    "prov-ref-2",
+                    "host_read",
+                    r#"{"path":"src"}"#,
+                )],
             ),
             stop_turn("done"),
         ];

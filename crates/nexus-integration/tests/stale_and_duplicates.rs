@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use nexus_core::{
     ApprovalId, ApproveCommand, CallId, CancelCommand, Command, CommandReply, DenyCommand,
-    EventPayload, RequestId, RunId, RunOutcome, SessionId,
+    EventPayload, ExecutionStatus, RequestId, RunId, RunOutcome, SessionId,
 };
 use nexus_fakes::{FakeTool, stop_turn, tool_turn};
 use nexus_runtime::event_is_live;
@@ -298,7 +298,8 @@ fn duplicate_approve_never_redispatches() {
 }
 
 /// Repeated cancellations never double-dispatch: both are accepted while the
-/// run is live, the tool runs at most once, and the run finalizes once as
+/// run is live, the blocked worker stays owned (quarantined) until it
+/// terminates, the tool runs at most once, and the run finalizes once as
 /// cancelled (completion is not rewritten into rollback).
 #[test]
 fn duplicate_cancel_never_double_dispatches() {
@@ -311,7 +312,10 @@ fn duplicate_cancel_never_double_dispatches() {
         let mut bed = common::make_bed_with_tools(
             script,
             common::auto_config(),
-            FakeTool::delayed("host_read", Duration::from_millis(200)),
+            // The worker blocks at its gate so cancellation and quarantine
+            // ownership are observed deterministically, without wall-clock
+            // races against a fixed delay.
+            FakeTool::gated("host_read"),
             FakeTool::mutation(),
         );
         let response = bed.runtime.submit(common::submit_cmd("dup-cancel")).await;
@@ -320,6 +324,23 @@ fn duplicate_cancel_never_double_dispatches() {
             matches!(event.payload(), EventPayload::ToolStarted(_))
         })
         .await;
+
+        // `ToolStarted` is emitted before the worker is spawned, so wait
+        // until the worker is confirmed blocked at its gate; only then does
+        // cancellation interrupt an execution that actually owns the tool.
+        let gate = bed.read_tool.gate().expect("gated tool exposes its gate");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !gate.is_entered() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("the blocked worker reached its gate");
+        assert_eq!(
+            bed.read_tool.execution_count(),
+            1,
+            "the worker entered before cancellation"
+        );
 
         let first = bed
             .runtime
@@ -338,11 +359,12 @@ fn duplicate_cancel_never_double_dispatches() {
             .await;
         assert_eq!(second.reply(), CommandReply::Accepted);
 
+        // Cancellation finalizes promptly; the still-blocked worker remains
+        // owned and quarantined rather than being silently abandoned.
         let (data, mut control, finished) =
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         control.extend(prelude);
         assert_eq!(finished.outcome(), RunOutcome::Cancelled);
-        assert_eq!(bed.read_tool.execution_count(), 1, "single dispatch only");
         assert_eq!(
             common::count_payload(&data, &control, |payload| matches!(
                 payload,
@@ -359,13 +381,61 @@ fn duplicate_cancel_never_double_dispatches() {
             "single terminal outcome"
         );
 
+        // The confirmed-blocked worker keeps its ownership: prove the
+        // quarantine blocks the next dispatch until the gate is released.
+        let blocked = bed
+            .runtime
+            .submit(common::submit_cmd("during-quarantine"))
+            .await;
+        assert_eq!(
+            blocked.reply(),
+            CommandReply::Busy,
+            "no new run while the worker termination is unconfirmed"
+        );
+
         let late = bed
             .runtime
             .cancel(CancelCommand {
                 request: RequestId::new("req-cancel-3").expect("valid"),
-                run,
+                run: run.clone(),
             })
             .await;
         assert_eq!(late.reply(), CommandReply::AlreadyFinalized);
+
+        // Releasing the worker lets it observe the live cancellation and
+        // terminate honestly; only then does the quarantine clear.
+        gate.release();
+        let next = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = bed
+                    .runtime
+                    .submit(common::submit_cmd("after-quarantine"))
+                    .await;
+                if response.reply() == CommandReply::Accepted {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("quarantine clears once the worker terminates");
+        assert_eq!(next.reply(), CommandReply::Accepted);
+        assert_eq!(bed.read_tool.execution_count(), 1, "single dispatch only");
+        let cancelled: Vec<ExecutionStatus> = control
+            .iter()
+            .filter_map(|event| match event.payload() {
+                EventPayload::ToolFinished(info) => Some(info.outcome.status()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancelled,
+            vec![ExecutionStatus::Cancelled],
+            "the interrupted outcome is preserved, never rewritten"
+        );
+
+        let (_, _, next_finished) =
+            common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(next_finished.outcome(), RunOutcome::Completed);
     });
 }
