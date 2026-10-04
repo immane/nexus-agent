@@ -1,0 +1,19 @@
+[package]
+name = "nexus-validation"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Core error type and the immutable NormalizedArgs carrier. No runtime,
+# executor, or policy types are involved.
+nexus-core = { path = "../nexus-core" }
+# Sole JSON parser. serde_json owns lexing, string/number decoding, and its
+# internal recursion limit; this crate only walks the parsed value. The
+# `float_roundtrip` feature makes float parsing correctly rounded instead of
+# serde_json's default fast approximation, so a crafted literal cannot shift
+# a bound comparison or an approval-bound canonical number. `serde` is a
+# direct dependency solely for the DeserializeSeed/Visitor trait hooks needed
+# to reject duplicate object keys on serde_json's streaming API; it is not a
+# second parser and no schema framework is used.
+serde = { version = "1", default-features = false }
+serde_json = { version = "1", features = ["float_roundtrip"] }
