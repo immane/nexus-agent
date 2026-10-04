@@ -1,0 +1,16 @@
+[package]
+name = "nexus-headless"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Domain types, ids, outcomes (path dep, no new capability).
+nexus-core = { path = "../nexus-core" }
+# Single-run execution loop + policy boundary (path dep, no new capability).
+nexus-runtime = { path = "../nexus-runtime" }
+# Deterministic scripted provider/tools; the only model/tool wiring in M0.
+nexus-fakes = { path = "../nexus-fakes" }
+# Minimal async features (same set as nexus-runtime): `rt` drives the loop,
+# `time` bounds the consume wait, `sync` is pulled in for channel types,
+# `macros` supplies `select!` for the two-channel consumer. No net/io/fs.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
