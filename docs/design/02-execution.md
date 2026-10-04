@@ -10,6 +10,10 @@ Do not block the first interactive state on model discovery, credentials over th
 
 Only the selected provider and enabled tools become operational on demand. Load a chosen historical session separately and bound the amount materialized in memory.
 
+Start with a new conversation, not the latest stored session. Automatic persistence uses the configured application-data location outside the project; saving accepted records must not turn into per-token writes. Manual restoration loads history only, without replay, old approvals, or plugin initialization.
+
+API profiles and credential references are resolved locally; network authentication and existing/local relay readiness must not block input. Browser login is not first-release scope. The TUI and headless entry point share the same lifecycle.
+
 ## Proposed Baseline
 
 One active run is supported initially. A second submission receives an explicit busy result rather than silently replacing the active run or creating an unbounded queue. Broader concurrency requires a bounded scheduling design and updated contracts.
@@ -25,6 +29,10 @@ Any active state -> cancellation, failure, or limit handling -> Finished
 The runtime validates complete tool calls before dispatch. The baseline waits for a valid completed model turn before executing its tools. Partial argument previews are presentation data, not executable instructions.
 
 Multiple calls from a turn execute in declared order initially. Safe bounded parallelism may be added after measuring a concrete workload; conflicting mutations must not race by default.
+
+The accepted default policy permits scoped reads/searches and asks before model-directed mutations or any command execution. Validate stable input facts once at their owning boundary; check mutable grant validity, cancellation, and deadlines immediately before dispatch, including after an approval or storage wait.
+
+When headless operation has no explicit approval handler, deny a confirmation-required call and expose its permission outcome. Do not wait forever for absent terminal input or switch into automatic approval.
 
 ## Run Loop
 
@@ -67,3 +75,5 @@ After an unexpected process exit, recovered runs are interrupted, not automatica
 - [Tool contract](../contracts/02-tool.md)
 - [Session store](../contracts/04-session-store.md)
 - [Configuration](../contracts/05-configuration.md)
+- [TUI and headless frontends](07-tui.md)
+- [First-release defaults](decisions/01-first-release-defaults.md)

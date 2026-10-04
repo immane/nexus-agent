@@ -1,6 +1,6 @@
 # Provider Contract
 
-Status: Draft contract, revision `draft-0`. Read the [common contract](00-common.md) first. No provider trait or adapter currently exists.
+Status: Draft contract, revision `draft-1`. Read the [common contract](00-common.md) first. API configuration and relay scope are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md); no provider trait or adapter exists yet.
 
 ## Semantic Operations
 
@@ -8,6 +8,16 @@ Status: Draft contract, revision `draft-0`. Read the [common contract](00-common
 - `stream(request, context)`: perform one model turn and yield normalized events.
 
 These are operation descriptions, not compilable Rust signatures. The adapter owns protocol parsing and connections; the runtime owns whether to invoke, retry, or continue the model loop.
+
+## API Profiles and Relay Plugins
+
+Direct providers and API relay plugins implement the same semantic port. A relay MUST NOT become a model-invoked tool or bypass normalized stream validation, limits, or host policy.
+
+First-release profiles use an explicit API endpoint, protocol/model selection, and external credential references. Resolve only credentials assigned to the selected integration when needed. Browser login/OAuth is outside initial scope, and neither authentication nor relay discovery may block interactive startup.
+
+Existing relay services are the first path. Future local relay implementations remain optional and on demand; no local proxy is mandatory. Cross-language provider plugins need their own supported HTTP or versioned process interface, not an assumed Rust ABI or MCP tool protocol.
+
+A relay MUST preserve call references and required continuation state, declare truthful capabilities, and isolate destination/credential selection. Do not silently forward a request to multiple destinations, merge retries into one turn, or reinterpret unsupported protocol state as valid history.
 
 ## Request
 
@@ -60,10 +70,11 @@ After partial output, a retry MUST not silently concatenate a new attempt onto t
 
 ## Required Tests
 
-Cover split UTF-8/JSON, malformed and oversized frames, multiple calls, duplicate references, truncated streams, refusals, usage timing, cancellation, incompatible continuation state, and successful continuation round trips for each supported protocol.
+Cover split UTF-8/JSON, malformed and oversized frames, multiple calls, duplicate references, truncated streams, refusals, usage timing, cancellation, incompatible continuation state, and successful continuation round trips for each supported protocol. Apply the same cases to relay profiles, including credential isolation and no initialization of unused endpoints or processes.
 
 ## Related Documents
 
 - [Model integration design](../design/03-model-integration.md)
 - [Tool](02-tool.md)
 - [Session store](04-session-store.md)
+- [API relay design](../design/08-api-relay.md)

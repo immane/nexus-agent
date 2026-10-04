@@ -26,6 +26,9 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 | [04 - Tool plugins](design/04-tool-plugins.md) | Built-in Rust tools and cross-language external plugins | Draft design |
 | [05 - Performance](design/05-performance.md) | Startup acceptance, resource measurement, and optimization | Draft design; startup goal confirmed |
 | [06 - Security](design/06-security.md) | Trust, authorization, side effects, and separate isolation work | Draft design |
+| [07 - TUI and headless frontends](design/07-tui.md) | Grok Build-style layout, approvals, history, and script entry point | Draft design; product defaults accepted |
+| [08 - API relay](design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries | Draft design; integration scope accepted |
+| [09 - Implementation readiness](design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review | Draft engineering gates |
 
 ## Contracts
 
@@ -41,14 +44,15 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 ## Decisions
 
 - [00 - Project foundation](design/decisions/00-project-foundation.md): accepted project direction.
+- [01 - First-release defaults](design/decisions/01-first-release-defaults.md): accepted permissions, UI, sessions, entry points, authentication, relay scope, and code-simplicity requirements.
 
 ## Reading Order
 
-1. Read the overview and project foundation for confirmed scope.
+1. Read the overview and accepted decisions for confirmed scope and defaults.
 2. Read component and execution designs for boundaries and lifecycle.
 3. Read common contracts before the relevant component contract.
 4. Read security and performance requirements before introducing integrations or dependencies.
 
 ## Before Implementation
 
-Review and accept the relevant draft contracts. Select the Rust toolchain, dependency features, schema-validation support, and external protocol versions explicitly. Establish Linux and macOS reference environments for performance measurements. Do not add placeholder crates, runbooks, or validators just because a document mentions a future component.
+Follow [implementation readiness](design/09-implementation-readiness.md). Review the relevant draft contracts before relying on their detailed semantics; accepted product defaults do not automatically accept every proposed interface. Select the toolchain and dependency features for M0, then choose storage/schema/external-protocol details before their respective integrations. Establish Linux and macOS reference environments for measurements. Do not add placeholder crates, runbooks, or validators just because a document mentions a future component.

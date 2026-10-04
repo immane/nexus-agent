@@ -13,6 +13,8 @@ Both paths implement the [tool contract](../contracts/02-tool.md). Built-in tool
 
 A Rust trait is an in-process implementation interface, not a cross-language ABI. Python, Go, JavaScript, Rust executables, or other programs can participate if they implement a supported language-neutral protocol and their runtime is available.
 
+This document covers tool plugins. Provider plugins, including API relay integrations, use the separate [provider contract](../contracts/01-provider.md) and [relay design](08-api-relay.md). Do not expose relay routing as an executable tool or force provider streams through MCP tool calls.
+
 ## External Transport
 
 MCP over stdio is the preferred initial interoperability candidate. Keep it in an optional adapter, outside the domain contract. Select and document supported MCP versions and capabilities before implementation; the project currently claims no MCP compliance.
@@ -45,6 +47,8 @@ The proposed coding distribution registers tools for scoped reading, search, pat
 
 Command execution is a high-impact capability, not a safe escape hatch around missing tool permissions. Large command output must remain bounded and visibly report truncation.
 
+Under the accepted default policy, approved project reads/searches are automatic; mutations and command execution require exact-call confirmation. This applies to both native and external executors. Plugin annotations cannot grant exemptions. A headless consumer without an explicit approval handler receives a denial instead of automatic execution.
+
 ## Deferred Mechanisms
 
 Native dynamic-library loading, WASM execution, arbitrary runtime hooks, and automatic plugin installation are deferred. Add them only for a concrete need and after evaluating footprint, compatibility, lifecycle, and trust.
@@ -58,3 +62,4 @@ Untrusted plugin isolation is a separate design effort. A subprocess still norma
 - [Tool contract](../contracts/02-tool.md)
 - [Configuration](../contracts/05-configuration.md)
 - [Security](06-security.md)
+- [First-release defaults](decisions/01-first-release-defaults.md)

@@ -1,10 +1,10 @@
 # Common Contract
 
-Status: Draft contract, revision `draft-0`. Requirements below are proposed invariants for review before implementation; they are not claims about existing code.
+Status: Draft contract, revision `draft-1`. Accepted product defaults are recorded in [Decision 01](../design/decisions/01-first-release-defaults.md); detailed interfaces and other proposed invariants still require review. No implementation is claimed.
 
 ## Contract Vocabulary
 
-`MUST` identifies a correctness or safety requirement. `SHOULD` identifies the default behavior, with deviations requiring a documented reason. `MAY` identifies an optional capability. These terms apply to this proposed contract once accepted.
+`MUST` identifies a correctness or safety requirement. `SHOULD` identifies the default behavior, with deviations requiring a documented reason. `MAY` identifies an optional capability. Accepted ADR requirements already govern product direction; the remaining proposed contract mechanics apply once reviewed and accepted.
 
 Type names describe semantic data structures. Concrete Rust signatures, ownership representations, serialization formats, and protocol versions remain to be selected. Internal interfaces do not establish a stable Rust ABI or a public JSON API.
 
@@ -31,6 +31,12 @@ Use explicit message, content, tool-call, tool-result, capability, and outcome t
 Dynamic JSON is allowed at validated tool-argument/schema boundaries. Opaque bytes are allowed for bounded provider continuation state. Neither becomes an unrestricted map for the entire domain model.
 
 Content records SHOULD preserve source identity and whether the content is complete. Partial streaming output MUST NOT be silently stored as a completed assistant turn. External content does not gain instruction authority by being placed in a domain record.
+
+## Validation Ownership and Simplicity
+
+Parse external representations and validate immutable facts at their owning boundary. Carry explicit validated arguments, identities, and states internally instead of repeating the same checks in every function. Revalidate when the underlying schema, implementation, or relevant data changes.
+
+Authorization, cancellation, deadlines, and revocation can change while awaiting I/O or approval; their execution-boundary checks remain necessary. Keep decisions explicit and failure paths short. Do not add speculative compatibility/fallback branches or wrappers solely to disguise conditional complexity.
 
 ## Errors and Outcomes
 

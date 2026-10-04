@@ -1,19 +1,30 @@
 # Configuration Contract
 
-Status: Draft contract, revision `draft-0`. No configuration parser, schema, environment-variable naming convention, or file format has been selected.
+Status: Draft contract, revision `draft-1`. Product defaults are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). No configuration parser, schema, environment-variable naming convention, or file format has been selected.
 
 ## Effective Configuration
 
 Represent configuration with explicit typed profiles, not an unrestricted runtime map. Relevant groups are:
 
-- Provider profiles: protocol adapter, endpoint, model, secret reference, known capabilities, conservative overrides.
+- Provider profiles: direct or relay implementation, protocol adapter, endpoint, model/mapping, assigned secret reference, known capabilities, conservative overrides.
 - Tool registrations: enabled identities/revisions, approved resource scope, effect policy, and limits.
 - Plugin launch profiles: executable/arguments, permitted environment, protocol selection, process limits.
 - Runtime policy: turn/call/concurrency limits, deadlines, queue/output budgets, approval handling.
-- Session policy: persistent or explicit ephemeral mode, storage location, durability, retention.
+- Session policy: automatic local persistence outside the project, explicit restoration, optional explicitly selected ephemeral mode, durability, retention.
 - Frontend policy: presentation bounds, refresh behavior, and output sanitization.
 
 The implementation MUST choose one documented representation and revision policy rather than introducing multiple parsers for hypothetical needs.
+
+## Accepted Defaults
+
+- Permit scoped project reads/searches subject to host restrictions; require confirmation for model-directed mutations and all command execution.
+- Deny confirmation-required headless calls when no explicit approval handler is configured.
+- Save sessions automatically outside the project; begin a new conversation and restore history only on request.
+- Provide the full-screen TUI and headless entry point over one runtime.
+- Use API profiles and external credential references; browser account login/OAuth is deferred.
+- Register existing relay services as provider plugins; local relay execution remains an optional later boundary and never mandatory startup work.
+
+These are product defaults, not names of implemented enum variants, config keys, or CLI switches. Loading history must not reapply old grants or replace the current credential/profile policy implicitly.
 
 ## Resolution and Validation
 
@@ -28,6 +39,8 @@ Bound configuration size and processing. Do not perform network discovery, packa
 Use secret references such as named environment variables or approved secret-store entries. Resolve credentials only for the selected integration when needed. Never serialize secret values into session history, debug dumps, or public errors.
 
 External plugins receive only explicitly allowed environment and credentials. A host provider secret is not implicitly available to every tool. A missing credential should produce a safe actionable failure, not silent fallback to another service.
+
+A relay receives only the credential reference assigned to its profile. Do not embed secret values in stored endpoints or forward another provider's key automatically. Endpoint/routing changes require destination, compatibility, and credential-scope validation. No network authentication, relay probing, or local-relay launch belongs in ordinary startup configuration loading.
 
 ## Limits
 
@@ -53,9 +66,13 @@ Safe configuration summaries MUST redact secrets and sensitive launch arguments.
 
 Cover precedence, invalid bounds, oversized input, missing/deferred secrets, incompatible profiles, revocation, changed tool identities, secret redaction, controlled plugin environments, and offline startup without plugin execution.
 
+Verify accepted defaults, isolated relay credentials, manual-only history restoration, and denial of headless confirmation-required calls without a handler. Concise implementation must retain validation of mutable policy at dispatch rather than spreading repeated immutable checks across adapters.
+
 ## Related Documents
 
 - [Execution design](../design/02-execution.md)
 - [Tool plugin design](../design/04-tool-plugins.md)
 - [Performance design](../design/05-performance.md)
 - [Security design](../design/06-security.md)
+- [API relay design](../design/08-api-relay.md)
+- [TUI and headless design](../design/07-tui.md)

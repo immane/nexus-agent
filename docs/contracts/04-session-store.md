@@ -1,12 +1,12 @@
 # Session Store Contract
 
-Status: Draft contract, revision `draft-0`. No storage implementation or on-disk format exists. Read the [common contract](00-common.md) first.
+Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). No storage implementation or on-disk format exists. Read the [common contract](00-common.md) first.
 
 ## Scope and Operations
 
 The store persists accepted conversation and operation records. It does not decide authorization, schedule tools, or treat stored prompts as executable instructions.
 
-Semantic operations include loading a selected session, saving a versioned checkpoint, recording tool intent, and recording tool outcome. Actual method signatures and physical layout remain open.
+Semantic operations include bounded/paged session metadata listing, loading a selected session, saving a versioned checkpoint, recording tool intent, and recording tool outcome. Actual method signatures and physical layout remain open.
 
 Prefer a small file-backed implementation first. Versioned snapshots and a compact operation journal are candidates; a database or full event-sourcing system requires a concrete need. Do not persist every token merely because runtime events exist.
 
@@ -22,9 +22,19 @@ Prefer a small file-backed implementation first. Versioned snapshots and a compa
 
 Keep credentials out of records. Tool arguments, results, and continuation data may still be sensitive; apply retention/redaction policy without making recovery records misleading or unsafe to interpret.
 
+## Accepted Save and Restore Defaults
+
+Automatically save accepted input/turns and relevant operation records in configured local application storage outside the project. Do not place conversation history in the repository, upload it as model context by default, or persist each text delta.
+
+Start a new conversation. Metadata listing and restoration occur only on explicit request and remain bounded; ordinary startup MUST NOT scan/materialize all history or restore the most recent session automatically.
+
+Restoration loads history, not execution. It MUST NOT replay tools, restart interrupted tasks, or restore old per-call grants. It uses the current explicit profile/policy and validates compatibility before continuation. A later run receives a fresh identity.
+
+Host-managed persistence under the selected storage policy does not require a model-tool approval for each checkpoint, and grants no arbitrary filesystem access. The physical data directory and format remain implementation choices.
+
 ## Modes and Durability
 
-Persistent mode is the proposed normal coding-session mode. Ephemeral mode MAY be selected explicitly for use cases or measurements; it must disclose that crash recovery and durable history are unavailable.
+Persistent automatic-saving mode is the accepted default. Ephemeral mode MAY be selected explicitly for use cases or measurements; it must disclose that crash recovery and durable history are unavailable. Storage failure MUST NOT silently switch a normal session into ephemeral mode.
 
 Every write acknowledgement MUST identify the promised durability level. Buffered acceptance is not crash-recoverable acknowledgement. A claim of crash recoverability requires an implemented and tested filesystem/database protocol, including relevant flush and atomicity behavior.
 
@@ -50,7 +60,7 @@ Changing provider or adapter revision requires compatibility validation. Invalid
 
 ## Required Tests
 
-Cover interrupted writes, stale revisions, invalid formats, limits, intent durability failure, crash between intent and result, result-write failure after effects, recovery without replay, expired approvals, and incompatible continuation data.
+Cover automatic saves outside the project, default new-session startup, bounded explicit listing/restoration, no silent ephemeral fallback, interrupted writes, stale revisions, invalid formats, limits, intent durability failure, crash between intent and result, result-write failure after effects, recovery without replay, expired approvals, and incompatible continuation data.
 
 Filesystem durability and recovery behavior require tests on both Linux and macOS. Tests of an in-memory double alone are not evidence of crash-safe file persistence.
 

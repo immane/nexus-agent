@@ -17,6 +17,14 @@ Do not create a dependency on a vendor SDK merely to serialize a small protocol.
 
 Cloud platforms with additional signing, routing, or authentication requirements may need separate adapters. A configurable base URL alone does not make those platforms compatible.
 
+## Authentication and Relay Plugins
+
+The first release uses API configuration with external credential references, such as explicitly named environment variables. Browser account login/OAuth is deferred. Do not resolve credentials for every profile, prompt for account login before rendering, or contact endpoints during ordinary startup.
+
+An API relay is a provider plugin using the same normalized request/stream contract, not a tool offered to the model. First integrate existing relay services through explicit endpoint/protocol/model profiles and isolated credential references. Reuse shared protocol clients rather than starting a local proxy or importing a new SDK per relay.
+
+Keep an optional boundary for later local forwarding, routing, or protocol conversion. Local relay execution must be on demand, bounded, and absent from the default startup path. Tool-oriented MCP transport is not a provider-plugin protocol. See the [relay design](08-api-relay.md).
+
 ## Capability Model
 
 Resolve capabilities for the configured adapter/profile/model combination. Streaming, tool calls, structured outputs, multimodal inputs, usage reporting, and context limits are distinct capabilities.
@@ -60,3 +68,5 @@ Consult current official documentation when implementing a selected API version:
 - [Common contract](../contracts/00-common.md)
 - [Provider contract](../contracts/01-provider.md)
 - [Performance](05-performance.md)
+- [API relay](08-api-relay.md)
+- [First-release defaults](decisions/01-first-release-defaults.md)

@@ -16,6 +16,16 @@ Approvals bind to a run, call, implementation/schema identity, exact arguments, 
 
 Classify file mutation, command execution, network access, and other high-impact operations conservatively. Tool annotations are hints; they cannot prove that arbitrary plugin code or shell commands are read-only or idempotent.
 
+## Accepted Default Policy
+
+Automatic access is limited to host-permitted project reads and searches. Model-directed file mutations and command execution require confirmation, including apparently read-only shell commands. Existing deny/sensitive-resource restrictions still apply; a tool cannot label itself safe to bypass them.
+
+The TUI presents allow-once or deny for the exact call. Headless mode without an explicitly configured approval handler denies confirmation-required calls rather than waiting indefinitely or switching to automatic approval. Restored history never reinstates old call grants.
+
+Automatic session persistence is a separately configured host operation in local application storage outside the project. It is not blanket permission for a model or plugin to write files. An existing relay profile authorizes only the selected provider destination and its assigned credentials, not new tool network access or silent forwarding elsewhere.
+
+Keep security checks at their actual enforcement boundary. Avoid repeating immutable validation, but recheck grant validity, cancellation, deadlines, and revoked policy where they can change before dispatch. Simplicity does not justify a fail-open path.
+
 ## Filesystem and Process Safety
 
 Do not validate filesystem scope using string prefixes alone. Account for traversal, symlinks, nonexistent write targets, and check/use races in the relevant platform adapter. Where a guarantee cannot be enforced, report the limitation and require appropriate authorization.
@@ -27,6 +37,8 @@ Cancellation and process-group termination are not guaranteed containment of det
 ## Privacy and Output Handling
 
 Send only authorized context to the configured provider. Enabling a provider does not authorize reading or uploading every file. Credentials are external secret references, not persisted conversation fields.
+
+The same privacy boundary applies to relay services. Do not silently substitute a relay for another provider or pass unrelated vendor keys to it. Local relay processes, when eventually supported, receive only explicit environment/credential grants.
 
 Redact sensitive data from errors, operational logs, fixtures, and performance artifacts. Apply retention rules to conversation history, tool output, and opaque provider state; these may contain private information even when not human-readable.
 
@@ -52,3 +64,5 @@ Test denied and stale approvals, changed tool definitions, malformed calls, outp
 - [Commands and events](../contracts/03-command-events.md)
 - [Session store](../contracts/04-session-store.md)
 - [Configuration](../contracts/05-configuration.md)
+- [First-release defaults](decisions/01-first-release-defaults.md)
+- [API relay](08-api-relay.md)

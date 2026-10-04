@@ -1,12 +1,16 @@
 # Commands and Events Contract
 
-Status: Draft contract, revision `draft-0`. This describes an in-process frontend/runtime boundary, not a public transport protocol.
+Status: Draft contract, revision `draft-1`. This describes an in-process frontend/runtime boundary, not a public transport protocol. TUI/headless scope and manual history restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md).
 
 ## Ownership
 
 The runtime owns execution state. Frontends submit typed commands and maintain their own presentation state from typed events. Neither a TUI nor a headless frontend may directly invoke providers/tools or bypass policy.
 
 The baseline uses one active run and one authoritative event consumer. Additional subscribers require an explicit delivery policy; do not replace required delivery with a lossy broadcast by default.
+
+Ship a Grok Build-style full-screen TUI and headless entry point over the same port. Headless mode MUST NOT initialize terminal state, introduce a mandatory service, or auto-approve confirmation-required calls. When no explicit approval handler exists, deny such calls and expose the permission outcome.
+
+Machine-readable result/event output needs a documented wire revision before release. Keep diagnostics separate from that data; do not mix terminal escapes or banners into structured output. These requirements do not select CLI flags or a serialization format yet.
 
 ## Commands and Replies
 
@@ -17,12 +21,16 @@ The baseline uses one active run and one authoritative event consumer. Additiona
 | `Approve` | Targets a live approval and its run/call identity; cannot change the approved arguments |
 | `Deny` | Refuses a live approval without executing its call |
 | `GetSnapshot` | Requests a bounded consistent view of a known run and its last event sequence |
+| `ListSessions` | Explicit bounded/paged history metadata lookup; does not load all conversation contents or execute work |
+| `RestoreSession` | Loads selected bounded history into an idle session without replay or old call grants; rejects conflicting active work |
 
 Replies distinguish accepted, rejected, already finalized, stale/unknown target, and busy outcomes as applicable. Every processed command has a correlated response; disconnected clients cannot assume they received it.
 
 `Submit` returns a host-issued `RunId`. `RequestId` is correlation, not a promise of exactly-once processing. A frontend MUST resolve uncertain submission status instead of blindly resubmitting. Repeated approval/cancellation commands cannot cause duplicate tool dispatch.
 
 A second run is rejected as busy in the baseline. Changing this behavior requires a bounded scheduling contract, not an implicit submission queue.
+
+Start a new conversation by default. History listing/restoration are explicit session-level operations with correlated replies, not synthetic agent runs. A restore reply identifies the selected session/revision and bounded presentation state; any incomplete retained view is labeled. A subsequent submission creates a new `RunId`, not a revival of the interrupted one.
 
 ## Event Envelope
 
@@ -66,7 +74,7 @@ Snapshots identify their last published sequence, pending approvals, lifecycle, 
 
 ## Required Tests
 
-Cover causal reconciliation of replies/events, stale runs, duplicate approvals, busy submission, finalization, slow consumers, bounded buffers, text batching, prompt cancellation under load, and disconnect while a tool is active.
+Cover causal reconciliation of replies/events, stale runs, duplicate approvals, busy submission, finalization, slow consumers, bounded buffers, text batching, prompt cancellation under load, and disconnect while a tool is active. Also cover bounded manual history restoration without replay/grants, rejection during conflicting work, structured-output separation, and headless approval denial.
 
 ## Related Documents
 
@@ -74,3 +82,4 @@ Cover causal reconciliation of replies/events, stale runs, duplicate approvals, 
 - [Performance design](../design/05-performance.md)
 - [Tool](02-tool.md)
 - [Session store](04-session-store.md)
+- [TUI and headless design](../design/07-tui.md)

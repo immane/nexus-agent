@@ -21,6 +21,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 | **Clear boundaries** | Separate domain logic, execution, integrations, and presentation. |
 | **Broad model coverage** | Adapt mainstream protocols without requiring a different SDK for every vendor. |
 | **Explicit extensibility** | Support direct Rust tools and cross-language external plugins through narrow contracts. |
+| **Concise code** | Keep normal paths direct, failure paths short, and validation at explicit boundaries. |
 | **Linux and macOS first** | Treat both as first-release acceptance platforms; defer Windows. |
 
 The startup target includes local configuration and interface initialization, but not model responses or optional plugin readiness. It is a goal for documented reference environments, **not a measured result or a guarantee on arbitrary hardware**. See the [performance design](docs/design/05-performance.md).
@@ -34,12 +35,12 @@ flowchart TB
     Frontend["Rust TUI / headless frontend"]
     Core["Domain core<br/>Types, transitions, contracts"]
     Runtime["Agent runtime<br/>Policy, lifecycle, cancellation"]
-    Provider["Provider adapters<br/>Cloud and local model APIs"]
+    Provider["Provider adapters<br/>Direct APIs and relay plugins"]
     Tools["Tool execution adapters"]
     Store["Session persistence"]
     Builtin["Built-in Rust coding tools"]
-    Bridge["External plugin adapter"]
-    Plugins["External plugin processes<br/>Any language"]
+    Bridge["External tool adapter"]
+    Plugins["External tool processes<br/>Any language"]
 
     Frontend <-->|Commands / events| Runtime
     Core --- Runtime
@@ -110,6 +111,18 @@ sequenceDiagram
 
 Partial tool arguments are previews, never executable instructions. The proposed baseline has one active run and sequential tool dispatch. Cancellation is not rollback, and uncertain side effects must not be blindly replayed.
 
+## First-Release Defaults
+
+Accepted in [Decision 01](docs/design/decisions/01-first-release-defaults.md); detailed interfaces remain drafts.
+
+| Area | Accepted default |
+| --- | --- |
+| Permissions | Scoped project reads/searches are automatic; file mutations and command execution require confirmation. |
+| Frontend | Grok Build-style full-screen Rust TUI plus a headless entry point over the same runtime. |
+| Sessions | Save automatically outside the project; start new and restore history only on explicit request. |
+| Authentication | API configuration with external credential references; browser login deferred. |
+| API relay | Relay is a provider plugin; support existing services first and keep local execution optional. |
+
 ## Extensions
 
 Built-in and external tools share one semantic contract, but do not share the same transport cost.
@@ -119,7 +132,9 @@ Built-in and external tools share one semantic contract, but do not share the sa
 | **Built-in Rust tools** | Compiled modules registered through the tool port | Direct calls, no IPC; implementation changes require rebuilding. |
 | **External plugins** | Separate programs connected through an adapter | Any language implementing a supported protocol; additional process and serialization overhead. |
 
-MCP over stdio is the preferred initial external-transport candidate, kept outside the domain core. Protocol versions and optional capabilities have not been selected, and **MCP compliance is not currently claimed**.
+MCP over stdio is the preferred initial external-tool transport candidate, kept outside the domain core. Protocol versions and optional capabilities have not been selected, and **MCP compliance is not currently claimed**.
+
+API relay is separate from tool plugins: a relay is a provider implementation behind the provider port, not a model-invoked tool. Existing relay services come first; local relay execution remains an optional boundary and never mandatory startup work.
 
 The initial coding distribution is intended to provide scoped reads, search, patch application, and command execution. Workflow, context selection, storage, and frontend replacement retain explicit boundaries without allowing arbitrary mutation of runtime internals.
 
@@ -140,7 +155,9 @@ Coverage is organized by protocol family rather than by a growing list of vendor
 
 These are **coverage targets, not verified integrations**. Each adapter must declare capabilities, preserve tool-call identity and required continuation data, and validate its compatibility. A configurable base URL alone does not establish support.
 
-See [model integration](docs/design/03-model-integration.md) and the [provider contract](docs/contracts/01-provider.md).
+First-release authentication uses API profiles with external credential references. Existing relay services integrate as provider plugins; local relay execution is optional and on demand.
+
+See [model integration](docs/design/03-model-integration.md), [API relay](docs/design/08-api-relay.md), and the [provider contract](docs/contracts/01-provider.md).
 
 ## Safety and Trust
 
@@ -148,12 +165,15 @@ The proposed runtime enforces permissions, resource scopes, deadlines, and outpu
 
 Initial external plugins are explicitly enabled **trusted code**. A subprocess is not a sandbox; isolation for untrusted plugins requires a separate implementation and platform-specific testing. No sandbox or containment guarantee exists today.
 
+The default permission policy and session behavior are accepted; automatic reads remain scoped, mutations/commands require exact-call confirmation, and restored history never replays operations or old grants.
+
 See the [security design](docs/design/06-security.md) and [session recovery contract](docs/contracts/04-session-store.md).
 
 ## Project Status
 
 - [x] MIT license and confirmed project direction.
 - [x] Draft architecture, performance, security, and interface contracts.
+- [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
 - [ ] Review and accept the minimal implementation contracts.
 - [ ] Build a testable core/runtime and minimal frontend.
 - [ ] Establish Linux and macOS startup and resource baselines.
@@ -169,6 +189,10 @@ Start with the [documentation index](docs/index.md). Proposed implementation wor
 | Start here | Purpose |
 | --- | --- |
 | [Project foundation](docs/design/decisions/00-project-foundation.md) | Confirmed goals and scope. |
+| [First-release defaults](docs/design/decisions/01-first-release-defaults.md) | Accepted permissions, UI, sessions, entry points, authentication, relay scope, and code simplicity. |
+| [TUI and headless frontends](docs/design/07-tui.md) | Grok Build-style layout, approvals, history, and script entry point. |
+| [API relay](docs/design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries. |
+| [Implementation readiness](docs/design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review. |
 | [Overview](docs/design/00-overview.md) | First-release boundaries and non-goals. |
 | [Common contract](docs/contracts/00-common.md) | Identifiers, outcomes, errors, limits, and compatibility. |
 | [Commands and events](docs/contracts/03-command-events.md) | Frontend/runtime interaction and backpressure. |

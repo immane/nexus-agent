@@ -1,6 +1,6 @@
 # Tool Contract
 
-Status: Draft contract, revision `draft-0`. Read the [common contract](00-common.md) first. The same semantics apply to built-in and external executors.
+Status: Draft contract, revision `draft-1`. Read the [common contract](00-common.md) first. The default permission policy is accepted in [Decision 01](../design/decisions/01-first-release-defaults.md); remaining mechanics are proposed for both built-in and external executors.
 
 ## Semantic Operations
 
@@ -27,7 +27,15 @@ A narrow context does not remove the ambient OS privileges of trusted native cod
 
 Check authorization against the actual tool identity, revision, normalized arguments, current resource scope, and effective policy immediately before dispatch. An approval binds these values plus its run, call, expiry, and relevant policy revision.
 
+The default policy automatically permits only host-authorized project reads/searches. Model-directed file mutations and all command execution require confirmation, even for commands described as read-only. Unknown or externally declared effect classifications do not independently earn automatic permission.
+
+Without an explicitly configured approval handler, a headless confirmation-required call MUST be denied with not-started effects. It cannot wait for nonexistent terminal input, silently enable automatic approval, or execute via another adapter.
+
+Host-managed session writes under the configured storage policy are not model-directed tool mutations. They grant no broader filesystem permission to the model or plugins.
+
 Changed arguments, tool definitions, revocation, expiry, or run cancellation invalidate the approval. An already consumed approval cannot dispatch the call again. External read-only/idempotent annotations are not authoritative security evidence.
+
+Carry validated immutable arguments into the executor without redundant structural checking. After approval or persistence waits, recheck mutable authorization/cancellation/deadline conditions at the actual dispatch boundary. A shorter code path MUST NOT bypass those checks.
 
 In persistent mode, side-effecting dispatch MUST meet the [session-store intent requirements](04-session-store.md). If required validation, authorization, or intent recording fails, do not execute.
 
@@ -62,7 +70,7 @@ Unknown effects forbid blind retry. A caller timeout does not establish that an 
 
 ## Required Tests
 
-Cover registration/schema failure, incomplete calls, denied/stale/consumed approvals, changed arguments, scope enforcement, output limits, cleanup, timeout with uncertain effects, and prevention of blind replay.
+Cover registration/schema failure, incomplete calls, automatic scoped reads/searches, confirmation for mutations and apparently read-only commands, headless denial without a handler, denied/stale/consumed approvals, changed arguments, scope enforcement, output limits, cleanup, timeout with uncertain effects, and prevention of blind replay.
 
 ## Related Documents
 

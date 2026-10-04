@@ -38,11 +38,15 @@ Record OS, architecture, hardware, terminal or PTY setup, compiler, build profil
 
 Keep startup offline and bounded. Defer session materialization, plugin processes, discovery, and indexing. Disabled optional integrations must not initialize background work.
 
+Measure the accepted default: a new conversation, no automatic restoration, no browser login, and no relay probing or local proxy startup. Include the local setup needed for the configured session store; do not hide mandatory persistence work behind a misleading readiness signal. Explicit history restoration and optional relay startup are separate measurements.
+
 Reuse connections and immutable configuration. Prefer direct built-in tool calls, bounded buffers, and ownership transfer over repeated whole-history cloning. Batch presentation deltas without losing text or delaying control traffic.
 
 Do not introduce a dependency per model vendor, a runtime per component, or an internal service to connect built-in modules. Avoid full-history parsing or layout for every token. Establish a regression baseline before changing allocator, dispatch, or compiler strategies.
 
 Evaluate stripping, link-time optimization, feature reduction, allocator choices, and dispatch representation with measurements. A smaller binary is not automatically faster, and aggressive compiler settings can increase development cost or regress runtime behavior.
+
+Keep optimized code readable. Do not build redundant checking layers, speculative fast-path/fallback trees, or macros merely to make code appear small. Consolidate immutable validation at boundaries without weakening dispatch-time safety.
 
 ## Resource Budgets
 
@@ -61,3 +65,5 @@ Live model latency is an integration measurement, not the core performance bench
 - [Execution](02-execution.md)
 - [Components](01-components.md)
 - [Commands and events](../contracts/03-command-events.md)
+- [TUI and headless frontends](07-tui.md)
+- [Implementation readiness](09-implementation-readiness.md)

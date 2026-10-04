@@ -1,6 +1,6 @@
 # Overview
 
-Status: Draft design. Confirmed requirements are recorded in the [project foundation decision](decisions/00-project-foundation.md). Nothing in this document claims an implemented feature.
+Status: Draft design. Confirmed requirements are recorded in the [project foundation](decisions/00-project-foundation.md) and [first-release defaults](decisions/01-first-release-defaults.md) decisions. Nothing in this document claims an implemented feature.
 
 ## Confirmed Goals
 
@@ -11,10 +11,17 @@ Status: Draft design. Confirmed requirements are recorded in the [project founda
 - Integrate models broadly and allow extensions at explicit boundaries.
 - Support built-in Rust tool modules and cross-language external plugins.
 - Design isolation for untrusted plugins separately; do not equate subprocesses with a sandbox.
+- Keep code concise: direct normal paths, short failures, validated types, and no redundant checks or speculative fallback branches.
 
 ## First-Release Scope
 
-The proposed baseline is one active agent run in the host process, streaming model output, bounded tool execution, explicit authorization, cancellation, and recoverable session history. The same runtime must be usable without a terminal UI.
+The proposed execution baseline is one active agent run in the host process, streaming output, bounded tools, cancellation, and recoverable history. The first release must provide both a Grok Build-style full-screen Rust TUI and a headless entry point using the same runtime.
+
+Project-scoped reads/searches are automatic subject to host restrictions. Model-directed file mutations and command execution require confirmation. Headless calls requiring approval are denied when no explicit approval handler is configured.
+
+Save sessions automatically in local application storage outside the project. Start a new conversation by default; restore selected history only on request, without replaying operations or restoring old call grants.
+
+Use API profiles with externally referenced credentials. Browser login/OAuth is deferred. Existing API relay services are first-release provider-plugin integrations; keep an optional local-relay boundary without making a local proxy part of startup.
 
 The initial coding distribution should register a small set of tools for reading files, searching, applying patches, and running commands. These are tool implementations, not special cases embedded in the core loop.
 
@@ -25,6 +32,7 @@ Provider integration should cover mainstream protocol families. A configurable e
 - A general-purpose multi-agent framework or arbitrary lifecycle-hook system.
 - A vector database, always-running indexing service, or internal HTTP server without a concrete requirement.
 - Native dynamic-library loading or an embedded WASM runtime.
+- Mandatory account login, automatic latest-session restoration, or a mandatory local relay service.
 - Guaranteed safety for untrusted plugins without an implemented isolation backend.
 - Identical support for every model feature or all third-party compatible services.
 - Guaranteed startup time on arbitrary hardware, filesystems, or terminal environments.
@@ -49,3 +57,6 @@ A useful first release must complete a model/tool/model cycle, handle interrupti
 - [Execution](02-execution.md)
 - [Security](06-security.md)
 - [Common contract](../contracts/00-common.md)
+- [TUI and headless frontends](07-tui.md)
+- [API relay](08-api-relay.md)
+- [Implementation readiness](09-implementation-readiness.md)

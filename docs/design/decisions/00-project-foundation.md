@@ -45,3 +45,4 @@ These choices require review of the relevant draft design or contract. They do n
 - [Components](../01-components.md)
 - [Performance](../05-performance.md)
 - [Security](../06-security.md)
+- [Decision 01: First-release defaults](01-first-release-defaults.md)

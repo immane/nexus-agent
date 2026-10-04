@@ -27,6 +27,8 @@ The runtime receives implementations through ports. It must not import a concret
 
 A headless frontend and the TUI use the same runtime interface. Replacing a frontend must not create a second authorization or tool-execution path.
 
+Both are first-release entry points. The TUI follows the [Grok Build-style frontend design](07-tui.md); headless mode uses no terminal or additional service and denies confirmation-required calls without an explicit approval handler.
+
 ## Ownership
 
 - The runtime owns authoritative run state and accepted conversation state.
@@ -42,6 +44,14 @@ Avoid an application-wide mutable object shared by every component. Prefer messa
 Provider, tool, and frontend command/event contracts are the first public boundaries. Session storage is a separate port. Workflow and context-selection policies should remain independently testable modules; introduce public replacement interfaces when a concrete extension needs them.
 
 All replacement paths must obey common runtime invariants. Do not expose arbitrary hooks that let extensions skip authorization, inject terminal outcomes, or change another run's state.
+
+API relay belongs to the provider port, not the tool port. A registered provider plugin may reuse a protocol adapter against an existing relay endpoint; future local relay executors stay behind that boundary. MCP tool interoperability does not define the provider-plugin ABI or process protocol.
+
+## Concise Implementation
+
+Keep the normal agent path direct. Parse and validate external data at its boundary, carry explicit validated types, and use clear state transitions, matches, and early returns instead of repeating immutable checks in every layer.
+
+Recheck mutable policy, approvals, cancellation, and deadlines where execution requires it. Do not remove those checks for brevity or hide simple logic behind wrappers, generic pipelines, or macros. Introduce helpers for meaningful ownership or actual reuse, not merely to shorten a function's apparent length.
 
 ## Packaging and Dependencies
 
@@ -61,3 +71,5 @@ Check that the core can be tested with fake providers and tools, the runtime can
 - [Tool contract](../contracts/02-tool.md)
 - [Commands and events](../contracts/03-command-events.md)
 - [Session store](../contracts/04-session-store.md)
+- [API relay](08-api-relay.md)
+- [Implementation readiness](09-implementation-readiness.md)

@@ -58,6 +58,9 @@ Follow explicit user instructions and applicable project-specific rules. More sp
 ## 7. Code, Comments, and Documentation
 
 - Match the surrounding naming, style, structure, and language idioms. Prefer clear, maintainable code over cleverness.
+- Keep normal paths straightforward and exceptional paths short. Prefer guard clauses, early returns, and explicit states over deeply nested or repetitive conditionals.
+- Validate at trust boundaries and carry validated data internally rather than repeatedly checking unchanged facts. Recheck authorization, cancellation, deadlines, and other mutable conditions where required.
+- Do not add speculative fallback branches or hide simple decisions behind layers of wrappers. Do not use macros, metaprogramming, or compressed expressions merely to reduce line count.
 - Let names, types, structure, and tests explain ordinary behavior. Comment on non-obvious rationale, invariants, safety requirements, units, and deliberate limitations.
 - Do not restate code, retain commented-out implementations, or leave vague TODO/FIXME notes. Give necessary follow-up work concrete context.
 - Update or remove stale comments and documentation when behavior changes.
