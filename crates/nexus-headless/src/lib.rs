@@ -3,8 +3,7 @@
 //! M0 headless composition root: fake-wired, test-only.
 //!
 //! The binary owns the M0 composition root for headless mode: it builds the
-//! runtime with a scripted [`FakeProvider`](nexus_fakes::FakeProvider) plus
-//! [`FakeTool`](nexus_fakes::FakeTool) set, submits one task taken from
+//! runtime with a scripted [`FakeProvider`] plus [`FakeTool`] set, submits one task taken from
 //! argv, drains both event channels to the terminal [`RunOutcome`], and
 //! exits. No approval handler is configured, so confirmation-required calls
 //! exercise the denial path (denied, never executed, never hung).
@@ -12,10 +11,40 @@
 //! Output contract (unstable test-only revision `m0-test-0`, see
 //! [`OUTPUT_REV`]): stdout carries ONLY machine-readable event/result lines,
 //! one record per line, each starting with `rev=m0-test-0 `. Fields are
-//! space-separated `key=value` pairs; values never contain spaces, `=`,
-//! newlines, or escape codes (see [`sanitize`]). No `Debug` formatting is
-//! used. Event lines are sorted by per-run sequence before printing.
-//! Diagnostics and [`FAKE_BANNER`] go to stderr only.
+//! space-separated `key=value` pairs. Every value is percent-encoded over
+//! its UTF-8 bytes (see [`sanitize`]): bytes outside the RFC 3986
+//! unreserved set `A-Za-z0-9-._~` become `%XX` with uppercase hex, so no
+//! raw space, `=`, newline, or ESC byte can appear inside a value and every
+//! `%` starts a complete escape. Decode a record by splitting it on spaces,
+//! splitting each field at its first `=`, and calling [`percent_decode`] on
+//! the value. Encoding is reversible for any UTF-8 text; malformed escapes
+//! and non-UTF-8 byte sequences are rejected by the decoder. No `Debug`
+//! formatting is used. Event lines are sorted by per-run sequence before
+//! printing. Diagnostics and [`FAKE_BANNER`] go to stderr only.
+//!
+//! Report retention separates mandatory control records (`RunStarted`,
+//! approvals, tool lifecycle, usage, terminal) from presentation data (text,
+//! previews, progress). Mandatory records are never dropped because
+//! presentation filled the budget: presentation lines are bounded by
+//! [`MAX_REPORT_EVENTS`] and the exact encoded bytes left under
+//! [`MAX_REPORT_BYTES`], and the oldest presentation lines are evicted first
+//! when mandatory lines need the space. If mandatory records exceed their own
+//! finite reserve ([`MAX_MANDATORY_EVENTS`]/[`MAX_MANDATORY_BYTES`]), the
+//! report is refused with an explicit operation error instead of dropping a
+//! mandatory record. Every line is formatted on receipt and memory is exactly
+//! the sum of the retained encoded lines, including approval args previews
+//! and error correlation diagnostics. Dropped presentation sets
+//! [`HeadlessReport::truncated`]; counters still describe every observed
+//! event.
+//!
+//! Lifecycle bounds: the consume watchdog is the runtime's remaining
+//! run-duration budget plus [`WATCHDOG_SLACK`]. If it expires, the library
+//! requests runtime cancellation before dropping the driver and reconciles
+//! within [`RECONCILE_TIMEOUT`], so an error path never skips the requested
+//! cancellation or waits forever. Runtime teardown waits at most
+//! [`SHUTDOWN_TIMEOUT`] for blocking workers; that only stops waiting, it
+//! does not kill work, and the runtime owner quarantines workers that
+//! outlive the wait.
 //!
 //! Task routing (test-only stand-in, not a product default): the task string
 //! is submitted verbatim as the run input; the fake script is picked by
@@ -24,21 +53,29 @@
 //! (completed path).
 //!
 //! Exit-code mapping: 0 = completed with no denied calls; 3 = completed run
-//! containing denied calls (headless denial); 1 = failed or refused; 4 =
-//! cancelled; 5 = limit reached; 2 = usage error (missing/empty/oversize
-//! task, rejected submit). A denied tool call surfaces as `Completed` at
-//! run level with a `Denied`/`NotStarted` tool outcome, hence the distinct
-//! code 3.
+//! containing denied calls (headless denial); 1 = failed or refused run, or
+//! an operational entry-point failure (runtime setup, rejected submit,
+//! watchdog expiry, closed channel); 4 = cancelled; 5 = limit reached;
+//! 2 = usage error (missing, empty, oversize, or non-UTF-8 argv input);
+//! 6 = the stdout consumer closed early (broken pipe), so the process
+//! stopped writing deliberately instead of panicking. A denied tool call
+//! surfaces as `Completed` at run level with a `Denied`/`NotStarted` tool
+//! outcome, hence the distinct code 3.
 
+use std::collections::VecDeque;
+use std::fmt;
+use std::future::Future;
+use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use nexus_core::commands::EventSequence;
 use nexus_core::{
-    CommandReply, EventPayload, Limits, RequestId, RunEvent, RunFinished, RunOutcome, SessionId,
-    SubmitCommand,
+    CancelCommand, CommandReply, CorrelationData, EventPayload, Limits, RequestId, RunEvent,
+    RunFinished, RunId, RunOutcome, SessionId, SubmitCommand,
 };
 use nexus_fakes::{FakeProvider, FakeTool, candidate, stop_turn, tool_turn};
-use nexus_runtime::{Policy, Runtime, RuntimeConfig};
+use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 
 /// Unstable test-only output revision. Parsers must exact-match this.
 pub const OUTPUT_REV: &str = "m0-test-0";
@@ -49,6 +86,54 @@ pub const FAKE_BANNER: &str = "nexus-headless: FAKE TEST-ONLY wiring rev m0-test
 
 /// Usage hint for stderr diagnostics.
 pub const USAGE: &str = "usage: nexus-headless <task>; prefix with 'deny:' to exercise headless denial, 'refuse:' for refusal";
+
+/// Exit code for a stdout consumer that closed early (broken pipe). The
+/// report is incomplete by construction, so this is deliberately distinct
+/// from both success and the usage/operation error codes.
+pub const EXIT_STDOUT_CLOSED: i32 = 6;
+
+/// Extra wait beyond the runtime's own remaining run-duration budget before
+/// the consume watchdog gives up. The runtime enforces its deadline; the
+/// slack only covers scheduling and shutdown, so the watchdog can never
+/// truncate a run the runtime still considers live.
+pub const WATCHDOG_SLACK: Duration = Duration::from_secs(5);
+
+/// Bounded post-cancel reconciliation window. After a watchdog expiry or a
+/// closed control channel, the headless driver requests runtime cancellation
+/// and waits at most this long (for the cancel request and again for the
+/// terminal record) before reporting the error. The error path never skips
+/// the requested cancellation and never waits indefinitely.
+pub const RECONCILE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Finite wait for blocking workers during runtime teardown. Stopping the
+/// wait does not cancel or kill the worker; it only stops waiting. Workers
+/// that outlive the wait are quarantined by the runtime owner, and process
+/// exit must not block on arbitrary blocking code.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// M0-TEST: maximum presentation records retained for one
+/// [`HeadlessReport`]. Extra presentation records are counted but not
+/// formatted. Mandatory control records use [`MAX_MANDATORY_EVENTS`]
+/// instead and never consume this budget.
+pub const MAX_REPORT_EVENTS: usize = 1_024;
+
+/// M0-TEST: exact encoded byte budget shared by presentation and mandatory
+/// lines. Presentation retention uses whatever remains after mandatory
+/// lines; the oldest presentation lines are evicted first when mandatory
+/// lines need space. Mandatory lines alone are bounded by
+/// [`MAX_MANDATORY_BYTES`].
+pub const MAX_REPORT_BYTES: usize = 262_144;
+
+/// M0-TEST: reserved count for mandatory control records (outcomes and the
+/// terminal event). Presentation pressure can never consume this reserve.
+pub const MAX_MANDATORY_EVENTS: usize = 256;
+
+/// M0-TEST: finite encoded-byte budget for mandatory control lines,
+/// measured on the exact formatted line. It covers the M0 worst case (16
+/// tool-finished payloads at the 262,144-byte output budget, percent-encoded
+/// at three characters per byte) with headroom. Exceeding it refuses the
+/// report with an explicit operation error, never a silent drop.
+pub const MAX_MANDATORY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Terminal report for one headless task.
 pub struct HeadlessReport {
@@ -66,9 +151,66 @@ pub struct HeadlessReport {
     pub approval_required: usize,
     /// `ToolFinished` events observed.
     pub tool_finished: usize,
+    /// True when presentation records were dropped or evicted to keep the
+    /// report within [`MAX_REPORT_EVENTS`]/[`MAX_REPORT_BYTES`]. Mandatory
+    /// control records are never dropped; exceeding their reserve refuses
+    /// the report with [`HeadlessError::Operation`] instead. The counters
+    /// and outcome still describe every observed event.
+    pub truncated: bool,
     /// Process exit code per the mapping documented above.
     pub exit_code: i32,
 }
+
+/// Entry-point failure with two deliberately distinct classes so the caller
+/// can map usage mistakes to exit code 2 and operational failures to exit
+/// code 1. Messages are static or runtime-generated but never echo raw argv
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessError {
+    /// The caller supplied invalid input (empty, oversize, or non-UTF-8).
+    Usage(String),
+    /// The run was accepted but did not complete operationally (runtime
+    /// setup, rejected submit, watchdog expiry, closed channel).
+    Operation(String),
+}
+
+impl HeadlessError {
+    /// Process exit code for usage mistakes.
+    pub const USAGE_EXIT_CODE: i32 = 2;
+    /// Process exit code for operational failures.
+    pub const OPERATION_EXIT_CODE: i32 = 1;
+
+    /// Returns true when the failure is a usage mistake (exit code 2).
+    #[must_use]
+    pub fn is_usage(&self) -> bool {
+        matches!(self, Self::Usage(_))
+    }
+
+    /// Returns the diagnostic message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Usage(message) | Self::Operation(message) => message,
+        }
+    }
+
+    /// Returns the process exit code: 2 for usage, 1 for operation.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Usage(_) => Self::USAGE_EXIT_CODE,
+            Self::Operation(_) => Self::OPERATION_EXIT_CODE,
+        }
+    }
+}
+
+impl fmt::Display for HeadlessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for HeadlessError {}
 
 /// Maps a terminal outcome (plus denial count) to a process exit code.
 #[must_use]
@@ -94,121 +236,404 @@ pub fn outcome_name(outcome: RunOutcome) -> &'static str {
     }
 }
 
-/// Makes free text safe for `key=value` stdout lines: the output alphabet
-/// excludes whitespace, `=`, escape codes, and all other control characters,
-/// so stdout can never carry terminal escapes.
+/// Reversible machine encoding for free text in `key=value` stdout lines.
+///
+/// Encodes the UTF-8 bytes of `raw`: bytes in the RFC 3986 unreserved set
+/// `A-Z a-z 0-9 - . _ ~` pass through unchanged, and every other byte is
+/// written as `%XX` with uppercase hexadecimal digits. The result is ASCII
+/// with no raw space, `=`, newline, or ESC byte; every `%` introduces a
+/// complete two-digit escape, and [`percent_decode`] restores the original
+/// text losslessly. Percent encoding a byte can expand it to three
+/// characters.
 #[must_use]
 pub fn sanitize(raw: &str) -> String {
-    raw.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | ',' | '-' | '_' | '+' | '/' | ':' => c,
-            ' ' => '_',
-            _ => '?',
-        })
-        .collect()
+    percent_encode(raw.as_bytes())
+}
+
+/// Failure modes of [`percent_decode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PercentDecodeError {
+    /// A `%` was not followed by exactly two hexadecimal digits.
+    MalformedEscape,
+    /// The decoded byte sequence is not valid UTF-8.
+    InvalidUtf8,
+}
+
+impl fmt::Display for PercentDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedEscape => formatter.write_str("malformed percent escape"),
+            Self::InvalidUtf8 => formatter.write_str("decoded bytes are not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for PercentDecodeError {}
+
+/// Decodes the machine encoding produced by [`sanitize`]. Bytes that are not
+/// `%` escapes pass through unchanged, so the decoder also accepts plain
+/// ASCII values. Escapes are accepted in either hex case and validated as
+/// UTF-8; a malformed escape or invalid byte sequence is rejected.
+pub fn percent_decode(encoded: &str) -> Result<String, PercentDecodeError> {
+    let decoded = percent_decode_bytes(encoded.as_bytes())?;
+    String::from_utf8(decoded).map_err(|_| PercentDecodeError::InvalidUtf8)
+}
+
+/// Writes every report line followed by a newline, then flushes. The caller
+/// owns failure mapping; [`std::io::ErrorKind::BrokenPipe`] must not be
+/// turned into a panic or a silently swallowed success.
+pub fn write_report_lines<W: Write>(writer: &mut W, lines: &[String]) -> std::io::Result<()> {
+    for line in lines {
+        writeln!(writer, "{line}")?;
+    }
+    writer.flush()
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if is_unreserved(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(hex_digit(byte >> 4));
+            encoded.push(hex_digit(byte & 0x0F));
+        }
+    }
+    encoded
+}
+
+fn percent_decode_bytes(bytes: &[u8]) -> Result<Vec<u8>, PercentDecodeError> {
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let high = bytes
+                .get(index + 1)
+                .copied()
+                .and_then(hex_value)
+                .ok_or(PercentDecodeError::MalformedEscape)?;
+            let low = bytes
+                .get(index + 2)
+                .copied()
+                .and_then(hex_value)
+                .ok_or(PercentDecodeError::MalformedEscape)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    Ok(decoded)
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn hex_digit(nibble: u8) -> char {
+    char::from(b"0123456789ABCDEF"[usize::from(nibble & 0x0F)])
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Submits `task`, drains both event channels to the terminal outcome, and
-/// builds the stdout lines plus exit code. Returns `Err` for invalid input
-/// or a rejected submit (caller maps to exit code 2).
-pub fn run_task(task: &str) -> Result<HeadlessReport, String> {
+/// builds the stdout lines plus exit code. Invalid input returns
+/// [`HeadlessError::Usage`]; operational failures return
+/// [`HeadlessError::Operation`].
+pub fn run_task(task: &str) -> Result<HeadlessReport, HeadlessError> {
+    block_on_with_shutdown(run_task_async(task), SHUTDOWN_TIMEOUT)?
+}
+
+/// Runs one future on a fresh current-thread runtime, then stops waiting for
+/// blocking workers after `shutdown`. The future's result is captured before
+/// teardown and returned unchanged. `shutdown_timeout` does not kill or
+/// cancel arbitrary blocking code; it only stops waiting, and any worker
+/// that outlives the wait is quarantined by the runtime owner instead of
+/// holding process exit hostage.
+fn block_on_with_shutdown<F: Future>(
+    future: F,
+    shutdown: Duration,
+) -> Result<F::Output, HeadlessError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| format!("test runtime failed: {error}"))?;
-    runtime.block_on(run_task_async(task))
+        .map_err(|error| HeadlessError::Operation(format!("test runtime failed: {error}")))?;
+    let result = runtime.block_on(future);
+    runtime.shutdown_timeout(shutdown);
+    Ok(result)
 }
 
-async fn run_task_async(task: &str) -> Result<HeadlessReport, String> {
-    let provider = Arc::new(FakeProvider::new(script_for(task)));
-    let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = vec![
+/// Counts every observed event and retains a bounded, exactly-sized subset
+/// of formatted lines for the report.
+struct RunConsumer {
+    retention: Retention,
+    tool_started: usize,
+    approval_required: usize,
+    tool_finished: usize,
+    denied_calls: usize,
+}
+
+impl RunConsumer {
+    fn new() -> Self {
+        Self {
+            retention: Retention::new(),
+            tool_started: 0,
+            approval_required: 0,
+            tool_finished: 0,
+            denied_calls: 0,
+        }
+    }
+
+    fn observe(&mut self, event: RunEvent) {
+        match event.payload() {
+            EventPayload::ToolStarted(_) => self.tool_started += 1,
+            EventPayload::ApprovalRequired(_) => self.approval_required += 1,
+            EventPayload::ToolFinished(info) => {
+                self.tool_finished += 1;
+                if info.outcome.status() == nexus_core::ExecutionStatus::Denied {
+                    self.denied_calls += 1;
+                }
+            }
+            _ => {}
+        }
+        self.retention.retain(event);
+    }
+}
+
+/// One formatted stdout record with its per-run sequence for final ordering.
+struct RetainedLine {
+    seq: EventSequence,
+    line: String,
+}
+
+/// Retention separates mandatory control records from presentation data.
+///
+/// Mandatory records (`RunStarted`, approvals, tool lifecycle, usage,
+/// terminal) are never dropped for presentation pressure: they are bounded
+/// only by [`MAX_MANDATORY_EVENTS`]/[`MAX_MANDATORY_BYTES`], and exceeding
+/// that finite reserve sets `over_limit` so the caller can refuse the report
+/// explicitly instead of dropping a record. Presentation records are bounded
+/// by [`MAX_REPORT_EVENTS`] and the exact encoded bytes left under
+/// [`MAX_REPORT_BYTES`]; the oldest presentation lines are evicted first
+/// when mandatory lines need the space. Formatting happens on receipt, so
+/// memory is exactly the sum of the retained encoded lines, including
+/// approval args previews and error correlation diagnostics.
+struct Retention {
+    mandatory: Vec<RetainedLine>,
+    mandatory_bytes: usize,
+    presentation: VecDeque<RetainedLine>,
+    presentation_bytes: usize,
+    over_limit: bool,
+    truncated: bool,
+}
+
+impl Retention {
+    fn new() -> Self {
+        Self {
+            mandatory: Vec::new(),
+            mandatory_bytes: 0,
+            presentation: VecDeque::new(),
+            presentation_bytes: 0,
+            over_limit: false,
+            truncated: false,
+        }
+    }
+
+    fn retain(&mut self, event: RunEvent) {
+        if self.over_limit {
+            return;
+        }
+        let record = RetainedLine {
+            seq: event.seq(),
+            line: format_event(&event),
+        };
+        if is_mandatory(event.payload()) {
+            self.retain_mandatory(record);
+        } else {
+            self.retain_presentation(record);
+        }
+    }
+
+    fn retain_mandatory(&mut self, record: RetainedLine) {
+        if self.mandatory.len() >= MAX_MANDATORY_EVENTS
+            || self.mandatory_bytes.saturating_add(record.line.len()) > MAX_MANDATORY_BYTES
+        {
+            // Mandatory records are never silently dropped; the caller turns
+            // this explicit limit into an operation error.
+            self.over_limit = true;
+            return;
+        }
+        self.mandatory_bytes += record.line.len();
+        self.mandatory.push(record);
+        self.evict_presentation_to_fit();
+    }
+
+    fn retain_presentation(&mut self, record: RetainedLine) {
+        let budget = MAX_REPORT_BYTES.saturating_sub(self.mandatory_bytes);
+        if self.presentation.len() >= MAX_REPORT_EVENTS
+            || self.presentation_bytes.saturating_add(record.line.len()) > budget
+        {
+            self.truncated = true;
+            return;
+        }
+        self.presentation_bytes += record.line.len();
+        self.presentation.push_back(record);
+    }
+
+    /// Evicts the oldest presentation records until the combined encoded
+    /// size fits the report budget. Mandatory records are never evicted.
+    fn evict_presentation_to_fit(&mut self) {
+        while self.presentation_bytes.saturating_add(self.mandatory_bytes) > MAX_REPORT_BYTES {
+            let Some(oldest) = self.presentation.pop_front() else {
+                break;
+            };
+            self.presentation_bytes = self.presentation_bytes.saturating_sub(oldest.line.len());
+            self.truncated = true;
+        }
+    }
+}
+
+/// Mirrors the runtime transport's control classification: these records are
+/// mandatory report content and must never be lost to presentation pressure.
+fn is_mandatory(payload: &EventPayload) -> bool {
+    matches!(
+        payload,
+        EventPayload::RunStarted { .. }
+            | EventPayload::ApprovalRequired(_)
+            | EventPayload::ToolStarted(_)
+            | EventPayload::ToolFinished(_)
+            | EventPayload::UsageUpdated(_)
+            | EventPayload::RunFinished(_)
+    )
+}
+
+/// Consume watchdog: the runtime's own remaining run-duration budget plus
+/// [`WATCHDOG_SLACK`]. It must never cut a run short of the runtime deadline.
+fn watchdog_budget(remaining: Duration) -> Duration {
+    remaining.saturating_add(WATCHDOG_SLACK)
+}
+
+/// Builds the M0-test tool set; [`Runtime::try_new`] validates every
+/// registration (revision, duplicate names, schema) before a run can start.
+fn m0_tools() -> Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> {
+    vec![
         Arc::new(FakeTool::read_only()),
         Arc::new(FakeTool::mutation()),
         Arc::new(FakeTool::command()),
-    ];
-    let (runtime, mut streams) = Runtime::new(
+    ]
+}
+
+/// Builds the runtime through the fallible constructor so invalid
+/// registration is a normal [`HeadlessError::Operation`], never a panic.
+fn build_runtime(
+    limits: Limits,
+    provider: Arc<dyn nexus_core::ProviderPort + Send + Sync>,
+    tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>>,
+) -> Result<(Runtime, EventStreams), HeadlessError> {
+    Runtime::try_new(
         RuntimeConfig {
-            limits: Limits::m0_test(),
+            limits,
             policy: Policy::m0_test(),
             has_approval_handler: false,
         },
         provider,
         tools,
-    );
+    )
+    .map_err(|error| HeadlessError::Operation(format!("runtime registration failed: {error}")))
+}
+
+async fn run_task_async(task: &str) -> Result<HeadlessReport, HeadlessError> {
+    let limits = Limits::m0_test();
+    let provider: Arc<dyn nexus_core::ProviderPort + Send + Sync> =
+        Arc::new(FakeProvider::new(script_for(task)));
+    let (runtime, mut streams) = build_runtime(limits, provider, m0_tools())?;
     let submit = SubmitCommand::new(
-        RequestId::new("req-headless-1").map_err(|_| "request id invalid".to_owned())?,
-        SessionId::new("sess-headless-1").map_err(|_| "session id invalid".to_owned())?,
+        RequestId::new("req-headless-1")
+            .map_err(|_| HeadlessError::Operation("request id invalid".to_owned()))?,
+        SessionId::new("sess-headless-1")
+            .map_err(|_| HeadlessError::Operation("session id invalid".to_owned()))?,
         task,
         "m0-test",
     )
-    .map_err(|_| "task input is empty or exceeds the input budget".to_owned())?;
+    .map_err(|_| {
+        HeadlessError::Usage("task input is empty or exceeds the input budget".to_owned())
+    })?;
+    let started = Instant::now();
     let response = runtime.submit(submit).await;
     if response.reply() != CommandReply::Accepted {
-        return Err("run submit was not accepted".to_owned());
+        return Err(HeadlessError::Operation(
+            "run submit was not accepted".to_owned(),
+        ));
     }
     let run = response
         .run()
         .cloned()
         .expect("accepted submit issues a run");
 
-    let mut events: Vec<RunEvent> = Vec::new();
-    let terminal: RunFinished = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            tokio::select! {
-                event = streams.data.recv() => {
-                    if let Some(event) = event {
-                        events.push(event);
-                    }
-                }
-                event = streams.control.recv() => {
-                    match event {
-                        None => return None,
-                        Some(event) => {
-                            let done = matches!(event.payload(), EventPayload::RunFinished(_));
-                            let finished = if done {
-                                match event.payload() {
-                                    EventPayload::RunFinished(finished) => Some(finished.clone()),
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            };
-                            events.push(event);
-                            if let Some(finished) = finished {
-                                return Some(finished);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    })
+    let mut consumer = RunConsumer::new();
+    let watchdog = watchdog_budget(limits.run_duration.saturating_sub(started.elapsed()));
+    let terminal = match tokio::time::timeout(
+        watchdog,
+        consume_until_terminal(&mut streams, &mut consumer),
+    )
     .await
-    .map_err(|_| "run did not reach a terminal outcome in time".to_owned())?
-    .ok_or_else(|| "control channel closed before terminal outcome".to_owned())?;
-    while let Ok(event) = streams.data.try_recv() {
-        events.push(event);
-    }
-    events.sort_by_key(RunEvent::seq);
-
-    let mut tool_started = 0;
-    let mut approval_required = 0;
-    let mut tool_finished = 0;
-    let mut denied_calls = 0;
-    let mut lines: Vec<String> = Vec::with_capacity(events.len() + 1);
-    for event in &events {
-        match event.payload() {
-            EventPayload::ToolStarted(_) => tool_started += 1,
-            EventPayload::ApprovalRequired(_) => approval_required += 1,
-            EventPayload::ToolFinished(info) => {
-                tool_finished += 1;
-                if info.outcome.status() == nexus_core::ExecutionStatus::Denied {
-                    denied_calls += 1;
-                }
-            }
-            _ => {}
+    {
+        Ok(Some(finished)) => finished,
+        Ok(None) => {
+            // The control channel closed without a terminal record. Request
+            // cancellation so the runtime can stop dispatch and record
+            // honest outcomes before its driver is dropped.
+            request_cancel(&runtime, &run, RECONCILE_TIMEOUT).await;
+            return Err(HeadlessError::Operation(
+                "control channel closed before terminal outcome".to_owned(),
+            ));
         }
-        lines.push(format_event(event));
+        Err(_) => {
+            // Watchdog expiry: request cancellation before dropping the
+            // driver, then reconcile within a small finite window. The error
+            // path must not skip the requested cancellation.
+            request_cancel(&runtime, &run, RECONCILE_TIMEOUT).await;
+            let _ = reconcile(&mut streams, &mut consumer, RECONCILE_TIMEOUT).await;
+            return Err(HeadlessError::Operation(
+                "run did not reach a terminal outcome within the watchdog budget".to_owned(),
+            ));
+        }
+    };
+    while let Ok(event) = streams.data.try_recv() {
+        consumer.observe(event);
+    }
+    if consumer.retention.over_limit {
+        return Err(HeadlessError::Operation(
+            "mandatory control records exceed the finite report retention budget".to_owned(),
+        ));
+    }
+
+    let RunConsumer {
+        retention,
+        tool_started,
+        approval_required,
+        tool_finished,
+        denied_calls,
+    } = consumer;
+    let mut retained: Vec<RetainedLine> = retention
+        .mandatory
+        .into_iter()
+        .chain(retention.presentation)
+        .collect();
+    retained.sort_by_key(|record| record.seq);
+    let mut lines: Vec<String> = Vec::with_capacity(retained.len() + 1);
+    for record in retained {
+        lines.push(record.line);
     }
     let outcome = terminal.outcome();
     lines.push(format!(
@@ -225,8 +650,92 @@ async fn run_task_async(task: &str) -> Result<HeadlessReport, String> {
         tool_started,
         approval_required,
         tool_finished,
+        truncated: retention.truncated,
         exit_code,
     })
+}
+
+/// Drains both channels until the terminal record arrives or the control
+/// channel closes. Every observed event is counted and retained subject to
+/// the retention policy.
+async fn consume_until_terminal(
+    streams: &mut EventStreams,
+    consumer: &mut RunConsumer,
+) -> Option<RunFinished> {
+    loop {
+        tokio::select! {
+            event = streams.data.recv() => {
+                if let Some(event) = event {
+                    consumer.observe(event);
+                }
+            }
+            event = streams.control.recv() => {
+                match event {
+                    None => return None,
+                    Some(event) => {
+                        let finished = match event.payload() {
+                            EventPayload::RunFinished(finished) => Some(finished.clone()),
+                            _ => None,
+                        };
+                        consumer.observe(event);
+                        if let Some(finished) = finished {
+                            return Some(finished);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Requests cancellation of `run`, bounded by `budget` so a wedged runtime
+/// cannot hold the error path open. The static request id is valid by
+/// construction; the reply is intentionally ignored because the caller is
+/// already on an error path, but the request itself is never skipped.
+async fn request_cancel(runtime: &Runtime, run: &RunId, budget: Duration) {
+    let Ok(request) = RequestId::new("req-headless-cancel") else {
+        return;
+    };
+    let command = CancelCommand {
+        request,
+        run: run.clone(),
+    };
+    let _ = tokio::time::timeout(budget, runtime.cancel(command)).await;
+}
+
+/// Bounded post-cancel reconciliation: drain both channels until the
+/// terminal record arrives or `budget` expires. Returns true when a terminal
+/// record was observed.
+async fn reconcile(
+    streams: &mut EventStreams,
+    consumer: &mut RunConsumer,
+    budget: Duration,
+) -> bool {
+    tokio::time::timeout(budget, async {
+        loop {
+            tokio::select! {
+                event = streams.data.recv() => {
+                    if let Some(event) = event {
+                        consumer.observe(event);
+                    }
+                }
+                event = streams.control.recv() => {
+                    match event {
+                        None => return,
+                        Some(event) => {
+                            let terminal = matches!(event.payload(), EventPayload::RunFinished(_));
+                            consumer.observe(event);
+                            if terminal {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .is_ok()
 }
 
 fn script_for(task: &str) -> Vec<Vec<nexus_core::ProviderEvent>> {
@@ -282,10 +791,13 @@ fn format_event(event: &RunEvent) -> String {
             format!("{head}preview item={}", sanitize(item_key))
         }
         EventPayload::ApprovalRequired(notice) => format!(
-            "{head}approval-required approval={} call={} scope={}",
+            "{head}approval-required approval={} call={} scope={} args-preview={}",
             notice.approval.as_str(),
             notice.call.as_str(),
             sanitize(&notice.scope_summary),
+            notice
+                .args_preview()
+                .map_or_else(|| "none".to_owned(), sanitize),
         ),
         EventPayload::ToolStarted(info) => {
             format!("{head}tool-started call={}", info.call.as_str())
@@ -318,16 +830,44 @@ fn format_event(event: &RunEvent) -> String {
                 nexus_core::UsageFinality::Final => "final",
             },
         ),
-        EventPayload::RunFinished(finished) => format!(
-            "{head}run-finished outcome={} persistence={}",
-            outcome_name(finished.outcome()),
-            match finished.persistence() {
-                nexus_core::PersistenceState::Ephemeral => "ephemeral",
-                nexus_core::PersistenceState::Saved => "saved",
-                nexus_core::PersistenceState::SaveFailed => "save-failed",
-            },
-        ),
+        EventPayload::RunFinished(finished) => {
+            // Only static category names and bounded, caller-pre-redacted
+            // correlation pairs are exposed; free-form message text is never
+            // echoed and no `Debug` formatting is used. Core may attach a
+            // typed failure with `RunFinished::with_error`.
+            let (error, correlation) = match finished.error() {
+                Some(error) => (
+                    error.category().as_str(),
+                    correlation_name(error.correlation()),
+                ),
+                None => ("none", "none".to_owned()),
+            };
+            format!(
+                "{head}run-finished outcome={} persistence={} error={error} error-correlation={correlation}",
+                outcome_name(finished.outcome()),
+                match finished.persistence() {
+                    nexus_core::PersistenceState::Ephemeral => "ephemeral",
+                    nexus_core::PersistenceState::Saved => "saved",
+                    nexus_core::PersistenceState::SaveFailed => "save-failed",
+                },
+            )
+        }
     }
+}
+
+/// Encodes safe pre-redacted correlation pairs as one reversible token:
+/// `key=value` pairs joined with `,`, then percent-encoded so the field
+/// stays a single `key=value` token. Empty correlation is `none`.
+fn correlation_name(correlation: &CorrelationData) -> String {
+    if correlation.is_empty() {
+        return "none".to_owned();
+    }
+    let joined = correlation
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sanitize(&joined)
 }
 
 fn execution_name(status: nexus_core::ExecutionStatus) -> &'static str {
@@ -364,6 +904,10 @@ fn usage_tokens(tokens: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_core::{
+        AssistantText, CallId, EffectState, Evidence, ExecutionStatus, RunId, ToolFinishedInfo,
+        ToolOutcome, TurnId,
+    };
 
     fn assert_stdout_hygiene(lines: &[String]) {
         assert!(!lines.is_empty());
@@ -379,9 +923,45 @@ mod tests {
             );
             assert!(!line.contains("FAKE"), "no banner leakage: {line}");
             for field in line.split(' ').skip(1) {
-                assert!(field.contains('='), "key=value fields: {line}");
+                let (key, value) = field.split_once('=').expect("key=value fields");
+                assert!(!key.is_empty(), "empty key: {line}");
+                assert_encoded_value(value, line);
             }
         }
+    }
+
+    /// Every value byte is either unreserved or the start of a complete
+    /// `%XX` escape; no raw separator or control byte can slip through.
+    fn assert_encoded_value(value: &str, line: &str) {
+        let bytes = value.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let pair = value.get(index + 1..index + 3).expect("escape pair");
+                assert!(
+                    pair.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "escape uses hex digits: {line}"
+                );
+                index += 3;
+            } else {
+                assert!(
+                    is_unreserved(bytes[index]),
+                    "unreserved byte required: {line}"
+                );
+                index += 1;
+            }
+        }
+    }
+
+    fn text_event(seq: u64, text: &str) -> RunEvent {
+        let fragment = AssistantText::new(TurnId::new("t1-0").expect("valid turn"), "item-1", text)
+            .expect("bounded fragment");
+        RunEvent::new(
+            SessionId::new("sess-headless-1").expect("valid session"),
+            RunId::new("run-1").expect("valid run"),
+            seq,
+            EventPayload::AssistantTextDelta(fragment),
+        )
     }
 
     #[test]
@@ -392,6 +972,7 @@ mod tests {
         assert_eq!(report.tool_started, 1);
         assert_eq!(report.tool_finished, 1);
         assert_eq!(report.exit_code, 0);
+        assert!(!report.truncated, "small run fits the report budget");
         assert_stdout_hygiene(&report.lines);
         assert!(
             report
@@ -430,9 +1011,44 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_oversize_tasks_are_rejected() {
-        assert!(run_task("").is_err());
-        assert!(run_task(&"x".repeat(nexus_core::commands::MAX_INPUT_BYTES + 1)).is_err());
+    fn usage_and_operation_errors_map_to_distinct_exit_codes() {
+        let usage = run_task("").err().expect("empty task is usage");
+        assert!(usage.is_usage());
+        assert_eq!(usage.exit_code(), 2);
+        let oversize = run_task(&"x".repeat(nexus_core::commands::MAX_INPUT_BYTES + 1))
+            .err()
+            .expect("oversize task is usage");
+        assert!(oversize.is_usage());
+        assert_eq!(oversize.exit_code(), 2);
+        let operation = HeadlessError::Operation("checked".to_owned());
+        assert!(!operation.is_usage());
+        assert_eq!(operation.exit_code(), 1);
+        assert_eq!(operation.message(), "checked");
+    }
+
+    #[test]
+    fn runtime_registration_failure_is_a_normal_operation_error() {
+        let duplicate: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = vec![
+            Arc::new(FakeTool::read_only()),
+            Arc::new(FakeTool::read_only()),
+        ];
+        let error = build_runtime(
+            Limits::m0_test(),
+            Arc::new(FakeProvider::new(vec![])),
+            duplicate,
+        )
+        .err()
+        .expect("duplicate registration is rejected");
+        assert!(!error.is_usage());
+        assert!(
+            error.message().contains("duplicate tool registration"),
+            "{error}"
+        );
+        assert_eq!(
+            m0_tools().len(),
+            3,
+            "M0 composition registers distinct tools"
+        );
     }
 
     #[test]
@@ -443,16 +1059,350 @@ mod tests {
         assert_eq!(exit_code_for(RunOutcome::Refused, 0), 1);
         assert_eq!(exit_code_for(RunOutcome::Cancelled, 0), 4);
         assert_eq!(exit_code_for(RunOutcome::LimitReached, 0), 5);
+        assert_eq!(EXIT_STDOUT_CLOSED, 6);
     }
 
     #[test]
-    fn sanitize_strips_escapes_newlines_and_separators() {
-        let dirty = "a\x1bb\nc\rd=e f\"g";
+    fn watchdog_covers_run_duration_with_slack_not_a_fixed_minute() {
+        let limits = Limits::m0_test();
+        assert_eq!(limits.run_duration, Duration::from_secs(300));
+        assert_eq!(
+            watchdog_budget(limits.run_duration),
+            Duration::from_secs(305)
+        );
+        assert!(watchdog_budget(limits.run_duration) > Duration::from_secs(60));
+        assert_eq!(watchdog_budget(Duration::ZERO), WATCHDOG_SLACK);
+    }
+
+    #[test]
+    fn percent_encoding_keeps_unreserved_ascii_identity() {
+        assert_eq!(sanitize("run-1_item.key~0"), "run-1_item.key~0");
+        assert_eq!(sanitize("host_read"), "host_read");
+    }
+
+    #[test]
+    fn percent_encoding_escapes_controls_separators_and_percent() {
+        let dirty = "a\x1bb\nc\rd=e f\"g%h#,";
         let clean = sanitize(dirty);
+        assert_eq!(clean, "a%1Bb%0Ac%0Dd%3De%20f%22g%25h%23%2C");
         assert!(!clean.contains('\x1b'));
         assert!(!clean.contains(['\n', '\r', ' ', '=']));
-        assert!(clean.contains('?'));
-        assert_eq!(sanitize("run-1"), "run-1");
+    }
+
+    #[test]
+    fn percent_encoding_roundtrips_every_byte_value() {
+        // Byte-level round-trip: every possible byte survives encode/decode.
+        let bytes: Vec<u8> = (0u8..=u8::MAX).collect();
+        let encoded = percent_encode(&bytes);
+        assert!(encoded.is_ascii());
+        assert_eq!(
+            percent_decode_bytes(encoded.as_bytes()).expect("byte roundtrip"),
+            bytes
+        );
+
+        // Text round-trip: every basic code point U+0000..=U+00FF, plus
+        // multi-byte scalars, survives the public string API.
+        let text: String = (0u32..=0xFF).filter_map(char::from_u32).collect();
+        assert_eq!(percent_decode(&sanitize(&text)).expect("roundtrip"), text);
+        for scalar in text.chars() {
+            let single = scalar.to_string();
+            assert_eq!(
+                percent_decode(&sanitize(&single)).expect("roundtrip"),
+                single
+            );
+        }
+    }
+
+    #[test]
+    fn percent_encoding_roundtrips_text_samples() {
+        for text in [
+            "héllo 🌍 世界",
+            "line\nbreak\ttab",
+            "%25 already escaped",
+            "a=b c",
+            "",
+        ] {
+            assert_eq!(percent_decode(&sanitize(text)).expect("roundtrip"), text);
+        }
+    }
+
+    #[test]
+    fn percent_decode_rejects_malformed_escapes_and_invalid_utf8() {
+        assert_eq!(
+            percent_decode("%"),
+            Err(PercentDecodeError::MalformedEscape)
+        );
+        assert_eq!(
+            percent_decode("%2"),
+            Err(PercentDecodeError::MalformedEscape)
+        );
+        assert_eq!(
+            percent_decode("%GG"),
+            Err(PercentDecodeError::MalformedEscape)
+        );
+        assert_eq!(percent_decode("%FF"), Err(PercentDecodeError::InvalidUtf8));
+        assert_eq!(percent_decode("%c3%a9").expect("lowercase hex"), "é");
+    }
+
+    fn terminal_event(seq: u64) -> RunEvent {
+        RunEvent::new(
+            SessionId::new("sess-headless-1").expect("valid session"),
+            RunId::new("run-1").expect("valid run"),
+            seq,
+            EventPayload::RunFinished(
+                RunFinished::new(
+                    RunOutcome::Completed,
+                    nexus_core::PersistenceState::Ephemeral,
+                    None,
+                )
+                .expect("terminal record builds"),
+            ),
+        )
+    }
+
+    fn tool_finished_event(seq: u64, content_len: usize) -> RunEvent {
+        let outcome = ToolOutcome::new(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownApplied,
+            Evidence::HostObserved,
+            "z".repeat(content_len),
+            false,
+        )
+        .expect("bounded outcome builds");
+        RunEvent::new(
+            SessionId::new("sess-headless-1").expect("valid session"),
+            RunId::new("run-1").expect("valid run"),
+            seq,
+            EventPayload::ToolFinished(ToolFinishedInfo {
+                call: CallId::new("c1-0").expect("valid call"),
+                outcome,
+            }),
+        )
+    }
+
+    #[test]
+    fn presentation_retention_stays_within_count_and_byte_caps() {
+        let mut retention = Retention::new();
+        for seq in 0..(MAX_REPORT_EVENTS as u64 + 8) {
+            retention.retain(text_event(seq, "x"));
+        }
+        assert_eq!(retention.presentation.len(), MAX_REPORT_EVENTS);
+        assert!(retention.mandatory.is_empty());
+        assert!(retention.truncated);
+
+        let mut retention = Retention::new();
+        for seq in 0..5 {
+            retention.retain(text_event(seq, &"y".repeat(65_000)));
+        }
+        assert!(
+            retention.presentation.len() < 5,
+            "byte budget bounds presentation"
+        );
+        assert!(retention.presentation_bytes <= MAX_REPORT_BYTES);
+        assert!(retention.truncated);
+    }
+
+    #[test]
+    fn mandatory_control_records_survive_presentation_pressure() {
+        let mut retention = Retention::new();
+        for seq in 0..4 {
+            retention.retain(text_event(seq, &"y".repeat(65_000)));
+        }
+        assert_eq!(retention.presentation.len(), 4);
+        assert!(!retention.truncated);
+
+        retention.retain(tool_finished_event(10, 65_000));
+        assert_eq!(
+            retention.mandatory.len(),
+            1,
+            "tool outcomes are never dropped"
+        );
+        assert!(retention.truncated, "eviction of presentation is visible");
+        assert!(retention.presentation.len() < 4);
+        assert!(
+            retention.mandatory_bytes + retention.presentation_bytes <= MAX_REPORT_BYTES,
+            "combined exact encoded memory stays bounded"
+        );
+
+        retention.retain(terminal_event(11));
+        assert_eq!(retention.mandatory.len(), 2, "terminal is never dropped");
+        assert!(!retention.over_limit);
+    }
+
+    #[test]
+    fn mandatory_overflow_is_an_explicit_limit_not_a_drop() {
+        let mut retention = Retention::new();
+        for seq in 0..(MAX_MANDATORY_EVENTS as u64 + 1) {
+            retention.retain(terminal_event(seq));
+        }
+        assert!(
+            retention.over_limit,
+            "exceeding the mandatory reserve is explicit"
+        );
+        assert_eq!(retention.mandatory.len(), MAX_MANDATORY_EVENTS);
+    }
+
+    #[test]
+    fn run_finished_line_reports_error_category_without_debug() {
+        let finished = RunFinished::new(
+            RunOutcome::Failed,
+            nexus_core::PersistenceState::Ephemeral,
+            None,
+        )
+        .expect("terminal record builds")
+        .with_error(
+            nexus_core::AgentError::new(
+                nexus_core::ErrorCategory::Protocol,
+                "stream framing failed",
+                nexus_core::RetryGuidance::DoNotRetry,
+            )
+            .expect("static message builds"),
+        );
+        let event = RunEvent::new(
+            SessionId::new("sess-headless-1").expect("valid session"),
+            RunId::new("run-1").expect("valid run"),
+            7,
+            EventPayload::RunFinished(finished),
+        );
+        let line = format_event(&event);
+        assert!(line.contains("kind=run-finished"), "{line}");
+        assert!(line.contains("error=protocol"), "{line}");
+        assert!(line.contains("error-correlation=none"), "{line}");
+        assert!(
+            !line.contains("stream framing failed"),
+            "message text is never echoed: {line}"
+        );
+    }
+
+    #[test]
+    fn run_finished_line_exposes_only_safe_pre_redacted_correlation() {
+        let mut correlation = CorrelationData::new();
+        correlation
+            .push("call", "c1-0")
+            .expect("safe correlation pair");
+        correlation
+            .push("scope", "m0-test-grant")
+            .expect("safe correlation pair");
+        let error = nexus_core::AgentError::with_correlation(
+            nexus_core::ErrorCategory::ToolFailure,
+            "tool failed",
+            correlation,
+            nexus_core::RetryGuidance::DoNotRetry,
+        )
+        .expect("safe error builds");
+        let finished = RunFinished::new(
+            RunOutcome::Failed,
+            nexus_core::PersistenceState::Ephemeral,
+            None,
+        )
+        .expect("terminal record builds")
+        .with_error(error);
+        let event = RunEvent::new(
+            SessionId::new("sess-headless-1").expect("valid session"),
+            RunId::new("run-1").expect("valid run"),
+            8,
+            EventPayload::RunFinished(finished),
+        );
+        let line = format_event(&event);
+        assert!(line.contains("error=tool-failure"), "{line}");
+        assert!(
+            line.contains("error-correlation=call%3Dc1-0%2Cscope%3Dm0-test-grant"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("tool failed"),
+            "message text is never echoed: {line}"
+        );
+    }
+
+    #[test]
+    fn approval_line_shows_encoded_args_preview() {
+        let notice = nexus_core::ApprovalNotice::new(
+            nexus_core::ApprovalId::new("a1-0").expect("valid approval"),
+            CallId::new("c1-0").expect("valid call"),
+            "write dst",
+            "m0-test-grant",
+            Duration::from_secs(120),
+        )
+        .expect("notice builds")
+        .with_args_preview(r#"{"path":"dst"}"#)
+        .expect("bounded preview builds");
+        let event = RunEvent::new(
+            SessionId::new("sess-headless-1").expect("valid session"),
+            RunId::new("run-1").expect("valid run"),
+            3,
+            EventPayload::ApprovalRequired(notice),
+        );
+        let line = format_event(&event);
+        assert!(
+            line.contains("args-preview=%7B%22path%22%3A%22dst%22%7D"),
+            "{line}"
+        );
+        assert!(
+            !line.contains(r#"{"path""#),
+            "raw arguments are never emitted: {line}"
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_bounds_wait_for_stuck_blocking_workers() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        block_on_with_shutdown(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                // Wait (bounded) until the blocking worker reports that it is
+                // parked, so teardown exercises a genuinely stuck worker
+                // rather than a queued one.
+                tokio::time::timeout(Duration::from_secs(5), started_rx)
+                    .await
+                    .expect("worker start signal arrives")
+                    .expect("worker start send succeeds");
+            },
+            Duration::from_millis(50),
+        )
+        .expect("runtime builds and future completes");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(45),
+            "teardown waits the finite timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "teardown never waits indefinitely: {elapsed:?}"
+        );
+        // Release the quarantined worker so this test leaves no live thread.
+        release_tx.send(()).expect("worker still reachable");
+    }
+
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+    }
+
+    #[test]
+    fn broken_pipe_write_surfaces_as_error_not_panic() {
+        let lines = vec!["rev=m0-test-0 type=result outcome=completed".to_owned()];
+        let error =
+            write_report_lines(&mut ClosedPipe, &lines).expect_err("broken pipe is an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
