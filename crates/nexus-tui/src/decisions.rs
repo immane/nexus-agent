@@ -8,14 +8,45 @@
 //! live approval identity the runtime published.
 
 use nexus_core::{
-    AgentError, ApproveCommand, CancelCommand, Command, DenyCommand, RequestId, RunId, SessionId,
-    SubmitCommand,
+    AgentError, ApprovalNotice, ApproveCommand, CancelCommand, Command, DenyCommand, RequestId,
+    RunId, SessionId, SubmitCommand,
 };
 
 use crate::state::PendingApprovalCard;
 
+/// Builds the allow-once command from the runtime's published notice.
+///
+/// The notice is the authority for the exact `(run, call, approval)` tuple.
+/// Only those identity fields are bound here; the preview text is never
+/// parsed, reformatted, or used to infer target details, so what the user
+/// saw is the runtime's own summary and what the runtime receives is the
+/// runtime's own identity.
+#[must_use]
+pub fn approve_notice_command(request: RequestId, run: &RunId, notice: &ApprovalNotice) -> Command {
+    Command::Approve(ApproveCommand {
+        request,
+        approval: notice.approval.clone(),
+        run: run.clone(),
+        call: notice.call.clone(),
+    })
+}
+
+/// Builds the refusal command from the runtime's published notice. Denial
+/// never executes the call; execution stays the runtime's decision.
+#[must_use]
+pub fn deny_notice_command(request: RequestId, run: &RunId, notice: &ApprovalNotice) -> Command {
+    Command::Deny(DenyCommand {
+        request,
+        approval: notice.approval.clone(),
+        run: run.clone(),
+        call: notice.call.clone(),
+    })
+}
+
 /// Builds the allow-once command for the exact live approval on the card.
-/// The bound arguments are the runtime's, never edited here.
+/// The card identity fields are copied verbatim from the runtime notice by
+/// the presentation layer; `summary`/`scope_summary` are display text and are
+/// never interpreted here. The bound arguments stay the runtime's.
 #[must_use]
 pub fn approve_command(request: RequestId, run: &RunId, card: &PendingApprovalCard) -> Command {
     Command::Approve(ApproveCommand {
@@ -107,6 +138,65 @@ mod tests {
         assert_eq!(deny.approval.as_str(), "a1-0");
         assert_eq!(deny.call.as_str(), "c1-0");
         assert_eq!(deny.run.as_str(), "run-1");
+    }
+
+    #[test]
+    fn notice_commands_bind_the_exact_runtime_identity() {
+        let notice = ApprovalNotice::new(
+            ApprovalId::new("a1-0").expect("valid"),
+            CallId::new("c1-0").expect("valid"),
+            "run tool host_write",
+            "project scope",
+            Duration::from_secs(120),
+        )
+        .expect("notice builds");
+        let approve = approve_notice_command(request(), &run(), &notice);
+        let Command::Approve(approve) = &approve else {
+            panic!("notice approve must emit Command::Approve");
+        };
+        assert_eq!(approve.approval.as_str(), "a1-0");
+        assert_eq!(approve.call.as_str(), "c1-0");
+        assert_eq!(approve.run.as_str(), "run-1");
+        assert_eq!(approve.request.as_str(), "req-1");
+
+        let deny = deny_notice_command(request(), &run(), &notice);
+        let Command::Deny(deny) = &deny else {
+            panic!("notice deny must emit Command::Deny");
+        };
+        assert_eq!(deny.approval.as_str(), "a1-0");
+        assert_eq!(deny.call.as_str(), "c1-0");
+        assert_eq!(deny.run.as_str(), "run-1");
+    }
+
+    #[test]
+    fn preview_text_never_changes_the_decided_identity() {
+        // Identical runtime identity with different display text still binds
+        // the same command identity: previews are display-only.
+        let first = ApprovalNotice::new(
+            ApprovalId::new("a7-1").expect("valid"),
+            CallId::new("c7-1").expect("valid"),
+            "run tool host_write",
+            "project scope",
+            Duration::from_secs(120),
+        )
+        .expect("notice builds");
+        let second = ApprovalNotice::new(
+            ApprovalId::new("a7-1").expect("valid"),
+            CallId::new("c7-1").expect("valid"),
+            "delete directory",
+            "different scope",
+            Duration::from_secs(120),
+        )
+        .expect("notice builds");
+        let Command::Approve(first) = approve_notice_command(request(), &run(), &first) else {
+            panic!("approve emits Command::Approve");
+        };
+        let Command::Approve(second) = approve_notice_command(request(), &run(), &second) else {
+            panic!("approve emits Command::Approve");
+        };
+        assert_eq!(first.approval, second.approval);
+        assert_eq!(first.call, second.call);
+        assert_eq!(first.run, second.run);
     }
 
     #[test]

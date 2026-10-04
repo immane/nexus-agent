@@ -24,8 +24,11 @@
 //! | Viewport | `q` | Quit (test-only convenience) |
 //! | Approval | `a` | Allow once (exact live call only) |
 //! | Approval | `d` | Deny without executing |
+//! | Approval | `i` | Open/close the expanded detail (inspection only) |
+//! | Approval | `Up`/`k`, `Down`/`j` | Scroll the expanded detail |
+//! | Approval | `PageUp`/`PageDown` | Page the expanded detail |
 //! | Approval | `Tab` | Switch focus |
-//! | Approval | `Esc` | Park focus without answering or dismissing |
+//! | Approval | `Esc` | Close the expanded detail, else park focus |
 //! | Any | `Ctrl+C` | Cancel while cancellable (caller checks
 //! [`crate::AppState::can_cancel`]), else quit |
 //! | Any | `Ctrl+D` | Quit |
@@ -34,8 +37,17 @@
 //! owns the keyboard; the DO-NOT-COPY list (always-approve toggles,
 //! persisted grants, fail-open hooks) is excluded by construction: no such
 //! intent exists here.
+//!
+//! Only key presses map to intents: auto-repeat and release events return
+//! `None`, so a held key cannot produce an unbounded stream of actions.
+//! Composer typing ([`Action::Type`]) accepts only control-free,
+//! non-bidi characters because the composer is rendered without
+//! sanitization; newlines arrive solely through the explicit newline
+//! bindings.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::sanitize::is_bidi_format;
 
 /// Which card owns the keyboard (mirrors the upstream blocking-card
 /// contract: one focused card, `Esc` steps back one rung, never cancels).
@@ -75,6 +87,9 @@ pub enum Action {
     ApproveOnce,
     /// Refuse the live approval without executing.
     Deny,
+    /// Open or close the expanded approval detail. Inspection only: it
+    /// displays hidden rows and never issues a decision.
+    InspectApproval,
     /// Cancel streaming work or a pending approval.
     Cancel,
     /// Leave the TUI.
@@ -85,11 +100,26 @@ pub enum Action {
     Backspace,
 }
 
+/// Whether `char` may enter the composer through the typing path. Control
+/// characters (including `\n`, `\r`, and `ESC`) and bidi formatting
+/// controls are excluded: the composer is rendered without sanitization,
+/// so neither terminal controls nor text-reordering characters may arrive
+/// as typed input. Newlines enter only through the explicit submit/newline
+/// bindings above.
+fn is_composable(char: char) -> bool {
+    !char.is_control() && !is_bidi_format(char)
+}
+
 /// Maps one key event to an intent for the focused card. Returns `None`
 /// for unbound keys. The mapping is total over the table above and emits
 /// [`Action::Cancel`] only for `Ctrl+C`, never for `Esc`.
 #[must_use]
 pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
+    if key.kind != KeyEventKind::Press {
+        // Auto-repeat and release carry no new user intent; ignoring them
+        // keeps a held key from feeding an unbounded action stream.
+        return None;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Cancel),
@@ -109,7 +139,7 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
         (Focus::Composer, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::Composer, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::Composer, KeyCode::Backspace) => Some(Action::Backspace),
-        (Focus::Composer, KeyCode::Char(char)) => Some(Action::Type(char)),
+        (Focus::Composer, KeyCode::Char(char)) if is_composable(char) => Some(Action::Type(char)),
         (Focus::Viewport, KeyCode::Up | KeyCode::Char('k')) => Some(Action::ScrollUp),
         (Focus::Viewport, KeyCode::Down | KeyCode::Char('j')) => Some(Action::ScrollDown),
         (Focus::Viewport, KeyCode::PageUp) => Some(Action::PageUp),
@@ -122,6 +152,11 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
         (Focus::Viewport, KeyCode::Char('q')) => Some(Action::Quit),
         (Focus::ApprovalCard, KeyCode::Char('a')) => Some(Action::ApproveOnce),
         (Focus::ApprovalCard, KeyCode::Char('d')) => Some(Action::Deny),
+        (Focus::ApprovalCard, KeyCode::Char('i')) => Some(Action::InspectApproval),
+        (Focus::ApprovalCard, KeyCode::Up | KeyCode::Char('k')) => Some(Action::ScrollUp),
+        (Focus::ApprovalCard, KeyCode::Down | KeyCode::Char('j')) => Some(Action::ScrollDown),
+        (Focus::ApprovalCard, KeyCode::PageUp) => Some(Action::PageUp),
+        (Focus::ApprovalCard, KeyCode::PageDown) => Some(Action::PageDown),
         (Focus::ApprovalCard, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::ApprovalCard, KeyCode::Esc) => Some(Action::ParkFocus),
         _ => None,
@@ -205,6 +240,85 @@ mod tests {
             Some(Action::Type('a'))
         );
         assert_eq!(map_key(Focus::Viewport, key(KeyCode::Char('a'))), None);
+    }
+
+    #[test]
+    fn inspect_and_detail_scroll_require_the_approval_focus() {
+        assert_eq!(
+            map_key(Focus::ApprovalCard, key(KeyCode::Char('i'))),
+            Some(Action::InspectApproval),
+            "i opens the detail inspector under the approval card"
+        );
+        // Outside the approval card, `i` is ordinary text or unbound: it can
+        // never open the inspector or decide anything.
+        assert_eq!(
+            map_key(Focus::Composer, key(KeyCode::Char('i'))),
+            Some(Action::Type('i'))
+        );
+        assert_eq!(map_key(Focus::Viewport, key(KeyCode::Char('i'))), None);
+        assert_ne!(
+            map_key(Focus::Viewport, key(KeyCode::Char('i'))),
+            Some(Action::InspectApproval)
+        );
+        for (code, expected) in [
+            (KeyCode::Up, Action::ScrollUp),
+            (KeyCode::Char('k'), Action::ScrollUp),
+            (KeyCode::Down, Action::ScrollDown),
+            (KeyCode::Char('j'), Action::ScrollDown),
+            (KeyCode::PageUp, Action::PageUp),
+            (KeyCode::PageDown, Action::PageDown),
+        ] {
+            assert_eq!(
+                map_key(Focus::ApprovalCard, key(code)),
+                Some(expected),
+                "{code:?} scrolls the expanded detail"
+            );
+        }
+        assert_ne!(
+            map_key(Focus::ApprovalCard, key(KeyCode::Char('i'))),
+            Some(Action::ApproveOnce),
+            "inspection never approves"
+        );
+    }
+
+    #[test]
+    fn repeat_and_release_events_do_not_map() {
+        let repeat = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(map_key(Focus::Composer, repeat), None);
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::empty(), KeyEventKind::Release);
+        assert_eq!(map_key(Focus::Composer, release), None);
+        let release_cancel = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        );
+        assert_eq!(map_key(Focus::ApprovalCard, release_cancel), None);
+    }
+
+    #[test]
+    fn composer_typing_rejects_control_and_bidi_chars() {
+        for char in [
+            '\x1b', '\n', '\r', '\t', '\x7f', '\u{200F}', '\u{202E}', '\u{2066}',
+        ] {
+            assert_eq!(
+                map_key(Focus::Composer, key(KeyCode::Char(char))),
+                None,
+                "{char:?} must not become typed text"
+            );
+        }
+        // Ordinary printable and multilingual characters still type.
+        for char in ['a', ' ', 'é', '日', '🌍'] {
+            assert_eq!(
+                map_key(Focus::Composer, key(KeyCode::Char(char))),
+                Some(Action::Type(char)),
+                "{char:?} is normal text"
+            );
+        }
     }
 
     #[test]
