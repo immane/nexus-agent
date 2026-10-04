@@ -1,0 +1,15 @@
+[package]
+name = "nexus-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Core domain types plus the synchronous provider/tool ports (P2). All
+# behavior (lifecycle, policy, events) lives in this crate.
+nexus-core = { path = "../nexus-core" }
+# Single async runtime, minimal features only: `rt` (executor + blocking
+# pool that adapts the sync core ports), `time` (monotonic
+# sleeps/timeouts/deadlines), `sync` (bounded channels, mutex, cancel
+# notification), `macros` (`select!` for responsive waits only). No
+# net/io/fs/full features, no second runtime.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
