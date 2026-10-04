@@ -1,0 +1,22 @@
+[package]
+name = "nexus-integration"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "nexus_integration"
+path = "src/lib.rs"
+
+[dev-dependencies]
+# P6 drives the real runtime plus the real fakes/TUI/headless consumers over
+# path dependencies only; no new capability enters through these.
+nexus-core = { path = "../nexus-core" }
+nexus-runtime = { path = "../nexus-runtime" }
+nexus-fakes = { path = "../nexus-fakes" }
+nexus-tui = { path = "../nexus-tui" }
+nexus-headless = { path = "../nexus-headless" }
+# tokio solely to drive the async runtime APIs under test (block_on,
+# timeouts, select over the two event channels). This is the exact minimal
+# feature set already used by nexus-runtime and nexus-headless
+# (rt/time/sync/macros): no net/io/fs/full features, no second runtime.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
