@@ -10,7 +10,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 [Documentation](docs/index.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
 > [!IMPORTANT]
-> Nexus Agent has an M0 **test-only implementation** (scripted fakes, ephemeral store; no real providers, tools, or plugins). macOS and Linux (container) baselines exist; no bare-metal Linux or PTY first-interactive numbers yet. The diagrams and capabilities below describe the proposed architecture, not stable features.
+> Nexus Agent has an M0 **test-only implementation** (scripted fakes, ephemeral store; no real providers, tools, or plugins), but **M0 acceptance is not complete** and the documentation repair is still in progress. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and capabilities below describe the proposed architecture, not stable features.
 
 ## Design Goals
 
@@ -175,8 +175,9 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Draft architecture, performance, security, and interface contracts.
 - [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
 - [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
-- [x] Build a testable core/runtime and minimal frontend (137 workspace tests pass on macOS and Linux).
-- [x] Establish Linux and macOS startup and resource baselines (spawn-to-exit; PTY first-interactive still open).
+- [x] Build a testable core/runtime and minimal frontend (test-only fakes; historical workspace checks passed on macOS and Linux with 137 tests recorded, pending re-verification).
+- [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
+- [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
 - [ ] Implement coding tools and mainstream model adapters (scripted fakes only).
 - [ ] Add bounded external-plugin interoperability and session recovery.
 

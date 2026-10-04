@@ -1,6 +1,6 @@
 # Performance and Measurement
 
-Status: Draft measurement design. The 100 ms first-release startup target is confirmed; no benchmarks or resource budgets have been established yet.
+Status: Draft measurement design, documentation repair in progress. The 100 ms first-release startup target is confirmed; no accepted baseline or resource budget exists. Historical spawn-to-exit characterization runs are recorded in the [documentation index](../index.md), but they are not readiness evidence: they do not measure the first-interactive definition below, their RSS method is confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements remain unrun. See Evidence Status below.
 
 ## Startup Definition
 
@@ -11,6 +11,18 @@ Include local configuration validation, runtime setup, and terminal initializati
 Exclude build time, shell startup before process launch, network completion, model first-token latency, and optional plugin readiness. Report those separately; do not hide mandatory local initialization behind a readiness marker.
 
 The first-release target is at most 100 ms on documented Linux and macOS reference environments. It is an initial ceiling to improve, not a universal hardware guarantee. A proposed regression gate is p95 at or below 100 ms for repeated fresh-process launches; accept the reference hardware and methodology before enforcing it.
+
+## Evidence Status
+
+The recorded macOS and Linux runs characterize spawn-to-exit and must not be promoted to baselines or acceptance evidence:
+
+- The harness measures wall time to process exit, not the first-interactive definition above, so results are not comparable with the 100 ms target.
+- RSS is a cumulative `RUSAGE_CHILDREN` high-water mark that includes other harness children such as the cache-purge command; it cannot be attributed to the binary. The unreproduced 514 MB reading is retained as an unresolved anomaly, not dismissed.
+- The macOS "cold" runs used no cache purge and are unprepared-cache runs. Linux `drop_caches` runs exist, but with small samples and high variance.
+- PTY first-interactive, idle CPU, streaming throughput, event-buffer high-water marks, and local dispatch overhead are still unmeasured.
+- Compiler versions were whatever each environment had; no exact compiler pin has been selected yet (the toolchain choice is still pending).
+
+Re-run the profiles and validation plan below once the implementation stabilizes; do not record any number as a baseline before then.
 
 ## Measurement Profiles
 

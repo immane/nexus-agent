@@ -1,6 +1,6 @@
 # Implementation Readiness
 
-Status: Draft engineering gates based on accepted [project direction](decisions/00-project-foundation.md) and [first-release defaults](decisions/01-first-release-defaults.md). No workspace, implementation, CI workflow, or benchmark exists yet.
+Status: Draft engineering gates based on accepted [project direction](decisions/00-project-foundation.md) and [first-release defaults](decisions/01-first-release-defaults.md). A test-only M0 workspace and historical measurements exist; correctness repairs and acceptance re-verification are in progress. See the [implementation status](../index.md#implementation-status) for evidence and outstanding gates.
 
 ## What Is Settled
 

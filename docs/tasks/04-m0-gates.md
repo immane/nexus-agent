@@ -1,6 +1,6 @@
 # M0 Gates and Evidence
 
-Status: Draft acceptance gates. No gate has been executed; there are no measured results yet.
+Status: Draft acceptance gates, documentation repair in progress. Gate checks were executed historically during the M0 pipeline (workspace lint/format/test runs and spawn-to-exit measurement runs); those results are historical evidence, not accepted M0 completion. The acceptance checklist below remains incomplete, P7 baselines are pending (PTY first-interactive, idle CPU, streaming, event-buffer high-water marks, dispatch overhead), recorded RSS evidence is confounded, and nothing is verified until the coordinator completes review.
 
 ## Per-Stage Exit Criteria
 
@@ -15,6 +15,10 @@ Status: Draft acceptance gates. No gate has been executed; there are no measured
 - P7: startup, binary size, memory, idle CPU, streaming, buffer high-water marks, and dispatch overhead recorded for both platforms with methodology.
 
 ## M0 Acceptance Checklist
+
+All items remain unchecked: coordinator verification is incomplete. The
+implementation and historical check runs provide partial evidence for some
+items, but none is accepted yet.
 
 - [ ] One model/tool/model cycle completes with fake integrations.
 - [ ] Read-like fake calls proceed under scoped policy; mutation/command-like calls require approval or headless denial.

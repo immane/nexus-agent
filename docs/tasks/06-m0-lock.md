@@ -1,6 +1,6 @@
 # M0 Subset Lock (P0 exit)
 
-Status: Accepted M0 semantics for P2-P5. Test-only; no stability claims, no product defaults, no implementation claims beyond the empty P1 workspace.
+Status: Accepted M0 semantics for P2-P5. Test-only; no stability claims and no product defaults. This lock describes required M0 semantics only; it makes no claim about workspace contents or about M0 implementation or acceptance status.
 
 Source: P0 consistency review of all draft contracts, designs, decisions, and task docs. Items the drafts mark pending, proposed, or to-be-selected are resolved below with explicit M0-test stand-ins. Anything not listed here stays deferred and must not be silently invented by P2-P5.
 
