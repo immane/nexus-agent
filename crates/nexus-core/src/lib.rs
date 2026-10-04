@@ -10,6 +10,7 @@ pub mod approval;
 pub mod commands;
 pub mod content;
 pub mod error;
+pub mod execution;
 pub mod ids;
 pub mod limits;
 pub mod outcomes;
@@ -30,6 +31,7 @@ pub use content::{
     ToolResult, TurnCompleteness,
 };
 pub use error::{AgentError, CorrelationData, ErrorBuildError, ErrorCategory, RetryGuidance};
+pub use execution::{CancellationToken, Deadline};
 pub use ids::{
     ApprovalId, CallId, IdError, M0_REVISION, RequestId, RunId, SessionId, ToolId, TurnId,
 };
@@ -39,7 +41,9 @@ pub use outcomes::{
     PersistenceState, RunFinished, RunOutcome, ToolOutcome, TurnFinished, Usage, UsageFinality,
 };
 pub use provider::{
-    CredentialRef, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort,
+    CredentialRef, DEFAULT_ADAPTER_IDENTITY, ItemKey, MAX_CONVERSATION_BYTES,
+    MAX_CONVERSATION_ITEMS, MAX_TOOL_DEFINITION_BYTES, MAX_TOOL_DEFINITIONS, ModelContextItem,
+    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, ProviderRef,
 };
 pub use store::{
     STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, ToolIntentRecord,

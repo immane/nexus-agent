@@ -5,11 +5,12 @@
 //! tool must never mutate the conversation, schedule runs, or grant itself
 //! capabilities. The trait is synchronous and data-only.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::approval::ApprovedScope;
 use crate::content::ToolCall;
 use crate::error::{AgentError, ErrorCategory, RetryGuidance};
+use crate::execution::CancellationToken;
 use crate::ids::ToolId;
 use crate::limits::Limits;
 use crate::outcomes::ToolOutcome;
@@ -75,19 +76,28 @@ impl ToolSpec {
     }
 }
 
-/// Execution context: effective budgets, monotonic deadline, cancellation,
-/// and the approved resource scope. No unrestricted runtime state and no
-/// unrelated credentials cross this boundary.
+/// Execution context: effective budgets, live cancellation, a monotonic
+/// deadline, and the approved resource scope. No unrestricted runtime state
+/// and no unrelated credentials cross this boundary.
+///
+/// [`ToolContext::new`] keeps the legacy fixture shape: a `Duration` elapsed
+/// reading and a `bool` cancellation snapshot, neither cooperative.
+/// [`ToolContext::with_control`] additively installs a live
+/// [`CancellationToken`] and an evaluable [`Instant`] deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolContext {
     output_budget_bytes: usize,
     deadline_elapsed: Duration,
     cancelled: bool,
     scope: ApprovedScope,
+    token: Option<CancellationToken>,
+    deadline_at: Option<Instant>,
 }
 
 impl ToolContext {
-    /// Builds the context with a finite output budget (never infinity).
+    /// Builds the legacy context with a finite output budget (never
+    /// infinity). `deadline_elapsed` is a monotonic reading and `cancelled`
+    /// is a snapshot observed at dispatch.
     pub fn new(
         output_budget_bytes: usize,
         deadline_elapsed: Duration,
@@ -102,7 +112,19 @@ impl ToolContext {
             deadline_elapsed,
             cancelled,
             scope,
+            token: None,
+            deadline_at: None,
         })
+    }
+
+    /// Additively installs live cancellation and monotonic deadline control,
+    /// replacing any previously installed control. The legacy snapshot
+    /// fields stay untouched for fixtures.
+    #[must_use]
+    pub fn with_control(mut self, token: CancellationToken, deadline: Instant) -> Self {
+        self.token = Some(token);
+        self.deadline_at = Some(deadline);
+        self
     }
 
     /// Returns the finite output budget in bytes.
@@ -111,16 +133,29 @@ impl ToolContext {
         self.output_budget_bytes
     }
 
-    /// Returns the monotonic deadline.
+    /// Returns the monotonic elapsed reading from the legacy constructor.
     #[must_use]
     pub fn deadline_elapsed(&self) -> Duration {
         self.deadline_elapsed
     }
 
-    /// Returns the cancellation flag observed at dispatch.
+    /// Returns the live monotonic deadline, or [`None`] for legacy
+    /// constructor snapshots: an elapsed `Duration` carries no evaluable
+    /// instant without the run's start reading.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline_at
+    }
+
+    /// Returns cancellation observed live from the token, falling back to
+    /// the dispatch-time snapshot for legacy fixtures. A `bool` snapshot is
+    /// never cooperative.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled
+        self.token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+            || self.cancelled
     }
 
     /// Returns the approved resource scope.
@@ -129,10 +164,36 @@ impl ToolContext {
         &self.scope
     }
 
-    /// Maps a set cancellation flag to an explicit outcome for dispatch.
+    /// Explicit combined dispatch check: cancellation first, then the live
+    /// deadline. Cancellation maps to [`ErrorCategory::Cancelled`], an
+    /// elapsed deadline to [`ErrorCategory::Timeout`].
+    pub fn check_active(&self) -> Result<(), AgentError> {
+        if self.is_cancelled() {
+            return Err(tool_state_error(
+                ErrorCategory::Cancelled,
+                "tool execution cancelled",
+            ));
+        }
+        if self
+            .deadline_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(tool_state_error(
+                ErrorCategory::Timeout,
+                "tool deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Maps cancellation to an explicit outcome for dispatch, observing the
+    /// live token when control was installed.
     pub fn check_not_cancelled(&self) -> Result<(), AgentError> {
-        if self.cancelled {
-            return Err(tool_error("tool execution cancelled"));
+        if self.is_cancelled() {
+            return Err(tool_state_error(
+                ErrorCategory::Cancelled,
+                "tool execution cancelled",
+            ));
         }
         Ok(())
     }
@@ -156,6 +217,11 @@ fn tool_error(message: &'static str) -> AgentError {
         RetryGuidance::DoNotRetry,
     )
     .expect("static safe tool message builds")
+}
+
+fn tool_state_error(category: ErrorCategory, message: &'static str) -> AgentError {
+    AgentError::new(category, message, RetryGuidance::DoNotRetry)
+        .expect("static safe tool message builds")
 }
 
 #[cfg(test)]
@@ -188,5 +254,60 @@ mod tests {
             .expect("valid context builds");
         assert!(context.is_cancelled());
         assert!(context.check_not_cancelled().is_err());
+        assert_eq!(
+            context
+                .check_active()
+                .expect_err("snapshot cancels")
+                .category(),
+            ErrorCategory::Cancelled
+        );
+    }
+
+    #[test]
+    fn live_control_observes_cancellation_and_evaluable_deadline() {
+        let scope = ApprovedScope::new("project-read").expect("valid");
+        let token = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let context = ToolContext::new(1024, Duration::from_secs(300), false, scope.clone())
+            .expect("valid context builds")
+            .with_control(token.clone(), deadline);
+        assert_eq!(context.deadline(), Some(deadline));
+        assert!(!context.is_cancelled());
+        assert!(context.check_active().is_ok());
+
+        token.cancel();
+        assert!(
+            context.is_cancelled(),
+            "token is re-read after construction"
+        );
+        assert_eq!(
+            context.check_active().expect_err("live cancel").category(),
+            ErrorCategory::Cancelled
+        );
+        assert!(context.check_not_cancelled().is_err());
+
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("test clock has history");
+        let expired = ToolContext::new(1024, Duration::from_secs(300), false, scope)
+            .expect("valid context builds")
+            .with_control(CancellationToken::new(), past);
+        assert!(!expired.is_cancelled());
+        assert_eq!(
+            expired
+                .check_active()
+                .expect_err("deadline passed")
+                .category(),
+            ErrorCategory::Timeout
+        );
+    }
+
+    #[test]
+    fn legacy_contexts_have_no_evaluable_deadline() {
+        let scope = ApprovedScope::new("project-read").expect("valid");
+        let context = ToolContext::new(1024, Duration::from_secs(60), false, scope)
+            .expect("valid context builds");
+        assert_eq!(context.deadline(), None);
+        assert_eq!(context.deadline_elapsed(), Duration::from_secs(60));
     }
 }

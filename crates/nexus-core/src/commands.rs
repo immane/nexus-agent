@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::error::{AgentError, ErrorCategory, RetryGuidance};
+use crate::error::{AgentError, ErrorCategory, RetryGuidance, is_bounded_safe_text};
 use crate::ids::{ApprovalId, CallId, RequestId, RunId, SessionId, TurnId};
 use crate::limits::Limits;
 use crate::outcomes::{
@@ -41,27 +41,35 @@ pub struct SubmitCommand {
 }
 
 impl SubmitCommand {
-    /// Validates bounded input at the frontend boundary.
+    /// Builds a submit command, validating bounded input.
     pub fn new(
         request: RequestId,
         session: SessionId,
         input: impl Into<String>,
         profile: impl Into<String>,
     ) -> Result<Self, AgentError> {
-        let input = input.into();
-        let profile = profile.into();
-        if input.is_empty() || input.len() > MAX_INPUT_BYTES {
-            return Err(command_error("submit input is invalid"));
-        }
-        if profile.is_empty() || profile.len() > MAX_SUMMARY_BYTES {
-            return Err(command_error("submit profile is invalid"));
-        }
-        Ok(Self {
+        let command = Self {
             request,
             session,
-            input,
-            profile,
-        })
+            input: input.into(),
+            profile: profile.into(),
+        };
+        command.validate()?;
+        Ok(command)
+    }
+
+    /// Validates bounded input at the frontend trust boundary. Reused by
+    /// [`Self::new`]; call it again for values whose public fields were
+    /// changed after construction. Diagnostics are static and never
+    /// interpolate the rejected content.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if self.input.is_empty() || self.input.len() > MAX_INPUT_BYTES {
+            return Err(command_error("submit input is invalid"));
+        }
+        if self.profile.is_empty() || self.profile.len() > MAX_SUMMARY_BYTES {
+            return Err(command_error("submit profile is invalid"));
+        }
+        Ok(())
     }
 }
 
@@ -120,12 +128,20 @@ pub struct ListSessionsCommand {
 }
 
 impl ListSessionsCommand {
-    /// Validates a finite nonzero limit.
+    /// Builds a list command, validating a finite nonzero limit.
     pub fn new(request: RequestId, limit: usize) -> Result<Self, AgentError> {
-        if limit == 0 || limit > MAX_LIST_LIMIT {
+        let command = Self { request, limit };
+        command.validate()?;
+        Ok(command)
+    }
+
+    /// Validates a finite nonzero limit at the boundary. Reused by
+    /// [`Self::new`] and available for publicly mutated limits.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if self.limit == 0 || self.limit > MAX_LIST_LIMIT {
             return Err(command_error("list limit must be finite and nonzero"));
         }
-        Ok(Self { request, limit })
+        Ok(())
     }
 }
 
@@ -237,47 +253,61 @@ pub struct AssistantText {
 }
 
 impl AssistantText {
-    /// Validates fragment bounds at the publishing boundary.
+    /// Builds a text fragment, validating bounds at the publishing boundary.
     pub fn new(
         turn: TurnId,
         item_key: impl Into<String>,
         text: impl Into<String>,
     ) -> Result<Self, AgentError> {
-        let item_key = item_key.into();
-        let text = text.into();
-        if item_key.is_empty()
-            || item_key.len() > crate::content::MAX_ITEM_KEY_LEN
-            || text.len() > MAX_TEXT_FRAGMENT_BYTES
+        let fragment = Self {
+            turn,
+            item_key: item_key.into(),
+            text: text.into(),
+        };
+        fragment.validate()?;
+        Ok(fragment)
+    }
+
+    /// Validates the fragment bounds. Reused by [`Self::new`]; call it again
+    /// when public fields are changed after construction.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if self.item_key.is_empty()
+            || self.item_key.len() > crate::content::MAX_ITEM_KEY_LEN
+            || self.text.len() > MAX_TEXT_FRAGMENT_BYTES
         {
             return Err(command_error("assistant text fragment is invalid"));
         }
-        Ok(Self {
-            turn,
-            item_key,
-            text,
-        })
+        Ok(())
     }
 }
 
 /// Exact approval request: identity, safe action summary, affected scope,
-/// and expiry. Previews never authorize; only the grant path through
-/// [`ApproveCommand`] does.
+/// bounded exact-arguments preview, and expiry. Previews never authorize;
+/// only the grant path through [`ApproveCommand`] does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalNotice {
     /// Grant identity.
     pub approval: ApprovalId,
     /// Bound call.
     pub call: CallId,
-    /// Safe action summary with no secrets.
+    /// Caller-redacted safe action summary. Bounded and marker-checked;
+    /// the marker net is best-effort, not proof of secret-freedom.
     pub summary: String,
-    /// Affected resource scope text with no secrets.
+    /// Caller-redacted affected resource scope text with the same bounds as
+    /// [`Self::summary`].
     pub scope_summary: String,
+    /// Caller-redacted bounded preview of the exact normalized arguments
+    /// that would execute, if one was attached.
+    pub args_preview: Option<String>,
     /// Monotonic expiry reading.
     pub expires_at_elapsed: Duration,
 }
 
 impl ApprovalNotice {
-    /// Validates secret-free bounded summary and scope text.
+    /// Builds a notice with bounded scope and summary text. The caller must
+    /// pre-redact both fields; the marker net only rejects known secret
+    /// shapes. The existing signature is preserved; attach the optional
+    /// exact-arguments preview with [`Self::with_args_preview`].
     pub fn new(
         approval: ApprovalId,
         call: CallId,
@@ -285,27 +315,56 @@ impl ApprovalNotice {
         scope_summary: impl Into<String>,
         expires_at_elapsed: Duration,
     ) -> Result<Self, AgentError> {
-        let summary = AgentError::new(
-            ErrorCategory::PermissionDenied,
-            summary.into(),
-            RetryGuidance::DoNotRetry,
-        )
-        .map(|safe| safe.message().to_owned())
-        .map_err(|_| command_error("approval summary is invalid"))?;
-        let scope_summary = AgentError::new(
-            ErrorCategory::PermissionDenied,
-            scope_summary.into(),
-            RetryGuidance::DoNotRetry,
-        )
-        .map(|safe| safe.message().to_owned())
-        .map_err(|_| command_error("approval scope is invalid"))?;
-        Ok(Self {
+        let notice = Self {
             approval,
             call,
-            summary,
-            scope_summary,
+            summary: summary.into(),
+            scope_summary: scope_summary.into(),
+            args_preview: None,
             expires_at_elapsed,
-        })
+        };
+        notice.validate()?;
+        Ok(notice)
+    }
+
+    /// Attaches a caller-redacted bounded preview of the exact normalized
+    /// arguments that would execute. Additive builder: [`Self::new`] keeps
+    /// its signature and an absent preview stays [`None`].
+    pub fn with_args_preview(
+        mut self,
+        args_preview: impl Into<String>,
+    ) -> Result<Self, AgentError> {
+        let args_preview = args_preview.into();
+        if !is_bounded_safe_text(&args_preview, MAX_SUMMARY_BYTES) {
+            return Err(command_error("approval args preview is invalid"));
+        }
+        self.args_preview = Some(args_preview);
+        Ok(self)
+    }
+
+    /// Returns the exact-arguments preview, if one was attached.
+    #[must_use]
+    pub fn args_preview(&self) -> Option<&str> {
+        self.args_preview.as_deref()
+    }
+
+    /// Validates bounded, caller-redacted summary, scope, and preview text.
+    /// Reused by [`Self::new`] and [`Self::with_args_preview`]; call it
+    /// again for publicly mutated fields. Diagnostics are static and never
+    /// interpolate the rejected content.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if !is_bounded_safe_text(&self.summary, MAX_SUMMARY_BYTES) {
+            return Err(command_error("approval summary is invalid"));
+        }
+        if !is_bounded_safe_text(&self.scope_summary, MAX_SUMMARY_BYTES) {
+            return Err(command_error("approval scope is invalid"));
+        }
+        if let Some(preview) = &self.args_preview
+            && !is_bounded_safe_text(preview, MAX_SUMMARY_BYTES)
+        {
+            return Err(command_error("approval args preview is invalid"));
+        }
+        Ok(())
     }
 }
 
@@ -328,21 +387,28 @@ pub struct ToolProgress {
 }
 
 impl ToolProgress {
-    /// Validates progress against the shared output budget.
+    /// Builds progress bounded by the shared output budget.
     pub fn new(
         call: CallId,
         preview: impl Into<String>,
         truncated: bool,
     ) -> Result<Self, AgentError> {
-        let preview = preview.into();
-        if preview.len() > Limits::M0_TEST_TOOL_OUTPUT_BYTES {
+        let progress = Self {
+            call,
+            preview: preview.into(),
+            truncated,
+        };
+        progress.validate()?;
+        Ok(progress)
+    }
+
+    /// Validates the progress preview against the shared output budget.
+    /// Reused by [`Self::new`]; call it again for publicly mutated fields.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if self.preview.len() > Limits::M0_TEST_TOOL_OUTPUT_BYTES {
             return Err(command_error("tool progress exceeds output budget"));
         }
-        Ok(Self {
-            call,
-            preview,
-            truncated,
-        })
+        Ok(())
     }
 }
 
@@ -382,6 +448,31 @@ pub enum EventPayload {
     UsageUpdated(Usage),
     /// Terminal outcome and persistence state.
     RunFinished(RunFinished),
+}
+
+impl EventPayload {
+    /// Validates payload-level bounds at the publishing boundary. Types with
+    /// private, constructor-validated fields need no further checks; payload
+    /// variants carrying public text are revalidated here. Runtime-owned
+    /// ordering and lifecycle rules are not part of this check.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        match self {
+            Self::AssistantTextDelta(text) => text.validate(),
+            Self::ToolCallPreview { item_key } => {
+                if item_key.is_empty() || item_key.len() > crate::content::MAX_ITEM_KEY_LEN {
+                    return Err(command_error("tool call preview is invalid"));
+                }
+                Ok(())
+            }
+            Self::ApprovalRequired(notice) => notice.validate(),
+            Self::ToolOutput(progress) => progress.validate(),
+            Self::RunStarted { .. }
+            | Self::ToolStarted(_)
+            | Self::ToolFinished(_)
+            | Self::UsageUpdated(_)
+            | Self::RunFinished(_) => Ok(()),
+        }
+    }
 }
 
 /// Authoritative run event: owning session and run plus a contiguous
@@ -434,6 +525,13 @@ impl RunEvent {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self.payload, EventPayload::RunFinished(_))
+    }
+
+    /// Validates the contained payload bounds at the publishing boundary.
+    /// Sequence contiguity and ownership are assigned and enforced by the
+    /// runtime, not by this check.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        self.payload.validate()
     }
 }
 
@@ -716,6 +814,132 @@ mod tests {
         assert!(ListSessionsCommand::new(request.clone(), 0).is_err());
         assert!(ListSessionsCommand::new(request.clone(), MAX_LIST_LIMIT + 1).is_err());
         assert!(ListSessionsCommand::new(request, 1).is_ok());
+    }
+
+    #[test]
+    fn public_mutation_validation_catches_boundary_bypasses() {
+        let request = RequestId::new("req-1").expect("valid");
+        let (session, run) = session_run();
+        let call = CallId::new("call-1").expect("valid");
+
+        let mut submit = SubmitCommand::new(request.clone(), session.clone(), "go", "p")
+            .expect("valid submit builds");
+        submit.input.clear();
+        assert!(submit.validate().is_err(), "empty input is rejected");
+        submit.input = "x".repeat(MAX_INPUT_BYTES + 1);
+        assert!(submit.validate().is_err(), "oversized input is rejected");
+        submit.input = "go".to_owned();
+        submit.profile.clear();
+        assert!(submit.validate().is_err(), "empty profile is rejected");
+
+        let mut list = ListSessionsCommand::new(request.clone(), 1).expect("valid list builds");
+        list.limit = 0;
+        assert!(list.validate().is_err(), "mutated zero limit is rejected");
+        list.limit = MAX_LIST_LIMIT + 1;
+        assert!(
+            list.validate().is_err(),
+            "mutated oversized limit is rejected"
+        );
+
+        let mut fragment =
+            AssistantText::new(TurnId::new("turn-1").expect("valid"), "item-0", "hi")
+                .expect("valid fragment builds");
+        fragment.item_key.clear();
+        assert!(fragment.validate().is_err(), "empty item key is rejected");
+        fragment.item_key = "item-0".to_owned();
+        fragment.text = "x".repeat(MAX_TEXT_FRAGMENT_BYTES + 1);
+        assert!(fragment.validate().is_err(), "oversized text is rejected");
+
+        let mut progress =
+            ToolProgress::new(call.clone(), "ok", false).expect("valid progress builds");
+        progress.preview = "x".repeat(Limits::M0_TEST_TOOL_OUTPUT_BYTES + 1);
+        assert!(
+            progress.validate().is_err(),
+            "mutated progress exceeds the output budget"
+        );
+
+        let mut notice = ApprovalNotice::new(
+            ApprovalId::new("appr-1").expect("valid"),
+            call,
+            "delete directory",
+            "project scope",
+            Duration::from_secs(120),
+        )
+        .expect("valid notice builds");
+        notice.summary = "api_key=AAAA".to_owned();
+        assert!(
+            notice.validate().is_err(),
+            "mutated secret summary is rejected"
+        );
+        notice.summary = "delete directory".to_owned();
+        notice.args_preview = Some("secret=AAAA".to_owned());
+        assert!(
+            notice.validate().is_err(),
+            "mutated secret preview is rejected"
+        );
+
+        let valid = RunEvent::new(
+            session.clone(),
+            run.clone(),
+            0,
+            EventPayload::RunStarted {
+                request: request.clone(),
+            },
+        );
+        assert!(valid.validate().is_ok());
+        let invalid = RunEvent::new(
+            session,
+            run,
+            1,
+            EventPayload::ToolCallPreview {
+                item_key: String::new(),
+            },
+        );
+        assert!(
+            invalid.validate().is_err(),
+            "empty preview item key is rejected"
+        );
+    }
+
+    #[test]
+    fn approval_notice_args_preview_is_additive_and_bounded() {
+        fn base() -> ApprovalNotice {
+            ApprovalNotice::new(
+                ApprovalId::new("appr-1").expect("valid"),
+                CallId::new("call-1").expect("valid"),
+                "run tool host_write",
+                "project scope",
+                Duration::from_secs(120),
+            )
+            .expect("valid notice builds")
+        }
+        assert_eq!(
+            base().args_preview(),
+            None,
+            "old constructor adds no preview"
+        );
+        let notice = base()
+            .with_args_preview(r#"{"path":"src","mode":"read"}"#)
+            .expect("safe preview attaches");
+        assert_eq!(
+            notice.args_preview(),
+            Some(r#"{"path":"src","mode":"read"}"#)
+        );
+        assert_eq!(notice.summary, "run tool host_write");
+        assert!(
+            base().with_args_preview("password=hunter2").is_err(),
+            "secret-bearing preview never attaches"
+        );
+        assert!(
+            base()
+                .with_args_preview("x".repeat(MAX_SUMMARY_BYTES + 1))
+                .is_err(),
+            "oversized preview never attaches"
+        );
+        assert!(
+            base().with_args_preview("").is_err(),
+            "empty preview is invalid"
+        );
     }
 
     #[test]

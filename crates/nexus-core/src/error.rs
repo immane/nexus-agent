@@ -2,8 +2,15 @@
 //!
 //! [`AgentError`] carries a typed category, a safe message, bounded
 //! correlation data, and advisory retry guidance. Diagnostics containing
-//! secrets or unrestricted payloads must never cross this boundary: the
-//! constructors reject suspected secret material instead of carrying it.
+//! secrets or unrestricted payloads must never cross this boundary: callers
+//! MUST supply pre-redacted message and correlation text, and SHOULD pass
+//! static diagnostics that never interpolate credentials, raw external
+//! payloads, or user content.
+//!
+//! The constructors enforce documented bounds and apply a best-effort marker
+//! net for known secret shapes. The net reduces accidental leaks; it does
+//! not prove that text is secret-free, so it never replaces caller
+//! redaction.
 
 /// Maximum safe-message length in bytes.
 pub const MAX_MESSAGE_LEN: usize = 1024;
@@ -16,7 +23,9 @@ pub const MAX_CORRELATION_VALUE_LEN: usize = 256;
 
 /// Substrings that suggest secret material. Best-effort boundary net, not a
 /// secret detector; matched case-insensitively against every message and
-/// correlation value before an [`AgentError`] may exist.
+/// correlation value before an [`AgentError`] may exist. A match rejects the
+/// diagnostic, but a non-match does not prove the text is secret-free:
+/// callers must still pre-redact.
 const SECRET_MARKERS: &[&str] = &[
     "-----begin",
     "bearer ",
@@ -35,6 +44,14 @@ const SECRET_MARKERS: &[&str] = &[
 fn contains_secret_marker(text: &str) -> bool {
     let lowered = text.to_lowercase();
     SECRET_MARKERS.iter().any(|marker| lowered.contains(marker))
+}
+
+/// Best-effort safe-text check shared by trust-boundary validators: the text
+/// must be non-empty, within `max_bytes`, and free of known secret markers.
+/// Passing does not prove the text is secret-free; validators using this
+/// helper must also document that callers pre-redact.
+pub(crate) fn is_bounded_safe_text(text: &str, max_bytes: usize) -> bool {
+    !text.is_empty() && text.len() <= max_bytes && !contains_secret_marker(text)
 }
 
 /// Typed failure category covering the contract outcome vocabulary.
@@ -101,8 +118,9 @@ pub enum RetryGuidance {
     SafeToRetry,
 }
 
-/// Bounded key/value correlation data. Values are non-secret by
-/// construction: the constructor rejects suspected secret material.
+/// Bounded key/value correlation data. Values are bounded and checked
+/// against the best-effort marker net; callers must supply pre-redacted
+/// values because the net is not a secret detector.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CorrelationData(Vec<(String, String)>);
 
@@ -113,7 +131,9 @@ impl CorrelationData {
         Self(Vec::new())
     }
 
-    /// Appends one entry after bounds and secret checks.
+    /// Appends one entry after bounds and best-effort marker checks.
+    /// The caller must pass a pre-redacted value; a passing check does not
+    /// prove the value is secret-free.
     pub fn push(
         &mut self,
         key: impl Into<String>,
@@ -181,7 +201,8 @@ impl std::fmt::Display for ErrorBuildError {
 
 impl std::error::Error for ErrorBuildError {}
 
-/// Public error type. Only safe, bounded, secret-free diagnostics exist here.
+/// Public error type. Diagnostics here are bounded and pre-redacted by their
+/// caller; the constructor's marker net is best-effort only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentError {
     category: ErrorCategory,
@@ -191,7 +212,9 @@ pub struct AgentError {
 }
 
 impl AgentError {
-    /// Builds an error without correlation data.
+    /// Builds an error without correlation data. `message` must be
+    /// pre-redacted display text; prefer a static diagnostic that does not
+    /// interpolate credentials, raw payloads, or user content.
     pub fn new(
         category: ErrorCategory,
         message: impl Into<String>,
@@ -200,7 +223,9 @@ impl AgentError {
         Self::with_correlation(category, message, CorrelationData::new(), retry)
     }
 
-    /// Builds an error with bounded correlation data.
+    /// Builds an error with bounded correlation data. `message` and the
+    /// correlation values must be pre-redacted; the marker net is
+    /// best-effort and never proves safety.
     pub fn with_correlation(
         category: ErrorCategory,
         message: impl Into<String>,
@@ -345,5 +370,33 @@ mod tests {
             correlation.push("extra", "v"),
             Err(ErrorBuildError::TooLong)
         );
+    }
+
+    #[test]
+    fn marker_net_is_best_effort_not_a_secret_detector() {
+        // The net matches known marker substrings only. Text carrying a
+        // secret in another form passes, which is why callers must
+        // pre-redact; this test pins the documented limitation.
+        assert!(
+            AgentError::new(
+                ErrorCategory::Authentication,
+                "login rejected for hunter2",
+                RetryGuidance::DoNotRetry
+            )
+            .is_ok(),
+            "the net does not prove the absence of secrets"
+        );
+    }
+
+    #[test]
+    fn bounded_safe_text_enforces_bounds_and_markers() {
+        assert!(is_bounded_safe_text("delete directory", MAX_MESSAGE_LEN));
+        assert!(!is_bounded_safe_text("", MAX_MESSAGE_LEN));
+        assert!(!is_bounded_safe_text("x", 0));
+        assert!(!is_bounded_safe_text("password=hunter2", MAX_MESSAGE_LEN));
+        assert!(!is_bounded_safe_text(
+            &"x".repeat(MAX_MESSAGE_LEN + 1),
+            MAX_MESSAGE_LEN
+        ));
     }
 }

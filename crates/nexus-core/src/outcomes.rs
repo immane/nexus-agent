@@ -118,6 +118,60 @@ impl ToolOutcome {
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }
+
+    /// Builds an outcome from content that may exceed the global M0 output
+    /// cap ([`Limits::M0_TEST_TOOL_OUTPUT_BYTES`]): the content is cut on a
+    /// UTF-8 character boundary to fit, and `status`, `effect`, and
+    /// `evidence` are recorded unchanged. The truncation flag is set when
+    /// content was cut; a caller-provided `true` is preserved. The
+    /// denied-implies-not-started invariant still applies. For the effective
+    /// configured operation budget, apply [`Self::enforce_budget`] to the
+    /// result.
+    pub fn from_bounded_content(
+        status: ExecutionStatus,
+        effect: EffectState,
+        evidence: Evidence,
+        content: impl Into<String>,
+        truncated: bool,
+    ) -> Result<Self, AgentError> {
+        let mut content = content.into();
+        let cut = truncate_utf8_bytes(&mut content, Limits::M0_TEST_TOOL_OUTPUT_BYTES);
+        Self::new(status, effect, evidence, content, truncated || cut)
+    }
+
+    /// Enforces an effective configured operation budget on an already
+    /// bounded outcome. `budget` is the policy-selected operation budget,
+    /// not the global M0 cap, and must be finite and within
+    /// `1..=Limits::M0_TEST_TOOL_OUTPUT_BYTES`; an out-of-range budget is
+    /// rejected with a static diagnostic rather than silently widened.
+    ///
+    /// Content is cut on a UTF-8 character boundary, so a budget too small
+    /// for the leading character yields empty content with an explicit
+    /// truncation flag, never a split character. `status`, `effect`, and
+    /// `evidence` are preserved, and an existing `truncated` flag is never
+    /// cleared.
+    pub fn enforce_budget(mut self, budget: usize) -> Result<Self, AgentError> {
+        if budget == 0 || budget > Limits::M0_TEST_TOOL_OUTPUT_BYTES {
+            return Err(outcome_error("tool output budget is invalid"));
+        }
+        let cut = truncate_utf8_bytes(&mut self.content, budget);
+        self.truncated = self.truncated || cut;
+        Ok(self)
+    }
+}
+
+/// Cuts `text` to at most `max_bytes` bytes on a UTF-8 character boundary,
+/// returning true when bytes were removed. Characters are never split.
+fn truncate_utf8_bytes(text: &mut String, max_bytes: usize) -> bool {
+    if text.len() <= max_bytes {
+        return false;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
 }
 
 /// Why a fully consumed model invocation ended.
@@ -197,7 +251,11 @@ pub struct TurnFinished {
 }
 
 impl TurnFinished {
-    /// Builds a finished-turn record.
+    /// Builds a finished-turn record for legacy call sites. This constructor
+    /// is unchecked: it does not guarantee final usage and is not the host
+    /// protocol guarantee. Host/provider boundaries MUST enforce the terminal
+    /// invariant with [`Self::validate`] (or build through [`Self::try_new`]),
+    /// which rejects provisional counters.
     #[must_use]
     pub fn new(reason: FinishReason, usage: Usage, continuation: Option<ContinuationData>) -> Self {
         Self {
@@ -205,6 +263,27 @@ impl TurnFinished {
             usage,
             continuation,
         }
+    }
+
+    /// Builds a finished-turn record and rejects provisional usage: a
+    /// terminal turn carries final counters only (provider contract).
+    pub fn try_new(
+        reason: FinishReason,
+        usage: Usage,
+        continuation: Option<ContinuationData>,
+    ) -> Result<Self, AgentError> {
+        let finished = Self::new(reason, usage, continuation);
+        finished.validate()?;
+        Ok(finished)
+    }
+
+    /// Validates terminal invariants: usage must be final because no further
+    /// update can follow a fully consumed turn.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if self.usage.finality() != UsageFinality::Final {
+            return Err(outcome_error("finished turn requires final usage"));
+        }
+        Ok(())
     }
 
     /// Returns the finish reason.
@@ -276,17 +355,20 @@ pub enum PersistenceState {
 }
 
 /// Terminal run record. A save failure is reported alongside the outcome
-/// without losing already observed tool effects.
+/// without losing already observed tool effects. A typed execution failure
+/// can be retained additively beside the lifecycle outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFinished {
     outcome: RunOutcome,
     persistence: PersistenceState,
     persistence_error: Option<AgentError>,
+    error: Option<AgentError>,
 }
 
 impl RunFinished {
     /// Builds a terminal record. A persistence error is allowed only with
-    /// [`PersistenceState::SaveFailed`], and is required with it.
+    /// [`PersistenceState::SaveFailed`], and is required with it. No
+    /// execution error is attached; use [`Self::with_error`] for that.
     pub fn new(
         outcome: RunOutcome,
         persistence: PersistenceState,
@@ -302,6 +384,7 @@ impl RunFinished {
             outcome,
             persistence,
             persistence_error,
+            error: None,
         })
     }
 
@@ -321,6 +404,22 @@ impl RunFinished {
     #[must_use]
     pub fn persistence_error(&self) -> Option<&AgentError> {
         self.persistence_error.as_ref()
+    }
+
+    /// Attaches the typed execution failure for this terminal record.
+    /// Additive builder; [`Self::new`] keeps its signature. Attach an error
+    /// for failed, refused, cancelled, or limit-reached outcomes; a record
+    /// whose lifecycle completed normally should not carry one.
+    #[must_use]
+    pub fn with_error(mut self, error: AgentError) -> Self {
+        self.error = Some(error);
+        self
+    }
+
+    /// Returns the retained typed execution failure, if any.
+    #[must_use]
+    pub fn error(&self) -> Option<&AgentError> {
+        self.error.as_ref()
     }
 }
 
@@ -403,6 +502,145 @@ mod tests {
     }
 
     #[test]
+    fn bounded_content_cuts_utf8_on_a_char_boundary_and_preserves_fields() {
+        let budget = Limits::M0_TEST_TOOL_OUTPUT_BYTES;
+        // The 2-byte character starts one byte before the budget; a naive cut
+        // at `budget` would split it.
+        let mut content = "a".repeat(budget - 1);
+        content.push('é');
+        content.push_str("tail");
+        let outcome = ToolOutcome::from_bounded_content(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownApplied,
+            Evidence::HostObserved,
+            content,
+            false,
+        )
+        .expect("bounded outcome builds");
+        assert_eq!(outcome.content().len(), budget - 1);
+        assert!(outcome.content().is_char_boundary(outcome.content().len()));
+        assert_eq!(outcome.status(), ExecutionStatus::Succeeded);
+        assert_eq!(outcome.effect(), EffectState::KnownApplied);
+        assert_eq!(outcome.evidence(), Evidence::HostObserved);
+        assert!(outcome.is_truncated());
+
+        let exact = "x".repeat(budget);
+        let kept = ToolOutcome::from_bounded_content(
+            ExecutionStatus::Failed,
+            EffectState::Unknown,
+            Evidence::Uncertain,
+            exact,
+            true,
+        )
+        .expect("exact-budget content builds");
+        assert_eq!(kept.content().len(), budget);
+        assert!(kept.is_truncated(), "caller truncation flag is preserved");
+
+        assert!(
+            ToolOutcome::from_bounded_content(
+                ExecutionStatus::Denied,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                "x",
+                false,
+            )
+            .is_err(),
+            "denial invariant still applies to bounded construction"
+        );
+    }
+
+    #[test]
+    fn enforce_budget_cuts_utf8_and_preserves_status_effect_and_evidence() {
+        let multibyte = ToolOutcome::new(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownApplied,
+            Evidence::HostObserved,
+            "é-tail",
+            false,
+        )
+        .expect("globally bounded content builds");
+        // A 1-byte budget cannot hold a 2-byte character: empty content with
+        // an explicit truncation flag is a legitimate bounded outcome.
+        let cut = multibyte.enforce_budget(1).expect("finite budget accepts");
+        assert!(cut.content().is_empty());
+        assert!(cut.is_truncated());
+        assert_eq!(cut.status(), ExecutionStatus::Succeeded);
+        assert_eq!(cut.effect(), EffectState::KnownApplied);
+        assert_eq!(cut.evidence(), Evidence::HostObserved);
+
+        let failed = ToolOutcome::new(
+            ExecutionStatus::Failed,
+            EffectState::KnownNotApplied,
+            Evidence::PluginReported,
+            "failure detail",
+            false,
+        )
+        .expect("failure outcome builds");
+        let cut = failed.enforce_budget(7).expect("finite budget accepts");
+        assert_eq!(cut.content(), "failure");
+        assert!(cut.is_truncated());
+        assert_eq!(cut.status(), ExecutionStatus::Failed);
+        assert_eq!(cut.effect(), EffectState::KnownNotApplied);
+        assert_eq!(cut.evidence(), Evidence::PluginReported);
+
+        let denied = ToolOutcome::new(
+            ExecutionStatus::Denied,
+            EffectState::NotStarted,
+            Evidence::HostObserved,
+            "confirmation required",
+            false,
+        )
+        .expect("denied outcome builds");
+        let cut = denied.enforce_budget(4).expect("finite budget accepts");
+        assert_eq!(cut.content(), "conf");
+        assert!(cut.is_truncated());
+        assert_eq!(cut.status(), ExecutionStatus::Denied);
+        assert_eq!(cut.effect(), EffectState::NotStarted);
+        assert_eq!(cut.evidence(), Evidence::HostObserved);
+
+        let exact = ToolOutcome::new(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownApplied,
+            Evidence::HostObserved,
+            "abc",
+            true,
+        )
+        .expect("exact content builds");
+        let kept = exact.enforce_budget(3).expect("fitting budget accepts");
+        assert_eq!(kept.content(), "abc");
+        assert!(
+            kept.is_truncated(),
+            "an existing truncation flag is never cleared"
+        );
+
+        let build = || {
+            ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                "x",
+                false,
+            )
+            .expect("outcome builds")
+        };
+        assert!(
+            build().enforce_budget(0).is_err(),
+            "zero budget is rejected"
+        );
+        assert!(
+            build()
+                .enforce_budget(Limits::M0_TEST_TOOL_OUTPUT_BYTES + 1)
+                .is_err(),
+            "a budget above the global cap is rejected"
+        );
+        assert!(
+            build()
+                .enforce_budget(Limits::M0_TEST_TOOL_OUTPUT_BYTES)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn missing_usage_stays_unknown_never_zero() {
         let usage = Usage::new(None, None, UsageFinality::Final);
         assert_eq!(usage.input_tokens(), None);
@@ -415,6 +653,45 @@ mod tests {
         assert_eq!(
             InvocationOutcome::Failed(timeout_error()).finish_reason(),
             None
+        );
+    }
+
+    #[test]
+    fn turn_finished_rejects_provisional_terminal_usage() {
+        let provisional = Usage::new(Some(10), Some(5), UsageFinality::Provisional);
+        assert!(
+            TurnFinished::try_new(FinishReason::Stop, provisional, None).is_err(),
+            "a consumed turn cannot carry provisional usage"
+        );
+        let compatibility = TurnFinished::new(FinishReason::Stop, provisional, None);
+        assert!(
+            compatibility.validate().is_err(),
+            "the compatibility constructor still exposes a detectable violation"
+        );
+
+        let committed = Usage::new(Some(10), Some(8), UsageFinality::Final);
+        let finished =
+            TurnFinished::try_new(FinishReason::Stop, committed, None).expect("final usage builds");
+        assert_eq!(finished.usage(), committed);
+        assert!(finished.validate().is_ok());
+    }
+
+    #[test]
+    fn run_finished_retains_typed_execution_error() {
+        let typed = timeout_error();
+        let finished = RunFinished::new(RunOutcome::Failed, PersistenceState::Ephemeral, None)
+            .expect("failed record builds")
+            .with_error(typed.clone());
+        assert_eq!(finished.outcome(), RunOutcome::Failed);
+        assert_eq!(finished.error(), Some(&typed));
+        assert!(finished.persistence_error().is_none());
+        assert_eq!(finished.clone(), finished, "typed error survives a clone");
+        assert!(
+            RunFinished::new(RunOutcome::Completed, PersistenceState::Ephemeral, None)
+                .expect("completed record builds")
+                .error()
+                .is_none(),
+            "no execution error is fabricated"
         );
     }
 

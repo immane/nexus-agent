@@ -4,6 +4,10 @@
 //! decides authorization or schedules work. M0 uses in-memory ephemeral
 //! storage that self-identifies as non-durable (lock section 5). Stored
 //! formats carry explicit revisions with exact-equality checks.
+//!
+//! Finite M0-test caps bound retained sessions, intent/outcome records,
+//! profile metadata, and stored messages. Exhaustion is always an explicit
+//! error, never a silent fallback.
 
 use crate::approval::{ApprovedScope, NormalizedArgs};
 use crate::error::{AgentError, ErrorCategory, RetryGuidance};
@@ -18,6 +22,23 @@ pub const STORE_FORMAT_REVISION: u32 = M0_REVISION;
 /// Maximum stored messages per checkpoint (M0-TEST choice aligned with the
 /// retained-context budget).
 pub const MAX_STORED_MESSAGES: usize = Limits::M0_TEST_RETAINED_CONTEXT_ITEMS;
+
+/// Maximum retained session checkpoints per store (M0-TEST choice; not a
+/// product default). A save of a new session beyond this bound fails
+/// explicitly; existing sessions stay writable.
+pub const MAX_SESSIONS: usize = 64;
+
+/// Maximum retained tool-intent records per store (M0-TEST choice; not a
+/// product default). Recording beyond this bound fails explicitly.
+pub const MAX_INTENT_RECORDS: usize = 256;
+
+/// Maximum retained tool-outcome records per store (M0-TEST choice; not a
+/// product default). Recording beyond this bound fails explicitly.
+pub const MAX_OUTCOME_RECORDS: usize = 256;
+
+/// Maximum stored profile-metadata length in bytes (M0-TEST choice aligned
+/// with the provider profile-name bound).
+pub const MAX_PROFILE_LEN: usize = crate::provider::MAX_PROFILE_LEN;
 
 /// Accepted message retained in a checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +64,8 @@ pub struct SessionCheckpoint {
 
 impl SessionCheckpoint {
     /// Builds a checkpoint after validating the format revision exactly and
-    /// bounding retained messages. Partial assistant output must be labeled
-    /// incomplete by the caller.
+    /// bounding retained messages and profile metadata. Partial assistant
+    /// output must be labeled incomplete by the caller.
     pub fn new(
         session: SessionId,
         format_revision: u32,
@@ -53,23 +74,14 @@ impl SessionCheckpoint {
         profile: impl Into<String>,
     ) -> Result<Self, AgentError> {
         check_format_revision(format_revision)?;
-        if messages.len() > MAX_STORED_MESSAGES {
-            return Err(store_error("checkpoint exceeds retained message bound"));
-        }
-        for message in &messages {
-            if message.source.is_empty()
-                || message.source.len() > 64
-                || message.text.len() > Limits::M0_TEST_TOOL_OUTPUT_BYTES
-            {
-                return Err(store_error("checkpoint message is invalid"));
-            }
-        }
+        let profile = profile.into();
+        check_stored_parts(&messages, &profile)?;
         Ok(Self {
             session,
             format_revision,
             logical_revision,
             messages,
-            profile: profile.into(),
+            profile,
         })
     }
 
@@ -108,6 +120,31 @@ impl SessionCheckpoint {
 pub fn check_format_revision(revision: u32) -> Result<(), AgentError> {
     if revision != STORE_FORMAT_REVISION {
         return Err(store_error("unsupported session format revision"));
+    }
+    Ok(())
+}
+
+/// Re-validates retained-message and profile-metadata bounds at a store
+/// boundary. [`SessionCheckpoint::new`] already enforces these; a store calls
+/// this so it never admits an out-of-bounds record.
+pub fn check_checkpoint_bounds(checkpoint: &SessionCheckpoint) -> Result<(), AgentError> {
+    check_stored_parts(checkpoint.messages(), checkpoint.profile())
+}
+
+fn check_stored_parts(messages: &[StoredMessage], profile: &str) -> Result<(), AgentError> {
+    if messages.len() > MAX_STORED_MESSAGES {
+        return Err(store_error("checkpoint exceeds retained message bound"));
+    }
+    for message in messages {
+        if message.source.is_empty()
+            || message.source.len() > 64
+            || message.text.len() > Limits::M0_TEST_TOOL_OUTPUT_BYTES
+        {
+            return Err(store_error("checkpoint message is invalid"));
+        }
+    }
+    if profile.is_empty() || profile.len() > MAX_PROFILE_LEN {
+        return Err(store_error("checkpoint profile metadata is invalid"));
     }
     Ok(())
 }
@@ -204,6 +241,20 @@ mod tests {
         )
     }
 
+    fn checkpoint_with_profile(profile: &str) -> Result<SessionCheckpoint, AgentError> {
+        SessionCheckpoint::new(
+            SessionId::new("sess-1").expect("valid"),
+            STORE_FORMAT_REVISION,
+            3,
+            vec![StoredMessage {
+                source: "user".to_owned(),
+                text: "hello".to_owned(),
+                complete: true,
+            }],
+            profile,
+        )
+    }
+
     #[test]
     fn incompatible_format_revision_fails_exact_equality() {
         assert!(checkpoint(STORE_FORMAT_REVISION).is_ok());
@@ -233,5 +284,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn checkpoint_bounds_profile_metadata() {
+        assert!(checkpoint_with_profile("").is_err(), "empty profile fails");
+        assert!(
+            checkpoint_with_profile(&"p".repeat(MAX_PROFILE_LEN)).is_ok(),
+            "profile at the bound is accepted"
+        );
+        assert!(
+            checkpoint_with_profile(&"p".repeat(MAX_PROFILE_LEN + 1)).is_err(),
+            "profile beyond the bound fails"
+        );
+    }
+
+    #[test]
+    fn store_boundary_recheck_accepts_constructed_checkpoint() {
+        let built = checkpoint(STORE_FORMAT_REVISION).expect("valid checkpoint builds");
+        check_checkpoint_bounds(&built)
+            .expect("constructed checkpoint passes the boundary recheck");
+    }
+
+    #[test]
+    fn store_test_caps_are_finite_and_positive() {
+        assert_eq!(MAX_STORED_MESSAGES, Limits::M0_TEST_RETAINED_CONTEXT_ITEMS);
+        assert_eq!(MAX_PROFILE_LEN, crate::provider::MAX_PROFILE_LEN);
+        const _: () = assert!(MAX_SESSIONS > 0);
+        const _: () = assert!(MAX_INTENT_RECORDS > 0);
+        const _: () = assert!(MAX_OUTCOME_RECORDS > 0);
     }
 }

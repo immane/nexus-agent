@@ -2,9 +2,12 @@
 //!
 //! Every field is a plain number: an omitted value can never mean infinity
 //! because there is no optional field. [`Limits::validate`] rejects zero
-//! budgets, and each `check_*` method maps exhaustion to an explicit
+//! budgets and durations beyond the documented practical M0-test ceiling,
+//! and each `check_*` method maps exhaustion to an explicit
 //! [`AgentError`] with category [`ErrorCategory::ResourceLimit`], never to a
-//! silent fallback.
+//! silent fallback. Validated durations stay far below `Duration`/`Instant`
+//! overflow, but callers still build deadlines with checked arithmetic and
+//! treat overflow as exhaustion.
 //!
 //! The associated `M0_TEST_*` constants are M0-test stand-ins only, not
 //! product defaults.
@@ -67,6 +70,12 @@ impl Limits {
     pub const M0_TEST_MAX_CONCURRENT_OPS: usize = 8;
     /// M0-TEST: default approval expiry in seconds. Not a product default.
     pub const M0_TEST_APPROVAL_EXPIRY_SECS: u64 = 120;
+    /// M0-TEST: practical ceiling for any single validated duration (run,
+    /// per-tool timeout, approval expiry), 24 hours. A [`Duration`] can hold
+    /// values that are effectively unbounded; this ceiling keeps deadline
+    /// arithmetic far from `Duration`/`Instant` overflow. Not a product
+    /// default.
+    pub const M0_TEST_MAX_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
     /// Returns the M0-test budget set from the lock table.
     #[must_use]
@@ -87,7 +96,16 @@ impl Limits {
         }
     }
 
-    /// Rejects zero budgets: a missing or zero value never means infinity.
+    /// Rejects zero budgets, an argument-assembly budget above the global M0
+    /// cap ([`Self::M0_TEST_ARG_ASSEMBLY_BYTES`]), and any individual duration
+    /// above the documented practical M0-test ceiling. Durations are
+    /// validated independently: a short run budget may legitimately carry the
+    /// longer default per-tool timeout or approval expiry, because the
+    /// effective deadline is the minimum of the run deadline and the
+    /// operation deadline, evaluated by the runtime. Values that pass this
+    /// check stay subject to checked runtime arithmetic: callers build
+    /// deadlines with `Instant::checked_add` and treat a failed add as budget
+    /// exhaustion, never as a panic.
     pub fn validate(&self) -> Result<(), AgentError> {
         if self.max_model_turns_per_run == 0
             || self.max_tool_calls_per_run == 0
@@ -101,11 +119,23 @@ impl Limits {
         {
             return Err(limit_error("limit budget must be nonzero"));
         }
+        if self.max_arg_assembly_bytes > Self::M0_TEST_ARG_ASSEMBLY_BYTES {
+            return Err(limit_error("argument assembly budget exceeds M0 maximum"));
+        }
         if self.run_duration.is_zero()
             || self.per_tool_timeout.is_zero()
             || self.approval_expiry.is_zero()
         {
             return Err(limit_error("limit duration must be nonzero"));
+        }
+        if self.run_duration > Self::M0_TEST_MAX_DURATION {
+            return Err(limit_error("run duration exceeds practical maximum"));
+        }
+        if self.per_tool_timeout > Self::M0_TEST_MAX_DURATION {
+            return Err(limit_error("tool timeout exceeds practical maximum"));
+        }
+        if self.approval_expiry > Self::M0_TEST_MAX_DURATION {
+            return Err(limit_error("approval expiry exceeds practical maximum"));
         }
         Ok(())
     }
@@ -184,7 +214,9 @@ impl Limits {
 
     /// Maps run-duration exhaustion to an explicit outcome.
     /// `elapsed` must come from a monotonic clock; wall-clock
-    /// timestamps are for records, not timeout arithmetic.
+    /// timestamps are for records, not timeout arithmetic. Callers combine
+    /// this with `Instant::checked_add` and treat a failed checked add as
+    /// exhaustion rather than panicking.
     pub fn check_run_elapsed(&self, elapsed: Duration) -> Result<(), AgentError> {
         if elapsed >= self.run_duration {
             return Err(limit_error("run duration exhausted"));
@@ -232,6 +264,84 @@ mod tests {
         let mut limits = Limits::m0_test();
         limits.run_duration = Duration::ZERO;
         assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn arg_assembly_budget_is_capped_at_the_m0_maximum() {
+        let mut limits = Limits::m0_test();
+        limits.max_arg_assembly_bytes = Limits::M0_TEST_ARG_ASSEMBLY_BYTES;
+        limits
+            .validate()
+            .expect("the M0 assembly maximum is accepted");
+
+        limits.max_arg_assembly_bytes = Limits::M0_TEST_ARG_ASSEMBLY_BYTES + 1;
+        let error = limits
+            .validate()
+            .expect_err("above the M0 assembly maximum is rejected");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    #[test]
+    fn duration_maxima_are_per_duration_and_short_runs_stay_valid() {
+        assert_eq!(
+            Limits::M0_TEST_MAX_DURATION,
+            Duration::from_secs(24 * 60 * 60)
+        );
+
+        let mut limits = Limits::m0_test();
+        limits.run_duration = Limits::M0_TEST_MAX_DURATION;
+        limits.per_tool_timeout = Limits::M0_TEST_MAX_DURATION;
+        limits.approval_expiry = Limits::M0_TEST_MAX_DURATION;
+        limits
+            .validate()
+            .expect("each duration at the practical maximum is accepted");
+
+        let mut limits = Limits::m0_test();
+        limits.run_duration = Limits::M0_TEST_MAX_DURATION + Duration::from_secs(1);
+        assert!(
+            limits.validate().is_err(),
+            "run duration above the practical maximum is rejected"
+        );
+
+        let mut limits = Limits::m0_test();
+        limits.per_tool_timeout = Limits::M0_TEST_MAX_DURATION + Duration::from_secs(1);
+        assert!(
+            limits.validate().is_err(),
+            "tool timeout above the practical maximum is rejected"
+        );
+
+        let mut limits = Limits::m0_test();
+        limits.approval_expiry = Limits::M0_TEST_MAX_DURATION + Duration::from_secs(1);
+        assert!(
+            limits.validate().is_err(),
+            "approval expiry above the practical maximum is rejected"
+        );
+
+        let mut limits = Limits::m0_test();
+        limits.run_duration = Duration::MAX;
+        assert!(
+            limits.validate().is_err(),
+            "a type-finite but effectively unbounded duration is rejected"
+        );
+
+        // A short run budget may carry the longer default operation
+        // timeouts: durations are validated independently and the effective
+        // deadline is the minimum, so the runtime must expire this run at
+        // 10 ms, never extend it to the tool or approval defaults.
+        let mut limits = Limits::m0_test();
+        limits.run_duration = Duration::from_millis(10);
+        limits.per_tool_timeout = Duration::from_secs(60);
+        limits.approval_expiry = Duration::from_secs(120);
+        limits
+            .validate()
+            .expect("longer operation defaults under a short run are valid");
+        assert!(limits.check_run_elapsed(Duration::from_millis(9)).is_ok());
+        assert!(
+            limits.check_run_elapsed(Duration::from_millis(10)).is_err(),
+            "the run budget wins over the longer operation defaults"
+        );
+        assert!(limits.check_run_elapsed(Duration::from_secs(60)).is_err());
     }
 
     #[test]

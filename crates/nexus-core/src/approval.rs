@@ -17,12 +17,14 @@ use crate::limits::Limits;
 /// representation choice, not a product default).
 pub const MAX_SCOPE_BYTES: usize = 1024;
 
-/// Validated immutable tool arguments.
+/// Immutable object-shaped tool-argument text.
 ///
 /// Lightweight object-root check (trimmed text starts with `{` and ends
 /// with `}`) within the assembly budget. The closed minimal-validator
-/// keyword subset (lock section 4) is enforced at registration and dispatch
-/// by the runtime, not in this carrier type.
+/// keyword subset (lock section 4), JSON parsing, and canonicalization are
+/// enforced by `nexus-validation` at the runtime admission boundary, not by
+/// this carrier constructor. Constructing this value alone never authorizes
+/// execution or establishes schema validity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedArgs(String);
 
@@ -43,7 +45,7 @@ impl NormalizedArgs {
         Ok(Self(value))
     }
 
-    /// Returns the normalized argument text.
+    /// Returns the carried argument text; admission supplies canonical JSON.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -152,6 +154,12 @@ impl ApprovalBinding {
     #[must_use]
     pub fn policy_revision(&self) -> u32 {
         self.policy_revision
+    }
+
+    /// Returns the monotonic run-elapsed expiry used by dispatch and notices.
+    #[must_use]
+    pub fn expires_at_elapsed(&self) -> Duration {
+        self.expires_at_elapsed
     }
 
     /// Returns true once the monotonic `now_elapsed` reaches expiry.
