@@ -1,15 +1,18 @@
 //! Nexus runtime: single-active-run execution loop.
 //!
 //! M0 scope: one active run with explicit `Busy` rejection, exact-tuple
-//! approval binding, headless denial without a handler, bounded two-channel
-//! event transport with contiguous per-run sequencing, honest cancellation
-//! (unknown effects, never rollback claims, never blind retry), and
-//! ephemeral-only persistence. Core ports stay synchronous; async adaptation
-//! lives at this crate's boundary.
+//! approval binding, live cancellation and absolute deadlines, quarantined
+//! worker ownership until termination, a bounded control outbox that never
+//! silently drops a required terminal event, contiguous per-run sequencing
+//! committed only on successful enqueue, honest cancellation (unknown
+//! effects, never rollback claims, never blind retry), and ephemeral-only
+//! persistence. Core ports stay synchronous; async adaptation lives at this
+//! crate's boundary.
 
 #![forbid(unsafe_code)]
 
 pub mod policy;
+pub mod protocol;
 pub mod runtime;
 pub mod transport;
 

@@ -7,6 +7,12 @@ edition = "2024"
 # Core domain types plus the synchronous provider/tool ports (P2). All
 # behavior (lifecycle, policy, events) lives in this crate.
 nexus-core = { path = "../nexus-core" }
+# Closed M0 tool-schema/argument validator (lock section 4). Schemas compile
+# once at registration; admitted arguments validate through it.
+nexus-validation = { path = "../nexus-validation" }
+# JSON parsing for the policy boundary only: exact bounded argument previews
+# and object checks. No schema framework is added here.
+serde_json = "1"
 # Single async runtime, minimal features only: `rt` (executor + blocking
 # pool that adapts the sync core ports), `time` (monotonic
 # sleeps/timeouts/deadlines), `sync` (bounded channels, mutex, cancel
