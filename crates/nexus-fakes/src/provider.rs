@@ -5,18 +5,28 @@
 //! [`reassemble_bytes`]) before valid UTF-8 [`ProviderEvent::TextDelta`]
 //! fragments are emitted, and split argument JSON appears as
 //! [`ProviderEvent::ToolCallDelta`] progress followed by one complete
-//! [`CallCandidate`](nexus_core::CallCandidate). Conflict, malformed, and
-//! truncated scripts always end in a terminal failure or incomplete outcome,
-//! never in a dispatchable success.
+//! [`CallCandidate`]. Conflict, malformed, and
+//! truncated scripts never present a dispatchable success: the scripted
+//! failure fixtures end in `Failed`, and the adversarial success fixtures
+//! end in `TurnFinished` while violating the provider contract, so only the
+//! host's rejection can keep them from dispatching.
+//!
+//! Every invocation records the observed [`ModelRequest`] clone (see
+//! [`FakeProvider::requests`]) before any cancellation or gate wait, and an
+//! exhausted script yields an explicit terminal `Failed`, never a fabricated
+//! idle success. [`FakeGate`] adds entered/release coordination for
+//! deterministic cancellation worker ownership tests; it is a test
+//! primitive, not a runtime cancellation token.
 
 use std::collections::VecDeque;
 use std::sync::{
-    Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use nexus_core::{
-    AgentError, CallCandidate, ContinuationData, ErrorCategory, FinishReason, ModelRequest,
+    AgentError, CallCandidate, ContinuationData, ErrorCategory, FinishReason, Limits, ModelRequest,
     ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RetryGuidance,
     TurnFinished, Usage, UsageFinality,
 };
@@ -25,9 +35,10 @@ use nexus_core::{
 pub const FRAGMENTED_TEXT: &str = "héllo 🌍";
 
 /// Reassembles raw byte chunks split at arbitrary boundaries (possibly
-/// mid-codepoint) into text. Models the adapter step before emitting valid
-/// `TextDelta` strings; a chunk sequence that is not valid UTF-8 as a whole
-/// is a protocol failure, never silent replacement.
+/// mid-codepoint) into text. This is a fixture-building helper for tests,
+/// **not** a wire parser: it makes no framing or protocol decisions, and
+/// adapters own real wire parsing. A chunk sequence that is not valid UTF-8
+/// as a whole is a protocol failure, never silent replacement.
 pub fn reassemble_bytes(chunks: &[&[u8]]) -> Result<String, AgentError> {
     let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
     let mut joined = Vec::with_capacity(total);
@@ -102,16 +113,158 @@ fn cancelled_failure() -> ProviderEvent {
     )
 }
 
+/// Adapter label carried by the fake's scripted continuation state and
+/// returned by [`ProviderPort::adapter_identity`].
+const FAKE_ADAPTER: &str = "fake-adapter";
+
+/// Compatibility scope label carried by the fake's scripted continuation
+/// state and returned by [`ProviderPort::continuation_scope`].
+const FAKE_SCOPE: &str = "fake-model";
+
 fn continuation(bytes: Vec<u8>) -> ContinuationData {
-    ContinuationData::new("fake-adapter", "fake-model", bytes).expect("fake continuation builds")
+    ContinuationData::new(FAKE_ADAPTER, FAKE_SCOPE, bytes).expect("fake continuation builds")
 }
 
-/// Deterministic scripted provider. Each `stream` call pops the next queued
-/// turn; a cancelled context always yields a single terminal `Failed`
-/// without consuming the script. Unknown limits stay `None`.
+fn exhausted_failure() -> ProviderEvent {
+    ProviderEvent::Failed(
+        AgentError::new(
+            ErrorCategory::Protocol,
+            "fake provider script exhausted",
+            RetryGuidance::DoNotRetry,
+        )
+        .expect("static safe fake message builds"),
+    )
+}
+
+fn gate_failure() -> ProviderEvent {
+    ProviderEvent::Failed(
+        AgentError::new(
+            ErrorCategory::Protocol,
+            "fake provider gate was never released",
+            RetryGuidance::DoNotRetry,
+        )
+        .expect("static safe fake message builds"),
+    )
+}
+
+/// Test coordination gate shared by a gated fake and the test driving it.
+///
+/// The gate is **not** a runtime cancellation token: a synchronous port call
+/// cannot be interrupted from outside, so the gate instead makes worker
+/// ownership deterministic. The fake marks `entered` and blocks at its
+/// hand-off point; the test waits for entry, performs its action (for
+/// example, cancelling the owning run), and calls [`FakeGate::release`] so
+/// the blocked worker can return. When the context carries live control
+/// (`with_control`), the fakes re-read `is_cancelled` after the gate, so a
+/// cancellation that arrived while blocked is observed without changing this
+/// gate API.
+#[derive(Debug, Clone, Default)]
+pub struct FakeGate {
+    inner: Arc<GateInner>,
+}
+
+#[derive(Debug, Default)]
+struct GateInner {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    entered: bool,
+    released: bool,
+}
+
+impl FakeGate {
+    /// Longest a gated fake waits for [`FakeGate::release`] before failing
+    /// explicitly instead of hanging an entire test run.
+    pub const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Creates an unreleased gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true once the fake reached its blocking point.
+    #[must_use]
+    pub fn is_entered(&self) -> bool {
+        self.inner.state.lock().expect("fake gate readable").entered
+    }
+
+    /// Returns true once the fake was released.
+    #[must_use]
+    pub fn is_released(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("fake gate readable")
+            .released
+    }
+
+    /// Waits until the fake reaches its blocking point or `timeout` elapses;
+    /// returns true when entry was observed.
+    #[must_use]
+    pub fn wait_entered(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inner.state.lock().expect("fake gate readable");
+        while !state.entered {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, _) = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("fake gate waitable");
+            state = next;
+        }
+        true
+    }
+
+    /// Releases the fake and stays released; safe before or after entry.
+    pub fn release(&self) {
+        let mut state = self.inner.state.lock().expect("fake gate readable");
+        state.released = true;
+        self.inner.changed.notify_all();
+    }
+
+    /// Fake side: announces entry, then waits (bounded) for release. Returns
+    /// false when the test never released the gate.
+    pub(crate) fn enter_and_wait(&self) -> bool {
+        let mut state = self.inner.state.lock().expect("fake gate readable");
+        state.entered = true;
+        self.inner.changed.notify_all();
+        let deadline = Instant::now() + Self::RELEASE_TIMEOUT;
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, _) = self
+                .inner
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("fake gate waitable");
+            state = next;
+        }
+        true
+    }
+}
+
+/// Deterministic scripted provider. Each `stream` call records the observed
+/// request and pops the next queued turn; a cancelled context always yields a
+/// single terminal `Failed` without consuming the script, and an exhausted
+/// script yields an explicit terminal `Failed` instead of a fallback success.
+/// [`ProviderPort::adapter_identity`] and [`ProviderPort::continuation_scope`]
+/// report the `fake-adapter`/`fake-model` labels carried by the scripted
+/// continuation state. Unknown limits stay `None`.
 pub struct FakeProvider {
     calls: AtomicUsize,
     script: Mutex<VecDeque<Vec<ProviderEvent>>>,
+    requests: Mutex<Vec<ModelRequest>>,
+    gate: Option<FakeGate>,
 }
 
 impl FakeProvider {
@@ -120,7 +273,34 @@ impl FakeProvider {
         Self {
             calls: AtomicUsize::new(0),
             script: Mutex::new(script.into()),
+            requests: Mutex::new(Vec::new()),
+            gate: None,
         }
+    }
+
+    /// Serves the script after the shared gate is released. The `stream` call
+    /// records its request and blocks at the gate, so a test can cancel the
+    /// owning run while the worker still owns the invocation.
+    pub fn gated(script: Vec<Vec<ProviderEvent>>) -> Self {
+        let mut provider = Self::new(script);
+        provider.gate = Some(FakeGate::new());
+        provider
+    }
+
+    /// Returns the gate handle when this provider is gated.
+    #[must_use]
+    pub fn gate(&self) -> Option<FakeGate> {
+        self.gate.clone()
+    }
+
+    /// Returns the observed request clones in call order. Requests are
+    /// recorded before any cancellation or gate wait, so a blocked worker's
+    /// request stays inspectable.
+    pub fn requests(&self) -> Vec<ModelRequest> {
+        self.requests
+            .lock()
+            .expect("fake request log readable")
+            .clone()
     }
 
     /// Returns the number of `stream` calls observed, including cancelled ones.
@@ -233,6 +413,33 @@ impl FakeProvider {
         ]])
     }
 
+    /// Adversarial: the same provider reference proposed twice, followed by a
+    /// **successful** tool-calls terminal. A host that trusts the terminal
+    /// would dispatch an ambiguous duplicate, so rejection is the only
+    /// compliant outcome. Contrast
+    /// [`FakeProvider::duplicate_reference_failure`], which ends in `Failed`.
+    pub fn duplicate_reference_success() -> Self {
+        Self::new(vec![vec![
+            ProviderEvent::ToolCallReady(candidate(
+                "item-1",
+                "prov-dup",
+                "host_read",
+                r#"{"path":"a"}"#,
+            )),
+            ProviderEvent::ToolCallReady(candidate(
+                "item-2",
+                "prov-dup",
+                "host_read",
+                r#"{"path":"a"}"#,
+            )),
+            ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::ToolCalls,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )),
+        ]])
+    }
+
     /// One provider reference bound to two different calls, then failure.
     pub fn conflicting_reference_failure() -> Self {
         Self::new(vec![vec![
@@ -252,6 +459,32 @@ impl FakeProvider {
         ]])
     }
 
+    /// Adversarial: one provider reference bound to two different calls,
+    /// followed by a **successful** tool-calls terminal. The host must reject
+    /// the invocation instead of choosing one binding. Contrast
+    /// [`FakeProvider::conflicting_reference_failure`].
+    pub fn conflicting_reference_success() -> Self {
+        Self::new(vec![vec![
+            ProviderEvent::ToolCallReady(candidate(
+                "item-1",
+                "prov-dup",
+                "host_read",
+                r#"{"path":"a"}"#,
+            )),
+            ProviderEvent::ToolCallReady(candidate(
+                "item-2",
+                "prov-dup",
+                "host_write",
+                r#"{"path":"b"}"#,
+            )),
+            ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::ToolCalls,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )),
+        ]])
+    }
+
     /// Argument fragments that never parse: progress only, then failure. No
     /// candidate is emitted because there is nothing valid to dispatch.
     pub fn malformed_json_failure() -> Self {
@@ -264,6 +497,26 @@ impl FakeProvider {
         ]])
     }
 
+    /// Adversarial: a complete candidate whose argument text is not valid
+    /// JSON, followed by a **successful** tool-calls terminal. The host must
+    /// reject the arguments at admission instead of executing them. Contrast
+    /// [`FakeProvider::malformed_json_failure`], which emits no candidate.
+    pub fn malformed_json_success() -> Self {
+        Self::new(vec![vec![
+            ProviderEvent::ToolCallReady(candidate(
+                "item-1",
+                "prov-ref-1",
+                "host_read",
+                "not-json",
+            )),
+            ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::ToolCalls,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )),
+        ]])
+    }
+
     /// Partial text with an incomplete (never stop-success) terminal.
     pub fn truncated_stream() -> Self {
         Self::new(vec![vec![
@@ -273,6 +526,48 @@ impl FakeProvider {
             },
             ProviderEvent::TurnFinished(TurnFinished::new(
                 FinishReason::Incomplete,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )),
+        ]])
+    }
+
+    /// Adversarial: argument progress for one item never reaches a
+    /// `ToolCallReady`, yet the turn claims an ordinary completed stop. The
+    /// host must not accept an unfinished item as a clean success. Contrast
+    /// [`FakeProvider::truncated_stream`], which marks itself incomplete.
+    pub fn unfinished_success() -> Self {
+        Self::new(vec![vec![
+            ProviderEvent::ToolCallDelta {
+                item_key: "item-1".to_owned(),
+                assembled_bytes: 8,
+            },
+            ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::Stop,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )),
+        ]])
+    }
+
+    /// Adversarial: advertised argument progress exceeds the M0-test assembly
+    /// budget while a valid candidate and a **successful** tool-calls
+    /// terminal still follow. The host must reject the invocation on the
+    /// budget violation rather than dispatch the candidate.
+    pub fn oversized_progress_success() -> Self {
+        Self::new(vec![vec![
+            ProviderEvent::ToolCallDelta {
+                item_key: "item-1".to_owned(),
+                assembled_bytes: Limits::M0_TEST_ARG_ASSEMBLY_BYTES + 1,
+            },
+            ProviderEvent::ToolCallReady(candidate(
+                "item-1",
+                "prov-ref-1",
+                "host_read",
+                r#"{"path":"src"}"#,
+            )),
+            ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::ToolCalls,
                 Usage::new(None, None, UsageFinality::Final),
                 None,
             )),
@@ -338,24 +633,51 @@ impl ProviderPort for FakeProvider {
         }
     }
 
-    fn stream(&self, _request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
+    fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .expect("fake request log writable")
+            .push(request.clone());
         if context.is_cancelled() {
             return vec![cancelled_failure()];
+        }
+        if let Some(gate) = &self.gate {
+            if !gate.enter_and_wait() {
+                return vec![gate_failure()];
+            }
+            // Live control: a `with_control` token is re-read after the wait,
+            // so cancellation that arrived while the worker was blocked
+            // yields an explicit `Cancelled` terminal instead of the script.
+            // Legacy snapshot contexts keep their dispatch-time observation.
+            if context.is_cancelled() {
+                return vec![cancelled_failure()];
+            }
         }
         self.script
             .lock()
             .expect("fake script readable")
             .pop_front()
-            .unwrap_or_else(|| stop_turn("idle"))
+            .unwrap_or_else(|| vec![exhausted_failure()])
+    }
+
+    fn adapter_identity(&self) -> &str {
+        // Matches the adapter label carried by `continuation(...)`.
+        FAKE_ADAPTER
+    }
+
+    fn continuation_scope(&self, _profile: &str) -> String {
+        // Matches the scope label carried by `continuation(...)`; the fake's
+        // compatibility scope is its model label, not the profile.
+        FAKE_SCOPE.to_owned()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_core::{RunId, TurnId};
-    use std::time::Duration;
+    use nexus_core::{CancellationToken, NormalizedArgs, RunId, TurnId};
+    use std::time::{Duration, Instant};
 
     fn request(continuation: Option<ContinuationData>) -> ModelRequest {
         ModelRequest::new(
@@ -389,8 +711,11 @@ mod tests {
         terminal[0]
     }
 
+    /// Exercises the raw-byte fixture helper only. This is explicitly not a
+    /// wire parser test: no framing, protocol, or adapter behavior is
+    /// involved.
     #[test]
-    fn split_multibyte_bytes_reassemble() {
+    fn raw_byte_helper_reassembles_splits_without_wire_parsing() {
         let raw = FRAGMENTED_TEXT.as_bytes();
         for split in 1..raw.len() {
             let text =
@@ -515,6 +840,125 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_reference_success_claims_success_for_host_rejection() {
+        let provider = FakeProvider::duplicate_reference_success();
+        let events = provider.stream(&request(None), &live_context());
+        let refs: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallReady(candidate) => Some(candidate.provider_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs, vec!["prov-dup", "prov-dup"]);
+        assert!(
+            matches!(
+                terminal(&events),
+                ProviderEvent::TurnFinished(finished)
+                    if finished.reason() == FinishReason::ToolCalls
+            ),
+            "adversarial fixture claims success; the host must reject it"
+        );
+    }
+
+    #[test]
+    fn conflicting_reference_success_claims_success_for_host_rejection() {
+        let provider = FakeProvider::conflicting_reference_success();
+        let events = provider.stream(&request(None), &live_context());
+        let ready: Vec<&CallCandidate> = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallReady(candidate) => Some(candidate),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].provider_ref(), ready[1].provider_ref());
+        assert_ne!(ready[0].tool_name(), ready[1].tool_name());
+        assert!(matches!(
+            terminal(&events),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::ToolCalls
+        ));
+    }
+
+    #[test]
+    fn malformed_json_success_emits_rejectable_candidate() {
+        let provider = FakeProvider::malformed_json_success();
+        let events = provider.stream(&request(None), &live_context());
+        let ready = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolCallReady(candidate) => Some(candidate),
+                _ => None,
+            })
+            .expect("adversarial fixture emits a candidate");
+        assert!(
+            NormalizedArgs::new(ready.arguments_json()).is_err(),
+            "arguments must not validate as object-root JSON"
+        );
+        assert!(matches!(
+            terminal(&events),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::ToolCalls
+        ));
+    }
+
+    #[test]
+    fn unfinished_success_claims_a_clean_stop() {
+        let provider = FakeProvider::unfinished_success();
+        let events = provider.stream(&request(None), &live_context());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallDelta { .. })),
+            "progress is present"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallReady(_))),
+            "no item ever completed assembly"
+        );
+        assert!(
+            matches!(
+                terminal(&events),
+                ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::Stop
+            ),
+            "adversarial fixture claims a clean stop despite the unfinished item"
+        );
+    }
+
+    #[test]
+    fn oversized_progress_success_exceeds_assembly_budget() {
+        let provider = FakeProvider::oversized_progress_success();
+        let events = provider.stream(&request(None), &live_context());
+        let progress = events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::ToolCallDelta {
+                    assembled_bytes, ..
+                } => Some(*assembled_bytes),
+                _ => None,
+            })
+            .expect("progress is present");
+        let limits = Limits::m0_test();
+        assert!(
+            limits.check_arg_assembly_bytes(progress).is_err(),
+            "fixture progress must exceed the effective assembly budget"
+        );
+        assert_eq!(progress, Limits::M0_TEST_ARG_ASSEMBLY_BYTES + 1);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallReady(_))),
+            "a candidate follows so a naive host would dispatch it"
+        );
+        assert!(matches!(
+            terminal(&events),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::ToolCalls
+        ));
+    }
+
+    #[test]
     fn refusal_carries_unknown_usage() {
         let provider = FakeProvider::refusal();
         let events = provider.stream(&request(None), &live_context());
@@ -560,9 +1004,136 @@ mod tests {
     }
 
     #[test]
+    fn observed_requests_record_every_invocation_in_call_order() {
+        let provider = FakeProvider::new(vec![stop_turn("one"), stop_turn("two")]);
+        let first = request(None);
+        let second = request(Some(continuation(vec![1, 2, 3])));
+        let _ = provider.stream(&first, &live_context());
+        let _ = provider.stream(&second, &cancelled_context());
+        let observed = provider.requests();
+        assert_eq!(
+            observed.len(),
+            2,
+            "cancelled invocations are still observed"
+        );
+        assert_eq!(observed[0], first);
+        assert_eq!(observed[1], second);
+        assert_eq!(provider.call_count(), 2);
+    }
+
+    #[test]
+    fn exhausted_script_fails_explicitly_without_idle_success() {
+        let provider = FakeProvider::new(vec![stop_turn("only")]);
+        let first = provider.stream(&request(None), &live_context());
+        assert!(matches!(
+            terminal(&first),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::Stop
+        ));
+        let second = provider.stream(&request(None), &live_context());
+        match terminal(&second) {
+            ProviderEvent::Failed(error) => {
+                assert_eq!(error.category(), ErrorCategory::Protocol);
+                assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+            }
+            other => panic!("exhausted script must fail explicitly, got {other:?}"),
+        }
+        assert_eq!(provider.call_count(), 2);
+        assert_eq!(provider.requests().len(), 2);
+    }
+
+    #[test]
+    fn gated_provider_blocks_until_released_with_request_observable() {
+        let provider = FakeProvider::gated(vec![stop_turn("released")]);
+        let gate = provider
+            .gate()
+            .expect("gated provider exposes a gate handle");
+        assert!(!gate.is_entered());
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| provider.stream(&request(None), &live_context()));
+            assert!(
+                gate.wait_entered(Duration::from_secs(5)),
+                "provider worker reached the gate"
+            );
+            assert_eq!(
+                provider.requests().len(),
+                1,
+                "request is recorded while the worker is blocked"
+            );
+            assert!(!gate.is_released());
+            gate.release();
+            let events = worker.join().expect("gated provider worker joins");
+            assert!(matches!(
+                terminal(&events),
+                ProviderEvent::TurnFinished(finished)
+                    if finished.reason() == FinishReason::Stop
+            ));
+        });
+        assert!(gate.is_released());
+        assert_eq!(provider.call_count(), 1);
+    }
+
+    #[test]
+    fn pre_cancelled_gated_provider_skips_the_gate_and_preserves_script() {
+        let provider = FakeProvider::gated(vec![stop_turn("unused")]);
+        let gate = provider
+            .gate()
+            .expect("gated provider exposes a gate handle");
+        let cancelled = provider.stream(&request(None), &cancelled_context());
+        assert!(matches!(
+            terminal(&cancelled),
+            ProviderEvent::Failed(error) if error.category() == ErrorCategory::Cancelled
+        ));
+        assert!(!gate.is_entered(), "a cancelled call never blocks a worker");
+        assert_eq!(provider.call_count(), 1);
+
+        gate.release();
+        let live = provider.stream(&request(None), &live_context());
+        assert!(
+            matches!(terminal(&live), ProviderEvent::TurnFinished(_)),
+            "cancellation did not consume the scripted turn"
+        );
+    }
+
+    #[test]
+    fn gated_provider_observes_live_cancellation_after_release() {
+        let provider = FakeProvider::gated(vec![stop_turn("unused")]);
+        let gate = provider
+            .gate()
+            .expect("gated provider exposes a gate handle");
+        let token = CancellationToken::new();
+        let context = ProviderContext::new(Duration::from_secs(60), false, None)
+            .with_control(token.clone(), Instant::now() + Duration::from_secs(60));
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| provider.stream(&request(None), &context));
+            assert!(
+                gate.wait_entered(Duration::from_secs(5)),
+                "provider worker reached the gate"
+            );
+            token.cancel();
+            gate.release();
+            let events = worker.join().expect("gated provider worker joins");
+            assert!(
+                matches!(
+                    terminal(&events),
+                    ProviderEvent::Failed(error) if error.category() == ErrorCategory::Cancelled
+                ),
+                "live cancellation is re-read after the gate"
+            );
+        });
+        assert_eq!(provider.call_count(), 1);
+
+        let live = provider.stream(&request(None), &live_context());
+        assert!(
+            matches!(terminal(&live), ProviderEvent::TurnFinished(_)),
+            "the cancelled invocation did not consume the script"
+        );
+    }
+
+    #[test]
     fn continuation_round_trip_preserves_refs_and_bytes() {
         let provider = FakeProvider::continuation_round_trip();
-        let first = provider.stream(&request(None), &live_context());
+        let first_request = request(None);
+        let first = provider.stream(&first_request, &live_context());
         let (provider_ref, carried) = match terminal(&first) {
             ProviderEvent::TurnFinished(finished) => {
                 let ready = first
@@ -584,18 +1155,62 @@ mod tests {
         };
         assert_eq!(provider_ref, "prov-ref-7");
         assert_eq!(carried.bytes(), &[7, 7, 1]);
+        assert_eq!(
+            carried.adapter(),
+            provider.adapter_identity(),
+            "scripted continuation adapter matches the declared identity"
+        );
+        assert_eq!(
+            carried.scope(),
+            provider.continuation_scope(first_request.profile()),
+            "scripted continuation scope matches the declared scope"
+        );
 
         let second_request = request(Some(carried.clone()));
-        assert_eq!(
-            second_request.continuation().expect("request carries it"),
-            &carried
-        );
         let second = provider.stream(&second_request, &live_context());
         assert!(matches!(
             terminal(&second),
             ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::Stop
         ));
         assert_eq!(provider.call_count(), 2);
+
+        // Honesty check: inspect what the provider actually observed rather
+        // than re-asserting the locally constructed request. The first
+        // observed request is the exact input; the second observed request
+        // carries the continuation state the provider itself issued.
+        let observed = provider.requests();
+        assert_eq!(observed.len(), 2, "both invocations recorded");
+        assert_eq!(
+            observed[0], first_request,
+            "first observed request matches input"
+        );
+        let echoed = observed[1]
+            .continuation()
+            .expect("observed second request carries continuation");
+        assert_eq!(
+            echoed, &carried,
+            "observed request echoes issued continuation"
+        );
+        assert_eq!(echoed.bytes(), &[7, 7, 1]);
+    }
+
+    #[test]
+    fn adapter_identity_and_scope_match_the_scripted_continuation_labels() {
+        let provider = FakeProvider::new(vec![]);
+        assert_eq!(provider.adapter_identity(), FAKE_ADAPTER);
+        assert_eq!(provider.adapter_identity(), "fake-adapter");
+        assert_ne!(
+            provider.adapter_identity(),
+            nexus_core::DEFAULT_ADAPTER_IDENTITY,
+            "the fake overrides the reserved placeholder"
+        );
+        assert_eq!(provider.continuation_scope("profile-a"), FAKE_SCOPE);
+        assert_eq!(provider.continuation_scope("profile-a"), "fake-model");
+        assert_eq!(
+            provider.continuation_scope("profile-b"),
+            provider.continuation_scope("profile-a"),
+            "scope stays stable across profiles for the scripted continuation"
+        );
     }
 
     #[test]

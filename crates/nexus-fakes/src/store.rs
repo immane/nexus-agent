@@ -1,19 +1,29 @@
 //! Test-only ephemeral session store.
 //!
-//! [`EphemeralStore`] is an in-memory [`SessionStore`](nexus_core::SessionStore)
+//! [`EphemeralStore`] is an in-memory [`SessionStore`]
 //! that is explicitly **non-durable**: [`EphemeralStore::is_durable`] always
 //! returns `false` and [`EphemeralStore::durability`] reports
 //! [`PersistenceState::Ephemeral`](nexus_core::PersistenceState), so crash
 //! recovery and durable history are unavailable. It must never be mistaken
 //! for evidence of crash-safe file persistence. Format revisions use exact
-//! equality against [`STORE_FORMAT_REVISION`](nexus_core::STORE_FORMAT_REVISION)
+//! equality against [`STORE_FORMAT_REVISION`]
 //! (M0 revision `0`); a stale checkpoint (older logical revision than the
-//! stored one) is rejected explicitly. The plain-bool `fail_next_write` flag
-//! simulates an interrupted write for P6 without any framework.
+//! stored one) is rejected explicitly, and an equal-revision save is accepted
+//! only when the checkpoint is identical (idempotent retry) — a conflicting
+//! equal-revision save fails explicitly and preserves the stored checkpoint.
+//! Retained sessions, intent records, and outcome records are bounded by the
+//! finite M0-test caps in [`nexus_core::store`]; listing is bounded by the
+//! caller's limit over a `BTreeMap` without materializing all sessions. The
+//! plain-bool `fail_next_write` flag simulates an interrupted write for P6
+//! without any framework and never replaces a prior observation.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
-use nexus_core::store::check_format_revision;
+use nexus_core::store::{
+    MAX_INTENT_RECORDS, MAX_OUTCOME_RECORDS, MAX_SESSIONS, check_checkpoint_bounds,
+    check_format_revision,
+};
 use nexus_core::{
     AgentError, ErrorCategory, PersistenceState, RetryGuidance, STORE_FORMAT_REVISION,
     SessionCheckpoint, SessionId, SessionMetadata, SessionStore, ToolIntentRecord,
@@ -22,7 +32,7 @@ use nexus_core::{
 
 /// Non-durable test-only session store. See the module docs.
 pub struct EphemeralStore {
-    checkpoints: HashMap<String, SessionCheckpoint>,
+    checkpoints: BTreeMap<String, SessionCheckpoint>,
     intents: Vec<ToolIntentRecord>,
     outcomes: Vec<ToolOutcomeRecord>,
     fail_next_write: bool,
@@ -32,7 +42,7 @@ impl EphemeralStore {
     /// Creates an empty store.
     pub fn new() -> Self {
         Self {
-            checkpoints: HashMap::new(),
+            checkpoints: BTreeMap::new(),
             intents: Vec::new(),
             outcomes: Vec::new(),
             fail_next_write: false,
@@ -96,17 +106,17 @@ impl Default for EphemeralStore {
 
 impl SessionStore for EphemeralStore {
     fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMetadata>, AgentError> {
-        let mut entries: Vec<SessionMetadata> = self
+        // `BTreeMap` iteration is ordered by session id, and `take` stops at
+        // the requested bound instead of materializing every session.
+        Ok(self
             .checkpoints
             .values()
+            .take(limit)
             .map(|checkpoint| SessionMetadata {
                 session: checkpoint.session().clone(),
                 logical_revision: checkpoint.logical_revision(),
             })
-            .collect();
-        entries.sort_by(|left, right| left.session.as_str().cmp(right.session.as_str()));
-        entries.truncate(limit);
-        Ok(entries)
+            .collect())
     }
 
     fn load_session(&self, id: &SessionId) -> Result<SessionCheckpoint, AgentError> {
@@ -119,12 +129,33 @@ impl SessionStore for EphemeralStore {
     fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError> {
         self.take_interruption()?;
         check_format_revision(checkpoint.format_revision())?;
-        if let Some(stored) = self.checkpoints.get(checkpoint.session().as_str())
-            && checkpoint.logical_revision() < stored.logical_revision()
-        {
+        check_checkpoint_bounds(checkpoint)?;
+        if let Some(stored) = self.checkpoints.get(checkpoint.session().as_str()) {
+            match checkpoint
+                .logical_revision()
+                .cmp(&stored.logical_revision())
+            {
+                Ordering::Less => {
+                    return Err(store_error(
+                        ErrorCategory::InvalidInput,
+                        "stale checkpoint revision",
+                    ));
+                }
+                // Equal revisions are an idempotent retry only when the
+                // checkpoint is identical; a conflicting write preserves the
+                // stored checkpoint and fails explicitly.
+                Ordering::Equal if checkpoint != stored => {
+                    return Err(store_error(
+                        ErrorCategory::InvalidInput,
+                        "conflicting checkpoint at equal revision",
+                    ));
+                }
+                Ordering::Equal | Ordering::Greater => {}
+            }
+        } else if self.checkpoints.len() >= MAX_SESSIONS {
             return Err(store_error(
-                ErrorCategory::InvalidInput,
-                "stale checkpoint revision",
+                ErrorCategory::ResourceLimit,
+                "session capacity exhausted",
             ));
         }
         self.checkpoints
@@ -134,12 +165,24 @@ impl SessionStore for EphemeralStore {
 
     fn record_intent(&mut self, intent: &ToolIntentRecord) -> Result<(), AgentError> {
         self.take_interruption()?;
+        if self.intents.len() >= MAX_INTENT_RECORDS {
+            return Err(store_error(
+                ErrorCategory::ResourceLimit,
+                "intent capacity exhausted",
+            ));
+        }
         self.intents.push(intent.clone());
         Ok(())
     }
 
     fn record_outcome(&mut self, outcome: &ToolOutcomeRecord) -> Result<(), AgentError> {
         self.take_interruption()?;
+        if self.outcomes.len() >= MAX_OUTCOME_RECORDS {
+            return Err(store_error(
+                ErrorCategory::ResourceLimit,
+                "outcome capacity exhausted",
+            ));
+        }
         self.outcomes.push(outcome.clone());
         Ok(())
     }
@@ -159,40 +202,57 @@ mod tests {
         RunId, ToolId,
     };
 
-    fn checkpoint(session: &str, logical_revision: u64) -> SessionCheckpoint {
+    fn checkpoint_with(
+        session: &str,
+        logical_revision: u64,
+        text: &str,
+        profile: &str,
+    ) -> SessionCheckpoint {
         SessionCheckpoint::new(
             SessionId::new(session).expect("valid"),
             STORE_FORMAT_REVISION,
             logical_revision,
             vec![StoredMessage {
                 source: "user".to_owned(),
-                text: "hello".to_owned(),
+                text: text.to_owned(),
                 complete: true,
             }],
-            "fake-profile",
+            profile,
         )
         .expect("valid checkpoint builds")
     }
 
-    fn intent() -> ToolIntentRecord {
+    fn checkpoint(session: &str, logical_revision: u64) -> SessionCheckpoint {
+        checkpoint_with(session, logical_revision, "hello", "fake-profile")
+    }
+
+    fn intent_for(call: usize) -> ToolIntentRecord {
         ToolIntentRecord {
             run: RunId::new("run-1").expect("valid"),
-            call: CallId::new("call-1").expect("valid"),
+            call: CallId::new(format!("call-{call}")).expect("valid"),
             tool: ToolId::new("host_write", M0_REVISION).expect("valid"),
             args: NormalizedArgs::new(r#"{"path":"dst"}"#).expect("valid"),
             scope: ApprovedScope::new("project-write").expect("valid"),
         }
     }
 
-    fn outcome() -> ToolOutcomeRecord {
+    fn intent() -> ToolIntentRecord {
+        intent_for(1)
+    }
+
+    fn outcome_for(call: usize) -> ToolOutcomeRecord {
         ToolOutcomeRecord {
             run: RunId::new("run-1").expect("valid"),
-            call: CallId::new("call-1").expect("valid"),
+            call: CallId::new(format!("call-{call}")).expect("valid"),
             status: ExecutionStatus::Succeeded,
             effect: EffectState::KnownApplied,
             evidence: Evidence::HostObserved,
             truncated: false,
         }
+    }
+
+    fn outcome() -> ToolOutcomeRecord {
+        outcome_for(1)
     }
 
     #[test]
@@ -234,7 +294,128 @@ mod tests {
             .expect("newer saves");
         store
             .save_checkpoint(&checkpoint("sess-1", 4))
-            .expect("same revision is an idempotent overwrite");
+            .expect("identical equal-revision retry is accepted");
+    }
+
+    #[test]
+    fn equal_revision_conflict_is_rejected_and_preserves_stored() {
+        let mut store = EphemeralStore::new();
+        let original = checkpoint_with("sess-1", 3, "hello", "fake-profile");
+        store
+            .save_checkpoint(&original)
+            .expect("initial save works");
+        store
+            .save_checkpoint(&original)
+            .expect("identical retry is idempotent");
+
+        let conflicting = checkpoint_with("sess-1", 3, "changed", "other-profile");
+        let error = store.save_checkpoint(&conflicting).unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        let loaded = store
+            .load_session(&SessionId::new("sess-1").expect("valid"))
+            .expect("stored checkpoint is preserved");
+        assert_eq!(loaded.logical_revision(), 3);
+        assert_eq!(loaded.messages()[0].text, "hello");
+        assert_eq!(loaded.profile(), "fake-profile");
+
+        store
+            .save_checkpoint(&checkpoint_with("sess-1", 4, "changed", "other-profile"))
+            .expect("strictly newer revision replaces");
+        let reloaded = store
+            .load_session(&SessionId::new("sess-1").expect("valid"))
+            .expect("newer checkpoint loads");
+        assert_eq!(reloaded.logical_revision(), 4);
+        assert_eq!(reloaded.messages()[0].text, "changed");
+    }
+
+    #[test]
+    fn interrupted_write_never_replaces_prior_observation() {
+        let mut store = EphemeralStore::new();
+        store
+            .save_checkpoint(&checkpoint_with("sess-1", 1, "original", "fake-profile"))
+            .expect("save works");
+        store.set_fail_next_write(true);
+        assert!(
+            store
+                .save_checkpoint(&checkpoint_with("sess-1", 2, "replacement", "fake-profile"))
+                .is_err()
+        );
+        let loaded = store
+            .load_session(&SessionId::new("sess-1").expect("valid"))
+            .expect("prior checkpoint survives the interrupted write");
+        assert_eq!(loaded.logical_revision(), 1);
+        assert_eq!(loaded.messages()[0].text, "original");
+
+        store.set_fail_next_write(true);
+        assert!(store.record_intent(&intent()).is_err());
+        store.set_fail_next_write(true);
+        assert!(store.record_outcome(&outcome()).is_err());
+        assert!(store.intents().is_empty());
+        assert!(store.outcomes().is_empty());
+    }
+
+    #[test]
+    fn finite_capacities_fail_explicitly_without_eviction() {
+        let mut store = EphemeralStore::new();
+        for index in 0..MAX_SESSIONS {
+            store
+                .save_checkpoint(&checkpoint(&format!("sess-{index:03}"), 1))
+                .expect("within session capacity");
+        }
+        let error = store
+            .save_checkpoint(&checkpoint("sess-over", 1))
+            .unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        store
+            .save_checkpoint(&checkpoint("sess-000", 2))
+            .expect("existing session stays writable at capacity");
+
+        for index in 0..MAX_INTENT_RECORDS {
+            store
+                .record_intent(&intent_for(index))
+                .expect("within intent capacity");
+        }
+        let error = store.record_intent(&intent_for(0)).unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(store.intents().len(), MAX_INTENT_RECORDS);
+
+        for index in 0..MAX_OUTCOME_RECORDS {
+            store
+                .record_outcome(&outcome_for(index))
+                .expect("within outcome capacity");
+        }
+        let error = store.record_outcome(&outcome_for(0)).unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(store.outcomes().len(), MAX_OUTCOME_RECORDS);
+    }
+
+    #[test]
+    fn listing_is_bounded_and_missing_load_fails() {
+        let mut store = EphemeralStore::new();
+        for session in ["sess-b", "sess-a", "sess-c"] {
+            store
+                .save_checkpoint(&checkpoint(session, 1))
+                .expect("save works");
+        }
+        assert!(store.list_sessions(0).expect("zero bound works").is_empty());
+        let listed = store.list_sessions(2).expect("list works");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].session.as_str(), "sess-a");
+        assert_eq!(listed[1].session.as_str(), "sess-b");
+        let all = store.list_sessions(16).expect("list works");
+        assert_eq!(all.len(), 3);
+        assert!(
+            all.windows(2)
+                .all(|pair| pair[0].session.as_str() <= pair[1].session.as_str()),
+            "deterministic session order"
+        );
+        assert!(
+            store
+                .load_session(&SessionId::new("sess-missing").expect("valid"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -257,29 +438,5 @@ mod tests {
         store.record_outcome(&outcome()).expect("disarmed");
         assert_eq!(store.intents().len(), 1);
         assert_eq!(store.outcomes().len(), 1);
-    }
-
-    #[test]
-    fn listing_is_bounded_and_missing_load_fails() {
-        let mut store = EphemeralStore::new();
-        for session in ["sess-b", "sess-a", "sess-c"] {
-            store
-                .save_checkpoint(&checkpoint(session, 1))
-                .expect("save works");
-        }
-        let listed = store.list_sessions(2).expect("list works");
-        assert_eq!(listed.len(), 2);
-        let all = store.list_sessions(16).expect("list works");
-        assert_eq!(all.len(), 3);
-        assert!(
-            all.windows(2)
-                .all(|pair| pair[0].session.as_str() <= pair[1].session.as_str()),
-            "deterministic session order"
-        );
-        assert!(
-            store
-                .load_session(&SessionId::new("sess-missing").expect("valid"))
-                .is_err()
-        );
     }
 }
