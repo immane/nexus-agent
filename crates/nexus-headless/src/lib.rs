@@ -1445,7 +1445,7 @@ mod cov_encoding_private {
         let expected: Vec<u8> = (b'A'..=b'Z')
             .chain(b'a'..=b'z')
             .chain(b'0'..=b'9')
-            .chain([b'-', b'.', b'_', b'~'])
+            .chain(*b"-._~")
             .collect();
         assert_eq!(expected.len(), 66, "26+26+10+4 unreserved bytes");
         for byte in 0u8..=u8::MAX {
@@ -1500,7 +1500,7 @@ mod cov_encoding_private {
             assert_eq!(hex_value(b'a' + value), Some(10 + value), "lower {value}");
         }
         // The letters immediately after `F` are no longer hex digits.
-        for rejected in [b'G', b'H', b'I', b'J', b'K', b'L', b'M'] {
+        for rejected in *b"GHIJKLM" {
             assert_eq!(hex_value(rejected), None, "byte {rejected:#04X}");
             assert_eq!(hex_value(rejected.to_ascii_lowercase()), None);
         }

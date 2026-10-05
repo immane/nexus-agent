@@ -515,7 +515,7 @@ mod cov_content_private {
         for byte in b'0'..=b'9' {
             assert!(is_tool_name_byte(byte), "{byte}");
         }
-        for byte in [b'-', b'_'] {
+        for byte in *b"-_" {
             assert!(is_tool_name_byte(byte), "{byte}");
         }
         for byte in [0u8, b'.', b'/', b' ', b':', b'@', b'\\', b'~', 0xFF] {
