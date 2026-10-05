@@ -12,6 +12,10 @@ use crate::model::{CONFIG_REVISION, UserConfig};
 
 /// Maximum configuration document size in bytes (parse budget).
 pub const MAX_DOCUMENT_BYTES: usize = 65_536;
+/// Environment variable overriding the configuration file path.
+pub const CONFIG_ENV_VAR: &str = "NEXUS_CONFIG";
+/// Configuration file name under the platform config directory.
+pub const CONFIG_FILE_NAME: &str = "config.json";
 
 /// Error kind for configuration failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +85,61 @@ pub(crate) fn parse_document(text: &str) -> Result<serde_json::Value, ConfigErro
     }
     nexus_validation::parse_object(text, MAX_DOCUMENT_BYTES)
         .map_err(|_| invalid("configuration is invalid"))
+}
+
+/// Resolves the configuration file path with the documented precedence:
+/// explicit CLI path, then the `NEXUS_CONFIG` environment variable, then
+/// the platform default. Returns `None` when no source names a path.
+pub fn resolve_path(cli: Option<&str>) -> Option<std::path::PathBuf> {
+    resolve_path_with(cli, |var| std::env::var(var).ok())
+}
+
+/// Resolves the path with an injected environment lookup, so precedence
+/// is testable without touching the process environment.
+pub fn resolve_path_with(
+    cli: Option<&str>,
+    env: impl FnOnce(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = cli.filter(|path| !path.is_empty()) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    if let Some(path) = env(CONFIG_ENV_VAR).filter(|path| !path.is_empty()) {
+        return Some(std::path::PathBuf::from(path));
+    }
+    default_path()
+}
+
+/// Returns the platform default configuration file path, if the platform
+/// exposes a config directory.
+#[must_use]
+pub fn default_path() -> Option<std::path::PathBuf> {
+    default_path_with(
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+/// Computes the default path from injected locations: `XDG_CONFIG_HOME`
+/// wins, otherwise `$HOME/.config`, each joined with the file name.
+/// Pure and fully testable; [`default_path`] reads the environment.
+#[must_use]
+pub fn default_path_with(
+    xdg_config_home: Option<String>,
+    home: Option<String>,
+) -> Option<std::path::PathBuf> {
+    if let Some(base) = xdg_config_home.filter(|base| !base.is_empty()) {
+        return Some(
+            std::path::PathBuf::from(base)
+                .join("nexus-agent")
+                .join(CONFIG_FILE_NAME),
+        );
+    }
+    home.filter(|base| !base.is_empty()).map(|base| {
+        std::path::PathBuf::from(base)
+            .join(".config")
+            .join("nexus-agent")
+            .join(CONFIG_FILE_NAME)
+    })
 }
 
 /// Loads the document at `path`, or `None` when the file is absent (the

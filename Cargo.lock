@@ -246,6 +246,7 @@ dependencies = [
 name = "nexus-server"
 version = "0.1.0"
 dependencies = [
+ "nexus-config",
  "nexus-core",
  "nexus-fakes",
  "nexus-runtime",
@@ -258,6 +259,7 @@ name = "nexus-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "nexus-config",
  "nexus-core",
  "nexus-fakes",
  "nexus-runtime",
