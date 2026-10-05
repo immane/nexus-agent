@@ -552,6 +552,10 @@ pub struct AppState {
     /// are jailed to). `None` renders no segment, so tests and headless
     /// transcripts that never set it are unaffected.
     project_dir: Option<String>,
+    /// Conversation session label shown in the header (`s1`, `s2`, ...).
+    /// `None` renders no segment, so frames that never select a session are
+    /// unaffected.
+    session_label: Option<String>,
     /// Model selected in the composer, shown in its title. `None` renders
     /// the bare title, so frames that never select a model are unaffected.
     active_model: Option<String>,
@@ -597,6 +601,7 @@ impl AppState {
             finished: None,
             viewport: (80, 20),
             project_dir: None,
+            session_label: None,
             active_model: None,
             active_provider: None,
             last_usage: None,
@@ -613,6 +618,19 @@ impl AppState {
     #[must_use]
     pub fn project_dir(&self) -> Option<&str> {
         self.project_dir.as_deref()
+    }
+
+    /// Records the conversation session label for the header. Short,
+    /// frontend-assigned labels (`s1`, `s2`) name the slot; the runtime
+    /// session identity stays the authority for commands and events.
+    pub fn set_session_label(&mut self, label: impl Into<String>) {
+        self.session_label = Some(label.into());
+    }
+
+    /// Returns the session label, if one was recorded.
+    #[must_use]
+    pub fn session_label(&self) -> Option<&str> {
+        self.session_label.as_deref()
     }
 
     /// Shows a selected model (and its provider, when known) in the

@@ -49,8 +49,8 @@ use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, Focus, RefreshGate, SlashCommand, cancel_command, install_panic_hook,
-    map_key, next_focus, render, submit_command,
+    Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, cancel_command,
+    install_panic_hook, map_key, next_focus, render, submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -102,7 +102,10 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 /// receive a path. Adding a second, TUI-local way to choose the file would
 /// duplicate that precedence with no consumer here, and would risk writing
 /// model usage back to a file the user did not mean to write.
-#[derive(Debug)]
+///
+/// Cloned once per session slot: every conversation shares the same startup
+/// document and boot model, while each keeps its own runtime and history.
+#[derive(Debug, Clone)]
 struct SessionConfig {
     config: UserConfig,
     path: Option<std::path::PathBuf>,
@@ -174,6 +177,125 @@ fn boot_model(config: &UserConfig) -> Option<String> {
         .or_else(|| config.favourites().first())
         .or_else(|| config.models().first().map(|entry| &entry.id))
         .cloned()
+}
+
+/// One conversation slot: an owned runtime, its unconsumed event streams,
+/// and the frontend (presentation, focus, merge, approval) for it.
+/// Switching slots never moves runs, approvals, or drafts between them; a
+/// background slot's events buffer in its bounded channels until it is
+/// active again.
+struct SessionSlot {
+    /// Short display label (`s1`, `s2`, ...), stable for the process.
+    label: String,
+    runtime: Runtime,
+    streams: EventStreams,
+    front: Frontend,
+}
+
+/// Local conversation registry: every slot shares the startup
+/// configuration template but owns its runtime and history. Only the active
+/// slot is polled and drawn; background slots keep buffering. A future
+/// remote backend plugs in here beside the local runtime without changing
+/// the picker surface.
+struct SessionRegistry {
+    slots: Vec<SessionSlot>,
+    active: usize,
+    template: SessionConfig,
+}
+
+impl SessionRegistry {
+    fn new(first: SessionSlot, template: SessionConfig) -> Self {
+        Self {
+            slots: vec![first],
+            active: 0,
+            template,
+        }
+    }
+
+    /// Borrows the active slot.
+    fn active(&self) -> &SessionSlot {
+        &self.slots[self.active]
+    }
+
+    /// Mutably borrows the active slot.
+    fn active_mut(&mut self) -> &mut SessionSlot {
+        &mut self.slots[self.active]
+    }
+
+    /// Counts live slots.
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Resolves a switch target: 1-based index (`2`), label (`s2`), or exact
+    /// runtime session id. Anything else is `None`, never a guess.
+    fn resolve_target(&self, target: &str) -> Option<usize> {
+        let trimmed = target.trim();
+        if let Ok(number) = trimmed.parse::<usize>()
+            && (1..=self.slots.len()).contains(&number)
+        {
+            return Some(number - 1);
+        }
+        self.slots
+            .iter()
+            .position(|slot| slot.label == trimmed || slot.front.session.as_str() == trimmed)
+    }
+
+    /// Creates a new empty slot and switches to it. A wiring failure leaves
+    /// the registry untouched and reports the error instead.
+    fn create(&mut self) -> io::Result<usize> {
+        let number = self.slots.len() + 1;
+        let (runtime, streams) = build_runtime()?;
+        let session =
+            SessionId::new(format!("{DEMO_SESSION}-{number}")).map_err(io::Error::other)?;
+        let mut front = Frontend::with_config(session, self.template.clone());
+        let label = format!("s{number}");
+        front.state.set_session_label(&label);
+        front
+            .state
+            .notice(&format!("session {label} started (local demo runtime)"));
+        self.slots.push(SessionSlot {
+            label,
+            runtime,
+            streams,
+            front,
+        });
+        self.active = self.slots.len() - 1;
+        Ok(self.active)
+    }
+
+    /// Switches to `index`. Returns false for out-of-range indices and for
+    /// the already-active slot.
+    fn switch(&mut self, index: usize) -> bool {
+        if index >= self.slots.len() || index == self.active {
+            return false;
+        }
+        self.active = index;
+        true
+    }
+
+    /// One transcript line per slot: label, runtime session id, active
+    /// marker, and live status. The active slot sorts first implicitly by
+    /// its marker; order is creation order otherwise.
+    fn describe(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let marker = if index == self.active {
+                    " [active]"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} ({}){marker} — {}",
+                    slot.label,
+                    slot.front.session.as_str(),
+                    slot.front.state.status()
+                )
+            })
+            .collect()
+    }
 }
 
 /// Test-only demo provider: serves a fresh scripted demo script for every
@@ -258,11 +380,10 @@ async fn run() -> io::Result<()> {
     // fail as a startup error on the plain stderr surface, never inside a
     // restored-screen report. Both paths below share this one load.
     let session_config = load_session_config()?;
-    let (runtime, streams) = build_runtime()?;
     if io::stdout().is_terminal() {
         match nexus_tui::TerminalGuard::setup() {
             Ok(mut guard) => {
-                let report = interactive(runtime, streams, session_config).await;
+                let report = interactive(session_config).await;
                 // Retryable restoration: a step that fails stays owned and is
                 // attempted again on drop, and the failure is reported rather
                 // than presented as a clean restore.
@@ -297,10 +418,12 @@ async fn run() -> io::Result<()> {
             }
             Err(error) => {
                 eprintln!("terminal setup failed ({error}); test transcript fallback");
+                let (runtime, streams) = build_runtime()?;
                 headless(runtime, streams, session_config).await
             }
         }
     } else {
+        let (runtime, streams) = build_runtime()?;
         headless(runtime, streams, session_config).await
     }
 }
@@ -465,6 +588,11 @@ struct Frontend {
     config_path: Option<std::path::PathBuf>,
     /// Currently selected model id, or `None` when none is configured.
     active_model: Option<String>,
+    /// Queued `/session` intents in recording order: key handling appends on
+    /// the active front, and the loop drains them against the registry after
+    /// the batch, where runtimes can be built. At most one push per Enter
+    /// keypress, drained every tick, so the queue stays tiny.
+    pending_session_cmds: Vec<SessionArgs>,
 }
 
 impl Frontend {
@@ -483,6 +611,7 @@ impl Frontend {
             config: UserConfig::default_config(),
             config_path: None,
             active_model: None,
+            pending_session_cmds: Vec::new(),
         }
     }
 
@@ -582,6 +711,12 @@ impl Frontend {
         self.request_counter += 1;
         RequestId::new(format!("req-tui-{}", self.request_counter))
             .expect("counter request id is valid")
+    }
+
+    /// Takes queued session intents in recording order, clearing the queue
+    /// so each executes exactly once.
+    fn take_session_cmds(&mut self) -> Vec<SessionArgs> {
+        std::mem::take(&mut self.pending_session_cmds)
     }
 
     /// Adopts the accepted submit reply before any event is merged. `Busy`
@@ -753,7 +888,8 @@ async fn handle_key_batch(
 /// Executes a local slash command. Returns true only when the loop must
 /// exit (`/quit`); everything else answers inline and keeps the session
 /// alive. Model switches reuse the same admission-order selection as the
-/// `m` key, so both paths always agree on what is active.
+/// `m` key, so both paths always agree on what is active. Session commands
+/// borrow the registry; every other command answers on the active front.
 fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
     match command {
         SlashCommand::Help => {
@@ -812,6 +948,107 @@ fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
             front
                 .state
                 .notice(&format!("unknown command /{word} — type /help"));
+            false
+        }
+        SlashCommand::Session(args) => {
+            // Registry-owned work (create/switch/list) cannot run on a bare
+            // front: queue the intent and let the loop execute it against
+            // the registry after the batch. Usage answers inline.
+            if args == SessionArgs::Usage {
+                front.state.notice(SessionArgs::usage_text());
+            } else {
+                front.pending_session_cmds.push(args);
+            }
+            false
+        }
+    }
+}
+
+/// Maximum live conversation slots in one TUI process. Each slot owns a
+/// runtime plus bounded presentation state; the cap keeps slot creation
+/// from growing either without bound.
+const MAX_SESSIONS: usize = 16;
+
+/// Executes a `/session` command against the registry. Returns true only
+/// when the loop must exit (never for session commands: they always answer
+/// inline and keep every session alive).
+fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) -> bool {
+    match args {
+        SessionArgs::Show => {
+            let line = {
+                let active = sessions.active();
+                format!(
+                    "session {} ({}) — {} ({} of {})",
+                    active.label,
+                    active.front.session.as_str(),
+                    active.front.state.status(),
+                    sessions.active + 1,
+                    sessions.len(),
+                )
+            };
+            sessions.active_mut().front.state.notice(&line);
+            false
+        }
+        SessionArgs::New => {
+            if sessions.len() >= MAX_SESSIONS {
+                sessions
+                    .active_mut()
+                    .front
+                    .state
+                    .notice("session limit reached (16 live sessions)");
+                return false;
+            }
+            match sessions.create() {
+                Ok(_) => false,
+                Err(error) => {
+                    let label = sessions.active().label.clone();
+                    sessions.active_mut().front.state.notice(&format!(
+                        "session creation failed ({error}); still on {label}"
+                    ));
+                    false
+                }
+            }
+        }
+        SessionArgs::List => {
+            for line in sessions.describe() {
+                sessions.active_mut().front.state.notice(&line);
+            }
+            false
+        }
+        SessionArgs::Switch(target) => match sessions.resolve_target(target) {
+            None => {
+                sessions
+                    .active_mut()
+                    .front
+                    .state
+                    .notice(&format!("unknown session {target} — type /session list"));
+                false
+            }
+            Some(index) => {
+                if sessions.switch(index) {
+                    let label = sessions.active().label.clone();
+                    let position = sessions.active + 1;
+                    let total = sessions.len();
+                    sessions.active_mut().front.state.notice(&format!(
+                        "switched to session {label} ({position} of {total})"
+                    ));
+                } else {
+                    let label = sessions.active().label.clone();
+                    sessions
+                        .active_mut()
+                        .front
+                        .state
+                        .notice(&format!("already on session {label}"));
+                }
+                false
+            }
+        },
+        SessionArgs::Usage => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice(SessionArgs::usage_text());
             false
         }
     }
@@ -985,54 +1222,61 @@ struct InteractiveReport {
 /// Interactive scripted demo: one canned submission, live approval card,
 /// full test-only keyset. The loop stays up across terminal outcomes so
 /// further tasks can be submitted; it exits on quit, channel close, or
-/// error, cancelling live work first.
-async fn interactive(
-    runtime: Runtime,
-    mut streams: EventStreams,
-    session_config: SessionConfig,
-) -> io::Result<InteractiveReport> {
+/// error, cancelling live work first. Conversations live in a session
+/// registry: the first slot serves the canned submission, further slots
+/// arrive through `/session new`, and only the active slot is polled.
+async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
+    let (runtime, streams) = build_runtime()?;
     let session =
         SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?;
-    let mut front = Frontend::with_config(session, session_config);
+    let mut front = Frontend::with_config(session, session_config.clone());
+    front.state.set_session_label("s1");
+    let mut sessions = SessionRegistry::new(
+        SessionSlot {
+            label: "s1".to_owned(),
+            runtime,
+            streams,
+            front,
+        },
+        session_config,
+    );
     let mut gate = RefreshGate::m0_test();
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Canned M0 submission through the same command path as typed input. The
     // draft is recorded and the run adopted only after `Accepted`.
-    let submit = submit_command(
-        front.next_request(),
-        front.session.clone(),
-        DEMO_INPUT,
-        DEMO_PROFILE,
-    )
-    .map_err(io::Error::other)?;
-    let reply = runtime.handle(submit).await.0;
-    if settle_submit(&mut front, DEMO_INPUT, &reply) {
-        front.state.notice("canned M0 submission accepted");
+    {
+        let slot = sessions.active_mut();
+        let submit = submit_command(
+            slot.front.next_request(),
+            slot.front.session.clone(),
+            DEMO_INPUT,
+            DEMO_PROFILE,
+        )
+        .map_err(io::Error::other)?;
+        let reply = slot.runtime.handle(submit).await.0;
+        if settle_submit(&mut slot.front, DEMO_INPUT, &reply) {
+            slot.front.state.notice("canned M0 submission accepted");
+        }
     }
     gate.request();
 
-    let result = interactive_loop(
-        &runtime,
-        &mut streams,
-        &mut front,
-        &mut gate,
-        &mut terminal,
-        &mut interval,
-    )
-    .await;
+    let result = interactive_loop(&mut sessions, &mut gate, &mut terminal, &mut interval).await;
 
-    // Quit, terminal, and error exits all pass through here: while the run
-    // has no terminal outcome, cancel it and reconcile within a bounded
+    // Quit, terminal, and error exits all pass through here: every slot
+    // with no terminal outcome cancels and reconciles within a bounded
     // window before the terminal is restored.
-    let unresolved_blocking = if front.merger.is_finalized() {
-        false
-    } else {
-        reconcile_after_stop(&runtime, &mut streams, &mut front, "exit").await
-    };
+    let mut unresolved_blocking = false;
+    for slot in &mut sessions.slots {
+        if !slot.front.merger.is_finalized() {
+            unresolved_blocking |=
+                reconcile_after_stop(&slot.runtime, &mut slot.streams, &mut slot.front, "exit")
+                    .await;
+        }
+    }
     Ok(InteractiveReport {
         result,
         unresolved_blocking,
@@ -1040,9 +1284,7 @@ async fn interactive(
 }
 
 async fn interactive_loop(
-    runtime: &Runtime,
-    streams: &mut EventStreams,
-    front: &mut Frontend,
+    sessions: &mut SessionRegistry,
     gate: &mut RefreshGate,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     interval: &mut tokio::time::Interval,
@@ -1050,18 +1292,30 @@ async fn interactive_loop(
     let mut event_since_tick = false;
     loop {
         let mut dirty = false;
-        match next_loop_step(interval, &mut streams.data, &mut streams.control).await {
+        // Only the active slot is polled and drawn; background slots keep
+        // buffering in their bounded channels until switched back to. The
+        // borrow ends before the step is handled so a session switch inside
+        // key handling can move the active index freely.
+        let step = {
+            let slot = sessions.active_mut();
+            next_loop_step(interval, &mut slot.streams.data, &mut slot.streams.control).await
+        };
+        match step {
             // A closed channel ends input, but the other one may still hold
             // queued events: apply everything already committed before exit
             // so a close racing the terminal cannot drop the outcome.
             LoopStep::Closed => {
-                let drained =
-                    drain_available(&mut streams.data, &mut streams.control, &mut front.merger);
-                front.apply_events(drained);
-                let flushed = front.merger.flush();
-                front.apply_events(flushed);
-                front.report_merger();
-                draw(terminal, front)?;
+                let slot = sessions.active_mut();
+                let drained = drain_available(
+                    &mut slot.streams.data,
+                    &mut slot.streams.control,
+                    &mut slot.front.merger,
+                );
+                slot.front.apply_events(drained);
+                let flushed = slot.front.merger.flush();
+                slot.front.apply_events(flushed);
+                slot.front.report_merger();
+                draw(terminal, &mut slot.front)?;
                 return Ok(());
             }
             LoopStep::Event(event) => {
@@ -1070,23 +1324,37 @@ async fn interactive_loop(
                 // A terminal outcome stays on screen and the loop keeps
                 // serving: the next `Accepted` submit adopts a new run.
                 // Only quit, close, or an I/O error ends the loop.
-                if absorb(front, event, streams) {
-                    draw(terminal, front)?;
+                let slot = sessions.active_mut();
+                if absorb(&mut slot.front, event, &mut slot.streams) {
+                    draw(terminal, &mut slot.front)?;
                 }
             }
             LoopStep::Tick => {
-                let batch = handle_key_batch(front, runtime, read_key, MAX_KEYS_PER_TICK).await?;
+                let batch = {
+                    let slot = sessions.active_mut();
+                    handle_key_batch(&mut slot.front, &slot.runtime, read_key, MAX_KEYS_PER_TICK)
+                        .await?
+                };
                 if batch.quit {
                     return Ok(());
                 }
                 dirty |= batch.handled > 0;
-                if !event_since_tick && front.merger.has_pending() {
-                    let flushed = front.merger.flush();
-                    front.report_merger();
+                // Drain queued session intents against the registry in
+                // recording order: creation moves the active slot, so later
+                // intents resolve after earlier ones.
+                let cmds = sessions.active_mut().front.take_session_cmds();
+                for cmd in &cmds {
+                    handle_session_command(sessions, cmd);
+                    dirty = true;
+                }
+                let slot = sessions.active_mut();
+                if !event_since_tick && slot.front.merger.has_pending() {
+                    let flushed = slot.front.merger.flush();
+                    slot.front.report_merger();
                     if !flushed.is_empty() {
                         dirty = true;
-                        if front.apply_events(flushed) {
-                            draw(terminal, front)?;
+                        if slot.front.apply_events(flushed) {
+                            draw(terminal, &mut slot.front)?;
                         }
                     }
                 }
@@ -1098,7 +1366,7 @@ async fn interactive_loop(
         }
         let now = Instant::now();
         if gate.ready(now) {
-            draw(terminal, front)?;
+            draw(terminal, &mut sessions.active_mut().front)?;
             gate.mark_drawn(now);
         }
     }
@@ -2708,6 +2976,167 @@ mod cov_main_topup {
         (run, front)
     }
 
+    /// One registry slot over the demo wiring, labelled for the header.
+    fn slot(label: &str, session: &str, template: &SessionConfig) -> SessionSlot {
+        let (runtime, streams) = build_runtime().expect("demo wiring builds");
+        let mut front = Frontend::with_config(
+            SessionId::new(session).expect("test session id is valid"),
+            template.clone(),
+        );
+        front.state.set_session_label(label);
+        SessionSlot {
+            label: label.to_owned(),
+            runtime,
+            streams,
+            front,
+        }
+    }
+
+    /// Wraps one front+runtime+streams triple into a single-slot registry so
+    /// loop-level tests exercise the production entry point.
+    fn registry_with(
+        label: &str,
+        front: Frontend,
+        runtime: Runtime,
+        streams: EventStreams,
+    ) -> SessionRegistry {
+        SessionRegistry {
+            slots: vec![SessionSlot {
+                label: label.to_owned(),
+                runtime,
+                streams,
+                front,
+            }],
+            active: 0,
+            template: defaults_config(),
+        }
+    }
+
+    /// A one-slot registry over the empty startup document.
+    fn registry() -> SessionRegistry {
+        let template = defaults_config();
+        let first = slot("s1", "sess-test-1", &template);
+        SessionRegistry::new(first, template)
+    }
+
+    #[test]
+    fn session_targets_resolve_by_index_label_or_exact_id() {
+        let sessions = registry();
+        assert_eq!(sessions.resolve_target("1"), Some(0));
+        assert_eq!(sessions.resolve_target("s1"), Some(0));
+        assert_eq!(sessions.resolve_target("sess-test-1"), Some(0));
+        for unknown in ["", "0", "2", "9", "s2", "sess-test-2", "S1", "s 1"] {
+            assert_eq!(
+                sessions.resolve_target(unknown),
+                None,
+                "{unknown:?} resolves to nothing, never a guess"
+            );
+        }
+    }
+
+    #[test]
+    fn session_switch_moves_only_to_live_slots() {
+        let mut sessions = registry();
+        assert!(!sessions.switch(0), "the active slot is not re-entered");
+        assert!(!sessions.switch(7), "out-of-range indices change nothing");
+        assert_eq!(sessions.active, 0);
+
+        let template = defaults_config();
+        sessions.slots.push(slot("s2", "sess-test-2", &template));
+        assert_eq!(sessions.resolve_target("2"), Some(1));
+        assert_eq!(sessions.resolve_target("s2"), Some(1));
+        assert!(sessions.switch(1));
+        assert_eq!(sessions.active, 1);
+        assert!(!sessions.switch(1));
+        assert!(sessions.switch(0));
+        assert_eq!(sessions.active, 0);
+    }
+
+    #[test]
+    fn session_create_labels_switches_and_announces() {
+        let mut sessions = registry();
+        let index = sessions.create().expect("creation succeeds on demo wiring");
+        assert_eq!(index, 1);
+        assert_eq!(sessions.active, 1);
+        assert_eq!(sessions.len(), 2);
+        let active = sessions.active();
+        assert_eq!(active.label, "s2");
+        assert_eq!(active.front.session.as_str(), format!("{DEMO_SESSION}-2"));
+        assert_eq!(active.front.state.session_label(), Some("s2"));
+        assert!(
+            transcript(&active.front).contains("session s2 started"),
+            "the new slot announces itself in its own history"
+        );
+    }
+
+    #[test]
+    fn session_commands_answer_inline_without_quitting() {
+        let mut sessions = registry();
+        assert!(!handle_session_command(&mut sessions, &SessionArgs::Show));
+        assert!(
+            transcript(&sessions.active().front).contains("session s1 (sess-test-1)"),
+            "show names the active session and its runtime id"
+        );
+
+        assert!(!handle_session_command(&mut sessions, &SessionArgs::Usage));
+        assert!(
+            transcript(&sessions.active().front).contains("/session new"),
+            "usage explains instead of guessing"
+        );
+
+        assert!(!handle_session_command(
+            &mut sessions,
+            &SessionArgs::Switch("nope".to_owned())
+        ));
+        assert!(
+            transcript(&sessions.active().front).contains("unknown session nope"),
+            "unknown targets name themselves and hint at the list"
+        );
+
+        assert!(!handle_session_command(
+            &mut sessions,
+            &SessionArgs::Switch("1".to_owned())
+        ));
+        assert!(
+            transcript(&sessions.active().front).contains("already on session s1"),
+            "re-selecting the active slot is a no-op notice"
+        );
+
+        assert!(!handle_session_command(&mut sessions, &SessionArgs::New));
+        assert_eq!(sessions.active, 1);
+        assert!(!handle_session_command(&mut sessions, &SessionArgs::List));
+        let listed = transcript(&sessions.active().front);
+        assert!(
+            listed.contains("s1 (sess-test-1)") && listed.contains("[active]"),
+            "the list marks the active slot: {listed:?}"
+        );
+
+        assert!(!handle_session_command(
+            &mut sessions,
+            &SessionArgs::Switch("s1".to_owned())
+        ));
+        assert_eq!(sessions.active, 0);
+        assert!(
+            transcript(&sessions.active().front).contains("switched to session s1"),
+            "switching announces the arrival in the target history"
+        );
+    }
+
+    #[test]
+    fn session_creation_stops_at_the_live_slot_cap() {
+        let mut sessions = registry();
+        while sessions.len() < MAX_SESSIONS {
+            sessions.create().expect("slots admit up to the cap");
+        }
+        assert_eq!(sessions.len(), MAX_SESSIONS);
+        assert!(!handle_session_command(&mut sessions, &SessionArgs::New));
+        assert_eq!(sessions.len(), MAX_SESSIONS, "the cap holds");
+        assert!(
+            transcript(&sessions.active().front).contains("session limit reached"),
+            "the refusal is explicit, never a silent drop"
+        );
+    }
+
     #[test]
     fn boot_model_prefers_recent_then_favourites_then_admission_order() {
         assert_eq!(boot_model(&UserConfig::default_config()), None);
@@ -3354,25 +3783,19 @@ mod cov_main_topup {
 
     #[tokio::test]
     async fn interactive_loop_ends_at_once_when_both_channels_close() {
-        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (runtime, _) = build_runtime().expect("demo wiring is valid");
         let run = run_id("run-loop-closed");
         let mut front = Frontend::new(session());
         front.merger.adopt(&run);
-        let mut streams = closed_streams();
+        let mut sessions = registry_with("s1", front, runtime, closed_streams());
         let mut gate = RefreshGate::m0_test();
         let mut interval = interval();
         let mut terminal = fixed_terminal();
 
-        interactive_loop(
-            &runtime,
-            &mut streams,
-            &mut front,
-            &mut gate,
-            &mut terminal,
-            &mut interval,
-        )
-        .await
-        .expect("a closed channel pair ends the loop cleanly");
+        interactive_loop(&mut sessions, &mut gate, &mut terminal, &mut interval)
+            .await
+            .expect("a closed channel pair ends the loop cleanly");
+        let front = &sessions.active().front;
         assert_eq!(front.merger.active_run(), Some(&run));
         assert_eq!(front.state.last_seq(), None, "no event was applied");
     }
@@ -3385,10 +3808,6 @@ mod cov_main_topup {
         front.merger.adopt(&run);
         let (data_tx, data_rx) = mpsc::channel::<RunEvent>(4);
         let (control_tx, control_rx) = mpsc::channel::<RunEvent>(4);
-        let mut streams = EventStreams {
-            data: data_rx,
-            control: control_rx,
-        };
         data_tx.try_send(started(&run, 0)).expect("capacity");
         data_tx.try_send(finished(&run, 1)).expect("capacity");
         // Both senders are dropped up front: whatever the channel race
@@ -3396,26 +3815,29 @@ mod cov_main_topup {
         // queued events before exiting, so both are always applied.
         drop(data_tx);
         drop(control_tx);
+        let mut sessions = registry_with(
+            "s1",
+            front,
+            runtime,
+            EventStreams {
+                data: data_rx,
+                control: control_rx,
+            },
+        );
         let mut gate = RefreshGate::m0_test();
         let mut interval = interval();
         let mut terminal = fixed_terminal();
 
         // The terminal outcome is applied and presented, but the loop no
         // longer ends on it: only the channel close ends the loop.
-        interactive_loop(
-            &runtime,
-            &mut streams,
-            &mut front,
-            &mut gate,
-            &mut terminal,
-            &mut interval,
-        )
-        .await
-        .expect("the loop ends on close after applying the terminal outcome");
+        interactive_loop(&mut sessions, &mut gate, &mut terminal, &mut interval)
+            .await
+            .expect("the loop ends on close after applying the terminal outcome");
+        let front = &sessions.active().front;
         assert_eq!(front.state.last_seq(), Some(1), "both events were applied");
         assert!(front.state.is_finished(), "the outcome was presented");
         assert!(
-            transcript(&front).contains(&format!("run {} started", run.as_str())),
+            transcript(front).contains(&format!("run {} started", run.as_str())),
             "the applied event is presented"
         );
     }

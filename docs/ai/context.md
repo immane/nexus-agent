@@ -29,7 +29,7 @@
 | `nexus-openai` | Real OpenAI-compatible chat adapter over blocking std I/O: `http` direct, `https` via the system `openssl s_client` TLS bridge (verified, no vendored TLS crate). Sends `stream:true`, parses SSE incrementally (`data:` chunks + `[DONE]`, chunked framing) with live text/usage sink delivery; candidates + terminal stay in the returned aggregated batch. Opts into incremental streaming. Cancellation/deadlines between read quanta; unknown usage stays unknown. |
 | `nexus-runtime` | Single-active-run loop: scoped policy, live cancellation/deadlines, quarantined workers until termination, contiguous per-run sequencing, honest terminal outcomes. Publishes provisional provider prefixes live per run while the turn streams (text flushed at once, previews, usage estimates; candidates/terminals withheld to the validated batch; join-drain covers the channel race), then ingests the authoritative batch without replay. `Runtime::try_new` validates everything up front. |
 | `nexus-server` | Loopback HTTP frontend (`127.0.0.1` only, no auth): one `Runtime` per session, SSE event streams (single subscriber, terminal-drain fix applied), exact-identity approve/deny, per-session provider selection, `--tools real|fake`. |
-| `nexus-tui` | Interactive TUI: persistent multi-run loop, modal approval card (auto-focus on arrival, `i` inspect, `a`/`d` decide, `Esc` parks never cancels), slash commands (`/help /model /usage /quit`), viewport `m` model cycling, header shows project dir, composer shows model@provider, footer shows token counters (`?` never `0`). |
+| `nexus-tui` | Interactive TUI: persistent multi-run loop, local session registry (one runtime/history per slot, `/session new|list|switch`, 16-slot cap, header `sess:` segment, per-slot focus/approval preserved; only the active slot is polled), modal approval card (auto-focus on arrival, `i` inspect, `a`/`d` decide, `Esc` parks never cancels), slash commands (`/help /model /session /usage /quit`), viewport `m` model cycling, header shows project dir, composer shows model@provider, footer shows token counters (`?` never `0`). |
 | `nexus-headless` | One-shot machine-output runner over scripted fakes. |
 | `nexus-integration` | Cross-crate behavior + review regression tests. |
 
@@ -67,7 +67,7 @@
 ## Open gaps (prioritized, honest)
 
 1. Real provider streams incrementally end to end (wire SSE → provisional TUI/server deltas). Remaining provider work: per-run model override for real execution (session-level only; needs `ModelRequest` change).
-2. No real tools besides `host_read`; no write/exec tools; TUI still fake-only for tools, and still a single in-process session (server multi-session picker wiring not started).
+2. No real tools besides `host_read`; no write/exec tools; TUI sessions are local demo runtimes (remote server backend plugs into the same picker next; server approval JSON lacks `expires_at`, needed for faithful remote cards).
 3. Ephemeral store only; no durable sessions/resume; no auth/TLS on server (localhost-only by design).
 4. Linux same-toolchain validation, exact toolchain pin, PTY/idle/streaming baselines still open (M0).
 5. `docs/contracts/05-configuration.md` ("no format selected") is now stale; contract-doc edits need explicit approval.

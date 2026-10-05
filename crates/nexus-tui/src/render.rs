@@ -153,6 +153,9 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
     // The directory trails every existing segment, so frames that never
     // set it render byte-identically and narrow frames clip the path
     // before any status marker.
+    if let Some(label) = state.session_label() {
+        spans.push(Span::raw(format!(" sess:{label}")));
+    }
     if let Some(dir) = state.project_dir() {
         spans.push(Span::raw(format!(" dir:{}", abbreviate_home(dir))));
     }
@@ -1768,6 +1771,18 @@ mod cov_render_private {
     }
 
     #[test]
+    fn header_hides_the_session_label_until_one_is_recorded() {
+        let state = AppState::new();
+        let area = Rect::new(0, 0, 80, 1);
+        let header = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(!header.contains("sess:"), "{header:?}");
+        assert!(header.contains("focus:viewport"), "{header:?}");
+    }
+
+    #[test]
     fn header_hides_the_directory_until_one_is_recorded() {
         let state = AppState::new();
         let area = Rect::new(0, 0, 80, 1);
@@ -1777,6 +1792,23 @@ mod cov_render_private {
             .clone();
         assert!(!header.contains("dir:"), "{header:?}");
         assert!(header.contains("focus:viewport"), "{header:?}");
+    }
+
+    #[test]
+    fn header_shows_the_session_label_before_the_directory() {
+        let mut state = AppState::new();
+        state.set_session_label("s2");
+        state.set_project_dir("/Volumes/work/proj");
+        let area = Rect::new(0, 0, 120, 1);
+        let header = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(header.contains("sess:s2"), "{header:?}");
+        assert!(
+            header.find("sess:").expect("session") < header.find("dir:").expect("dir"),
+            "the session slot precedes the directory: {header:?}"
+        );
     }
 
     #[test]
