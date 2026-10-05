@@ -2220,3 +2220,703 @@ mod tests {
         assert!(!gate.ready(start + Duration::from_millis(34)));
     }
 }
+
+/// Coverage for the private helpers no external caller can reach on its own:
+/// the bounded-text cut flags, geometry recording, detail-view row tracking,
+/// and the approval gate's internal flags. All of it is deterministic and
+/// clock-free; nothing here changes production behavior.
+#[cfg(test)]
+mod cov_state_private {
+    use super::*;
+    use nexus_core::{ApprovalId, ApprovalNotice, RequestId, SessionId};
+
+    /// Injected cache height that must never survive a fingerprint change.
+    const POISONED: usize = 9_999;
+
+    fn cov_session() -> SessionId {
+        SessionId::new("cov-sess").expect("valid")
+    }
+
+    fn cov_run() -> RunId {
+        RunId::new("cov-run").expect("valid")
+    }
+
+    fn started(seq: u64) -> RunEvent {
+        RunEvent::new(
+            cov_session(),
+            cov_run(),
+            seq,
+            EventPayload::RunStarted {
+                request: RequestId::new("cov-req").expect("valid"),
+            },
+        )
+    }
+
+    fn approval_notice(seq: u64, summary: &str) -> RunEvent {
+        let notice = ApprovalNotice::new(
+            ApprovalId::new("cov-a").expect("valid"),
+            CallId::new("cov-c").expect("valid"),
+            summary,
+            "project scope",
+            Duration::from_secs(120),
+        )
+        .expect("notice builds");
+        RunEvent::new(
+            cov_session(),
+            cov_run(),
+            seq,
+            EventPayload::ApprovalRequired(notice),
+        )
+    }
+
+    /// State holding one live, unmeasured approval card.
+    fn card_state() -> AppState {
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        assert!(state.apply_event(&approval_notice(1, "run tool host_write")));
+        state
+    }
+
+    /// State parked at the entry-count retention bound.
+    fn filled_state() -> AppState {
+        let mut state = AppState::new();
+        for index in 0..(MAX_RETAINED_ENTRIES + 2) {
+            state.push_tool(format!("tool {index}"), vec!["body".to_owned()]);
+        }
+        assert_eq!(state.entry_count(), MAX_RETAINED_ENTRIES);
+        assert!(state.dropped_entries > 0);
+        state
+    }
+
+    fn geometry(
+        inner_width: usize,
+        inner_rows: usize,
+        detail_rows: usize,
+        clipped: bool,
+    ) -> ApprovalGeometry {
+        ApprovalGeometry {
+            inner_width,
+            inner_rows,
+            detail_rows,
+            clipped,
+        }
+    }
+
+    /// The fingerprint production code computed for `width`.
+    fn live_key(entry: &Entry, width: usize) -> HeightKey {
+        assert!(entry.wrapped_len(width) > 0);
+        entry.height_cache.get().expect("cache is filled").key
+    }
+
+    fn poison(entry: &Entry, key: HeightKey) {
+        entry.height_cache.set(Some(HeightCache {
+            key,
+            height: POISONED,
+        }));
+    }
+
+    #[test]
+    fn safe_prefix_keeps_short_and_exact_text_whole() {
+        assert_eq!(safe_prefix("abc", 10), "abc");
+        assert_eq!(safe_prefix("abc", 3), "abc", "the exact bound is not a cut");
+        assert_eq!(safe_prefix("abc", 0), "", "no bytes means no text");
+        assert_eq!(safe_prefix("", 4), "");
+        assert_eq!(safe_prefix("é", 1), "", "a 2-byte char does not fit 1 byte");
+        assert_eq!(safe_prefix("aé", 2), "a");
+        assert_eq!(safe_prefix("aé", 3), "aé");
+    }
+
+    #[test]
+    fn titles_are_flattened_escaped_and_cut_on_a_char_boundary() {
+        assert_eq!(bounded_title("plain"), "plain");
+        assert_eq!(bounded_title(""), "");
+        assert_eq!(
+            bounded_title("line\nbreak"),
+            "line break",
+            "a title is one line"
+        );
+        assert_eq!(
+            bounded_title("\x1b[2Jclean"),
+            "clean",
+            "escapes never reach it"
+        );
+        assert_eq!(
+            bounded_title("safe\u{202E}tail"),
+            "safe\\u{202E}tail",
+            "an attempted reorder stays visible"
+        );
+
+        let exact = "é".repeat(MAX_TITLE_BYTES / 2);
+        assert_eq!(exact.len(), MAX_TITLE_BYTES);
+        assert_eq!(bounded_title(&exact), exact, "a title at the bound is kept");
+        let cut = bounded_title(&format!("a{exact}"));
+        assert!(
+            cut.len() < MAX_TITLE_BYTES,
+            "an over-bound title is cut: {} bytes",
+            cut.len()
+        );
+        assert!(
+            cut.chars().all(|char| char == 'a' || char == 'é'),
+            "the cut backs off to a character boundary"
+        );
+        assert_eq!(
+            bounded_title(&"t".repeat(MAX_TITLE_BYTES * 2)).len(),
+            MAX_TITLE_BYTES
+        );
+    }
+
+    #[test]
+    fn bounded_text_flags_a_cut_after_sanitizing_and_flattening() {
+        let (text, cut) = bounded_text("plain", 5);
+        assert_eq!(text, "plain");
+        assert!(!cut, "the exact bound is not a cut");
+
+        let (text, cut) = bounded_text("newline\nhere", 64);
+        assert_eq!(text, "newline here", "newlines flatten before bounding");
+        assert!(!cut);
+
+        let (text, cut) = bounded_text("abcdef", 3);
+        assert_eq!(text, "abc");
+        assert!(cut);
+
+        let (text, cut) = bounded_text("anything", 0);
+        assert_eq!(text, "");
+        assert!(cut, "an impossible bound cuts instead of passing text");
+
+        let (text, cut) = bounded_text(&"é".repeat(4), 5);
+        assert!(cut);
+        assert_eq!(text.len(), 4, "the cut backs off to a char boundary");
+        assert!(text.chars().all(|char| char == 'é'));
+
+        let (text, cut) = bounded_text(&"a\nb".repeat(10), 19);
+        assert!(cut, "flattened bytes are charged against the bound");
+        assert!(text.len() <= 19);
+        assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn an_absent_preview_is_not_a_cut() {
+        assert_eq!(bounded_optional_text(None, 64), (None, false));
+        let (preview, cut) = bounded_optional_text(Some("args"), 64);
+        assert_eq!(preview.as_deref(), Some("args"));
+        assert!(!cut);
+        let (preview, cut) = bounded_optional_text(Some("args preview"), 4);
+        assert_eq!(preview.as_deref(), Some("args"));
+        assert!(cut, "the bounded helper's cut flag is propagated");
+        let (preview, cut) = bounded_optional_text(Some("a\nb"), 64);
+        assert_eq!(
+            preview.as_deref(),
+            Some("a b"),
+            "previews flatten newlines too"
+        );
+        assert!(!cut);
+    }
+
+    #[test]
+    fn chunking_is_char_based_and_always_makes_progress() {
+        assert_eq!(chunks("", 4).count(), 0, "an empty string yields no chunk");
+        assert_eq!(chunks("abc", 3).collect::<Vec<_>>(), vec!["abc"]);
+        assert_eq!(
+            chunks("abcdefg", 3).collect::<Vec<_>>(),
+            vec!["abc", "def", "g"]
+        );
+        assert_eq!(
+            chunks("abcdef", 0).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d", "e", "f"],
+            "a zero width still advances one char at a time"
+        );
+        assert_eq!(
+            chunks("éé", 1).collect::<Vec<_>>(),
+            vec!["é", "é"],
+            "chunks are characters, not bytes"
+        );
+        assert_eq!(chunks("héllo", 4).collect::<Vec<_>>(), vec!["héll", "o"]);
+    }
+
+    #[test]
+    fn wrapping_primitives_measure_chars_and_reserve_the_body_indent() {
+        assert_eq!(wrapped_height("", 10), 1, "an empty line still takes a row");
+        assert_eq!(
+            wrapped_height("abc", 0),
+            3,
+            "a zero width degrades to one char"
+        );
+        assert_eq!(wrapped_height("abcde", 5), 1);
+        assert_eq!(
+            wrapped_height("abcde", 4),
+            2,
+            "an exact multiple adds no row"
+        );
+        assert_eq!(wrapped_height("abcdefgh", 4), 2);
+
+        assert_eq!(body_width(0), 1, "the indent never exhausts the frame");
+        assert_eq!(body_width(1), 1);
+        assert_eq!(body_width(2), 1);
+        assert_eq!(body_width(80), 80 - BODY_INDENT);
+
+        assert_eq!(folded_text("title", 3), "title  [folded, 3 lines]");
+        assert_eq!(folded_text("", 0), "  [folded, 0 lines]");
+    }
+
+    #[test]
+    fn emit_line_skips_earlier_rows_and_stops_at_the_budget() {
+        let mut out = vec!["pre".to_owned()];
+        let mut index = 0;
+        assert!(!emit_line(&mut out, &mut index, 0, 4, "tail", false));
+        assert_eq!(index, 1, "a skipped row still advances the cursor");
+        assert_eq!(out, vec!["pre".to_owned(), "tail".to_owned()]);
+
+        let mut window = Vec::new();
+        let mut cursor = 0;
+        emit_line(&mut window, &mut cursor, 2, usize::MAX, "skipped", true);
+        assert!(
+            window.is_empty(),
+            "rows above the skip offset are never materialized"
+        );
+        assert_eq!(cursor, 1);
+        emit_line(&mut window, &mut cursor, 1, usize::MAX, "body", true);
+        assert_eq!(
+            window,
+            vec!["  body".to_owned()],
+            "body rows carry the indent"
+        );
+        assert_eq!(cursor, 2);
+
+        let mut budget = Vec::new();
+        let mut at = 0;
+        assert!(!emit_line(&mut budget, &mut at, 0, 2, "one", false));
+        assert!(
+            emit_line(&mut budget, &mut at, 0, 2, "two", false),
+            "filling the budget stops the caller"
+        );
+        assert!(
+            emit_line(&mut budget, &mut at, 0, 2, "three", false),
+            "an already full budget stops without emitting"
+        );
+        assert_eq!(budget, vec!["one".to_owned(), "two".to_owned()]);
+    }
+
+    #[test]
+    fn render_range_honors_skip_take_and_empty_titles() {
+        let mut entry = Entry::new(EntryKind::Assistant, "assistant");
+        entry.push_line("body");
+
+        let mut none = Vec::new();
+        entry.render_range(40, 0, 0, &mut none);
+        assert!(none.is_empty(), "a zero budget renders nothing");
+
+        let mut past = Vec::new();
+        entry.render_range(40, 99, 10, &mut past);
+        assert!(past.is_empty(), "a skip past the entry renders nothing");
+
+        let full = render_entry_lines(&entry, 40);
+        assert_eq!(full, vec!["assistant".to_owned(), "  body".to_owned()]);
+        let mut slice = Vec::new();
+        entry.render_range(40, 1, 1, &mut slice);
+        assert_eq!(slice, vec![full[1].clone()], "only the requested window");
+
+        let untitled = Entry::new(EntryKind::System, "");
+        assert_eq!(render_entry_lines(&untitled, 40), vec![String::new()]);
+        assert_eq!(untitled.wrapped_len(40), 1, "height and rendering agree");
+
+        // A fold marker that wraps at this width still honors the window.
+        let mut folded = Entry::new(EntryKind::Assistant, &"t".repeat(45));
+        folded.push_line("hidden");
+        folded.folded = true;
+        let all = render_entry_lines(&folded, 40);
+        assert_eq!(all.len(), 2, "the fold marker wraps at this width");
+        assert_eq!(
+            folded.wrapped_len(40),
+            wrapped_height(&folded_text(&folded.title, 1), 40)
+        );
+        let mut folded_slice = Vec::new();
+        folded.render_range(40, 1, 1, &mut folded_slice);
+        assert_eq!(folded_slice, vec![all[1].clone()]);
+    }
+
+    #[test]
+    fn the_height_cache_memoizes_on_every_fingerprint_field() {
+        let mut entry = Entry::new(EntryKind::Assistant, "assistant");
+        entry.push_line(&"a".repeat(50));
+        // Title 1 row plus 50 body chars at body width 38 = 2 rows.
+        assert_eq!(entry.wrapped_len(40), 3);
+        let key = live_key(&entry, 40);
+        assert_eq!(key.lines, 1);
+        assert_eq!(key.title_len, "assistant".len());
+        assert_eq!(key.tail_len, 50);
+        assert!(!key.folded);
+        assert!(!key.truncated);
+
+        poison(&entry, key);
+        assert_eq!(
+            entry.wrapped_len(40),
+            POISONED,
+            "an unchanged fingerprint reuses the cached height"
+        );
+        for changed in [
+            HeightKey { width: 41, ..key },
+            HeightKey { lines: 2, ..key },
+            HeightKey {
+                folded: true,
+                ..key
+            },
+            HeightKey {
+                truncated: true,
+                ..key
+            },
+            HeightKey {
+                title_len: key.title_len + 1,
+                ..key
+            },
+            HeightKey {
+                tail_len: key.tail_len + 1,
+                ..key
+            },
+        ] {
+            poison(&entry, changed);
+            assert_eq!(entry.wrapped_len(40), 3, "{changed:?} must be a cache miss");
+        }
+
+        // The cached key tracks the entry: one field moved, height redone.
+        entry.append_open("extra");
+        assert_eq!(entry.lines.len(), 1, "the fragment joins the open line");
+        let updated = live_key(&entry, 40);
+        assert_eq!(updated.lines, key.lines, "only the tail length moved");
+        assert_eq!(updated.tail_len, key.tail_len + 5);
+        assert_eq!(
+            entry.height_cache.get().expect("cache").height,
+            3,
+            "55 chars still wrap to two body rows at width 38"
+        );
+
+        // Truncation adds the marker rows, in height and in rendering.
+        entry.mark_truncated();
+        let truncated = entry.wrapped_len(40);
+        assert_eq!(
+            truncated,
+            3 + wrapped_height(TRUNCATION_MARKER, body_width(40))
+        );
+        assert_eq!(render_entry_lines(&entry, 40).len(), truncated);
+    }
+
+    #[test]
+    fn streamed_appends_stop_at_the_entry_byte_bound() {
+        let filler = MAX_ENTRY_BYTES - LINE_OVERHEAD - "assistant".len();
+        let mut full = Entry::new(EntryKind::Assistant, "assistant");
+        full.append_text(&"x".repeat(filler));
+        assert_eq!(full.retained_bytes(), MAX_ENTRY_BYTES);
+        assert!(full.open_line, "the line stays open for the next fragment");
+        let before = full.lines.clone();
+        full.append_text("more");
+        assert!(full.truncated, "an append past the bound is flagged");
+        assert_eq!(full.lines, before, "no bytes are added past the bound");
+        assert_eq!(full.retained_bytes(), MAX_ENTRY_BYTES);
+
+        // A partially fitting fragment keeps a safe prefix.
+        let mut nearly = Entry::new(EntryKind::Assistant, "assistant");
+        nearly.append_text(&"x".repeat(filler - 2));
+        nearly.append_text("yzw");
+        assert!(nearly.truncated);
+        assert_eq!(nearly.retained_bytes(), MAX_ENTRY_BYTES);
+        assert!(nearly.lines.last().expect("line").ends_with('z'));
+
+        // Appending to an entry with no lines materializes one.
+        let mut orphan = Entry::new(EntryKind::Assistant, "assistant");
+        orphan.append_open("orphan");
+        assert_eq!(orphan.lines, vec!["orphan".to_owned()]);
+
+        // An empty fragment changes nothing at all.
+        let mut blank = Entry::new(EntryKind::Assistant, "assistant");
+        blank.append_text("");
+        assert!(blank.lines.is_empty());
+        assert_eq!(blank.retained_bytes(), "assistant".len());
+    }
+
+    #[test]
+    fn a_stream_entry_restarts_when_the_tail_stops_matching() {
+        let mut state = AppState::new();
+        let key = StreamKey::Assistant {
+            turn: TurnId::new("t1").expect("valid"),
+            item: "item-0".to_owned(),
+        };
+        state.ensure_stream_entry(EntryKind::Assistant, "assistant", key.clone());
+        state.mutate_tail(|entry| entry.append_text("he"));
+        state.ensure_stream_entry(EntryKind::Assistant, "assistant", key.clone());
+        state.mutate_tail(|entry| entry.append_text("llo"));
+        assert_eq!(state.entry_count(), 1, "the same identity keeps one entry");
+        assert_eq!(
+            state.entry(0).expect("entry").lines,
+            vec!["hello".to_owned()]
+        );
+
+        // Folding the tail breaks adjacency even for the same identity.
+        assert!(state.toggle_fold(0));
+        state.ensure_stream_entry(EntryKind::Assistant, "assistant", key);
+        state.mutate_tail(|entry| entry.append_text("fresh"));
+        assert_eq!(state.entry_count(), 2, "a folded tail absorbs nothing");
+        assert_eq!(
+            state.entry(1).expect("entry").lines,
+            vec!["fresh".to_owned()],
+            "the new entry starts a fresh open line"
+        );
+    }
+
+    #[test]
+    fn notices_and_submissions_record_kinds_and_reset_the_view() {
+        let mut state = AppState::new();
+        state.notice("");
+        let entry = state.entry(0).expect("entry exists");
+        assert_eq!(entry.kind, EntryKind::System);
+        assert_eq!(
+            entry.lines,
+            vec![String::new()],
+            "an empty notice keeps one blank row"
+        );
+        assert_eq!(
+            render_entry_lines(entry, 40),
+            vec!["system".to_owned(), "  ".to_owned()],
+            "the blank body row still renders indented"
+        );
+        assert_eq!(entry.wrapped_len(40), 2, "height and rendering agree");
+
+        let mut live = filled_state();
+        live.move_selection(1);
+        live.scroll_up(3);
+        assert!(live.scrollback() > 0);
+        live.record_submitted("a\nb");
+        assert_eq!(live.scrollback(), 0, "submitting pins the view to the tail");
+        assert!(live.selected().is_none());
+        let submitted = live.entry(live.entry_count() - 1).expect("entry exists");
+        assert_eq!(submitted.kind, EntryKind::User);
+        assert_eq!(submitted.lines, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn retention_trim_keeps_the_selection_on_the_same_entry() {
+        let mut pinned = filled_state();
+        pinned.move_selection(1);
+        let selected = pinned.selected().expect("selection follows the last entry");
+        pinned.scroll_up(1);
+        let drops = pinned.dropped_entries;
+        pinned.push_tool("newest".to_owned(), vec!["body".to_owned()]);
+        assert_eq!(pinned.entry_count(), MAX_RETAINED_ENTRIES);
+        assert_eq!(pinned.dropped_entries, drops + 1);
+        assert_eq!(
+            pinned.selected(),
+            Some(selected - 1),
+            "the index follows its entry when the oldest is dropped"
+        );
+
+        let mut live = filled_state();
+        live.move_selection(1);
+        live.push_tool("newest".to_owned(), vec!["body".to_owned()]);
+        assert!(
+            live.selected().is_none(),
+            "an unpinned tail re-follows new output instead of keeping an index"
+        );
+    }
+
+    #[test]
+    fn geometry_recording_reports_the_latest_frame_only() {
+        assert_eq!(
+            ApprovalGeometry::default(),
+            geometry(0, 0, 0, false),
+            "an unrendered card measures nothing"
+        );
+        let mut state = card_state();
+        assert!(state.approval_geometry().is_none(), "no frame yet");
+
+        let compact = geometry(78, 24, 6, false);
+        state.set_approval_geometry(compact);
+        assert_eq!(state.approval_geometry(), Some(compact));
+        assert!(
+            state.approval_decision_allowed(),
+            "a complete compact card unlocks on its own"
+        );
+
+        let clipped = geometry(20, 2, 9, true);
+        state.set_approval_geometry(clipped);
+        assert_eq!(
+            state.approval_geometry(),
+            Some(clipped),
+            "the newest frame replaces the previous measurement"
+        );
+        assert!(!state.approval_decision_allowed());
+
+        // A replacement notice invalidates the measurement.
+        assert!(state.apply_event(&approval_notice(2, "run tool host_write again")));
+        assert!(
+            state.approval_geometry().is_none(),
+            "the new card has not been measured"
+        );
+        assert!(!state.approval_decision_allowed());
+        assert!(!state.approval_detail_open());
+
+        // So does issuing the decision.
+        state.set_approval_geometry(compact);
+        assert!(state.approval_decision_allowed());
+        state.resolve_approval();
+        assert!(state.approval_geometry().is_none());
+        assert_eq!(state.approval_detail_total_rows(), 0);
+        assert_eq!(state.approval_detail_view_rows(), 0);
+        assert_eq!(state.approval_detail_seen_through, 0);
+        assert!(!state.approval_detail_open());
+    }
+
+    #[test]
+    fn detail_row_measurement_clamps_scroll_and_needs_contiguous_coverage() {
+        let mut state = card_state();
+        state.inspect_approval();
+        // A zero-row viewport still records one row, so coverage can move.
+        state.record_approval_detail_view(0, 0, 6);
+        assert_eq!(state.approval_detail_view_rows(), 1);
+        assert_eq!(state.approval_detail_scroll_position(), 0);
+        assert!(!state.approval_detail_seen_all());
+
+        // A scroll past the final page is clamped to the final page.
+        state.record_approval_detail_view(99, 2, 6);
+        assert_eq!(state.approval_detail_scroll_position(), 4);
+        assert_eq!(
+            state.approval_detail_seen_through, 1,
+            "a frame starting past the seen cursor cannot advance coverage"
+        );
+
+        // Contiguous pages from row 1 reach the end.
+        state.record_approval_detail_view(1, 2, 6);
+        assert_eq!(state.approval_detail_seen_through, 3);
+        state.record_approval_detail_view(3, 2, 6);
+        assert_eq!(state.approval_detail_seen_through, 5);
+        state.record_approval_detail_view(4, 2, 6);
+        assert_eq!(state.approval_detail_seen_through, 6);
+        assert!(state.approval_detail_seen_all());
+        assert!(
+            state.approval_decision_allowed(),
+            "a clipped card unlocks after a complete contiguous inspection"
+        );
+
+        // Zero detail rows means there is nothing to have seen.
+        let mut bare = card_state();
+        bare.inspect_approval();
+        bare.record_approval_detail_view(0, 1, 0);
+        assert!(!bare.approval_detail_seen_all());
+        assert!(!bare.approval_decision_allowed());
+    }
+
+    #[test]
+    fn the_detail_view_needs_a_card_and_reopens_deliberately() {
+        let mut bare = AppState::new();
+        bare.open_approval_detail();
+        assert!(!bare.approval_detail_open(), "no card, no detail view");
+        bare.inspect_approval();
+        assert!(!bare.approval_detail_open());
+
+        let mut state = card_state();
+        state.inspect_approval();
+        state.record_approval_detail_view(0, 2, 6);
+        assert_eq!(
+            state.approval_detail_seen_through, 2,
+            "the first frame covers rows 0..2"
+        );
+        state.record_approval_detail_view(1, 2, 6);
+        assert_eq!(
+            state.approval_detail_seen_through, 3,
+            "row 1 is adjacent to what was seen"
+        );
+        state.open_approval_detail();
+        assert_eq!(
+            state.approval_detail_scroll_position(),
+            1,
+            "re-opening an open view keeps its row position"
+        );
+        assert_eq!(
+            state.approval_detail_seen_through, 3,
+            "and keeps its recorded coverage"
+        );
+    }
+
+    #[test]
+    fn detail_scrolling_is_inert_while_the_view_is_closed() {
+        let mut state = card_state();
+        state.inspect_approval();
+        state.record_approval_detail_view(0, 2, 6);
+        state.record_approval_detail_view(1, 2, 6);
+        assert_eq!(state.approval_detail_scroll_position(), 1);
+        state.approval_detail_page(0);
+        assert_eq!(
+            state.approval_detail_scroll_position(),
+            1,
+            "a zero-direction page never moves"
+        );
+        state.approval_detail_page(-1);
+        assert_eq!(
+            state.approval_detail_scroll_position(),
+            0,
+            "paging up clamps at the first row"
+        );
+
+        state.record_approval_detail_view(1, 2, 6);
+        state.close_approval_detail();
+        assert!(!state.approval_detail_open());
+        state.approval_detail_scroll(3);
+        state.approval_detail_page(1);
+        assert_eq!(
+            state.approval_detail_scroll_position(),
+            1,
+            "scroll and page are no-ops while closed"
+        );
+        assert_eq!(
+            state.approval_detail_seen_through, 3,
+            "closing keeps the recorded coverage"
+        );
+
+        state.inspect_approval();
+        assert!(state.approval_detail_open());
+        assert_eq!(
+            state.approval_detail_scroll_position(),
+            0,
+            "a reopened view restarts at row 0"
+        );
+        assert_eq!(
+            state.approval_detail_seen_through, 0,
+            "a reopened view re-requires inspection"
+        );
+        assert!(!state.approval_detail_seen_all());
+
+        // A page is one recorded viewport height, clamped at the last page.
+        state.record_approval_detail_view(0, 3, 9);
+        state.approval_detail_page(1);
+        assert_eq!(state.approval_detail_scroll_position(), 3);
+        state.approval_detail_page(1);
+        assert_eq!(state.approval_detail_scroll_position(), 6);
+        state.approval_detail_page(1);
+        assert_eq!(
+            state.approval_detail_scroll_position(),
+            6,
+            "paging past the last row clamps"
+        );
+        // A taller viewport re-clamps the retained scroll position.
+        state.record_approval_detail_view(3, 8, 9);
+        assert_eq!(state.approval_detail_scroll_position(), 1);
+    }
+
+    #[test]
+    fn the_gate_reads_stored_flags_not_rendered_output() {
+        let mut state = card_state();
+        // Forge the exact internal combination the gate consults.
+        state.approval_field_truncated = true;
+        state.set_approval_geometry(geometry(78, 24, 6, false));
+        assert!(state.approval_detail_truncated());
+        assert!(
+            !state.approval_decision_allowed(),
+            "a field cut at storage outranks a clean measurement"
+        );
+        // Coverage advances from any recorded frame, open view or not: the
+        // renderer is the only caller that records a frame it actually drew.
+        state.record_approval_detail_view(0, 64, 6);
+        assert!(state.approval_detail_seen_all());
+        assert!(
+            !state.approval_decision_allowed(),
+            "detail cut before storage can never be approved"
+        );
+    }
+}

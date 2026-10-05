@@ -64,7 +64,10 @@ const MAX_KEYS_PER_TICK: usize = 32;
 const MAX_REORDER_EVENTS: usize = 256;
 const DEMO_SESSION: &str = "sess-tui-m0-test";
 
-fn build_runtime() -> (Runtime, EventStreams) {
+/// Fallible production composition: the runtime validates limits, provider
+/// capabilities, and every tool registration before any run can start, so an
+/// invalid demo wiring is an explicit startup error, never a hung run.
+fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
     let config = RuntimeConfig {
         limits: Limits::m0_test(),
         policy: Policy::m0_test(),
@@ -75,7 +78,7 @@ fn build_runtime() -> (Runtime, EventStreams) {
         Arc::new(FakeTool::read_only()),
         Arc::new(FakeTool::mutation()),
     ];
-    Runtime::new(config, provider, tools)
+    Runtime::try_new(config, provider, tools).map_err(io::Error::other)
 }
 
 fn main() {
@@ -113,7 +116,7 @@ fn main() {
 }
 
 async fn run() -> io::Result<()> {
-    let (runtime, streams) = build_runtime();
+    let (runtime, streams) = build_runtime()?;
     if io::stdout().is_terminal() {
         match nexus_tui::TerminalGuard::setup() {
             Ok(mut guard) => {
@@ -1195,7 +1198,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_batches_are_bounded_and_stop_on_quit() {
-        let (runtime, _streams) = build_runtime();
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
         let keys: Vec<KeyEvent> = (0..100)
             .map(|_| KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()))
@@ -1295,7 +1298,7 @@ mod tests {
 
     #[tokio::test]
     async fn quit_while_approval_awaits_reconciles() {
-        let (runtime, mut streams) = build_runtime();
+        let (runtime, mut streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
         let submit = submit_command(
             front.next_request(),
@@ -1334,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn quit_path_cancels_and_reconciles_within_the_bound() {
-        let (runtime, mut streams) = build_runtime();
+        let (runtime, mut streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
         let submit = submit_command(
             front.next_request(),
@@ -1351,6 +1354,1331 @@ mod tests {
             "cancellation reconciles while the run awaits approval"
         );
         assert!(front.merger.is_finalized());
+        assert!(front.state.is_finished());
+    }
+}
+
+/// Coverage for the binary's private loop internals.
+///
+/// [`EventMerger`], the persistent tick, key batching, and quit
+/// reconciliation live in this binary target and are therefore unreachable
+/// from the library or integration tests. Each case below asserts the
+/// documented invariant directly, reads private merger state where the
+/// bound itself is the claim, and waits only inside an explicit bound.
+#[cfg(test)]
+mod cov_main_private {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use nexus_core::{AssistantText, PersistenceState, RunFinished, RunOutcome, TurnId};
+
+    fn session() -> SessionId {
+        SessionId::new("sess-cov").expect("valid")
+    }
+
+    fn run_id(id: &str) -> RunId {
+        RunId::new(id).expect("valid")
+    }
+
+    fn request(id: &str) -> RequestId {
+        RequestId::new(id).expect("valid")
+    }
+
+    fn started(run: &RunId, seq: u64) -> RunEvent {
+        RunEvent::new(
+            session(),
+            run.clone(),
+            seq,
+            EventPayload::RunStarted {
+                request: request("req-cov"),
+            },
+        )
+    }
+
+    fn text(run: &RunId, seq: u64, body: &str) -> RunEvent {
+        RunEvent::new(
+            session(),
+            run.clone(),
+            seq,
+            EventPayload::AssistantTextDelta(
+                AssistantText::new(TurnId::new("t1-0").expect("valid"), "item-0", body)
+                    .expect("fragment builds"),
+            ),
+        )
+    }
+
+    fn finished(run: &RunId, seq: u64) -> RunEvent {
+        RunEvent::new(
+            session(),
+            run.clone(),
+            seq,
+            EventPayload::RunFinished(
+                RunFinished::new(RunOutcome::Completed, PersistenceState::Ephemeral, None)
+                    .expect("terminal record builds"),
+            ),
+        )
+    }
+
+    fn seqs(events: &[RunEvent]) -> Vec<u64> {
+        events.iter().map(|event| event.seq()).collect()
+    }
+
+    fn interval() -> tokio::time::Interval {
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    }
+
+    /// Receivers whose senders are already gone: every read reports closed.
+    fn closed_streams() -> EventStreams {
+        let (data_tx, data_rx) = mpsc::channel::<RunEvent>(1);
+        let (control_tx, control_rx) = mpsc::channel::<RunEvent>(1);
+        drop(data_tx);
+        drop(control_tx);
+        EventStreams {
+            data: data_rx,
+            control: control_rx,
+        }
+    }
+
+    /// A frontend holding a run the runtime never issued, so cancellation can
+    /// never produce a terminal outcome for it.
+    fn adopted_orphan() -> (RunId, Frontend) {
+        let run = run_id("run-orphan");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        (run, front)
+    }
+
+    fn user_line_count(front: &Frontend) -> usize {
+        front
+            .state
+            .transcript()
+            .iter()
+            .filter(|line| line.starts_with("[User]"))
+            .count()
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn merger_emits_reversed_cross_channel_traffic_once() {
+        let run = run_id("run-reversed");
+        let mut merger = EventMerger::new();
+        merger.adopt(&run);
+
+        // Fully reversed arrival, as two channels with no shared ordering can
+        // deliver it: nothing is emitted until the head sequence shows up.
+        let mut emitted = Vec::new();
+        for seq in [4, 3, 2, 1, 0] {
+            emitted.extend(merger.push(match seq {
+                4 => finished(&run, seq),
+                _ => text(&run, seq, "fragment"),
+            }));
+        }
+
+        assert_eq!(seqs(&emitted), vec![0, 1, 2, 3, 4], "contiguous order");
+        assert_eq!(
+            emitted.iter().filter(|event| event.is_terminal()).count(),
+            1,
+            "the outcome is emitted exactly once"
+        );
+        assert_eq!(
+            *emitted.last().expect("outcome emitted"),
+            finished(&run, 4),
+            "the terminal outcome is always last"
+        );
+        assert_eq!(merger.gaps(), 0);
+        assert_eq!(merger.rejected(), 0);
+        assert!(merger.is_finalized());
+        assert!(!merger.has_pending());
+        assert!(!merger.has_terminal());
+    }
+
+    #[test]
+    fn merger_rejects_pre_adoption_old_duplicate_and_post_terminal_traffic() {
+        let run = run_id("run-guard");
+        let stale = run_id("run-previous");
+        let mut merger = EventMerger::new();
+
+        // Nothing is adopted yet: events are rejected, never guessed into a run.
+        assert!(merger.push(started(&run, 0)).is_empty());
+        assert_eq!(merger.rejected(), 1);
+        assert!(merger.active_run().is_none());
+        assert!(!merger.is_finalized());
+
+        merger.adopt(&run);
+        assert_eq!(merger.push(started(&run, 0)).len(), 1);
+        assert!(merger.push(started(&stale, 1)).is_empty(), "no other run");
+        assert!(
+            merger.push(text(&run, 0, "older")).is_empty(),
+            "an older sequence never reopens the stream"
+        );
+        assert!(merger.push(text(&run, 2, "held")).is_empty());
+        assert!(
+            merger.push(text(&run, 2, "duplicate")).is_empty(),
+            "a duplicate inside the window is counted, not merged"
+        );
+        assert_eq!(
+            seqs(&merger.push(started(&run, 1))),
+            vec![1, 2],
+            "the window drains contiguously"
+        );
+        assert_eq!(merger.gaps(), 0);
+        assert_eq!(
+            merger.rejected(),
+            4,
+            "pre-adoption, other run, older sequence, duplicate"
+        );
+
+        assert_eq!(merger.push(finished(&run, 3)).len(), 1);
+        assert!(merger.is_finalized());
+        assert!(merger.push(finished(&run, 4)).is_empty(), "one outcome");
+        assert!(
+            merger.push(text(&run, 4, "late")).is_empty(),
+            "post-terminal text is rejected"
+        );
+        assert!(
+            merger.push(started(&stale, 5)).is_empty(),
+            "a next run is adopted explicitly, never implicitly"
+        );
+        assert_eq!(merger.rejected(), 7);
+        assert!(!merger.has_pending());
+        assert_eq!(
+            merger.push(started(&stale, 5)).len(),
+            0,
+            "the rejection is stable, not a retry"
+        );
+        assert_eq!(merger.rejected(), 8);
+    }
+
+    #[test]
+    fn adopt_resets_a_held_window_for_the_next_accepted_run() {
+        let first = run_id("run-first");
+        let second = run_id("run-second");
+        let mut merger = EventMerger::new();
+        merger.adopt(&first);
+        assert_eq!(merger.push(text(&first, 0, "head")).len(), 1);
+        assert!(merger.push(text(&first, 2, "held")).is_empty());
+        assert!(merger.has_pending());
+
+        merger.adopt(&second);
+        assert_eq!(merger.active_run(), Some(&second));
+        assert!(!merger.has_pending(), "the reorder window is dropped");
+        assert!(!merger.has_terminal());
+        assert!(!merger.is_finalized(), "a new accepted run reopens it");
+        assert!(
+            merger.push(text(&first, 1, "stray")).is_empty(),
+            "the previous run can no longer merge"
+        );
+        assert_eq!(
+            merger.push(started(&second, 0)).len(),
+            1,
+            "the next run starts at sequence 0"
+        );
+        assert_eq!(merger.gaps(), 0, "a discarded window is not a gap");
+    }
+
+    #[test]
+    fn flush_counts_missing_sequences_without_reordering() {
+        let run = run_id("run-gap");
+        let mut merger = EventMerger::new();
+        merger.adopt(&run);
+        assert_eq!(seqs(&merger.push(text(&run, 0, "head"))), vec![0]);
+        assert!(
+            merger.push(text(&run, 3, "tail")).is_empty(),
+            "sequences 1 and 2 never arrived"
+        );
+        assert!(merger.has_pending());
+
+        let flushed = merger.flush();
+        assert_eq!(
+            seqs(&flushed),
+            vec![3],
+            "only what arrived is emitted, in sequence order"
+        );
+        assert_eq!(merger.gaps(), 2, "each missing sequence is counted");
+        assert!(!merger.has_pending());
+        assert!(merger.flush().is_empty(), "an empty flush is a no-op");
+        assert_eq!(merger.gaps(), 2, "an empty flush counts nothing");
+
+        // The missing sequences arriving late are rejected, never reordered in.
+        assert!(merger.push(text(&run, 1, "late")).is_empty());
+        assert!(merger.push(text(&run, 2, "late")).is_empty());
+        assert_eq!(merger.rejected(), 2);
+        assert_eq!(merger.gaps(), 2, "rejection never rewrites the count");
+
+        // A window whose head is contiguous counts only the real head gap.
+        let mut contiguous = EventMerger::new();
+        contiguous.adopt(&run);
+        assert!(contiguous.push(text(&run, 5, "x")).is_empty());
+        assert!(contiguous.push(text(&run, 6, "y")).is_empty());
+        assert_eq!(seqs(&contiguous.flush()), vec![5, 6]);
+        assert_eq!(contiguous.gaps(), 5, "sequences 0 through 4 never arrived");
+        assert!(!contiguous.has_pending());
+    }
+
+    #[test]
+    fn reorder_window_stays_inside_its_finite_bound() {
+        let run = run_id("run-window");
+        let mut merger = EventMerger::new();
+        merger.adopt(&run);
+
+        for seq in 1..=MAX_REORDER_EVENTS as u64 {
+            assert!(merger.push(text(&run, seq, "x")).is_empty());
+            assert!(
+                merger.buffered.len() <= MAX_REORDER_EVENTS,
+                "the reorder window is finite"
+            );
+        }
+        assert_eq!(
+            merger.buffered.len(),
+            MAX_REORDER_EVENTS,
+            "a full window still holds every buffered event"
+        );
+
+        // One arrival past the bound flushes the window instead of growing it.
+        let overflow = merger.push(text(&run, MAX_REORDER_EVENTS as u64 + 1, "y"));
+        assert!(
+            merger.buffered.is_empty(),
+            "the window is force-flushed at the bound"
+        );
+        assert_eq!(merger.gaps(), 1, "sequence 0 was skipped explicitly");
+        let emitted = seqs(&overflow);
+        assert_eq!(emitted.len(), MAX_REORDER_EVENTS + 1);
+        assert_eq!(emitted.first(), Some(&1));
+        assert_eq!(emitted.last(), Some(&(MAX_REORDER_EVENTS as u64 + 1)));
+        assert!(
+            emitted.windows(2).all(|pair| pair[0] < pair[1]),
+            "emission stays strictly ordered across a flush"
+        );
+        assert!(!merger.has_pending());
+    }
+
+    #[tokio::test]
+    async fn absorb_drains_preceding_text_before_the_terminal_outcome() {
+        let run = run_id("run-absorb");
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let mut streams = EventStreams {
+            data: data_rx,
+            control: control_rx,
+        };
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+
+        // The control channel delivers the outcome first; every earlier send is
+        // still queued, and sequence 3 is dropped by the data channel.
+        data_tx.try_send(started(&run, 0)).expect("capacity");
+        data_tx.try_send(text(&run, 1, "alpha")).expect("capacity");
+        data_tx.try_send(text(&run, 2, "omega")).expect("capacity");
+        control_tx.try_send(finished(&run, 4)).expect("capacity");
+
+        let outcome = streams.control.recv().await.expect("outcome queued");
+        assert!(absorb(&mut front, outcome, &mut streams));
+
+        assert!(front.merger.is_finalized());
+        assert!(!front.merger.has_terminal(), "the pending outcome drained");
+        assert!(!front.merger.has_pending());
+        assert_eq!(front.merger.gaps(), 1, "only sequence 3 was missing");
+        assert_eq!(front.state.last_seq(), Some(4));
+        assert!(front.state.is_finished());
+        assert_eq!(
+            front.state_rejected, 0,
+            "every drained event belonged to the adopted run"
+        );
+
+        // Same-item fragments may coalesce into one entry, so ordering is
+        // asserted on the presented byte stream rather than per line.
+        let transcript = front.state.transcript().join("\n");
+        let at = |needle: &str| {
+            transcript
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} is presented"))
+        };
+        assert!(at("alpha") < at("omega"), "channel order is restored");
+        assert!(
+            at("omega") < at("finished: Completed"),
+            "preceding text is applied before the final outcome"
+        );
+        assert!(
+            transcript.contains("presentation gap: 1 event(s) missing"),
+            "a dropped sequence is reported, not hidden"
+        );
+
+        // A finalized run never reopens on late traffic.
+        let before = front.state.transcript().len();
+        assert!(!absorb(&mut front, text(&run, 5, "late"), &mut streams));
+        assert!(front.merger.is_finalized());
+        assert_eq!(front.state.last_seq(), Some(4), "the run is not extended");
+        assert_eq!(
+            front.state.transcript().len() - before,
+            2,
+            "one notice entry records the rejection"
+        );
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("1 old, duplicate, or post-terminal event(s) rejected")),
+            "the rejection is surfaced explicitly"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_submit_adopts_the_run_and_takes_the_draft() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.state.composer_type('h');
+        front.state.composer_type('i');
+
+        let first = front.next_request();
+        assert_eq!(first.as_str(), "req-tui-1", "requests are per frontend");
+        let command = submit_command(
+            first,
+            front.session.clone(),
+            front.state.composer(),
+            DEMO_PROFILE,
+        )
+        .expect("valid submit builds");
+        let reply = runtime.handle(command).await.0;
+        assert_eq!(reply.reply(), CommandReply::Accepted);
+        assert!(settle_submit(&mut front, "hi", &reply));
+        assert_eq!(front.merger.active_run(), reply.run());
+        assert_eq!(user_line_count(&front), 1, "the accepted draft is recorded");
+
+        let stashed = front.state.composer_take();
+        assert_eq!(stashed, "hi", "the recorded draft is the cleared draft");
+
+        // An `Accepted` reply carrying no run identity records the draft but
+        // adopts nothing, so no event can be attributed to it.
+        front.state.composer_type('?');
+        let orphan = CommandResponse::new(front.next_request(), CommandReply::Accepted, None);
+        assert!(settle_submit(&mut front, "?", &orphan));
+        assert_eq!(
+            front.merger.active_run(),
+            reply.run(),
+            "no run identity is invented"
+        );
+        assert_eq!(user_line_count(&front), 2);
+        assert_eq!(front.state.composer(), "?", "the caller owns the clear");
+    }
+
+    #[tokio::test]
+    async fn busy_and_rejected_submits_preserve_the_draft() {
+        let mut front = Frontend::new(session());
+        front.state.composer_type('h');
+        front.state.composer_type('i');
+        let draft = front.state.composer().to_owned();
+        let live = run_id("run-live");
+
+        let busy =
+            CommandResponse::new(front.next_request(), CommandReply::Busy, Some(live.clone()));
+        assert!(!settle_submit(&mut front, &draft, &busy));
+        assert_eq!(front.state.composer(), "hi", "Busy preserves the draft");
+        assert!(
+            front.merger.active_run().is_none(),
+            "Busy adopts nothing, even with a run attached"
+        );
+        assert_eq!(user_line_count(&front), 0, "Busy records no submission");
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("submit not accepted (Busy); draft preserved")),
+            "the refusal is reported with the preserved draft"
+        );
+
+        let rejected = CommandResponse::new(
+            front.next_request(),
+            CommandReply::Rejected,
+            Some(live.clone()),
+        );
+        assert!(!settle_submit(&mut front, &draft, &rejected));
+        assert_eq!(front.state.composer(), "hi", "a refusal preserves it too");
+        assert!(front.merger.active_run().is_none());
+        assert_eq!(user_line_count(&front), 0);
+        assert_eq!(
+            front.request_counter, 2,
+            "each submit attempt has its own request identity"
+        );
+
+        // Retyping after a refusal keeps the same draft: only the accepted
+        // reply records it, and clearing it stays the caller's job.
+        front.state.composer_backspace();
+        let retried = front.state.composer().to_owned();
+        assert_eq!(retried, "h", "editing after a refusal stays local");
+        assert!(!front.adopt_accepted(&busy), "a refusal is not retried");
+        let accepted = CommandResponse::new(
+            front.next_request(),
+            CommandReply::Accepted,
+            Some(live.clone()),
+        );
+        assert!(settle_submit(&mut front, &retried, &accepted));
+        assert_eq!(front.merger.active_run(), Some(&live));
+        assert_eq!(user_line_count(&front), 1, "recorded exactly once");
+        assert_eq!(front.state.composer(), "h", "the draft is untouched");
+        assert_eq!(front.state.composer_take(), "h");
+    }
+
+    #[tokio::test]
+    async fn blank_submit_never_reaches_the_runtime_and_quit_keys_exit() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        for _ in 0..3 {
+            front.state.composer_type(' ');
+        }
+        let enter = press(KeyCode::Enter);
+
+        assert!(!handle_key(&mut front, &runtime, enter).await);
+        assert_eq!(front.state.composer(), "   ", "a blank draft is untouched");
+        assert_eq!(
+            front.request_counter, 0,
+            "no command is built for a blank draft"
+        );
+        assert!(front.merger.active_run().is_none());
+        assert_eq!(user_line_count(&front), 0);
+
+        // `Ctrl+D` leaves the loop from any focus.
+        assert!(
+            handle_key(
+                &mut front,
+                &runtime,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
+            )
+            .await
+        );
+
+        // `Ctrl+C` with nothing cancellable exits instead of cancelling nothing.
+        assert!(!front.state.can_cancel());
+        assert!(
+            handle_key(
+                &mut front,
+                &runtime,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            )
+            .await
+        );
+        assert_eq!(
+            front.request_counter, 0,
+            "neither quit path issues a runtime command"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_ticks_fire_while_one_channel_stays_permanently_ready() {
+        let (data_tx, data_rx) = mpsc::channel(4);
+        // Held open and never written, so the control channel stays a pending
+        // (never closed, never ready) branch of the select.
+        let (_control_tx, control_rx) = mpsc::channel::<RunEvent>(4);
+        let run = run_id("run-pressure");
+        let flood = tokio::spawn(async move {
+            while data_tx.send(text(&run, 0, "flood")).await.is_ok() {
+                // Keep the channel permanently ready.
+            }
+        });
+
+        let mut interval = interval();
+        let observed = tokio::time::timeout(Duration::from_secs(3), async move {
+            let mut data = data_rx;
+            let mut control = control_rx;
+            let mut ticks = 0usize;
+            let mut events = 0usize;
+            // The control channel stays open and empty: only data is ever ready.
+            while ticks < 3 {
+                match next_loop_step(&mut interval, &mut data, &mut control).await {
+                    LoopStep::Tick => ticks += 1,
+                    LoopStep::Event(_) => events += 1,
+                    LoopStep::Closed => break,
+                }
+            }
+            (ticks, events)
+        })
+        .await;
+        flood.abort();
+
+        let (ticks, events) = observed.expect("the tick deadline keeps arriving");
+        assert_eq!(ticks, 3, "a ready channel never starves the tick");
+        assert!(events > 0, "events are still applied between ticks");
+    }
+
+    #[tokio::test]
+    async fn key_batches_stop_at_their_bound_and_skip_non_press_kinds() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+
+        // A zero bound never polls the key source at all.
+        let mut reads = 0;
+        let batch = handle_key_batch(
+            &mut front,
+            &runtime,
+            || {
+                reads += 1;
+                Ok(Some(press(KeyCode::F(1))))
+            },
+            0,
+        )
+        .await
+        .expect("key source never fails");
+        assert_eq!(batch.handled, 0);
+        assert!(!batch.quit);
+        assert_eq!(reads, 0, "a zero bound reads nothing");
+
+        // A burst longer than the bound stops reading and leaves the rest for
+        // a later tick.
+        let mut index = 0;
+        let batch = handle_key_batch(
+            &mut front,
+            &runtime,
+            || {
+                index += 1;
+                Ok(Some(press(KeyCode::F(1))))
+            },
+            4,
+        )
+        .await
+        .expect("key source never fails");
+        assert_eq!(batch.handled, 4);
+        assert!(!batch.quit);
+        assert_eq!(index, 4, "the unread remainder stays queued");
+
+        // Release and autorepeat consume a slot but produce no action.
+        let kinds = [
+            KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::empty(), KeyEventKind::Release),
+            KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::empty(), KeyEventKind::Repeat),
+            press(KeyCode::F(5)),
+        ];
+        let mut index = 0;
+        let batch = handle_key_batch(
+            &mut front,
+            &runtime,
+            || {
+                let key = kinds.get(index).copied();
+                index += 1;
+                Ok(key)
+            },
+            3,
+        )
+        .await
+        .expect("key source never fails");
+        assert_eq!(index, 3, "the batch still stops at its bound");
+        assert_eq!(batch.handled, 1, "only presses are handled");
+        assert!(!batch.quit);
+
+        // A quit ends the batch at once: the rest of the burst is unread.
+        let burst = [
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            press(KeyCode::F(1)),
+        ];
+        let mut index = 0;
+        let batch = handle_key_batch(
+            &mut front,
+            &runtime,
+            || {
+                let key = burst.get(index).copied();
+                index += 1;
+                Ok(key)
+            },
+            8,
+        )
+        .await
+        .expect("key source never fails");
+        assert!(batch.quit, "the loop exits on the quit key");
+        assert_eq!(batch.handled, 1);
+        assert_eq!(index, 1, "no key after the quit is handled");
+
+        // A failing key source surfaces as an error, never a silent empty batch.
+        let failed = handle_key_batch(
+            &mut front,
+            &runtime,
+            || Err(io::Error::other("key source failed")),
+            4,
+        )
+        .await;
+        let error = match failed {
+            Ok(_) => panic!("a failing key source is never an empty batch"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "key source failed");
+    }
+
+    #[tokio::test]
+    async fn quit_key_exits_the_batch_then_reconciles_the_live_run() {
+        let (runtime, mut streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        let submit = submit_command(
+            front.next_request(),
+            front.session.clone(),
+            DEMO_INPUT,
+            DEMO_PROFILE,
+        )
+        .expect("valid submit builds");
+        let reply = runtime.handle(submit).await.0;
+        assert!(settle_submit(&mut front, DEMO_INPUT, &reply));
+        assert!(front.merger.active_run().is_some());
+
+        // The user quits before any event has been merged.
+        let mut read = false;
+        let batch = handle_key_batch(
+            &mut front,
+            &runtime,
+            || {
+                if read {
+                    return Ok(None);
+                }
+                read = true;
+                Ok(Some(KeyEvent::new(
+                    KeyCode::Char('d'),
+                    KeyModifiers::CONTROL,
+                )))
+            },
+            MAX_KEYS_PER_TICK,
+        )
+        .await
+        .expect("key source never fails");
+        assert!(batch.quit);
+        assert_eq!(batch.handled, 1);
+        assert!(
+            !front.merger.is_finalized(),
+            "quitting early leaves the run live"
+        );
+
+        let unresolved = reconcile_after_stop(&runtime, &mut streams, &mut front, "quit").await;
+        assert!(!unresolved, "the bounded window reconciles the run");
+        assert!(front.merger.is_finalized());
+        assert!(front.state.is_finished());
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.starts_with("quit: cancel reply")),
+            "the reconcile records the cancel reply on the transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_skipped_for_a_finalized_or_absent_run() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+
+        // A finalized run is already reconciled; the stop path is a no-op.
+        let done_run = run_id("run-done");
+        let mut done = Frontend::new(session());
+        done.merger.adopt(&done_run);
+        assert_eq!(done.merger.push(started(&done_run, 0)).len(), 1);
+        assert_eq!(done.merger.push(finished(&done_run, 1)).len(), 1);
+        assert!(done.merger.is_finalized());
+        let before = done.state.transcript().len();
+        let mut streams = closed_streams();
+        assert!(
+            !reconcile_after_stop(&runtime, &mut streams, &mut done, "quit").await,
+            "an already finalized run needs no cancellation"
+        );
+        assert_eq!(
+            done.state.transcript().len(),
+            before,
+            "no cancel reply is recorded for a finalized run"
+        );
+        assert!(done.merger.is_finalized());
+
+        // No run was ever adopted and none is live in the state: nothing to
+        // cancel, so the stop path reports no outstanding work.
+        let mut idle = Frontend::new(session());
+        assert!(idle.merger.active_run().is_none());
+        assert!(idle.state.active_run().is_none());
+        assert!(!idle.state.can_cancel());
+        assert!(!reconcile_after_stop(&runtime, &mut streams, &mut idle, "quit").await);
+        assert_eq!(
+            idle.state.transcript().len(),
+            0,
+            "an idle session records nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_unresolved_when_no_terminal_outcome_arrives() {
+        let (runtime, mut streams) = build_runtime().expect("demo wiring is valid");
+
+        // Closed channels stop the wait at once; the run is still live, so
+        // unresolved work is reported instead of claimed clean.
+        let (_run, mut front) = adopted_orphan();
+        let mut closed = closed_streams();
+        let started = Instant::now();
+        assert!(
+            reconcile_after_stop(&runtime, &mut closed, &mut front, "quit").await,
+            "a run with no terminal outcome is reported, not hidden"
+        );
+        assert!(!front.merger.is_finalized());
+        assert!(started.elapsed() < RECONCILE_TIMEOUT, "no window is wasted");
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.starts_with("quit: cancel reply")),
+            "the attempted cancellation is still recorded"
+        );
+
+        // Open but silent channels wait out the bound, then report unresolved.
+        let (_run, mut stalled) = adopted_orphan();
+        let started = Instant::now();
+        assert!(
+            reconcile_after_stop(&runtime, &mut streams, &mut stalled, "quit").await,
+            "the reconcile never claims a rollback it did not observe"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= RECONCILE_TIMEOUT,
+            "the cancellation window is bounded from below, got {waited:?}"
+        );
+        assert!(
+            waited < RECONCILE_TIMEOUT * 4,
+            "the window is a bound, not a hang, got {waited:?}"
+        );
+        assert!(!stalled.merger.is_finalized());
+        assert!(!stalled.state.is_finished(), "no outcome is fabricated");
+    }
+}
+
+/// Coverage top-up for the paths the two modules above leave unexercised:
+/// the non-terminal fallback itself, the full `handle_key` action table, the
+/// approval decision and cancellation branches, the presentation-state
+/// rejection counter, the closed-control-channel select arm, the control-side
+/// drain, the reconcile loop's data arm, and the redraw path behind the loop.
+///
+/// Determinism: the scripted `nexus-fakes` runtime and fixed id literals
+/// only; no clock, sleep, thread spawn, randomness, or terminal-size query.
+/// The `headless` transcript is captured by the test harness and the redraw
+/// tests use a fixed viewport, so no real terminal is required.
+#[cfg(test)]
+mod cov_main_topup {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use nexus_core::{
+        ApprovalId, AssistantText, CallId, PersistenceState, RunFinished, RunOutcome, TurnId,
+    };
+    use nexus_tui::state::ApprovalGeometry;
+    use ratatui::layout::Rect;
+    use ratatui::{TerminalOptions, Viewport};
+
+    fn session() -> SessionId {
+        SessionId::new("sess-topup").expect("valid")
+    }
+
+    fn run_id(id: &str) -> RunId {
+        RunId::new(id).expect("valid")
+    }
+
+    fn request(id: &str) -> RequestId {
+        RequestId::new(id).expect("valid")
+    }
+
+    fn started(run: &RunId, seq: u64) -> RunEvent {
+        RunEvent::new(
+            session(),
+            run.clone(),
+            seq,
+            EventPayload::RunStarted {
+                request: request("req-topup"),
+            },
+        )
+    }
+
+    fn text(run: &RunId, seq: u64, body: &str) -> RunEvent {
+        RunEvent::new(
+            session(),
+            run.clone(),
+            seq,
+            EventPayload::AssistantTextDelta(
+                AssistantText::new(TurnId::new("t1-0").expect("valid"), "item-0", body)
+                    .expect("fragment builds"),
+            ),
+        )
+    }
+
+    fn finished(run: &RunId, seq: u64) -> RunEvent {
+        RunEvent::new(
+            session(),
+            run.clone(),
+            seq,
+            EventPayload::RunFinished(
+                RunFinished::new(RunOutcome::Completed, PersistenceState::Ephemeral, None)
+                    .expect("terminal record builds"),
+            ),
+        )
+    }
+
+    /// Exact runtime approval request published on the control channel.
+    fn approval(run: &RunId, seq: u64, call: &str) -> RunEvent {
+        let notice = ApprovalNotice::new(
+            ApprovalId::new("a1-0").expect("valid approval id"),
+            CallId::new(call).expect("valid call id"),
+            "run tool host_write",
+            "project scope",
+            Duration::from_secs(120),
+        )
+        .expect("notice builds");
+        RunEvent::new(
+            session(),
+            run.clone(),
+            seq,
+            EventPayload::ApprovalRequired(notice),
+        )
+    }
+
+    fn interval() -> tokio::time::Interval {
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn ctrl(char: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(char), KeyModifiers::CONTROL)
+    }
+
+    /// Streams whose senders are already gone: every read reports closed.
+    fn closed_streams() -> EventStreams {
+        let (data_tx, data_rx) = mpsc::channel::<RunEvent>(1);
+        let (control_tx, control_rx) = mpsc::channel::<RunEvent>(1);
+        drop(data_tx);
+        drop(control_tx);
+        EventStreams {
+            data: data_rx,
+            control: control_rx,
+        }
+    }
+
+    /// A frontend holding a run the runtime never issued, so a cancel reply
+    /// can never produce a terminal outcome for it.
+    fn adopted_orphan() -> (RunId, Frontend) {
+        let run = run_id("run-orphan-topup");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        (run, front)
+    }
+
+    /// One fixed-size terminal over the real stdout backend. `Viewport::Fixed`
+    /// skips the backend size query, so no real terminal is needed and the
+    /// frame size is the same on every run.
+    fn fixed_terminal() -> Terminal<CrosstermBackend<io::Stdout>> {
+        Terminal::with_options(
+            CrosstermBackend::new(io::stdout()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("a fixed viewport needs no terminal size")
+    }
+
+    fn user_line_count(front: &Frontend) -> usize {
+        front
+            .state
+            .transcript()
+            .iter()
+            .filter(|line| line.starts_with("[User]"))
+            .count()
+    }
+
+    fn transcript(front: &Frontend) -> String {
+        front.state.transcript().join("\n")
+    }
+
+    /// A frontend whose state owns `run` and is awaiting a decision on `call`.
+    fn awaiting_approval(run: &RunId, call: &str) -> Frontend {
+        let mut front = Frontend::new(session());
+        front.merger.adopt(run);
+        assert!(!front.apply_events(vec![started(run, 0), approval(run, 1, call)]));
+        front
+    }
+
+    #[tokio::test]
+    async fn headless_drains_the_scripted_run_and_denies_its_approval() {
+        let (runtime, streams) = build_runtime().expect("demo wiring is valid");
+        headless(runtime, streams)
+            .await
+            .expect("the non-terminal fallback always completes");
+    }
+
+    #[tokio::test]
+    async fn composer_submit_adopts_the_run_and_clears_the_draft() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.focus = Focus::Composer;
+        front.state.composer_type('h');
+        front.state.composer_type('i');
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(front.request_counter, 1, "the submit has its own identity");
+        assert_eq!(front.state.composer(), "", "the accepted draft is cleared");
+        assert!(
+            front.merger.active_run().is_some(),
+            "only an accepted reply adopts a run"
+        );
+        assert_eq!(user_line_count(&front), 1, "the draft is recorded once");
+    }
+
+    #[tokio::test]
+    async fn composer_keys_edit_the_draft_and_cycle_focus() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.focus = Focus::Composer;
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('a'))).await);
+        assert!(
+            !handle_key(&mut front, &runtime, ctrl('j')).await,
+            "Ctrl+J is an explicit newline, never typed text"
+        );
+        assert_eq!(front.state.composer(), "a\n");
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Backspace)).await);
+        assert_eq!(front.state.composer(), "a");
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Tab)).await);
+        assert_eq!(front.focus, Focus::Viewport, "Tab leaves the composer");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Tab)).await);
+        assert_eq!(
+            front.focus,
+            Focus::Composer,
+            "no approval is pending, so the card is not reachable"
+        );
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert_eq!(front.focus, Focus::Viewport, "Esc parks in the viewport");
+        assert!(!front.state.approval_detail_open(), "Esc never decides");
+        assert_eq!(front.request_counter, 0, "no focus key issues a command");
+    }
+
+    #[tokio::test]
+    async fn approval_keys_scroll_the_detail_and_never_decide() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-approval-keys");
+        let mut front = awaiting_approval(&run, "c1-0");
+        front.focus = Focus::ApprovalCard;
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('i'))).await);
+        assert!(front.state.approval_detail_open(), "i opens the detail");
+        for key in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            assert!(
+                !handle_key(&mut front, &runtime, press(key)).await,
+                "scrolling the expanded detail never exits the loop"
+            );
+        }
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('i'))).await);
+        assert!(!front.state.approval_detail_open(), "i closes the detail");
+
+        front.focus = Focus::Viewport;
+        for key in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            assert!(!handle_key(&mut front, &runtime, press(key)).await);
+        }
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
+        assert_eq!(front.request_counter, 0, "navigation issues no command");
+        assert!(
+            front.live_approval.is_some(),
+            "inspection leaves the approval undecided"
+        );
+        assert!(
+            front.state.pending_approval().is_some(),
+            "the card is still awaiting a decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn folding_without_a_selection_selects_an_entry_first() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-fold");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        front.apply_events(vec![started(&run, 0), text(&run, 1, "hello")]);
+        front.focus = Focus::Viewport;
+        assert!(front.state.selected().is_none());
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
+        let selected = front.state.selected().expect("an entry is selected");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
+        assert_eq!(front.state.selected(), Some(selected), "the fold toggles");
+        assert!(front.state.entry_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn allow_once_stays_locked_until_the_detail_is_measured() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-locked");
+        let mut front = awaiting_approval(&run, "c1-0");
+        front.focus = Focus::ApprovalCard;
+        assert!(
+            !front.state.approval_decision_allowed(),
+            "no frame has measured the card yet"
+        );
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('a'))).await);
+        assert!(
+            transcript(&front).contains("allow-once locked"),
+            "the locked path names the inspection key"
+        );
+        assert_eq!(front.request_counter, 0, "a locked key issues no command");
+        assert!(front.live_approval.is_some(), "the approval still awaits");
+
+        front.state.set_approval_geometry(ApprovalGeometry {
+            inner_width: 40,
+            inner_rows: 6,
+            detail_rows: 6,
+            clipped: false,
+        });
+        assert!(front.state.approval_decision_allowed());
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('a'))).await);
+        assert_eq!(front.request_counter, 1);
+        assert!(
+            transcript(&front).contains("decision reply"),
+            "the runtime reply is surfaced"
+        );
+        assert!(front.live_approval.is_none(), "the decision is spent");
+        assert!(front.state.pending_approval().is_none());
+        assert_eq!(
+            front.focus,
+            Focus::Viewport,
+            "focus returns to the viewport"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_needs_no_measurement_and_allow_once_without_a_notice_is_refused() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-deny");
+
+        let mut undecided = Frontend::new(session());
+        undecided.focus = Focus::ApprovalCard;
+        assert!(!handle_key(&mut undecided, &runtime, press(KeyCode::Char('a'))).await);
+        assert!(
+            transcript(&undecided).contains("no live approval to decide"),
+            "an absent live approval is refused, never invented"
+        );
+        assert_eq!(undecided.request_counter, 0);
+
+        let mut front = awaiting_approval(&run, "c1-0");
+        front.focus = Focus::ApprovalCard;
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('d'))).await);
+        assert_eq!(front.request_counter, 1);
+        assert!(transcript(&front).contains("decision reply"));
+        assert!(front.live_approval.is_none());
+        assert!(front.state.pending_approval().is_none());
+        assert_eq!(front.focus, Focus::Viewport);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_cancels_the_live_run_through_the_runtime() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-cancel-topup");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        front.apply_events(vec![started(&run, 0)]);
+        assert!(front.state.can_cancel(), "output is streaming");
+
+        assert!(!handle_key(&mut front, &runtime, ctrl('c')).await);
+        assert_eq!(front.request_counter, 1);
+        assert!(
+            transcript(&front).contains("cancel reply"),
+            "the cancel reply is surfaced"
+        );
+    }
+
+    #[test]
+    fn a_state_rejection_is_counted_and_surfaced_once() {
+        let mut front = Frontend::new(session());
+        let stale = run_id("run-unowned");
+        front.merger.adopt(&stale);
+        // The merger admits the event for the adopted run, but presentation
+        // state owns no run, so it rejects the very same event.
+        assert!(!front.apply_events(vec![text(&stale, 0, "unowned")]));
+        assert_eq!(front.state_rejected, 1);
+        assert_eq!(front.state.last_seq(), None, "no state was mutated");
+
+        front.report_merger();
+        let first = transcript(&front);
+        assert!(
+            first.contains("1 event(s) rejected by presentation state"),
+            "the rejection is surfaced explicitly"
+        );
+        front.report_merger();
+        assert_eq!(
+            transcript(&front)
+                .matches("rejected by presentation state")
+                .count(),
+            1,
+            "the count is reported once, not on every tick"
+        );
+        assert!(front.state_rejected_reported);
+    }
+
+    #[tokio::test]
+    async fn a_closed_control_channel_reports_closed_while_data_stays_open() {
+        let (data_tx, mut data_rx) = mpsc::channel::<RunEvent>(1);
+        let (control_tx, mut control_rx) = mpsc::channel::<RunEvent>(1);
+        drop(control_tx);
+        let mut interval = interval();
+
+        let step = next_loop_step(&mut interval, &mut data_rx, &mut control_rx).await;
+        drop(data_tx);
+        assert!(
+            matches!(step, LoopStep::Closed),
+            "a closed control channel ends the wait even with data open"
+        );
+    }
+
+    #[tokio::test]
+    async fn absorb_drains_the_control_channel_behind_a_buffered_outcome() {
+        let run = run_id("run-drain-control");
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::channel(8);
+        let mut streams = EventStreams {
+            data: data_rx,
+            control: control_rx,
+        };
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        data_tx.try_send(started(&run, 0)).expect("capacity");
+        control_tx
+            .try_send(text(&run, 1, "alpha"))
+            .expect("capacity");
+
+        // The outcome is observed while both channels still hold earlier
+        // traffic, so the control side must be drained too.
+        assert!(absorb(&mut front, finished(&run, 2), &mut streams));
+        assert!(front.merger.is_finalized());
+        assert!(!front.merger.has_pending());
+        assert_eq!(front.merger.gaps(), 0, "every sequence arrived");
+        assert_eq!(front.state.last_seq(), Some(2));
+
+        let transcript = transcript(&front);
+        let at = |needle: &str| {
+            transcript
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} is presented"))
+        };
+        assert!(at("alpha") < at("finished: Completed"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_absorbs_a_queued_event_then_stops_on_the_closed_channel() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (run, mut front) = adopted_orphan();
+        let (data_tx, data_rx) = mpsc::channel(4);
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let mut streams = EventStreams {
+            data: data_rx,
+            control: control_rx,
+        };
+        data_tx.try_send(text(&run, 0, "queued")).expect("capacity");
+        drop(data_tx);
+        let _control_still_open = control_tx;
+
+        assert!(
+            reconcile_after_stop(&runtime, &mut streams, &mut front, "quit").await,
+            "no terminal outcome arrives, so unresolved work is reported"
+        );
+        assert!(!front.merger.is_finalized());
+        let transcript = transcript(&front);
+        assert!(
+            transcript.contains("quit: cancel reply"),
+            "the attempted cancellation is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_loop_ends_at_once_when_both_channels_close() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-loop-closed");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        let mut streams = closed_streams();
+        let mut gate = RefreshGate::m0_test();
+        let mut interval = interval();
+        let mut terminal = fixed_terminal();
+
+        interactive_loop(
+            &runtime,
+            &mut streams,
+            &mut front,
+            &mut gate,
+            &mut terminal,
+            &mut interval,
+        )
+        .await
+        .expect("a closed channel pair ends the loop cleanly");
+        assert_eq!(front.merger.active_run(), Some(&run));
+        assert_eq!(front.state.last_seq(), None, "no event was applied");
+    }
+
+    #[tokio::test]
+    async fn interactive_loop_applies_an_event_redraws_and_then_ends() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-loop-event");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        let (data_tx, data_rx) = mpsc::channel::<RunEvent>(4);
+        let (control_tx, control_rx) = mpsc::channel::<RunEvent>(4);
+        let mut streams = EventStreams {
+            data: data_rx,
+            control: control_rx,
+        };
+        data_tx.try_send(started(&run, 0)).expect("capacity");
+        data_tx.try_send(finished(&run, 1)).expect("capacity");
+        drop(data_tx);
+        let _control_still_open = control_tx;
+        let mut gate = RefreshGate::m0_test();
+        let mut interval = interval();
+        let mut terminal = fixed_terminal();
+
+        // The first event is not terminal, so the loop falls through to the
+        // refresh gate and redraws; the second one ends the loop immediately.
+        interactive_loop(
+            &runtime,
+            &mut streams,
+            &mut front,
+            &mut gate,
+            &mut terminal,
+            &mut interval,
+        )
+        .await
+        .expect("the loop ends on the terminal outcome");
+        assert_eq!(front.state.last_seq(), Some(1), "both events were applied");
+        assert!(front.state.is_finished(), "the outcome was presented");
+        assert!(
+            transcript(&front).contains(&format!("run {} started", run.as_str())),
+            "the applied event is presented"
+        );
+    }
+
+    #[test]
+    fn draw_renders_a_frame_without_querying_a_terminal_size() {
+        let run = run_id("run-draw");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        front.apply_events(vec![
+            started(&run, 0),
+            text(&run, 1, "hello"),
+            finished(&run, 2),
+        ]);
+        front.focus = Focus::Viewport;
+        let mut terminal = fixed_terminal();
+
+        draw(&mut terminal, &mut front).expect("the frame renders");
         assert!(front.state.is_finished());
     }
 }

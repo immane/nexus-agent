@@ -819,3 +819,879 @@ mod tests {
         assert!(!frame.contains('\x1b'), "title cannot inject escapes");
     }
 }
+
+#[cfg(test)]
+mod cov_render_private {
+    //! Coverage for the renderer's private layout arithmetic.
+    //!
+    //! The public tests observe only whole frames. These tests reach the
+    //! private functions directly so each invariant is pinned on its own: the
+    //! reserved-chrome constants, the region split, the wrap-budget interaction
+    //! between the detail fields and the clip warning, the exact detail-field
+    //! text, the compact and expanded layout accounting, and the per-widget
+    //! title, hint, and style choices. Everything is a plain function over
+    //! fixed `Rect` and `PendingApprovalCard` values: no terminal, no clock, no
+    //! threads, no I/O.
+
+    use super::*;
+    use crate::state::MAX_TITLE_BYTES;
+    use nexus_core::{
+        ApprovalId, ApprovalNotice, AssistantText, CallId, EventPayload, RequestId, RunEvent,
+        RunId, SessionId, TurnId,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use std::time::Duration;
+
+    fn card(summary: &str, scope: &str) -> PendingApprovalCard {
+        PendingApprovalCard {
+            approval: ApprovalId::new("a1-0").expect("valid"),
+            call: CallId::new("c1-0").expect("valid"),
+            summary: summary.to_owned(),
+            scope_summary: scope.to_owned(),
+            expires_at_elapsed: Duration::from_secs(120),
+        }
+    }
+
+    /// Reads a buffer as text rows, one string per frame row.
+    fn text_rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Renders one region with the matching private renderer and returns the
+    /// text rows, so a single widget can be inspected without a full frame.
+    fn rows_of(area: Rect, draw: impl FnOnce(&mut Buffer)) -> Vec<String> {
+        let mut buffer = Buffer::empty(area);
+        draw(&mut buffer);
+        text_rows(&buffer)
+    }
+
+    fn row_holding(rows: &[String], needle: &str) -> Option<usize> {
+        rows.iter().position(|row| row.contains(needle))
+    }
+
+    fn started(seq: u64) -> RunEvent {
+        RunEvent::new(
+            SessionId::new("sess-1").expect("valid"),
+            RunId::new("run-1").expect("valid"),
+            seq,
+            EventPayload::RunStarted {
+                request: RequestId::new("req-1").expect("valid"),
+            },
+        )
+    }
+
+    fn text(seq: u64, body: &str) -> RunEvent {
+        RunEvent::new(
+            SessionId::new("sess-1").expect("valid"),
+            RunId::new("run-1").expect("valid"),
+            seq,
+            EventPayload::AssistantTextDelta(
+                AssistantText::new(TurnId::new("t1-0").expect("valid"), "item-0", body)
+                    .expect("fragment builds"),
+            ),
+        )
+    }
+
+    fn approval(seq: u64, summary: &str, scope: &str) -> RunEvent {
+        let notice = ApprovalNotice::new(
+            ApprovalId::new("a1-0").expect("valid"),
+            CallId::new("c1-0").expect("valid"),
+            summary,
+            scope,
+            Duration::from_secs(120),
+        )
+        .expect("notice builds");
+        RunEvent::new(
+            SessionId::new("sess-1").expect("valid"),
+            RunId::new("run-1").expect("valid"),
+            seq,
+            EventPayload::ApprovalRequired(notice),
+        )
+    }
+
+    #[test]
+    fn the_reserved_chrome_constants_are_pinned() {
+        assert_eq!(MIN_WIDTH, 20);
+        assert_eq!(CHROME_LINES, 4);
+        assert_eq!(MAX_COMPOSER_BODY, 5);
+        assert_eq!(APPROVAL_MIN_ROWS, 3);
+        assert_eq!(
+            APPROVAL_LOCK,
+            "[!] detail clipped: press [i] to inspect before deciding"
+        );
+    }
+
+    #[test]
+    fn split_reserves_the_fixed_chrome_and_hands_the_rest_to_the_body() {
+        for (height, composer_body, approval_rows) in [
+            (24u16, 1u16, 0u16),
+            (24, MAX_COMPOSER_BODY, 0),
+            (24, 1, 6),
+            (16, 3, 4),
+            (10, MAX_COMPOSER_BODY, 0),
+        ] {
+            let area = Rect::new(0, 0, 40, height);
+            let regions = split(area, composer_body, approval_rows);
+            assert_eq!(regions.header.height, 1, "the header is one row");
+            assert_eq!(regions.footer.height, 1, "the footer is one row");
+            assert_eq!(
+                regions.composer.height,
+                composer_body + 2,
+                "the composer is its body plus two border rows"
+            );
+            assert_eq!(
+                regions.approval.map(|rect| rect.height),
+                if approval_rows == 0 {
+                    None
+                } else {
+                    Some(approval_rows)
+                },
+                "the card region exists exactly when rows were measured for it"
+            );
+            // The regions tile the frame exactly once, top to bottom, at full
+            // width, with no gap and no overlap.
+            let total = regions.header.height
+                + regions.body.height
+                + regions.approval.map_or(0, |rect| rect.height)
+                + regions.composer.height
+                + regions.footer.height;
+            assert_eq!(total, height, "{height} rows must be fully allocated");
+            assert_eq!(regions.header.y, 0);
+            assert_eq!(regions.body.y, 1);
+            let after_body = regions.body.y + regions.body.height;
+            let after_card = after_body + regions.approval.map_or(0, |rect| rect.height);
+            assert_eq!(regions.composer.y, after_card);
+            assert_eq!(
+                regions.footer.y,
+                regions.composer.y + regions.composer.height
+            );
+            assert_eq!(regions.footer.y + 1, height, "the footer ends the frame");
+            for rect in [
+                regions.header,
+                regions.body,
+                regions.composer,
+                regions.footer,
+            ] {
+                assert_eq!(rect.x, 0, "every region spans the full width");
+                assert_eq!(rect.width, area.width);
+            }
+        }
+    }
+
+    #[test]
+    fn push_wrapped_chunks_by_char_and_honours_an_absolute_row_budget() {
+        let mut out = Vec::new();
+        push_wrapped("abcdefgh", 3, usize::MAX, &mut out);
+        assert_eq!(out, vec!["abc", "def", "gh"]);
+        // A zero budget materializes nothing, not even an empty line.
+        let mut out = Vec::new();
+        push_wrapped("abc", 3, 0, &mut out);
+        assert!(out.is_empty());
+        // An empty line still occupies one row, so a blank field is not lost.
+        let mut out = Vec::new();
+        push_wrapped("", 3, 2, &mut out);
+        assert_eq!(out, vec![String::new()]);
+        // A zero width degrades to one character per row instead of dividing.
+        let mut out = Vec::new();
+        push_wrapped("ab", 0, usize::MAX, &mut out);
+        assert_eq!(out, vec!["a", "b"]);
+        // Chunks are cut by character, never by byte, so no grapheme is split.
+        let mut out = Vec::new();
+        push_wrapped("héllo", 2, usize::MAX, &mut out);
+        assert_eq!(out, vec!["hé", "ll", "o"]);
+        // The budget is absolute against the rows already present, so a later
+        // call cannot push past it, and a call that would fill the budget stops
+        // as soon as it is reached.
+        let mut out = Vec::new();
+        push_wrapped("abcdefgh", 3, 2, &mut out);
+        assert_eq!(out, vec!["abc", "def"]);
+        push_wrapped("zz", 3, 2, &mut out);
+        assert_eq!(out, vec!["abc", "def"], "the budget is absolute");
+        let mut out = vec!["kept".to_owned()];
+        push_wrapped("abcdefgh", 3, 3, &mut out);
+        assert_eq!(
+            out,
+            vec!["kept", "abc", "def"],
+            "the budget counts prior rows"
+        );
+        // Materializing a whole line agrees with the measured height, which is
+        // the invariant the layout relies on.
+        for width in 1..=9usize {
+            for text in ["", "x", "abcdef", "héllo wörld"] {
+                let mut out = Vec::new();
+                push_wrapped(text, width, usize::MAX, &mut out);
+                assert_eq!(
+                    out.len(),
+                    wrapped_height(text, width),
+                    "{text:?} at width {width}"
+                );
+                assert_eq!(out.concat(), text, "no character is lost or reordered");
+                assert!(
+                    out.iter().all(|row| row.chars().count() <= width),
+                    "{text:?} at width {width} produced an over-wide row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn push_fields_fills_its_budget_in_order_and_stops() {
+        let fields: Vec<String> = vec![
+            "one".to_owned(),
+            "two three four".to_owned(),
+            String::new(),
+            "five".to_owned(),
+        ];
+        // A zero budget writes nothing at all.
+        let mut out = Vec::new();
+        push_fields(&fields, 7, 0, &mut out);
+        assert!(out.is_empty());
+        // Everything fits: order and content are preserved, wrapped to width.
+        let mut out = Vec::new();
+        push_fields(&fields, 7, usize::MAX, &mut out);
+        assert_eq!(out, vec!["one", "two thr", "ee four", "", "five"]);
+        // A partial budget cuts the tail, never the head or the middle.
+        let mut out = Vec::new();
+        push_fields(&fields, 7, 3, &mut out);
+        assert_eq!(out, vec!["one", "two thr", "ee four"]);
+        let mut out = Vec::new();
+        push_fields(&fields, 7, 1, &mut out);
+        assert_eq!(out, vec!["one"]);
+        // No fields means no rows.
+        let mut out = Vec::new();
+        push_fields(&[], 7, 5, &mut out);
+        assert!(out.is_empty());
+        // Whatever the budget, the result never exceeds it.
+        for budget in 0..=9usize {
+            let mut out = Vec::new();
+            push_fields(&fields, 5, budget, &mut out);
+            assert!(out.len() <= budget, "budget {budget} exceeded");
+            assert!(out.iter().all(|row| row.chars().count() <= 5));
+        }
+    }
+
+    #[test]
+    fn push_detail_range_tiles_the_detail_rows_without_gaps_or_repeats() {
+        let fields = vec!["abcdefgh".to_owned(), String::new(), "ij".to_owned()];
+        // The full materialization matches per-field wrapping and the measured
+        // height, including the single row an empty field occupies.
+        let mut full = Vec::new();
+        push_detail_range(&fields, 3, 0, usize::MAX, &mut full);
+        assert_eq!(full, vec!["abc", "def", "gh", "", "ij"]);
+        let expected: usize = fields.iter().map(|field| wrapped_height(field, 3)).sum();
+        assert_eq!(full.len(), expected, "layout and measurement cannot drift");
+        // A zero take materializes nothing, even with rows already present.
+        let mut out = vec!["kept".to_owned()];
+        push_detail_range(&fields, 3, 0, 0, &mut out);
+        assert_eq!(out, vec!["kept"]);
+        // Every window is exactly the matching slice of the full rows, so a
+        // scrolled view can never skip or repeat a detail row.
+        for skip in 0..=full.len() {
+            for take in 0..=4usize {
+                let mut window = Vec::new();
+                push_detail_range(&fields, 3, skip, take, &mut window);
+                let end = (skip + take).min(full.len());
+                assert_eq!(window, full[skip..end], "skip {skip} take {take}");
+            }
+        }
+        // A zero width degrades to one character per row rather than dividing.
+        let mut narrow = Vec::new();
+        push_detail_range(&["ab".to_owned()], 0, 0, usize::MAX, &mut narrow);
+        assert_eq!(narrow, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn approval_detail_fields_name_the_exact_operation_scope_and_binding() {
+        let card = card("run tool host_write", "project scope");
+        let fields = approval_detail_fields(&card, Some("run-1"), Some("path=src/main.rs"));
+        assert_eq!(
+            fields,
+            vec![
+                "operation: run tool host_write",
+                "scope: project scope",
+                "args: path=src/main.rs",
+                "call:c1-0 run:run-1",
+                "grant:a1-0 runtime-bound; deadline 120s run-elapsed (monotonic, rechecked at dispatch)",
+            ]
+        );
+        // An absent preview contributes no row at all, and an unknown run is
+        // reported explicitly rather than omitted.
+        let bare = approval_detail_fields(&card, None, None);
+        assert_eq!(
+            bare,
+            vec![
+                "operation: run tool host_write",
+                "scope: project scope",
+                "call:c1-0 run:?",
+                "grant:a1-0 runtime-bound; deadline 120s run-elapsed (monotonic, rechecked at dispatch)",
+            ]
+        );
+        assert!(
+            !bare.iter().any(|field| field.starts_with("args:")),
+            "an absent preview must not fabricate an args row"
+        );
+        // The deadline is the monotonic run-elapsed reading, never a wall clock
+        // and never a remaining time.
+        let expired = PendingApprovalCard {
+            expires_at_elapsed: Duration::from_secs(0),
+            ..card.clone()
+        };
+        let fields = approval_detail_fields(&expired, None, None);
+        assert!(
+            fields[3].contains("deadline 0s run-elapsed (monotonic"),
+            "{}",
+            fields[3]
+        );
+    }
+
+    #[test]
+    fn a_fitting_compact_card_shows_every_field_and_both_decisions() {
+        let card = card("run tool host_write", "project scope");
+        let args = Some("path=src/main.rs");
+        let fields = approval_detail_fields(&card, Some("run-1"), args);
+        let area = Rect::new(0, 0, 120, 30);
+        let layout = approval_layout(&card, Some("run-1"), args, area, 1, false, 0);
+        let detail: usize = fields.iter().map(|field| wrapped_height(field, 118)).sum();
+        assert_eq!(
+            layout.inner_width, 118,
+            "the inner width is the card width minus its borders"
+        );
+        assert_eq!(
+            layout.detail_rows, detail,
+            "the measured detail is the sum of the field heights"
+        );
+        assert!(!layout.clipped);
+        assert!(!layout.expanded);
+        assert_eq!(layout.scroll, 0, "the compact view never scrolls");
+        let rows_cap = 30 - 6;
+        assert_eq!(
+            layout.view_rows,
+            (rows_cap - 2) as usize,
+            "the compact card may use the inner rows it was measured for"
+        );
+        assert!(
+            layout.detail_rows <= layout.view_rows,
+            "the detail fits, so the card is not clipped"
+        );
+        // The full detail plus both decision rows are present, in order.
+        let text = layout.lines.concat();
+        assert!(text.contains("operation: run tool host_write"));
+        assert!(text.contains("scope: project scope"));
+        assert!(text.contains("args: path=src/main.rs"));
+        assert!(text.contains("call:c1-0 run:run-1"));
+        assert!(text.contains("grant:a1-0 runtime-bound"));
+        assert!(text.contains("[a] allow once   [d] deny"));
+        assert!(text.contains("decisions go through the runtime only"));
+        assert!(
+            !text.contains("[!] detail clipped"),
+            "a fitting card must not claim it clipped"
+        );
+        // The card claims exactly the rows it drew, plus its two border rows.
+        assert_eq!(layout.rows, layout.lines.len() as u16 + 2);
+        // The geometry reported to the gate is the geometry the card was given.
+        let geometry = layout.geometry();
+        assert_eq!(geometry.inner_width, layout.inner_width);
+        assert_eq!(geometry.inner_rows, layout.view_rows);
+        assert_eq!(geometry.detail_rows, layout.detail_rows);
+        assert!(!geometry.clipped);
+    }
+
+    #[test]
+    fn a_clipped_compact_card_hides_every_decision_row() {
+        let card = card(&"s".repeat(900), &"c".repeat(900));
+        let area = Rect::new(0, 0, 48, 16);
+        let layout = approval_layout(&card, Some("run-1"), None, area, 1, false, 0);
+        assert_eq!(layout.inner_width, 46);
+        assert!(layout.clipped, "the detail cannot fit the measured rows");
+        assert!(layout.detail_rows > layout.view_rows);
+        assert!(!layout.expanded);
+        // No decision affordance survives the clip: the leading detail consumes
+        // the budget before a decision row would be reached.
+        for forbidden in ["[a] allow once", "[d] deny", "[esc] park", "decisions go"] {
+            assert!(
+                !layout.lines.iter().any(|line| line.contains(forbidden)),
+                "{forbidden:?} must not survive a clip: {:?}",
+                layout.lines
+            );
+        }
+        // The card stays within the rows it was measured for.
+        assert!(layout.lines.len() <= layout.view_rows);
+        assert!(
+            layout.rows <= 16 - 6,
+            "the card never exceeds the spare rows"
+        );
+        assert_eq!(layout.rows, layout.lines.len() as u16 + 2);
+        let geometry = layout.geometry();
+        assert!(geometry.clipped, "the gate is told the detail did not fit");
+        assert_eq!(geometry.detail_rows, layout.detail_rows);
+    }
+
+    #[test]
+    fn a_narrow_clipped_card_still_spends_every_row_on_the_lock_not_a_decision() {
+        // In a card too small for the leading detail to matter, the clip
+        // warning alone can consume the whole inner budget. Every row must then
+        // belong to the warning: no decision may leak into a clipped card.
+        let card = card(&"s".repeat(900), &"c".repeat(900));
+        let area = Rect::new(0, 0, 24, 10);
+        let layout = approval_layout(&card, Some("run-1"), None, area, 1, false, 0);
+        assert!(layout.clipped);
+        assert_eq!(layout.inner_width, 22);
+        let rows_cap = 10 - 6;
+        assert_eq!(
+            layout.rows, rows_cap,
+            "the card claims exactly its spare rows"
+        );
+        assert_eq!(
+            layout.lines.len(),
+            layout.view_rows,
+            "the inner rows are fully used"
+        );
+        assert!(
+            layout
+                .lines
+                .iter()
+                .all(|line| line.chars().count() <= layout.inner_width),
+            "{:?}",
+            layout.lines
+        );
+        // Whatever fills the card, the rows are the warning text or detail, and
+        // never a decision.
+        for line in &layout.lines {
+            assert!(!line.contains("[a]"), "{line:?}");
+            assert!(!line.contains("[d] deny"), "{line:?}");
+            assert!(!line.contains("[esc] park"), "{line:?}");
+        }
+        // The warning is present when the budget could fit it.
+        let warning = std::iter::once(APPROVAL_LOCK)
+            .flat_map(|lock| lock.as_bytes().chunks(layout.inner_width))
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<String>>();
+        let expected = warning.len().min(layout.view_rows);
+        let reconstructed = layout.lines[..expected].concat();
+        assert_eq!(
+            reconstructed,
+            warning[..expected].concat(),
+            "the warning text is materialized verbatim"
+        );
+    }
+
+    #[test]
+    fn the_expanded_layout_keeps_deny_reachable_and_reports_its_window() {
+        let card = card(&"s".repeat(900), &"c".repeat(900));
+        let fields = approval_detail_fields(&card, Some("run-1"), None);
+        let inner_width = 46;
+        let detail_rows: usize = fields
+            .iter()
+            .map(|field| wrapped_height(field, inner_width))
+            .sum();
+        let rows_cap = 16 - 6;
+        let inner_rows = (rows_cap - 2) as usize;
+        let view_rows = inner_rows - 1;
+
+        let first = expanded_approval_layout(&fields, detail_rows, inner_width, rows_cap, 0);
+        assert_eq!(
+            first.rows, rows_cap,
+            "the expanded view uses every spare row"
+        );
+        assert_eq!(
+            first.lines.len(),
+            view_rows + 1,
+            "the detail rows plus exactly one hint row"
+        );
+        assert_eq!(first.scroll, 0);
+        assert!(first.expanded);
+        assert!(first.clipped, "the detail is taller than the window");
+        assert_eq!(first.geometry().inner_rows, view_rows);
+        assert_eq!(first.geometry().detail_rows, detail_rows);
+        // The hint row is last and keeps deny reachable while allow is locked.
+        let hint = first.lines.last().expect("hint row");
+        assert!(hint.contains("[d] deny"), "{hint:?}");
+        assert!(!hint.contains("[a] allow once"), "{hint:?}");
+        assert!(
+            !first
+                .lines
+                .iter()
+                .any(|line| line.contains("[a] allow once")),
+            "allow must not appear mid-detail"
+        );
+        // The displayed detail rows are exactly the rows at that offset.
+        let mut full = Vec::new();
+        push_detail_range(&fields, inner_width, 0, usize::MAX, &mut full);
+        assert_eq!(full.len(), detail_rows);
+        assert_eq!(first.lines[..view_rows], full[..view_rows]);
+
+        // Scrolling clamps to the last page, which then reports the whole
+        // detail as seen and unlocks allow without ever hiding deny.
+        let max_scroll = detail_rows - view_rows;
+        let last =
+            expanded_approval_layout(&fields, detail_rows, inner_width, rows_cap, usize::MAX);
+        assert_eq!(
+            last.scroll, max_scroll,
+            "the scroll clamps to the last page"
+        );
+        assert_eq!(last.lines[..view_rows], full[max_scroll..]);
+        let hint = last.lines.last().expect("hint row");
+        assert!(hint.contains("[d] deny"), "{hint:?}");
+        assert!(hint.contains("all detail seen"), "{hint:?}");
+        assert!(hint.contains("[a] allow once"), "{hint:?}");
+        // An intermediate page is still locked.
+        let middle =
+            expanded_approval_layout(&fields, detail_rows, inner_width, rows_cap, max_scroll - 1);
+        let hint = middle.lines.last().expect("hint row");
+        assert!(hint.contains("allow locked until detail end"), "{hint:?}");
+    }
+
+    #[test]
+    fn an_expanded_layout_that_fits_reports_every_row_and_no_scroll() {
+        let card = card("run tool host_write", "project scope");
+        let fields = approval_detail_fields(&card, Some("run-1"), None);
+        let detail_rows: usize = fields.iter().map(|field| wrapped_height(field, 78)).sum();
+        assert_eq!(detail_rows, 5, "four fields, one of which wraps");
+        let layout = expanded_approval_layout(&fields, detail_rows, 78, 24, usize::MAX);
+        assert_eq!(layout.scroll, 0, "a detail that fits never scrolls");
+        assert!(!layout.clipped, "a detail that fits is not clipped");
+        assert_eq!(
+            layout.lines.len(),
+            detail_rows + 1,
+            "every detail row plus the hint row"
+        );
+        let hint = layout.lines.last().expect("hint row");
+        assert!(hint.contains("all detail seen"), "{hint:?}");
+        assert_eq!(layout.geometry().inner_rows, layout.view_rows);
+        assert_eq!(layout.geometry().detail_rows, detail_rows);
+    }
+
+    #[test]
+    fn an_expanded_card_too_small_for_a_hint_row_still_shows_detail() {
+        // A card of the minimum size has a single inner row: no hint row is
+        // possible, and the layout must degrade to showing detail only.
+        let fields = vec!["only row".to_owned()];
+        let layout = expanded_approval_layout(&fields, 1, 20, APPROVAL_MIN_ROWS, 0);
+        assert_eq!(layout.rows, APPROVAL_MIN_ROWS);
+        assert_eq!(layout.lines, vec!["only row"]);
+        assert_eq!(layout.geometry().inner_rows, 1);
+        assert!(!layout.clipped);
+        assert!(layout.expanded);
+    }
+
+    #[test]
+    fn header_reports_the_run_status_and_focus() {
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 80, 1);
+        let header = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(header.contains("nexus-tui"), "{header:?}");
+        assert!(header.contains("M0-TEST"), "{header:?}");
+        assert!(header.contains("run:no run"), "{header:?}");
+        assert!(header.contains("idle"), "{header:?}");
+        assert!(header.contains("focus:viewport"), "{header:?}");
+
+        assert!(state.apply_event(&started(0)));
+        for (focus, label) in [
+            (Focus::Composer, "focus:composer"),
+            (Focus::Viewport, "focus:viewport"),
+            (Focus::ApprovalCard, "focus:approvalcard"),
+        ] {
+            let header = rows_of(area, |buf| render_header(&state, area, buf, focus))[0].clone();
+            assert!(header.contains("run:run-1"), "{header:?}");
+            assert!(header.contains("running"), "{header:?}");
+            assert!(header.contains(label), "{header:?}");
+        }
+    }
+
+    #[test]
+    fn footer_switches_on_cancel_approval_and_detail_state() {
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 200, 1);
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(footer.contains(" m0-test "), "{footer:?}");
+        assert!(footer.contains("idle"), "{footer:?}");
+        assert!(
+            !footer.contains("ctrl+c cancel"),
+            "an idle run offers no cancel: {footer:?}"
+        );
+        assert!(!footer.contains("[i]"), "{footer:?}");
+        assert!(footer.contains("stale:0 seq:0 dropped:0"), "{footer:?}");
+
+        assert!(state.apply_event(&started(0)));
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(footer.contains("ctrl+c cancel"), "{footer:?}");
+
+        assert!(state.apply_event(&approval(1, "run tool host_write", "project scope")));
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(footer.contains("[i] inspect"), "{footer:?}");
+        assert!(footer.contains("approval i/a/d"), "{footer:?}");
+
+        state.inspect_approval();
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(footer.contains("[i] close"), "{footer:?}");
+        assert!(footer.contains("pgup/pgdn"), "{footer:?}");
+    }
+
+    #[test]
+    fn composer_shows_the_draft_and_marks_the_caret_only_while_focused() {
+        let mut state = AppState::new();
+        for char in "hello".chars() {
+            state.composer_type(char);
+        }
+        let area = Rect::new(0, 0, 40, 3);
+        let mut focused = Buffer::empty(area);
+        render_composer(&state, area, &mut focused, Focus::Composer);
+        let text = text_rows(&focused);
+        assert!(text[0].contains("composer (fixed)"), "{text:?}");
+        assert!(text[1].contains("hello"), "{text:?}");
+        assert!(text[1].contains('▊'), "{text:?}");
+        assert_eq!(
+            focused.get(0, 0).fg,
+            Color::Green,
+            "the focused composer border is green"
+        );
+
+        let mut blurred = Buffer::empty(area);
+        render_composer(&state, area, &mut blurred, Focus::Viewport);
+        let text = text_rows(&blurred);
+        assert!(text[1].contains("hello"), "{text:?}");
+        assert!(!text[1].contains('▊'), "{text:?}");
+        assert_ne!(blurred.get(0, 0).fg, Color::Green);
+    }
+
+    #[test]
+    fn body_reserves_one_row_for_the_presentation_bound_notice() {
+        let mut state = AppState::new();
+        for index in 0..20 {
+            state.record_submitted(&format!("message {index}"));
+        }
+        // A body region of seven rows: one is spent on the notice, six remain
+        // for the window.
+        let area = Rect::new(0, 0, 40, 7);
+        let rows = rows_of(area, |buf| render_body(&mut state, area, buf));
+        assert!(
+            rows[0].trim_end().starts_with('…'),
+            "the notice owns the first body row: {rows:?}"
+        );
+        assert!(rows[0].contains("presentation-truncated"), "{rows:?}");
+        assert_eq!(
+            state.viewport_height(),
+            6,
+            "the notice row is reserved before the window is materialized"
+        );
+        let view = state.visible_lines(40, state.viewport_height());
+        assert_eq!(
+            rows[0].trim_end(),
+            format!("… {}↑ presentation-truncated", view.hidden_above),
+            "the notice reports the exact hidden-line count"
+        );
+        assert!(
+            rows.last().expect("body row").contains("message 19"),
+            "the live tail is never the row clipped away: {rows:?}"
+        );
+
+        // With nothing to bound, no row is reserved and the window is taller.
+        let mut quiet = AppState::new();
+        quiet.record_submitted("short");
+        let rows = rows_of(area, |buf| render_body(&mut quiet, area, buf));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("presentation-truncated")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            quiet.viewport_height(),
+            7,
+            "no row is wasted on a notice that is not needed"
+        );
+    }
+
+    #[test]
+    fn approval_titles_track_the_state_of_the_card_they_render() {
+        let short = card("run tool host_write", "project scope");
+
+        // The compact, fully shown card names the bounded decision set.
+        let compact = approval_layout(
+            &short,
+            Some("run-1"),
+            None,
+            Rect::new(0, 0, 120, 30),
+            1,
+            false,
+            0,
+        );
+        assert!(!compact.clipped);
+        let area = Rect::new(0, 0, 120, compact.rows);
+        let rows = rows_of(area, |buf| render_approval(&compact, area, buf));
+        let title = rows[0].clone();
+        assert!(
+            title.contains("approval required: allow-once / deny"),
+            "{title:?}"
+        );
+
+        // A clipped compact card names the clip and the inspector instead. The
+        // detail must be long enough to overflow this frame: the same short
+        // card that fits above still fits here, so the long card is what makes
+        // the title branch observable.
+        let long = card(&"s".repeat(900), &"c".repeat(900));
+        let clipped = approval_layout(
+            &long,
+            Some("run-1"),
+            None,
+            Rect::new(0, 0, 48, 16),
+            1,
+            false,
+            0,
+        );
+        assert!(clipped.clipped);
+        // Rendered wide enough for the whole title: at the clipping width the
+        // border cuts the title itself, which says nothing about its text.
+        let area = Rect::new(0, 0, 120, clipped.rows);
+        let rows = rows_of(area, |buf| render_approval(&clipped, area, buf));
+        let title = rows[0].clone();
+        assert!(
+            title.contains("approval required (detail clipped · [i] inspect)"),
+            "{title:?}"
+        );
+
+        // The expanded view names its own scroll position and the keys.
+        let expanded = expanded_approval_layout(
+            &approval_detail_fields(&short, Some("run-1"), None),
+            9,
+            46,
+            10,
+            0,
+        );
+        let area = Rect::new(0, 0, 120, expanded.rows);
+        let rows = rows_of(area, |buf| render_approval(&expanded, area, buf));
+        let title = rows[0].clone();
+        assert!(title.contains("approval detail 1-7/9"), "{title:?}");
+        assert!(title.contains("PgUp/PgDn"), "{title:?}");
+        assert!(title.contains("i/esc close"), "{title:?}");
+        assert!(!title.contains("approval required"), "{title:?}");
+    }
+
+    #[test]
+    fn approval_styles_separate_the_decision_rows_from_the_detail_rows() {
+        let card = card("run tool host_write", "project scope");
+        let layout = approval_layout(
+            &card,
+            Some("run-1"),
+            None,
+            Rect::new(0, 0, 120, 30),
+            1,
+            false,
+            0,
+        );
+        let area = Rect::new(0, 0, 120, layout.rows);
+        let mut buffer = Buffer::empty(area);
+        render_approval(&layout, area, &mut buffer);
+        let rows = text_rows(&buffer);
+
+        // The allow row is green wherever it appears, and the advisory row is
+        // dimmed so it reads as a note rather than a control.
+        let allow = row_holding(&rows, "[a] allow once").expect("allow row") as u16;
+        assert_eq!(buffer.get(1, allow).fg, Color::Green);
+        let note = row_holding(&rows, "decisions go").expect("advisory row") as u16;
+        assert_eq!(buffer.get(1, note).fg, Color::Reset);
+        assert!(buffer.get(1, note).modifier.contains(Modifier::DIM));
+        // A plain detail row carries no decision styling.
+        let detail = row_holding(&rows, "operation:").expect("detail row") as u16;
+        assert_eq!(buffer.get(1, detail).fg, Color::Reset);
+        assert_eq!(buffer.get(1, detail).modifier, Modifier::empty());
+        // The border is always the loud, red framing the card is meant to have.
+        assert_eq!(buffer.get(0, 0).fg, Color::Red);
+        assert!(buffer.get(0, 0).modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn rendering_is_immediate_mode_and_agrees_with_a_terminal_draw() {
+        let build = || {
+            let mut state = AppState::new();
+            assert!(state.apply_event(&started(0)));
+            assert!(state.apply_event(&text(1, "hello world")));
+            state.record_submitted("a typed draft");
+            state
+        };
+        // Rendering into a buffer by hand and rendering through a Terminal must
+        // produce identical cells: the renderer keeps no hidden frame state.
+        let mut state = build();
+        let area = Rect::new(0, 0, 80, 24);
+        let direct: Vec<String> = rows_of(area, |buf| {
+            render(&mut state, area, buf, Focus::Composer);
+        });
+
+        let mut state = build();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal builds");
+        terminal
+            .draw(|frame| {
+                render(
+                    &mut state,
+                    frame.size(),
+                    frame.buffer_mut(),
+                    Focus::Composer,
+                );
+            })
+            .expect("test draw succeeds");
+        assert_eq!(text_rows(terminal.backend().buffer()), direct);
+    }
+
+    #[test]
+    fn hostile_entry_titles_are_bounded_and_escape_free_at_insertion() {
+        // A hostile tool-preview key is sanitized and bounded when it is
+        // inserted, before any layout, width, or card ever sees it.
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let event = RunEvent::new(
+            SessionId::new("sess-1").expect("valid"),
+            RunId::new("run-1").expect("valid"),
+            1,
+            EventPayload::ToolCallPreview {
+                item_key: format!("\u{202E}{}", "t".repeat(MAX_TITLE_BYTES * 8)),
+            },
+        );
+        assert!(state.apply_event(&event));
+        assert_eq!(
+            state.entry_count(),
+            2,
+            "both the system and preview entries exist"
+        );
+        for index in 0..state.entry_count() {
+            let entry = state.entry(index).expect("entry exists");
+            assert!(entry.title.len() <= MAX_TITLE_BYTES, "{:?}", entry.title);
+            assert!(!entry.title.contains('\x1b'), "{:?}", entry.title);
+            assert!(!entry.title.contains('\u{202E}'), "{:?}", entry.title);
+        }
+        let preview = state.entry(1).expect("preview entry");
+        assert!(
+            preview.title.starts_with("preview \\u{202E}"),
+            "the bidi override is escaped visibly: {:?}",
+            preview.title
+        );
+        assert_eq!(
+            preview.title.len(),
+            MAX_TITLE_BYTES,
+            "the bounded title is exactly the bound"
+        );
+    }
+}
