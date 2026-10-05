@@ -12,7 +12,11 @@
 //! - Keyboard handling per tick is bounded, so an input flood cannot starve
 //!   event application or redraws.
 //! - A `Submit` clears and records the draft and adopts the run identity
-//!   only on an `Accepted` reply; `Busy` keeps the draft untouched.
+//!   only on an `Accepted` reply; `Busy` keeps the draft untouched. A new
+//!   `Accepted` submit after a terminal outcome adopts the next run.
+//! - A newly arrived approval takes keyboard focus at once -- the card is
+//!   modal, so Tab-hunting is never required; later events never steal
+//!   focus back, and a spent or terminal run returns focus to the composer.
 //! - Data and control events are merged by the runtime's contiguous per-run
 //!   sequence with a finite reorder buffer; older runs, duplicates, and
 //!   post-terminal events are rejected, and preceding text is applied in
@@ -26,13 +30,14 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyEvent, KeyEventKind, poll, read};
 use nexus_core::{
-    ApprovalNotice, CommandReply, CommandResponse, EventPayload, Limits, RequestId, RunEvent,
-    RunId, SessionId,
+    ApprovalNotice, CommandReply, CommandResponse, EventPayload, Limits, ModelRequest,
+    ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunEvent, RunId,
+    SessionId,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
@@ -73,12 +78,55 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
         policy: Policy::m0_test(),
         has_approval_handler: true,
     };
-    let provider = Arc::new(FakeProvider::interleaved_items());
+    let provider = Arc::new(PerRunProvider::new());
     let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = vec![
         Arc::new(FakeTool::read_only()),
         Arc::new(FakeTool::mutation()),
     ];
     Runtime::try_new(config, provider, tools).map_err(io::Error::other)
+}
+
+/// Test-only demo provider: serves a fresh scripted demo script for every
+/// run. The shared [`FakeProvider`] consumes its script queue across calls,
+/// so without a reset the second task in one process would observe an
+/// exhausted script and fail instantly. Resetting per run-id keeps each
+/// demo task replayable; real adapters never replay.
+struct PerRunProvider {
+    capabilities: ProviderCapabilities,
+    current: Mutex<PerRunState>,
+}
+
+struct PerRunState {
+    run: Option<RunId>,
+    provider: FakeProvider,
+}
+
+impl PerRunProvider {
+    fn new() -> Self {
+        let capabilities = FakeProvider::demo_two_turn().capabilities();
+        Self {
+            capabilities,
+            current: Mutex::new(PerRunState {
+                run: None,
+                provider: FakeProvider::demo_two_turn(),
+            }),
+        }
+    }
+}
+
+impl ProviderPort for PerRunProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities.clone()
+    }
+
+    fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
+        let mut current = self.current.lock().expect("demo provider lockable");
+        if current.run.as_ref() != Some(request.run()) {
+            current.run = Some(request.run().clone());
+            current.provider = FakeProvider::demo_two_turn();
+        }
+        current.provider.stream(request, context)
+    }
 }
 
 fn main() {
@@ -352,8 +400,14 @@ impl Frontend {
     }
 
     /// Applies merged events in order. Returns true when the terminal
-    /// outcome was applied; the run is never reopened afterwards.
+    /// outcome was applied; the run is never reopened afterwards. A
+    /// terminal outcome returns keyboard focus to the composer so the
+    /// next task can be typed immediately. A newly arrived approval takes
+    /// focus at once -- the card is modal, so its decision keys must work
+    /// without Tab-hunting -- but later events never steal focus back
+    /// once the user has deliberately moved away.
     fn apply_events(&mut self, events: impl IntoIterator<Item = RunEvent>) -> bool {
+        let had_pending = self.state.pending_approval().is_some();
         for event in events {
             let terminal = event.is_terminal();
             self.note_approval(&event);
@@ -361,8 +415,12 @@ impl Frontend {
                 self.state_rejected += 1;
             }
             if terminal {
+                self.focus = Focus::Composer;
                 return true;
             }
+        }
+        if !had_pending && self.state.pending_approval().is_some() {
+            self.focus = Focus::ApprovalCard;
         }
         false
     }
@@ -615,7 +673,9 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
                 .notice(&format!("decision reply: {:?}", reply.reply()));
             front.state.resolve_approval();
             front.live_approval = None;
-            front.focus = Focus::Viewport;
+            // The card is gone: hand the keyboard back to the composer so
+            // the next task can be typed without a Tab round-trip.
+            front.focus = Focus::Composer;
         }
         Action::Cancel => {
             if !front.state.can_cancel() {
@@ -647,7 +707,9 @@ struct InteractiveReport {
 }
 
 /// Interactive scripted demo: one canned submission, live approval card,
-/// full test-only keyset. Exits on quit or the terminal run outcome.
+/// full test-only keyset. The loop stays up across terminal outcomes so
+/// further tasks can be submitted; it exits on quit, channel close, or
+/// error, cancelling live work first.
 async fn interactive(runtime: Runtime, mut streams: EventStreams) -> io::Result<InteractiveReport> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
@@ -709,13 +771,27 @@ async fn interactive_loop(
     loop {
         let mut dirty = false;
         match next_loop_step(interval, &mut streams.data, &mut streams.control).await {
-            LoopStep::Closed => return Ok(()),
+            // A closed channel ends input, but the other one may still hold
+            // queued events: apply everything already committed before exit
+            // so a close racing the terminal cannot drop the outcome.
+            LoopStep::Closed => {
+                let drained =
+                    drain_available(&mut streams.data, &mut streams.control, &mut front.merger);
+                front.apply_events(drained);
+                let flushed = front.merger.flush();
+                front.apply_events(flushed);
+                front.report_merger();
+                draw(terminal, front)?;
+                return Ok(());
+            }
             LoopStep::Event(event) => {
                 event_since_tick = true;
                 dirty = true;
+                // A terminal outcome stays on screen and the loop keeps
+                // serving: the next `Accepted` submit adopts a new run.
+                // Only quit, close, or an I/O error ends the loop.
                 if absorb(front, event, streams) {
                     draw(terminal, front)?;
-                    return Ok(());
                 }
             }
             LoopStep::Tick => {
@@ -731,7 +807,6 @@ async fn interactive_loop(
                         dirty = true;
                         if front.apply_events(flushed) {
                             draw(terminal, front)?;
-                            return Ok(());
                         }
                     }
                 }
@@ -2452,8 +2527,8 @@ mod cov_main_topup {
         assert!(front.state.pending_approval().is_none());
         assert_eq!(
             front.focus,
-            Focus::Viewport,
-            "focus returns to the viewport"
+            Focus::Composer,
+            "the spent card hands the keyboard back to the composer"
         );
     }
 
@@ -2478,7 +2553,39 @@ mod cov_main_topup {
         assert!(transcript(&front).contains("decision reply"));
         assert!(front.live_approval.is_none());
         assert!(front.state.pending_approval().is_none());
+        assert_eq!(
+            front.focus,
+            Focus::Composer,
+            "the spent card hands the keyboard back to the composer"
+        );
+    }
+
+    #[test]
+    fn approval_arrival_takes_focus_without_tab() {
+        let run = run_id("run-autofocus");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&run);
+        assert_eq!(front.focus, Focus::Composer);
+        assert!(!front.apply_events(vec![started(&run, 0)]));
+        assert_eq!(
+            front.focus,
+            Focus::Composer,
+            "plain output never steals focus"
+        );
+        assert!(!front.apply_events(vec![approval(&run, 1, "c1-0")]));
+        assert_eq!(
+            front.focus,
+            Focus::ApprovalCard,
+            "a newly arrived approval takes focus so its keys work at once"
+        );
+        // The user deliberately moves away; later traffic must not yank
+        // focus back to a card they already know about.
+        front.focus = Focus::Viewport;
+        assert!(!front.apply_events(vec![text(&run, 2, "later")]));
         assert_eq!(front.focus, Focus::Viewport);
+        // A terminal outcome returns focus for the next task.
+        assert!(front.apply_events(vec![finished(&run, 3)]));
+        assert_eq!(front.focus, Focus::Composer);
     }
 
     #[tokio::test]
@@ -2626,7 +2733,7 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
-    async fn interactive_loop_applies_an_event_redraws_and_then_ends() {
+    async fn interactive_loop_applies_terminal_and_ends_only_on_close() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let run = run_id("run-loop-event");
         let mut front = Frontend::new(session());
@@ -2639,14 +2746,17 @@ mod cov_main_topup {
         };
         data_tx.try_send(started(&run, 0)).expect("capacity");
         data_tx.try_send(finished(&run, 1)).expect("capacity");
+        // Both senders are dropped up front: whatever the channel race
+        // yields (event first or close first), the close path drains the
+        // queued events before exiting, so both are always applied.
         drop(data_tx);
-        let _control_still_open = control_tx;
+        drop(control_tx);
         let mut gate = RefreshGate::m0_test();
         let mut interval = interval();
         let mut terminal = fixed_terminal();
 
-        // The first event is not terminal, so the loop falls through to the
-        // refresh gate and redraws; the second one ends the loop immediately.
+        // The terminal outcome is applied and presented, but the loop no
+        // longer ends on it: only the channel close ends the loop.
         interactive_loop(
             &runtime,
             &mut streams,
@@ -2656,13 +2766,121 @@ mod cov_main_topup {
             &mut interval,
         )
         .await
-        .expect("the loop ends on the terminal outcome");
+        .expect("the loop ends on close after applying the terminal outcome");
         assert_eq!(front.state.last_seq(), Some(1), "both events were applied");
         assert!(front.state.is_finished(), "the outcome was presented");
         assert!(
             transcript(&front).contains(&format!("run {} started", run.as_str())),
             "the applied event is presented"
         );
+    }
+
+    #[test]
+    fn second_accepted_submit_adopts_a_new_run_after_terminal() {
+        let first = run_id("run-first");
+        let second = run_id("run-second");
+        let mut front = Frontend::new(session());
+        let accept = |front: &mut Frontend, run: &RunId| {
+            let reply = CommandResponse::new(
+                front.next_request(),
+                CommandReply::Accepted,
+                Some(run.clone()),
+            );
+            assert!(front.adopt_accepted(&reply), "accepted submits adopt");
+        };
+        // Drive events through the merger exactly like the loop does, so
+        // finalization, sequencing, and focus behave identically.
+        let apply = |front: &mut Frontend, events: Vec<RunEvent>| {
+            for event in events {
+                let pushed = front.merger.push(event);
+                front.apply_events(pushed);
+            }
+        };
+        accept(&mut front, &first);
+        apply(&mut front, vec![started(&first, 0), finished(&first, 1)]);
+        assert!(front.merger.is_finalized(), "the first run finalized");
+        assert_eq!(
+            front.focus,
+            Focus::Composer,
+            "focus returns for the next task"
+        );
+        accept(&mut front, &second);
+        assert!(
+            !front.merger.is_finalized(),
+            "the second accepted run reopens the merger"
+        );
+        apply(&mut front, vec![started(&second, 0), finished(&second, 1)]);
+        assert_eq!(front.state.last_seq(), Some(1), "per-run sequences restart");
+        assert!(
+            front.state.is_finished(),
+            "the second outcome was presented"
+        );
+    }
+
+    /// Applies queued events until the run finalizes or an approval awaits.
+    async fn drain_until_settled(
+        front: &mut Frontend,
+        streams: &mut EventStreams,
+        interval: &mut tokio::time::Interval,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !front.merger.is_finalized()
+            && front.live_approval.is_none()
+            && Instant::now() < deadline
+        {
+            match next_loop_step(interval, &mut streams.data, &mut streams.control).await {
+                LoopStep::Closed => break,
+                LoopStep::Event(event) => {
+                    let pushed = front.merger.push(event);
+                    front.apply_events(pushed);
+                }
+                LoopStep::Tick => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn two_demo_runs_each_replay_the_script_and_complete() {
+        let (runtime, mut streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        let mut interval = interval();
+        let mut first_run = None;
+        for task in [DEMO_INPUT, "second demo task"] {
+            let submit = submit_command(
+                front.next_request(),
+                front.session.clone(),
+                task,
+                DEMO_PROFILE,
+            )
+            .expect("valid submit builds");
+            let reply = runtime.handle(submit).await.0;
+            assert_eq!(
+                reply.reply(),
+                CommandReply::Accepted,
+                "each demo task is accepted, even after a previous run"
+            );
+            assert!(settle_submit(&mut front, task, &reply));
+            drain_until_settled(&mut front, &mut streams, &mut interval).await;
+            let (run, notice) = front
+                .live_approval
+                .clone()
+                .expect("the scripted mutation awaits a grant");
+            if let Some(first) = &first_run {
+                assert_ne!(&run, first, "the second task mints a fresh run identity");
+            }
+            first_run = Some(run.clone());
+            let command = approve_notice_command(front.next_request(), &run, &notice);
+            let decision = runtime.handle(command).await.0;
+            assert_eq!(decision.reply(), CommandReply::Accepted);
+            front.state.resolve_approval();
+            front.live_approval = None;
+            drain_until_settled(&mut front, &mut streams, &mut interval).await;
+            assert!(front.merger.is_finalized(), "the run finalized");
+            assert!(
+                transcript(&front).contains("finished: Completed"),
+                "the granted demo run completes instead of exhausting its script"
+            );
+        }
     }
 
     #[test]
