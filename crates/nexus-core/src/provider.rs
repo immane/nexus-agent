@@ -561,6 +561,42 @@ pub trait ProviderPort {
     /// exactly one terminal event.
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent>;
 
+    /// Performs one model turn while offering provisional events to `sink`
+    /// as they arrive. Only presentation-safe prefixes travel the sink:
+    /// `TextDelta`, `ToolCallDelta`, and `Usage`. Candidates
+    /// (`ToolCallReady`) and terminal events are withheld from the sink and
+    /// arrive only in the returned batch, so nothing streamed can dispatch
+    /// or conclude a turn before the full batch validates. Callers must
+    /// treat sinked events as provisional presentation: the returned batch
+    /// stays authoritative for validation, dispatch, and records.
+    ///
+    /// The default replays the completed batch prefix through the sink, so
+    /// implementors that cannot stream incrementally keep compiling and
+    /// behave exactly like [`ProviderPort::stream`]. Runtimes consult
+    /// [`ProviderPort::supports_incremental_streaming`] before relying on
+    /// any fast-path timing.
+    fn stream_with_sink(
+        &self,
+        request: &ModelRequest,
+        context: &ProviderContext,
+        sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    ) -> Vec<ProviderEvent> {
+        let events = self.stream(request, context);
+        for event in events.iter().filter(|event| !event.is_terminal()) {
+            sink(event.clone());
+        }
+        events
+    }
+
+    /// True when [`ProviderPort::stream_with_sink`] delivers provisional
+    /// events genuinely ahead of turn completion (wire-level streaming).
+    /// Defaults to false: the default [`ProviderPort::stream_with_sink`]
+    /// replays after completion, which is presentation-equivalent but never
+    /// early. Adapters that push live deltas override this to true.
+    fn supports_incremental_streaming(&self) -> bool {
+        false
+    }
+
     /// Returns the stable adapter identity used for continuation
     /// compatibility matching. The default is the reserved
     /// [`DEFAULT_ADAPTER_IDENTITY`] placeholder; implementors that emit
@@ -1022,6 +1058,64 @@ mod tests {
             provider.continuation_scope("profile-a"),
             provider.continuation_scope("profile-b"),
             "distinct profiles never share a default scope"
+        );
+        assert!(
+            !provider.supports_incremental_streaming(),
+            "the default sink replays after completion, never early"
+        );
+    }
+
+    #[test]
+    fn default_sink_replays_the_completed_prefix_without_the_terminal() {
+        use std::sync::{Arc, Mutex};
+        struct FixedProvider;
+        impl ProviderPort for FixedProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                MinimalProvider.capabilities()
+            }
+
+            fn stream(
+                &self,
+                _request: &ModelRequest,
+                _context: &ProviderContext,
+            ) -> Vec<ProviderEvent> {
+                vec![
+                    ProviderEvent::TextDelta {
+                        item_key: "item-0".to_owned(),
+                        text: "hi".to_owned(),
+                    },
+                    ProviderEvent::TurnFinished(TurnFinished::new(
+                        crate::outcomes::FinishReason::Stop,
+                        Usage::new(None, None, UsageFinality::Final),
+                        None,
+                    )),
+                ]
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let pushed = Arc::clone(&seen);
+        let sink = move |event: ProviderEvent| {
+            pushed.lock().expect("sink log writable").push(event);
+        };
+        let batch = FixedProvider.stream_with_sink(
+            &request(),
+            &ProviderContext::new(Duration::from_secs(60), false, None),
+            &sink,
+        );
+        assert_eq!(batch.len(), 2, "the returned batch stays authoritative");
+        let seen = seen.lock().expect("sink log readable");
+        assert_eq!(
+            seen.len(),
+            1,
+            "only the non-terminal prefix travels the default sink"
+        );
+        assert!(
+            matches!(
+                &seen[0],
+                ProviderEvent::TextDelta { item_key, text }
+                if item_key == "item-0" && text == "hi"
+            ),
+            "the replayed prefix preserves content and order"
         );
     }
 }

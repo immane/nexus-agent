@@ -20,13 +20,14 @@
 
 | Crate | Role |
 |---|---|
-| `nexus-core` | Domain types, errors, limits, ports. Dependency-free. No behavior. |
+| `nexus-core` | Domain types, errors, limits, ports. Dependency-free. No behavior. `ProviderPort` offers opt-in incremental streaming: `stream_with_sink` (provisional text/usage only; candidates + terminals stay in the batch) with a replay-by-default, plus `supports_incremental_streaming` (default false). |
+| `nexus-validation` | Closed M0 JSON/schema validator; strict duplicate-rejecting parse reused by config. |
 | `nexus-validation` | Closed M0 JSON/schema validator; strict duplicate-rejecting parse reused by config. |
 | `nexus-config` | Typed user config (providers, models, favourites, recents) + versioned JSON file persistence. Secrets only as env-var references; never stored, logged, or echoed. |
 | `nexus-fakes` | Scripted provider/tool/store doubles. Exhaustion fails explicitly, never idle-succeeds. |
 | `nexus-tools` | Real `host_read`@M0 against a canonicalized root jail. Escapes `Denied`/`NotStarted`; failures `Failed`/`Unknown`/`Uncertain`; budget-cut with flag; TOCTOU window documented. |
-| `nexus-openai` | Real OpenAI-compatible chat adapter over blocking std I/O: `http` direct, `https` via the system `openssl s_client` TLS bridge (verified, no vendored TLS crate). Sends `stream:true`, parses SSE (`data:` chunks + `[DONE]`, chunked framing) into one validated batch; plain JSON replies still accepted. Cancellation/deadlines between read quanta; unknown usage stays unknown. |
-| `nexus-runtime` | Single-active-run loop: scoped policy, live cancellation/deadlines, quarantined workers until termination, contiguous per-run sequencing, honest terminal outcomes. `Runtime::try_new` validates everything up front. |
+| `nexus-openai` | Real OpenAI-compatible chat adapter over blocking std I/O: `http` direct, `https` via the system `openssl s_client` TLS bridge (verified, no vendored TLS crate). Sends `stream:true`, parses SSE incrementally (`data:` chunks + `[DONE]`, chunked framing) with live text/usage sink delivery; candidates + terminal stay in the returned aggregated batch. Opts into incremental streaming. Cancellation/deadlines between read quanta; unknown usage stays unknown. |
+| `nexus-runtime` | Single-active-run loop: scoped policy, live cancellation/deadlines, quarantined workers until termination, contiguous per-run sequencing, honest terminal outcomes. Publishes provisional provider prefixes live per run while the turn streams (text flushed at once, previews, usage estimates; candidates/terminals withheld to the validated batch; join-drain covers the channel race), then ingests the authoritative batch without replay. `Runtime::try_new` validates everything up front. |
 | `nexus-server` | Loopback HTTP frontend (`127.0.0.1` only, no auth): one `Runtime` per session, SSE event streams (single subscriber, terminal-drain fix applied), exact-identity approve/deny, per-session provider selection, `--tools real|fake`. |
 | `nexus-tui` | Interactive TUI: persistent multi-run loop, modal approval card (auto-focus on arrival, `i` inspect, `a`/`d` decide, `Esc` parks never cancels), slash commands (`/help /model /usage /quit`), viewport `m` model cycling, header shows project dir, composer shows model@provider, footer shows token counters (`?` never `0`). |
 | `nexus-headless` | One-shot machine-output runner over scripted fakes. |
@@ -65,7 +66,7 @@
 
 ## Open gaps (prioritized, honest)
 
-1. Real provider speaks `https` (verified `openssl` bridge) and SSE streaming on the wire, but still returns one validated batch per turn: no incremental UI deltas yet (needs a `stream_with_sink`-style port extension that publishes provisional text while withholding candidates until terminal agreement), and no per-run model override for real execution (session-level only; needs `ModelRequest` change).
+1. Real provider streams incrementally end to end (wire SSE → provisional TUI/server deltas). Remaining provider work: per-run model override for real execution (session-level only; needs `ModelRequest` change).
 2. No real tools besides `host_read`; no write/exec tools; TUI still fake-only for tools, and still a single in-process session (server multi-session picker wiring not started).
 3. Ephemeral store only; no durable sessions/resume; no auth/TLS on server (localhost-only by design).
 4. Linux same-toolchain validation, exact toolchain pin, PTY/idle/streaming baselines still open (M0).

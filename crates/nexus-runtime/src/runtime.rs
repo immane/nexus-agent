@@ -24,7 +24,7 @@
 //! - the model conversation is rebuilt additively with exact input, call,
 //!   result, item-key, and provider-reference round-trips.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -147,6 +147,18 @@ struct CurrentCall {
     item_key: String,
     provider_ref: String,
     binding: Option<ApprovalBinding>,
+}
+
+/// Provisional prefixes already published live while a streaming provider
+/// turn is still in flight. The authoritative batch still carries the full
+/// event list for validation and records; ingestion consults these keys to
+/// publish each prefix exactly once instead of replaying it.
+#[derive(Default)]
+struct StreamedPrefix {
+    /// Text item keys with at least one live-published fragment.
+    text_keys: HashSet<String>,
+    /// Preview item keys already announced as `ToolCallPreview`.
+    preview_keys: HashSet<String>,
 }
 
 struct ActiveRun {
@@ -797,7 +809,19 @@ impl Runtime {
             }
         };
         let provider = self.shared.provider.clone();
-        let mut handle = tokio::task::spawn_blocking(move || provider.stream(&request, &context));
+        let incremental = provider.supports_incremental_streaming();
+        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<ProviderEvent>();
+        let mut handle = tokio::task::spawn_blocking(move || {
+            if incremental {
+                let sink = |event: ProviderEvent| {
+                    let _ = stream_tx.send(event);
+                };
+                provider.stream_with_sink(&request, &context, &sink)
+            } else {
+                provider.stream(&request, &context)
+            }
+        });
+        let mut prefix = StreamedPrefix::default();
         let mut cancelled_first = false;
         let joined = loop {
             if token.is_cancelled() {
@@ -807,6 +831,12 @@ impl Runtime {
             tokio::select! {
                 biased;
                 joined = &mut handle => break Some(joined),
+                streamed = stream_rx.recv() => {
+                    if let Some(event) = streamed {
+                        self.publish_provisional(run, &turn, event, &mut prefix)
+                            .await;
+                    }
+                }
                 () = wake.notified() => {
                     if token.is_cancelled() {
                         cancelled_first = true;
@@ -817,7 +847,14 @@ impl Runtime {
             }
         };
         match joined {
-            Some(Ok(events)) => self.ingest_model_batch(run, &turn, events).await,
+            Some(Ok(events)) => {
+                // The join may win the race while provisional events are
+                // still buffered: drain them first so every streamed prefix
+                // publishes before the authoritative batch ingests.
+                self.drain_stream(run, &turn, &mut stream_rx, &mut prefix)
+                    .await;
+                self.ingest_model_batch(run, &turn, events, &prefix).await
+            }
             Some(Err(join)) => {
                 let message = if join.is_panic() {
                     "provider worker panicked"
@@ -852,11 +889,82 @@ impl Runtime {
         }
     }
 
+    /// Publishes one provisional provider event while its turn is still in
+    /// flight. Only presentation-safe prefixes publish here: text fragments
+    /// (flushed at once so the frontend updates now, not at the terminal),
+    /// call previews, and usage estimates. Candidates and terminals are
+    /// withheld by contract and arrive through the validated batch, so
+    /// nothing streamed can dispatch work or conclude a turn early. Events
+    /// for a stale, cancelled, or finished run publish nothing.
+    async fn publish_provisional(
+        &self,
+        run: &RunId,
+        turn: &TurnId,
+        event: ProviderEvent,
+        prefix: &mut StreamedPrefix,
+    ) {
+        let mut state = self.shared.state.lock().await;
+        let Some(active) = state.active.as_mut() else {
+            return;
+        };
+        if &active.run != run || active.cancelled || active.token.is_cancelled() {
+            return;
+        }
+        match event {
+            ProviderEvent::TextDelta { item_key, text } => {
+                prefix.text_keys.insert(item_key.clone());
+                match AssistantText::new(turn.clone(), item_key, text) {
+                    Ok(fragment) => {
+                        buffer_text(&self.shared, active, run, fragment);
+                        flush_text(&self.shared, active);
+                    }
+                    Err(_) => active.data_dropped = true,
+                }
+            }
+            ProviderEvent::ToolCallDelta { item_key, .. } => {
+                prefix.preview_keys.insert(item_key.clone());
+                emit_data(
+                    &self.shared,
+                    active,
+                    run,
+                    EventPayload::ToolCallPreview { item_key },
+                );
+            }
+            ProviderEvent::Usage(usage) => {
+                if active.last_usage != Some(usage) {
+                    emit_control(&self.shared, active, run, EventPayload::UsageUpdated(usage));
+                    active.last_usage = Some(usage);
+                }
+            }
+            ProviderEvent::ToolCallReady(_)
+            | ProviderEvent::TurnFinished(_)
+            | ProviderEvent::Failed(_) => {}
+        }
+    }
+
+    /// Drains buffered provisional events after the provider turn joined,
+    /// publishing each exactly once ahead of batch ingestion. The join can
+    /// win the channel race while streamed prefixes are still queued; without
+    /// this drain they would be silently dropped and the batch would publish
+    /// them a second time.
+    async fn drain_stream(
+        &self,
+        run: &RunId,
+        turn: &TurnId,
+        stream_rx: &mut mpsc::UnboundedReceiver<ProviderEvent>,
+        prefix: &mut StreamedPrefix,
+    ) {
+        while let Ok(event) = stream_rx.try_recv() {
+            self.publish_provisional(run, turn, event, prefix).await;
+        }
+    }
+
     async fn ingest_model_batch(
         &self,
         run: &RunId,
         turn: &TurnId,
         events: Vec<ProviderEvent>,
+        prefix: &StreamedPrefix,
     ) -> Result<RunState, Terminal> {
         // Full-turn atomic validation: duplicate references, partial/final
         // disagreement, and finish-reason conflicts fail before any
@@ -897,20 +1005,27 @@ impl Runtime {
                     } else {
                         text_items.push((item_key.clone(), text.clone()));
                     }
-                    match AssistantText::new(turn.clone(), item_key.clone(), text.clone()) {
-                        Ok(fragment) => buffer_text(&self.shared, active, run, fragment),
-                        Err(_) => active.data_dropped = true,
+                    if !prefix.text_keys.contains(item_key) {
+                        // Keys published live while the turn streamed stay
+                        // published: records still accumulate above,
+                        // presentation does not replay.
+                        match AssistantText::new(turn.clone(), item_key.clone(), text.clone()) {
+                            Ok(fragment) => buffer_text(&self.shared, active, run, fragment),
+                            Err(_) => active.data_dropped = true,
+                        }
                     }
                 }
                 ProviderEvent::ToolCallDelta { item_key, .. } => {
-                    emit_data(
-                        &self.shared,
-                        active,
-                        run,
-                        EventPayload::ToolCallPreview {
-                            item_key: item_key.clone(),
-                        },
-                    );
+                    if !prefix.preview_keys.contains(item_key) {
+                        emit_data(
+                            &self.shared,
+                            active,
+                            run,
+                            EventPayload::ToolCallPreview {
+                                item_key: item_key.clone(),
+                            },
+                        );
+                    }
                 }
                 ProviderEvent::ToolCallReady(candidate) => candidates.push(candidate.clone()),
                 ProviderEvent::Usage(usage) => {
@@ -4591,7 +4706,12 @@ mod cov_runtime_topup_private {
             assert_cancelled(bed.runtime.on_calling_model(&run).await);
             assert_cancelled(
                 bed.runtime
-                    .ingest_model_batch(&run, &turn_id("absent"), stop_turn("ignored"))
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("absent"),
+                        stop_turn("ignored"),
+                        &StreamedPrefix::default(),
+                    )
                     .await,
             );
             assert_cancelled(bed.runtime.on_validating(&run).await);
@@ -4626,7 +4746,12 @@ mod cov_runtime_topup_private {
             assert_cancelled(bed.runtime.on_calling_model(&stale).await);
             assert_cancelled(
                 bed.runtime
-                    .ingest_model_batch(&stale, &turn_id("stale"), stop_turn("ignored"))
+                    .ingest_model_batch(
+                        &stale,
+                        &turn_id("stale"),
+                        stop_turn("ignored"),
+                        &StreamedPrefix::default(),
+                    )
                     .await,
             );
             assert_cancelled(bed.runtime.on_validating(&stale).await);

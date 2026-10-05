@@ -662,3 +662,105 @@ fn https_unreachable_peers_fail_protocol_not_unsupported() {
     let error = failed(provider.stream(&base_request(), &live_context()));
     assert_eq!(error.0, ErrorCategory::Protocol);
 }
+
+#[test]
+fn incremental_sink_streams_text_and_usage_but_withholds_dispatch() {
+    use std::sync::Mutex;
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-9\",\"function\":{\"name\":\"host_read\",\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\n",
+        "data: [DONE]\n",
+    );
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let seen = Mutex::new(Vec::new());
+    let sink = |event: ProviderEvent| {
+        seen.lock().expect("sink log writable").push(event);
+    };
+    let batch = provider(&base).stream_with_sink(&base_request(), &live_context(), &sink);
+    let seen = seen.lock().expect("sink log readable").clone();
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ProviderEvent::TextDelta { text, .. } if text == "hello "
+        )),
+        "text fragments stream provisionally: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Usage(usage) if usage.input_tokens() == Some(5)
+        )),
+        "usage streams provisionally: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ToolCallReady(_) | ProviderEvent::TurnFinished(_)
+        )),
+        "candidates and terminals never travel the sink: {seen:?}"
+    );
+    let ready = batch
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::ToolCallReady(candidate) => Some(candidate),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ready.len(), 1, "the batch stays authoritative: {batch:?}");
+    assert_eq!(finished(&batch).reason(), FinishReason::ToolCalls);
+}
+
+#[test]
+fn incremental_sink_sees_fragments_as_chunks_arrive() {
+    use std::sync::Mutex;
+    // One SSE line split across TCP segments: the live parser must still
+    // emit the fragment once the line completes, not only at EOF.
+    let full = "data: {\"choices\":[{\"delta\":{\"content\":\"abcdef\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n";
+    let head = sse_head(full.len());
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("loopback binds");
+    let port = listener.local_addr().expect("port known").port();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        use std::io::{Read, Write};
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut head_buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head_buf.ends_with(b"\r\n\r\n") {
+            match stream.read_exact(&mut byte) {
+                Ok(()) => head_buf.push(byte[0]),
+                Err(_) => break,
+            }
+            if head_buf.len() > 65_536 {
+                break;
+            }
+        }
+        let _ = stream.write_all(head.as_bytes());
+        let raw = full.as_bytes();
+        let _ = stream.write_all(&raw[..20]);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = stream.write_all(&raw[20..]);
+    });
+    let seen = Mutex::new(Vec::new());
+    let sink = |event: ProviderEvent| {
+        seen.lock().expect("sink log writable").push(event);
+    };
+    let provider = OpenAiProvider::new(
+        &format!("http://127.0.0.1:{port}/v1"),
+        present_credential(),
+        "m",
+    )
+    .expect("provider builds");
+    let batch = provider.stream_with_sink(&base_request(), &live_context(), &sink);
+    let seen = seen.lock().expect("sink log readable").clone();
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ProviderEvent::TextDelta { text, .. } if text == "abcdef"
+        )),
+        "split lines still stream: {seen:?}"
+    );
+    assert_eq!(finished(&batch).reason(), FinishReason::Stop);
+}
