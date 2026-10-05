@@ -37,6 +37,8 @@ const WEB_PROFILE: &str = "web-test";
 /// exhausted script and fail instantly. Real adapters never replay.
 struct PerRunProvider {
     capabilities: ProviderCapabilities,
+    adapter_label: String,
+    scope_label: String,
     current: Mutex<PerRunState>,
 }
 
@@ -47,9 +49,11 @@ struct PerRunState {
 
 impl PerRunProvider {
     fn new() -> Self {
-        let capabilities = FakeProvider::demo_two_turn().capabilities();
+        let probe = FakeProvider::demo_two_turn();
         Self {
-            capabilities,
+            capabilities: probe.capabilities(),
+            adapter_label: probe.adapter_identity().to_owned(),
+            scope_label: probe.continuation_scope(WEB_PROFILE),
             current: Mutex::new(PerRunState {
                 run: None,
                 provider: FakeProvider::demo_two_turn(),
@@ -61,6 +65,14 @@ impl PerRunProvider {
 impl ProviderPort for PerRunProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
+    }
+
+    fn adapter_identity(&self) -> &str {
+        &self.adapter_label
+    }
+
+    fn continuation_scope(&self, _profile: &str) -> String {
+        self.scope_label.clone()
     }
 
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
@@ -205,10 +217,9 @@ impl Server {
                 decision,
             } => self.with_session(session, |entry| self.decide(&entry, run, decision, body)),
             Route::Events { session, run } => match self.session(session) {
-                Some(entry) => {
-                    self.stream_events(&entry, run, stream);
-                    None
-                }
+                // The stream loop owns the connection on success (`None`)
+                // and closes it; a refusal (400/409) must still be framed.
+                Some(entry) => self.stream_events(&entry, run, stream),
                 None => Some(json_response(404, &json::error_body("unknown session"))),
             },
             Route::NotFound => Some(json_response(404, &json::error_body("unknown route"))),
@@ -524,6 +535,60 @@ fn json_response(status: u16, body: &[u8]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    /// Live demo context: a 60s elapsed reading, never cancelled, no
+    /// credential, so the served script is never short-circuited.
+    fn live_context() -> ProviderContext {
+        ProviderContext::new(Duration::from_secs(60), false, None)
+    }
+
+    /// One demo request for `run`/`turn` with no tools and no continuation.
+    fn request(run: &str, turn: &str) -> ModelRequest {
+        ModelRequest::new(
+            RunId::new(run).expect("valid"),
+            TurnId::new(turn).expect("valid"),
+            WEB_PROFILE,
+            vec![],
+            None,
+            1024,
+        )
+        .expect("valid request builds")
+    }
+
+    /// Returns the batch's single terminal event, asserting it is last: a
+    /// script that continued past its terminal would be a fake-contract bug,
+    /// not a wrapper behavior.
+    fn terminal(events: &[ProviderEvent]) -> &ProviderEvent {
+        assert!(!events.is_empty(), "every invocation returns a terminal");
+        let terminals: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.is_terminal())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one terminal event");
+        assert_eq!(terminals[0], events.len() - 1, "the terminal event is last");
+        &events[terminals[0]]
+    }
+
+    /// Provider references proposed by one invocation, in declared order.
+    fn ready_refs(events: &[ProviderEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ToolCallReady(candidate) => Some(candidate.provider_ref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Locks the live per-run state. The inner fake is observable only from
+    /// inside this module, and its call counter plus request log are what
+    /// prove whether the shared script survived or was replaced.
+    fn state(provider: &PerRunProvider) -> std::sync::MutexGuard<'_, PerRunState> {
+        provider.current.lock().expect("demo provider lockable")
+    }
 
     #[test]
     fn route_table_matches_every_documented_path() {
@@ -603,6 +668,145 @@ mod tests {
         assert_eq!(
             crate::json::reply_status(CommandReply::AlreadyFinalized),
             409
+        );
+    }
+
+    /// The wrapper's whole reason for existing: one shared fake serves many
+    /// runs, so a run that keeps its identity keeps the shared script queue.
+    /// Call one is the tool turn, call two is the stop turn, and call three is
+    /// the fake's explicit exhausted failure — never a silent replay of the
+    /// tool turn, which would re-propose calls after the run already ended.
+    #[test]
+    fn same_run_reuses_the_script_queue_until_it_exhausts() {
+        let provider = PerRunProvider::new();
+
+        let first = provider.stream(&request("run-same", "turn-1"), &live_context());
+        assert_eq!(ready_refs(&first), vec!["prov-ref-1", "prov-ref-2"]);
+        assert!(matches!(
+            terminal(&first),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::ToolCalls
+        ));
+
+        let second = provider.stream(&request("run-same", "turn-2"), &live_context());
+        assert!(
+            ready_refs(&second).is_empty(),
+            "the stop turn proposes no call, so the second turn cannot be the tool turn again"
+        );
+        assert!(matches!(
+            terminal(&second),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::Stop
+        ));
+
+        let third = provider.stream(&request("run-same", "turn-3"), &live_context());
+        assert_eq!(
+            third.len(),
+            1,
+            "an exhausted script yields only its terminal failure"
+        );
+        // The wrapper is ungated and uncancelled, so a lone `Protocol`
+        // failure is the fake's exhausted script, not a cancellation or a
+        // gate that was never released.
+        assert!(matches!(
+            terminal(&third),
+            ProviderEvent::Failed(error) if error.category() == ErrorCategory::Protocol
+        ));
+
+        // All three calls reached one live fake: a per-run reset would have
+        // left the replacement with a single recorded call.
+        let state = state(&provider);
+        assert_eq!(state.run.as_ref().map(RunId::as_str), Some("run-same"));
+        assert_eq!(state.provider.call_count(), 3);
+        let seen = state.provider.requests();
+        let runs: Vec<&str> = seen.iter().map(|seen| seen.run().as_str()).collect();
+        assert_eq!(runs, vec!["run-same", "run-same", "run-same"]);
+    }
+
+    /// A run change swaps in a whole fresh demo script, which is what keeps
+    /// the second task in one session from failing instantly on the shared
+    /// fake's exhausted script.
+    #[test]
+    fn different_run_resets_to_a_fresh_whole_script() {
+        let provider = PerRunProvider::new();
+
+        let first = provider.stream(&request("run-a", "turn-1"), &live_context());
+        assert_eq!(ready_refs(&first), vec!["prov-ref-1", "prov-ref-2"]);
+        let stop_a = provider.stream(&request("run-a", "turn-2"), &live_context());
+        assert!(matches!(
+            terminal(&stop_a),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::Stop
+        ));
+        let exhausted = provider.stream(&request("run-a", "turn-3"), &live_context());
+        assert!(matches!(terminal(&exhausted), ProviderEvent::Failed(_)));
+
+        let reset = provider.stream(&request("run-b", "turn-1"), &live_context());
+        assert_eq!(
+            ready_refs(&reset),
+            vec!["prov-ref-1", "prov-ref-2"],
+            "a new run serves the tool turn again instead of an exhausted failure"
+        );
+        assert!(matches!(
+            terminal(&reset),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::ToolCalls
+        ));
+
+        // The replacement is a whole script, not just its first entry: the
+        // second turn of the new run still completes with the stop turn.
+        let stop = provider.stream(&request("run-b", "turn-2"), &live_context());
+        assert!(matches!(
+            terminal(&stop),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::Stop
+        ));
+
+        // Only the last run is remembered, so returning to an earlier run
+        // resets again instead of resuming its exhausted script.
+        let returned = provider.stream(&request("run-a", "turn-4"), &live_context());
+        assert_eq!(ready_refs(&returned), vec!["prov-ref-1", "prov-ref-2"]);
+
+        let state = state(&provider);
+        assert_eq!(state.run.as_ref().map(RunId::as_str), Some("run-a"));
+        // Three fakes served this sequence: two were replaced wholesale, so the
+        // live one has seen only its own single call. A wrapper that kept a
+        // per-run fake map would still report a reused counter here.
+        assert_eq!(state.provider.call_count(), 1);
+        let seen = state.provider.requests();
+        let runs: Vec<&str> = seen.iter().map(|seen| seen.run().as_str()).collect();
+        assert_eq!(runs, vec!["run-a"]);
+    }
+
+    /// The wrapper advertises exactly the demo fixture's capabilities, and the
+    /// cached description survives the per-run script swap: a runtime that
+    /// negotiated capabilities before the first turn must not see them change.
+    #[test]
+    fn capabilities_match_the_demo_fixture_across_run_changes() {
+        let provider = PerRunProvider::new();
+        let expected = FakeProvider::demo_two_turn().capabilities();
+        assert_eq!(provider.capabilities(), expected);
+
+        let first = provider.stream(&request("run-a", "turn-1"), &live_context());
+        assert!(matches!(
+            terminal(&first),
+            ProviderEvent::TurnFinished(finished) if finished.reason() == FinishReason::ToolCalls
+        ));
+        let reset = provider.stream(&request("run-b", "turn-1"), &live_context());
+        assert_eq!(ready_refs(&reset), vec!["prov-ref-1", "prov-ref-2"]);
+        assert_eq!(provider.capabilities(), expected);
+    }
+
+    /// The wrapper forwards the demo fixture's identity and scope, so a
+    /// continuation-carrying script would observe the same labels through
+    /// the wrapper as through the fake itself.
+    #[test]
+    fn identity_and_scope_match_the_demo_fixture() {
+        let provider = PerRunProvider::new();
+        let probe = FakeProvider::demo_two_turn();
+        assert_eq!(provider.adapter_identity(), probe.adapter_identity());
+        assert_eq!(
+            provider.continuation_scope(WEB_PROFILE),
+            probe.continuation_scope(WEB_PROFILE)
+        );
+        assert_eq!(
+            provider.continuation_scope("other-profile"),
+            probe.continuation_scope("other-profile")
         );
     }
 }
