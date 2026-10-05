@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,13 +15,14 @@ concurrency:
 
 jobs:
   checks:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -29,9 +31,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          python-version: "3.12"
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -48,4 +50,4 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
 
       - name: Perf harness tests
-        run: python3 -m unittest discover -s tools/perf -p 'test_*.py'
+        run: python -m unittest discover -s tools/perf -p 'test_*.py' -v
