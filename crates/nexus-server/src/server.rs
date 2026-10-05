@@ -135,6 +135,11 @@ pub struct Session {
     control: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
     streaming: Mutex<bool>,
     next_request: AtomicU64,
+    /// Events consumed from the channels that belong to a run other than
+    /// the one being served. `try_recv` consumes, so a foreign event met
+    /// while draining cannot be left in the channel; it is stashed here
+    /// for its own waiter instead of being dropped.
+    pending: Mutex<Vec<nexus_core::RunEvent>>,
 }
 
 impl Session {
@@ -303,6 +308,7 @@ impl Server {
             control: Mutex::new(streams.control),
             streaming: Mutex::new(false),
             next_request: AtomicU64::new(1),
+            pending: Mutex::new(Vec::new()),
         });
         self.sessions
             .lock()
@@ -379,7 +385,15 @@ impl Server {
         let parsed: Value = if request.body.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&request.body).unwrap_or(Value::Null)
+            match serde_json::from_slice(&request.body) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Some(json_response(
+                        400,
+                        &json::error_body("request body is invalid"),
+                    ));
+                }
+            }
         };
         let body = &parsed;
         match route_path(&request.method, &request.path) {
@@ -803,26 +817,39 @@ impl Server {
         let mut data = session.data.lock().expect("data channel lockable");
         let mut control = session.control.lock().expect("control channel lockable");
         loop {
-            let next = self.handle.block_on(async {
-                tokio::time::timeout(SSE_IDLE, async {
-                    tokio::select! {
-                        event = data.recv() => event.map(StreamSide::Data),
-                        event = control.recv() => event.map(StreamSide::Control),
+            let event = match Self::take_pending(session, &run) {
+                Some(event) => event,
+                None => {
+                    let next = self.handle.block_on(async {
+                        tokio::time::timeout(SSE_IDLE, async {
+                            tokio::select! {
+                                event = data.recv() => event.map(StreamSide::Data),
+                                event = control.recv() => event.map(StreamSide::Control),
+                            }
+                        })
+                        .await
+                    });
+                    match next {
+                        Ok(Some(StreamSide::Data(event)))
+                        | Ok(Some(StreamSide::Control(event))) => event,
+                        Ok(None) => break,
+                        Err(_) => {
+                            if write!(stream, ": ping\n\n").is_err() || stream.flush().is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                     }
-                })
-                .await
-            });
-            let event = match next {
-                Ok(Some(StreamSide::Data(event))) | Ok(Some(StreamSide::Control(event))) => event,
-                Ok(None) => break,
-                Err(_) => {
-                    if write!(stream, ": ping\n\n").is_err() || stream.flush().is_err() {
-                        break;
-                    }
-                    continue;
                 }
             };
             if event.run() != &run {
+                // Another run's event: stash it for its own waiter
+                // instead of dropping it.
+                session
+                    .pending
+                    .lock()
+                    .expect("pending lockable")
+                    .push(event);
                 continue;
             }
             let terminal = event.is_terminal();
@@ -838,7 +865,9 @@ impl Server {
                 // independent channels): forward everything already
                 // committed first, terminal last, so a select! ordering can
                 // never strand a predecessor event.
-                if Self::drain_predecessors(stream, &mut data, &mut control, &run).is_err() {
+                if Self::drain_predecessors(stream, &mut data, &mut control, &run, &session.pending)
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -870,6 +899,7 @@ impl Server {
         data: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
         control: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
         run: &RunId,
+        pending: &Mutex<Vec<nexus_core::RunEvent>>,
     ) -> std::io::Result<()> {
         loop {
             let mut progressed = false;
@@ -877,7 +907,12 @@ impl Server {
                 while let Ok(queued) = channel.try_recv() {
                     progressed = true;
                     if queued.run() != run {
-                        continue;
+                        // `try_recv` already consumed this event, so it
+                        // cannot stay queued: stash it for its own waiter
+                        // and stop draining this channel, leaving the
+                        // events behind it untouched.
+                        pending.lock().expect("pending lockable").push(queued);
+                        break;
                     }
                     let frame = format!(
                         "id: {}\ndata: {}\n\n",
@@ -892,6 +927,16 @@ impl Server {
                 return Ok(());
             }
         }
+    }
+
+    /// Pops the earliest stashed event owned by `run`, if any. Stashed
+    /// events come from foreign-run encounters in the receive and drain
+    /// paths; serving them here keeps every event deliverable to its own
+    /// waiter exactly once.
+    fn take_pending(session: &Session, run: &RunId) -> Option<nexus_core::RunEvent> {
+        let mut pending = session.pending.lock().expect("pending lockable");
+        let pos = pending.iter().position(|event| event.run() == run)?;
+        Some(pending.remove(pos))
     }
     /// the document. A run submitted without a model has no entry and is
     /// skipped without touching the configuration.
@@ -1432,9 +1477,8 @@ mod tests {
     /// a missing target, distinct from the unknown-model refusal of the
     /// addition path even though both are "unknown" in different senses.
     ///
-    /// Exercised here rather than over a socket because the blocking
-    /// transport in `http::read_request` refuses every method but `GET` and
-    /// `POST` before routing, so a `DELETE` cannot currently be delivered.
+    /// Exercised here rather than over a socket to keep file persistence
+    /// assertions hermetic.
     #[test]
     fn removing_a_favourite_answers_with_the_resulting_list() {
         let directory =

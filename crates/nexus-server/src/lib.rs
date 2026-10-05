@@ -66,11 +66,8 @@
 //!   the resulting list; `400` for an unknown model, `409` for a full list,
 //!   `500` when the save fails.
 //! - `DELETE /config/favourites/{mid}` -> `200` with the resulting list;
-//!   `404` for an id that is not a favourite. Note that the transport in
-//!   `http::read_request` currently admits only `GET` and `POST`, so a
-//!   `DELETE` is refused with `405` before it reaches this route; the route
-//!   and its handler are implemented, and admitting the method in the parser
-//!   makes them reachable with no change here.
+//!   `404` for an id that is not a favourite. The transport admits
+//!   `DELETE` alongside `GET` and `POST`, so this route is reachable.
 //!
 //! # Dependency justification
 //!

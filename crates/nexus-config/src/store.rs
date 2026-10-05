@@ -6,7 +6,9 @@
 //! error). Saves are atomic (temporary file plus rename) with owner-only
 //! permissions on Unix.
 
+use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::model::{CONFIG_REVISION, UserConfig};
 
@@ -159,23 +161,77 @@ pub fn load(path: &Path) -> Result<Option<UserConfig>, ConfigError> {
     UserConfig::from_json(&text).map(Some)
 }
 
-/// Saves atomically: write a temporary sibling, restrict it to the owner,
-/// flush it, then rename over the target. Readers never observe a partial
-/// document.
+/// Per-process nonce disambiguating concurrent saves: the temporary name
+/// mixes pid, wall-clock nanos, and this counter, so two saves never share
+/// a sibling even within one process.
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Saves atomically: write a uniquely named temporary sibling created with
+/// exclusive semantics and owner-only permissions, flush it, then rename
+/// over the target. Readers never observe a partial document, concurrent
+/// saves never share a temporary, and no world-readable window exists.
 pub fn save(config: &UserConfig, path: &Path) -> Result<(), ConfigError> {
     let io_error = || ConfigError {
         kind: ConfigErrorKind::Io,
         message: "configuration could not be written",
     };
     let parent = path.parent().ok_or_else(io_error)?;
-    let temporary = parent.join(format!(".nexus-config-{}.tmp", std::process::id()));
-    std::fs::write(&temporary, config.to_json()).map_err(|_| io_error())?;
-    restrict_owner_only(&temporary).map_err(|_| io_error())?;
-    std::fs::rename(&temporary, path).map_err(|_| {
-        let _ = std::fs::remove_file(&temporary);
-        io_error()
-    })?;
-    Ok(())
+    let pid = std::process::id();
+    let mut attempts = 0;
+    loop {
+        let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let temporary = parent.join(format!(".nexus-config-{pid}-{nanos}-{nonce}.tmp"));
+        let mut file = match create_temp(&temporary) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => {
+                attempts += 1;
+                continue;
+            }
+            Err(_) => return Err(io_error()),
+            Ok(file) => file,
+        };
+        if file.write_all(config.to_json().as_bytes()).is_err()
+            || restrict_owner_only(&temporary).is_err()
+            || file.sync_all().is_err()
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(io_error());
+        }
+        drop(file);
+        if std::fs::rename(&temporary, path).is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(io_error());
+        }
+        return Ok(());
+    }
+}
+
+/// Creates the temporary save sibling exclusively: `create_new` fails when
+/// the name already exists instead of truncating a concurrent save. On Unix
+/// the file is born owner-only, so no permissive window precedes the
+/// post-write restriction.
+#[cfg(unix)]
+fn create_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Creates the temporary save sibling exclusively on non-Unix platforms,
+/// where owner-only permissions are a documented no-op.
+#[cfg(not(unix))]
+fn create_temp(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Restricts a file to owner-only access on Unix. Elsewhere this is a

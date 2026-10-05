@@ -87,25 +87,82 @@ impl OpenAiProvider {
             Some((authority, path)) => (authority, format!("/{path}")),
             None => (rest, String::new()),
         };
-        if authority.is_empty() || authority.contains([' ', '\t']) {
+        if authority.is_empty()
+            || authority
+                .chars()
+                .any(|c| c.is_ascii_control() || c == ' ' || c == '@')
+        {
             return Err(provider_error_inner(
                 ErrorCategory::InvalidInput,
                 "provider endpoint is invalid",
             ));
         }
-        let (host, port) = match authority.split_once(':') {
-            Some((host, port)) => (
-                host.to_owned(),
-                port.parse().map_err(|_| {
+        if base_path.chars().any(|c| c.is_ascii_control() || c == ' ') {
+            return Err(provider_error_inner(
+                ErrorCategory::InvalidInput,
+                "provider endpoint is invalid",
+            ));
+        }
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            let Some(end) = bracketed.find(']') else {
+                return Err(provider_error_inner(
+                    ErrorCategory::InvalidInput,
+                    "provider endpoint is invalid",
+                ));
+            };
+            let inner = &bracketed[..end];
+            let remainder = &bracketed[end + 1..];
+            if inner.is_empty()
+                || inner
+                    .chars()
+                    .any(|c| c.is_ascii_control() || c == ' ' || c == '@' || c == '[' || c == ']')
+            {
+                return Err(provider_error_inner(
+                    ErrorCategory::InvalidInput,
+                    "provider endpoint is invalid",
+                ));
+            }
+            let port = if remainder.is_empty() {
+                if use_tls { 443 } else { 80 }
+            } else if let Some(port_text) = remainder.strip_prefix(':') {
+                port_text.parse().map_err(|_| {
                     provider_error_inner(
                         ErrorCategory::InvalidInput,
                         "provider endpoint is invalid",
                     )
-                })?,
-            ),
-            None => (authority.to_owned(), if use_tls { 443 } else { 80 }),
+                })?
+            } else {
+                return Err(provider_error_inner(
+                    ErrorCategory::InvalidInput,
+                    "provider endpoint is invalid",
+                ));
+            };
+            (inner.to_owned(), port)
+        } else {
+            if authority.chars().any(|c| c == '[' || c == ']') {
+                return Err(provider_error_inner(
+                    ErrorCategory::InvalidInput,
+                    "provider endpoint is invalid",
+                ));
+            }
+            match authority.split_once(':') {
+                Some((host, port)) => (
+                    host.to_owned(),
+                    port.parse().map_err(|_| {
+                        provider_error_inner(
+                            ErrorCategory::InvalidInput,
+                            "provider endpoint is invalid",
+                        )
+                    })?,
+                ),
+                None => (authority.to_owned(), if use_tls { 443 } else { 80 }),
+            }
         };
-        if host.is_empty() {
+        if host.is_empty()
+            || host
+                .chars()
+                .any(|c| c.is_ascii_control() || c == ' ' || c == '@')
+        {
             return Err(provider_error_inner(
                 ErrorCategory::InvalidInput,
                 "provider endpoint is invalid",
@@ -149,23 +206,25 @@ impl OpenAiProvider {
     /// Encodes one turn as a Chat Completions body, always streaming: the
     /// SSE wire is parsed incrementally for cancellation responsiveness and
     /// aggregated into one validated batch (see [`ProviderPort::stream`]).
-    fn request_body(&self, request: &ModelRequest) -> Value {
+    fn request_body(&self, request: &ModelRequest) -> Result<Value, ProviderEvent> {
         let messages: Vec<Value> = request.conversation().iter().map(message_json).collect();
-        let tools: Vec<Value> = request
-            .tool_definitions()
-            .iter()
-            .map(|spec| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": spec.id().name(),
-                        "description": spec.description(),
-                        "parameters": serde_json::from_str::<Value>(spec.input_schema_json())
-                            .unwrap_or(Value::Bool(true)),
-                    }
-                })
-            })
-            .collect();
+        let mut tools: Vec<Value> = Vec::new();
+        for spec in request.tool_definitions() {
+            let schema: Value = serde_json::from_str(spec.input_schema_json()).map_err(|_| {
+                provider_error(
+                    ErrorCategory::InvalidInput,
+                    "provider tool schema is invalid",
+                )
+            })?;
+            tools.push(json!({
+                "type": "function",
+                "function": {
+                    "name": spec.id().name(),
+                    "description": spec.description(),
+                    "parameters": schema,
+                }
+            }));
+        }
         let mut body = json!({
             "model": self.model,
             "messages": messages,
@@ -176,7 +235,7 @@ impl OpenAiProvider {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = Value::String("auto".to_owned());
         }
-        body
+        Ok(body)
     }
 
     /// Performs one blocking exchange, honouring cancellation and the run
@@ -217,7 +276,7 @@ impl OpenAiProvider {
             }
         };
         let path = format!("{}/chat/completions", self.base_path);
-        let address = format!("{}:{}", self.host, self.port);
+        let address = join_host_port(&self.host, self.port);
         let head = format!(
             "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\naccept: text/event-stream, application/json\r\ncontent-length: {}\r\nauthorization: Bearer {token}\r\nconnection: close\r\n\r\n",
             address,
@@ -260,7 +319,7 @@ impl OpenAiProvider {
 
 /// Opens a plain-HTTP connection with a bounded connect timeout.
 fn connect_plain(host: &str, port: u16) -> Result<TcpStream, ProviderEvent> {
-    let address = format!("{host}:{port}");
+    let address = join_host_port(host, port);
     address
         .to_socket_addrs()
         .ok()
@@ -275,7 +334,7 @@ fn connect_plain(host: &str, port: u16) -> Result<TcpStream, ProviderEvent> {
 /// inside the pipe (argv carries only host and port, never the secret).
 /// Dropping the source terminates the helper.
 fn spawn_tls(host: &str, port: u16, head: &[u8], body: &[u8]) -> Result<TlsSource, ProviderEvent> {
-    let target = format!("{host}:{port}");
+    let target = join_host_port(host, port);
     let mut command = std::process::Command::new("openssl");
     command
         .arg("s_client")
@@ -983,6 +1042,16 @@ fn provider_error_inner(category: ErrorCategory, message: &'static str) -> Agent
         .expect("static safe provider message builds")
 }
 
+/// Joins a validated host with a port for dialing and the `host` header,
+/// bracketing IPv6 literals (`::1` becomes `[::1]:port`).
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// Encodes one conversation item as a Chat Completions message. Provider
 /// round-trip refs ride the tool-call ids; text item keys stay local.
 fn message_json(item: &ModelContextItem) -> Value {
@@ -1169,22 +1238,46 @@ fn events_for_json(body: &[u8]) -> Vec<ProviderEvent> {
             text: text.to_owned(),
         });
     }
-    let calls: Vec<(String, String, String)> = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|calls| {
-            calls
-                .iter()
-                .filter_map(|call| {
-                    let id = call.get("id")?.as_str()?;
-                    let function = call.get("function")?;
-                    let name = function.get("name")?.as_str()?;
-                    let arguments = function.get("arguments")?.as_str()?;
-                    Some((id.to_owned(), name.to_owned(), arguments.to_owned()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let calls: Vec<(String, String, String)> = match message.get("tool_calls") {
+        None => Vec::new(),
+        Some(Value::Array(calls)) => {
+            let mut parsed = Vec::with_capacity(calls.len());
+            for call in calls {
+                let Some(id) = call.get("id").and_then(Value::as_str) else {
+                    return vec![provider_error(
+                        ErrorCategory::InvalidInput,
+                        "provider reply tool calls are invalid",
+                    )];
+                };
+                let Some(function) = call.get("function") else {
+                    return vec![provider_error(
+                        ErrorCategory::InvalidInput,
+                        "provider reply tool calls are invalid",
+                    )];
+                };
+                let Some(name) = function.get("name").and_then(Value::as_str) else {
+                    return vec![provider_error(
+                        ErrorCategory::InvalidInput,
+                        "provider reply tool calls are invalid",
+                    )];
+                };
+                let Some(arguments) = function.get("arguments").and_then(Value::as_str) else {
+                    return vec![provider_error(
+                        ErrorCategory::InvalidInput,
+                        "provider reply tool calls are invalid",
+                    )];
+                };
+                parsed.push((id.to_owned(), name.to_owned(), arguments.to_owned()));
+            }
+            parsed
+        }
+        Some(_) => {
+            return vec![provider_error(
+                ErrorCategory::InvalidInput,
+                "provider reply tool calls are invalid",
+            )];
+        }
+    };
     let mut ready = Vec::new();
     for (index, (id, name, arguments)) in calls.iter().enumerate() {
         let item_key = format!("item-{}", index + 1);
@@ -1257,7 +1350,11 @@ impl ProviderPort for OpenAiProvider {
                 "provider call was cancelled",
             )];
         }
-        let body = serde_json::to_vec(&self.request_body(request)).unwrap_or_default();
+        let body_value = match self.request_body(request) {
+            Ok(body_value) => body_value,
+            Err(failure) => return vec![failure],
+        };
+        let body = serde_json::to_vec(&body_value).unwrap_or_default();
         if body.is_empty() {
             return vec![provider_error(
                 ErrorCategory::Internal,

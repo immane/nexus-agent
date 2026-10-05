@@ -706,7 +706,7 @@ fn an_unparsable_submit_body_is_rejected_without_echoing_it() {
 
     let (status, reply) = post(port, &path, r#"{"input":"unterminated"#);
     assert_eq!(status, 400, "an unparsable body is invalid: {reply}");
-    assert_eq!(reply["error"], "submit input is invalid");
+    assert_eq!(reply["error"], "request body is invalid");
     assert!(reply.get("run").is_none(), "no run was minted");
     let body = reply.to_string();
     assert!(!body.contains("unterminated"), "the input is not echoed");

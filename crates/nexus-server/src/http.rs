@@ -47,7 +47,10 @@ impl Request {
     pub fn query(&self, key: &str) -> Option<&str> {
         let query = self.path.split('?').nth(1)?;
         for pair in query.split('&') {
-            let (name, value) = pair.split_once('=')?;
+            let (name, value) = match pair.split_once('=') {
+                Some(split) => split,
+                None => continue,
+            };
             if name == key {
                 return Some(value);
             }
@@ -120,8 +123,14 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
             .split_once(':')
             .ok_or(bad(400, "header line is malformed"))?;
         let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() || name.contains([' ', '\t']) {
+        if name.is_empty()
+            || name.contains(' ')
+            || name.bytes().any(|b| b.is_ascii_control() || b == b':')
+        {
             return Err(bad(400, "header name is malformed"));
+        }
+        if name == "content-length" && headers.contains_key(&name) {
+            return Err(bad(400, "content length is malformed"));
         }
         headers.insert(name, value.trim().to_owned());
     }

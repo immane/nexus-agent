@@ -190,6 +190,10 @@ struct ActiveRun {
     last_seq: Option<EventSequence>,
     pending_text: Option<AssistantText>,
     data_dropped: bool,
+    /// Set once `u64::MAX` is committed: no further sequence exists, so
+    /// every later emit is refused instead of reusing the final value
+    /// (frontends reject duplicate sequences).
+    sequence_exhausted: bool,
     last_usage: Option<Usage>,
     force_terminal: Option<RunOutcome>,
     terminal: Option<RunOutcome>,
@@ -520,6 +524,7 @@ impl Runtime {
             last_seq: None,
             pending_text: None,
             data_dropped: false,
+            sequence_exhausted: false,
             last_usage: None,
             force_terminal: None,
             terminal: None,
@@ -2002,7 +2007,13 @@ fn commit_sequence(active: &mut ActiveRun, seq: EventSequence) {
         active.next_seq = next;
         active.last_seq = Some(seq);
     } else {
+        // The delivered `u64::MAX` event is the last sequence the run can
+        // ever assign: record it, report truncation, and refuse every later
+        // emit so the final value is never reused (frontends reject
+        // duplicates, which would otherwise repeat forever).
+        active.last_seq = Some(seq);
         active.data_dropped = true;
+        active.sequence_exhausted = true;
     }
 }
 
@@ -2010,6 +2021,11 @@ fn commit_sequence(active: &mut ActiveRun, seq: EventSequence) {
 /// channel drops presentation traffic without consuming a sequence number,
 /// so delivered sequences stay gap-free; control flow continues.
 fn flush_text(shared: &Arc<Shared>, active: &mut ActiveRun) {
+    if active.sequence_exhausted {
+        active.pending_text = None;
+        active.data_dropped = true;
+        return;
+    }
     let Some(fragment) = active.pending_text.take() else {
         return;
     };
@@ -2027,6 +2043,11 @@ fn flush_text(shared: &Arc<Shared>, active: &mut ActiveRun) {
 /// Emits one data event after flushing coalesced text, preserving order.
 fn emit_data(shared: &Arc<Shared>, active: &mut ActiveRun, run: &RunId, payload: EventPayload) {
     if &active.run != run {
+        return;
+    }
+    if active.sequence_exhausted {
+        active.pending_text = None;
+        active.data_dropped = true;
         return;
     }
     flush_text(shared, active);
@@ -2077,6 +2098,11 @@ fn emit_control(
     payload: EventPayload,
 ) -> ControlOutcome {
     if &active.run != run {
+        return ControlOutcome::Closed;
+    }
+    if active.sequence_exhausted {
+        active.pending_text = None;
+        active.data_dropped = true;
         return ControlOutcome::Closed;
     }
     debug_assert!(crate::transport::is_control_payload(&payload));
@@ -3838,6 +3864,7 @@ mod cov_runtime_private {
             last_seq: None,
             pending_text: None,
             data_dropped: false,
+            sequence_exhausted: false,
             last_usage: None,
             force_terminal: None,
             terminal: None,
@@ -3975,14 +4002,47 @@ mod cov_runtime_private {
 
     #[test]
     fn commit_sequence_overflow_reports_dropped_without_advancing() {
+        let (shared, mut data) = shared_with_data();
         let run = RunId::new("run-overflow").expect("valid run id");
         let mut active = active_for(&run);
-        active.next_seq = 7;
-        active.last_seq = Some(6);
+        active.next_seq = u64::MAX;
+        active.last_seq = Some(u64::MAX - 1);
         commit_sequence(&mut active, u64::MAX);
         assert!(active.data_dropped, "overflow is reported, never wrapped");
-        assert_eq!(active.next_seq, 7);
-        assert_eq!(active.last_seq, Some(6));
+        assert!(active.sequence_exhausted, "no sequence follows the maximum");
+        assert_eq!(active.next_seq, u64::MAX, "exhaustion advances nothing");
+        assert_eq!(active.last_seq, Some(u64::MAX));
+
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "late"),
+        );
+        flush_text(&shared, &mut active);
+        emit_data(
+            &shared,
+            &mut active,
+            &run,
+            EventPayload::ToolCallPreview {
+                item_key: "item-1".to_owned(),
+            },
+        );
+        let outcome = emit_control(
+            &shared,
+            &mut active,
+            &run,
+            EventPayload::UsageUpdated(Usage::new(None, None, nexus_core::UsageFinality::Final)),
+        );
+        assert_eq!(
+            outcome,
+            ControlOutcome::Closed,
+            "an exhausted run emits nothing further"
+        );
+        assert!(active.pending_text.is_none());
+        assert_eq!(active.next_seq, u64::MAX, "refused emits reuse no sequence");
+        assert_eq!(active.last_seq, Some(u64::MAX));
+        assert!(drain(&mut data).is_empty());
     }
 
     #[test]
@@ -4640,6 +4700,7 @@ mod cov_runtime_topup_private {
             last_seq: None,
             pending_text: None,
             data_dropped: false,
+            sequence_exhausted: false,
             last_usage: None,
             force_terminal: None,
             terminal: None,
