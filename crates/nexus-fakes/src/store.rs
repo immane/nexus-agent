@@ -440,3 +440,347 @@ mod tests {
         assert_eq!(store.outcomes().len(), 1);
     }
 }
+
+#[cfg(test)]
+mod cov_store_private {
+    //! Unit coverage for the private internals of [`EphemeralStore`]:
+    //! explicit error construction, single-shot interruption precedence,
+    //! capacity gates that only apply to new sessions, construction-bypass
+    //! rechecks, and the guarantee that failed writes leave every private
+    //! field untouched. Deterministic; no clock, randomness, or I/O.
+
+    use super::*;
+    use nexus_core::store::{MAX_PROFILE_LEN, MAX_STORED_MESSAGES, StoredMessage};
+    use nexus_core::{
+        ApprovedScope, CallId, EffectState, Evidence, ExecutionStatus, M0_REVISION, NormalizedArgs,
+        RunId, ToolId,
+    };
+
+    fn session(id: &str) -> SessionId {
+        SessionId::new(id).expect("valid session id")
+    }
+
+    fn message(text: &str) -> StoredMessage {
+        StoredMessage {
+            source: "user".to_owned(),
+            text: text.to_owned(),
+            complete: true,
+        }
+    }
+
+    fn checkpoint(id: &str, logical_revision: u64) -> SessionCheckpoint {
+        SessionCheckpoint::new(
+            session(id),
+            STORE_FORMAT_REVISION,
+            logical_revision,
+            vec![message("hello")],
+            "private-profile",
+        )
+        .expect("valid checkpoint builds")
+    }
+
+    fn intent(call: &str) -> ToolIntentRecord {
+        ToolIntentRecord {
+            run: RunId::new("run-1").expect("valid run id"),
+            call: CallId::new(call).expect("valid call id"),
+            tool: ToolId::new("host_write", M0_REVISION).expect("valid tool id"),
+            args: NormalizedArgs::new(r#"{"path":"dst"}"#).expect("valid args"),
+            scope: ApprovedScope::new("project-write").expect("valid scope"),
+        }
+    }
+
+    fn outcome(call: &str) -> ToolOutcomeRecord {
+        ToolOutcomeRecord {
+            run: RunId::new("run-1").expect("valid run id"),
+            call: CallId::new(call).expect("valid call id"),
+            status: ExecutionStatus::Succeeded,
+            effect: EffectState::KnownApplied,
+            evidence: Evidence::HostObserved,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn private_store_error_is_explicit_do_not_retry_for_every_probe() {
+        let probes = [
+            (ErrorCategory::StorageFailure, "session not found"),
+            (ErrorCategory::StorageFailure, "interrupted write"),
+            (ErrorCategory::InvalidInput, "stale checkpoint revision"),
+            (
+                ErrorCategory::InvalidInput,
+                "conflicting checkpoint at equal revision",
+            ),
+            (ErrorCategory::ResourceLimit, "session capacity exhausted"),
+            (ErrorCategory::ResourceLimit, "intent capacity exhausted"),
+            (ErrorCategory::ResourceLimit, "outcome capacity exhausted"),
+        ];
+        for (category, message) in probes {
+            let error = store_error(category, message);
+            assert_eq!(error.category(), category);
+            assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+            assert_eq!(error.message(), message);
+            assert!(error.correlation().is_empty());
+        }
+    }
+
+    #[test]
+    fn private_take_interruption_is_single_shot() {
+        let mut store = EphemeralStore::new();
+        assert!(
+            store.take_interruption().is_ok(),
+            "disarmed take is a no-op"
+        );
+        store.set_fail_next_write(true);
+        let error = store
+            .take_interruption()
+            .expect_err("armed take reports the interruption");
+        assert_eq!(error.category(), ErrorCategory::StorageFailure);
+        assert_eq!(error.message(), "interrupted write");
+        assert!(
+            !store.fail_next_write(),
+            "taking the interruption disarms it"
+        );
+        assert!(store.take_interruption().is_ok(), "second take is a no-op");
+    }
+
+    #[test]
+    fn private_interruption_precedes_validation_and_capacity() {
+        let mut store = EphemeralStore::new();
+        let current = checkpoint("sess-order", 5);
+        store.save_checkpoint(&current).expect("save works");
+
+        // Interruption is taken before the stale-revision check: the armed
+        // save reports StorageFailure even though the checkpoint is also
+        // stale, consumes the flag, and preserves the stored record.
+        let stale = checkpoint("sess-order", 1);
+        store.set_fail_next_write(true);
+        let error = store
+            .save_checkpoint(&stale)
+            .expect_err("armed save fails as interrupted");
+        assert_eq!(error.category(), ErrorCategory::StorageFailure);
+        assert!(!store.fail_next_write());
+        assert_eq!(store.checkpoints.get("sess-order"), Some(&current));
+        let error = store
+            .save_checkpoint(&stale)
+            .expect_err("retry now reports staleness");
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.message(), "stale checkpoint revision");
+
+        // Interruption is taken before the capacity checks too: seed both
+        // record vectors at their caps directly and observe StorageFailure,
+        // not ResourceLimit, with the vectors untouched.
+        store.intents = (0..MAX_INTENT_RECORDS).map(|_| intent("call-1")).collect();
+        store.outcomes = (0..MAX_OUTCOME_RECORDS)
+            .map(|_| outcome("call-1"))
+            .collect();
+
+        store.set_fail_next_write(true);
+        let error = store
+            .record_intent(&intent("call-2"))
+            .expect_err("armed intent fails as interrupted");
+        assert_eq!(error.category(), ErrorCategory::StorageFailure);
+        assert_eq!(store.intents.len(), MAX_INTENT_RECORDS);
+        let error = store
+            .record_intent(&intent("call-2"))
+            .expect_err("retry now reports the cap");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.message(), "intent capacity exhausted");
+
+        store.set_fail_next_write(true);
+        let error = store
+            .record_outcome(&outcome("call-2"))
+            .expect_err("armed outcome fails as interrupted");
+        assert_eq!(error.category(), ErrorCategory::StorageFailure);
+        assert_eq!(store.outcomes.len(), MAX_OUTCOME_RECORDS);
+        let error = store
+            .record_outcome(&outcome("call-2"))
+            .expect_err("retry now reports the cap");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.message(), "outcome capacity exhausted");
+    }
+
+    #[test]
+    fn private_invalid_checkpoints_never_reach_the_store() {
+        let store = EphemeralStore::new();
+
+        // `SessionCheckpoint::new` is the only public constructor, and it
+        // validates the exact format revision and the stored-part bounds.
+        // Every invalid shape therefore fails before the store sees a value,
+        // so the store's internal rechecks are unreachable from this crate;
+        // they are covered by `nexus_core`'s own tests.
+        let wrong_format = SessionCheckpoint::new(
+            session("sess-format"),
+            STORE_FORMAT_REVISION + 1,
+            1,
+            vec![message("hello")],
+            "p",
+        )
+        .expect_err("wrong format revision cannot construct");
+        assert_eq!(wrong_format.category(), ErrorCategory::InvalidInput);
+
+        let over_messages = SessionCheckpoint::new(
+            session("sess-messages"),
+            STORE_FORMAT_REVISION,
+            1,
+            (0..=MAX_STORED_MESSAGES).map(|_| message("t")).collect(),
+            "p",
+        )
+        .expect_err("over-count messages cannot construct");
+        assert_eq!(over_messages.category(), ErrorCategory::InvalidInput);
+
+        let over_profile = SessionCheckpoint::new(
+            session("sess-profile"),
+            STORE_FORMAT_REVISION,
+            1,
+            vec![message("hello")],
+            "p".repeat(MAX_PROFILE_LEN + 1),
+        )
+        .expect_err("over-long profile cannot construct");
+        assert_eq!(over_profile.category(), ErrorCategory::InvalidInput);
+
+        assert!(store.checkpoints.is_empty());
+        assert!(
+            store
+                .list_sessions(usize::MAX)
+                .expect("list works")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn private_failed_writes_leave_every_field_untouched() {
+        let mut store = EphemeralStore::new();
+        let stored = checkpoint("sess-state", 4);
+        store.save_checkpoint(&stored).expect("save works");
+        store
+            .record_intent(&intent("call-1"))
+            .expect("intent works");
+        store
+            .record_outcome(&outcome("call-1"))
+            .expect("outcome works");
+
+        let checkpoints = store.checkpoints.clone();
+        let intents = store.intents.clone();
+        let outcomes = store.outcomes.clone();
+        assert!(!store.fail_next_write);
+
+        store
+            .save_checkpoint(&checkpoint("sess-state", 3))
+            .expect_err("stale save fails");
+        let conflict = SessionCheckpoint::new(
+            session("sess-state"),
+            STORE_FORMAT_REVISION,
+            4,
+            vec![message("changed")],
+            "private-profile",
+        )
+        .expect("conflicting checkpoint is constructor-valid");
+        store
+            .save_checkpoint(&conflict)
+            .expect_err("conflicting save fails");
+        store.set_fail_next_write(true);
+        store
+            .save_checkpoint(&checkpoint("sess-state", 5))
+            .expect_err("interrupted save fails");
+
+        assert_eq!(store.checkpoints, checkpoints);
+        assert_eq!(store.intents, intents);
+        assert_eq!(store.outcomes, outcomes);
+        assert!(
+            !store.fail_next_write,
+            "the failed interrupted save consumed and disarmed the flag"
+        );
+    }
+
+    #[test]
+    fn private_session_capacity_gates_only_new_sessions() {
+        let mut store = EphemeralStore::new();
+        for index in 0..MAX_SESSIONS {
+            store
+                .save_checkpoint(&checkpoint(&format!("sess-{index:03}"), 1))
+                .expect("within session capacity");
+        }
+        assert_eq!(store.checkpoints.len(), MAX_SESSIONS);
+
+        let error = store
+            .save_checkpoint(&checkpoint("sess-new", 1))
+            .expect_err("new session over the cap fails");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.message(), "session capacity exhausted");
+        assert_eq!(store.checkpoints.len(), MAX_SESSIONS);
+        assert!(!store.checkpoints.contains_key("sess-new"));
+
+        // An existing session stays writable at the cap and updates in place.
+        let updated = checkpoint("sess-000", 2);
+        store
+            .save_checkpoint(&updated)
+            .expect("existing session stays writable at the cap");
+        assert_eq!(store.checkpoints.len(), MAX_SESSIONS);
+        assert_eq!(store.checkpoints.get("sess-000"), Some(&updated));
+    }
+
+    #[test]
+    fn private_identical_equal_revision_retry_is_state_preserving() {
+        let mut store = EphemeralStore::new();
+        let original = checkpoint("sess-idem", 3);
+        store.save_checkpoint(&original).expect("save works");
+        let before = store.checkpoints.clone();
+
+        store
+            .save_checkpoint(&original)
+            .expect("identical retry is accepted");
+        assert_eq!(store.checkpoints, before);
+        assert_eq!(store.checkpoints.len(), 1);
+        assert_eq!(store.checkpoints.get("sess-idem"), Some(&original));
+    }
+
+    #[test]
+    fn private_listing_takes_exactly_the_bound_in_identity_order() {
+        let mut store = EphemeralStore::new();
+        for id in ["sess-c", "sess-a", "sess-b"] {
+            store
+                .save_checkpoint(&checkpoint(id, 1))
+                .expect("save works");
+        }
+        assert!(store.list_sessions(0).expect("zero bound works").is_empty());
+        let listed = store.list_sessions(2).expect("bounded list works");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].session.as_str(), "sess-a");
+        assert_eq!(listed[1].session.as_str(), "sess-b");
+        let all = store
+            .list_sessions(usize::MAX)
+            .expect("over-large bound works");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].session.as_str(), "sess-c");
+    }
+
+    #[test]
+    fn private_default_is_an_empty_non_durable_store() {
+        let defaulted = EphemeralStore::default();
+        assert!(defaulted.checkpoints.is_empty());
+        assert!(defaulted.intents.is_empty());
+        assert!(defaulted.outcomes.is_empty());
+        assert!(!defaulted.fail_next_write);
+        assert!(!defaulted.is_durable());
+        assert_eq!(defaulted.durability(), PersistenceState::Ephemeral);
+        assert_eq!(defaulted.format_revision(), STORE_FORMAT_REVISION);
+    }
+
+    #[test]
+    fn private_records_are_owned_copies_not_aliases() {
+        let mut store = EphemeralStore::new();
+        let mut intent_record = intent("call-alias");
+        let intent_before = intent_record.clone();
+        store.record_intent(&intent_record).expect("intent records");
+        intent_record.call = CallId::new("call-mutated").expect("valid call id");
+        assert_eq!(store.intents[0], intent_before);
+
+        let mut outcome_record = outcome("call-alias");
+        let outcome_before = outcome_record.clone();
+        store
+            .record_outcome(&outcome_record)
+            .expect("outcome records");
+        outcome_record.truncated = true;
+        assert_eq!(store.outcomes[0], outcome_before);
+    }
+}

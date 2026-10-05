@@ -536,3 +536,118 @@ mod tests {
         assert_eq!(tool.execution_count(), 1, "the blocked attempt is recorded");
     }
 }
+
+#[cfg(test)]
+mod cov_tool_private {
+    use super::*;
+    use nexus_core::{NormalizedArgs, RunId, TurnId};
+
+    fn scope(text: &str) -> ApprovedScope {
+        ApprovedScope::new(text).expect("valid scope builds")
+    }
+
+    fn call(call_id: &str, tool_name: &str, args: &str) -> ToolCall {
+        ToolCall::new(
+            RunId::new("run-private").expect("valid run id"),
+            TurnId::new("turn-private").expect("valid turn id"),
+            CallId::new(call_id).expect("valid call id"),
+            ToolId::new(tool_name, M0_REVISION).expect("valid tool id"),
+            NormalizedArgs::new(args).expect("valid args build"),
+        )
+    }
+
+    fn context(budget: usize, cancelled: bool, scope_text: &str) -> ToolContext {
+        ToolContext::new(
+            budget,
+            Duration::from_secs(60),
+            cancelled,
+            scope(scope_text),
+        )
+        .expect("valid context builds")
+    }
+
+    #[test]
+    fn minimum_document_length_is_two_bytes() {
+        assert_eq!(MIN_JSON_DOCUMENT_BYTES, 2);
+    }
+
+    #[test]
+    fn json_document_is_exact_length_quoted_ascii() {
+        for len in [2usize, 3, 17, 1024] {
+            let document = json_document(len);
+            assert_eq!(document.len(), len);
+            assert!(document.starts_with('"'));
+            assert!(document.ends_with('"'));
+            assert!(
+                document[1..len - 1].bytes().all(|byte| byte == b'x'),
+                "only ASCII x payload bytes are materialized"
+            );
+            assert_eq!(document, format!("\"{}\"", "x".repeat(len - 2)));
+        }
+        assert_eq!(json_document(2), "\"\"");
+    }
+
+    #[test]
+    fn json_document_prefix_is_exact_length_without_closing_quote() {
+        for len in [1usize, 2, 33, 4096] {
+            let prefix = json_document_prefix(len);
+            assert_eq!(prefix.len(), len);
+            assert!(prefix.starts_with('"'));
+            assert!(prefix.bytes().skip(1).all(|byte| byte == b'x'));
+            let mut expected = String::from("\"");
+            expected.push_str(&"x".repeat(len - 1));
+            assert_eq!(prefix, expected);
+        }
+        let declared = 64;
+        assert!(json_document(declared).starts_with(&json_document_prefix(32)));
+        assert!(
+            !json_document(declared).starts_with(&json_document_prefix(declared)),
+            "the prefix of full length is missing the closing quote"
+        );
+    }
+
+    #[test]
+    fn spec_for_builds_the_named_revisioned_descriptor() {
+        let spec = spec_for("host_exec", "fake command");
+        assert_eq!(spec.id().name(), "host_exec");
+        assert_eq!(spec.id().revision(), M0_REVISION);
+        assert_eq!(spec.description(), "fake command");
+        assert_eq!(spec.input_schema_json(), r#"{"type":"object"}"#);
+    }
+
+    #[test]
+    fn static_cancelled_outcome_is_unknown_uncertain() {
+        let outcome = cancelled_outcome();
+        assert_eq!(outcome.status(), ExecutionStatus::Cancelled);
+        assert_eq!(outcome.effect(), EffectState::Unknown);
+        assert_eq!(outcome.evidence(), Evidence::Uncertain);
+        assert_eq!(outcome.content(), "fake execution cancelled");
+        assert!(!outcome.is_truncated());
+    }
+
+    #[test]
+    fn static_gate_timeout_outcome_is_failed_unknown_uncertain() {
+        let outcome = gate_timeout_outcome();
+        assert_eq!(outcome.status(), ExecutionStatus::Failed);
+        assert_eq!(outcome.effect(), EffectState::Unknown);
+        assert_eq!(outcome.evidence(), Evidence::Uncertain);
+        assert_eq!(outcome.content(), "fake gate was never released");
+        assert!(!outcome.is_truncated());
+    }
+
+    #[test]
+    fn record_stores_exact_call_bytes_and_scope() {
+        let tool = FakeTool::read_only();
+        let args = "{ \"path\": \"src\", \"n\": 1 }\n";
+        tool.record(
+            &call("call-record", "host_read", args),
+            &context(64, false, "scope/ü"),
+        );
+        let log = tool.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].call.as_str(), "call-record");
+        assert_eq!(log[0].args, args);
+        assert_eq!(log[0].scope.as_str(), "scope/ü");
+        assert_eq!(tool.execution_count(), 1);
+    }
+}

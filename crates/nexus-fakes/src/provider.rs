@@ -1221,3 +1221,232 @@ mod tests {
         assert_eq!(capabilities.max_output_bytes, None);
     }
 }
+
+#[cfg(test)]
+mod cov_provider_private {
+    //! Private-state coverage for the script queue, request log, gate
+    //! coordination, and static failure builders. The public boundary is
+    //! covered in `tests/cov_fake_provider.rs`; this module pins invariants
+    //! reachable only through private fields, deterministically and without
+    //! sleeps.
+
+    use super::*;
+    use nexus_core::{RunId, TurnId};
+
+    fn request(profile: &str) -> ModelRequest {
+        ModelRequest::new(
+            RunId::new("run-1").expect("valid"),
+            TurnId::new("turn-1").expect("valid"),
+            profile,
+            vec![],
+            None,
+            1024,
+        )
+        .expect("valid request builds")
+    }
+
+    fn live_context() -> ProviderContext {
+        ProviderContext::new(Duration::from_secs(60), false, None)
+    }
+
+    fn cancelled_context() -> ProviderContext {
+        ProviderContext::new(Duration::from_secs(60), true, None)
+    }
+
+    #[test]
+    fn new_initializes_private_state_exactly() {
+        let provider = FakeProvider::new(vec![stop_turn("a"), stop_turn("b")]);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            provider.script.lock().expect("fake script readable").len(),
+            2
+        );
+        assert!(
+            provider
+                .requests
+                .lock()
+                .expect("fake request log readable")
+                .is_empty()
+        );
+        assert!(provider.gate.is_none(), "an ungated fake owns no gate");
+    }
+
+    #[test]
+    fn gated_constructor_installs_a_gate_and_keeps_the_script() {
+        let provider = FakeProvider::gated(vec![stop_turn("a")]);
+        assert_eq!(
+            provider.script.lock().expect("fake script readable").len(),
+            1
+        );
+        assert!(provider.gate.is_some(), "gated provider owns a gate");
+        let handle = provider.gate().expect("gate handle");
+        assert!(!handle.is_entered() && !handle.is_released());
+    }
+
+    #[test]
+    fn stream_pops_one_turn_records_request_first_and_increments_calls() {
+        let provider = FakeProvider::new(vec![stop_turn("a"), stop_turn("b")]);
+        let observed = request("profile-a");
+        let events = provider.stream(&observed, &live_context());
+        assert_eq!(events, stop_turn("a"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.script.lock().expect("fake script readable").len(),
+            1,
+            "exactly one queued turn is consumed"
+        );
+        let recorded = provider.requests.lock().expect("fake request log readable");
+        assert_eq!(
+            recorded.as_slice(),
+            std::slice::from_ref(&observed),
+            "the request is recorded before the turn is served"
+        );
+    }
+
+    #[test]
+    fn exhausted_private_script_returns_the_exhausted_failure_event() {
+        let provider = FakeProvider::new(vec![]);
+        let events = provider.stream(&request("profile-a"), &live_context());
+        assert_eq!(events, vec![exhausted_failure()]);
+        assert!(
+            provider
+                .script
+                .lock()
+                .expect("fake script readable")
+                .is_empty()
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancelled_stream_records_request_without_consuming_the_private_script() {
+        let provider = FakeProvider::new(vec![stop_turn("kept")]);
+        let events = provider.stream(&request("profile-a"), &cancelled_context());
+        assert_eq!(events, vec![cancelled_failure()]);
+        assert_eq!(
+            provider.script.lock().expect("fake script readable").len(),
+            1,
+            "cancellation never consumes a scripted turn"
+        );
+        assert_eq!(
+            provider
+                .requests
+                .lock()
+                .expect("fake request log readable")
+                .len(),
+            1,
+            "cancelled invocations are still recorded"
+        );
+        assert_eq!(
+            provider.stream(&request("profile-a"), &live_context()),
+            stop_turn("kept")
+        );
+    }
+
+    #[test]
+    fn failure_builders_pin_exact_category_message_and_retry() {
+        let cases: [(&str, ProviderEvent, ErrorCategory); 4] = [
+            (
+                "duplicate provider reference",
+                protocol_failure("duplicate provider reference"),
+                ErrorCategory::Protocol,
+            ),
+            (
+                "provider invocation cancelled",
+                cancelled_failure(),
+                ErrorCategory::Cancelled,
+            ),
+            (
+                "fake provider script exhausted",
+                exhausted_failure(),
+                ErrorCategory::Protocol,
+            ),
+            (
+                "fake provider gate was never released",
+                gate_failure(),
+                ErrorCategory::Protocol,
+            ),
+        ];
+        for (message, event, category) in cases {
+            let ProviderEvent::Failed(error) = event else {
+                panic!("static failure builders must emit Failed");
+            };
+            assert_eq!(error.category(), category, "{message}");
+            assert_eq!(error.message(), message);
+            assert_eq!(error.retry(), RetryGuidance::DoNotRetry, "{message}");
+            assert!(error.correlation().is_empty(), "{message}");
+        }
+    }
+
+    #[test]
+    fn continuation_helper_uses_the_declared_adapter_and_scope_constants() {
+        let data = continuation(vec![9, 8, 7]);
+        assert_eq!(data.adapter(), FAKE_ADAPTER);
+        assert_eq!(data.scope(), FAKE_SCOPE);
+        assert_eq!(data.bytes(), &[9, 8, 7]);
+        assert_eq!(FAKE_ADAPTER, "fake-adapter");
+        assert_eq!(FAKE_SCOPE, "fake-model");
+        assert!(data.is_compatible_with(FAKE_ADAPTER, FAKE_SCOPE));
+    }
+
+    #[test]
+    fn gate_private_state_defaults_closed_and_release_is_idempotent() {
+        let gate = FakeGate::new();
+        {
+            let state = gate.inner.state.lock().expect("fake gate readable");
+            assert!(!state.entered, "a fresh gate is unentered");
+            assert!(!state.released, "a fresh gate is unreleased");
+        }
+        gate.release();
+        gate.release();
+        let state = gate.inner.state.lock().expect("fake gate readable");
+        assert!(!state.entered, "release never fakes entry");
+        assert!(state.released, "release latches");
+    }
+
+    #[test]
+    fn released_gate_enters_and_returns_without_waiting() {
+        let gate = FakeGate::new();
+        gate.release();
+        assert!(gate.enter_and_wait(), "a pre-released gate never blocks");
+        assert!(gate.is_entered() && gate.is_released());
+    }
+
+    #[test]
+    fn gate_handle_clones_share_private_state() {
+        let provider = FakeProvider::gated(vec![stop_turn("kept")]);
+        let first = provider.gate().expect("gate handle");
+        let second = provider.gate().expect("gate handle");
+        assert!(
+            Arc::ptr_eq(&first.inner, &second.inner),
+            "handles share one coordination state"
+        );
+        first.release();
+        assert!(
+            second.is_released(),
+            "release through one handle is visible through the other"
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_gated_stream_skips_gate_and_preserves_script() {
+        let provider = FakeProvider::gated(vec![stop_turn("kept")]);
+        let gate = provider.gate().expect("gate handle");
+        let events = provider.stream(&request("profile-a"), &cancelled_context());
+        assert_eq!(events, vec![cancelled_failure()]);
+        assert!(
+            !gate.is_entered(),
+            "a cancelled call never blocks at the gate"
+        );
+        assert_eq!(
+            provider.script.lock().expect("fake script readable").len(),
+            1
+        );
+        gate.release();
+        assert_eq!(
+            provider.stream(&request("profile-a"), &live_context()),
+            stop_turn("kept"),
+            "the scripted turn survived cancellation"
+        );
+    }
+}
