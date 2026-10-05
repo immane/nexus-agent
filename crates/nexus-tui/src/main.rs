@@ -49,8 +49,8 @@ use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, Focus, RefreshGate, cancel_command, install_panic_hook, map_key, next_focus,
-    render, submit_command,
+    Action, AppState, Focus, RefreshGate, SlashCommand, cancel_command, install_panic_hook,
+    map_key, next_focus, render, submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -750,6 +750,72 @@ async fn handle_key_batch(
     })
 }
 
+/// Executes a local slash command. Returns true only when the loop must
+/// exit (`/quit`); everything else answers inline and keeps the session
+/// alive. Model switches reuse the same admission-order selection as the
+/// `m` key, so both paths always agree on what is active.
+fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
+    match command {
+        SlashCommand::Help => {
+            front.state.notice(SlashCommand::help_text());
+            false
+        }
+        SlashCommand::Model(None) => {
+            match front.active_model.as_deref() {
+                Some(model) => front.state.notice(&format!("model: {model}")),
+                None => front.state.notice("no model selected"),
+            }
+            false
+        }
+        SlashCommand::Model(Some(name)) => {
+            if front.config.model(&name).is_some() {
+                front.active_model = Some(name.clone());
+                front.sync_model_display();
+                front.state.notice(&format!("model: {name}"));
+            } else {
+                let mut ids: Vec<&str> = front
+                    .config
+                    .models()
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect();
+                ids.sort_unstable();
+                if ids.is_empty() {
+                    front.state.notice("unknown model (no configured models)");
+                } else {
+                    front
+                        .state
+                        .notice(&format!("unknown model: available: {}", ids.join(", ")));
+                }
+            }
+            false
+        }
+        SlashCommand::Usage => {
+            match front.state.last_usage() {
+                Some(usage) => front.state.notice(&format!(
+                    "tokens in:{} out:{}",
+                    usage
+                        .input_tokens()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_owned()),
+                    usage
+                        .output_tokens()
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_owned()),
+                )),
+                None => front.state.notice("no usage observed yet"),
+            }
+            false
+        }
+        SlashCommand::Quit => true,
+        SlashCommand::Unknown(word) => {
+            front
+                .state
+                .notice(&format!("unknown command /{word} — type /help"));
+            false
+        }
+    }
+}
 /// Applies a submit reply to the frontend. Only `Accepted` adopts the run
 /// identity and records the draft; `Busy`/rejections keep the draft and
 /// report the reply. Returns true when the draft was accepted.
@@ -774,6 +840,15 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
         Action::Submit => {
             if front.state.composer().trim().is_empty() {
                 return false;
+            }
+            let draft = front.state.composer().to_owned();
+            if let Some(command) = SlashCommand::parse(&draft) {
+                // Slash commands route locally: the draft is recorded and
+                // cleared like any submit, but no runtime command is issued
+                // and the run slot is untouched.
+                front.state.record_submitted(&draft);
+                front.state.composer_take();
+                return handle_slash(front, command);
             }
             let request = front.next_request();
             match submit_command(
@@ -2853,6 +2928,120 @@ mod cov_main_topup {
             "only an accepted reply adopts a run"
         );
         assert_eq!(user_line_count(&front), 1, "the draft is recorded once");
+    }
+
+    /// Types a full draft one char at a time, like the key handler would.
+    fn type_draft(front: &mut Frontend, text: &str) {
+        front.focus = Focus::Composer;
+        for char in text.chars() {
+            front.state.composer_type(char);
+        }
+    }
+
+    #[tokio::test]
+    async fn slash_commands_route_locally_without_touching_the_runtime() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.focus = Focus::Composer;
+        type_draft(&mut front, "/help");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(front.request_counter, 0, "no runtime command is issued");
+        assert_eq!(front.state.composer(), "", "the draft is cleared");
+        assert_eq!(user_line_count(&front), 1, "the command is recorded once");
+        assert!(
+            transcript(&front).contains("/model"),
+            "help lists the commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_quit_leaves_the_loop() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        type_draft(&mut front, "/quit");
+        assert!(handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(front.request_counter, 0, "quitting issues no command");
+    }
+
+    #[tokio::test]
+    async fn slash_model_switches_and_reports() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (_run, mut front) = frontend_with(configured(2, &[], &[]));
+        assert_eq!(front.active_model.as_deref(), Some("m0"));
+
+        front.focus = Focus::Composer;
+        type_draft(&mut front, "/model");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(
+            transcript(&front).contains("model: m0"),
+            "bare /model reports the selection"
+        );
+
+        type_draft(&mut front, "/model m1");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(front.active_model.as_deref(), Some("m1"));
+        assert_eq!(front.state.active_model(), Some("m1"), "display follows");
+        assert_eq!(front.request_counter, 0, "switching is local");
+
+        type_draft(&mut front, "/model ghost");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(
+            front.active_model.as_deref(),
+            Some("m1"),
+            "failed switch keeps"
+        );
+        assert!(
+            transcript(&front).contains("unknown model"),
+            "failures name the fix"
+        );
+        assert!(
+            transcript(&front).contains("m0"),
+            "failures list what exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_usage_reports_observed_counters_or_their_absence() {
+        use nexus_core::{RunId, SessionId, Usage, UsageFinality};
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        type_draft(&mut front, "/usage");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(
+            transcript(&front).contains("no usage observed yet"),
+            "absence is explicit"
+        );
+
+        let run = RunId::new("run-usage").expect("valid");
+        front.merger.adopt(&run);
+        front.apply_events(vec![started(&run, 0)]);
+        let usage = RunEvent::new(
+            SessionId::new("sess-1").expect("valid"),
+            run,
+            1,
+            EventPayload::UsageUpdated(Usage::new(Some(10), None, UsageFinality::Final)),
+        );
+        front.apply_events(vec![usage]);
+        type_draft(&mut front, "/usage");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(
+            transcript(&front).contains("in:10 out:?"),
+            "unknown stays unknown, never zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_unknown_names_help() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        type_draft(&mut front, "/frobnicate");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(front.request_counter, 0, "unknown routes locally too");
+        assert!(
+            transcript(&front).contains("unknown command /frobnicate"),
+            "the word is echoed for correction"
+        );
+        assert!(transcript(&front).contains("/help"));
     }
 
     #[tokio::test]

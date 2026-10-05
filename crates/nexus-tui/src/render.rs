@@ -478,11 +478,26 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         .title(title);
     let inner = block.inner(area);
     block.render(area, buf);
-    let mut text = state.composer().to_owned();
-    if focus == Focus::Composer {
-        text.push('▊');
-    }
-    Paragraph::new(text).render(inner, buf);
+    // An empty focused composer shows a dimmed invitation instead of a
+    // bare caret; anything typed replaces it, and other focuses render
+    // the draft (or nothing) exactly as before.
+    let draft = state.composer().to_owned();
+    let line = if draft.is_empty() && focus == Focus::Composer {
+        Line::from(vec![
+            Span::styled(
+                "Type a task or /help for commands",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::raw("▊"),
+        ])
+    } else {
+        let mut text = draft;
+        if focus == Focus::Composer {
+            text.push('▊');
+        }
+        Line::from(text)
+    };
+    Paragraph::new(line).render(inner, buf);
 }
 
 fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {

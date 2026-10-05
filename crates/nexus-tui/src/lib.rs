@@ -25,11 +25,13 @@ pub mod decisions;
 pub mod keys;
 pub mod render;
 pub mod sanitize;
+pub mod slash;
 pub mod state;
 pub mod terminal;
 
 pub use decisions::{approve_command, cancel_command, deny_command, submit_command};
 pub use keys::{Action, Focus, map_key, next_focus};
 pub use render::render;
+pub use slash::SlashCommand;
 pub use state::{AppState, EntryKind, PendingApprovalCard, RefreshGate, VisibleView};
 pub use terminal::{TerminalGuard, install_panic_hook, restore_for_panic};
