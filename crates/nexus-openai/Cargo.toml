@@ -1,0 +1,16 @@
+[package]
+name = "nexus-openai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Core domain types plus the synchronous provider port. Behavior
+# (lifecycle, policy, events) stays in nexus-runtime; this crate only
+# translates turns to one OpenAI-compatible dialect and back.
+nexus-core = { path = "../nexus-core" }
+# Provider profiles and credential references. Values resolve at use
+# time through the documented helper, never from stored text.
+nexus-config = { path = "../nexus-config" }
+# JSON for Chat Completions bodies and responses. No HTTP framework is
+# used; the transport is hand-rolled blocking std I/O with no TLS.
+serde_json = "1"
