@@ -1025,3 +1025,179 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cov_provider_private {
+    use super::*;
+
+    fn past_instant() -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("test clock has history")
+    }
+
+    fn future_instant() -> Instant {
+        Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .expect("test clock has room")
+    }
+
+    #[test]
+    fn legacy_constructor_leaves_private_control_state_empty() {
+        let credential = CredentialRef::new("payments-prod-key").expect("valid reference");
+        let context = ProviderContext::new(Duration::from_secs(60), true, Some(credential.clone()));
+        assert_eq!(context.deadline_elapsed, Duration::from_secs(60));
+        assert!(context.cancelled);
+        assert_eq!(context.credential.as_ref(), Some(&credential));
+        assert!(
+            context.token.is_none(),
+            "legacy contexts carry no live token"
+        );
+        assert!(
+            context.deadline_at.is_none(),
+            "an elapsed reading is not an evaluable instant"
+        );
+    }
+
+    #[test]
+    fn with_control_sets_only_private_control_fields() {
+        let token = CancellationToken::new();
+        let deadline = future_instant();
+        let context = ProviderContext::new(Duration::from_secs(300), false, None)
+            .with_control(token.clone(), deadline);
+        assert!(context.token.as_ref().is_some_and(|held| held == &token));
+        assert_eq!(context.deadline_at, Some(deadline));
+        assert_eq!(
+            context.deadline_elapsed,
+            Duration::from_secs(300),
+            "legacy reading untouched"
+        );
+        assert!(!context.cancelled, "legacy snapshot untouched");
+        assert!(context.credential.is_none());
+    }
+
+    #[test]
+    fn with_control_replaces_private_control_state() {
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        let first_deadline = future_instant();
+        let second_deadline = first_deadline
+            .checked_add(Duration::from_secs(60))
+            .expect("test clock has room");
+        let context = ProviderContext::new(Duration::ZERO, false, None)
+            .with_control(first_token.clone(), first_deadline)
+            .with_control(second_token.clone(), second_deadline);
+        assert!(
+            context
+                .token
+                .as_ref()
+                .is_some_and(|held| held == &second_token)
+        );
+        assert!(
+            !context
+                .token
+                .as_ref()
+                .is_some_and(|held| held == &first_token),
+            "the previous token no longer controls the context"
+        );
+        assert_eq!(context.deadline_at, Some(second_deadline));
+    }
+
+    #[test]
+    fn is_cancelled_ors_live_token_and_legacy_snapshot() {
+        let inactive = ProviderContext {
+            deadline_elapsed: Duration::ZERO,
+            cancelled: false,
+            credential: None,
+            token: None,
+            deadline_at: None,
+        };
+        assert!(
+            !inactive.is_cancelled(),
+            "no token and no snapshot is active"
+        );
+
+        let snapshot = ProviderContext {
+            deadline_elapsed: Duration::ZERO,
+            cancelled: true,
+            credential: None,
+            token: None,
+            deadline_at: None,
+        };
+        assert!(snapshot.is_cancelled(), "legacy snapshot alone cancels");
+
+        let cancelled_token = CancellationToken::new();
+        cancelled_token.cancel();
+        let live = ProviderContext {
+            deadline_elapsed: Duration::ZERO,
+            cancelled: false,
+            credential: None,
+            token: Some(cancelled_token),
+            deadline_at: None,
+        };
+        assert!(live.is_cancelled(), "cancelled live token alone cancels");
+
+        let snapshot_over_live = ProviderContext {
+            deadline_elapsed: Duration::ZERO,
+            cancelled: true,
+            credential: None,
+            token: Some(CancellationToken::new()),
+            deadline_at: None,
+        };
+        assert!(
+            snapshot_over_live.is_cancelled(),
+            "a live token never clears the legacy snapshot"
+        );
+    }
+
+    #[test]
+    fn check_active_prefers_cancellation_over_elapsed_deadline() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let context = ProviderContext {
+            deadline_elapsed: Duration::ZERO,
+            cancelled: false,
+            credential: None,
+            token: Some(token),
+            deadline_at: Some(past_instant()),
+        };
+        let error = context.check_active().expect_err("cancellation wins");
+        assert_eq!(error.category(), ErrorCategory::Cancelled);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert!(error.correlation().is_empty());
+    }
+
+    #[test]
+    fn check_not_cancelled_ignores_private_deadline_state() {
+        let context = ProviderContext {
+            deadline_elapsed: Duration::MAX,
+            cancelled: false,
+            credential: None,
+            token: None,
+            deadline_at: Some(past_instant()),
+        };
+        assert!(
+            context.check_not_cancelled().is_ok(),
+            "the cancellation-only check never evaluates the deadline"
+        );
+        assert_eq!(
+            context
+                .check_active()
+                .expect_err("deadline elapsed")
+                .category(),
+            ErrorCategory::Timeout
+        );
+    }
+
+    #[test]
+    fn port_state_error_keeps_category_message_and_no_retry() {
+        let error = port_state_error(
+            ErrorCategory::Timeout,
+            "provider invocation deadline exceeded",
+        );
+        assert_eq!(error.category(), ErrorCategory::Timeout);
+        assert_eq!(error.message(), "provider invocation deadline exceeded");
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert!(error.correlation().is_empty());
+    }
+}

@@ -951,3 +951,84 @@ mod tests {
         assert!(matches!(payload, EventPayload::UsageUpdated(_)));
     }
 }
+
+#[cfg(test)]
+mod cov_commands_private {
+    use super::*;
+    use crate::error::is_bounded_safe_text;
+
+    #[test]
+    fn command_error_is_static_invalid_input_without_retry() {
+        let error = command_error("submit input is invalid");
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), "submit input is invalid");
+        assert_eq!(error.to_string(), "[invalid-input] submit input is invalid");
+        assert!(error.correlation().is_empty());
+    }
+
+    #[test]
+    fn bounded_safe_text_enforces_empty_bound_and_marker_rules() {
+        assert!(is_bounded_safe_text("delete directory", MAX_SUMMARY_BYTES));
+        assert!(!is_bounded_safe_text("", MAX_SUMMARY_BYTES));
+        assert!(!is_bounded_safe_text("x", 0));
+
+        let exact = "x".repeat(MAX_SUMMARY_BYTES);
+        assert!(is_bounded_safe_text(&exact, MAX_SUMMARY_BYTES));
+        assert!(!is_bounded_safe_text(
+            &"x".repeat(MAX_SUMMARY_BYTES + 1),
+            MAX_SUMMARY_BYTES
+        ));
+
+        for marker in [
+            "PASSWORD=",
+            "Bearer ",
+            "API_KEY=",
+            "Client_Secret",
+            "-----BEGIN",
+            "sk-",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_",
+            "xoxb-",
+            "passwd=",
+            "secret=",
+            "apikey=",
+        ] {
+            assert!(
+                !is_bounded_safe_text(marker, MAX_SUMMARY_BYTES),
+                "marker {marker:?} must be rejected"
+            );
+        }
+
+        // Documented limitation: the marker net is best-effort, not a secret
+        // detector; callers must still pre-redact.
+        assert!(is_bounded_safe_text("hunter2", MAX_SUMMARY_BYTES));
+    }
+
+    #[test]
+    fn private_field_construction_matches_read_accessors() {
+        let event = RunEvent {
+            session: SessionId::new("sess-1").expect("valid"),
+            run: RunId::new("run-1").expect("valid"),
+            seq: 9,
+            payload: EventPayload::RunStarted {
+                request: RequestId::new("req-1").expect("valid"),
+            },
+        };
+        assert_eq!(event.session().as_str(), "sess-1");
+        assert_eq!(event.run().as_str(), "run-1");
+        assert_eq!(event.seq(), 9);
+        assert!(matches!(event.payload(), EventPayload::RunStarted { .. }));
+        assert!(!event.is_terminal());
+        event.validate().expect("valid envelope validates");
+
+        let response = CommandResponse {
+            request: RequestId::new("req-1").expect("valid"),
+            reply: CommandReply::Accepted,
+            run: None,
+        };
+        assert_eq!(response.request().as_str(), "req-1");
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        assert!(response.run().is_none());
+    }
+}

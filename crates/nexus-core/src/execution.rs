@@ -196,3 +196,53 @@ mod tests {
         assert_eq!(past.instant(), at);
     }
 }
+
+#[cfg(test)]
+mod cov_execution_private {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// Panics while holding the wait lock so it becomes poisoned, then
+    /// recovers. Cancellation must stay usable even when an unrelated waiter
+    /// panicked while holding the lock.
+    fn poison_wait_lock(token: &CancellationToken) {
+        let inner = Arc::clone(&token.inner);
+        let poisoned = catch_unwind(AssertUnwindSafe(move || {
+            let _guard = inner.wait_lock.lock().expect("wait lock starts unpoisoned");
+            panic!("intentional panic poisons the wait lock");
+        }));
+        assert!(poisoned.is_err(), "the intentional panic must unwind");
+    }
+
+    #[test]
+    fn clones_share_the_cancelled_atomic() {
+        let token = CancellationToken::new();
+        let clone = token.clone();
+        assert!(Arc::ptr_eq(&token.inner, &clone.inner));
+        assert!(!token.inner.cancelled.load(Ordering::SeqCst));
+        clone.cancel();
+        assert!(token.inner.cancelled.load(Ordering::SeqCst));
+        assert!(token.is_cancelled());
+        assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_recovers_from_a_poisoned_wait_lock() {
+        let token = CancellationToken::new();
+        poison_wait_lock(&token);
+        token.cancel();
+        token.cancel();
+        assert!(token.is_cancelled());
+        assert!(token.wait_timeout(Duration::ZERO));
+    }
+
+    #[test]
+    fn wait_timeout_recovers_from_a_poisoned_wait_lock() {
+        let token = CancellationToken::new();
+        poison_wait_lock(&token);
+        assert!(!token.wait_timeout(Duration::ZERO));
+        assert!(!token.is_cancelled());
+        token.cancel();
+        assert!(token.wait_timeout(Duration::ZERO));
+    }
+}

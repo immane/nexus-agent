@@ -718,3 +718,97 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cov_outcomes_private {
+    use super::truncate_utf8_bytes;
+
+    /// Reference maximal character-boundary prefix; the production cut must
+    /// match it for every budget.
+    fn longest_prefix_within(text: &str, max_bytes: usize) -> &str {
+        let mut end = 0;
+        for (index, ch) in text.char_indices() {
+            let next = index + ch.len_utf8();
+            if next > max_bytes {
+                break;
+            }
+            end = next;
+        }
+        &text[..end]
+    }
+
+    #[test]
+    fn leaves_text_at_or_under_budget_untouched() {
+        let mut text = String::from("abc");
+        assert!(!truncate_utf8_bytes(&mut text, 3));
+        assert_eq!(text, "abc");
+        assert!(!truncate_utf8_bytes(&mut text, 4));
+        assert_eq!(text, "abc");
+
+        let mut empty = String::new();
+        assert!(!truncate_utf8_bytes(&mut empty, 0));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn zero_budget_empties_nonempty_text_and_reports_a_cut() {
+        let mut text = String::from("é");
+        assert!(truncate_utf8_bytes(&mut text, 0));
+        assert!(text.is_empty());
+    }
+
+    #[test]
+    fn backs_off_through_a_mixed_multibyte_sequence() {
+        // Boundaries: a=1, é=3, €=6, 𝄞=10. Every cut must land on one of
+        // them, never inside a character.
+        let original = "aé€𝄞";
+        let expected = [
+            (1, "a"),
+            (2, "a"),
+            (3, "aé"),
+            (4, "aé"),
+            (5, "aé"),
+            (6, "aé€"),
+            (7, "aé€"),
+            (8, "aé€"),
+            (9, "aé€"),
+        ];
+        for (max_bytes, want) in expected {
+            let mut text = original.to_string();
+            assert!(truncate_utf8_bytes(&mut text, max_bytes), "max={max_bytes}");
+            assert_eq!(text, want, "max={max_bytes}");
+        }
+
+        let mut exact = original.to_string();
+        assert!(!truncate_utf8_bytes(&mut exact, original.len()));
+        assert_eq!(exact, original);
+    }
+
+    #[test]
+    fn cut_is_always_a_maximal_character_boundary_prefix() {
+        let text = "aé€𝄞bc";
+        for max_bytes in 0..=text.len() + 2 {
+            let mut candidate = text.to_string();
+            let cut = truncate_utf8_bytes(&mut candidate, max_bytes);
+            assert_eq!(
+                candidate,
+                longest_prefix_within(text, max_bytes),
+                "max={max_bytes}"
+            );
+            assert_eq!(cut, candidate.len() < text.len(), "max={max_bytes}");
+            assert!(candidate.len() <= max_bytes, "max={max_bytes}");
+            assert!(candidate.is_char_boundary(candidate.len()));
+            assert!(text.starts_with(&candidate), "max={max_bytes}");
+            if candidate.len() < text.len() {
+                let next = text[candidate.len()..]
+                    .chars()
+                    .next()
+                    .expect("remaining text");
+                assert!(
+                    candidate.len() + next.len_utf8() > max_bytes,
+                    "cut must be maximal: max={max_bytes}"
+                );
+            }
+        }
+    }
+}

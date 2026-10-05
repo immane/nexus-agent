@@ -315,3 +315,128 @@ mod tests {
         const _: () = assert!(MAX_OUTCOME_RECORDS > 0);
     }
 }
+
+#[cfg(test)]
+mod cov_store_private {
+    use super::*;
+
+    fn private_message(source: &str, text: &str) -> StoredMessage {
+        StoredMessage {
+            source: source.to_owned(),
+            text: text.to_owned(),
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn private_stored_parts_bounds_are_byte_exact() {
+        assert!(
+            check_stored_parts(&[], "p").is_ok(),
+            "a minimal bounded record is accepted"
+        );
+
+        // Source labels are bounded at the fixed 64-byte boundary; text at
+        // the tool-output byte budget; both bounds are inclusive.
+        assert!(check_stored_parts(&[private_message("", "t")], "p").is_err());
+        let source_at_bound = "s".repeat(64);
+        assert!(check_stored_parts(&[private_message(&source_at_bound, "t")], "p").is_ok());
+        assert!(check_stored_parts(&[private_message(&"s".repeat(65), "t")], "p").is_err());
+
+        let text_at_bound = "t".repeat(Limits::M0_TEST_TOOL_OUTPUT_BYTES);
+        assert!(check_stored_parts(&[private_message("u", &text_at_bound)], "p").is_ok());
+        let text_over_bound = "t".repeat(Limits::M0_TEST_TOOL_OUTPUT_BYTES + 1);
+        assert!(check_stored_parts(&[private_message("u", &text_over_bound)], "p").is_err());
+
+        // Profile metadata is non-empty and bounded, and the message count is
+        // capped at exactly MAX_STORED_MESSAGES.
+        assert!(check_stored_parts(&[], "").is_err());
+        assert!(check_stored_parts(&[], &"p".repeat(MAX_PROFILE_LEN)).is_ok());
+        assert!(check_stored_parts(&[], &"p".repeat(MAX_PROFILE_LEN + 1)).is_err());
+
+        let at_count: Vec<StoredMessage> = (0..MAX_STORED_MESSAGES)
+            .map(|_| private_message("u", "t"))
+            .collect();
+        assert!(check_stored_parts(&at_count, "p").is_ok());
+        let over_count: Vec<StoredMessage> = (0..=MAX_STORED_MESSAGES)
+            .map(|_| private_message("u", "t"))
+            .collect();
+        assert!(check_stored_parts(&over_count, "p").is_err());
+    }
+
+    #[test]
+    fn private_boundary_recheck_rejects_construction_bypass() {
+        // `SessionCheckpoint::new` validates, but the store boundary must not
+        // trust construction: a checkpoint assembled through the private
+        // fields with an over-count message list is rejected by the recheck.
+        let bypass = SessionCheckpoint {
+            session: SessionId::new("sess-bypass").expect("valid"),
+            format_revision: STORE_FORMAT_REVISION,
+            logical_revision: 1,
+            messages: (0..=MAX_STORED_MESSAGES)
+                .map(|_| private_message("u", "t"))
+                .collect(),
+            profile: "p".to_owned(),
+        };
+        assert!(check_checkpoint_bounds(&bypass).is_err());
+
+        let wrong_format = SessionCheckpoint {
+            session: SessionId::new("sess-format").expect("valid"),
+            format_revision: STORE_FORMAT_REVISION + 1,
+            logical_revision: 1,
+            messages: vec![private_message("u", "t")],
+            profile: "p".to_owned(),
+        };
+        assert!(
+            check_checkpoint_bounds(&wrong_format).is_ok(),
+            "the bounds recheck judges stored parts, not the format revision"
+        );
+        assert!(check_format_revision(wrong_format.format_revision()).is_err());
+    }
+
+    #[test]
+    fn private_equality_covers_every_stored_field() {
+        // Conflict detection at equal revisions relies on whole-record
+        // equality, so every stored field must participate.
+        let base = SessionCheckpoint {
+            session: SessionId::new("sess-eq").expect("valid"),
+            format_revision: STORE_FORMAT_REVISION,
+            logical_revision: 9,
+            messages: vec![private_message("user", "hello")],
+            profile: "p".to_owned(),
+        };
+        assert_eq!(base, base.clone());
+
+        let mut other_session = base.clone();
+        other_session.session = SessionId::new("sess-other").expect("valid");
+        assert_ne!(base, other_session);
+
+        let mut other_format = base.clone();
+        other_format.format_revision = STORE_FORMAT_REVISION + 1;
+        assert_ne!(base, other_format);
+
+        let mut other_revision = base.clone();
+        other_revision.logical_revision = 10;
+        assert_ne!(base, other_revision);
+
+        let mut other_text = base.clone();
+        other_text.messages[0].text = "changed".to_owned();
+        assert_ne!(base, other_text);
+
+        let mut other_complete = base.clone();
+        other_complete.messages[0].complete = false;
+        assert_ne!(base, other_complete);
+
+        let mut other_profile = base.clone();
+        other_profile.profile = "other".to_owned();
+        assert_ne!(base, other_profile);
+    }
+
+    #[test]
+    fn private_store_error_is_invalid_input_without_retry() {
+        let error = store_error("private coverage probe");
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), "private coverage probe");
+        assert!(error.correlation().is_empty());
+    }
+}

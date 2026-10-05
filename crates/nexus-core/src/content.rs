@@ -490,3 +490,69 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cov_content_private {
+    use super::*;
+
+    #[test]
+    fn content_error_is_invalid_input_without_retry() {
+        let error = content_error("synthetic content failure");
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), "synthetic content failure");
+        assert!(error.correlation().is_empty());
+    }
+
+    #[test]
+    fn tool_name_byte_charset_is_exactly_the_lock_charset() {
+        for byte in b'A'..=b'Z' {
+            assert!(is_tool_name_byte(byte), "{byte}");
+        }
+        for byte in b'a'..=b'z' {
+            assert!(is_tool_name_byte(byte), "{byte}");
+        }
+        for byte in b'0'..=b'9' {
+            assert!(is_tool_name_byte(byte), "{byte}");
+        }
+        for byte in [b'-', b'_'] {
+            assert!(is_tool_name_byte(byte), "{byte}");
+        }
+        for byte in [0u8, b'.', b'/', b' ', b':', b'@', b'\\', b'~', 0xFF] {
+            assert!(!is_tool_name_byte(byte), "{byte}");
+        }
+    }
+
+    #[test]
+    fn private_turn_state_converts_only_when_complete() {
+        let run = RunId::new("run-private").expect("valid run id");
+        let turn = TurnId::new("turn-private").expect("valid turn id");
+
+        let partial = AssistantTurn {
+            run: run.clone(),
+            turn: turn.clone(),
+            blocks: vec![ContentBlock::Text(
+                TextContent::new("half").expect("valid text"),
+            )],
+            completeness: TurnCompleteness::Partial,
+        };
+        assert!(!partial.is_complete());
+        assert!(partial.into_completed().is_err());
+
+        let complete = AssistantTurn {
+            run,
+            turn,
+            blocks: vec![ContentBlock::Text(
+                TextContent::new("done").expect("valid text"),
+            )],
+            completeness: TurnCompleteness::Complete,
+        };
+        let completed = complete
+            .clone()
+            .into_completed()
+            .expect("complete converts");
+        assert_eq!(completed.0, complete);
+        assert_eq!(completed.inner(), &complete);
+        assert!(completed.inner().is_complete());
+    }
+}

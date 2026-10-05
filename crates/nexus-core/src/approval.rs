@@ -355,3 +355,89 @@ mod tests {
         assert!(NormalizedArgs::new("x".repeat(Limits::M0_TEST_ARG_ASSEMBLY_BYTES + 1)).is_err());
     }
 }
+
+/// Private-branch coverage unreachable from the public integration surface:
+/// the static error helpers, the raw carrier fields, and the branch-specific
+/// constructor diagnostics.
+#[cfg(test)]
+mod cov_approval_private {
+    use super::*;
+    use crate::ids::M0_REVISION;
+
+    #[test]
+    fn static_error_helpers_map_category_and_retry_exactly() {
+        let input = input_error("cov input diagnostic");
+        assert_eq!(input.category(), ErrorCategory::InvalidInput);
+        assert_eq!(input.message(), "cov input diagnostic");
+        assert_eq!(input.retry(), RetryGuidance::DoNotRetry);
+
+        let denied = dispatch_denied("cov denied diagnostic");
+        assert_eq!(denied.category(), ErrorCategory::PermissionDenied);
+        assert_eq!(denied.message(), "cov denied diagnostic");
+        assert_eq!(denied.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    #[test]
+    fn normalized_args_each_branch_reports_its_own_diagnostic() {
+        assert_eq!(
+            NormalizedArgs::new("").unwrap_err().message(),
+            "tool arguments are empty"
+        );
+        // Non-empty but not object-root: whitespace-only text reaches the
+        // trim path, and the short-circuit covers both operand orders.
+        for raw in [" ", "\n\t", "x", "}", "{"] {
+            assert_eq!(
+                NormalizedArgs::new(raw).unwrap_err().message(),
+                "tool arguments must be an object-root value",
+                "input {raw:?}"
+            );
+        }
+        // The budget check runs before the shape check.
+        assert_eq!(
+            NormalizedArgs::new("[".repeat(Limits::M0_TEST_ARG_ASSEMBLY_BYTES + 1))
+                .unwrap_err()
+                .message(),
+            "tool arguments exceed assembly budget"
+        );
+    }
+
+    #[test]
+    fn raw_fields_keep_exact_bytes_while_validation_trims() {
+        let raw = "  {\"path\":\"src\"}\n";
+        let args = NormalizedArgs::new(raw).expect("trimmed object root is accepted");
+        assert_eq!(args.0, raw, "the private field keeps the untrimmed text");
+        assert_eq!(args.as_str(), raw);
+
+        let scope_text = " project-read ";
+        let scope = ApprovedScope::new(scope_text).expect("scope within bound");
+        assert_eq!(scope.0, scope_text);
+        assert_eq!(scope.as_str(), scope_text);
+    }
+
+    #[test]
+    fn private_binding_fields_match_every_accessor() {
+        let args = NormalizedArgs::new(r#"{"path":"src"}"#).expect("valid");
+        let scope = ApprovedScope::new("project-read").expect("valid");
+        let binding = ApprovalBinding::new(
+            ApprovalId::new("appr-1").expect("valid"),
+            RunId::new("run-1").expect("valid"),
+            CallId::new("call-1").expect("valid"),
+            ToolId::new("host_read", M0_REVISION).expect("valid"),
+            args.clone(),
+            scope.clone(),
+            Duration::from_secs(120),
+            M0_REVISION,
+        );
+        assert_eq!(binding.approval, ApprovalId::new("appr-1").expect("valid"));
+        assert_eq!(binding.run, RunId::new("run-1").expect("valid"));
+        assert_eq!(binding.call, CallId::new("call-1").expect("valid"));
+        assert_eq!(
+            binding.tool,
+            ToolId::new("host_read", M0_REVISION).expect("valid")
+        );
+        assert_eq!(binding.args, args);
+        assert_eq!(binding.scope, scope);
+        assert_eq!(binding.expires_at_elapsed, Duration::from_secs(120));
+        assert_eq!(binding.policy_revision, M0_REVISION);
+    }
+}

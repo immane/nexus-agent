@@ -363,3 +363,50 @@ mod tests {
         assert_eq!(M0_REVISION, 0);
     }
 }
+
+#[cfg(test)]
+mod cov_ids_private {
+    use super::*;
+
+    #[test]
+    fn validate_id_accepts_the_lock_charset_and_rejects_the_rest() {
+        let allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        assert_eq!(allowed.len(), MAX_ID_LEN);
+        for byte in 0x20u8..=0x7E {
+            let raw = (byte as char).to_string();
+            let result = validate_id(&raw);
+            if allowed.contains(&byte) {
+                assert_eq!(result, Ok(()), "byte {byte:#04x}");
+            } else {
+                assert_eq!(result, Err(IdError::IllegalChar), "byte {byte:#04x}");
+            }
+        }
+        assert_eq!(validate_id("é"), Err(IdError::IllegalChar));
+        assert_eq!(validate_id("\u{0}"), Err(IdError::IllegalChar));
+    }
+
+    #[test]
+    fn validate_id_prefers_empty_then_length_then_charset() {
+        assert_eq!(validate_id(""), Err(IdError::Empty));
+        assert_eq!(validate_id(&"a".repeat(MAX_ID_LEN)), Ok(()));
+        assert_eq!(
+            validate_id(&"a".repeat(MAX_ID_LEN + 1)),
+            Err(IdError::TooLong)
+        );
+        let overlong_illegal = format!("{}!", "a".repeat(MAX_ID_LEN));
+        assert_eq!(validate_id(&overlong_illegal), Err(IdError::TooLong));
+        assert_eq!(validate_id("a!"), Err(IdError::IllegalChar));
+    }
+
+    #[test]
+    fn is_id_byte_matches_the_lock_charset_exactly() {
+        let allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        for byte in 0u8..=u8::MAX {
+            assert_eq!(
+                is_id_byte(byte),
+                allowed.contains(&byte),
+                "byte {byte:#04x}"
+            );
+        }
+    }
+}

@@ -400,3 +400,190 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod cov_error_private {
+    use super::*;
+
+    /// The exact marker set the boundary net documents. Mirrors the public
+    /// coverage list in `tests/cov_error_markers.rs`; this guard fails when
+    /// either list changes without the other.
+    const EXPECTED_MARKERS: &[&str] = &[
+        "-----begin",
+        "bearer ",
+        "sk-",
+        "akia",
+        "ghp_",
+        "xoxb-",
+        "password=",
+        "passwd=",
+        "secret=",
+        "api_key=",
+        "apikey=",
+        "client_secret",
+    ];
+
+    #[test]
+    fn marker_set_matches_the_documented_contract() {
+        assert_eq!(
+            SECRET_MARKERS.len(),
+            EXPECTED_MARKERS.len(),
+            "marker count changed; update the public coverage list too"
+        );
+        for expected in EXPECTED_MARKERS {
+            assert!(
+                SECRET_MARKERS.contains(expected),
+                "documented marker {expected:?} is not enforced"
+            );
+        }
+        let mut sorted = SECRET_MARKERS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            SECRET_MARKERS.len(),
+            "SECRET_MARKERS contains duplicate entries"
+        );
+    }
+
+    #[test]
+    fn markers_are_nonempty_lowercase_ascii() {
+        for marker in SECRET_MARKERS {
+            assert!(!marker.is_empty(), "empty marker can never match");
+            assert_eq!(
+                *marker,
+                marker.to_lowercase().as_str(),
+                "marker {marker:?} must be lowercase because the haystack is lowercased"
+            );
+            assert!(
+                marker.is_ascii(),
+                "marker {marker:?} must be ASCII for deterministic matching"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_secret_marker_matches_every_marker_in_any_case() {
+        for marker in SECRET_MARKERS {
+            assert!(contains_secret_marker(marker), "{marker:?} matches itself");
+            assert!(
+                contains_secret_marker(&marker.to_uppercase()),
+                "{marker:?} matches uppercased"
+            );
+            let mixed: String = marker
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    if index % 2 == 0 {
+                        character.to_ascii_uppercase()
+                    } else {
+                        character.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            assert!(
+                contains_secret_marker(&mixed),
+                "{marker:?} matches in mixed case"
+            );
+            assert!(
+                contains_secret_marker(&format!("request failed near {marker} upstream")),
+                "{marker:?} matches when embedded"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_secret_marker_ignores_near_misses() {
+        for text in [
+            "----begin certificate",
+            "-----begi",
+            "bearer",
+            "bearer\ttoken",
+            "b e a r e r ",
+            "sk",
+            "sk_",
+            "s k-",
+            "akla",
+            "akya",
+            "ghp",
+            "ghp-",
+            "xoxb",
+            "xoxb_",
+            "password",
+            "password:",
+            "password =",
+            "passwd",
+            "passw=",
+            "topsecret",
+            "secret:",
+            "secret =",
+            "api_key",
+            "api_key:",
+            "api-key=",
+            "apikey",
+            "apikey:",
+            "clientsecret",
+            "client-secret",
+            "client_sec",
+        ] {
+            assert!(
+                !contains_secret_marker(text),
+                "near-miss {text:?} must not trigger the net"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_secret_marker_uses_unicode_lowercase_folding() {
+        // U+212A KELVIN SIGN lowercases to ASCII 'k', so a visually exotic
+        // spelling of the AKIA marker is still caught by the lowercased
+        // haystack; the net is broader than plain ASCII case folding here.
+        assert!(contains_secret_marker("A\u{212A}IA"));
+    }
+
+    #[test]
+    fn is_bounded_safe_text_enforces_all_three_conditions() {
+        assert!(is_bounded_safe_text("safe text", 16));
+        assert!(
+            is_bounded_safe_text(&"x".repeat(64), 64),
+            "exact bound passes"
+        );
+        assert!(!is_bounded_safe_text("", 16), "empty is rejected");
+        assert!(!is_bounded_safe_text("safe text", 0), "zero bound rejects");
+        assert!(
+            !is_bounded_safe_text(&"x".repeat(65), 64),
+            "over bound rejects"
+        );
+        assert!(
+            !is_bounded_safe_text("PASSWORD=FAKE", 64),
+            "markers are rejected case-insensitively"
+        );
+        let marker_at_bound = format!("{}{}", "x".repeat(60), "ghp_");
+        assert_eq!(marker_at_bound.len(), 64);
+        assert!(
+            !is_bounded_safe_text(&marker_at_bound, 64),
+            "a marker inside the bound still rejects"
+        );
+    }
+
+    #[test]
+    fn with_correlation_rejects_oversized_data_unreachable_from_the_public_api() {
+        // CorrelationData::push caps entries at MAX_CORRELATION_ENTRIES, so
+        // this length check is only reachable from inside the module; build
+        // the otherwise-unconstructible value directly to exercise it.
+        let entries: Vec<(String, String)> = (0..=MAX_CORRELATION_ENTRIES)
+            .map(|index| (format!("k{index}"), "redacted".to_owned()))
+            .collect();
+        let correlation = CorrelationData(entries);
+        assert_eq!(correlation.len(), MAX_CORRELATION_ENTRIES + 1);
+        assert_eq!(
+            AgentError::with_correlation(
+                ErrorCategory::Internal,
+                "safe message",
+                correlation,
+                RetryGuidance::DoNotRetry,
+            ),
+            Err(ErrorBuildError::TooLong)
+        );
+    }
+}

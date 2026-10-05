@@ -381,3 +381,69 @@ mod tests {
         assert!(limits.check_run_elapsed(Duration::from_secs(299)).is_ok());
     }
 }
+
+#[cfg(test)]
+mod cov_limits_private {
+    use super::*;
+
+    #[test]
+    fn limit_error_maps_to_resource_limit_without_retry() {
+        let error = limit_error("assembly probe");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), "assembly probe");
+        assert_eq!(error.to_string(), "[resource-limit] assembly probe");
+    }
+
+    #[test]
+    fn assembly_max_boundary_is_inclusive() {
+        let mut limits = Limits::m0_test();
+        limits.max_arg_assembly_bytes = Limits::M0_TEST_ARG_ASSEMBLY_BYTES;
+        limits
+            .validate()
+            .expect("the exact M0 assembly maximum is accepted");
+        assert!(
+            limits
+                .check_arg_assembly_bytes(Limits::M0_TEST_ARG_ASSEMBLY_BYTES)
+                .is_ok()
+        );
+
+        limits.max_arg_assembly_bytes = Limits::M0_TEST_ARG_ASSEMBLY_BYTES + 1;
+        let error = limits
+            .validate()
+            .expect_err("one over the M0 assembly maximum is rejected");
+        assert_eq!(
+            error.message(),
+            "argument assembly budget exceeds M0 maximum"
+        );
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    #[test]
+    fn zero_budget_is_reported_before_the_cap_violation() {
+        let mut limits = Limits::m0_test();
+        limits.max_model_turns_per_run = 0;
+        limits.max_arg_assembly_bytes = Limits::M0_TEST_ARG_ASSEMBLY_BYTES + 1;
+        let error = limits.validate().expect_err("invalid limits are rejected");
+        assert_eq!(error.message(), "limit budget must be nonzero");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    #[test]
+    fn assembly_usage_check_rejects_only_strictly_over_budget() {
+        let mut limits = Limits::m0_test();
+        limits.max_arg_assembly_bytes = 1;
+        limits.validate().expect("the minimum budget is valid");
+
+        assert!(limits.check_arg_assembly_bytes(0).is_ok());
+        assert!(limits.check_arg_assembly_bytes(1).is_ok());
+        let error = limits
+            .check_arg_assembly_bytes(2)
+            .expect_err("strictly over budget is rejected");
+        assert_eq!(error.message(), "tool argument assembly budget exhausted");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+}

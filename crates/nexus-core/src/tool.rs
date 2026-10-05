@@ -311,3 +311,116 @@ mod tests {
         assert_eq!(context.deadline_elapsed(), Duration::from_secs(60));
     }
 }
+
+#[cfg(test)]
+mod cov_tool_private {
+    use super::*;
+    use crate::ids::M0_REVISION;
+
+    fn tool_id(revision: u32) -> ToolId {
+        ToolId::new("host_read", revision).expect("valid tool id")
+    }
+
+    fn scope() -> ApprovedScope {
+        ApprovedScope::new("project-read").expect("valid scope builds")
+    }
+
+    #[test]
+    fn private_error_helpers_are_typed_and_static() {
+        let invalid = tool_error("tool description is invalid");
+        assert_eq!(invalid.category(), ErrorCategory::InvalidInput);
+        assert_eq!(invalid.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(invalid.message(), "tool description is invalid");
+        assert!(invalid.correlation().is_empty());
+
+        for (category, message) in [
+            (ErrorCategory::Cancelled, "tool execution cancelled"),
+            (ErrorCategory::Timeout, "tool deadline exceeded"),
+        ] {
+            let error = tool_state_error(category, message);
+            assert_eq!(error.category(), category);
+            assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+            assert_eq!(error.message(), message);
+            assert!(error.correlation().is_empty());
+        }
+    }
+
+    #[test]
+    fn spec_fields_store_exact_bytes_at_the_bounds() {
+        let description = "d".repeat(MAX_TOOL_DESCRIPTION_LEN);
+        let schema = format!("{{{}}}", "s".repeat(MAX_SCHEMA_BYTES - 2));
+        assert_eq!(schema.len(), MAX_SCHEMA_BYTES);
+        let spec = ToolSpec::new(tool_id(M0_REVISION), description.clone(), schema.clone())
+            .expect("boundary spec builds");
+        assert_eq!(spec.description, description);
+        assert_eq!(spec.input_schema_json, schema);
+        assert_eq!(spec.description.len(), MAX_TOOL_DESCRIPTION_LEN);
+        assert_eq!(spec.input_schema_json.len(), MAX_SCHEMA_BYTES);
+        assert_eq!(spec.id.revision(), M0_REVISION);
+
+        assert!(
+            ToolSpec::new(
+                tool_id(M0_REVISION),
+                "d".repeat(MAX_TOOL_DESCRIPTION_LEN + 1),
+                "{}",
+            )
+            .is_err(),
+            "one byte over the description bound is rejected"
+        );
+        let over_schema = format!("{{{}}}", "s".repeat(MAX_SCHEMA_BYTES - 1));
+        assert_eq!(over_schema.len(), MAX_SCHEMA_BYTES + 1);
+        assert!(
+            ToolSpec::new(tool_id(M0_REVISION), "d", over_schema).is_err(),
+            "one byte over the schema bound is rejected"
+        );
+    }
+
+    #[test]
+    fn with_control_replaces_both_live_controls() {
+        let first_token = CancellationToken::new();
+        let second_token = CancellationToken::new();
+        let first_deadline = Instant::now() + Duration::from_secs(30);
+        let second_deadline = Instant::now() + Duration::from_secs(60);
+        let context = ToolContext::new(1024, Duration::from_secs(60), false, scope())
+            .expect("valid context builds")
+            .with_control(first_token.clone(), first_deadline)
+            .with_control(second_token.clone(), second_deadline);
+        assert_eq!(context.token.as_ref(), Some(&second_token));
+        assert_eq!(context.deadline_at, Some(second_deadline));
+
+        first_token.cancel();
+        assert!(
+            !context.is_cancelled(),
+            "the replaced token is no longer observed"
+        );
+        second_token.cancel();
+        assert!(context.is_cancelled());
+    }
+
+    #[test]
+    fn legacy_constructor_leaves_live_control_absent() {
+        let context =
+            ToolContext::new(1, Duration::ZERO, false, scope()).expect("valid context builds");
+        assert!(context.token.is_none());
+        assert!(context.deadline_at.is_none());
+        assert_eq!(context.deadline(), None);
+        assert_eq!(context.deadline_elapsed(), Duration::ZERO);
+        assert!(context.check_active().is_ok());
+    }
+
+    #[test]
+    fn snapshot_cancellation_survives_control_install() {
+        let context = ToolContext::new(1024, Duration::from_secs(60), true, scope())
+            .expect("valid context builds")
+            .with_control(
+                CancellationToken::new(),
+                Instant::now() + Duration::from_secs(60),
+            );
+        assert!(context.cancelled);
+        assert!(
+            context.is_cancelled(),
+            "the dispatch snapshot is never cleared by control install"
+        );
+        assert!(context.check_not_cancelled().is_err());
+    }
+}
