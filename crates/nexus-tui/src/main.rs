@@ -25,6 +25,11 @@
 //!   window before the terminal is restored; unresolved native blocking
 //!   work is reported instead of being presented as clean cleanup, and the
 //!   Tokio runtime teardown uses an explicit `shutdown_timeout`.
+//! - User configuration is loaded exactly once at startup on both the
+//!   interactive and headless paths: a missing file silently yields
+//!   defaults, a present but invalid file is an explicit startup error, and
+//!   a run's terminal outcome records the active model in the document
+//!   (a failed write is a transcript notice, never a crash).
 
 #![forbid(unsafe_code)]
 
@@ -34,6 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyEvent, KeyEventKind, poll, read};
+use nexus_config::{UserConfig, load as load_config, resolve_path, save as save_config};
 use nexus_core::{
     ApprovalNotice, CommandReply, CommandResponse, EventPayload, Limits, ModelRequest,
     ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunEvent, RunId,
@@ -84,6 +90,72 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
         Arc::new(FakeTool::mutation()),
     ];
     Runtime::try_new(config, provider, tools).map_err(io::Error::other)
+}
+
+/// User configuration resolved once at startup, plus the path it was read
+/// from (so a later write goes back to the same document) and the model the
+/// session boots with.
+///
+/// The TUI takes no `--config` flag: the document's location is
+/// [`nexus_config`]'s documented precedence (CLI path, then `NEXUS_CONFIG`,
+/// then the platform default), and this binary has no argument parser to
+/// receive a path. Adding a second, TUI-local way to choose the file would
+/// duplicate that precedence with no consumer here, and would risk writing
+/// model usage back to a file the user did not mean to write.
+#[derive(Debug)]
+struct SessionConfig {
+    config: UserConfig,
+    path: Option<std::path::PathBuf>,
+    active_model: Option<String>,
+}
+
+/// Loads the user configuration for both the interactive and the headless
+/// path, exactly once per process.
+///
+/// A missing file is not a failure: it means "not configured yet", so the
+/// defaults are used silently. A file that exists but cannot be parsed or
+/// validated is an explicit startup error -- silently starting with defaults
+/// would hide a broken document and then overwrite it on the first terminal
+/// outcome, destroying the user's actual settings.
+fn load_session_config() -> io::Result<SessionConfig> {
+    session_config_at(resolve_path(None))
+}
+
+/// Same contract as [`load_session_config`] with the resolved path supplied
+/// directly, so both the missing-file and invalid-file branches are testable
+/// without mutating the process environment.
+fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConfig> {
+    let config = match path.as_deref() {
+        Some(path) => load_config(path)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid user configuration: {error}"),
+                )
+            })?
+            .unwrap_or_else(UserConfig::default_config),
+        // No platform config location at all: run on defaults and never
+        // write, rather than guessing a path.
+        None => UserConfig::default_config(),
+    };
+    let active_model = boot_model(&config);
+    Ok(SessionConfig {
+        config,
+        path,
+        active_model,
+    })
+}
+
+/// Boot model: the most recently used model, else the first favourite, else
+/// the first configured model, else nothing (provider-dependent work then
+/// reports not-ready).
+fn boot_model(config: &UserConfig) -> Option<String> {
+    config
+        .recent()
+        .first()
+        .or_else(|| config.favourites().first())
+        .or_else(|| config.models().first().map(|entry| &entry.id))
+        .cloned()
 }
 
 /// Test-only demo provider: serves a fresh scripted demo script for every
@@ -164,11 +236,15 @@ fn main() {
 }
 
 async fn run() -> io::Result<()> {
+    // Loaded once, before the terminal is touched: an invalid document must
+    // fail as a startup error on the plain stderr surface, never inside a
+    // restored-screen report. Both paths below share this one load.
+    let session_config = load_session_config()?;
     let (runtime, streams) = build_runtime()?;
     if io::stdout().is_terminal() {
         match nexus_tui::TerminalGuard::setup() {
             Ok(mut guard) => {
-                let report = interactive(runtime, streams).await;
+                let report = interactive(runtime, streams, session_config).await;
                 // Retryable restoration: a step that fails stays owned and is
                 // attempted again on drop, and the failure is reported rather
                 // than presented as a clean restore.
@@ -203,11 +279,11 @@ async fn run() -> io::Result<()> {
             }
             Err(error) => {
                 eprintln!("terminal setup failed ({error}); test transcript fallback");
-                headless(runtime, streams).await
+                headless(runtime, streams, session_config).await
             }
         }
     } else {
-        headless(runtime, streams).await
+        headless(runtime, streams, session_config).await
     }
 }
 
@@ -363,6 +439,14 @@ struct Frontend {
     rejected_reported: bool,
     state_rejected: u64,
     state_rejected_reported: bool,
+    /// Typed user configuration: model admission order, favourites, and
+    /// recents. Read once at startup, written back when a run completes.
+    config: UserConfig,
+    /// Where [`Self::config`] came from. `None` means the platform exposes no
+    /// config location, in which case usage is never written back.
+    config_path: Option<std::path::PathBuf>,
+    /// Currently selected model id, or `None` when none is configured.
+    active_model: Option<String>,
 }
 
 impl Frontend {
@@ -378,6 +462,78 @@ impl Frontend {
             rejected_reported: false,
             state_rejected: 0,
             state_rejected_reported: false,
+            config: UserConfig::default_config(),
+            config_path: None,
+            active_model: None,
+        }
+    }
+
+    /// Builds a frontend over the already-loaded startup configuration, so
+    /// the interactive and headless paths share one load and one document.
+    fn with_config(session: SessionId, config: SessionConfig) -> Self {
+        Self {
+            config: config.config,
+            config_path: config.path,
+            active_model: config.active_model,
+            ..Self::new(session)
+        }
+    }
+
+    /// Advances the active model through the configured models in admission
+    /// order, wrapping at the end. With nothing configured this reports that
+    /// fact and changes nothing: cycling an empty list must not clear or
+    /// invent a selection.
+    fn cycle_model(&mut self) {
+        let ids: Vec<&str> = self
+            .config
+            .models()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        if ids.is_empty() {
+            self.state.notice("no configured models");
+            return;
+        }
+        let next = match self
+            .active_model
+            .as_deref()
+            .and_then(|current| ids.iter().position(|id| *id == current))
+        {
+            Some(index) => ids[(index + 1) % ids.len()],
+            // No usable selection yet: start at the first configured model.
+            None => ids[0],
+        };
+        self.active_model = Some(next.to_owned());
+        self.state.notice(&format!("model: {next}"));
+    }
+
+    /// Records the active model as recently used and writes the document
+    /// back. Called when a run reaches its terminal outcome, so the recents
+    /// list reflects runs that actually ran.
+    ///
+    /// Every failure here is a transcript notice: the model list is a
+    /// convenience, so a document that cannot be read back or written must
+    /// never take down a session that already produced its output. The
+    /// in-memory document keeps the recorded use either way.
+    fn record_active_model_use(&mut self) {
+        let Some(id) = self.active_model.clone() else {
+            return;
+        };
+        if self.config.model(&id).is_none() {
+            return;
+        }
+        // `record_use` only fails for an unknown id, which the membership
+        // check above already excluded; treat a failure as a write failure
+        // rather than asserting on library internals.
+        if self.config.record_use(&id).is_err() {
+            self.state.notice("config save failed");
+            return;
+        }
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        if save_config(&self.config, &path).is_err() {
+            self.state.notice("config save failed");
         }
     }
 
@@ -416,6 +572,9 @@ impl Frontend {
             }
             if terminal {
                 self.focus = Focus::Composer;
+                // The run completed, so this model is genuinely "used":
+                // record it before the notice history moves on.
+                self.record_active_model_use();
                 return true;
             }
         }
@@ -642,6 +801,7 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
                 front.state.scroll_down(front.state.viewport_height());
             }
         }
+        Action::CycleModel => front.cycle_model(),
         Action::FoldToggle => {
             if front.state.selected().is_none() {
                 front.state.move_selection(-1);
@@ -710,12 +870,16 @@ struct InteractiveReport {
 /// full test-only keyset. The loop stays up across terminal outcomes so
 /// further tasks can be submitted; it exits on quit, channel close, or
 /// error, cancelling live work first.
-async fn interactive(runtime: Runtime, mut streams: EventStreams) -> io::Result<InteractiveReport> {
+async fn interactive(
+    runtime: Runtime,
+    mut streams: EventStreams,
+    session_config: SessionConfig,
+) -> io::Result<InteractiveReport> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
     let session =
         SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?;
-    let mut front = Frontend::new(session);
+    let mut front = Frontend::with_config(session, session_config);
     let mut gate = RefreshGate::m0_test();
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -929,10 +1093,14 @@ fn draw(
 /// Non-terminal fallback: drains the scripted run, denies any approval
 /// (no user can confirm it), and prints the sanitized presentation
 /// transcript with no escape codes.
-async fn headless(runtime: Runtime, mut streams: EventStreams) -> io::Result<()> {
+async fn headless(
+    runtime: Runtime,
+    mut streams: EventStreams,
+    session_config: SessionConfig,
+) -> io::Result<()> {
     let session =
         SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?;
-    let mut front = Frontend::new(session);
+    let mut front = Frontend::with_config(session, session_config);
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1033,6 +1201,7 @@ async fn apply_headless(runtime: &Runtime, front: &mut Frontend, events: Vec<Run
             front.state_rejected += 1;
         }
         if terminal {
+            front.record_active_model_use();
             return true;
         }
     }
@@ -2365,6 +2534,208 @@ mod cov_main_topup {
         front.state.transcript().join("\n")
     }
 
+    /// An empty startup configuration with no write-back path, for tests that
+    /// exercise the loop rather than persistence.
+    fn defaults_config() -> SessionConfig {
+        SessionConfig {
+            config: UserConfig::default_config(),
+            path: None,
+            active_model: None,
+        }
+    }
+
+    /// A configuration with `count` models named `m0`.. in admission order and
+    /// an optional pre-set `recent`/`favourites` list, plus the path to write
+    /// back to. The provider profile is minimal but valid so model entries
+    /// resolve.
+    fn configured(count: usize, recent: &[&str], favourites: &[&str]) -> SessionConfig {
+        let mut config = UserConfig::default_config();
+        let profile = nexus_config::ProviderProfile::new(
+            "demo-provider",
+            "Demo provider",
+            nexus_config::AdapterKind::Direct,
+            Some("https://example.invalid".to_owned()),
+            nexus_config::CredentialRef::env_var("NEXUS_TUI_TEST_KEY")
+                .expect("credential reference is valid"),
+            "demo-model",
+        )
+        .expect("test provider profile is valid");
+        config.add_provider(profile).expect("provider admits");
+        for index in 0..count {
+            let entry =
+                nexus_config::ModelEntry::new(format!("m{index}"), "demo-provider", "demo-model")
+                    .expect("test model entry is valid");
+            config.add_model(entry).expect("model admits");
+        }
+        for id in favourites {
+            config
+                .add_favourite(id)
+                .expect("favourite is a known model");
+        }
+        for id in recent {
+            config.record_use(id).expect("recent is a known model");
+        }
+        let active_model = boot_model(&config);
+        SessionConfig {
+            config,
+            path: None,
+            active_model,
+        }
+    }
+
+    /// A frontend over `config`, with its state owned by an adopted run so a
+    /// terminal outcome can be applied.
+    fn frontend_with(config: SessionConfig) -> (RunId, Frontend) {
+        let run = run_id("run-config");
+        let mut front = Frontend::with_config(session(), config);
+        front.merger.adopt(&run);
+        (run, front)
+    }
+
+    #[test]
+    fn boot_model_prefers_recent_then_favourites_then_admission_order() {
+        assert_eq!(boot_model(&UserConfig::default_config()), None);
+        assert_eq!(
+            boot_model(&configured(3, &[], &[]).config).as_deref(),
+            Some("m0"),
+            "with nothing ranked, the first configured model boots"
+        );
+        assert_eq!(
+            boot_model(&configured(3, &[], &["m2"]).config).as_deref(),
+            Some("m2"),
+            "a favourite beats admission order"
+        );
+        assert_eq!(
+            boot_model(&configured(3, &["m1"], &["m2"]).config).as_deref(),
+            Some("m1"),
+            "recent beats favourites"
+        );
+    }
+
+    #[test]
+    fn viewport_m_cycles_admission_order_and_reports_the_selection() {
+        let (run, mut front) = frontend_with(configured(3, &[], &[]));
+        front.focus = Focus::Viewport;
+        assert_eq!(front.active_model.as_deref(), Some("m0"));
+
+        front.cycle_model();
+        assert_eq!(front.active_model.as_deref(), Some("m1"));
+        assert!(transcript(&front).contains("model: m1"));
+
+        front.cycle_model();
+        front.cycle_model();
+        assert_eq!(
+            front.active_model.as_deref(),
+            Some("m0"),
+            "cycling wraps at the end of the admission order"
+        );
+        assert!(
+            !front.state.is_finished(),
+            "cycling is presentation only: {run} is untouched"
+        );
+    }
+
+    #[test]
+    fn cycling_without_configured_models_notices_and_changes_nothing() {
+        let mut front = Frontend::with_config(session(), defaults_config());
+        front.focus = Focus::Viewport;
+        assert!(front.active_model.is_none());
+
+        front.cycle_model();
+        assert!(front.active_model.is_none(), "no selection is invented");
+        assert!(transcript(&front).contains("no configured models"));
+    }
+
+    #[test]
+    fn terminal_outcome_records_the_active_model_and_saves_the_document() {
+        let directory = temp_config_dir("terminal-save");
+        let path = directory.join("config.json");
+        let mut config = configured(3, &[], &[]);
+        config.path = Some(path.clone());
+        let (run, mut front) = frontend_with(config);
+        front.active_model = Some("m2".to_owned());
+
+        assert!(front.apply_events(vec![started(&run, 0), finished(&run, 1)]));
+        assert_eq!(
+            front.config.recent().first().map(String::as_str),
+            Some("m2"),
+            "the completed run's model leads the recents"
+        );
+        let persisted = load_config(&path)
+            .expect("the document is readable")
+            .expect("it exists");
+        assert_eq!(
+            persisted.recent().first().map(String::as_str),
+            Some("m2"),
+            "the usage was written back to the file the session loaded"
+        );
+        std::fs::remove_dir_all(&directory).expect("temporary directory removed");
+    }
+
+    #[test]
+    fn an_unwritable_config_path_is_a_notice_and_never_a_crash() {
+        let mut config = configured(2, &[], &[]);
+        // A path whose parent does not exist: `save` cannot create it.
+        config.path = Some(
+            std::env::temp_dir()
+                .join("nexus-tui-missing-parent")
+                .join("config.json"),
+        );
+        let (run, mut front) = frontend_with(config);
+        front.active_model = Some("m1".to_owned());
+
+        assert!(
+            front.apply_events(vec![started(&run, 0), finished(&run, 1)]),
+            "the terminal outcome is applied"
+        );
+        let lines = transcript(&front);
+        assert!(
+            lines.contains("config save failed"),
+            "a failed write is reported, not fatal"
+        );
+        assert!(
+            lines.contains("finished: Completed"),
+            "the run's outcome is still presented: {lines}"
+        );
+    }
+
+    #[test]
+    fn a_missing_config_file_starts_on_defaults_without_an_error() {
+        let directory = temp_config_dir("missing-file");
+        let loaded =
+            session_config_at(Some(directory.join("config.json"))).expect("a missing file is fine");
+        assert_eq!(loaded.active_model, None);
+        assert!(
+            loaded.config.models().is_empty(),
+            "defaults carry no models"
+        );
+        std::fs::remove_dir_all(&directory).expect("temporary directory removed");
+    }
+
+    #[test]
+    fn an_invalid_config_file_is_an_explicit_startup_error() {
+        let directory = temp_config_dir("invalid-file");
+        let path = directory.join("config.json");
+        std::fs::write(&path, "{ not json").expect("temporary document written");
+        let error = session_config_at(Some(path.clone()))
+            .expect_err("a present but broken document must not start silently");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            !error.to_string().contains("not json"),
+            "the diagnostic does not echo the document: {error}"
+        );
+        std::fs::remove_dir_all(&directory).expect("temporary directory removed");
+    }
+
+    /// A unique empty directory under the platform temp dir, removed by the
+    /// caller. Named from `purpose` so parallel tests never share one.
+    fn temp_config_dir(purpose: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!("nexus-tui-cfg-{purpose}"));
+        std::fs::remove_dir_all(&directory).ok();
+        std::fs::create_dir_all(&directory).expect("temporary directory created");
+        directory
+    }
+
     /// A frontend whose state owns `run` and is awaiting a decision on `call`.
     fn awaiting_approval(run: &RunId, call: &str) -> Frontend {
         let mut front = Frontend::new(session());
@@ -2376,7 +2747,7 @@ mod cov_main_topup {
     #[tokio::test]
     async fn headless_drains_the_scripted_run_and_denies_its_approval() {
         let (runtime, streams) = build_runtime().expect("demo wiring is valid");
-        headless(runtime, streams)
+        headless(runtime, streams, defaults_config())
             .await
             .expect("the non-terminal fallback always completes");
     }

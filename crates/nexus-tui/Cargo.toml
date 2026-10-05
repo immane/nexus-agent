@@ -18,6 +18,13 @@ nexus-core = { path = "../nexus-core" }
 # Single-run runtime handle: the ONLY execution/policy path. The TUI calls
 # `Runtime::handle` with typed commands and never invokes providers/tools.
 nexus-runtime = { path = "../nexus-runtime" }
+# Typed user configuration: model admission order, favourites, and recents.
+# The TUI reads it once at startup (missing file -> defaults, present but
+# invalid -> explicit startup error) and writes back `recent` when a run
+# reaches a terminal outcome. Rationale: configuration is owned by exactly
+# one crate, so the TUI never parses or rewrites the document itself and
+# cannot end up with a second representation of it.
+nexus-config = { path = "../nexus-config" }
 # Scripted fakes, used ONLY by the `nexus-tui` binary demo wiring
 # (self-identifying M0-test stand-in, never real configuration).
 nexus-fakes = { path = "../nexus-fakes" }

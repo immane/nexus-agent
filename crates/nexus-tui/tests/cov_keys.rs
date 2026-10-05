@@ -203,6 +203,14 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::FoldToggle,
         doc: "Viewport | l | Fold/unfold the selected entry",
     },
+    // Viewport | m | Cycle the active model (admission order)
+    Row {
+        focus: Focus::Viewport,
+        code: KeyCode::Char('m'),
+        modifiers: NONE,
+        intent: Action::CycleModel,
+        doc: "Viewport | m | Cycle the active model (admission order)",
+    },
     // Viewport | Tab | Switch focus
     Row {
         focus: Focus::Viewport,
@@ -362,6 +370,7 @@ const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
     ("Type", Focus::Composer),
     ("Backspace", Focus::Composer),
     ("FoldToggle", Focus::Viewport),
+    ("CycleModel", Focus::Viewport),
     ("ApproveOnce", Focus::ApprovalCard),
     ("Deny", Focus::ApprovalCard),
     ("InspectApproval", Focus::ApprovalCard),
@@ -460,6 +469,7 @@ fn intent_family(intent: &Action) -> &'static str {
         Action::PageUp => "PageUp",
         Action::PageDown => "PageDown",
         Action::FoldToggle => "FoldToggle",
+        Action::CycleModel => "CycleModel",
         Action::ApproveOnce => "ApproveOnce",
         Action::Deny => "Deny",
         Action::InspectApproval => "InspectApproval",
@@ -482,6 +492,7 @@ fn all_intents() -> Vec<Action> {
         Action::PageUp,
         Action::PageDown,
         Action::FoldToggle,
+        Action::CycleModel,
         Action::ApproveOnce,
         Action::Deny,
         Action::InspectApproval,
@@ -609,12 +620,12 @@ fn every_published_row_maps_to_its_documented_intent() {
 
 #[test]
 fn published_table_has_no_duplicate_or_conflicting_rows() {
-    // 35 literal rows: 6 composer, 12 viewport, 11 approval, and the 6
+    // 36 literal rows: 6 composer, 13 viewport, 11 approval, and the 6
     // focus-expanded `Any` rows (`Ctrl+C` and `Ctrl+D` in each focus). The
-    // 36th published row is parameterized over printable characters.
+    // 37th published row is parameterized over printable characters.
     assert_eq!(
         PUBLISHED_ROWS.len(),
-        35,
+        36,
         "the transcription lost or invented a published row"
     );
     // The oracle is only meaningful if it is a function: no `(focus, key,
@@ -728,6 +739,7 @@ fn intents_are_partitioned_by_focus() {
             Focus::Viewport,
             vec![
                 "Cancel",
+                "CycleModel",
                 "FocusSwitch",
                 "FoldToggle",
                 "PageDown",

@@ -146,6 +146,7 @@ fn expected_ascii_char(focus: Focus, char: char) -> Option<Action> {
         (Focus::Viewport, 'k') => Some(Action::ScrollUp),
         (Focus::Viewport, 'j') => Some(Action::ScrollDown),
         (Focus::Viewport, 'h' | 'l') => Some(Action::FoldToggle),
+        (Focus::Viewport, 'm') => Some(Action::CycleModel),
         (Focus::Viewport, 'q') => Some(Action::Quit),
         (Focus::ApprovalCard, 'a') => Some(Action::ApproveOnce),
         (Focus::ApprovalCard, 'd') => Some(Action::Deny),

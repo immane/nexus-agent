@@ -20,6 +20,7 @@
 //! | Viewport | `Up`/`k`, `Down`/`j` | Move selection (scrolls) |
 //! | Viewport | `PageUp`/`PageDown` | Scroll one page |
 //! | Viewport | `Left`/`h`, `Right`/`l` | Fold/unfold the selected entry |
+//! | Viewport | `m` | Cycle the active model (admission order) |
 //! | Viewport | `Tab` | Switch focus |
 //! | Viewport | `q` | Quit (test-only convenience) |
 //! | Approval | `a` | Allow once (exact live call only) |
@@ -83,6 +84,9 @@ pub enum Action {
     PageDown,
     /// Fold or unfold the selected entry.
     FoldToggle,
+    /// Cycle the active configured model. Bound in the viewport only, so
+    /// the composer keeps typing `m` as ordinary text.
+    CycleModel,
     /// Allow the exact live approval once.
     ApproveOnce,
     /// Refuse the live approval without executing.
@@ -148,6 +152,7 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
             Focus::Viewport,
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l'),
         ) => Some(Action::FoldToggle),
+        (Focus::Viewport, KeyCode::Char('m')) => Some(Action::CycleModel),
         (Focus::Viewport, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::Viewport, KeyCode::Char('q')) => Some(Action::Quit),
         (Focus::ApprovalCard, KeyCode::Char('a')) => Some(Action::ApproveOnce),
@@ -327,6 +332,28 @@ mod tests {
             assert_eq!(map_key(focus, ctrl('c')), Some(Action::Cancel));
             assert_eq!(map_key(focus, ctrl('d')), Some(Action::Quit));
         }
+    }
+
+    #[test]
+    fn model_cycling_is_viewport_only_and_the_composer_keeps_typing() {
+        assert_eq!(
+            map_key(Focus::Viewport, key(KeyCode::Char('m'))),
+            Some(Action::CycleModel)
+        );
+        assert_eq!(
+            map_key(Focus::Composer, key(KeyCode::Char('m'))),
+            Some(Action::Type('m')),
+            "`m` in the composer is text, never a model switch"
+        );
+        for focus in [Focus::Composer, Focus::Viewport, Focus::ApprovalCard] {
+            let release = KeyEvent::new_with_kind(
+                KeyCode::Char('m'),
+                KeyModifiers::empty(),
+                KeyEventKind::Repeat,
+            );
+            assert_eq!(map_key(focus, release), None, "{focus:?}");
+        }
+        assert_eq!(map_key(Focus::ApprovalCard, key(KeyCode::Char('m'))), None);
     }
 
     #[test]
