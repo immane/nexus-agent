@@ -2,13 +2,17 @@
 
 ## Status snapshot
 
-- Working tree: clean at `main` (`328e05f`), no uncommitted work.
-- Implementation stage: **M0 test-only** — scripted fakes, ephemeral store; no real providers, tools, or plugins. **M0 acceptance is NOT complete** (see `docs/tasks/04-m0-gates.md`).
+- Working tree: clean at `main`; see `git log` for the latest verified hash.
+- Implementation stage: **M0 test-only**, except two deliberately narrow
+  real boundaries: an OpenAI-compatible chat adapter over plain HTTP
+  (`nexus-openai`, no TLS, no streaming yet) and a root-jailed file reader
+  (`nexus-tools`, opt-in). No plugins, no durable history.
+  **M0 acceptance is NOT complete** (see `docs/tasks/04-m0-gates.md`).
 - Last verified gates (macOS, stable toolchain per `rust-toolchain.toml`):
-  - Rust: **1684 passed / 0 failed** across 117 test targets
+  - Rust: **1898 passed / 0 failed** across 138 test targets
   - Python (`tools/perf`): **253 passed** (1 Linux-only test skipped on macOS)
   - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo doc --workspace -- -D warnings`: clean
-  - Measured line coverage of production `src/`: **97.5%** (`rustc -C instrument-coverage` + Xcode `llvm-cov`; remaining gaps need a real PTY or unreachable defensive branches)
+  - Measured line coverage of production `src/`: **~97%** (`rustc -C instrument-coverage` + Xcode `llvm-cov`; re-measure after toolchain moves, as the two versions must agree; remaining gaps need a real PTY or unreachable defensive branches)
 
 ## Prerequisites
 
@@ -40,8 +44,12 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline
 |---|---|
 | `crates/nexus-core` | Domain types, errors, limits, ports. Dependency-free |
 | `crates/nexus-validation` | Closed M0 JSON/schema validator for tool arguments |
+| `crates/nexus-config` | Typed user config (providers, models, favourites, recents) + file persistence |
 | `crates/nexus-fakes` | Scripted deterministic provider/tool/store doubles (test-only) |
+| `crates/nexus-tools` | Real root-jailed file reader (`host_read`), opt-in |
+| `crates/nexus-openai` | Real OpenAI-compatible chat adapter over plain HTTP (no TLS) |
 | `crates/nexus-runtime` | Single-active-run loop: policy, cancellation, quarantine, ordered events |
+| `crates/nexus-server` | Loopback HTTP frontend: sessions, SSE streams, config-gated selection |
 | `crates/nexus-tui` | Test-only TUI shell over scripted fakes |
 | `crates/nexus-headless` | One-shot machine-output runner over scripted fakes |
 | `crates/nexus-integration` | Cross-crate behavior and regression tests |
@@ -56,6 +64,67 @@ cargo run -p nexus-tui --locked --offline
 ```
 
 Both print a test-only banner: no credentials, no network, no stored sessions.
+
+## Test a real LLM (local Ollama, end to end)
+
+The deterministic proof lives in `cargo test -p nexus-openai` (loopback
+mock, no network). To run a live model, only plain-HTTP
+OpenAI-compatible endpoints work (e.g. Ollama); `https` is refused
+explicitly because this transport has no TLS.
+
+```sh
+ollama pull llama3.1
+export OLLAMA_API_KEY=dummy   # local Ollama ignores it; the credential gate still requires it set
+cat > /tmp/nexus-config.json <<'EOF'
+{
+  "revision": 1,
+  "providers": [
+    {
+      "id": "ollama",
+      "display_name": "Ollama (local)",
+      "adapter": "direct",
+      "endpoint": "http://localhost:11434/v1",
+      "credential": {"env": "OLLAMA_API_KEY"},
+      "default_model": "llama3.1"
+    }
+  ],
+  "models": [
+    {"id": "local", "provider": "ollama", "name": "llama3.1"}
+  ],
+  "favourites": ["local"],
+  "recent": []
+}
+EOF
+cargo run -p nexus-server --locked --offline -- --port 8471 --config /tmp/nexus-config.json
+```
+
+In another terminal (session bound to the configured provider; tools
+stay scripted fakes unless `--tools real` is also passed):
+
+```sh
+SID=$(curl -s -X POST localhost:8471/sessions -d '{"provider":"ollama","model":"local"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['session'])")
+RID=$(curl -s -X POST localhost:8471/sessions/$SID/runs -d '{"input":"say hi in five words"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['run'])")
+curl -sN localhost:8471/sessions/$SID/runs/$RID/events
+```
+
+Expect the model's text, then a terminal `completed`. If the model
+calls a tool, an `approval-required` event appears: approve it with its
+exact ids (`POST .../approve {"approval":"...","call":"..."}`) and the
+run continues. Real file reads additionally need
+`--tools real --tools-root <dir>`: reads outside the root are denied
+before execution.
+
+Sanity checks that need no model at all:
+
+```sh
+curl -s -X POST localhost:8471/sessions -d '{"provider":"ghost"}'       # 400 unknown
+curl -s -X POST localhost:8471/sessions/$SID/runs -d '{"input":"x"}'    # fake demo path still works
+```
+
+Unset `OLLAMA_API_KEY` and submit with `"provider":"ollama"` to see the
+`503` credential gate: no socket ever opens without a referenced secret.
 
 ## Perf harnesses
 
@@ -79,6 +148,7 @@ xcrun llvm-profdata merge -sparse /tmp/nexus-cov/*.profraw -o /tmp/nexus-cov/mer
 
 ## What NOT to expect
 
-- No real model provider, no plugins, no durable history (ephemeral store only).
+- Provider transport is plain HTTP only (no TLS, no streaming SSE from the
+  model side); plugins and durable history do not exist (ephemeral store only).
 - Recorded performance numbers are historical characterization, not acceptance evidence; PTY/idle/streaming baselines are still pending.
 - Same-toolchain Linux validation and exact toolchain pinning are still open blockers.
