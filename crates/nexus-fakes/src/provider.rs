@@ -392,6 +392,21 @@ impl FakeProvider {
         ]])
     }
 
+    /// Two-turn demo script: the interleaved tool turn followed by a stop
+    /// turn, so one granted or denied run completes instead of exhausting.
+    ///
+    /// TEST-ONLY fixture for single-process demos that serve many runs;
+    /// real adapters never replay a script.
+    pub fn demo_two_turn() -> Self {
+        let provider = Self::interleaved_items();
+        provider
+            .script
+            .lock()
+            .expect("fake script writable")
+            .push_back(stop_turn("done"));
+        provider
+    }
+
     /// The same provider reference proposed twice, then a terminal failure.
     /// A runtime must discard the candidates with the failed invocation and
     /// never dispatch them.
@@ -776,6 +791,24 @@ mod tests {
             ProviderEvent::TurnFinished(finished)
                 if finished.reason() == FinishReason::ToolCalls
         ));
+    }
+
+    #[test]
+    fn demo_two_turn_serves_a_tool_turn_then_a_stop_turn() {
+        let provider = FakeProvider::demo_two_turn();
+        let first = provider.stream(&request(None), &live_context());
+        assert!(matches!(
+            terminal(&first),
+            ProviderEvent::TurnFinished(finished)
+                if finished.reason() == FinishReason::ToolCalls
+        ));
+        let second = provider.stream(&request(None), &live_context());
+        assert!(matches!(
+            terminal(&second),
+            ProviderEvent::TurnFinished(finished)
+                if finished.reason() == FinishReason::Stop
+        ));
+        assert_eq!(provider.call_count(), 2);
     }
 
     #[test]
