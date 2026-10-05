@@ -495,6 +495,7 @@ impl Frontend {
             active_model: config.active_model,
             ..Self::new(session)
         };
+        front.sync_model_display();
         if let Some(dir) = session_project_dir() {
             front.state.set_project_dir(dir);
         }
@@ -527,6 +528,24 @@ impl Frontend {
         };
         self.active_model = Some(next.to_owned());
         self.state.notice(&format!("model: {next}"));
+        self.sync_model_display();
+    }
+
+    /// Mirrors the selected model (and its provider, when the id still
+    /// resolves) into presentation state. Unknown ids clear the display
+    /// instead of showing a stale name.
+    fn sync_model_display(&mut self) {
+        let display = self.active_model.as_deref().and_then(|id| {
+            self.config
+                .model(id)
+                .map(|entry| (id.to_owned(), entry.provider.clone()))
+        });
+        match display {
+            Some((model, provider)) => {
+                self.state.set_active_model(Some(model), Some(provider));
+            }
+            None => self.state.set_active_model(None, None),
+        }
     }
 
     /// Records the active model as recently used and writes the document
@@ -2682,6 +2701,23 @@ mod cov_main_topup {
             !front.state.is_finished(),
             "cycling is presentation only: {run} is untouched"
         );
+    }
+
+    #[test]
+    fn model_display_follows_selection_and_clears_on_dangle() {
+        let (_run, mut front) = frontend_with(configured(2, &[], &[]));
+        assert_eq!(front.state.active_model(), Some("m0"));
+        assert_eq!(front.state.active_provider(), Some("demo-provider"));
+        front.focus = Focus::Viewport;
+        front.cycle_model();
+        assert_eq!(front.state.active_model(), Some("m1"));
+        assert_eq!(front.state.active_provider(), Some("demo-provider"));
+        // A selection that no longer resolves clears the display instead
+        // of showing a stale name.
+        front.active_model = Some("ghost".to_owned());
+        front.sync_model_display();
+        assert_eq!(front.state.active_model(), None);
+        assert_eq!(front.state.active_provider(), None);
     }
 
     #[test]

@@ -462,10 +462,20 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
     } else {
         Style::default()
     };
+    // The selected model rides in the title, after the fixed marker every
+    // existing test pins; an unselected model renders the bare title.
+    let mut title = String::from(" composer (fixed) ");
+    if let Some(model) = state.active_model() {
+        title.push_str(&format!("· {model}"));
+        if let Some(provider) = state.active_provider() {
+            title.push_str(&format!(" @ {provider}"));
+        }
+        title.push(' ');
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
-        .title(" composer (fixed) ");
+        .title(title);
     let inner = block.inner(area);
     block.render(area, buf);
     let mut text = state.composer().to_owned();
@@ -488,11 +498,11 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
     } else {
         ""
     };
-    let footer = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::raw(" m0-test "),
         Span::styled(cancel_hint, Style::default().fg(Color::Yellow)),
         Span::styled(approval_hint, Style::default().fg(Color::Yellow)),
-        Span::raw(" tab focus · enter submit · fold ←/→ · approval i/a/d · ctrl+d quit "),
+        Span::raw(" tab focus · enter submit · m model · fold ←/→ · approval i/a/d · ctrl+d quit "),
         Span::raw(
             format!(
                 "focus:{focus:?} stale:{} seq:{} dropped:{}",
@@ -500,8 +510,27 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
             )
             .to_lowercase(),
         ),
-    ]));
+    ];
+    // Context usage trails every existing segment, so frames without
+    // observed usage render byte-identically and narrow frames clip the
+    // counters before any status marker. Unknown stays `?`, never zero.
+    if let Some(usage) = state.last_usage() {
+        spans.push(Span::raw(format!(
+            " ctx in:{} out:{}",
+            counter(usage.input_tokens()),
+            counter(usage.output_tokens())
+        )));
+    }
+    let footer = Paragraph::new(Line::from(spans));
     footer.render(area, buf);
+}
+
+/// Renders an optional usage counter: the exact number, or `?` for
+/// unknown. Unknown is never fabricated as zero.
+fn counter(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_owned())
 }
 
 #[cfg(test)]
@@ -1772,5 +1801,64 @@ mod cov_render_private {
             abbreviate_home_with("/home/user/proj", Some("")),
             "/home/user/proj"
         );
+    }
+
+    #[test]
+    fn composer_title_names_the_selected_model_and_provider() {
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 80, 3);
+        let mut bare = Buffer::empty(area);
+        render_composer(&state, area, &mut bare, Focus::Composer);
+        let rows = text_rows(&bare);
+        assert!(rows[0].contains("composer (fixed)"), "{rows:?}");
+        assert!(!rows[0].contains('·'), "{rows:?}");
+
+        state.set_active_model(Some("demo".to_owned()), Some("acme".to_owned()));
+        let mut named = Buffer::empty(area);
+        render_composer(&state, area, &mut named, Focus::Composer);
+        let rows = text_rows(&named);
+        assert!(rows[0].contains("composer (fixed)"), "{rows:?}");
+        assert!(rows[0].contains("demo"), "{rows:?}");
+        assert!(rows[0].contains("acme"), "{rows:?}");
+
+        state.set_active_model(Some("demo".to_owned()), None);
+        let mut model_only = Buffer::empty(area);
+        render_composer(&state, area, &mut model_only, Focus::Composer);
+        let rows = text_rows(&model_only);
+        assert!(rows[0].contains("demo"), "{rows:?}");
+    }
+
+    #[test]
+    fn footer_shows_observed_usage_and_never_zeroes_unknown() {
+        use nexus_core::{EventPayload, RunEvent, RunId, SessionId, Usage, UsageFinality};
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 200, 1);
+        let plain = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(!plain.contains("ctx"), "{plain:?}");
+
+        assert!(state.apply_event(&started(0)));
+        let usage = |seq: u64, input: Option<u64>, output: Option<u64>| {
+            RunEvent::new(
+                SessionId::new("sess-1").expect("valid"),
+                RunId::new("run-1").expect("valid"),
+                seq,
+                EventPayload::UsageUpdated(Usage::new(input, output, UsageFinality::Final)),
+            )
+        };
+        assert!(state.apply_event(&usage(1, Some(10), None)));
+        let shown = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(shown.contains("ctx in:10 out:?"), "{shown:?}");
+        assert!(state.apply_event(&usage(2, Some(10), Some(3))));
+        let shown = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(shown.contains("ctx in:10 out:3"), "{shown:?}");
     }
 }

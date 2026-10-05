@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
-use nexus_core::{CallId, EventPayload, Limits, RunEvent, RunId, RunOutcome, TurnId};
+use nexus_core::{CallId, EventPayload, Limits, RunEvent, RunId, RunOutcome, TurnId, Usage};
 
 use crate::sanitize::{is_bidi_format, sanitize, sanitize_approval};
 
@@ -552,6 +552,14 @@ pub struct AppState {
     /// are jailed to). `None` renders no segment, so tests and headless
     /// transcripts that never set it are unaffected.
     project_dir: Option<String>,
+    /// Model selected in the composer, shown in its title. `None` renders
+    /// the bare title, so frames that never select a model are unaffected.
+    active_model: Option<String>,
+    /// Provider of the selected model, shown beside it when known.
+    active_provider: Option<String>,
+    /// Latest usage counters observed on the live run. Cleared by the next
+    /// `RunStarted` so a new run never wears the previous run's numbers.
+    last_usage: Option<Usage>,
 }
 
 impl Default for AppState {
@@ -589,6 +597,9 @@ impl AppState {
             finished: None,
             viewport: (80, 20),
             project_dir: None,
+            active_model: None,
+            active_provider: None,
+            last_usage: None,
         }
     }
 
@@ -602,6 +613,31 @@ impl AppState {
     #[must_use]
     pub fn project_dir(&self) -> Option<&str> {
         self.project_dir.as_deref()
+    }
+
+    /// Shows a selected model (and its provider, when known) in the
+    /// composer title. `None` clears the display back to the bare title.
+    pub fn set_active_model(&mut self, model: Option<String>, provider: Option<String>) {
+        self.active_model = model;
+        self.active_provider = provider;
+    }
+
+    /// Returns the displayed model, if one was selected.
+    #[must_use]
+    pub fn active_model(&self) -> Option<&str> {
+        self.active_model.as_deref()
+    }
+
+    /// Returns the displayed provider, if one is known.
+    #[must_use]
+    pub fn active_provider(&self) -> Option<&str> {
+        self.active_provider.as_deref()
+    }
+
+    /// Returns the latest usage counters observed on the live run.
+    #[must_use]
+    pub fn last_usage(&self) -> Option<Usage> {
+        self.last_usage
     }
 
     /// Applies one runtime event to presentation state. Returns false without
@@ -647,6 +683,7 @@ impl AppState {
             EventPayload::RunStarted { .. } => {
                 self.streaming = true;
                 self.finished = None;
+                self.last_usage = None;
                 self.status = "running".to_owned();
                 self.push_system(format!("run {} started", event.run().as_str()));
             }
@@ -750,7 +787,8 @@ impl AppState {
                 }
                 self.status = "running".to_owned();
             }
-            EventPayload::UsageUpdated(_) => {
+            EventPayload::UsageUpdated(usage) => {
+                self.last_usage = Some(*usage);
                 self.status = "running".to_owned();
             }
             EventPayload::RunFinished(finished) => {
@@ -2235,6 +2273,39 @@ mod tests {
         assert!(gate.ready(start + Duration::from_millis(33)));
         gate.mark_drawn(start + Duration::from_millis(33));
         assert!(!gate.ready(start + Duration::from_millis(34)));
+    }
+
+    #[test]
+    fn model_display_and_usage_track_explicit_updates_only() {
+        use nexus_core::{Usage, UsageFinality};
+        let mut state = AppState::new();
+        assert_eq!(state.active_model(), None);
+        assert_eq!(state.active_provider(), None);
+        assert_eq!(state.last_usage(), None);
+        state.set_active_model(Some("m0".to_owned()), Some("acme".to_owned()));
+        assert_eq!(state.active_model(), Some("m0"));
+        assert_eq!(state.active_provider(), Some("acme"));
+        state.set_active_model(None, None);
+        assert_eq!(state.active_model(), None);
+
+        let usage = |seq, input, output| {
+            RunEvent::new(
+                SessionId::new("sess-1").expect("valid"),
+                RunId::new("run-1").expect("valid"),
+                seq,
+                EventPayload::UsageUpdated(Usage::new(input, output, UsageFinality::Final)),
+            )
+        };
+        assert!(state.apply_event(&started(0)));
+        assert!(state.apply_event(&usage(1, Some(10), None)));
+        assert_eq!(
+            state.last_usage().expect("usage recorded"),
+            Usage::new(Some(10), None, UsageFinality::Final)
+        );
+        // A new run never wears the previous run's numbers.
+        assert!(state.apply_event(&finished(3)));
+        assert!(state.apply_event(&started_run("run-2", 4)));
+        assert_eq!(state.last_usage(), None);
     }
 }
 
