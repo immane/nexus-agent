@@ -39,8 +39,8 @@ FRAME = (
 
 BODY_FRAME_WAIT_QUIT = r'''
 import sys, tty
-sys.stdout.write(FRAME); sys.stdout.flush()
 tty.setraw(0)
+sys.stdout.write(FRAME); sys.stdout.flush()
 while True:
     b = sys.stdin.buffer.read(1)
     if not b or b in (b"\x04", b"\x03"):
@@ -49,8 +49,8 @@ while True:
 
 BODY_FRAME_CANCEL_ACK = r'''
 import sys, tty
-sys.stdout.write(FRAME); sys.stdout.flush()
 tty.setraw(0)
+sys.stdout.write(FRAME); sys.stdout.flush()
 while True:
     b = sys.stdin.buffer.read(1)
     if not b or b == b"\x04":
@@ -62,8 +62,8 @@ while True:
 
 BODY_FRAME_CANCEL_OUTCOME = r'''
 import sys, tty
-sys.stdout.write(FRAME); sys.stdout.flush()
 tty.setraw(0)
+sys.stdout.write(FRAME); sys.stdout.flush()
 while True:
     b = sys.stdin.buffer.read(1)
     if not b or b == b"\x04":
@@ -75,8 +75,8 @@ while True:
 
 BODY_FRAME_FOOTER_REDRAW = r'''
 import sys, tty
-sys.stdout.write(FRAME); sys.stdout.flush()
 tty.setraw(0)
+sys.stdout.write(FRAME); sys.stdout.flush()
 while True:
     b = sys.stdin.buffer.read(1)
     if not b or b == b"\x04":
@@ -87,8 +87,8 @@ while True:
 
 BODY_FRAME_ECHO = r'''
 import sys, tty
-sys.stdout.write(FRAME); sys.stdout.flush()
 tty.setraw(0)
+sys.stdout.write(FRAME); sys.stdout.flush()
 while True:
     b = sys.stdin.buffer.read(1)
     if not b or b in (b"\x04", b"\x03"):
@@ -137,8 +137,8 @@ while True:
 BODY_FRAME_BIG_OUTPUT = r'''
 import sys, tty
 sys.stdout.write("x" * 200000)
-sys.stdout.write(FRAME); sys.stdout.flush()
 tty.setraw(0)
+sys.stdout.write(FRAME); sys.stdout.flush()
 while True:
     b = sys.stdin.buffer.read(1)
     if not b or b in (b"\x04", b"\x03"):
@@ -149,8 +149,8 @@ BODY_FRAME_RSS = r'''
 import sys, tty
 ballast = bytearray(8 << 20)
 ballast[0] = 1
-sys.stdout.write(FRAME); sys.stdout.flush()
 tty.setraw(0)
+sys.stdout.write(FRAME); sys.stdout.flush()
 while True:
     b = sys.stdin.buffer.read(1)
     if not b or b in (b"\x04", b"\x03"):
