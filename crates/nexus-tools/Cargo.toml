@@ -1,0 +1,13 @@
+[package]
+name = "nexus-tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Core domain types plus the synchronous tool port. Behavior (lifecycle,
+# policy, events) stays in nexus-runtime; this crate only executes admitted
+# calls against the real filesystem inside one rooted jail.
+nexus-core = { path = "../nexus-core" }
+# JSON for reading the admitted `{"path": ...}` arguments. No schema
+# framework is added here; schemas are validated at registration.
+serde_json = "1"
