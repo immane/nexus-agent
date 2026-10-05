@@ -46,6 +46,7 @@ use nexus_core::{
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
+use nexus_tools::ScopedReader;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -56,6 +57,21 @@ use crate::json;
 const SSE_IDLE: Duration = Duration::from_secs(15);
 /// Default execution profile for web-submitted tasks.
 const WEB_PROFILE: &str = "web-test";
+
+/// Tool wiring for demo sessions. Fakes are the default: nothing touches
+/// the real filesystem. `RealFiles` executes `host_read` against the real
+/// filesystem jailed to `root` (mutations stay fake); the root is
+/// canonicalized and validated up front and per session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolsMode {
+    /// Scripted doubles only; the default.
+    Fakes,
+    /// Real jailed reads rooted here; writes stay scripted.
+    RealFiles {
+        /// Canonical jail root.
+        root: std::path::PathBuf,
+    },
+}
 
 /// Test-only demo provider: serves a fresh scripted demo script for every
 /// run. The shared [`FakeProvider`] consumes its script queue across calls,
@@ -147,14 +163,19 @@ pub struct Server {
     /// consumed by that run's SSE terminal event, so the map holds at most
     /// the runs that were accepted but never streamed to a terminal.
     run_models: Mutex<HashMap<String, String>>,
+    /// Tool wiring for sessions created after the call. Startup-only: set
+    /// before serving, alongside [`Server::set_config`].
+    tools_mode: ToolsMode,
 }
 
 impl Server {
     /// Creates shared state around the Tokio handle used for `block_on`.
     ///
-    /// The server starts with [`UserConfig::default_config`] and no
-    /// configuration path. Call [`Server::set_config`] before serving to
-    /// enable submit selection, favourites, and persisted recents.
+    /// The server starts with [`UserConfig::default_config`], no
+    /// configuration path, and scripted fake tools. Call
+    /// [`Server::set_config`] and [`Server::set_tools_mode`] before serving
+    /// to enable submit selection, favourites, persisted recents, and real
+    /// jailed reads.
     #[must_use]
     pub fn new(handle: tokio::runtime::Handle) -> Self {
         Self {
@@ -164,7 +185,19 @@ impl Server {
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             run_models: Mutex::new(HashMap::new()),
+            tools_mode: ToolsMode::Fakes,
         }
+    }
+
+    /// Installs the tool wiring for sessions created after this call.
+    /// Real roots are validated eagerly so an unreadable jail fails at
+    /// startup, never at the first submit.
+    pub fn set_tools_mode(&mut self, mode: ToolsMode) -> Result<(), nexus_core::AgentError> {
+        if let ToolsMode::RealFiles { root } = &mode {
+            ScopedReader::with_root(root)?;
+        }
+        self.tools_mode = mode;
+        Ok(())
     }
 
     /// Installs the user configuration and the file it is saved to.
@@ -189,10 +222,16 @@ impl Server {
             has_approval_handler: true,
         };
         let provider = Arc::new(PerRunProvider::new());
-        let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = vec![
-            Arc::new(FakeTool::read_only()),
-            Arc::new(FakeTool::mutation()),
-        ];
+        let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = match &self.tools_mode {
+            ToolsMode::Fakes => vec![
+                Arc::new(FakeTool::read_only()),
+                Arc::new(FakeTool::mutation()),
+            ],
+            ToolsMode::RealFiles { root } => vec![
+                Arc::new(ScopedReader::with_root(root)?),
+                Arc::new(FakeTool::mutation()),
+            ],
+        };
         let (runtime, streams): (Runtime, EventStreams) =
             Runtime::try_new(config, provider, tools)?;
         let entry = Arc::new(Session {

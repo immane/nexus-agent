@@ -15,6 +15,9 @@ nexus-runtime = { path = "../nexus-runtime" }
 nexus-config = { path = "../nexus-config" }
 # Scripted doubles for the test-only demo wiring (no real providers).
 nexus-fakes = { path = "../nexus-fakes" }
+# Real root-jailed file reader for opt-in `--tools real` sessions.
+# Mutations stay scripted; reads that escape the jail are denied.
+nexus-tools = { path = "../nexus-tools" }
 # JSON for the HTTP API only: request parsing and event/snapshot encoding.
 # No HTTP framework is used; the transport is hand-rolled std I/O.
 serde_json = "1"

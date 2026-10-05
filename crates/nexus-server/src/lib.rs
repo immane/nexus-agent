@@ -73,6 +73,9 @@
 //! `time`, `sync`, `macros`); sockets stay plain blocking `std::net` I/O,
 //! so there is intentionally no `net`/`io-util` async I/O and no HTTP
 //! framework. `nexus-fakes` supplies the test-only demo wiring.
+//! `nexus-tools` supplies the opt-in real root-jailed file reader:
+//! `--tools real` executes `host_read` against `--tools-root` (default:
+//! the working directory) while mutations stay scripted.
 //! `nexus-config` owns the configuration document, its strict parse, its
 //! atomic save, and credential *references*; the server resolves a
 //! reference at submit time and never handles the value beyond that
@@ -84,4 +87,4 @@ pub mod http;
 pub mod json;
 pub mod server;
 
-pub use server::{Server, Session};
+pub use server::{Server, Session, ToolsMode};

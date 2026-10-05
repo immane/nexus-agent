@@ -12,23 +12,35 @@ use std::sync::Arc;
 use std::thread;
 
 use nexus_config::{UserConfig, load, resolve_path};
-use nexus_server::Server;
+use nexus_server::{Server, ToolsMode};
 
 /// Default loopback port.
 const DEFAULT_PORT: u16 = 8471;
 
 fn usage() -> ! {
-    eprintln!("usage: nexus-server [--port N] [--config PATH] [--help]");
+    eprintln!(
+        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--help]"
+    );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
+    eprintln!(
+        "  --tools real executes host_read against --tools-root (default: working directory);"
+    );
+    eprintln!("  mutations stay scripted. The default --tools fake touches no real files.");
     std::process::exit(2);
 }
 
 /// CLI outcome: run with a port, or print usage and exit. Splitting the
 /// decision from the exit keeps every rejection path unit-testable.
 enum CliAction {
-    /// Serve on this loopback port with this optional explicit config path.
-    Run { port: u16, config: Option<String> },
+    /// Serve on this loopback port with this optional explicit config path
+    /// and tool wiring.
+    Run {
+        port: u16,
+        config: Option<String>,
+        tools_real: bool,
+        tools_root: Option<String>,
+    },
     /// Print usage and exit 2.
     Usage,
 }
@@ -36,6 +48,8 @@ enum CliAction {
 fn parse_args(argv: &[String]) -> CliAction {
     let mut port = DEFAULT_PORT;
     let mut config: Option<String> = None;
+    let mut tools_real = false;
+    let mut tools_root: Option<String> = None;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,10 +65,24 @@ fn parse_args(argv: &[String]) -> CliAction {
                 Some(value) => config = Some(value.clone()),
                 None => return CliAction::Usage,
             },
+            "--tools" => match args.next().map(String::as_str) {
+                Some("real") => tools_real = true,
+                Some("fake") => tools_real = false,
+                _ => return CliAction::Usage,
+            },
+            "--tools-root" => match args.next() {
+                Some(value) => tools_root = Some(value.clone()),
+                None => return CliAction::Usage,
+            },
             _ => return CliAction::Usage,
         }
     }
-    CliAction::Run { port, config }
+    CliAction::Run {
+        port,
+        config,
+        tools_real,
+        tools_root,
+    }
 }
 
 /// Loads the user configuration at startup.
@@ -87,18 +115,20 @@ fn load_user_config(explicit: Option<&str>) -> (UserConfig, Option<PathBuf>) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let (port, explicit) = match parse_args(&argv) {
-        CliAction::Run { port, config } => (port, config),
+    let (port, explicit_config, tools_real, tools_root) = match parse_args(&argv) {
+        CliAction::Run {
+            port,
+            config,
+            tools_real,
+            tools_root,
+        } => (port, config, tools_real, tools_root),
         CliAction::Usage => usage(),
     };
-    let (config, path) = load_user_config(explicit.as_deref());
+    let (config, path) = load_user_config(explicit_config.as_deref());
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
         eprintln!("nexus-server: cannot bind 127.0.0.1:{port} ({error})");
         std::process::exit(1);
     });
-    eprintln!(
-        "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (scripted fakes, no auth; never expose)"
-    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_time()
         .build()
@@ -108,6 +138,25 @@ fn main() {
         });
     let mut server = Server::new(runtime.handle().clone());
     server.set_config(config, path);
+    if tools_real {
+        // Fail fast on an unreadable jail: a missing default working
+        // directory and an explicit bad root are both startup errors.
+        let root = tools_root.unwrap_or_else(|| ".".to_owned());
+        let mode = ToolsMode::RealFiles {
+            root: std::path::PathBuf::from(&root),
+        };
+        if let Err(error) = server.set_tools_mode(mode) {
+            eprintln!("nexus-server: real tool root is unusable ({error}): {root}");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (real jailed reads at {root}, writes scripted, no auth; never expose)"
+        );
+    } else {
+        eprintln!(
+            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (scripted fakes, no auth; never expose)"
+        );
+    }
     let server = Arc::new(server);
     for stream in listener.incoming() {
         match stream {
@@ -146,9 +195,14 @@ mod cov_main_args {
     }
 
     /// Unwraps the `Run` variant, asserting the branch was taken.
-    fn run(args: &[&str]) -> (u16, Option<String>) {
+    fn run(args: &[&str]) -> (u16, Option<String>, bool, Option<String>) {
         match parse_args(&argv(args)) {
-            CliAction::Run { port, config } => (port, config),
+            CliAction::Run {
+                port,
+                config,
+                tools_real,
+                tools_root,
+            } => (port, config, tools_real, tools_root),
             CliAction::Usage => panic!("expected a run action for {args:?}"),
         }
     }
@@ -161,6 +215,12 @@ mod cov_main_args {
     /// The explicit `--config` value of a `Run` variant.
     fn config(args: &[&str]) -> Option<String> {
         run(args).1
+    }
+
+    /// The tool wiring of a `Run` variant: real reads plus optional root.
+    fn tools(args: &[&str]) -> (bool, Option<String>) {
+        let parsed = run(args);
+        (parsed.2, parsed.3)
     }
 
     /// Asserts the parser rejects the flags with usage.
@@ -278,16 +338,50 @@ mod cov_main_args {
     }
 
     /// Both flags may be combined in either order; neither consumes the
-    /// other's value, so the two spellings must be equivalent.
+    /// other's value, so the two spellings must be equivalent. Tool flags
+    /// default to scripted fakes with no root.
     #[test]
     fn port_and_config_flags_combine_independently() {
         assert_eq!(
             run(&["--port", "9401", "--config", "/tmp/c.json"]),
-            (9401, Some("/tmp/c.json".to_owned()))
+            (9401, Some("/tmp/c.json".to_owned()), false, None)
         );
         assert_eq!(
             run(&["--config", "/tmp/c.json", "--port", "9401"]),
-            (9401, Some("/tmp/c.json".to_owned()))
+            (9401, Some("/tmp/c.json".to_owned()), false, None)
         );
+    }
+
+    /// `--tools` selects the executor with no root by default; `fake` is
+    /// explicit and equivalent to omitting the flag.
+    #[test]
+    fn tools_flag_selects_fake_by_default_and_real_on_request() {
+        assert_eq!(tools(&[]), (false, None));
+        assert_eq!(tools(&["--tools", "fake"]), (false, None));
+        assert_eq!(tools(&["--tools", "real"]), (true, None));
+    }
+
+    /// `--tools-root` names the jail explicitly and combines with `--tools
+    /// real`; anything else is usage, never a silent default.
+    #[test]
+    fn tools_root_names_the_jail_explicitly() {
+        assert_eq!(
+            tools(&["--tools", "real", "--tools-root", "/srv/root"]),
+            (true, Some("/srv/root".to_owned()))
+        );
+        assert_eq!(
+            tools(&["--tools-root", "/srv/root", "--tools", "real"]),
+            (true, Some("/srv/root".to_owned()))
+        );
+    }
+
+    /// Unknown tool names and a missing root value are usage errors: the
+    /// server must not guess an executor.
+    #[test]
+    fn unknown_tools_or_missing_roots_are_usage() {
+        usage(&["--tools"]);
+        usage(&["--tools", "shell"]);
+        usage(&["--tools", ""]);
+        usage(&["--tools-root"]);
     }
 }

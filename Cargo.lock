@@ -250,8 +250,17 @@ dependencies = [
  "nexus-core",
  "nexus-fakes",
  "nexus-runtime",
+ "nexus-tools",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "nexus-tools"
+version = "0.1.0"
+dependencies = [
+ "nexus-core",
+ "serde_json",
 ]
 
 [[package]]
