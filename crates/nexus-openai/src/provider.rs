@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{CredentialRef, ProviderProfile};
 use nexus_core::{
-    AgentError, CallCandidate, ErrorCategory, FinishReason, ModelContextItem, ModelRequest,
-    ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RetryGuidance,
-    TurnFinished, Usage, UsageFinality,
+    AgentError, CallCandidate, CorrelationData, ErrorCategory, FinishReason, ModelContextItem,
+    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort,
+    RetryGuidance, TurnFinished, Usage, UsageFinality,
 };
 use serde_json::{Value, json};
 
@@ -35,6 +35,44 @@ fn provider_error(category: ErrorCategory, message: &'static str) -> ProviderEve
     ProviderEvent::Failed(
         AgentError::new(category, message, RetryGuidance::DoNotRetry)
             .expect("static safe provider message builds"),
+    )
+}
+
+/// Splits a non-2xx status into its typed class and static fallback.
+/// Classes stay value-free; the split exists so a rejected request body
+/// (ours to fix), a billing refusal (theirs to top up), and a server
+/// outage point in different directions instead of merging into one
+/// undifferentiated failure.
+fn status_class(status: u16) -> (ErrorCategory, &'static str) {
+    (
+        match status {
+            401 | 403 => ErrorCategory::Authentication,
+            402 => ErrorCategory::PermissionDenied,
+            400 | 422 => ErrorCategory::InvalidInput,
+            429 => ErrorCategory::RateLimited,
+            _ => ErrorCategory::Protocol,
+        },
+        match status {
+            401 | 403 => "provider credentials were rejected",
+            402 => "provider payment is required",
+            400 | 422 => "provider request was rejected",
+            429 => "provider rate limit reached",
+            _ => "provider request failed",
+        },
+    )
+}
+
+/// Vendor bodies can echo prompts, paths, or credentials without any secret
+/// marker. Only the status classification crosses the diagnostic boundary.
+fn status_error(status: u16) -> ProviderEvent {
+    let (category, fallback) = status_class(status);
+    let mut correlation = CorrelationData::new();
+    correlation
+        .push("http_status", status.to_string())
+        .expect("numeric status is safe");
+    ProviderEvent::Failed(
+        AgentError::with_correlation(category, fallback, correlation, RetryGuidance::DoNotRetry)
+            .expect("static status diagnostic is safe"),
     )
 }
 
@@ -207,7 +245,8 @@ impl OpenAiProvider {
     /// SSE wire is parsed incrementally for cancellation responsiveness and
     /// aggregated into one validated batch (see [`ProviderPort::stream`]).
     fn request_body(&self, request: &ModelRequest) -> Result<Value, ProviderEvent> {
-        let messages: Vec<Value> = request.conversation().iter().map(message_json).collect();
+        validate_conversation(request.conversation())?;
+        let messages: Vec<Value> = conversation_messages(request.conversation());
         let mut tools: Vec<Value> = Vec::new();
         for spec in request.tool_definitions() {
             let schema: Value = serde_json::from_str(spec.input_schema_json()).map_err(|_| {
@@ -579,14 +618,7 @@ fn stream_response(
         }
     };
     if !(200..300).contains(&status) {
-        return vec![provider_error(
-            match status {
-                401 | 403 => ErrorCategory::Authentication,
-                429 => ErrorCategory::RateLimited,
-                _ => ErrorCategory::Protocol,
-            },
-            "provider request failed",
-        )];
+        return vec![status_error(status)];
     }
     if !head.to_ascii_lowercase().contains("text/event-stream") {
         let mut body = body_start;
@@ -645,6 +677,9 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 #[derive(Default)]
 struct SseAccum {
     text: String,
+    /// Thinking trace to echo on later turns. Withheld from the provisional
+    /// sink: it is recorded for the batch only, never presented.
+    reasoning: String,
     fragments: BTreeMap<u64, SseCall>,
     reason: String,
     input: Option<u64>,
@@ -693,6 +728,12 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
     else {
         return Ok(applied);
     };
+    if !acc.reason.is_empty() {
+        return Err(vec![provider_error(
+            ErrorCategory::Protocol,
+            "provider choice follows its finish reason",
+        )]);
+    }
     if let Some(next) = choice.get("finish_reason").and_then(Value::as_str)
         && !next.is_empty()
     {
@@ -705,12 +746,19 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
         acc.text.push_str(fragment);
         applied.content.push_str(fragment);
     }
+    // Thinking-mode trace. Accumulated for echo on later turns; unlike
+    // text it never reaches the provisional sink.
+    if let Some(trace) = delta.get("reasoning_content").and_then(Value::as_str) {
+        acc.reasoning.push_str(trace);
+    }
     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-        for (position, call) in calls.iter().enumerate() {
-            let index = call
-                .get("index")
-                .and_then(Value::as_u64)
-                .unwrap_or(position as u64);
+        for call in calls {
+            let index = call.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                vec![provider_error(
+                    ErrorCategory::Protocol,
+                    "provider tool fragment is missing its index",
+                )]
+            })?;
             let entry = acc.fragments.entry(index).or_default();
             if let Some(id) = call.get("id").and_then(Value::as_str) {
                 entry.id.push_str(id);
@@ -725,7 +773,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
                     Some(_) => {
                         return Err(vec![provider_error(
                             ErrorCategory::Protocol,
-                            "provider reply is not valid JSON",
+                            "provider reply tool call arguments are invalid",
                         )]);
                     }
                 }
@@ -736,10 +784,11 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
 }
 
 /// Builds the authoritative batch from aggregated SSE state: at most one
-/// text delta at `item-0`, calls numbered from `item-1`, then exactly one
-/// terminal.
+/// text delta at `item-0`, the withheld thinking trace (when the vendor
+/// sent one), calls numbered from `item-1`, then exactly one terminal.
 fn finalize_sse(acc: &SseAccum) -> Vec<ProviderEvent> {
     if acc.text.len()
+        + acc.reasoning.len()
         + acc
             .fragments
             .values()
@@ -759,9 +808,29 @@ fn finalize_sse(acc: &SseAccum) -> Vec<ProviderEvent> {
             text: acc.text.clone(),
         });
     }
+    if !acc.reasoning.is_empty() {
+        events.push(ProviderEvent::ReasoningDelta {
+            text: acc.reasoning.clone(),
+        });
+    }
     let mut ready = Vec::new();
     for (position, (_, call)) in acc.fragments.iter().enumerate() {
         let item_key = format!("item-{}", position + 1);
+        // Shape-only triage before identity validation: an empty id or name
+        // means fragments never arrived, which is a different vendor shape
+        // problem than a malformed identifier. No values are echoed.
+        if call.id.is_empty() {
+            return vec![provider_error(
+                ErrorCategory::Protocol,
+                "provider reply tool call is missing an id",
+            )];
+        }
+        if call.name.is_empty() {
+            return vec![provider_error(
+                ErrorCategory::Protocol,
+                "provider reply tool call is missing a name",
+            )];
+        }
         match CallCandidate::new(
             item_key,
             call.id.clone(),
@@ -872,6 +941,7 @@ impl SseLive {
                 )));
             }
             if self.acc.text.len()
+                + self.acc.reasoning.len()
                 + self
                     .acc
                     .fragments
@@ -1052,30 +1122,239 @@ fn join_host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// Groups one turn's assistant items into a single assistant message.
+/// The runtime records text and calls as separate items, but vendors
+/// validate pairing per message: an assistant message carrying
+/// `tool_calls` must be followed by the tool responses for those ids
+/// before any other assistant message. Emitting one call per message
+/// (`assistant, assistant, tool, tool`) fails that check as soon as a
+/// turn carries more than one call; merging keeps the standard shape
+/// (`assistant, tool, tool`) with identical content. Only consecutive
+/// assistant items merge, so tool results (and turn boundaries they mark)
+/// are never crossed. Text fragments join with a newline; the first
+/// thinking trace wins (a turn carries at most one).
+fn conversation_messages(conversation: &[ModelContextItem]) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut pending: Vec<Value> = Vec::new();
+    for item in conversation {
+        match item {
+            ModelContextItem::AssistantText { .. }
+            | ModelContextItem::AssistantCall { .. }
+            | ModelContextItem::AssistantDeniedCall { .. }
+            | ModelContextItem::AssistantReasoning { .. } => {
+                pending.push(message_json(item));
+            }
+            _ => {
+                if let Some(merged) = merge_assistant(std::mem::take(&mut pending)) {
+                    messages.push(merged);
+                }
+                messages.push(message_json(item));
+            }
+        }
+    }
+    if let Some(merged) = merge_assistant(pending) {
+        messages.push(merged);
+    }
+    messages
+}
+
+/// Validate pairing before opening a connection, including host identities
+/// that are intentionally absent from the vendor wire representation.
+fn validate_conversation(conversation: &[ModelContextItem]) -> Result<(), ProviderEvent> {
+    let invalid = || {
+        provider_error(
+            ErrorCategory::Protocol,
+            "model conversation has invalid tool response ordering",
+        )
+    };
+    let mut pending = BTreeMap::new();
+    let mut responding = false;
+    let mut trace = None;
+    for item in conversation {
+        match item {
+            ModelContextItem::UserText(_) | ModelContextItem::ToolResult { .. } => trace = None,
+            _ => {
+                if let Some(next) = item.reasoning() {
+                    if trace.is_some_and(|previous| previous != next) {
+                        return Err(provider_error(
+                            ErrorCategory::Protocol,
+                            "model assistant group has conflicting reasoning traces",
+                        ));
+                    }
+                    trace = Some(next);
+                }
+            }
+        }
+        match item {
+            ModelContextItem::AssistantCall {
+                item_key,
+                provider_ref,
+                call,
+                ..
+            } => {
+                if responding
+                    || pending
+                        .insert(
+                            provider_ref.as_str(),
+                            (call.call(), item_key.as_str(), call.tool().name()),
+                        )
+                        .is_some()
+                {
+                    return Err(invalid());
+                }
+            }
+            ModelContextItem::AssistantDeniedCall {
+                call, candidate, ..
+            } => {
+                if responding
+                    || pending
+                        .insert(
+                            candidate.provider_ref(),
+                            (call, candidate.item_key(), candidate.tool_name()),
+                        )
+                        .is_some()
+                {
+                    return Err(invalid());
+                }
+            }
+            ModelContextItem::ToolResult {
+                call,
+                item_key,
+                provider_ref,
+                tool,
+                ..
+            } => {
+                if pending.remove(provider_ref.as_str())
+                    != Some((call, item_key.as_str(), tool.name()))
+                {
+                    return Err(invalid());
+                }
+                responding = !pending.is_empty();
+            }
+            ModelContextItem::UserText(_) => {
+                if !pending.is_empty() {
+                    return Err(invalid());
+                }
+                responding = false;
+            }
+            ModelContextItem::AssistantText { .. }
+            | ModelContextItem::AssistantReasoning { .. } => {
+                if responding {
+                    return Err(invalid());
+                }
+                responding = false;
+            }
+        }
+    }
+    if !pending.is_empty() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Merges rendered assistant messages into one: concatenated text content
+/// (null when no text), concatenated `tool_calls` in order, first thinking
+/// trace. A single message renders byte-identical to its input.
+fn merge_assistant(rendered: Vec<Value>) -> Option<Value> {
+    if rendered.is_empty() {
+        return None;
+    }
+    if rendered.len() == 1 {
+        return rendered.into_iter().next();
+    }
+    let mut texts = Vec::new();
+    let mut calls = Vec::new();
+    let mut reasoning = None;
+    for message in &rendered {
+        if let Some(Value::String(text)) = message.get("content") {
+            texts.push(text.clone());
+        }
+        if let Some(chunk) = message.get("tool_calls").and_then(Value::as_array) {
+            calls.extend(chunk.iter().cloned());
+        }
+        if reasoning.is_none() {
+            reasoning = message
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    let mut merged = serde_json::Map::new();
+    merged.insert("role".to_owned(), Value::String("assistant".to_owned()));
+    merged.insert(
+        "content".to_owned(),
+        if texts.is_empty() {
+            Value::Null
+        } else {
+            Value::String(texts.join("\n"))
+        },
+    );
+    if let Some(trace) = reasoning {
+        merged.insert("reasoning_content".to_owned(), Value::String(trace));
+    }
+    if !calls.is_empty() {
+        merged.insert("tool_calls".to_owned(), Value::Array(calls));
+    }
+    Some(Value::Object(merged))
+}
+
 /// Encodes one conversation item as a Chat Completions message. Provider
 /// round-trip refs ride the tool-call ids; text item keys stay local.
+/// Turn-level grouping happens in [`conversation_messages`]; this renders
+/// single items (and the per-item unit tests pin these shapes).
 fn message_json(item: &ModelContextItem) -> Value {
     match item {
+        ModelContextItem::AssistantReasoning { reasoning } => {
+            json!({"role":"assistant","content":Value::Null,"reasoning_content":reasoning})
+        }
+        ModelContextItem::AssistantDeniedCall {
+            candidate,
+            reasoning,
+            ..
+        } => {
+            let mut message = json!({"role":"assistant", "content":Value::Null,
+                "tool_calls":[{"id":candidate.provider_ref(),"type":"function",
+                    "function":{"name":candidate.tool_name(),"arguments":candidate.arguments_json()}}]});
+            if let Some(trace) = reasoning {
+                message["reasoning_content"] = Value::String(trace.clone());
+            }
+            message
+        }
         ModelContextItem::UserText(text) => {
             json!({ "role": "user", "content": text.as_str() })
         }
-        ModelContextItem::AssistantText { text, .. } => {
-            json!({ "role": "assistant", "content": text.as_str() })
+        ModelContextItem::AssistantText {
+            text, reasoning, ..
+        } => {
+            let mut message = json!({ "role": "assistant", "content": text.as_str() });
+            if let Some(trace) = reasoning {
+                message["reasoning_content"] = Value::String(trace.clone());
+            }
+            message
         }
         ModelContextItem::AssistantCall {
-            provider_ref, call, ..
-        } => json!({
-            "role": "assistant",
-            "content": Value::Null,
-            "tool_calls": [{
-                "id": provider_ref.as_str(),
-                "type": "function",
-                "function": {
-                    "name": call.tool().name(),
-                    "arguments": call.args().as_str(),
-                },
-            }],
-        }),
+            provider_ref,
+            call,
+            reasoning,
+            ..
+        } => {
+            let mut message = json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": provider_ref.as_str(),
+                    "type": "function",
+                    "function": {
+                        "name": call.tool().name(),
+                        "arguments": call.args().as_str(),
+                    },
+                }],
+            });
+            if let Some(trace) = reasoning {
+                message["reasoning_content"] = Value::String(trace.clone());
+            }
+            message
+        }
         ModelContextItem::ToolResult {
             provider_ref,
             outcome,
@@ -1096,14 +1375,7 @@ fn message_json(item: &ModelContextItem) -> Value {
 /// reply is still accepted for servers that ignore the flag.
 fn events_for(status: u16, head: &str, body: &[u8]) -> Vec<ProviderEvent> {
     if !(200..300).contains(&status) {
-        return vec![provider_error(
-            match status {
-                401 | 403 => ErrorCategory::Authentication,
-                429 => ErrorCategory::RateLimited,
-                _ => ErrorCategory::Protocol,
-            },
-            "provider request failed",
-        )];
+        return vec![status_error(status)];
     }
     if is_sse(head, body) {
         return events_for_sse(body);
@@ -1238,33 +1510,43 @@ fn events_for_json(body: &[u8]) -> Vec<ProviderEvent> {
             text: text.to_owned(),
         });
     }
+    if let Some(trace) = message.get("reasoning_content").and_then(Value::as_str)
+        && !trace.is_empty()
+    {
+        events.push(ProviderEvent::ReasoningDelta {
+            text: trace.to_owned(),
+        });
+    }
     let calls: Vec<(String, String, String)> = match message.get("tool_calls") {
         None => Vec::new(),
         Some(Value::Array(calls)) => {
             let mut parsed = Vec::with_capacity(calls.len());
             for call in calls {
+                // Each check reports which shape failed so a vendor deviation
+                // points at its field. Diagnostics are static: no values,
+                // keys, or fragments are echoed.
                 let Some(id) = call.get("id").and_then(Value::as_str) else {
                     return vec![provider_error(
                         ErrorCategory::InvalidInput,
-                        "provider reply tool calls are invalid",
+                        "provider reply tool call is missing an id",
                     )];
                 };
                 let Some(function) = call.get("function") else {
                     return vec![provider_error(
                         ErrorCategory::InvalidInput,
-                        "provider reply tool calls are invalid",
+                        "provider reply tool call is missing a function",
                     )];
                 };
                 let Some(name) = function.get("name").and_then(Value::as_str) else {
                     return vec![provider_error(
                         ErrorCategory::InvalidInput,
-                        "provider reply tool calls are invalid",
+                        "provider reply tool call name is invalid",
                     )];
                 };
                 let Some(arguments) = function.get("arguments").and_then(Value::as_str) else {
                     return vec![provider_error(
                         ErrorCategory::InvalidInput,
-                        "provider reply tool calls are invalid",
+                        "provider reply tool call arguments are invalid",
                     )];
                 };
                 parsed.push((id.to_owned(), name.to_owned(), arguments.to_owned()));

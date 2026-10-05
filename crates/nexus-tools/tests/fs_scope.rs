@@ -276,6 +276,20 @@ fn non_utf8_content_fails_without_mangling() {
 }
 
 #[test]
+fn bounded_read_cut_inside_utf8_preserves_text_and_truncation() {
+    let root = TempRoot::new();
+    let cap = Limits::M0_TEST_TOOL_OUTPUT_BYTES;
+    let mut text = "x".repeat(cap - 1);
+    text.push_str("中文");
+    root.file("big-utf8.txt", text.as_bytes());
+    let outcome =
+        reader_for(&root).execute(&call(r#"{"path":"big-utf8.txt"}"#), &context(cap, false));
+    assert_eq!(outcome.status(), ExecutionStatus::Succeeded);
+    assert!(outcome.is_truncated());
+    assert_eq!(outcome.content(), "x".repeat(cap - 1));
+}
+
+#[test]
 fn directories_are_not_readable_content() {
     let root = TempRoot::new();
     std::fs::create_dir_all(root.0.join("dir")).expect("dir builds");

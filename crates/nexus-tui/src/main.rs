@@ -39,14 +39,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyEvent, KeyEventKind, poll, read};
-use nexus_config::{UserConfig, load as load_config, resolve_path, save as save_config};
+use nexus_config::{
+    UserConfig, load as load_config, resolve_path, resolve_with, save as save_config,
+};
 use nexus_core::{
-    ApprovalNotice, CommandReply, CommandResponse, EventPayload, Limits, ModelRequest,
-    ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunEvent, RunId,
-    SessionId,
+    AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload, Limits,
+    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
+    RetryGuidance, RunEvent, RunId, SessionId,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
+use nexus_openai::OpenAiProvider;
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
+use nexus_tools::{ScopedReader, ScopedWriter};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
     Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, cancel_command,
@@ -110,6 +114,10 @@ struct SessionConfig {
     config: UserConfig,
     path: Option<std::path::PathBuf>,
     active_model: Option<String>,
+    /// Jail for real file reads/writes, from `--tools-root`. `None` keeps every
+    /// tool scripted. Cloned with the template so every slot shares the
+    /// startup wiring while keeping its own runtime and selection.
+    tools_root: Option<std::path::PathBuf>,
 }
 
 /// Loads the user configuration for both the interactive and the headless
@@ -121,7 +129,13 @@ struct SessionConfig {
 /// would hide a broken document and then overwrite it on the first terminal
 /// outcome, destroying the user's actual settings.
 fn load_session_config() -> io::Result<SessionConfig> {
-    session_config_at(resolve_path(None))
+    let tools_root = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
+        StartupAction::Run(args) => args.tools_root,
+        StartupAction::Usage => startup_usage(),
+    };
+    let mut session = session_config_at(resolve_path(None))?;
+    session.tools_root = tools_root;
+    Ok(session)
 }
 
 /// Same contract as [`load_session_config`] with the resolved path supplied
@@ -146,6 +160,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
         config,
         path,
         active_model,
+        tools_root: None,
     })
 }
 
@@ -177,6 +192,129 @@ fn boot_model(config: &UserConfig) -> Option<String> {
         .or_else(|| config.favourites().first())
         .or_else(|| config.models().first().map(|entry| &entry.id))
         .cloned()
+}
+
+/// Startup arguments. The TUI takes no `--config` flag (see
+/// [`SessionConfig`]); the only flag names the jail real file reads and
+/// writes are confined to. Absent, every tool stays scripted: exactly the
+/// historical demo wiring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupArgs {
+    /// Jail for real file reads and writes. `None` keeps every tool
+    /// scripted. Writes always need an approval grant, even when real.
+    tools_root: Option<std::path::PathBuf>,
+}
+
+/// Argument-parser outcome: run with the parsed jail, or print usage.
+enum StartupAction {
+    /// Serve the TUI with this optional real-files jail.
+    Run(StartupArgs),
+    /// Print usage and exit 2.
+    Usage,
+}
+
+/// Parses the process arguments. Only `--tools-root PATH` and
+/// `--help`/`-h` are recognized: anything else (including a bare word,
+/// which the historical parser ignored) is usage, never a silent boot
+/// into scripted mode on a mistyped flag.
+fn parse_startup_args(argv: &[String]) -> StartupAction {
+    let mut tools_root: Option<std::path::PathBuf> = None;
+    let mut args = argv.iter().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return StartupAction::Usage,
+            "--tools-root" => match args.next() {
+                Some(value) if !value.is_empty() => {
+                    tools_root = Some(std::path::PathBuf::from(value));
+                }
+                _ => return StartupAction::Usage,
+            },
+            _ => return StartupAction::Usage,
+        }
+    }
+    StartupAction::Run(StartupArgs { tools_root })
+}
+
+/// Prints usage and exits 2. Splitting the exit from the parser keeps
+/// every rejection path unit-testable.
+fn startup_usage() -> ! {
+    eprintln!("usage: nexus-tui [--tools-root PATH] [--help]");
+    eprintln!("  Without --tools-root every tool is scripted (demo wiring).");
+    eprintln!(
+        "  With it, host_read and host_write execute against PATH (jailed); writes still need approval."
+    );
+    std::process::exit(2);
+}
+
+/// Provider selection for one slot, shared by its frontend and its
+/// runtime. Cloned into the provider at slot creation and refreshed on
+/// every model switch, so cycling models applies to the next run without
+/// a restart. The credential itself is never stored here: it is looked
+/// up from this process's inherited environment on each run.
+#[derive(Debug, Clone)]
+struct LiveSelection {
+    config: UserConfig,
+    active_model: Option<String>,
+}
+
+/// Shared handle between a slot's [`Frontend`] and its provider.
+type LiveHandle = Arc<Mutex<LiveSelection>>;
+
+/// Per-run resolution outcome. `Demo` (nothing selected) keeps the
+/// historic scripted script; `Failed` carries a static diagnostic for a
+/// selection that exists but is unusable, so a missing credential is an
+/// explicit terminal error instead of a silent fake run.
+enum LiveResolve {
+    Demo,
+    Live(OpenAiProvider),
+    Failed(ErrorCategory, &'static str),
+}
+
+/// Resolves the active model to a live adapter through an injected
+/// credential lookup, so the missing/empty contract is testable without
+/// touching the process environment. Values never enter the diagnostic.
+fn resolve_live_adapter(
+    selection: &LiveSelection,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> LiveResolve {
+    let Some(model_id) = selection.active_model.as_deref() else {
+        return LiveResolve::Demo;
+    };
+    let Some(entry) = selection.config.model(model_id) else {
+        return LiveResolve::Failed(ErrorCategory::InvalidInput, "selected model is unknown");
+    };
+    let Some(profile) = selection.config.provider(&entry.provider) else {
+        return LiveResolve::Failed(ErrorCategory::InvalidInput, "selected provider is unknown");
+    };
+    if resolve_with(&profile.credential, lookup).is_err() {
+        return LiveResolve::Failed(
+            ErrorCategory::Authentication,
+            "provider credential is unavailable",
+        );
+    }
+    match OpenAiProvider::from_profile(profile, &entry.name) {
+        Ok(adapter) => LiveResolve::Live(adapter),
+        Err(_) => LiveResolve::Failed(ErrorCategory::InvalidInput, "selected provider is invalid"),
+    }
+}
+
+/// Reads a credential value from the process environment. Empty values
+/// count as missing; the value itself never enters a diagnostic.
+fn env_credential(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|value| !value.is_empty())
+}
+
+/// Terminal provider failure with a static diagnostic. A missing
+/// credential is retryable after updating it and restarting; an
+/// invalid selection is not.
+fn live_failure(category: ErrorCategory, message: &'static str) -> ProviderEvent {
+    let retry = match category {
+        ErrorCategory::Authentication => RetryGuidance::SafeToRetry,
+        _ => RetryGuidance::DoNotRetry,
+    };
+    ProviderEvent::Failed(
+        AgentError::new(category, message, retry).expect("static safe provider message builds"),
+    )
 }
 
 /// One conversation slot: an owned runtime, its unconsumed event streams,
@@ -245,15 +383,14 @@ impl SessionRegistry {
     /// the registry untouched and reports the error instead.
     fn create(&mut self) -> io::Result<usize> {
         let number = self.slots.len() + 1;
-        let (runtime, streams) = build_runtime()?;
+        let (runtime, streams, live) = build_live_runtime(&self.template)?;
         let session =
             SessionId::new(format!("{DEMO_SESSION}-{number}")).map_err(io::Error::other)?;
         let mut front = Frontend::with_config(session, self.template.clone());
         let label = format!("s{number}");
         front.state.set_session_label(&label);
-        front
-            .state
-            .notice(&format!("session {label} started (local demo runtime)"));
+        front.state.notice(&format!("session {label} started"));
+        front.attach_live(live, self.template.tools_root.as_deref());
         self.slots.push(SessionSlot {
             label,
             runtime,
@@ -298,29 +435,59 @@ impl SessionRegistry {
     }
 }
 
-/// Test-only demo provider: serves a fresh scripted demo script for every
-/// run. The shared [`FakeProvider`] consumes its script queue across calls,
-/// so without a reset the second task in one process would observe an
-/// exhausted script and fail instantly. Resetting per run-id keeps each
-/// demo task replayable; real adapters never replay.
+/// Demo-or-live provider: serves a fresh scripted demo script for every
+/// run while nothing is selected, and the configured OpenAI-compatible
+/// adapter once the slot's selection resolves. The shared [`FakeProvider`]
+/// consumes its script queue across calls, so without a reset the second
+/// task in one process would observe an exhausted script and fail
+/// instantly. Resetting per run-id keeps each demo task replayable; real
+/// adapters never replay.
+///
+/// Resolution happens per run (not per process) from the slot's shared
+/// selection, so model switches apply to the next run. Environment
+/// credentials are inherited at process startup; exporting in another
+/// shell cannot update this process. An unusable selection (missing
+/// credential, invalid endpoint) fails the run with an explicit terminal
+/// error: it never falls back to a silent fake.
 struct PerRunProvider {
     capabilities: ProviderCapabilities,
+    binding: LiveHandle,
     current: Mutex<PerRunState>,
+}
+
+enum ActiveProvider {
+    Fake(FakeProvider),
+    Live(OpenAiProvider),
+    Unavailable(ErrorCategory, &'static str),
 }
 
 struct PerRunState {
     run: Option<RunId>,
-    provider: FakeProvider,
+    provider: ActiveProvider,
 }
 
 impl PerRunProvider {
+    /// Demo-only wiring: the shared selection carries no models, so every
+    /// run serves the scripted demo. Unit tests use this; production uses
+    /// [`PerRunProvider::live`].
     fn new() -> Self {
+        Self::live(Arc::new(Mutex::new(LiveSelection {
+            config: UserConfig::default_config(),
+            active_model: None,
+        })))
+    }
+
+    /// Production wiring over the slot's shared selection.
+    fn live(binding: LiveHandle) -> Self {
+        // Fake and real adapters advertise identical capabilities, so one
+        // static claim covers both resolutions.
         let capabilities = FakeProvider::demo_two_turn().capabilities();
         Self {
             capabilities,
+            binding,
             current: Mutex::new(PerRunState {
                 run: None,
-                provider: FakeProvider::demo_two_turn(),
+                provider: ActiveProvider::Fake(FakeProvider::demo_two_turn()),
             }),
         }
     }
@@ -332,20 +499,137 @@ impl ProviderPort for PerRunProvider {
     }
 
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
+        self.run_turn(request, context, None)
+    }
+
+    fn supports_incremental_streaming(&self) -> bool {
+        // The live path forwards wire deltas; demo providers may replay
+        // their completed prefix, without changing authoritative validation.
+        true
+    }
+
+    fn stream_with_sink(
+        &self,
+        request: &ModelRequest,
+        context: &ProviderContext,
+        sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    ) -> Vec<ProviderEvent> {
+        self.run_turn(request, context, Some(sink))
+    }
+}
+
+impl PerRunProvider {
+    fn run_turn(
+        &self,
+        request: &ModelRequest,
+        context: &ProviderContext,
+        sink: Option<&(dyn Fn(ProviderEvent) + Send + Sync)>,
+    ) -> Vec<ProviderEvent> {
         let mut current = self.current.lock().expect("demo provider lockable");
         if current.run.as_ref() != Some(request.run()) {
             current.run = Some(request.run().clone());
-            current.provider = FakeProvider::demo_two_turn();
+            let selection = self
+                .binding
+                .lock()
+                .expect("live selection lockable")
+                .clone();
+            current.provider = match resolve_live_adapter(&selection, env_credential) {
+                LiveResolve::Demo => ActiveProvider::Fake(FakeProvider::demo_two_turn()),
+                LiveResolve::Live(adapter) => ActiveProvider::Live(adapter),
+                LiveResolve::Failed(category, message) => {
+                    ActiveProvider::Unavailable(category, message)
+                }
+            };
         }
-        current.provider.stream(request, context)
+        match &current.provider {
+            ActiveProvider::Fake(provider) => match sink {
+                Some(sink) => provider.stream_with_sink(request, context, sink),
+                None => provider.stream(request, context),
+            },
+            ActiveProvider::Live(adapter) => match sink {
+                Some(sink) => adapter.stream_with_sink(request, context, sink),
+                None => adapter.stream(request, context),
+            },
+            ActiveProvider::Unavailable(category, message) => {
+                vec![live_failure(*category, message)]
+            }
+        }
     }
+}
+
+/// Production composition over the startup configuration: the provider
+/// resolves per run from the slot's selection (demo script while nothing
+/// is selected, live adapter once it resolves), and file reads/writes are real
+/// and jailed only under an explicit `--tools-root`. Returns the shared
+/// selection handle alongside so the frontend keeps it in sync on model
+/// switches.
+///
+/// A root that cannot be canonicalized or is not a directory is an
+/// explicit startup error, never a silent fallback to scripted reads.
+fn build_live_runtime(
+    session_config: &SessionConfig,
+) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
+    let config = RuntimeConfig {
+        limits: Limits::m0_test(),
+        policy: Policy::m0_test(),
+        has_approval_handler: true,
+    };
+    let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = match &session_config.tools_root {
+        None => vec![
+            Arc::new(FakeTool::read_only()),
+            Arc::new(FakeTool::mutation()),
+        ],
+        Some(root) => {
+            let canonical = std::fs::canonicalize(root).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "tools root is unusable")
+            })?;
+            if !canonical.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tools root is unusable",
+                ));
+            }
+            vec![
+                Arc::new(ScopedReader::with_root(&canonical).map_err(io::Error::other)?),
+                Arc::new(ScopedWriter::with_root(&canonical).map_err(io::Error::other)?),
+            ]
+        }
+    };
+    let binding = Arc::new(Mutex::new(LiveSelection {
+        config: session_config.config.clone(),
+        active_model: session_config.active_model.clone(),
+    }));
+    let provider = Arc::new(PerRunProvider::live(Arc::clone(&binding)));
+    let (runtime, streams) = Runtime::try_new(config, provider, tools).map_err(io::Error::other)?;
+    Ok((runtime, streams, binding))
+}
+
+/// One-line wiring report for the transcript: which provider (if any) the
+/// next run resolves to, and whether file tools are real. Only counts and the
+/// operator's own identities appear; values never do.
+fn wiring_notice(selection: &LiveSelection, tools_root: Option<&std::path::Path>) -> String {
+    let provider = match resolve_live_adapter(selection, env_credential) {
+        LiveResolve::Demo => "demo script".to_owned(),
+        LiveResolve::Live(adapter) => format!("live adapter ({})", adapter.model()),
+        LiveResolve::Failed(_, message) => format!("unavailable ({message})"),
+    };
+    let tools = match tools_root {
+        None => "scripted tools".to_owned(),
+        Some(root) => format!(
+            "real reads/writes at {} (writes require approval)",
+            root.display()
+        ),
+    };
+    format!("wiring: {provider}; {tools}")
 }
 
 fn main() {
     install_panic_hook();
     eprintln!(
-        "nexus-tui M0 TEST-ONLY demo: scripted fakes, ephemeral store, no network, \
-         no credentials, no real provider. Not real configuration."
+        "nexus-tui M0 TEST-ONLY demo: scripted fakes by default, ephemeral store. \
+          A slot whose model resolves to a configured provider with a credential \
+          uses the real adapter (network egress, billable); --tools-root enables \
+           real jailed reads/writes (writes require approval). No durable storage."
     );
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -588,6 +872,11 @@ struct Frontend {
     config_path: Option<std::path::PathBuf>,
     /// Currently selected model id, or `None` when none is configured.
     active_model: Option<String>,
+    /// Shared provider selection for this slot's runtime. `None` in unit
+    /// tests (which use the demo-only wiring); production slots set it
+    /// right after [`Frontend::with_config`] and refresh it on every
+    /// model switch so the next run resolves the new selection.
+    live: Option<LiveHandle>,
     /// Queued `/session` intents in recording order: key handling appends on
     /// the active front, and the loop drains them against the registry after
     /// the batch, where runtimes can be built. At most one push per Enter
@@ -611,6 +900,7 @@ impl Frontend {
             config: UserConfig::default_config(),
             config_path: None,
             active_model: None,
+            live: None,
             pending_session_cmds: Vec::new(),
         }
     }
@@ -629,6 +919,48 @@ impl Frontend {
             front.state.set_project_dir(dir);
         }
         front
+    }
+
+    /// Mirrors the current document and selection into the runtime's shared
+    /// selection, so the next run resolves what the header shows. No-op
+    /// without a production handle (unit tests).
+    fn sync_live_binding(&mut self) {
+        if let Some(binding) = &self.live {
+            *binding.lock().expect("live selection lockable") = LiveSelection {
+                config: self.config.clone(),
+                active_model: self.active_model.clone(),
+            };
+        }
+    }
+
+    /// Attaches the slot's shared selection handle, syncs it, and reports
+    /// the resolved wiring to the transcript. Production slots call this
+    /// once, right after [`Frontend::with_config`].
+    fn attach_live(&mut self, live: LiveHandle, tools_root: Option<&std::path::Path>) {
+        self.live = Some(live);
+        self.sync_live_binding();
+        let message = {
+            let handle = self.live.as_ref().expect("live handle attached");
+            let selection = handle.lock().expect("live selection lockable");
+            wiring_notice(&selection, tools_root)
+        };
+        self.state.notice(&message);
+    }
+
+    /// True when the next run resolves to a real adapter (selection known,
+    /// credential present, endpoint valid). The interactive canned demo
+    /// submission is gated on the negation: auto-firing a real network
+    /// call on every launch would bill the operator for a transcript
+    /// nobody asked for. No handle (unit tests) counts as demo.
+    fn is_live(&self) -> bool {
+        let Some(binding) = &self.live else {
+            return false;
+        };
+        let selection = binding.lock().expect("live selection lockable");
+        matches!(
+            resolve_live_adapter(&selection, env_credential),
+            LiveResolve::Live(_)
+        )
     }
 
     /// Advances the active model through the configured models in admission
@@ -658,6 +990,7 @@ impl Frontend {
         self.active_model = Some(next.to_owned());
         self.state.notice(&format!("model: {next}"));
         self.sync_model_display();
+        self.sync_live_binding();
     }
 
     /// Mirrors the selected model (and its provider, when the id still
@@ -907,6 +1240,7 @@ fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
             if front.config.model(&name).is_some() {
                 front.active_model = Some(name.clone());
                 front.sync_model_display();
+                front.sync_live_binding();
                 front.state.notice(&format!("model: {name}"));
             } else {
                 let mut ids: Vec<&str> = front
@@ -1228,11 +1562,12 @@ struct InteractiveReport {
 async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
-    let (runtime, streams) = build_runtime()?;
+    let (runtime, streams, live) = build_live_runtime(&session_config)?;
     let session =
         SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?;
     let mut front = Frontend::with_config(session, session_config.clone());
     front.state.set_session_label("s1");
+    front.attach_live(live, session_config.tools_root.as_deref());
     let mut sessions = SessionRegistry::new(
         SessionSlot {
             label: "s1".to_owned(),
@@ -1247,8 +1582,10 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Canned M0 submission through the same command path as typed input. The
-    // draft is recorded and the run adopted only after `Accepted`.
-    {
+    // draft is recorded and the run adopted only after `Accepted`. Gated on
+    // demo wiring: with a live adapter this would fire a real billable
+    // network call on every launch for a transcript nobody asked for.
+    if !sessions.active().front.is_live() {
         let slot = sessions.active_mut();
         let submit = submit_command(
             slot.front.next_request(),
@@ -1476,7 +1813,10 @@ fn draw(
 
 /// Non-terminal fallback: drains the scripted run, denies any approval
 /// (no user can confirm it), and prints the sanitized presentation
-/// transcript with no escape codes.
+/// transcript with no escape codes. Deliberately demo-only wiring: this
+/// path fires without a user present, so it must never resolve a live
+/// adapter or touch the network. Callers pass [`build_runtime`], never
+/// [`build_live_runtime`].
 async fn headless(
     runtime: Runtime,
     mut streams: EventStreams,
@@ -2925,6 +3265,7 @@ mod cov_main_topup {
             config: UserConfig::default_config(),
             path: None,
             active_model: None,
+            tools_root: None,
         }
     }
 
@@ -2964,6 +3305,7 @@ mod cov_main_topup {
             config,
             path: None,
             active_model,
+            tools_root: None,
         }
     }
 
@@ -3965,5 +4307,328 @@ mod cov_main_topup {
 
         draw(&mut terminal, &mut front).expect("the frame renders");
         assert!(front.state.is_finished());
+    }
+}
+
+#[cfg(test)]
+mod cov_live_wiring {
+    //! Coverage for the demo-or-live wiring: startup argument parsing,
+    //! per-run provider resolution with an injected credential lookup, and
+    //! real-reads root validation. No test touches the process environment
+    //! or the network: credentials arrive through explicit closures and the
+    //! live adapter is only ever constructed (endpoint parsing), never run.
+
+    use super::*;
+
+    /// Builds the full argv vector a process would receive.
+    fn argv(args: &[&str]) -> Vec<String> {
+        std::iter::once("nexus-tui")
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Unwraps the `Run` variant, asserting the branch was taken.
+    fn tools_root(args: &[&str]) -> Option<std::path::PathBuf> {
+        match parse_startup_args(&argv(args)) {
+            StartupAction::Run(parsed) => parsed.tools_root,
+            StartupAction::Usage => panic!("expected a run action for {args:?}"),
+        }
+    }
+
+    /// Asserts the parser rejects the flags with usage.
+    fn usage(args: &[&str]) {
+        assert!(
+            matches!(parse_startup_args(&argv(args)), StartupAction::Usage),
+            "expected usage for {args:?}"
+        );
+    }
+
+    #[test]
+    fn no_arguments_keep_every_tool_scripted() {
+        assert_eq!(tools_root(&[]), None);
+    }
+
+    #[test]
+    fn tools_root_names_the_jail_explicitly() {
+        assert_eq!(
+            tools_root(&["--tools-root", "/srv/root"]),
+            Some(std::path::PathBuf::from("/srv/root"))
+        );
+    }
+
+    #[test]
+    fn unknown_or_incomplete_flags_are_usage_never_silent_defaults() {
+        usage(&["--help"]);
+        usage(&["-h"]);
+        usage(&["--tools-root"]);
+        usage(&["--tools-root", ""]);
+        usage(&["--tools"]);
+        usage(&["--bogus"]);
+        usage(&["typed-text-is-not-a-flag"]);
+    }
+
+    /// A configured selection like the `configured` helper's, with the
+    /// credential lookup injected so no environment is touched.
+    fn selection_with(active_model: Option<&str>) -> LiveSelection {
+        let mut config = UserConfig::default_config();
+        let profile = nexus_config::ProviderProfile::new(
+            "demo-provider",
+            "Demo provider",
+            nexus_config::AdapterKind::Direct,
+            Some("https://example.invalid".to_owned()),
+            nexus_config::CredentialRef::env_var("NEXUS_TUI_TEST_KEY")
+                .expect("credential reference is valid"),
+            "demo-model",
+        )
+        .expect("test provider profile is valid");
+        config.add_provider(profile).expect("provider admits");
+        let entry = nexus_config::ModelEntry::new("m0", "demo-provider", "demo-model")
+            .expect("test model entry is valid");
+        config.add_model(entry).expect("model admits");
+        LiveSelection {
+            config,
+            active_model: active_model.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn no_selection_serves_the_demo_script() {
+        let selection = LiveSelection {
+            config: UserConfig::default_config(),
+            active_model: None,
+        };
+        assert!(
+            matches!(
+                resolve_live_adapter(&selection, |_| Some("secret".to_owned())),
+                LiveResolve::Demo
+            ),
+            "nothing selected resolves to the demo, never a network call"
+        );
+    }
+
+    #[test]
+    fn unknown_model_is_an_explicit_failure_not_a_fake() {
+        let selection = selection_with(Some("ghost"));
+        assert!(
+            matches!(
+                resolve_live_adapter(&selection, |_| Some("secret".to_owned())),
+                LiveResolve::Failed(ErrorCategory::InvalidInput, _)
+            ),
+            "a dangling selection must fail loudly instead of serving the demo"
+        );
+    }
+
+    #[test]
+    fn wiring_notice_distinguishes_unavailable_provider_and_real_writes() {
+        let notice = wiring_notice(
+            &selection_with(Some("ghost")),
+            Some(std::path::Path::new("/project")),
+        );
+        assert!(notice.contains("unavailable"));
+        assert!(!notice.contains("demo script"));
+        assert!(notice.contains("real reads/writes"));
+        assert!(notice.contains("writes require approval"));
+    }
+
+    #[test]
+    fn live_wrapper_delivers_text_before_the_http_turn_finishes() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock binds");
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (observed, wait_observed) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            stream.read_exact(&mut vec![0; length]).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"early\"},\"finish_reason\":null}]}\n\n").unwrap();
+            // Do not finish the response until the wrapper's caller has
+            // observed the prefix. A batch-only wrapper cannot satisfy this.
+            wait_observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("early sink delivery");
+            stream.write_all(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").unwrap();
+        });
+        let request = ModelRequest::new(
+            RunId::new("run-stream").unwrap(),
+            nexus_core::TurnId::new("turn-stream").unwrap(),
+            "test-profile",
+            Vec::new(),
+            None,
+            4096,
+        )
+        .unwrap();
+        let wrapper = PerRunProvider::new();
+        {
+            let mut current = wrapper.current.lock().unwrap();
+            current.run = Some(request.run().clone());
+            current.provider = ActiveProvider::Live(
+                OpenAiProvider::new(
+                    &endpoint,
+                    nexus_config::CredentialRef::env_var("PATH").unwrap(),
+                    "test-model",
+                )
+                .unwrap(),
+            );
+        }
+        let events = wrapper.stream_with_sink(
+            &request,
+            &ProviderContext::new(Duration::from_secs(10), false, None),
+            &|event| {
+                if let ProviderEvent::TextDelta { text, .. } = event {
+                    assert_eq!(text, "early");
+                    observed.send(()).unwrap();
+                } else {
+                    assert!(!event.is_terminal());
+                }
+            },
+        );
+        assert!(wrapper.supports_incremental_streaming());
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::TurnFinished(_))
+        ));
+        server.join().expect("mock finishes");
+    }
+
+    #[test]
+    fn missing_credential_is_an_explicit_retryable_failure() {
+        let selection = selection_with(Some("m0"));
+        assert!(
+            matches!(
+                resolve_live_adapter(&selection, |_| None),
+                LiveResolve::Failed(ErrorCategory::Authentication, _)
+            ),
+            "without a credential the run fails; it must not silently fake"
+        );
+        assert!(
+            matches!(
+                resolve_live_adapter(&selection, |_| Some(String::new())),
+                LiveResolve::Failed(ErrorCategory::Authentication, _)
+            ),
+            "an empty credential value counts as missing"
+        );
+    }
+
+    #[test]
+    fn present_credential_resolves_the_live_adapter_without_network() {
+        let selection = selection_with(Some("m0"));
+        match resolve_live_adapter(&selection, |_| Some("secret".to_owned())) {
+            LiveResolve::Live(adapter) => {
+                assert_eq!(adapter.model(), "demo-model");
+                assert!(
+                    adapter.uses_tls(),
+                    "the https test endpoint resolves to the TLS bridge"
+                );
+            }
+            LiveResolve::Demo => panic!("a complete selection must not serve the demo"),
+            LiveResolve::Failed(_, message) => {
+                panic!("a complete selection must resolve: {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn unparsable_endpoint_is_an_explicit_failure() {
+        // An empty host passes the document shape check but cannot become
+        // an adapter: resolution must fail instead of serving the demo.
+        let mut config = UserConfig::default_config();
+        let profile = nexus_config::ProviderProfile::new(
+            "empty-host",
+            "Empty host",
+            nexus_config::AdapterKind::Direct,
+            Some("https://:8080".to_owned()),
+            nexus_config::CredentialRef::env_var("NEXUS_TUI_TEST_KEY")
+                .expect("credential reference is valid"),
+            "demo-model",
+        )
+        .expect("the document shape accepts an empty host");
+        config.add_provider(profile).expect("provider admits");
+        let entry = nexus_config::ModelEntry::new("m0", "empty-host", "demo-model")
+            .expect("test model entry is valid");
+        config.add_model(entry).expect("model admits");
+        let selection = LiveSelection {
+            config,
+            active_model: Some("m0".to_owned()),
+        };
+        assert!(
+            matches!(
+                resolve_live_adapter(&selection, |_| Some("secret".to_owned())),
+                LiveResolve::Failed(ErrorCategory::InvalidInput, _)
+            ),
+            "an endpoint the adapter rejects fails instead of faking"
+        );
+    }
+
+    #[test]
+    fn failure_events_are_terminal_with_static_diagnostics() {
+        for (category, retry) in [
+            (ErrorCategory::Authentication, RetryGuidance::SafeToRetry),
+            (ErrorCategory::InvalidInput, RetryGuidance::DoNotRetry),
+        ] {
+            match live_failure(category, "static diagnostic") {
+                ProviderEvent::Failed(error) => {
+                    assert_eq!(error.category(), category);
+                    assert_eq!(error.retry(), retry);
+                }
+                _ => panic!("resolution failures are terminal"),
+            }
+        }
+    }
+
+    #[test]
+    fn live_roots_must_exist_as_directories() {
+        let missing = std::path::PathBuf::from("/nonexistent-nexus-tui-jail");
+        let session = SessionConfig {
+            config: UserConfig::default_config(),
+            path: None,
+            active_model: None,
+            tools_root: Some(missing),
+        };
+        assert!(
+            build_live_runtime(&session).is_err(),
+            "a missing jail is a startup error, never silent scripted reads"
+        );
+        let file = std::path::PathBuf::from("/dev/null");
+        let session = SessionConfig {
+            tools_root: Some(file),
+            ..session
+        };
+        assert!(
+            build_live_runtime(&session).is_err(),
+            "a non-directory jail is a startup error"
+        );
+    }
+
+    #[test]
+    fn demo_wiring_builds_without_a_jail() {
+        let session = SessionConfig {
+            config: UserConfig::default_config(),
+            path: None,
+            active_model: None,
+            tools_root: None,
+        };
+        let (_runtime, _streams, live) = build_live_runtime(&session).expect("demo wiring builds");
+        assert!(
+            !Frontend::new(SessionId::new("sess-test-live").expect("test session id is valid"))
+                .is_live(),
+            "no handle means demo, even beside a live-capable runtime"
+        );
+        drop(live);
     }
 }

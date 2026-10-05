@@ -120,10 +120,17 @@ struct RegisteredTool {
 struct State {
     active: Option<ActiveRun>,
     last: Option<FinishedRun>,
+    /// Whole completed exchanges, globally bounded by the context budgets.
+    history: VecDeque<RetainedExchange>,
     /// Workers whose termination is not yet established. A non-empty list
     /// blocks new runs and further dispatch; at most one entry exists in the
     /// sequential M0 baseline.
     quarantine: Vec<QuarantineMeta>,
+}
+
+struct RetainedExchange {
+    session: SessionId,
+    items: Vec<ModelContextItem>,
 }
 
 struct QuarantineMeta {
@@ -180,6 +187,7 @@ struct ActiveRun {
     calls_used: u32,
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
+    history_len: usize,
     queue: VecDeque<QueuedCall>,
     current: Option<CurrentCall>,
     pending: HashMap<ApprovalId, PendingApproval>,
@@ -401,6 +409,7 @@ impl Runtime {
             state: Mutex::new(State {
                 active: None,
                 last: None,
+                history: VecDeque::new(),
                 quarantine: Vec::new(),
             }),
             data_tx,
@@ -495,6 +504,31 @@ impl Runtime {
             let run = state.last.as_ref().map(|last| last.run.clone());
             return CommandResponse::new(command.request.clone(), CommandReply::Busy, run);
         }
+        let mut conversation = Vec::new();
+        let mut count = 1;
+        let mut bytes = user_item.payload_bytes();
+        let mut retained = Vec::new();
+        for exchange in state
+            .history
+            .iter()
+            .rev()
+            .filter(|exchange| exchange.session == command.session)
+        {
+            let size = conversation_bytes(&exchange.items);
+            if count + exchange.items.len() > self.shared.context_items_bound
+                || bytes.saturating_add(size) > nexus_core::provider::MAX_CONVERSATION_BYTES
+            {
+                break;
+            }
+            count += exchange.items.len();
+            bytes += size;
+            retained.push(exchange);
+        }
+        for exchange in retained.into_iter().rev() {
+            conversation.extend(exchange.items.iter().cloned());
+        }
+        let history_len = conversation.len();
+        conversation.push(user_item);
         state.active = Some(ActiveRun {
             phase: RunState::Preparing,
             run: run.clone(),
@@ -513,7 +547,8 @@ impl Runtime {
             turns_used: 0,
             calls_used: 0,
             continuation: None,
-            conversation: vec![user_item],
+            conversation,
+            history_len,
             queue: VecDeque::new(),
             current: None,
             pending: HashMap::new(),
@@ -768,6 +803,7 @@ impl Runtime {
             if StdInstant::now() >= active.deadline {
                 return Err(Terminal::limit("run duration exhausted"));
             }
+            trim_inherited_history(active, self.shared.context_items_bound);
             if active.conversation.len() > self.shared.context_items_bound {
                 return Err(Terminal::limit("retained context budget exhausted"));
             }
@@ -943,6 +979,7 @@ impl Runtime {
             }
             ProviderEvent::ToolCallReady(_)
             | ProviderEvent::TurnFinished(_)
+            | ProviderEvent::ReasoningDelta { .. }
             | ProviderEvent::Failed(_) => {}
         }
     }
@@ -973,17 +1010,18 @@ impl Runtime {
     ) -> Result<RunState, Terminal> {
         // Full-turn atomic validation: duplicate references, partial/final
         // disagreement, and finish-reason conflicts fail before any
-        // admission, identity consumption, or queue mutation.
-        // Full-turn atomic validation: duplicate references, partial/final
-        // disagreement, and finish-reason conflicts fail before any
         // admission, identity consumption, or queue mutation. An honestly
         // failed invocation keeps its provider error primary: a protocol
         // ordering diagnostic must not replace a typed timeout/failure.
-        if let Err(protocol_error) = crate::protocol::validate_batch(&events, &self.shared.limits) {
-            if let Some(error) = events.iter().find_map(|event| match event {
-                ProviderEvent::Failed(error) => Some(error.clone()),
-                _ => None,
-            }) {
+        let mut effective_limits = self.shared.limits;
+        effective_limits.max_tool_output_bytes = self.shared.effective_output_budget;
+        if let Err(protocol_error) = crate::protocol::validate_batch(&events, &effective_limits) {
+            if let Some(ProviderEvent::Failed(error)) = events.last()
+                && !events[..events.len() - 1]
+                    .iter()
+                    .any(ProviderEvent::is_terminal)
+            {
+                let error = error.clone();
                 return Err(if error.category() == ErrorCategory::Cancelled {
                     Terminal::cancelled_with(error)
                 } else {
@@ -1002,8 +1040,15 @@ impl Runtime {
         let mut candidates = Vec::new();
         let mut terminal: Option<Result<nexus_core::TurnFinished, AgentError>> = None;
         let mut text_items: Vec<(String, String)> = Vec::new();
+        // Thinking trace for this turn, echoed back on later turns when
+        // present. Accumulated silently: reasoning is never presented and
+        // never previewed, only recorded into the turn's assistant items.
+        let mut reasoning = String::new();
         for event in &events {
             match event {
+                ProviderEvent::ReasoningDelta { text } => {
+                    reasoning.push_str(text);
+                }
                 ProviderEvent::TextDelta { item_key, text } => {
                     if let Some(entry) = text_items.iter_mut().find(|(key, _)| key == item_key) {
                         entry.1.push_str(text);
@@ -1093,7 +1138,15 @@ impl Runtime {
                 }
                 match finished.reason() {
                     FinishReason::Stop => {
-                        append_assistant_text(active, text_items);
+                        if text_items.iter().all(|(_, text)| text.is_empty())
+                            && !reasoning.is_empty()
+                        {
+                            active.conversation.push(
+                                ModelContextItem::assistant_reasoning(reasoning.clone())
+                                    .map_err(Terminal::failed)?,
+                            );
+                        }
+                        append_assistant_text(active, text_items, &reasoning)?;
                         Err(Terminal::completed())
                     }
                     FinishReason::Refusal => Err(Terminal::refused()),
@@ -1109,8 +1162,14 @@ impl Runtime {
                                 "tool-call turn carried no complete candidates",
                             )));
                         }
-                        append_assistant_text(active, text_items);
-                        self.admit_candidates(active, turn, candidates)?;
+                        let has_text = text_items.iter().any(|(_, text)| !text.is_empty());
+                        append_assistant_text(active, text_items, &reasoning)?;
+                        self.admit_candidates(
+                            active,
+                            turn,
+                            candidates,
+                            if has_text { "" } else { &reasoning },
+                        )?;
                         Ok(RunState::ValidatingTools)
                     }
                 }
@@ -1123,8 +1182,11 @@ impl Runtime {
         active: &mut ActiveRun,
         turn: &TurnId,
         candidates: Vec<CallCandidate>,
+        reasoning: &str,
     ) -> Result<(), Terminal> {
         let run = active.run.clone();
+        let mut denied_results = Vec::new();
+        let mut trace = (!reasoning.is_empty()).then(|| reasoning.to_owned());
         for (index, candidate) in candidates.into_iter().enumerate() {
             if self
                 .shared
@@ -1147,7 +1209,14 @@ impl Runtime {
             active.calls_used += 1;
             let call = self.next_call_id(active)?;
             let Some(registered) = self.shared.tools.get(candidate.tool_name()) else {
-                let outcome = denied_outcome("unknown tool");
+                let outcome = bound_outcome(&self.shared, denied_outcome("unknown tool"));
+                denied_results.push(denied_context(
+                    active,
+                    &candidate,
+                    &call,
+                    &outcome,
+                    trace.take(),
+                )?);
                 record_denied(&self.shared, active, &run, call, outcome);
                 continue;
             };
@@ -1158,7 +1227,15 @@ impl Runtime {
             ) {
                 Ok(args) => args,
                 Err(_) => {
-                    let outcome = denied_outcome("invalid tool arguments");
+                    let outcome =
+                        bound_outcome(&self.shared, denied_outcome("invalid tool arguments"));
+                    denied_results.push(denied_context(
+                        active,
+                        &candidate,
+                        &call,
+                        &outcome,
+                        trace.take(),
+                    )?);
                     record_denied(&self.shared, active, &run, call, outcome);
                     continue;
                 }
@@ -1175,15 +1252,17 @@ impl Runtime {
                 provider_ref: candidate.provider_ref().to_owned(),
                 needs_approval: self.shared.policy.requires_approval(&tool_id),
             };
-            if let Ok(item) = ModelContextItem::assistant_call(
+            let item = ModelContextItem::assistant_call_with_reasoning(
                 candidate.item_key(),
                 candidate.provider_ref(),
                 queued.call.clone(),
-            ) {
-                active.conversation.push(item);
-            }
+                trace.take(),
+            )
+            .map_err(Terminal::failed)?;
+            active.conversation.push(item);
             active.queue.push_back(queued);
         }
+        active.conversation.extend(denied_results);
         Ok(())
     }
 
@@ -1639,21 +1718,22 @@ impl Runtime {
         let Some((call, outcome)) = active.outcome_slot.take() else {
             return Ok(RunState::ValidatingTools);
         };
+        let outcome = bound_outcome(&self.shared, outcome);
         active.outcomes.push(OutcomeSummary {
             call: call.clone(),
             status: outcome.status(),
             effect: outcome.effect(),
             evidence: outcome.evidence(),
         });
-        if let Some(current) = active.current.take()
-            && let Ok(item) = ModelContextItem::tool_result(
+        if let Some(current) = active.current.take() {
+            let item = ModelContextItem::tool_result(
                 call.clone(),
                 current.item_key,
                 current.provider_ref,
                 current.call.tool().clone(),
                 outcome.clone(),
             )
-        {
+            .map_err(Terminal::failed)?;
             active.conversation.push(item);
         }
         if emit_control(
@@ -1796,6 +1876,34 @@ impl Runtime {
         }
         active.finished_sent = true;
         active.phase = RunState::Finished;
+        // Failed/cancelled/limited runs are not committed: their partial
+        // calls or provisional text must never contaminate the next request.
+        if outcome == RunOutcome::Completed {
+            let items = active.conversation[active.history_len..].to_vec();
+            if items.len() <= self.shared.context_items_bound
+                && conversation_bytes(&items) <= nexus_core::provider::MAX_CONVERSATION_BYTES
+            {
+                state.history.push_back(RetainedExchange {
+                    session: active.session.clone(),
+                    items,
+                });
+                while state
+                    .history
+                    .iter()
+                    .map(|exchange| exchange.items.len())
+                    .sum::<usize>()
+                    > self.shared.context_items_bound
+                    || state
+                        .history
+                        .iter()
+                        .map(|exchange| conversation_bytes(&exchange.items))
+                        .sum::<usize>()
+                        > nexus_core::provider::MAX_CONVERSATION_BYTES
+                {
+                    state.history.pop_front();
+                }
+            }
+        }
         state.last = Some(FinishedRun {
             run: active.run.clone(),
             session: active.session.clone(),
@@ -1887,12 +1995,72 @@ fn abandon_pending(active: &mut ActiveRun) {
     active.pending.clear();
 }
 
-fn append_assistant_text(active: &mut ActiveRun, text_items: Vec<(String, String)>) {
+fn append_assistant_text(
+    active: &mut ActiveRun,
+    text_items: Vec<(String, String)>,
+    reasoning: &str,
+) -> Result<(), Terminal> {
+    let mut trace = (!reasoning.is_empty()).then(|| reasoning.to_owned());
     for (item_key, text) in text_items {
-        if let Ok(item) = ModelContextItem::assistant_text(item_key, text) {
-            active.conversation.push(item);
+        if text.is_empty() {
+            continue;
         }
+        let item = ModelContextItem::assistant_text_with_reasoning(item_key, text, trace.take())
+            .map_err(Terminal::failed)?;
+        active.conversation.push(item);
     }
+    Ok(())
+}
+
+fn conversation_bytes(items: &[ModelContextItem]) -> usize {
+    items.iter().fold(0usize, |total, item| {
+        total.saturating_add(item.payload_bytes())
+    })
+}
+
+/// Make room for the current run without splitting any inherited exchange.
+/// Current-run items are never evicted to hide a budget violation or pending
+/// tool call; an oversized current run still terminates with a limit error.
+fn trim_inherited_history(active: &mut ActiveRun, bound: usize) {
+    while active.history_len > 0
+        && (active.conversation.len() > bound
+            || conversation_bytes(&active.conversation)
+                > nexus_core::provider::MAX_CONVERSATION_BYTES)
+    {
+        let remove = active.conversation[..active.history_len]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, item)| {
+                matches!(item, ModelContextItem::UserText(_)).then_some(index)
+            })
+            .unwrap_or(active.history_len);
+        active.conversation.drain(..remove);
+        active.history_len -= remove;
+    }
+}
+
+fn denied_context(
+    active: &mut ActiveRun,
+    candidate: &CallCandidate,
+    call: &CallId,
+    outcome: &ToolOutcome,
+    reasoning: Option<String>,
+) -> Result<ModelContextItem, Terminal> {
+    let tool = ToolId::new(candidate.tool_name(), nexus_core::M0_REVISION)
+        .map_err(|_| Terminal::failed_internal("denied tool identity is invalid"))?;
+    active.conversation.push(
+        ModelContextItem::assistant_denied_call(call.clone(), candidate.clone(), reasoning)
+            .map_err(Terminal::failed)?,
+    );
+    ModelContextItem::tool_result(
+        call.clone(),
+        candidate.item_key(),
+        candidate.provider_ref(),
+        tool,
+        outcome.clone(),
+    )
+    .map_err(Terminal::failed)
 }
 
 fn record_denied(
@@ -3854,6 +4022,7 @@ mod cov_runtime_private {
             calls_used: 0,
             continuation: None,
             conversation: Vec::new(),
+            history_len: 0,
             queue: VecDeque::new(),
             current: None,
             pending: HashMap::new(),
@@ -4690,6 +4859,7 @@ mod cov_runtime_topup_private {
             calls_used: 0,
             continuation: None,
             conversation: Vec::new(),
+            history_len: 0,
             queue: VecDeque::new(),
             current: None,
             pending: HashMap::new(),

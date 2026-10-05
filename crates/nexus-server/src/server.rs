@@ -46,7 +46,7 @@ use nexus_core::{
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
-use nexus_tools::ScopedReader;
+use nexus_tools::{ScopedReader, ScopedWriter};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -59,14 +59,14 @@ const SSE_IDLE: Duration = Duration::from_secs(15);
 const WEB_PROFILE: &str = "web-test";
 
 /// Tool wiring for demo sessions. Fakes are the default: nothing touches
-/// the real filesystem. `RealFiles` executes `host_read` against the real
-/// filesystem jailed to `root` (mutations stay fake); the root is
+/// the real filesystem. `RealFiles` executes `host_read` and `host_write`
+/// against the filesystem jailed to `root` (writes require approval); the root is
 /// canonicalized and validated up front and per session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolsMode {
     /// Scripted doubles only; the default.
     Fakes,
-    /// Real jailed reads rooted here; writes stay scripted.
+    /// Real jailed reads and approval-gated writes rooted here.
     RealFiles {
         /// Canonical jail root.
         root: std::path::PathBuf,
@@ -215,7 +215,7 @@ impl Server {
     /// configuration path, and scripted fake tools. Call
     /// [`Server::set_config`] and [`Server::set_tools_mode`] before serving
     /// to enable submit selection, favourites, persisted recents, and real
-    /// jailed reads.
+    /// jailed file tools.
     #[must_use]
     pub fn new(handle: tokio::runtime::Handle) -> Self {
         Self {
@@ -296,7 +296,10 @@ impl Server {
                     ScopedReader::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
                 ),
-                Arc::new(FakeTool::mutation()),
+                Arc::new(
+                    ScopedWriter::with_root(root)
+                        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+                ),
             ],
         };
         let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)

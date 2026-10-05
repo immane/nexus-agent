@@ -111,6 +111,7 @@ pub(crate) fn validate_batch(events: &[ProviderEvent], limits: &Limits) -> Resul
 #[derive(Default)]
 struct Scan {
     text_bytes: usize,
+    reasoning_bytes: usize,
     payload_bytes: usize,
     text_keys: HashSet<String>,
     call_keys: HashSet<String>,
@@ -150,7 +151,9 @@ impl Scan {
             ProviderEvent::TextDelta { item_key, text } => {
                 ItemKey::new(item_key.as_str())?;
                 self.text_bytes = self.text_bytes.saturating_add(text.len());
-                if self.text_bytes > limits.max_tool_output_bytes {
+                if self.text_bytes.saturating_add(self.reasoning_bytes)
+                    > limits.max_tool_output_bytes
+                {
                     return Err(limit_error("provider text exceeds the output byte budget"));
                 }
                 if self.call_keys.contains(item_key.as_str()) {
@@ -213,6 +216,17 @@ impl Scan {
                 }
             }
             ProviderEvent::TurnFinished(_) | ProviderEvent::Failed(_) => {}
+            ProviderEvent::ReasoningDelta { text } => {
+                self.reasoning_bytes = self.reasoning_bytes.saturating_add(text.len());
+                if self.reasoning_bytes > Limits::M0_TEST_TOOL_OUTPUT_BYTES
+                    || self.reasoning_bytes.saturating_add(self.text_bytes)
+                        > limits.max_tool_output_bytes
+                {
+                    return Err(limit_error(
+                        "provider reasoning exceeds the output byte budget",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -249,6 +263,7 @@ impl Scan {
             ProviderEvent::TextDelta { .. }
             | ProviderEvent::ToolCallDelta { .. }
             | ProviderEvent::ToolCallReady(_)
+            | ProviderEvent::ReasoningDelta { .. }
             | ProviderEvent::Usage(_) => Err(protocol_error(
                 "provider batch does not end with a terminal event",
             )),
@@ -329,6 +344,7 @@ fn known_counter_differs(previous: Option<u64>, terminal: Option<u64>) -> bool {
 fn event_payload_bytes(event: &ProviderEvent) -> usize {
     match event {
         ProviderEvent::TextDelta { item_key, text } => item_key.len() + text.len(),
+        ProviderEvent::ReasoningDelta { text } => text.len(),
         ProviderEvent::ToolCallDelta { item_key, .. } => item_key.len(),
         ProviderEvent::ToolCallReady(candidate) => {
             candidate.item_key().len()
@@ -377,6 +393,46 @@ mod tests {
 
     fn limits() -> Limits {
         Limits::m0_test()
+    }
+
+    #[test]
+    fn reasoning_and_text_share_the_effective_budget_in_either_order() {
+        let mut tight = limits();
+        tight.max_tool_output_bytes = 8;
+        for reverse in [false, true] {
+            let mut events = vec![
+                text("k", "1234"),
+                ProviderEvent::ReasoningDelta {
+                    text: "5678".to_owned(),
+                },
+            ];
+            if reverse {
+                events.reverse();
+            }
+            events.push(finished(FinishReason::Stop, final_usage()));
+            validate_batch(&events, &tight).unwrap();
+            events.insert(
+                0,
+                ProviderEvent::ReasoningDelta {
+                    text: "9".to_owned(),
+                },
+            );
+            assert_eq!(
+                validate_batch(&events, &tight).unwrap_err().category(),
+                ErrorCategory::ResourceLimit
+            );
+        }
+        let events = vec![
+            ProviderEvent::ReasoningDelta {
+                text: "x".repeat(Limits::M0_TEST_TOOL_OUTPUT_BYTES + 1),
+            },
+            finished(FinishReason::Stop, final_usage()),
+        ];
+        tight.max_tool_output_bytes = MAX_BATCH_BYTES;
+        assert_eq!(
+            validate_batch(&events, &tight).unwrap_err().category(),
+            ErrorCategory::ResourceLimit
+        );
     }
 
     fn final_usage() -> Usage {

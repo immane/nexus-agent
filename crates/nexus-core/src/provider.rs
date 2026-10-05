@@ -140,6 +140,11 @@ pub enum ModelContextItem {
         item_key: ItemKey,
         /// Assistant text.
         text: TextContent,
+        /// Thinking trace to echo back on later turns. Vendors running a
+        /// thinking mode (DeepSeek `reasoning_content`) reject follow-up
+        /// requests that drop it; it is never presented as an answer and
+        /// never authorizes anything.
+        reasoning: Option<String>,
     },
     /// Assistant call admitted by the host, correlated to its provider item.
     AssistantCall {
@@ -149,6 +154,23 @@ pub enum ModelContextItem {
         provider_ref: ProviderRef,
         /// Admitted host call carrying run, turn, call, tool, and arguments.
         call: ToolCall,
+        /// Thinking trace to echo back, as above.
+        reasoning: Option<String>,
+    },
+    /// Rejected proposal, retained verbatim for provider correlation only.
+    /// Unlike `AssistantCall`, it carries no executable, validated call.
+    AssistantDeniedCall {
+        /// Host identity of the denial.
+        call: CallId,
+        /// Original bounded proposal, including unvalidated argument text.
+        candidate: CallCandidate,
+        /// Thinking trace for the assistant turn.
+        reasoning: Option<String>,
+    },
+    /// A completed thinking-only turn, with no fabricated visible answer.
+    AssistantReasoning {
+        /// Bounded trace, never presented as answer text.
+        reasoning: String,
     },
     /// Recorded tool outcome correlated to its host call and provider item.
     ToolResult {
@@ -166,6 +188,25 @@ pub enum ModelContextItem {
 }
 
 impl ModelContextItem {
+    /// Builds a reasoning-only assistant record without inventing content.
+    pub fn assistant_reasoning(reasoning: String) -> Result<Self, AgentError> {
+        validate_reasoning(Some(&reasoning))?;
+        Ok(Self::AssistantReasoning { reasoning })
+    }
+
+    /// Records a rejected proposal; this type cannot reach a tool executor.
+    pub fn assistant_denied_call(
+        call: CallId,
+        candidate: CallCandidate,
+        reasoning: Option<String>,
+    ) -> Result<Self, AgentError> {
+        validate_reasoning(reasoning.as_deref())?;
+        Ok(Self::AssistantDeniedCall {
+            call,
+            candidate,
+            reasoning: reasoning.filter(|trace| !trace.is_empty()),
+        })
+    }
     /// Builds bounded user text.
     pub fn user_text(text: impl Into<String>) -> Result<Self, AgentError> {
         Ok(Self::UserText(TextContent::new(text)?))
@@ -176,9 +217,21 @@ impl ModelContextItem {
         item_key: impl Into<String>,
         text: impl Into<String>,
     ) -> Result<Self, AgentError> {
+        Self::assistant_text_with_reasoning(item_key, text, None)
+    }
+
+    /// Builds bounded assistant text plus an optional thinking trace to
+    /// echo on later turns. An empty trace normalizes to absent.
+    pub fn assistant_text_with_reasoning(
+        item_key: impl Into<String>,
+        text: impl Into<String>,
+        reasoning: Option<String>,
+    ) -> Result<Self, AgentError> {
+        validate_reasoning(reasoning.as_deref())?;
         Ok(Self::AssistantText {
             item_key: ItemKey::new(item_key)?,
             text: TextContent::new(text)?,
+            reasoning: reasoning.filter(|trace| !trace.is_empty()),
         })
     }
 
@@ -189,11 +242,36 @@ impl ModelContextItem {
         provider_ref: impl Into<String>,
         call: ToolCall,
     ) -> Result<Self, AgentError> {
+        Self::assistant_call_with_reasoning(item_key, provider_ref, call, None)
+    }
+
+    /// Builds an assistant call plus an optional thinking trace to echo on
+    /// later turns. An empty trace normalizes to absent.
+    pub fn assistant_call_with_reasoning(
+        item_key: impl Into<String>,
+        provider_ref: impl Into<String>,
+        call: ToolCall,
+        reasoning: Option<String>,
+    ) -> Result<Self, AgentError> {
+        validate_reasoning(reasoning.as_deref())?;
         Ok(Self::AssistantCall {
             item_key: ItemKey::new(item_key)?,
             provider_ref: ProviderRef::new(provider_ref)?,
             call,
+            reasoning: reasoning.filter(|trace| !trace.is_empty()),
         })
+    }
+
+    /// Returns the thinking trace to echo on later turns, if any.
+    #[must_use]
+    pub fn reasoning(&self) -> Option<&str> {
+        match self {
+            Self::AssistantReasoning { reasoning } => Some(reasoning),
+            Self::AssistantText { reasoning, .. }
+            | Self::AssistantCall { reasoning, .. }
+            | Self::AssistantDeniedCall { reasoning, .. } => reasoning.as_deref(),
+            Self::UserText(_) | Self::ToolResult { .. } => None,
+        }
     }
 
     /// Builds a recorded result correlated to its host call and provider
@@ -217,19 +295,41 @@ impl ModelContextItem {
 
     /// Returns the owned UTF-8 string payload bytes counted against the
     /// request bound: item keys, provider references, host identities
-    /// (run/turn/call and tool name), arguments, text, and outcome content.
-    /// This is not total allocated overhead: per-item object, `Vec`, and
-    /// revision-field overhead is finite and covered by the request's count
-    /// bound.
+    /// (run/turn/call and tool name), arguments, text, reasoning traces, and
+    /// outcome content. This is not total allocated overhead: per-item
+    /// object, `Vec`, and revision-field overhead is finite and covered by
+    /// the request's count bound.
     #[must_use]
     pub fn payload_bytes(&self) -> usize {
         match self {
+            Self::AssistantReasoning { reasoning } => reasoning.len(),
+            Self::AssistantDeniedCall {
+                call,
+                candidate,
+                reasoning,
+            } => {
+                call.as_str().len()
+                    + candidate.item_key().len()
+                    + candidate.provider_ref().len()
+                    + candidate.tool_name().len()
+                    + candidate.arguments_json().len()
+                    + reasoning.as_deref().map_or(0, str::len)
+            }
             Self::UserText(text) => text.as_str().len(),
-            Self::AssistantText { item_key, text } => item_key.as_str().len() + text.as_str().len(),
+            Self::AssistantText {
+                item_key,
+                text,
+                reasoning,
+            } => {
+                item_key.as_str().len()
+                    + text.as_str().len()
+                    + reasoning.as_deref().map_or(0, str::len)
+            }
             Self::AssistantCall {
                 item_key,
                 provider_ref,
                 call,
+                reasoning,
             } => {
                 item_key.as_str().len()
                     + provider_ref.as_str().len()
@@ -238,6 +338,7 @@ impl ModelContextItem {
                     + call.call().as_str().len()
                     + call.tool().name().len()
                     + call.args().as_str().len()
+                    + reasoning.as_deref().map_or(0, str::len)
             }
             Self::ToolResult {
                 call,
@@ -348,6 +449,9 @@ impl ModelRequest {
             return Err(port_limit_error(
                 "model conversation exceeds retained context budget",
             ));
+        }
+        for item in &conversation {
+            validate_reasoning(item.reasoning())?;
         }
         let total = conversation
             .iter()
@@ -518,6 +622,14 @@ pub enum ProviderEvent {
         /// Fragment text.
         text: String,
     },
+    /// Thinking-trace fragment for the current turn. Withheld from
+    /// provisional sinks like tool previews: it is recorded for echo on
+    /// later turns (vendors running a thinking mode reject follow-ups that
+    /// drop it), never presented as an answer and never dispatched.
+    ReasoningDelta {
+        /// Fragment text.
+        text: String,
+    },
     /// Non-executable argument progress for a proposed call.
     ToolCallDelta {
         /// Turn-local item key.
@@ -582,7 +694,14 @@ pub trait ProviderPort {
         sink: &(dyn Fn(ProviderEvent) + Send + Sync),
     ) -> Vec<ProviderEvent> {
         let events = self.stream(request, context);
-        for event in events.iter().filter(|event| !event.is_terminal()) {
+        for event in events.iter().filter(|event| {
+            matches!(
+                event,
+                ProviderEvent::TextDelta { .. }
+                    | ProviderEvent::ToolCallDelta { .. }
+                    | ProviderEvent::Usage(_)
+            )
+        }) {
             sink(event.clone());
         }
         events
@@ -622,6 +741,15 @@ fn port_error(message: &'static str) -> AgentError {
         RetryGuidance::DoNotRetry,
     )
     .expect("static safe provider message builds")
+}
+
+fn validate_reasoning(reasoning: Option<&str>) -> Result<(), AgentError> {
+    if reasoning.is_some_and(|trace| trace.len() > Limits::M0_TEST_TOOL_OUTPUT_BYTES) {
+        return Err(port_limit_error(
+            "assistant reasoning exceeds its byte budget",
+        ));
+    }
+    Ok(())
 }
 
 fn port_limit_error(message: &'static str) -> AgentError {
@@ -665,6 +793,49 @@ mod tests {
             1024,
         )
         .expect("valid request builds")
+    }
+
+    #[test]
+    fn reasoning_is_bounded_per_item_and_in_aggregate_even_for_direct_variants() {
+        let exact = "x".repeat(Limits::M0_TEST_TOOL_OUTPUT_BYTES);
+        assert!(
+            ModelContextItem::assistant_text_with_reasoning("k", "text", Some(exact.clone()))
+                .is_ok()
+        );
+        assert!(
+            ModelContextItem::assistant_call_with_reasoning(
+                "k",
+                "ref",
+                test_tool_call(),
+                Some(format!("{exact}x"))
+            )
+            .is_err()
+        );
+        let invalid = ModelContextItem::AssistantReasoning {
+            reasoning: format!("{exact}x"),
+        };
+        assert_eq!(
+            request()
+                .with_conversation(vec![invalid])
+                .unwrap_err()
+                .category(),
+            ErrorCategory::ResourceLimit
+        );
+        let item = ModelContextItem::assistant_reasoning(exact).unwrap();
+        assert_eq!(item.payload_bytes(), Limits::M0_TEST_TOOL_OUTPUT_BYTES);
+        assert!(
+            request()
+                .clone()
+                .with_conversation(vec![item.clone(); 4])
+                .is_ok()
+        );
+        assert_eq!(
+            request()
+                .with_conversation(vec![item; 5])
+                .unwrap_err()
+                .category(),
+            ErrorCategory::ResourceLimit
+        );
     }
 
     fn test_tool_call() -> ToolCall {
@@ -877,11 +1048,13 @@ mod tests {
                 item_key,
                 provider_ref,
                 call: carried,
+                reasoning,
             } => {
                 assert_eq!(item_key.as_str(), "item-1");
                 assert_eq!(provider_ref.as_str(), "prov-ref-1");
                 assert_eq!(carried.call(), call.call());
                 assert_eq!(carried.tool(), call.tool());
+                assert_eq!(reasoning, &None);
             }
             other => panic!("unexpected conversation item {other:?}"),
         }
@@ -1080,6 +1253,12 @@ mod tests {
                 _context: &ProviderContext,
             ) -> Vec<ProviderEvent> {
                 vec![
+                    ProviderEvent::ReasoningDelta {
+                        text: "hidden trace".to_owned(),
+                    },
+                    ProviderEvent::ToolCallReady(
+                        CallCandidate::new("item-1", "ref-1", "host_read", "{}").unwrap(),
+                    ),
                     ProviderEvent::TextDelta {
                         item_key: "item-0".to_owned(),
                         text: "hi".to_owned(),
@@ -1102,7 +1281,7 @@ mod tests {
             &ProviderContext::new(Duration::from_secs(60), false, None),
             &sink,
         );
-        assert_eq!(batch.len(), 2, "the returned batch stays authoritative");
+        assert_eq!(batch.len(), 4, "the returned batch stays authoritative");
         let seen = seen.lock().expect("sink log readable");
         assert_eq!(
             seen.len(),

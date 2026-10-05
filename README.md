@@ -10,7 +10,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 [Documentation](docs/index.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
 > [!IMPORTANT]
-> Nexus Agent has an M0 **test-only implementation** (scripted fakes, ephemeral store; no real providers, tools, or plugins), but **M0 acceptance is not complete** and the documentation repair is still in progress. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and capabilities below describe the proposed architecture, not stable features.
+> Nexus Agent has an M0 **test-only implementation** with opt-in OpenAI-compatible live providers and root-jailed file reads/writes; storage remains ephemeral and plugins are not implemented. See [QUICKSTART.md](QUICKSTART.md) for live wiring and limitations. **M0 acceptance is not complete**. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and broader capabilities below describe the proposed architecture, not stable features.
 
 ## Design Goals
 
@@ -178,7 +178,7 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Build a testable core/runtime and minimal frontend (test-only fakes; historical workspace checks passed on macOS and Linux with 137 tests recorded, pending re-verification).
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
-- [ ] Implement coding tools and mainstream model adapters (scripted fakes only).
+- [ ] Complete coding tools and mainstream model adapters (opt-in OpenAI-compatible streaming and file reads/writes are implemented; search, shell execution, and other provider protocols remain pending).
 - [ ] Add bounded external-plugin interoperability and session recovery.
 
 Windows and untrusted-plugin isolation are separate follow-up work. Build the M0 test-only binaries with `cargo build --workspace --release` (produces `nexus-headless` and `nexus-tui`); there is no installable release yet.

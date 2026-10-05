@@ -84,6 +84,8 @@ fn kind(item: &ModelContextItem) -> &'static str {
         ModelContextItem::UserText(_) => "user",
         ModelContextItem::AssistantText { .. } => "text",
         ModelContextItem::AssistantCall { .. } => "call",
+        ModelContextItem::AssistantDeniedCall { .. } => "denied-call",
+        ModelContextItem::AssistantReasoning { .. } => "reasoning",
         ModelContextItem::ToolResult { .. } => "result",
     }
 }
@@ -124,6 +126,7 @@ fn carried_calls(request: &ModelRequest) -> Vec<(String, String, String)> {
                 item_key,
                 provider_ref,
                 call,
+                ..
             } => Some((
                 provider_ref.as_str().to_owned(),
                 item_key.as_str().to_owned(),

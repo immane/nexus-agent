@@ -814,8 +814,20 @@ impl AppState {
                 self.finished = Some(finished.outcome());
                 self.resolve_approval();
                 self.status = format!("finished: {:?}", finished.outcome());
+                // Surface the typed failure on the transcript: without it a
+                // failed run shows only its outcome and the next debug step
+                // is a guessing game. The message is static by construction
+                // (the core marker net rejects anything else), so displaying
+                // it echoes no values; sanitize anyway for terminal safety.
+                let detail = finished.error().map_or_else(String::new, |error| {
+                    format!(
+                        " error={:?} {}",
+                        error.category(),
+                        sanitize(error.message())
+                    )
+                });
                 self.push_system(format!(
-                    "run {} finished: {:?} (ephemeral record)",
+                    "run {} finished: {:?} (ephemeral record){detail}",
                     event.run().as_str(),
                     finished.outcome()
                 ));
@@ -1555,6 +1567,54 @@ mod tests {
         assert!(state.apply_event(&started(0)));
         assert!(state.apply_event(&text(1, "live")));
         assert!(state.apply_event(&finished(2)));
+    }
+
+    #[test]
+    fn failed_finish_names_its_error_while_clean_finish_stays_bare() {
+        use nexus_core::{AgentError, ErrorCategory, PersistenceState, RetryGuidance, RunFinished};
+        let (session, run) = session_run();
+        // Clean finish: the historical bare line, no error suffix.
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        assert!(state.apply_event(&text(1, "live")));
+        assert!(state.apply_event(&finished(2)));
+        let lines: Vec<String> = state.transcript();
+        assert!(
+            lines.iter().any(
+                |line| line.contains("finished: Completed (ephemeral record)")
+                    && !line.contains("error=")
+            ),
+            "a clean finish carries no error detail: {lines:?}"
+        );
+        // Failed finish with a typed error: category plus static message.
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let error = AgentError::new(
+            ErrorCategory::Protocol,
+            "provider reply tool call arguments are invalid",
+            RetryGuidance::DoNotRetry,
+        )
+        .expect("static diagnostic builds");
+        let failed = RunEvent::new(
+            session,
+            run,
+            1,
+            EventPayload::RunFinished(
+                RunFinished::new(RunOutcome::Failed, PersistenceState::Ephemeral, None)
+                    .expect("terminal record builds")
+                    .with_error(error),
+            ),
+        );
+        assert!(state.apply_event(&failed));
+        let lines: Vec<String> = state.transcript();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("finished: Failed (ephemeral record)")
+                    && line.contains("error=Protocol")
+                    && line.contains("provider reply tool call arguments are invalid")),
+            "a failed run names its error on the transcript: {lines:?}"
+        );
     }
 
     #[test]

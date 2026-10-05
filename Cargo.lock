@@ -238,7 +238,10 @@ version = "0.1.0"
 dependencies = [
  "nexus-config",
  "nexus-core",
+ "nexus-runtime",
+ "nexus-tools",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -281,7 +284,9 @@ dependencies = [
  "nexus-config",
  "nexus-core",
  "nexus-fakes",
+ "nexus-openai",
  "nexus-runtime",
+ "nexus-tools",
  "ratatui",
  "tokio",
 ]

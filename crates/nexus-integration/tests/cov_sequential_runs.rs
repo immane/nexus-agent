@@ -245,8 +245,8 @@ fn completed_run_frees_the_slot_for_the_next_sequential_run() {
             );
         }
 
-        // Every run builds its own model context: no conversation, turn, or
-        // continuation state carries from one run into the next.
+        // Completed exchanges carry within a session; turn identities and
+        // opaque per-run continuation state are never reused.
         let requests = bed.provider.requests();
         assert_eq!(requests.len(), 2, "exactly one model invocation per run");
         assert_eq!(requests[0].run(), &run_one);
@@ -259,8 +259,8 @@ fn completed_run_frees_the_slot_for_the_next_sequential_run() {
         for (index, request) in requests.iter().enumerate() {
             assert_eq!(
                 request.conversation().len(),
-                1,
-                "run {} starts from its own input only, never an earlier run's context",
+                1 + index * 2,
+                "run {} includes completed same-session context",
                 index + 1
             );
             assert!(
@@ -269,6 +269,10 @@ fn completed_run_frees_the_slot_for_the_next_sequential_run() {
                 index + 1
             );
         }
+        assert_eq!(requests[1].conversation()[0], requests[0].conversation()[0],
+            "the original same-session user input is retained verbatim");
+        assert!(matches!(&requests[1].conversation()[1], nexus_core::ModelContextItem::AssistantText { text, .. }
+            if text.as_str() == "first answer"), "the actual completed answer is retained, not synthesized");
 
         assert_terminal_cannot_reopen(&bed, &run_one, "first-run").await;
     });

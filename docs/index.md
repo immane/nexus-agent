@@ -15,8 +15,10 @@ fakes (`nexus-fakes`) through one `nexus-runtime` policy boundary.
 shared runtime: `nexus-headless` (1,006,464 bytes macOS / 1,169,136 bytes
 Linux) and `nexus-tui` (1,502,336 bytes macOS / 1,719,984 bytes Linux).
 The repository also contains engineering guidance and the
-[MIT license](../LICENSE). There are no real provider adapters, no coding
-tools beyond fakes, no external plugins, and persistence is an in-memory
+[MIT license](../LICENSE). Opt-in OpenAI-compatible live providers and
+root-jailed file reads/writes are now implemented; see
+[QUICKSTART.md](../QUICKSTART.md) for current wiring and limitations.
+External plugins are not implemented, and persistence is an in-memory
 ephemeral store that self-identifies as non-durable. Historical
 `cargo test --workspace`, `cargo fmt --check`, and clippy runs were recorded
 as passing on macOS and Linux (137 tests at the time, 0 failures); because

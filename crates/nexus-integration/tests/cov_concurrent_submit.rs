@@ -550,7 +550,7 @@ fn submit_reply_reconciles_with_run_started_and_stays_unique() {
 /// dispatches and the run fails with the batch-level diagnostic instead of
 /// completing on whichever terminal it kept. A batch whose first terminal is
 /// an honest `Failed` is not laundered by a trailing tool-calls terminal, and
-/// the provider's typed error stays primary.
+/// invalid terminal ordering is rejected even if one terminal claims failure.
 #[test]
 fn duplicate_terminal_invocation_never_dispatches() {
     let duplicate_terminal = vec![
@@ -581,7 +581,7 @@ fn duplicate_terminal_invocation_never_dispatches() {
     assert_rejected_invocation(
         "duplicate-terminal-after-failure",
         failed_then_tool_calls,
-        "provider stream ended mid turn",
+        "provider batch contains more than one terminal event",
     );
 }
 

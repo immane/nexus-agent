@@ -354,9 +354,14 @@ fn conversation_is_additive_across_turns() {
 
     // The new items land at the end and keep their correlated identities.
     match &observed[2].conversation()[3] {
-        ModelContextItem::AssistantText { item_key, text } => {
+        ModelContextItem::AssistantText {
+            item_key,
+            text,
+            reasoning,
+        } => {
             assert_eq!(item_key.as_str(), "item-2");
             assert_eq!(text.as_str(), "done");
+            assert_eq!(reasoning, &None);
         }
         other => panic!("unexpected last item {other:?}"),
     }

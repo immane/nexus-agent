@@ -2,13 +2,13 @@
 
 ## Status snapshot
 
-- Working tree: clean at `main`; see `git log` for the latest verified hash.
-- Implementation stage: **M0 test-only**, except two deliberately narrow
-  real boundaries: an OpenAI-compatible chat adapter over plain HTTP
-  (`nexus-openai`, no TLS, no streaming yet) and a root-jailed file reader
-  (`nexus-tools`, opt-in). No plugins, no durable history.
+- See `git status` and `git log` for the current worktree and revision.
+- Implementation stage: **M0 test-only with opt-in live integrations**:
+  an incremental OpenAI-compatible chat adapter (`nexus-openai`, HTTP or
+  HTTPS through the system `openssl` TLS bridge) and root-jailed file
+  reads/writes (`nexus-tools`). No plugins, no durable history.
   **M0 acceptance is NOT complete** (see `docs/tasks/04-m0-gates.md`).
-- Last verified gates (macOS, stable toolchain per `rust-toolchain.toml`):
+- Historical gates (macOS; these counts predate the live integration fixes):
   - Rust: **1898 passed / 0 failed** across 138 test targets
   - Python (`tools/perf`): **253 passed** (1 Linux-only test skipped on macOS)
   - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo doc --workspace -- -D warnings`: clean
@@ -46,11 +46,11 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline
 | `crates/nexus-validation` | Closed M0 JSON/schema validator for tool arguments |
 | `crates/nexus-config` | Typed user config (providers, models, favourites, recents) + file persistence |
 | `crates/nexus-fakes` | Scripted deterministic provider/tool/store doubles (test-only) |
-| `crates/nexus-tools` | Real root-jailed file reader (`host_read`), opt-in |
-| `crates/nexus-openai` | Real OpenAI-compatible chat adapter over plain HTTP (no TLS) |
+| `crates/nexus-tools` | Opt-in root-jailed `host_read` and approval-gated `host_write` |
+| `crates/nexus-openai` | Streaming OpenAI-compatible chat adapter over HTTP/HTTPS |
 | `crates/nexus-runtime` | Single-active-run loop: policy, cancellation, quarantine, ordered events |
 | `crates/nexus-server` | Loopback HTTP frontend: sessions, SSE streams, config-gated selection |
-| `crates/nexus-tui` | Test-only TUI shell over scripted fakes |
+| `crates/nexus-tui` | TUI with configured live providers or scripted demo wiring |
 | `crates/nexus-headless` | One-shot machine-output runner over scripted fakes |
 | `crates/nexus-integration` | Cross-crate behavior and regression tests |
 | `tools/perf` | stdlib-only startup/readiness measurement harnesses + their tests |
@@ -63,14 +63,44 @@ cargo run -p nexus-headless --locked --offline -- "hello"
 cargo run -p nexus-tui --locked --offline
 ```
 
-Both print a test-only banner: no credentials, no network, no stored sessions.
+The headless binary uses fakes. The TUI uses fakes only when no configured
+model is selected; a configured model can send paid requests. Neither has
+durable session storage.
+
+## Use a configured model in the TUI
+
+Configure a provider and model in the user configuration, with credentials
+referenced by environment-variable name, not embedded in JSON. Export that
+variable **before starting the TUI in the same shell**. No server is needed.
+
+```sh
+cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project
+```
+
+With `--tools-root`, `host_read` reads real UTF-8 files and `host_write`
+creates or replaces real files. Writes require exact-call approval (`a` in
+the approval card); parent directories must already exist. Without the
+flag, tools remain scripted and do not modify files. Directory listing,
+search, and shell execution are not implemented. The path jail is not an
+OS sandbox and retains a check/open race against concurrent path changes.
+
+Changing the environment in another shell does not change a running TUI's
+credentials; restart it after changing credentials.
+
+Completed exchanges are retained in memory for follow-up tasks within the
+same session. `/session new` starts isolated context. Retention is bounded
+by context-item limits and 1 MiB per runtime; oldest complete exchanges are
+evicted when necessary, never individual tool-call/result pairs. Failed,
+cancelled, and limited runs are not retained—even if a tool already changed
+a file. Cancellation is not rollback; reread affected files before relying
+on their state. Restarting loses this history; disk restore is not implemented.
 
 ## Test a real LLM (local Ollama, end to end)
 
 The deterministic proof lives in `cargo test -p nexus-openai` (loopback
-mock, no network). To run a live model, only plain-HTTP
-OpenAI-compatible endpoints work (e.g. Ollama); `https` is refused
-explicitly because this transport has no TLS.
+mock, no external API). To run a live model, use an OpenAI-compatible
+endpoint such as Ollama. HTTPS endpoints require the system `openssl`
+executable; certificate and hostname verification remain enabled.
 
 ```sh
 ollama pull llama3.1
@@ -112,9 +142,9 @@ curl -sN localhost:8471/sessions/$SID/runs/$RID/events
 Expect the model's text, then a terminal `completed`. If the model
 calls a tool, an `approval-required` event appears: approve it with its
 exact ids (`POST .../approve {"approval":"...","call":"..."}`) and the
-run continues. Real file reads additionally need
-`--tools real --tools-root <dir>`: reads outside the root are denied
-before execution.
+run continues. Real file tools additionally need
+`--tools real --tools-root <dir>`: reads are automatic within policy scope,
+writes require approval, and paths outside the root are refused.
 
 Sanity checks that need no model at all:
 

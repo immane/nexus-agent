@@ -178,9 +178,11 @@ fn assistant_text_bounds_key_and_text_and_counts_both() {
         ModelContextItem::AssistantText {
             item_key,
             text: carried,
+            reasoning,
         } => {
             assert_eq!(item_key.as_str(), key);
             assert_eq!(carried.as_str(), text);
+            assert_eq!(reasoning, &None);
         }
         other => panic!("unexpected item {other:?}"),
     }
@@ -224,10 +226,12 @@ fn assistant_call_bounds_refs_and_counts_owned_metadata() {
             item_key,
             provider_ref,
             call: carried,
+            reasoning,
         } => {
             assert_eq!(item_key.as_str(), key);
             assert_eq!(provider_ref.as_str(), reference);
             assert_eq!(carried, &call);
+            assert_eq!(reasoning, &None);
         }
         other => panic!("unexpected item {other:?}"),
     }
@@ -343,9 +347,14 @@ fn refs_use_byte_bounds_and_preserve_text_exactly() {
     // happens at this boundary.
     let item = ModelContextItem::assistant_text(" item-1 ", " hällo ").expect("spaced text builds");
     match &item {
-        ModelContextItem::AssistantText { item_key, text } => {
+        ModelContextItem::AssistantText {
+            item_key,
+            text,
+            reasoning,
+        } => {
             assert_eq!(item_key.as_str(), " item-1 ");
             assert_eq!(text.as_str(), " hällo ");
+            assert_eq!(reasoning, &None);
         }
         other => panic!("unexpected item {other:?}"),
     }
@@ -628,10 +637,12 @@ fn assistant_call_and_tool_result_preserve_correlated_identities() {
             item_key,
             provider_ref,
             call: carried,
+            reasoning,
         } => {
             assert_eq!(item_key.as_str(), "item-1");
             assert_eq!(provider_ref.as_str(), "prov-ref-1");
             assert_eq!(carried, &call);
+            assert_eq!(reasoning, &None);
         }
         other => panic!("unexpected item {other:?}"),
     }
@@ -707,9 +718,14 @@ fn with_conversation_replaces_previous_items_and_accepts_empty() {
     assert_eq!(second.profile(), "test-profile");
     assert_eq!(second.output_budget_bytes(), OUTPUT_BUDGET);
     match &second.conversation()[0] {
-        ModelContextItem::AssistantText { item_key, text } => {
+        ModelContextItem::AssistantText {
+            item_key,
+            text,
+            reasoning,
+        } => {
             assert_eq!(item_key.as_str(), "item-1");
             assert_eq!(text.as_str(), "second");
+            assert_eq!(reasoning, &None);
         }
         other => panic!("stale item survived replacement: {other:?}"),
     }

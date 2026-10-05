@@ -113,6 +113,24 @@ fn base_request() -> ModelRequest {
     .expect("request builds")
 }
 
+fn result_for(call: &str, item: &str, provider_ref: &str) -> ModelContextItem {
+    ModelContextItem::tool_result(
+        CallId::new(call).unwrap(),
+        item,
+        provider_ref,
+        ToolId::new("host_read", M0_REVISION).unwrap(),
+        ToolOutcome::new(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownNotApplied,
+            Evidence::HostObserved,
+            "observed result",
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
 fn failed(events: Vec<ProviderEvent>) -> (ErrorCategory, nexus_core::RetryGuidance) {
     assert_eq!(events.len(), 1, "failures are single events: {events:?}");
     match &events[0] {
@@ -763,4 +781,337 @@ fn incremental_sink_sees_fragments_as_chunks_arrive() {
         "split lines still stream: {seen:?}"
     );
     assert_eq!(finished(&batch).reason(), FinishReason::Stop);
+}
+
+/// Shape-only diagnostics name the failing field without echoing values.
+fn failed_message(events: Vec<ProviderEvent>) -> (ErrorCategory, String) {
+    assert_eq!(events.len(), 1, "failures are single events: {events:?}");
+    match &events[0] {
+        ProviderEvent::Failed(error) => (error.category(), error.message().to_owned()),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn malformed_tool_calls_report_which_shape_failed() {
+    for (body, category, message) in [
+        (
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"host_read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ErrorCategory::InvalidInput,
+            "provider reply tool call is missing an id",
+        ),
+        (
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c","type":"function"}]},"finish_reason":"tool_calls"}]}"#,
+            ErrorCategory::InvalidInput,
+            "provider reply tool call is missing a function",
+        ),
+        (
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ErrorCategory::InvalidInput,
+            "provider reply tool call name is invalid",
+        ),
+        (
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"host_read","arguments":{"path":"src"}}}]},"finish_reason":"tool_calls"}]}"#,
+            ErrorCategory::InvalidInput,
+            "provider reply tool call arguments are invalid",
+        ),
+        (
+            r#"{"choices":[{"message":{"role":"assistant","tool_calls":{"id":"c"}},"finish_reason":"tool_calls"}]}"#,
+            ErrorCategory::InvalidInput,
+            "provider reply tool calls are invalid",
+        ),
+    ] {
+        let (base, _) = serve(200, body, Duration::ZERO);
+        let (actual_category, actual_message) =
+            failed_message(provider(&base).stream(&base_request(), &live_context()));
+        assert_eq!(actual_category, category, "{body}");
+        assert_eq!(actual_message, message, "{body}");
+        assert!(
+            !actual_message.contains("host_read") && !actual_message.contains("src"),
+            "diagnostics never echo vendor values: {actual_message}"
+        );
+    }
+}
+
+#[test]
+fn sse_object_arguments_report_the_field_not_generic_json() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-9\",\"function\":{\"name\":\"host_read\",\"arguments\":{\"path\":\"src\"}}}]},\"finish_reason\":null}]}\n\n",
+        "data: [DONE]\n",
+    );
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let (category, message) =
+        failed_message(provider(&base).stream(&base_request(), &live_context()));
+    assert_eq!(category, ErrorCategory::Protocol);
+    assert_eq!(message, "provider reply tool call arguments are invalid");
+}
+
+#[test]
+fn sse_idless_fragments_report_the_missing_id() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"host_read\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n",
+    );
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let (category, message) =
+        failed_message(provider(&base).stream(&base_request(), &live_context()));
+    assert_eq!(category, ErrorCategory::Protocol);
+    assert_eq!(message, "provider reply tool call is missing an id");
+}
+
+#[test]
+fn http_status_classes_point_in_different_directions() {
+    for (status, category, message) in [
+        (
+            400,
+            ErrorCategory::InvalidInput,
+            "provider request was rejected",
+        ),
+        (
+            422,
+            ErrorCategory::InvalidInput,
+            "provider request was rejected",
+        ),
+        (
+            402,
+            ErrorCategory::PermissionDenied,
+            "provider payment is required",
+        ),
+    ] {
+        let (base, _) = serve(status, r#"{"error":"nope"}"#, Duration::ZERO);
+        let events = provider(&base).stream(&base_request(), &live_context());
+        assert_eq!(events.len(), 1, "failures are single events: {events:?}");
+        match &events[0] {
+            ProviderEvent::Failed(error) => {
+                assert_eq!(error.category(), category, "{status}");
+                assert_eq!(error.message(), message, "{status}");
+            }
+            other => panic!("expected a failure for {status}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn sse_reasoning_fragments_accumulate_withheld_from_sink() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"again\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n",
+    );
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    let reasoning: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::ReasoningDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["think again".to_owned()]);
+    assert_eq!(finished(&events).reason(), FinishReason::Stop);
+}
+
+#[test]
+fn json_reasoning_content_maps_to_a_reasoning_event() {
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi","reasoning_content":"because"},"finish_reason":"stop"}]}"#;
+    let (base, _) = serve(200, body, Duration::ZERO);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ProviderEvent::ReasoningDelta { text } if text == "because"
+        )),
+        "reasoning is recorded: {events:?}"
+    );
+    assert_eq!(finished(&events).reason(), FinishReason::Stop);
+}
+
+#[test]
+fn request_echoes_recorded_reasoning_on_assistant_messages() {
+    use nexus_core::{CallId, M0_REVISION, ModelContextItem, ToolId};
+    let call = nexus_core::ToolCall::new(
+        RunId::new("run-1").expect("valid"),
+        nexus_core::TurnId::new("turn-1").expect("valid"),
+        CallId::new("call-1").expect("valid"),
+        ToolId::new("host_read", M0_REVISION).expect("valid"),
+        nexus_core::NormalizedArgs::new(r#"{"path":"src"}"#).expect("valid args build"),
+    );
+    let request = base_request()
+        .with_conversation(vec![
+            ModelContextItem::assistant_text_with_reasoning(
+                "item-0",
+                "reading",
+                Some("trace-a".to_owned()),
+            )
+            .expect("text builds"),
+            ModelContextItem::assistant_call_with_reasoning(
+                "item-1",
+                "prov-9",
+                call,
+                Some("trace-a".to_owned()),
+            )
+            .expect("call builds"),
+            result_for("call-1", "item-1", "prov-9"),
+        ])
+        .expect("conversation attaches");
+    let (base, served) = serve(200, &stop_body("x"), Duration::ZERO);
+    let _ = provider(&base).stream(&request, &live_context());
+    let raw = served.request.lock().expect("request readable").clone();
+    let text = String::from_utf8_lossy(&raw);
+    let (_, body) = text.split_once("\r\n\r\n").expect("framed request");
+    let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+    let messages = payload["messages"].as_array().expect("messages");
+    // One turn's text plus its call merge into a single assistant message.
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["reasoning_content"], "trace-a");
+    assert_eq!(messages[0]["content"], "reading");
+    assert_eq!(messages[0]["tool_calls"][0]["id"], "prov-9");
+}
+
+#[test]
+fn consecutive_turn_calls_merge_per_turn_never_across_results() {
+    use nexus_core::{CallId, M0_REVISION, ModelContextItem, ToolId};
+    fn read_call(call: &str) -> nexus_core::ToolCall {
+        nexus_core::ToolCall::new(
+            RunId::new("run-1").expect("valid"),
+            nexus_core::TurnId::new("turn-1").expect("valid"),
+            CallId::new(call).expect("valid"),
+            ToolId::new("host_read", M0_REVISION).expect("valid"),
+            nexus_core::NormalizedArgs::new(r#"{"path":"src"}"#).expect("valid args build"),
+        )
+    }
+    let request = base_request()
+        .with_conversation(vec![
+            ModelContextItem::assistant_text("item-0", "first").expect("text builds"),
+            ModelContextItem::assistant_call("item-1", "prov-1", read_call("call-1"))
+                .expect("call builds"),
+            ModelContextItem::assistant_call("item-2", "prov-2", read_call("call-2"))
+                .expect("call builds"),
+            result_for("call-1", "item-1", "prov-1"),
+            result_for("call-2", "item-2", "prov-2"),
+        ])
+        .expect("conversation attaches");
+    let (base, served) = serve(200, &stop_body("x"), Duration::ZERO);
+    let _ = provider(&base).stream(&request, &live_context());
+    let raw = served.request.lock().expect("request readable").clone();
+    let text = String::from_utf8_lossy(&raw);
+    let (_, body) = text.split_once("\r\n\r\n").expect("framed request");
+    let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+    let messages = payload["messages"].as_array().expect("messages");
+    // Text plus both calls of one turn: one assistant message, vendor
+    // pairing rule satisfied (tool responses follow it directly).
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "assistant");
+    assert_eq!(messages[0]["content"], "first");
+    let calls = messages[0]["tool_calls"].as_array().expect("calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["id"], "prov-1");
+    assert_eq!(calls[1]["id"], "prov-2");
+}
+
+#[test]
+fn vendor_rejection_text_is_not_echoed_even_without_secret_markers() {
+    let body = r#"{"error":{"message":"messages[3].reasoning_content is required in thinking mode","type":"invalid_request_error"}}"#;
+    let (base, _) = serve(400, body, Duration::ZERO);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    assert_eq!(events.len(), 1, "failures are single events: {events:?}");
+    match &events[0] {
+        ProviderEvent::Failed(error) => {
+            assert_eq!(error.category(), ErrorCategory::InvalidInput);
+            assert!(
+                error
+                    .correlation()
+                    .iter()
+                    .any(|(key, value)| key == "http_status" && value == "400")
+            );
+            assert_eq!(error.message(), "provider request was rejected");
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn vendor_rejection_without_usable_text_falls_back_to_static() {
+    for body in [
+        r#"{"error":{"message":"Rejected confidential prompt: customer medical record and /private/client-contract.txt"}}"#,
+        r#"{"error":"nope"}"#,
+        r#"{"error":{"message":""}}"#,
+        r#"{"ok":true}"#,
+        "not json at all",
+    ] {
+        let (base, _) = serve(422, body, Duration::ZERO);
+        let events = provider(&base).stream(&base_request(), &live_context());
+        assert_eq!(events.len(), 1, "failures are single events: {events:?}");
+        match &events[0] {
+            ProviderEvent::Failed(error) => {
+                assert_eq!(error.category(), ErrorCategory::InvalidInput, "{body}");
+                assert_eq!(error.message(), "provider request was rejected", "{body}");
+            }
+            other => panic!("expected a failure for {body}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn malformed_conversation_pairing_is_rejected_before_network_io() {
+    let call = ToolCall::new(
+        RunId::new("run-1").unwrap(),
+        TurnId::new("turn-1").unwrap(),
+        CallId::new("call-1").unwrap(),
+        ToolId::new("host_read", M0_REVISION).unwrap(),
+        NormalizedArgs::new("{}").unwrap(),
+    );
+    let assistant = ModelContextItem::assistant_call("item-1", "prov-1", call).unwrap();
+    let result = result_for("call-1", "item-1", "prov-1");
+    for conversation in [
+        vec![assistant.clone()],
+        vec![result.clone(), assistant.clone()],
+        vec![
+            assistant.clone(),
+            ModelContextItem::user_text("interrupt").unwrap(),
+            result.clone(),
+        ],
+        vec![
+            assistant.clone(),
+            result_for("different", "item-1", "prov-1"),
+        ],
+        vec![
+            assistant.clone(),
+            result_for("call-1", "different", "prov-1"),
+        ],
+        vec![
+            assistant.clone(),
+            result_for("call-1", "item-1", "different"),
+        ],
+        vec![assistant.clone(), result.clone(), result.clone()],
+        vec![assistant.clone(), assistant.clone(), result.clone()],
+    ] {
+        let request = base_request().with_conversation(conversation).unwrap();
+        let (category, message) =
+            failed_message(provider("http://127.0.0.1:9/v1").stream(&request, &live_context()));
+        assert_eq!(category, ErrorCategory::Protocol);
+        assert_eq!(
+            message,
+            "model conversation has invalid tool response ordering"
+        );
+    }
+}
+
+#[test]
+fn sse_rejects_choice_payload_after_finish_and_unindexed_tool_fragments() {
+    for body in [
+        concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n"
+        ),
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"host_read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n",
+    ] {
+        let (base, _) = serve_raw(&sse_head(body.len()), body);
+        assert_eq!(
+            failed(provider(&base).stream(&base_request(), &live_context())).0,
+            ErrorCategory::Protocol
+        );
+    }
 }

@@ -393,6 +393,27 @@ async fn provider_failure_after_usage_order_violation_keeps_provider_error() {
 }
 
 #[tokio::test]
+async fn failure_event_cannot_mask_invalid_terminal_ordering() {
+    for events in [
+        vec![
+            failed(ErrorCategory::Timeout, "provider timed out"),
+            stop_turn(final_usage(None, None)),
+        ],
+        vec![
+            stop_turn(final_usage(None, None)),
+            failed(ErrorCategory::Timeout, "provider timed out"),
+        ],
+    ] {
+        let (_, finished) = run_script("invalid-terminal-order", vec![events]).await;
+        assert_eq!(finished.outcome(), RunOutcome::Failed);
+        assert_eq!(
+            finished.error().unwrap().category(),
+            ErrorCategory::Protocol
+        );
+    }
+}
+
+#[tokio::test]
 async fn cancelled_provider_failure_after_usage_order_violation_stays_cancelled() {
     let committed = final_usage(Some(10), Some(8));
     let late = provisional(Some(11), Some(9));

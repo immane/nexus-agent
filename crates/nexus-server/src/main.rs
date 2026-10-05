@@ -1,8 +1,10 @@
 //! `nexus-server` binary: loopback HTTP frontend for the agent runtime.
 //!
-//! TEST-ONLY demo. Binds `127.0.0.1` only and serves scripted fakes: any
-//! local process can submit, approve, and cancel. There is no
-//! authentication. Do not expose this server to a network.
+//! TEST-ONLY demo. Binds `127.0.0.1` only: any local process can submit,
+//! approve, and cancel. There is no authentication. Sessions created
+//! without a provider selection serve scripted fakes; sessions bound to
+//! a configured provider use the real OpenAI-compatible adapter.
+//! Do not expose this server to a network.
 
 #![forbid(unsafe_code)]
 
@@ -24,9 +26,11 @@ fn usage() -> ! {
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
     eprintln!(
-        "  --tools real executes host_read against --tools-root (default: working directory);"
+        "  --tools real executes host_read and host_write against --tools-root (default: working directory);"
     );
-    eprintln!("  mutations stay scripted. The default --tools fake touches no real files.");
+    eprintln!(
+        "  writes still need an approval grant. The default --tools fake touches no real files."
+    );
     std::process::exit(2);
 }
 
@@ -137,7 +141,19 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
+    // The banner describes the default wiring, not every session: tools
+    // follow the startup mode, while each session's provider is chosen at
+    // creation (unbound sessions serve the demo script, bound sessions use
+    // the real adapter). Reporting only the provider count keeps operator
+    // output free of configuration values. Counted before `set_config`
+    // moves the document into the server.
+    let configured = config.providers().len();
     server.set_config(config, path);
+    let providers = if configured == 0 {
+        "no configured providers (all sessions serve the demo script)".to_owned()
+    } else {
+        format!("{configured} configured provider(s) available for bound sessions")
+    };
     if tools_real {
         // Fail fast on an unreadable jail: a missing default working
         // directory and an explicit bad root are both startup errors.
@@ -150,11 +166,11 @@ fn main() {
             std::process::exit(1);
         }
         eprintln!(
-            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (real jailed reads at {root}, writes scripted, no auth; never expose)"
+            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (real jailed reads and writes at {root}, writes need approval, {providers}, no auth; never expose)"
         );
     } else {
         eprintln!(
-            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (scripted fakes, no auth; never expose)"
+            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (scripted fakes by default, {providers}, no auth; never expose)"
         );
     }
     let server = Arc::new(server);

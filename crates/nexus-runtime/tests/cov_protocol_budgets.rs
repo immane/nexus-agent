@@ -251,14 +251,6 @@ fn stop() -> ProviderEvent {
     ProviderEvent::TurnFinished(TurnFinished::new(FinishReason::Stop, final_usage(), None))
 }
 
-fn stop_with_continuation(continuation: ContinuationData) -> ProviderEvent {
-    ProviderEvent::TurnFinished(TurnFinished::new(
-        FinishReason::Stop,
-        final_usage(),
-        Some(continuation),
-    ))
-}
-
 fn tool_calls_terminal() -> ProviderEvent {
     ProviderEvent::TurnFinished(TurnFinished::new(
         FinishReason::ToolCalls,
@@ -308,17 +300,17 @@ fn batch_payload_budget_boundary_is_exact() {
     runtime.block_on(async {
         let limits = limits_with_output(MAX_BATCH_BYTES);
 
-        // Payload is exactly `item_key.len() + text.len()` == MAX_BATCH_BYTES.
-        let exact_text = "x".repeat(MAX_BATCH_BYTES - "item-0".len());
+        // Non-dispatching proposals isolate the aggregate payload cap from
+        // the separately lowered per-request text/output cap.
         let (mut bed, provider) = make_bed(
             limits,
-            vec![vec![text("item-0", &exact_text), stop()]],
+            vec![payload_batch(MAX_BATCH_BYTES, None)],
             vec![stop()],
         );
         let probe = submit_and_settle(&mut bed, &provider, "payload-exact").await;
         assert_eq!(
             probe.finished.outcome(),
-            RunOutcome::Completed,
+            RunOutcome::Refused,
             "a payload exactly at MAX_BATCH_BYTES is accepted"
         );
         assert!(
@@ -326,17 +318,40 @@ fn batch_payload_budget_boundary_is_exact() {
             "accepted batch has no error"
         );
 
-        // One more text byte crosses the same payload bound; the text budget
-        // is set above the payload bound so only the payload check can fire.
-        let over_text = "x".repeat(MAX_BATCH_BYTES - "item-0".len() + 1);
+        // One more proposal byte crosses only the aggregate payload bound.
         let (mut bed, provider) = make_bed(
             limits,
-            vec![vec![text("item-0", &over_text), stop()]],
+            vec![payload_batch(MAX_BATCH_BYTES + 1, None)],
             vec![stop()],
         );
         let probe = submit_and_settle(&mut bed, &provider, "payload-over").await;
         assert_resource_limit_failure(&probe, "provider batch exceeds the payload byte budget");
     });
+}
+
+fn payload_batch(bytes: usize, continuation: Option<ContinuationData>) -> Vec<ProviderEvent> {
+    let overhead = continuation
+        .as_ref()
+        .map_or(0, |c| c.adapter().len() + c.scope().len() + c.bytes().len());
+    let metadata: usize = (0..16)
+        .map(|i| format!("item-{i}").len() + format!("ref-{i}").len() + "host_read".len())
+        .sum();
+    let arguments = bytes - overhead - metadata;
+    let mut events: Vec<_> = (0..16)
+        .map(|i| {
+            ready(
+                &format!("item-{i}"),
+                &format!("ref-{i}"),
+                &"x".repeat(arguments / 16 + usize::from(i < arguments % 16)),
+            )
+        })
+        .collect();
+    events.push(ProviderEvent::TurnFinished(TurnFinished::new(
+        FinishReason::Refusal,
+        Usage::new(None, None, UsageFinality::Final),
+        continuation,
+    )));
+    events
 }
 
 #[test]
@@ -498,31 +513,23 @@ fn terminal_continuation_counts_against_the_payload_budget() {
         // adapter label, scope label, and opaque bytes all count. The
         // continuation is compatible with the default provider identity and
         // profile scope, so the run completes.
-        let exact_text = "x".repeat(MAX_BATCH_BYTES - "item-0".len() - overhead);
         let (mut bed, provider) = make_bed(
             limits,
-            vec![vec![
-                text("item-0", &exact_text),
-                stop_with_continuation(continuation.clone()),
-            ]],
+            vec![payload_batch(MAX_BATCH_BYTES, Some(continuation.clone()))],
             vec![stop()],
         );
         let probe = submit_and_settle(&mut bed, &provider, "continuation-exact").await;
         assert_eq!(
             probe.finished.outcome(),
-            RunOutcome::Completed,
+            RunOutcome::Refused,
             "continuation bytes exactly at the payload bound are accepted"
         );
 
         // One more text byte crosses the payload bound, proving the
         // continuation bytes were summed into it.
-        let over_text = "x".repeat(MAX_BATCH_BYTES - "item-0".len() - overhead + 1);
         let (mut bed, provider) = make_bed(
             limits,
-            vec![vec![
-                text("item-0", &over_text),
-                stop_with_continuation(continuation),
-            ]],
+            vec![payload_batch(MAX_BATCH_BYTES + 1, Some(continuation))],
             vec![stop()],
         );
         let probe = submit_and_settle(&mut bed, &provider, "continuation-over").await;
@@ -532,13 +539,13 @@ fn terminal_continuation_counts_against_the_payload_budget() {
         // payload bound and completes; only the continuation pushed it over.
         let (mut bed, provider) = make_bed(
             limits,
-            vec![vec![text("item-0", &over_text), stop()]],
+            vec![payload_batch(MAX_BATCH_BYTES + 1 - overhead, None)],
             vec![stop()],
         );
         let probe = submit_and_settle(&mut bed, &provider, "continuation-control").await;
         assert_eq!(
             probe.finished.outcome(),
-            RunOutcome::Completed,
+            RunOutcome::Refused,
             "without continuation the same text fits the payload bound"
         );
     });

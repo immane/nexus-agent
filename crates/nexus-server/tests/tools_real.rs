@@ -95,8 +95,9 @@ fn spawn_real_tools(root: &std::path::Path) -> u16 {
     port
 }
 
-/// Reads SSE frames until the first tool outcome lands, then returns it.
-fn first_tool_outcome(port: u16, session: &str, run: &str) -> Value {
+/// Waits for the terminal event, then returns exactly `wanted` tool
+/// outcomes. Tool completion alone does not mean the run slot is idle.
+fn tool_outcomes(port: u16, session: &str, run: &str, wanted: usize) -> Vec<Value> {
     let mut stream = TcpStream::connect(address(port)).expect("loopback connects");
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
@@ -107,11 +108,12 @@ fn first_tool_outcome(port: u16, session: &str, run: &str) -> Value {
                 .as_bytes(),
         )
         .expect("SSE subscribes");
+    let mut outcomes = Vec::new();
     let mut buffer = Vec::new();
     loop {
         let mut chunk = [0u8; 4096];
         let read = stream.read(&mut chunk).expect("stream reads");
-        assert!(read > 0, "stream stays open until the first outcome");
+        assert!(read > 0, "stream stays open until run-finished");
         buffer.extend_from_slice(&chunk[..read]);
         while let Some(end) = buffer
             .windows(2)
@@ -126,7 +128,11 @@ fn first_tool_outcome(port: u16, session: &str, run: &str) -> Value {
                 };
                 let event: Value = serde_json::from_str(payload).expect("event JSON");
                 if event["kind"] == "tool-finished" {
-                    return event["detail"]["outcome"].clone();
+                    outcomes.push(event["detail"]["outcome"].clone());
+                }
+                if event["kind"] == "run-finished" {
+                    assert_eq!(outcomes.len(), wanted);
+                    return outcomes;
                 }
             }
         }
@@ -150,28 +156,33 @@ fn admitted_reads_execute_against_the_jailed_root() {
     let run = body["run"].as_str().expect("run id");
 
     // The scripted read call carries {"path":"a"}: the outcome content
-    // must be the real file bytes, which no double could know.
-    let outcome = first_tool_outcome(port, session, run);
-    assert_eq!(outcome["status"], "Succeeded");
-    assert_eq!(outcome["effect"], "KnownNotApplied");
-    assert_eq!(outcome["content"], "real-bytes-123");
-    assert_eq!(outcome["truncated"], false);
+    // must be the real file bytes, which no double could know. The
+    // scripted write call carries path-only {"path":"b"}: under the real
+    // writer's closed schema that is denied at admission, before any
+    // approval or execution, so no file is created.
+    let outcomes = tool_outcomes(port, session, run, 2);
+    let read = outcomes
+        .iter()
+        .find(|outcome| outcome["status"] == "Succeeded")
+        .expect("the admitted read succeeds");
+    assert_eq!(read["effect"], "KnownNotApplied");
+    assert_eq!(read["content"], "real-bytes-123");
+    assert_eq!(read["truncated"], false);
+    let denied = outcomes
+        .iter()
+        .find(|outcome| outcome["status"] == "Denied")
+        .expect("the path-only write is denied at admission");
+    assert_eq!(denied["effect"], "NotStarted");
+    assert!(!root.0.join("b").exists(), "a denied write creates nothing");
 
-    // The run is parked on the scripted write approval meanwhile: a second
-    // submit still reports the busy slot instead of disturbing it.
-    let (status, _) = post(
+    // Admission denied the write, so nothing parks on approval: the stop
+    // turn completes the run and the slot accepts new work.
+    let (status, body) = post(
         port,
         &format!("/sessions/{session}/runs"),
         r#"{"input":"second"}"#,
     );
-    assert_eq!(status, 409);
-
-    let (status, _) = post(
-        port,
-        &format!("/sessions/{session}/runs/{run}/cancel"),
-        "{}",
-    );
-    assert_eq!(status, 200);
+    assert_eq!(status, 201, "the slot is free after completion: {body}");
 }
 
 #[test]

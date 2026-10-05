@@ -28,6 +28,15 @@ nexus-config = { path = "../nexus-config" }
 # Scripted fakes, used ONLY by the `nexus-tui` binary demo wiring
 # (self-identifying M0-test stand-in, never real configuration).
 nexus-fakes = { path = "../nexus-fakes" }
+# Real OpenAI-compatible adapter, used ONLY when the active model resolves
+# to a configured provider with an available credential; otherwise the
+# binary serves the scripted demo above. Same adapter crate the server
+# binds provider-selected sessions to.
+nexus-openai = { path = "../nexus-openai" }
+# Real root-jailed file tools, used ONLY under an explicit `--tools-root`
+# jail (mirrors the server's `--tools real`); otherwise file tools stay
+# scripted. Reads are automatic; writes always need an approval grant.
+nexus-tools = { path = "../nexus-tools" }
 # Rationale: ratatui is the ONE terminal library for M0. Immediate-mode
 # rendering over a single crossterm backend covers the fixed composer,
 # bounded viewport, approval card, and footer with no extra fullscreen
