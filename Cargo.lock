@@ -234,6 +234,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-server"
+version = "0.1.0"
+dependencies = [
+ "nexus-core",
+ "nexus-fakes",
+ "nexus-runtime",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "nexus-tui"
 version = "0.1.0"
 dependencies = [
@@ -252,17 +263,6 @@ dependencies = [
  "nexus-core",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "nexus-web"
-version = "0.1.0"
-dependencies = [
- "nexus-core",
- "nexus-fakes",
- "nexus-runtime",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

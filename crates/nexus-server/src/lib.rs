@@ -1,4 +1,4 @@
-//! `nexus-web`: loopback HTTP frontend for the agent runtime (M0-test scope).
+//! `nexus-server`: loopback HTTP frontend for the agent runtime (M0-test scope).
 //!
 //! TEST-ONLY. This crate transports the same runtime command/event port the
 //! TUI uses over plain HTTP/1.1 on loopback, with server-sent events for the

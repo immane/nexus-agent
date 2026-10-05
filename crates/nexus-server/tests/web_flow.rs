@@ -122,7 +122,7 @@ fn spawn_server() -> u16 {
         .enable_time()
         .build()
         .expect("test executor builds");
-    let server = std::sync::Arc::new(nexus_web::Server::new(runtime.handle().clone()));
+    let server = std::sync::Arc::new(nexus_server::Server::new(runtime.handle().clone()));
     std::thread::spawn(move || {
         // The executor outlives the test: it is reclaimed at process exit,
         // after the last assertion runs.
