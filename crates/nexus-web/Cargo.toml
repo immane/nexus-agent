@@ -1,0 +1,22 @@
+[package]
+name = "nexus-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Core domain types plus the synchronous provider/tool ports. Behavior
+# (lifecycle, policy, events) lives in nexus-runtime; this crate only
+# transports its command/event port over loopback HTTP.
+nexus-core = { path = "../nexus-core" }
+# Single-active-run execution loop shared with the TUI and headless paths.
+nexus-runtime = { path = "../nexus-runtime" }
+# Scripted doubles for the test-only demo wiring (no real providers).
+nexus-fakes = { path = "../nexus-fakes" }
+# JSON for the HTTP API only: request parsing and event/snapshot encoding.
+# No HTTP framework is used; the transport is hand-rolled std I/O.
+serde_json = "1"
+# Async executor for driving the runtime port from blocking connection
+# threads: `rt` + `rt-multi-thread` (shared handle, concurrent block_on),
+# `time` (SSE heartbeats), `sync` (event channels), `macros` (`select!`).
+# No `net`/`io-util`: sockets stay plain blocking std I/O.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
