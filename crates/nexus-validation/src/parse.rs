@@ -197,3 +197,159 @@ impl<'de> Visitor<'de> for StrictValueVisitor {
         Ok(Value::Object(object))
     }
 }
+
+#[cfg(test)]
+mod cov_parse_private {
+    use super::*;
+    use nexus_core::{ErrorCategory, RetryGuidance};
+
+    fn strict(text: &str, max_depth: usize, max_nodes: usize) -> Result<Value, ParseFault> {
+        parse_strict(text, max_depth, max_nodes)
+    }
+
+    fn fault(text: &str, max_depth: usize, max_nodes: usize) -> ParseFault {
+        strict(text, max_depth, max_nodes).expect_err("strict parse must fail")
+    }
+
+    #[test]
+    fn strict_parse_returns_plain_values() {
+        let value = strict(r#"{"a":[1,2.5,"x",true,null,{}]}"#, 8, 32).expect("parses");
+        assert_eq!(value, serde_json::json!({"a":[1,2.5,"x",true,null,{}]}));
+    }
+
+    #[test]
+    fn strict_parse_rejects_duplicate_keys_per_level() {
+        for text in [
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":1,"a":1}"#,
+            r#"{"a":1,"\u0061":2}"#,
+            r#"{"o":{"k":1,"k":2}}"#,
+            r#"{"a":[{"k":1,"k":2}]}"#,
+        ] {
+            assert_eq!(fault(text, 8, 32), ParseFault::DuplicateKey, "{text:?}");
+        }
+        // A duplicate wins over trailing content: the walk fails before the
+        // end-of-input check runs.
+        assert_eq!(
+            fault(r#"{"a":1,"a":2} trailing"#, 8, 32),
+            ParseFault::DuplicateKey
+        );
+        // The same key may appear in sibling objects and sibling array items.
+        strict(r#"{"a":{"k":1},"b":{"k":2},"c":[{"k":3},{"k":4}]}"#, 8, 32)
+            .expect("duplicate names at different levels are legal");
+    }
+
+    #[test]
+    fn strict_parse_fault_taxonomy() {
+        for text in [
+            "",
+            "   ",
+            "{",
+            "nul",
+            "{\"a\":1,}",
+            "{\"a\":01}",
+            "{\"a\":+1}",
+            "{\"a\":NaN}",
+            "{\"a\":1e999}",
+            "{\"a\":\"\\ud800\"}",
+            "{\"a\":1} x",
+            "{} {}",
+        ] {
+            assert_eq!(fault(text, 8, 64), ParseFault::Malformed, "{text:?}");
+        }
+        // Whitespace around the single value is not trailing content.
+        strict("  {\"a\":1} \n\t", 8, 64).expect("surrounding whitespace is accepted");
+    }
+
+    #[test]
+    fn strict_parse_depth_budget_is_exact() {
+        assert_eq!(fault("[[[]]]", 1, 64), ParseFault::DepthExceeded);
+        strict("[[[]]]", 2, 64).expect("depth at the budget parses");
+        assert_eq!(fault("{\"a\":{\"b\":1}}", 1, 64), ParseFault::DepthExceeded);
+        strict("{\"a\":{\"b\":1}}", 2, 64).expect("depth at the budget parses");
+        assert_eq!(fault("{\"a\":1}", 0, 64), ParseFault::DepthExceeded);
+        strict("{}", 0, 64).expect("the root value sits at depth zero");
+    }
+
+    #[test]
+    fn strict_parse_node_budget_is_exact() {
+        strict("[1,2]", 8, 3).expect("nodes at the budget parse");
+        assert_eq!(fault("[1,2]", 8, 2), ParseFault::NodeBudgetExceeded);
+        strict("1", 8, 1).expect("a scalar is one node");
+        assert_eq!(fault("{}", 8, 0), ParseFault::NodeBudgetExceeded);
+        strict("{}", 8, 1).expect("an empty object is one node");
+        strict("{\"a\":{}}", 8, 2).expect("two nested objects are two nodes");
+        assert_eq!(fault("{\"a\":{}}", 8, 1), ParseFault::NodeBudgetExceeded);
+    }
+
+    #[test]
+    fn strict_parse_reports_depth_before_nodes() {
+        // The depth check runs before the node counter, so a value that
+        // violates both budgets reports the depth fault.
+        assert_eq!(fault("{\"a\":1}", 0, 1), ParseFault::DepthExceeded);
+    }
+
+    #[test]
+    fn faults_map_to_argument_errors() {
+        let cases = [
+            (
+                ParseFault::Malformed,
+                ErrorCategory::InvalidInput,
+                "arguments are not valid JSON",
+            ),
+            (
+                ParseFault::DuplicateKey,
+                ErrorCategory::InvalidInput,
+                "arguments contain a duplicate object key",
+            ),
+            (
+                ParseFault::DepthExceeded,
+                ErrorCategory::ResourceLimit,
+                "argument depth budget exhausted",
+            ),
+            (
+                ParseFault::NodeBudgetExceeded,
+                ErrorCategory::ResourceLimit,
+                "argument node budget exhausted",
+            ),
+        ];
+        for (fault, category, message) in cases {
+            let error = fault.into_argument_error();
+            assert_eq!(error.category(), category, "{message}");
+            assert_eq!(error.message(), message);
+            assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        }
+    }
+
+    #[test]
+    fn faults_map_to_schema_errors() {
+        let cases = [
+            (
+                ParseFault::Malformed,
+                ErrorCategory::InvalidInput,
+                "schema is not valid JSON",
+            ),
+            (
+                ParseFault::DuplicateKey,
+                ErrorCategory::InvalidInput,
+                "schema contains a duplicate object key",
+            ),
+            (
+                ParseFault::DepthExceeded,
+                ErrorCategory::ResourceLimit,
+                "schema depth budget exhausted",
+            ),
+            (
+                ParseFault::NodeBudgetExceeded,
+                ErrorCategory::ResourceLimit,
+                "schema node budget exhausted",
+            ),
+        ];
+        for (fault, category, message) in cases {
+            let error = fault.into_schema_error();
+            assert_eq!(error.category(), category, "{message}");
+            assert_eq!(error.message(), message);
+            assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        }
+    }
+}

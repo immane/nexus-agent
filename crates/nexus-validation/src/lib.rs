@@ -181,3 +181,49 @@ pub(crate) fn limit_error(message: &'static str) -> AgentError {
     )
     .expect("static safe validation message builds")
 }
+
+#[cfg(test)]
+mod cov_lib_private {
+    use nexus_core::{ErrorCategory, Limits, RetryGuidance};
+
+    use super::{MAX_ARG_BYTES, check_arg_budget, input_error, limit_error};
+
+    #[test]
+    fn hard_arg_maximum_equals_the_core_m0_assembly_budget() {
+        assert_eq!(MAX_ARG_BYTES, Limits::M0_TEST_ARG_ASSEMBLY_BYTES);
+        assert_eq!(MAX_ARG_BYTES, 65_536);
+    }
+
+    #[test]
+    fn check_arg_budget_accepts_exactly_one_through_the_hard_maximum() {
+        assert!(check_arg_budget(1).is_ok());
+        assert!(check_arg_budget(MAX_ARG_BYTES).is_ok());
+        for budget in [0, MAX_ARG_BYTES + 1, usize::MAX] {
+            let error = check_arg_budget(budget).expect_err("budget must be rejected");
+            assert_eq!(error.category(), ErrorCategory::InvalidInput);
+            assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        }
+        assert!(
+            check_arg_budget(0)
+                .unwrap_err()
+                .message()
+                .contains("nonzero")
+        );
+        assert!(
+            check_arg_budget(MAX_ARG_BYTES + 1)
+                .unwrap_err()
+                .message()
+                .contains("hard maximum")
+        );
+    }
+
+    #[test]
+    fn static_error_helpers_pin_their_categories() {
+        let invalid = input_error("invalid");
+        let limit = limit_error("limit");
+        assert_eq!(invalid.category(), ErrorCategory::InvalidInput);
+        assert_eq!(limit.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(invalid.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(limit.retry(), RetryGuidance::DoNotRetry);
+    }
+}
