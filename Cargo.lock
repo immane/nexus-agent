@@ -233,6 +233,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-openai"
+version = "0.1.0"
+dependencies = [
+ "nexus-config",
+ "nexus-core",
+ "serde_json",
+]
+
+[[package]]
 name = "nexus-runtime"
 version = "0.1.0"
 dependencies = [
@@ -249,6 +258,7 @@ dependencies = [
  "nexus-config",
  "nexus-core",
  "nexus-fakes",
+ "nexus-openai",
  "nexus-runtime",
  "nexus-tools",
  "serde_json",

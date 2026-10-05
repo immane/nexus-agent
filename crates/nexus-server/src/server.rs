@@ -168,6 +168,41 @@ pub struct Server {
     tools_mode: ToolsMode,
 }
 
+/// Session creation failure with its HTTP status and static diagnostic.
+/// Rejected input never echoes caller text.
+pub struct SessionError {
+    status: u16,
+    message: &'static str,
+}
+
+impl SessionError {
+    fn new(status: u16, message: &'static str) -> Self {
+        Self { status, message }
+    }
+
+    /// Returns the HTTP status for this failure.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Returns the static diagnostic.
+    #[must_use]
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+
+    /// Maps back to a domain error for the legacy constructor path.
+    fn into_agent_error(self) -> nexus_core::AgentError {
+        nexus_core::AgentError::new(
+            nexus_core::ErrorCategory::InvalidInput,
+            self.message,
+            nexus_core::RetryGuidance::DoNotRetry,
+        )
+        .expect("static safe session message builds")
+    }
+}
+
 impl Server {
     /// Creates shared state around the Tokio handle used for `block_on`.
     ///
@@ -213,6 +248,27 @@ impl Server {
     /// Creates a session with a fresh demo-wired runtime and returns its
     /// token. Wiring failures are startup-class errors, never hung runs.
     pub fn create_session(&self) -> Result<String, nexus_core::AgentError> {
+        self.create_session_with(None, None)
+            .map_err(|error| error.into_agent_error())
+    }
+
+    /// Creates a session, optionally bound to a configured provider and
+    /// model. Without a selection the session serves the demo script;
+    /// with one it serves the real OpenAI-compatible adapter while tools
+    /// follow the server tool mode. Unknown identities fail before any
+    /// run is minted; a missing credential fails without network touch.
+    pub fn create_session_with(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<String, SessionError> {
+        if provider.is_none() && model.is_some() {
+            return Err(SessionError::new(400, "selected model needs a provider"));
+        }
+        let provider = match provider {
+            None => None,
+            Some(id) => Some(self.select_provider(id, model)?),
+        };
         let n = self.next_session.fetch_add(1, Ordering::SeqCst);
         let token = format!("sess-web-{n}");
         let session = SessionId::new(&token).expect("counter session id is valid");
@@ -221,19 +277,25 @@ impl Server {
             policy: Policy::m0_test(),
             has_approval_handler: true,
         };
-        let provider = Arc::new(PerRunProvider::new());
+        let provider: Arc<dyn nexus_core::ProviderPort + Send + Sync> = match provider {
+            Some(adapter) => Arc::new(adapter),
+            None => Arc::new(PerRunProvider::new()),
+        };
         let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = match &self.tools_mode {
             ToolsMode::Fakes => vec![
                 Arc::new(FakeTool::read_only()),
                 Arc::new(FakeTool::mutation()),
             ],
             ToolsMode::RealFiles { root } => vec![
-                Arc::new(ScopedReader::with_root(root)?),
+                Arc::new(
+                    ScopedReader::with_root(root)
+                        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+                ),
                 Arc::new(FakeTool::mutation()),
             ],
         };
-        let (runtime, streams): (Runtime, EventStreams) =
-            Runtime::try_new(config, provider, tools)?;
+        let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)
+            .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
         let entry = Arc::new(Session {
             session,
             runtime: Mutex::new(runtime),
@@ -247,6 +309,43 @@ impl Server {
             .expect("sessions lockable")
             .insert(token.clone(), entry);
         Ok(token)
+    }
+
+    /// Resolves a configured provider plus an optional model override to
+    /// a live adapter. The credential resolves here, before any socket
+    /// opens; unknown identities and model/provider mismatches fail with
+    /// static diagnostics.
+    fn select_provider(
+        &self,
+        id: &str,
+        model: Option<&str>,
+    ) -> Result<nexus_openai::OpenAiProvider, SessionError> {
+        let unknown_provider = || SessionError::new(400, "selected provider is unknown");
+        let profile = {
+            let config = self.config.lock().expect("config lockable");
+            let profile = config.provider(id).ok_or_else(unknown_provider)?.clone();
+            match model {
+                None => (profile, None),
+                Some(name) => {
+                    let entry = config
+                        .model(name)
+                        .ok_or_else(|| SessionError::new(400, "selected model is unknown"))?;
+                    if entry.provider != id {
+                        return Err(SessionError::new(
+                            400,
+                            "selected model belongs to another provider",
+                        ));
+                    }
+                    (profile, Some(entry.name.clone()))
+                }
+            }
+        };
+        let (profile, vendor) = profile;
+        let vendor = vendor.unwrap_or(profile.default_model.clone());
+        nexus_config::resolve_credential(&profile.credential)
+            .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
+        nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
+            .map_err(|_| SessionError::new(400, "selected provider is invalid"))
     }
 
     /// Looks up a session by token.
@@ -285,16 +384,41 @@ impl Server {
         let body = &parsed;
         match route_path(&request.method, &request.path) {
             Route::Health => Some(json_response(200, &body_json(crate::json::health_json()))),
-            Route::CreateSession => match self.create_session() {
-                Ok(token) => Some(json_response(
-                    201,
-                    &body_json(serde_json::json!({ "session": token })),
-                )),
-                Err(_) => Some(json_response(
-                    500,
-                    &json::error_body("demo wiring is invalid"),
-                )),
-            },
+            Route::CreateSession => {
+                let field = |key: &str| match body.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(text)) => Ok(Some(text.as_str())),
+                    Some(_) => Err(json_response(
+                        400,
+                        &json::error_body("selected identity is invalid"),
+                    )),
+                };
+                let (provider, model) = match (field("provider"), field("model")) {
+                    (Ok(provider), Ok(model)) => (provider, model),
+                    _ => {
+                        return Some(json_response(
+                            400,
+                            &json::error_body("selected identity is invalid"),
+                        ));
+                    }
+                };
+                match self.create_session_with(provider, model) {
+                    Ok(token) => {
+                        let mut reply = serde_json::json!({ "session": token });
+                        if let Some(id) = provider {
+                            reply["provider"] = Value::String(id.to_owned());
+                        }
+                        if let Some(name) = model {
+                            reply["model"] = Value::String(name.to_owned());
+                        }
+                        Some(json_response(201, &body_json(reply)))
+                    }
+                    Err(error) => Some(json_response(
+                        error.status(),
+                        &json::error_body(error.message()),
+                    )),
+                }
+            }
             Route::SubmitRun { session } => {
                 self.with_session(session, |entry| self.submit_run(&entry, body))
             }
@@ -709,6 +833,14 @@ impl Server {
             // the run looks finished but its usage is not yet durable.
             if terminal {
                 self.record_model_use(run.as_str());
+                // The terminal may win the channel race while presentation
+                // traffic is still queued behind it (data and control are
+                // independent channels): forward everything already
+                // committed first, terminal last, so a select! ordering can
+                // never strand a predecessor event.
+                if Self::drain_predecessors(stream, &mut data, &mut control, &run).is_err() {
+                    break;
+                }
             }
             let frame = format!(
                 "id: {}\ndata: {}\n\n",
@@ -726,7 +858,41 @@ impl Server {
         None
     }
 
-    /// Records a finished run's selected model as recently used and saves
+    /// Forwards events already queued on either channel for this run. Called
+    /// with the terminal in hand but before publishing it, so predecessors
+    /// stranded by a channel race still precede it on the wire. Only the
+    /// caller knows which event is authoritative; everything drained here is
+    /// forwarded, including a duplicate terminal if one ever appears (the
+    /// runtime publishes exactly one, so its presence would itself be the
+    /// finding, never something to hide).
+    fn drain_predecessors(
+        stream: &mut TcpStream,
+        data: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
+        control: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
+        run: &RunId,
+    ) -> std::io::Result<()> {
+        loop {
+            let mut progressed = false;
+            for channel in [&mut *data, &mut *control] {
+                while let Ok(queued) = channel.try_recv() {
+                    progressed = true;
+                    if queued.run() != run {
+                        continue;
+                    }
+                    let frame = format!(
+                        "id: {}\ndata: {}\n\n",
+                        queued.seq(),
+                        crate::json::event_json(&queued)
+                    );
+                    stream.write_all(frame.as_bytes())?;
+                    stream.flush()?;
+                }
+            }
+            if !progressed {
+                return Ok(());
+            }
+        }
+    }
     /// the document. A run submitted without a model has no entry and is
     /// skipped without touching the configuration.
     ///

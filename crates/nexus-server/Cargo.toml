@@ -15,6 +15,10 @@ nexus-runtime = { path = "../nexus-runtime" }
 nexus-config = { path = "../nexus-config" }
 # Scripted doubles for the test-only demo wiring (no real providers).
 nexus-fakes = { path = "../nexus-fakes" }
+# OpenAI-compatible chat adapter for sessions bound to a configured
+# provider. Plain HTTP only; https needs a TLS transport that is out of
+# scope, and unknown usage stays unknown.
+nexus-openai = { path = "../nexus-openai" }
 # Real root-jailed file reader for opt-in `--tools real` sessions.
 # Mutations stay scripted; reads that escape the jail are denied.
 nexus-tools = { path = "../nexus-tools" }

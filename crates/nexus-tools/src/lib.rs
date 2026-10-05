@@ -1,6 +1,6 @@
 //! `nexus-tools`: real tool executors behind narrow filesystem jails.
 //!
-//! This crate owns the first real [`ToolPort`] implementation:
+//! This crate owns the first real [`nexus_core::ToolPort`] implementation:
 //! [`ScopedReader`], a read-only file reader registered as `host_read` at
 //! the M0 revision, so the existing scoped-read policy authorizes it
 //! automatically. Every path is resolved against one canonical root and

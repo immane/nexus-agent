@@ -11,9 +11,15 @@
 //! # Protocol (v1, unstable, test-only)
 //!
 //! - `GET /health` -> `{"status":"ok"}`.
-//! - `POST /sessions` -> `201 {"session": "<id>"}`. One [`Runtime`] per
+//! - `POST /sessions` -> `201 {"session": "<id>"}`. One
+//!   [`nexus_runtime::Runtime`] per
 //!   session: sessions never alias runs, calls, or approvals, and a second
-//!   session is never blocked by the first.
+//!   session is never blocked by the first. An optional
+//!   `{"provider": "<id>", "model": "<id>"}` body binds the session to a
+//!   configured provider served by the real OpenAI-compatible adapter;
+//!   without it the session serves the demo script. Unknown identities
+//!   fail before any run is minted, and a missing credential fails
+//!   without network touch.
 //! - `POST /sessions/{sid}/runs` with `{"input": "...", "profile?": "..."}`
 //!   -> `201 {"reply":"Accepted","run":"..."}` on acceptance,
 //!   `409` while the session's run slot is busy, `400` on invalid input.
