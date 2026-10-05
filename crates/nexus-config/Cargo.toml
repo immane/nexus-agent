@@ -1,0 +1,13 @@
+[package]
+name = "nexus-config"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Core domain errors only; the config model is its own typed layer.
+nexus-core = { path = "../nexus-core" }
+# Strict argument-text parsing reused for the config file: duplicate keys
+# never last-win, and byte/depth/node budgets bound the document.
+nexus-validation = { path = "../nexus-validation" }
+# JSON file format only: parsing plus canonical serialization for saves.
+serde_json = "1"

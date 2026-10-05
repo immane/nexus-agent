@@ -191,6 +191,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-config"
+version = "0.1.0"
+dependencies = [
+ "nexus-core",
+ "nexus-validation",
+ "serde_json",
+]
+
+[[package]]
 name = "nexus-core"
 version = "0.1.0"
 
