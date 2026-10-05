@@ -907,3 +907,400 @@ mod tests {
         validate_batch(&within, &limits()).expect("bounded continuation passes");
     }
 }
+
+#[cfg(test)]
+mod cov_protocol_private {
+    //! Coverage hardening for the private `validate_batch` turn-shape
+    //! contract: exactly one terminal event in final position, `Stop` and
+    //! `ToolCalls` agreement with candidates and progress, unambiguous
+    //! candidate identities, no text/call key collisions, and per-item
+    //! progress that neither regresses nor continues past completion.
+    //!
+    //! Rejections assert the exact static diagnostic so a different (but also
+    //! protocol-category) failure cannot silently satisfy the test. Each
+    //! rejection is paired with the nearest accepted shape, and every
+    //! dispatch-safety check is confirmed inert for non-dispatching terminals,
+    //! whose candidates and progress the caller discards.
+
+    use super::*;
+    use nexus_core::{CallCandidate, TurnFinished};
+
+    fn limits() -> Limits {
+        Limits::m0_test()
+    }
+
+    fn final_usage() -> Usage {
+        Usage::new(None, None, UsageFinality::Final)
+    }
+
+    fn text(item: &str, body: &str) -> ProviderEvent {
+        ProviderEvent::TextDelta {
+            item_key: item.to_owned(),
+            text: body.to_owned(),
+        }
+    }
+
+    fn delta(item: &str, assembled_bytes: usize) -> ProviderEvent {
+        ProviderEvent::ToolCallDelta {
+            item_key: item.to_owned(),
+            assembled_bytes,
+        }
+    }
+
+    fn ready(item: &str, provider_ref: &str, args: &str) -> ProviderEvent {
+        ProviderEvent::ToolCallReady(
+            CallCandidate::new(item, provider_ref, "host_read", args).expect("candidate builds"),
+        )
+    }
+
+    fn finished(reason: FinishReason) -> ProviderEvent {
+        ProviderEvent::TurnFinished(TurnFinished::new(reason, final_usage(), None))
+    }
+
+    fn failed() -> ProviderEvent {
+        ProviderEvent::Failed(
+            AgentError::new(
+                ErrorCategory::Protocol,
+                "provider stream ended unexpectedly",
+                RetryGuidance::DoNotRetry,
+            )
+            .expect("static safe message builds"),
+        )
+    }
+
+    /// Asserts a shape rejection: protocol category, exact static diagnostic,
+    /// and non-retryable guidance. The message check pins which agreement
+    /// check fired, so reordering the validator cannot pass silently.
+    #[track_caller]
+    fn assert_shape_rejection(events: &[ProviderEvent], expected_message: &str) {
+        let error = validate_batch(events, &limits()).expect_err("batch must be rejected");
+        assert_eq!(
+            error.category(),
+            ErrorCategory::Protocol,
+            "unexpected category for: {}",
+            error.message()
+        );
+        assert_eq!(error.message(), expected_message);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    #[test]
+    fn terminal_is_unique_and_last_for_every_terminal_kind() {
+        assert_shape_rejection(
+            &[finished(FinishReason::Stop), text("item-0", "after")],
+            "provider batch does not end with a terminal event",
+        );
+        assert_shape_rejection(
+            &[
+                failed(),
+                ProviderEvent::Usage(Usage::new(None, None, UsageFinality::Provisional)),
+            ],
+            "provider batch does not end with a terminal event",
+        );
+
+        assert_shape_rejection(
+            &[finished(FinishReason::Stop), finished(FinishReason::Stop)],
+            "provider batch contains more than one terminal event",
+        );
+        assert_shape_rejection(
+            &[failed(), finished(FinishReason::Stop)],
+            "provider batch contains more than one terminal event",
+        );
+        assert_shape_rejection(
+            &[finished(FinishReason::Stop), failed()],
+            "provider batch contains more than one terminal event",
+        );
+
+        validate_batch(&[finished(FinishReason::Stop)], &limits()).expect("bare stop is valid");
+        validate_batch(&[failed()], &limits()).expect("bare failure is valid");
+    }
+
+    #[test]
+    fn empty_and_unterminated_batches_are_rejected_for_every_non_terminal_tail() {
+        assert_shape_rejection(&[], "provider batch is empty");
+
+        for event in [
+            text("item-0", "x"),
+            delta("item-1", 1),
+            ready("item-2", "prov-ref-2", r#"{"path":"a"}"#),
+            ProviderEvent::Usage(Usage::new(None, None, UsageFinality::Provisional)),
+        ] {
+            assert_shape_rejection(
+                std::slice::from_ref(&event),
+                "provider batch does not end with a terminal event",
+            );
+            assert_shape_rejection(
+                &[text("item-0", "prefix"), event],
+                "provider batch does not end with a terminal event",
+            );
+        }
+    }
+
+    #[test]
+    fn stop_rejects_candidates_and_unresolved_progress_with_precise_diagnostics() {
+        assert_shape_rejection(
+            &[
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                finished(FinishReason::Stop),
+            ],
+            "stop finish reason must not carry tool call candidates",
+        );
+        assert_shape_rejection(
+            &[delta("item-1", 4), finished(FinishReason::Stop)],
+            "stop finish reason leaves tool argument progress unresolved",
+        );
+        // A resolved candidate is still a candidate: the candidate check wins
+        // over the unresolved-progress check.
+        assert_shape_rejection(
+            &[
+                delta("item-1", 4),
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                finished(FinishReason::Stop),
+            ],
+            "stop finish reason must not carry tool call candidates",
+        );
+
+        validate_batch(
+            &[text("item-0", "answer"), finished(FinishReason::Stop)],
+            &limits(),
+        )
+        .expect("text-only stop is valid");
+    }
+
+    #[test]
+    fn tool_calls_requires_a_candidate_even_with_text_or_progress() {
+        for events in [
+            vec![finished(FinishReason::ToolCalls)],
+            vec![
+                text("item-0", "thinking"),
+                finished(FinishReason::ToolCalls),
+            ],
+            vec![delta("item-1", 4), finished(FinishReason::ToolCalls)],
+            vec![
+                ProviderEvent::Usage(Usage::new(None, None, UsageFinality::Final)),
+                finished(FinishReason::ToolCalls),
+            ],
+        ] {
+            assert_shape_rejection(
+                &events,
+                "tool-calls finish reason requires at least one candidate",
+            );
+        }
+
+        validate_batch(
+            &[
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            &limits(),
+        )
+        .expect("one candidate satisfies tool calls");
+    }
+
+    #[test]
+    fn unresolved_progress_without_a_matching_candidate_is_rejected() {
+        assert_shape_rejection(
+            &[
+                delta("item-1", 4),
+                ready("item-2", "prov-ref-2", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "tool argument progress never resolves to a candidate",
+        );
+
+        validate_batch(&[delta("item-1", 4), failed()], &limits())
+            .expect("failed batches never dispatch partial progress");
+    }
+
+    #[test]
+    fn duplicate_and_conflicting_candidate_identities_are_rejected() {
+        assert_shape_rejection(
+            &[
+                ready("item-1", "prov-ref-a", r#"{"path":"a"}"#),
+                ready("item-1", "prov-ref-b", r#"{"path":"b"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "provider batch repeats a candidate item key",
+        );
+        assert_shape_rejection(
+            &[
+                ready("item-1", "prov-dup", r#"{"path":"a"}"#),
+                ready("item-2", "prov-dup", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "provider batch repeats a provider call reference",
+        );
+        // Duplicate key and duplicate reference together: the key check wins.
+        assert_shape_rejection(
+            &[
+                ready("item-1", "prov-dup", r#"{"path":"a"}"#),
+                ready("item-1", "prov-dup", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "provider batch repeats a candidate item key",
+        );
+
+        validate_batch(
+            &[
+                ready("item-1", "prov-ref-a", r#"{"path":"a"}"#),
+                ready("item-2", "prov-ref-b", r#"{"path":"b"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            &limits(),
+        )
+        .expect("unique keys and references are valid");
+
+        validate_batch(
+            &[
+                ready("item-1", "prov-dup", r#"{"path":"a"}"#),
+                ready("item-1", "prov-dup", r#"{"path":"a"}"#),
+                failed(),
+            ],
+            &limits(),
+        )
+        .expect("failed batches never dispatch duplicated candidates");
+    }
+
+    #[test]
+    fn text_and_call_key_collisions_are_rejected_for_dispatchable_success() {
+        assert_shape_rejection(
+            &[
+                text("item-0", "answer"),
+                ready("item-0", "prov-ref-0", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "provider item key is used for both text and a tool call",
+        );
+        assert_shape_rejection(
+            &[
+                delta("item-0", 4),
+                ready("item-0", "prov-ref-0", r#"{"path":"a"}"#),
+                text("item-0", "late"),
+                finished(FinishReason::ToolCalls),
+            ],
+            "provider item key is used for both text and a tool call",
+        );
+        // A delta-only collision still loses to the collision check when
+        // another key supplies the candidate, even though progress for
+        // `item-0` never resolves.
+        assert_shape_rejection(
+            &[
+                text("item-0", "answer"),
+                delta("item-0", 4),
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "provider item key is used for both text and a tool call",
+        );
+
+        validate_batch(
+            &[
+                text("item-0", "answer"),
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            &limits(),
+        )
+        .expect("distinct text and call keys are valid");
+
+        validate_batch(
+            &[
+                text("item-0", "answer"),
+                ready("item-0", "prov-ref-0", r#"{"path":"a"}"#),
+                finished(FinishReason::Refusal),
+            ],
+            &limits(),
+        )
+        .expect("non-dispatching terminals never dispatch colliding candidates");
+    }
+
+    #[test]
+    fn progress_after_ready_and_nonmonotonic_progress_are_rejected() {
+        assert_shape_rejection(
+            &[
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                delta("item-1", 4),
+                finished(FinishReason::ToolCalls),
+            ],
+            "tool argument progress follows a completed candidate",
+        );
+        assert_shape_rejection(
+            &[
+                delta("item-1", 8),
+                delta("item-1", 4),
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "tool argument progress is not monotonic",
+        );
+        // A regression on one item is not forgotten when a later item
+        // completes.
+        assert_shape_rejection(
+            &[
+                delta("item-1", 8),
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                delta("item-2", 4),
+                delta("item-2", 1),
+                ready("item-2", "prov-ref-2", r#"{"path":"b"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            "tool argument progress is not monotonic",
+        );
+
+        validate_batch(
+            &[
+                delta("item-1", 4),
+                delta("item-1", 4),
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                finished(FinishReason::ToolCalls),
+            ],
+            &limits(),
+        )
+        .expect("repeated equal progress is monotonic");
+
+        validate_batch(
+            &[
+                delta("item-1", 8),
+                delta("item-1", 4),
+                ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                delta("item-1", 2),
+                failed(),
+            ],
+            &limits(),
+        )
+        .expect("failed batches never dispatch regressed or post-ready progress");
+    }
+
+    #[test]
+    fn non_dispatching_terminals_tolerate_discarded_progress_shapes() {
+        for reason in [
+            FinishReason::Refusal,
+            FinishReason::Incomplete,
+            FinishReason::OutputLimit,
+        ] {
+            validate_batch(
+                &[
+                    delta("item-1", 8),
+                    delta("item-1", 4),
+                    ready("item-1", "prov-ref-1", r#"{"path":"a"}"#),
+                    delta("item-1", 2),
+                    finished(reason),
+                ],
+                &limits(),
+            )
+            .unwrap_or_else(|_| panic!("{reason:?} never dispatches discarded progress"));
+        }
+    }
+
+    #[test]
+    fn shape_rejections_are_deterministic_and_stateless() {
+        let events = [
+            ready("item-1", "prov-dup", r#"{"path":"a"}"#),
+            ready("item-2", "prov-dup", r#"{"path":"a"}"#),
+            finished(FinishReason::ToolCalls),
+        ];
+        let first = validate_batch(&events, &limits()).expect_err("duplicate reference rejects");
+        let second = validate_batch(&events, &limits()).expect_err("duplicate reference rejects");
+        assert_eq!(first, second);
+    }
+}

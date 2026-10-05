@@ -3647,3 +3647,1818 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod cov_runtime_private {
+    use super::*;
+    use nexus_core::ProviderCapabilities;
+    use nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES;
+
+    /// Minimal provider only used to build a real `Shared` with its bounded
+    /// channels; the covered helpers never invoke it.
+    struct NoopProvider;
+
+    impl ProviderPort for NoopProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                streaming: true,
+                tool_calls: true,
+                structured_output: false,
+                usage_reporting: false,
+                max_context_items: None,
+                max_output_bytes: None,
+            }
+        }
+
+        fn stream(
+            &self,
+            _request: &ModelRequest,
+            _context: &ProviderContext,
+        ) -> Vec<ProviderEvent> {
+            Vec::new()
+        }
+    }
+
+    fn shared_with_data() -> (Arc<Shared>, mpsc::Receiver<RunEvent>) {
+        let (runtime, streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        (runtime.shared, streams.data)
+    }
+
+    fn active_for(run: &RunId) -> ActiveRun {
+        ActiveRun {
+            phase: RunState::Preparing,
+            run: run.clone(),
+            run_n: 1,
+            session: SessionId::new("sess-cov-private").expect("valid session id"),
+            request: RequestId::new("req-cov-private").expect("valid request id"),
+            profile: "cov-profile".to_owned(),
+            started: StdInstant::now(),
+            deadline: StdInstant::now() + Duration::from_secs(60),
+            token: CancellationToken::new(),
+            wake: Arc::new(Notify::new()),
+            cancelled: false,
+            turn_seq: 0,
+            call_seq: 0,
+            approval_seq: 0,
+            turns_used: 0,
+            calls_used: 0,
+            continuation: None,
+            conversation: Vec::new(),
+            queue: VecDeque::new(),
+            current: None,
+            pending: HashMap::new(),
+            decided: HashMap::new(),
+            outcomes: Vec::new(),
+            outcome_slot: None,
+            next_seq: 0,
+            last_seq: None,
+            pending_text: None,
+            data_dropped: false,
+            last_usage: None,
+            force_terminal: None,
+            terminal: None,
+            terminal_error: None,
+            delivery_closed: false,
+            finished_sent: false,
+        }
+    }
+
+    fn fragment(turn: &str, item_key: &str, text: &str) -> AssistantText {
+        AssistantText::new(TurnId::new(turn).expect("valid turn id"), item_key, text)
+            .expect("valid text fragment")
+    }
+
+    fn drain(data: &mut mpsc::Receiver<RunEvent>) -> Vec<RunEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = data.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn assert_delta(event: &RunEvent, turn: &str, item_key: &str, text: &str, seq: EventSequence) {
+        assert_eq!(event.seq(), seq);
+        match event.payload() {
+            EventPayload::AssistantTextDelta(fragment) => {
+                assert_eq!(fragment.turn.as_str(), turn);
+                assert_eq!(fragment.item_key, item_key);
+                assert_eq!(fragment.text, text);
+            }
+            other => panic!("expected an assistant text delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_final_usage_prefers_terminal_counters() {
+        let last = Usage::new(Some(10), Some(8), nexus_core::UsageFinality::Final);
+        let terminal = Usage::new(Some(3), Some(4), nexus_core::UsageFinality::Final);
+        assert_eq!(
+            merge_final_usage(Some(last), terminal),
+            Usage::new(Some(3), Some(4), nexus_core::UsageFinality::Final)
+        );
+    }
+
+    #[test]
+    fn merge_final_usage_retains_last_final_unknowns() {
+        let last = Usage::new(Some(10), Some(8), nexus_core::UsageFinality::Final);
+        let terminal = Usage::new(None, None, nexus_core::UsageFinality::Final);
+        assert_eq!(
+            merge_final_usage(Some(last), terminal),
+            Usage::new(Some(10), Some(8), nexus_core::UsageFinality::Final)
+        );
+    }
+
+    #[test]
+    fn merge_final_usage_never_borrows_provisional_counters() {
+        let provisional = Usage::new(Some(10), Some(8), nexus_core::UsageFinality::Provisional);
+        let terminal = Usage::new(None, None, nexus_core::UsageFinality::Final);
+        assert_eq!(
+            merge_final_usage(Some(provisional), terminal),
+            Usage::new(None, None, nexus_core::UsageFinality::Final),
+            "an unknown final counter stays unknown instead of using a provisional value"
+        );
+        assert_eq!(
+            merge_final_usage(None, terminal),
+            Usage::new(None, None, nexus_core::UsageFinality::Final),
+            "no last usage still yields final unknown counters"
+        );
+    }
+
+    #[test]
+    fn merge_final_usage_merges_each_counter_independently() {
+        let last = Usage::new(Some(10), Some(8), nexus_core::UsageFinality::Final);
+        let terminal = Usage::new(Some(11), None, nexus_core::UsageFinality::Final);
+        assert_eq!(
+            merge_final_usage(Some(last), terminal),
+            Usage::new(Some(11), Some(8), nexus_core::UsageFinality::Final)
+        );
+    }
+
+    #[test]
+    fn merge_final_usage_relabels_terminal_counters_as_final() {
+        let terminal = Usage::new(Some(5), Some(6), nexus_core::UsageFinality::Provisional);
+        let merged = merge_final_usage(None, terminal);
+        assert_eq!(merged.input_tokens(), Some(5));
+        assert_eq!(merged.output_tokens(), Some(6));
+        assert_eq!(merged.finality(), nexus_core::UsageFinality::Final);
+    }
+
+    #[test]
+    fn private_outcome_builders_are_exact_and_untruncated() {
+        let denied = denied_outcome("denied by policy");
+        assert_eq!(denied.status(), ExecutionStatus::Denied);
+        assert_eq!(denied.effect(), EffectState::NotStarted);
+        assert_eq!(denied.evidence(), Evidence::HostObserved);
+        assert_eq!(denied.content(), "denied by policy");
+        assert!(!denied.is_truncated());
+
+        let cancelled = cancelled_outcome("cancelled while queued");
+        assert_eq!(cancelled.status(), ExecutionStatus::Cancelled);
+        assert_eq!(cancelled.effect(), EffectState::Unknown);
+        assert_eq!(cancelled.evidence(), Evidence::Uncertain);
+        assert_eq!(cancelled.content(), "cancelled while queued");
+        assert!(!cancelled.is_truncated());
+
+        let timed_out = timeout_outcome("deadline exhausted");
+        assert_eq!(timed_out.status(), ExecutionStatus::TimedOut);
+        assert_eq!(timed_out.effect(), EffectState::Unknown);
+        assert_eq!(timed_out.evidence(), Evidence::Uncertain);
+        assert_eq!(timed_out.content(), "deadline exhausted");
+        assert!(!timed_out.is_truncated());
+
+        let failed = failed_outcome("worker failed");
+        assert_eq!(failed.status(), ExecutionStatus::Failed);
+        assert_eq!(failed.effect(), EffectState::Unknown);
+        assert_eq!(failed.evidence(), Evidence::Uncertain);
+        assert_eq!(failed.content(), "worker failed");
+        assert!(!failed.is_truncated());
+    }
+
+    #[test]
+    fn commit_sequence_advances_on_the_committed_sequence() {
+        let run = RunId::new("run-commit").expect("valid run id");
+        let mut active = active_for(&run);
+        commit_sequence(&mut active, 0);
+        assert_eq!(active.next_seq, 1);
+        assert_eq!(active.last_seq, Some(0));
+        assert!(!active.data_dropped);
+
+        commit_sequence(&mut active, 1);
+        assert_eq!(active.next_seq, 2);
+        assert_eq!(active.last_seq, Some(1));
+        assert!(!active.data_dropped);
+    }
+
+    #[test]
+    fn commit_sequence_overflow_reports_dropped_without_advancing() {
+        let run = RunId::new("run-overflow").expect("valid run id");
+        let mut active = active_for(&run);
+        active.next_seq = 7;
+        active.last_seq = Some(6);
+        commit_sequence(&mut active, u64::MAX);
+        assert!(active.data_dropped, "overflow is reported, never wrapped");
+        assert_eq!(active.next_seq, 7);
+        assert_eq!(active.last_seq, Some(6));
+    }
+
+    #[test]
+    fn buffer_text_keeps_the_first_fragment_pending() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-buffer-first").expect("valid run id");
+        let mut active = active_for(&run);
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "hello"),
+        );
+
+        let pending = active
+            .pending_text
+            .as_ref()
+            .expect("fragment stays pending");
+        assert_eq!(pending.turn.as_str(), "turn-1");
+        assert_eq!(pending.item_key, "item-0");
+        assert_eq!(pending.text, "hello");
+        assert_eq!(active.next_seq, 0);
+        assert_eq!(active.last_seq, None);
+        assert!(!active.data_dropped);
+        assert!(drain(&mut data).is_empty());
+    }
+
+    #[test]
+    fn buffer_text_coalesces_adjacent_same_turn_item_fragments() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-buffer-merge").expect("valid run id");
+        let mut active = active_for(&run);
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "hel"),
+        );
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "lo"),
+        );
+        assert_eq!(active.pending_text.as_ref().expect("pending").text, "hello");
+        assert!(drain(&mut data).is_empty(), "coalescing emits nothing yet");
+
+        flush_text(&shared, &mut active);
+        let events = drain(&mut data);
+        assert_eq!(events.len(), 1);
+        assert_delta(&events[0], "turn-1", "item-0", "hello", 0);
+        assert!(active.pending_text.is_none());
+        assert_eq!(active.next_seq, 1);
+        assert_eq!(active.last_seq, Some(0));
+    }
+
+    #[test]
+    fn buffer_text_emits_the_tail_on_turn_and_item_boundaries() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-buffer-boundary").expect("valid run id");
+        let mut active = active_for(&run);
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "a"),
+        );
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-2", "item-0", "b"),
+        );
+        assert_eq!(active.pending_text.as_ref().expect("pending").text, "b");
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-2", "item-1", "c"),
+        );
+        assert_eq!(active.pending_text.as_ref().expect("pending").text, "c");
+        flush_text(&shared, &mut active);
+
+        let events = drain(&mut data);
+        assert_eq!(events.len(), 3);
+        assert_delta(&events[0], "turn-1", "item-0", "a", 0);
+        assert_delta(&events[1], "turn-2", "item-0", "b", 1);
+        assert_delta(&events[2], "turn-2", "item-1", "c", 2);
+        assert_eq!(active.next_seq, 3);
+        assert_eq!(active.last_seq, Some(2));
+    }
+
+    #[test]
+    fn buffer_text_splits_an_oversized_merge_instead_of_dropping_it() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-buffer-split").expect("valid run id");
+        let mut active = active_for(&run);
+        let at_bound = "x".repeat(MAX_TEXT_FRAGMENT_BYTES);
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", &at_bound),
+        );
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "y"),
+        );
+
+        assert_eq!(active.pending_text.as_ref().expect("pending").text, "y");
+        let events = drain(&mut data);
+        assert_eq!(
+            events.len(),
+            1,
+            "the boundary-sized tail is emitted, not lost"
+        );
+        assert_delta(&events[0], "turn-1", "item-0", &at_bound, 0);
+
+        flush_text(&shared, &mut active);
+        let events = drain(&mut data);
+        assert_eq!(events.len(), 1);
+        assert_delta(&events[0], "turn-1", "item-0", "y", 1);
+    }
+
+    #[test]
+    fn text_helpers_ignore_a_stale_run_identity() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-live").expect("valid run id");
+        let stale = RunId::new("run-stale").expect("valid run id");
+        let mut active = active_for(&run);
+
+        buffer_text(
+            &shared,
+            &mut active,
+            &stale,
+            fragment("turn-1", "item-0", "stale"),
+        );
+        assert!(active.pending_text.is_none());
+        emit_data(
+            &shared,
+            &mut active,
+            &stale,
+            EventPayload::ToolCallPreview {
+                item_key: "item-0".to_owned(),
+            },
+        );
+        assert!(drain(&mut data).is_empty());
+        assert_eq!(active.next_seq, 0);
+
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "live"),
+        );
+        emit_data(
+            &shared,
+            &mut active,
+            &stale,
+            EventPayload::ToolCallPreview {
+                item_key: "item-0".to_owned(),
+            },
+        );
+        assert_eq!(
+            active.pending_text.as_ref().expect("pending").text,
+            "live",
+            "a refused stale emit must not flush the live pending fragment"
+        );
+        assert!(drain(&mut data).is_empty());
+        assert_eq!(active.next_seq, 0);
+    }
+
+    #[test]
+    fn flush_text_without_pending_is_a_noop() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-flush-empty").expect("valid run id");
+        let mut active = active_for(&run);
+        flush_text(&shared, &mut active);
+        assert_eq!(active.next_seq, 0);
+        assert_eq!(active.last_seq, None);
+        assert!(!active.data_dropped);
+        assert!(drain(&mut data).is_empty());
+    }
+
+    #[test]
+    fn emit_data_flushes_pending_text_before_the_payload() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-emit-order").expect("valid run id");
+        let mut active = active_for(&run);
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "hello"),
+        );
+        emit_data(
+            &shared,
+            &mut active,
+            &run,
+            EventPayload::ToolCallPreview {
+                item_key: "item-1".to_owned(),
+            },
+        );
+
+        let events = drain(&mut data);
+        assert_eq!(events.len(), 2);
+        assert_delta(&events[0], "turn-1", "item-0", "hello", 0);
+        assert_eq!(events[1].seq(), 1);
+        assert!(matches!(
+            events[1].payload(),
+            EventPayload::ToolCallPreview { item_key } if item_key == "item-1"
+        ));
+        assert_eq!(active.next_seq, 2);
+        assert_eq!(active.last_seq, Some(1));
+    }
+
+    #[test]
+    fn flush_text_marks_dropped_without_consuming_a_sequence_when_data_is_full() {
+        let (shared, mut data) = shared_with_data();
+        let run = RunId::new("run-data-full").expect("valid run id");
+        let session = SessionId::new("sess-data-full").expect("valid session id");
+        let mut filler = 0usize;
+        loop {
+            let filler_event = RunEvent::new(
+                session.clone(),
+                run.clone(),
+                filler as EventSequence,
+                EventPayload::ToolCallPreview {
+                    item_key: "filler".to_owned(),
+                },
+            );
+            if shared.data_tx.try_send(filler_event).is_err() {
+                break;
+            }
+            filler += 1;
+        }
+        assert_eq!(
+            filler, DATA_CAPACITY,
+            "filler saturates the bounded data channel"
+        );
+
+        let mut active = active_for(&run);
+        buffer_text(
+            &shared,
+            &mut active,
+            &run,
+            fragment("turn-1", "item-0", "lost"),
+        );
+        flush_text(&shared, &mut active);
+        assert!(
+            active.pending_text.is_none(),
+            "a dropped fragment is not retained"
+        );
+        assert!(active.data_dropped);
+        assert_eq!(
+            active.next_seq, 0,
+            "dropped presentation traffic consumes no sequence"
+        );
+        assert_eq!(active.last_seq, None);
+
+        emit_data(
+            &shared,
+            &mut active,
+            &run,
+            EventPayload::ToolCallPreview {
+                item_key: "also-lost".to_owned(),
+            },
+        );
+        assert!(active.data_dropped);
+        assert_eq!(active.next_seq, 0);
+
+        let events = drain(&mut data);
+        assert_eq!(events.len(), DATA_CAPACITY);
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event.payload(), EventPayload::ToolCallPreview { .. })),
+            "the dropped fragment never reached the channel"
+        );
+    }
+}
+
+/// Top-up coverage for the private state-machine steps, reached only through a
+/// direct in-file call with a hand-built [`ActiveRun`].
+///
+/// Every fixture uses the production constructor, so the shared registry,
+/// policy, and bounded channels are real; only the run state is installed by
+/// hand, which is what a step observes. Each case asserts the honest outcome a
+/// step records rather than only that it returned. Deterministic: fixed
+/// inputs, no fixed sleeps (blocking workers are released through channels),
+/// and every wait is bounded.
+#[cfg(test)]
+mod cov_runtime_topup_private {
+    use super::*;
+    use nexus_core::{
+        ApprovedScope, M0_REVISION, NormalizedArgs, ProviderCapabilities, TurnFinished,
+        UsageFinality,
+    };
+    use std::sync::atomic::AtomicUsize;
+
+    /// Bounded failure backstop for a gated blocking worker: passing cases
+    /// release the worker immediately.
+    const GATE_WAIT: Duration = Duration::from_secs(5);
+    /// Bounded failure backstop for the control flusher observing a vanished
+    /// consumer.
+    const FLUSH_WAIT: Duration = Duration::from_secs(5);
+
+    /// Entry/release gate for one blocking worker double. Entry is observed
+    /// through the asynchronous receiver and release through the synchronous
+    /// sender, so no test sleeps to order a worker step.
+    struct Gate {
+        entered: mpsc::UnboundedSender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    /// The test-side handles of one gate.
+    struct GateHandle {
+        entered: mpsc::UnboundedReceiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            let _ = self.entered.send(());
+            let release = self
+                .release
+                .lock()
+                .expect("gate release lock is never poisoned by a test");
+            let _ = release.recv_timeout(GATE_WAIT);
+        }
+    }
+
+    fn gate() -> (Gate, GateHandle) {
+        let (entered_tx, entered_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Gate {
+                entered: entered_tx,
+                release: StdMutex::new(release_rx),
+            },
+            GateHandle {
+                entered: entered_rx,
+                release: release_tx,
+            },
+        )
+    }
+
+    /// Waits for the worker to enter its blocking section, then releases it.
+    async fn await_worker(handle: &mut GateHandle) {
+        handle
+            .entered
+            .recv()
+            .await
+            .expect("the worker enters its blocking section");
+        handle
+            .release
+            .send(())
+            .expect("the worker release channel accepts a release");
+    }
+
+    /// Scripted provider double: one complete event batch per call, with an
+    /// optional gate that keeps a worker deterministically live.
+    struct ScriptedProvider {
+        calls: AtomicUsize,
+        script: StdMutex<VecDeque<Vec<ProviderEvent>>>,
+        gate: Option<Gate>,
+    }
+
+    impl ScriptedProvider {
+        fn new(script: Vec<Vec<ProviderEvent>>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                script: StdMutex::new(script.into()),
+                gate: None,
+            }
+        }
+
+        fn gated(script: Vec<Vec<ProviderEvent>>, gate: Gate) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                script: StdMutex::new(script.into()),
+                gate: Some(gate),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ProviderPort for ScriptedProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                streaming: true,
+                tool_calls: true,
+                structured_output: false,
+                usage_reporting: true,
+                max_context_items: None,
+                max_output_bytes: None,
+            }
+        }
+
+        fn stream(
+            &self,
+            _request: &ModelRequest,
+            _context: &ProviderContext,
+        ) -> Vec<ProviderEvent> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
+            self.script
+                .lock()
+                .expect("script mutex is never poisoned by a test")
+                .pop_front()
+                .unwrap_or_else(|| stop_turn("script exhausted"))
+        }
+    }
+
+    /// Tool double with an execution counter, a fixed observed success, and an
+    /// optional gate that keeps the worker live until released.
+    struct ScriptedTool {
+        spec: ToolSpec,
+        executed: AtomicUsize,
+        outcome: ToolOutcome,
+        gate: Option<Gate>,
+    }
+
+    impl ScriptedTool {
+        fn new(name: &str, gate: Option<Gate>) -> Self {
+            Self {
+                spec: ToolSpec::new(
+                    ToolId::new(name, M0_REVISION).expect("valid tool identity"),
+                    format!("test double for {name}"),
+                    r#"{"type":"object"}"#,
+                )
+                .expect("valid tool spec"),
+                executed: AtomicUsize::new(0),
+                outcome: ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownApplied,
+                    Evidence::HostObserved,
+                    "test double executed",
+                    false,
+                )
+                .expect("valid tool outcome"),
+                gate,
+            }
+        }
+
+        fn execution_count(&self) -> usize {
+            self.executed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ToolPort for ScriptedTool {
+        fn describe(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn execute(&self, _call: &ToolCall, _context: &ToolContext) -> ToolOutcome {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
+            self.outcome.clone()
+        }
+    }
+
+    /// Real runtime over hand-installed run state, plus its event receivers and
+    /// inspectable doubles.
+    struct Bed {
+        runtime: Runtime,
+        shared: Arc<Shared>,
+        data: mpsc::Receiver<RunEvent>,
+        control: mpsc::Receiver<RunEvent>,
+        provider: Arc<ScriptedProvider>,
+        read: Arc<ScriptedTool>,
+        write: Arc<ScriptedTool>,
+    }
+
+    fn make_bed(
+        limits: Limits,
+        has_approval_handler: bool,
+        script: Vec<Vec<ProviderEvent>>,
+        provider_gate: Option<Gate>,
+        read_gate: Option<Gate>,
+    ) -> Bed {
+        let provider = Arc::new(match provider_gate {
+            Some(gate) => ScriptedProvider::gated(script, gate),
+            None => ScriptedProvider::new(script),
+        });
+        // The gate belongs to `host_read`: the automatic read tool is the one
+        // an executed-call fixture dispatches, so that is where a live worker
+        // is created deterministically.
+        let read = Arc::new(ScriptedTool::new("host_read", read_gate));
+        let write = Arc::new(ScriptedTool::new("host_write", None));
+        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![read.clone(), write.clone()];
+        let (runtime, streams) = Runtime::try_new(
+            RuntimeConfig {
+                limits,
+                policy: Policy::m0_test(),
+                has_approval_handler,
+            },
+            provider.clone(),
+            tools,
+        )
+        .expect("test wiring is valid");
+        let shared = runtime.shared.clone();
+        Bed {
+            runtime,
+            shared,
+            data: streams.data,
+            control: streams.control,
+            provider,
+            read,
+            write,
+        }
+    }
+
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds")
+    }
+
+    fn run_id(tag: &str) -> RunId {
+        RunId::new(format!("run-{tag}")).expect("valid run id")
+    }
+
+    fn turn_id(tag: &str) -> TurnId {
+        TurnId::new(format!("turn-{tag}")).expect("valid turn id")
+    }
+
+    fn call_id(tag: &str) -> CallId {
+        CallId::new(format!("call-{tag}")).expect("valid call id")
+    }
+
+    fn approval_id(tag: &str) -> ApprovalId {
+        ApprovalId::new(format!("approval-{tag}")).expect("valid approval id")
+    }
+
+    fn tool_id(name: &str) -> ToolId {
+        ToolId::new(name, M0_REVISION).expect("valid tool identity")
+    }
+
+    fn session_id() -> SessionId {
+        SessionId::new("sess-cov-topup").expect("valid session id")
+    }
+
+    fn stop_turn(text: &str) -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::TextDelta {
+                item_key: "item-0".to_owned(),
+                text: text.to_owned(),
+            },
+            ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::Stop,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )),
+        ]
+    }
+
+    fn started_payload() -> EventPayload {
+        EventPayload::RunStarted {
+            request: RequestId::new("req-cov-topup").expect("valid request id"),
+        }
+    }
+
+    fn usage_payload() -> EventPayload {
+        EventPayload::UsageUpdated(Usage::new(Some(1), Some(2), UsageFinality::Final))
+    }
+
+    fn read_call(run: &RunId, call: CallId) -> ToolCall {
+        ToolCall::new(
+            run.clone(),
+            turn_id("topup"),
+            call,
+            tool_id("host_read"),
+            NormalizedArgs::new(r#"{"path":"src"}"#).expect("valid arguments"),
+        )
+    }
+
+    fn write_call(run: &RunId, call: CallId) -> ToolCall {
+        ToolCall::new(
+            run.clone(),
+            turn_id("topup"),
+            call,
+            tool_id("host_write"),
+            NormalizedArgs::new(r#"{"path":"dst"}"#).expect("valid arguments"),
+        )
+    }
+
+    fn current_call(call: &ToolCall, binding: Option<ApprovalBinding>) -> CurrentCall {
+        CurrentCall {
+            call: call.clone(),
+            item_key: "item-0".to_owned(),
+            provider_ref: "prov-ref-0".to_owned(),
+            binding,
+        }
+    }
+
+    fn binding_for(
+        run: &RunId,
+        call: &ToolCall,
+        approval: ApprovalId,
+        expires_at_elapsed: Duration,
+    ) -> ApprovalBinding {
+        ApprovalBinding::new(
+            approval,
+            run.clone(),
+            call.call().clone(),
+            call.tool().clone(),
+            call.args().clone(),
+            ApprovedScope::new("path:dst").expect("valid approved scope"),
+            expires_at_elapsed,
+            M0_REVISION,
+        )
+    }
+
+    /// A live run with a fresh deadline and no admitted work.
+    fn active_for(run: &RunId) -> ActiveRun {
+        let now = StdInstant::now();
+        ActiveRun {
+            phase: RunState::Preparing,
+            run: run.clone(),
+            run_n: 1,
+            session: session_id(),
+            request: RequestId::new("req-cov-topup").expect("valid request id"),
+            profile: "cov-profile".to_owned(),
+            started: now,
+            deadline: now + Duration::from_secs(60),
+            token: CancellationToken::new(),
+            wake: Arc::new(Notify::new()),
+            cancelled: false,
+            turn_seq: 0,
+            call_seq: 0,
+            approval_seq: 0,
+            turns_used: 0,
+            calls_used: 0,
+            continuation: None,
+            conversation: Vec::new(),
+            queue: VecDeque::new(),
+            current: None,
+            pending: HashMap::new(),
+            decided: HashMap::new(),
+            outcomes: Vec::new(),
+            outcome_slot: None,
+            next_seq: 0,
+            last_seq: None,
+            pending_text: None,
+            data_dropped: false,
+            last_usage: None,
+            force_terminal: None,
+            terminal: None,
+            terminal_error: None,
+            delivery_closed: false,
+            finished_sent: false,
+        }
+    }
+
+    async fn install(bed: &Bed, active: ActiveRun) {
+        let mut state = bed.shared.state.lock().await;
+        state.active = Some(active);
+    }
+
+    /// Reads one value out of the retained run state, or `None` once the
+    /// runtime no longer owns a run.
+    async fn inspect<T>(bed: &Bed, read: impl FnOnce(&ActiveRun) -> T) -> Option<T> {
+        let state = bed.shared.state.lock().await;
+        state.active.as_ref().map(read)
+    }
+
+    /// The recorded `(status, effect, content)` of a step's pending outcome.
+    fn recorded(active: &ActiveRun) -> (ExecutionStatus, EffectState, String) {
+        let (_, outcome) = active
+            .outcome_slot
+            .clone()
+            .expect("the step records exactly one outcome");
+        (
+            outcome.status(),
+            outcome.effect(),
+            outcome.content().to_owned(),
+        )
+    }
+
+    fn assert_cancelled(step: Result<RunState, Terminal>) {
+        let Err(terminal) = step else {
+            panic!("a step for a run the state does not own never advances the phase");
+        };
+        assert_eq!(terminal.outcome, RunOutcome::Cancelled);
+        assert!(
+            terminal.error.is_none(),
+            "an unowned run is a bare cancellation, not a fabricated failure"
+        );
+    }
+
+    fn assert_limit(step: Result<RunState, Terminal>, message: &str) {
+        let Err(terminal) = step else {
+            panic!("an exhausted budget never advances the phase");
+        };
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        let error = terminal.error.expect("a limit outcome keeps its cause");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.message(), message);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    #[test]
+    fn a_step_for_an_unowned_run_is_a_bare_cancellation() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("absent");
+        let rt = test_rt();
+        rt.block_on(async {
+            assert_cancelled(bed.runtime.on_preparing(&run).await);
+            assert_cancelled(bed.runtime.on_calling_model(&run).await);
+            assert_cancelled(
+                bed.runtime
+                    .ingest_model_batch(&run, &turn_id("absent"), stop_turn("ignored"))
+                    .await,
+            );
+            assert_cancelled(bed.runtime.on_validating(&run).await);
+            assert_cancelled(bed.runtime.on_awaiting(&run).await);
+            assert_cancelled(bed.runtime.on_executing(&run).await);
+            assert_cancelled(bed.runtime.on_recording(&run).await);
+            assert_eq!(
+                bed.provider.call_count(),
+                0,
+                "no step for an unowned run reaches the provider"
+            );
+            assert_eq!(bed.read.execution_count(), 0);
+            assert_eq!(bed.write.execution_count(), 0);
+        });
+    }
+
+    #[test]
+    fn a_step_refuses_a_run_the_retained_state_does_not_own() {
+        let mut bed = make_bed(
+            Limits::m0_test(),
+            true,
+            vec![stop_turn("ignored")],
+            None,
+            None,
+        );
+        let live = run_id("live");
+        let stale = run_id("stale");
+        let rt = test_rt();
+        rt.block_on(async {
+            install(&bed, active_for(&live)).await;
+
+            assert_cancelled(bed.runtime.on_calling_model(&stale).await);
+            assert_cancelled(
+                bed.runtime
+                    .ingest_model_batch(&stale, &turn_id("stale"), stop_turn("ignored"))
+                    .await,
+            );
+            assert_cancelled(bed.runtime.on_validating(&stale).await);
+            assert_cancelled(bed.runtime.on_awaiting(&stale).await);
+            assert_cancelled(bed.runtime.on_executing(&stale).await);
+            assert_cancelled(bed.runtime.on_recording(&stale).await);
+
+            bed.runtime
+                .set_terminal(&stale, RunOutcome::Completed, None)
+                .await;
+            assert_eq!(
+                inspect(&bed, |active| active.terminal).await,
+                Some(None),
+                "a stale identity never decides the retained run"
+            );
+
+            assert_eq!(
+                bed.runtime.take_terminal(&stale).await,
+                (RunOutcome::Cancelled, None),
+                "an unknown run has no terminal to report"
+            );
+
+            assert!(
+                bed.runtime
+                    .publish_control(&stale, usage_payload())
+                    .await
+                    .is_err(),
+                "a stale identity publishes nothing"
+            );
+            assert!(bed.control.try_recv().is_err());
+
+            bed.runtime
+                .finish_run(&stale, RunOutcome::Failed, None)
+                .await;
+            assert_eq!(
+                inspect(&bed, |active| active.run.clone()).await,
+                Some(live.clone()),
+                "the retained run is restored, never replaced"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.finished_sent).await,
+                Some(false),
+                "a stale finalization never marks the retained run finished"
+            );
+            let state = bed.shared.state.lock().await;
+            assert!(state.last.is_none(), "no finished run is recorded");
+            drop(state);
+            assert!(bed.control.try_recv().is_err());
+            assert_eq!(bed.provider.call_count(), 0);
+        });
+    }
+
+    #[test]
+    fn terminal_bookkeeping_ignores_a_missing_or_already_decided_run() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let missing = run_id("missing");
+        let rt = test_rt();
+        rt.block_on(async {
+            bed.runtime
+                .set_terminal(&missing, RunOutcome::Completed, None)
+                .await;
+            assert_eq!(
+                bed.runtime.take_terminal(&missing).await,
+                (RunOutcome::Cancelled, None)
+            );
+            assert!(
+                bed.runtime
+                    .publish_control(&missing, started_payload())
+                    .await
+                    .is_err()
+            );
+            bed.runtime
+                .finish_run(&missing, RunOutcome::Failed, None)
+                .await;
+            let state = bed.shared.state.lock().await;
+            assert!(state.active.is_none());
+            assert!(state.last.is_none(), "a missing run records no run");
+            drop(state);
+            assert!(bed.control.try_recv().is_err());
+
+            // A run that already decided its terminal keeps the first decision.
+            let decided = run_id("decided");
+            let mut active = active_for(&decided);
+            active.terminal = Some(RunOutcome::Cancelled);
+            install(&bed, active).await;
+            bed.runtime
+                .set_terminal(&decided, RunOutcome::Completed, None)
+                .await;
+            assert_eq!(
+                inspect(&bed, |active| active.terminal).await,
+                Some(Some(RunOutcome::Cancelled)),
+                "the first terminal decision stands"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.terminal_error.is_none()).await,
+                Some(true),
+                "a refused decision adds no cause"
+            );
+        });
+    }
+
+    #[test]
+    fn an_exhausted_run_deadline_refuses_the_next_step() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("deadline");
+        let rt = test_rt();
+        rt.block_on(async {
+            let mut active = active_for(&run);
+            active.started = StdInstant::now() - Duration::from_secs(120);
+            active.deadline = StdInstant::now() - Duration::from_secs(60);
+            install(&bed, active).await;
+
+            assert_limit(
+                bed.runtime.on_preparing(&run).await,
+                "run duration exhausted",
+            );
+            assert_limit(
+                bed.runtime.on_calling_model(&run).await,
+                "run duration exhausted",
+            );
+            assert_limit(
+                bed.runtime.on_validating(&run).await,
+                "run duration exhausted",
+            );
+            assert_eq!(
+                bed.provider.call_count(),
+                0,
+                "an exhausted run never reaches the provider"
+            );
+        });
+    }
+
+    #[test]
+    fn executing_records_an_honest_outcome_before_any_dispatch() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("pre-dispatch");
+        let rt = test_rt();
+        rt.block_on(async {
+            // Cancelled before dispatch: unknown effect, no dispatch.
+            let call = read_call(&run, call_id("cancelled"));
+            let mut active = active_for(&run);
+            active.cancelled = true;
+            active.current = Some(current_call(&call, None));
+            install(&bed, active).await;
+            let step = bed.runtime.on_executing(&run).await;
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(
+                inspect(&bed, recorded).await,
+                Some((
+                    ExecutionStatus::Cancelled,
+                    EffectState::Unknown,
+                    "cancelled before dispatch".to_owned(),
+                )),
+                "a cancelled dispatch claims no effect and states the reason"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.force_terminal).await,
+                Some(Some(RunOutcome::Cancelled))
+            );
+            assert_eq!(bed.read.execution_count(), 0);
+
+            // Deadline passed before dispatch: timed out, no dispatch.
+            let call = read_call(&run, call_id("deadline"));
+            let mut active = active_for(&run);
+            active.deadline = StdInstant::now() - Duration::from_secs(1);
+            active.current = Some(current_call(&call, None));
+            install(&bed, active).await;
+            let step = bed.runtime.on_executing(&run).await;
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(
+                inspect(&bed, recorded).await,
+                Some((
+                    ExecutionStatus::TimedOut,
+                    EffectState::Unknown,
+                    "run deadline passed before dispatch".to_owned(),
+                ))
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.force_terminal).await,
+                Some(Some(RunOutcome::LimitReached))
+            );
+            assert_eq!(bed.read.execution_count(), 0);
+
+            // An approval binding that expired between the decision and the
+            // dispatch is denied without claiming a timeout or an effect.
+            let call = read_call(&run, call_id("expired-grant"));
+            let approval = approval_id("expired");
+            let expired = binding_for(&run, &call, approval, Duration::ZERO);
+            let mut active = active_for(&run);
+            active.current = Some(current_call(&call, Some(expired)));
+            install(&bed, active).await;
+            let step = bed.runtime.on_executing(&run).await;
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(
+                inspect(&bed, recorded).await,
+                Some((
+                    ExecutionStatus::Denied,
+                    EffectState::NotStarted,
+                    "approval binding mismatch".to_owned(),
+                )),
+                "an unusable grant is denied as not started, never retried"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.force_terminal).await,
+                Some(None),
+                "a denied dispatch lets the run continue honestly"
+            );
+            assert_eq!(bed.read.execution_count(), 0);
+        });
+    }
+
+    #[test]
+    fn validating_refuses_an_exhausted_concurrent_operation_budget() {
+        let mut limits = Limits::m0_test();
+        limits.max_concurrent_ops = 1;
+        let bed = make_bed(limits, true, Vec::new(), None, None);
+        let run = run_id("concurrency");
+        let rt = test_rt();
+        rt.block_on(async {
+            let call = write_call(&run, call_id("queued"));
+            let approval = approval_id("pending");
+            let mut active = active_for(&run);
+            active.queue.push_back(QueuedCall {
+                call: call.clone(),
+                item_key: "item-0".to_owned(),
+                provider_ref: "prov-ref-0".to_owned(),
+                needs_approval: true,
+            });
+            active.pending.insert(
+                approval.clone(),
+                PendingApproval {
+                    binding: binding_for(&run, &call, approval, Duration::from_secs(60)),
+                },
+            );
+            install(&bed, active).await;
+
+            assert_limit(
+                bed.runtime.on_validating(&run).await,
+                "concurrent operation budget exhausted",
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.pending.len()).await,
+                Some(1),
+                "the live grant is neither consumed nor abandoned"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.outcome_slot.is_none()).await,
+                Some(true),
+                "a refused validation records no call outcome"
+            );
+            assert_eq!(bed.write.execution_count(), 0);
+        });
+    }
+
+    #[test]
+    fn a_wake_that_does_not_cancel_never_abandons_the_model_worker() {
+        let (gate, mut handle) = gate();
+        let mut bed = make_bed(
+            Limits::m0_test(),
+            false,
+            vec![stop_turn("ingested")],
+            Some(gate),
+            None,
+        );
+        let run = run_id("wake-provider");
+        let rt = test_rt();
+        rt.block_on(async {
+            let active = active_for(&run);
+            // A stored wake permit with no cancellation behind it: the worker
+            // is still owned and its batch must still be ingested.
+            active.wake.notify_one();
+            install(&bed, active).await;
+
+            let (step, ()) = tokio::join!(
+                bed.runtime.on_calling_model(&run),
+                await_worker(&mut handle),
+            );
+            let Err(terminal) = step else {
+                panic!("an ingested stop turn is a terminal completion");
+            };
+            assert_eq!(terminal.outcome, RunOutcome::Completed);
+            assert!(terminal.error.is_none());
+            assert_eq!(bed.provider.call_count(), 1);
+            let event = bed
+                .data
+                .try_recv()
+                .expect("the batch after the stray wake is published");
+            assert!(
+                matches!(event.payload(), EventPayload::AssistantTextDelta(fragment) if fragment.text == "ingested"),
+                "the batch after the stray wake is ingested, not dropped"
+            );
+            assert!(bed.data.try_recv().is_err());
+            let usage = bed
+                .control
+                .try_recv()
+                .expect("the ingested turn published its usage update");
+            assert!(matches!(usage.payload(), EventPayload::UsageUpdated(_)));
+            assert!(bed.control.try_recv().is_err());
+            assert_eq!(
+                inspect(&bed, |active| (active.next_seq, active.last_seq, active.data_dropped))
+                    .await,
+                Some((2, Some(1), false)),
+                "the one text delta and the one usage update hold sequences 0 and 1: \
+                 a stray wake consumes none and drops nothing"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.force_terminal.is_none()).await,
+                Some(true),
+                "a stray wake forces no terminal"
+            );
+        });
+    }
+
+    #[test]
+    fn a_wake_that_does_not_cancel_never_abandons_the_tool_worker() {
+        let (gate, mut handle) = gate();
+        let mut bed = make_bed(Limits::m0_test(), false, Vec::new(), None, Some(gate));
+        let run = run_id("wake-tool");
+        let rt = test_rt();
+        rt.block_on(async {
+            let call = read_call(&run, call_id("woken"));
+            let mut active = active_for(&run);
+            active.wake.notify_one();
+            active.current = Some(current_call(&call, None));
+            install(&bed, active).await;
+
+            let (step, ()) =
+                tokio::join!(bed.runtime.on_executing(&run), await_worker(&mut handle),);
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(
+                bed.read.execution_count(),
+                1,
+                "a stray wake never cancels, retries, or double-dispatches a live call"
+            );
+            assert_eq!(
+                inspect(&bed, recorded).await,
+                Some((
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownApplied,
+                    "test double executed".to_owned(),
+                )),
+                "the worker's own outcome is recorded, not a cancellation"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.force_terminal.is_none()).await,
+                Some(true),
+                "a stray wake forces no terminal"
+            );
+            let started = bed.control.try_recv().expect("the dispatch was announced");
+            assert!(matches!(started.payload(), EventPayload::ToolStarted(_)));
+            assert!(bed.control.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn emit_control_refuses_a_run_it_does_not_own() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let live = run_id("emit-live");
+        let stale = run_id("emit-stale");
+        let rt = test_rt();
+        rt.block_on(async {
+            install(&bed, active_for(&live)).await;
+            let mut state = bed.shared.state.lock().await;
+            let mut active = state
+                .active
+                .take()
+                .expect("the run is retained while the emit is attempted");
+            let outcome = emit_control(&bed.shared, &mut active, &stale, started_payload());
+            assert_eq!(
+                outcome,
+                ControlOutcome::Closed,
+                "an emit for another run is refused, never published"
+            );
+            assert_eq!(active.next_seq, 0, "a refused emit consumes no sequence");
+            assert!(active.last_seq.is_none());
+            assert!(
+                !active.data_dropped,
+                "a refused emit is not reported as dropped presentation traffic"
+            );
+            state.active = Some(active);
+            drop(state);
+            assert!(bed.control.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn a_vanished_control_consumer_retains_the_committed_outbox_event() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("outbox");
+        let rt = test_rt();
+        rt.block_on(async {
+            install(&bed, active_for(&run)).await;
+            // Saturate the bounded control channel through the production
+            // sender, so a control event that cannot enter it must be committed
+            // to the bounded outbox instead of being dropped.
+            for index in 0..CONTROL_CAPACITY as u64 {
+                let filler = RunEvent::new(session_id(), run.clone(), index, started_payload());
+                bed.shared
+                    .control_tx
+                    .try_reserve()
+                    .expect("a filler fits the declared control bound")
+                    .send(filler);
+            }
+            assert_eq!(bed.shared.control_tx.capacity(), 0);
+            let buffered = RunEvent::new(session_id(), run.clone(), 0, usage_payload());
+            bed.shared
+                .outbox
+                .lock()
+                .expect("the control outbox is readable")
+                .push_back(buffered.clone());
+
+            // The only consumer disappears while an event is committed to the
+            // outbox. The flusher must retain that undeliverable event and
+            // classify the channel as closed rather than as saturation.
+            drop(bed.control);
+            tokio::time::timeout(FLUSH_WAIT, flush_control(bed.shared.clone()))
+                .await
+                .expect("the flusher settles on a closed control channel");
+
+            assert!(
+                bed.shared.control_closed.load(Ordering::SeqCst),
+                "a vanished consumer is classified as closed, never as saturation"
+            );
+            let mut outbox = bed
+                .shared
+                .outbox
+                .lock()
+                .expect("the control outbox is readable");
+            assert_eq!(
+                outbox.len(),
+                1,
+                "the undeliverable event is retained, never dropped"
+            );
+            assert_eq!(
+                outbox.front().map(RunEvent::seq),
+                Some(buffered.seq()),
+                "the retained event is the committed one, in order"
+            );
+            // Production clears the outbox once a closed consumer is classified
+            // (see `finish_run`); doing the same here ends the flusher's respawn
+            // instead of letting the test leave a spinning successor behind.
+            outbox.clear();
+        });
+    }
+
+    #[test]
+    fn the_run_disappearing_mid_tool_execution_cancels_the_step() {
+        // The exact state a supervised driver failure leaves behind: the
+        // blocking worker is live while the runtime no longer retains its run.
+        let (gate, mut handle) = gate();
+        let bed = make_bed(Limits::m0_test(), false, Vec::new(), None, Some(gate));
+        let run = run_id("vanishing");
+        let rt = test_rt();
+        rt.block_on(async {
+            let call = read_call(&run, call_id("orphaned"));
+            install(&bed, active_for(&run)).await;
+            {
+                let mut state = bed.shared.state.lock().await;
+                let mut active = state.active.take().expect("the run is retained");
+                active.current = Some(current_call(&call, None));
+                state.active = Some(active);
+            }
+
+            let (step, ()) = tokio::join!(bed.runtime.on_executing(&run), async {
+                handle.entered.recv().await;
+                // The worker is inside its blocking section when the retained
+                // run disappears underneath the executing step.
+                bed.shared.state.lock().await.active = None;
+                let _ = handle.release.send(());
+            });
+            assert_cancelled(step);
+            assert_eq!(bed.read.execution_count(), 1);
+        });
+    }
+
+    #[test]
+    fn a_replaced_run_mid_tool_execution_cancels_the_step() {
+        let (gate, mut handle) = gate();
+        let bed = make_bed(Limits::m0_test(), false, Vec::new(), None, Some(gate));
+        let run = run_id("replaced");
+        let rt = test_rt();
+        rt.block_on(async {
+            let call = read_call(&run, call_id("replaced"));
+            install(&bed, active_for(&run)).await;
+            {
+                let mut state = bed.shared.state.lock().await;
+                let mut active = state.active.take().expect("the run is retained");
+                active.current = Some(current_call(&call, None));
+                state.active = Some(active);
+            }
+
+            let (step, ()) = tokio::join!(bed.runtime.on_executing(&run), async {
+                handle.entered.recv().await;
+                // A different run now owns the slot the step resumes into.
+                let mut state = bed.shared.state.lock().await;
+                let mut active = state.active.take().expect("the run is retained");
+                active.run = run_id("successor");
+                active.current = None;
+                state.active = Some(active);
+                let _ = handle.release.send(());
+            });
+            assert_cancelled(step);
+        });
+    }
+
+    #[test]
+    fn finish_run_records_an_outcome_a_step_never_recorded() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("unrecorded-outcome");
+        let rt = test_rt();
+        rt.block_on(async {
+            let call = write_call(&run, call_id("decided-outcome"));
+            let mut active = active_for(&run);
+            // The call already produced an outcome that no recording step
+            // consumed, and no current call is left to re-report.
+            active.outcome_slot = Some((call.call().clone(), cancelled_outcome("left over")));
+            install(&bed, active).await;
+
+            bed.runtime
+                .finish_run(&run, RunOutcome::Cancelled, None)
+                .await;
+
+            let finished = bed
+                .control
+                .try_recv()
+                .expect("the pending outcome is published at finalization");
+            let EventPayload::ToolFinished(info) = finished.payload() else {
+                panic!("a pending call outcome is published as ToolFinished");
+            };
+            assert_eq!(info.call, *call.call());
+            assert_eq!(info.outcome.status(), ExecutionStatus::Cancelled);
+            assert_eq!(info.outcome.effect(), EffectState::Unknown);
+
+            let terminal = bed
+                .control
+                .try_recv()
+                .expect("the terminal follows the retained outcome");
+            assert!(terminal.is_terminal());
+            assert!(bed.control.try_recv().is_err());
+            let state = bed.shared.state.lock().await;
+            let last = state.last.as_ref().expect("the finished run is retained");
+            assert_eq!(last.outcome, RunOutcome::Cancelled);
+            assert_eq!(last.outcomes.len(), 1);
+            assert_eq!(last.outcomes[0].call, *call.call());
+        });
+    }
+
+    #[test]
+    fn finish_run_reports_an_unknown_cancellation_for_an_unreported_call() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("unreported-call");
+        let rt = test_rt();
+        rt.block_on(async {
+            let call = write_call(&run, call_id("never-reported"));
+            let mut active = active_for(&run);
+            // The call was admitted and dispatched, but no outcome was ever
+            // recorded for it: the honest record is an unknown cancellation.
+            active.current = Some(current_call(&call, None));
+            install(&bed, active).await;
+
+            bed.runtime
+                .finish_run(&run, RunOutcome::Cancelled, None)
+                .await;
+
+            let reported = bed
+                .control
+                .try_recv()
+                .expect("an unreported call is reported honestly, not dropped");
+            let EventPayload::ToolFinished(info) = reported.payload() else {
+                panic!("an unreported call is published as ToolFinished");
+            };
+            assert_eq!(info.call, *call.call());
+            assert_eq!(info.outcome.status(), ExecutionStatus::Cancelled);
+            assert_eq!(info.outcome.effect(), EffectState::Unknown);
+            assert_eq!(info.outcome.evidence(), Evidence::Uncertain);
+            assert_eq!(
+                info.outcome.content(),
+                "run ended before the tool outcome was recorded"
+            );
+
+            let terminal = bed
+                .control
+                .try_recv()
+                .expect("the terminal follows the honest cancellation");
+            assert!(terminal.is_terminal());
+            assert!(bed.control.try_recv().is_err());
+            let state = bed.shared.state.lock().await;
+            let last = state.last.as_ref().expect("the finished run is retained");
+            assert_eq!(last.outcomes.len(), 1);
+            assert_eq!(last.outcomes[0].status, ExecutionStatus::Cancelled);
+            assert_eq!(last.outcomes[0].effect, EffectState::Unknown);
+            assert_eq!(last.outcomes[0].evidence, Evidence::Uncertain);
+        });
+    }
+
+    #[test]
+    fn the_retained_outbox_events_survive_every_flusher_pass() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("outbox-respawn");
+        let rt = test_rt();
+        rt.block_on(async {
+            // Two committed events and no consumer. The flusher must retain
+            // both, in order, and respawn itself rather than losing either one.
+            let first = RunEvent::new(session_id(), run.clone(), 0, usage_payload());
+            let second = RunEvent::new(session_id(), run.clone(), 1, started_payload());
+            {
+                let mut outbox = bed
+                    .shared
+                    .outbox
+                    .lock()
+                    .expect("the control outbox is readable");
+                outbox.push_back(first.clone());
+                outbox.push_back(second.clone());
+            }
+            drop(bed.control);
+            ensure_flusher(&bed.shared);
+
+            tokio::time::timeout(FLUSH_WAIT, async {
+                while !bed.shared.control_closed.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                // A respawned flusher reaches the same verdict on its own.
+                while !bed.shared.flushing.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the flusher classifies the vanished consumer and respawns");
+            // Let the respawned pass run once more against the retained outbox.
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+
+            assert!(bed.shared.control_closed.load(Ordering::SeqCst));
+            let mut outbox = bed
+                .shared
+                .outbox
+                .lock()
+                .expect("the control outbox is readable");
+            assert_eq!(
+                outbox.len(),
+                2,
+                "neither retained event is dropped, however many passes run"
+            );
+            assert_eq!(outbox.front().map(RunEvent::seq), Some(first.seq()));
+            assert_eq!(outbox.back().map(RunEvent::seq), Some(second.seq()));
+            // Production clears the outbox once a closed consumer is classified
+            // (see `finish_run`); clearing here ends the respawn loop the way a
+            // finalizing run does, instead of leaving a spinning successor.
+            outbox.clear();
+        });
+    }
+
+    #[test]
+    fn awaiting_without_a_current_call_returns_to_validation() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("awaiting-no-current");
+        let rt = test_rt();
+        rt.block_on(async {
+            // The approval wait observes no current call: the step hands the
+            // run back to validation instead of waiting on a missing binding.
+            let mut active = active_for(&run);
+            active.phase = RunState::AwaitingApproval;
+            install(&bed, active).await;
+
+            let step = bed.runtime.on_awaiting(&run).await;
+            assert!(matches!(step, Ok(RunState::ValidatingTools)));
+            assert!(bed.control.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn awaiting_a_bindingless_call_continues_to_execution() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("awaiting-no-binding");
+        let rt = test_rt();
+        rt.block_on(async {
+            // A current call with no approval binding needs no decision: the
+            // wait hands straight over to execution.
+            let call = read_call(&run, call_id("bindingless"));
+            let mut active = active_for(&run);
+            active.phase = RunState::AwaitingApproval;
+            active.current = Some(current_call(&call, None));
+            install(&bed, active).await;
+
+            let step = bed.runtime.on_awaiting(&run).await;
+            assert!(matches!(step, Ok(RunState::ExecutingTool)));
+            assert_eq!(bed.read.execution_count(), 0);
+            assert!(bed.control.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn awaiting_a_zero_remaining_wait_re_measures_instead_of_sleeping() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("awaiting-zero-wait");
+        let rt = test_rt();
+        rt.block_on(async {
+            // The grant expires at the current reading: the wait measure is
+            // zero, so the step re-measures rather than sleeping on nothing.
+            let call = read_call(&run, call_id("zero-wait"));
+            let approval = approval_id("zero");
+            let mut active = active_for(&run);
+            active.phase = RunState::AwaitingApproval;
+            let now_elapsed = active.started.elapsed();
+            active.current = Some(current_call(
+                &call,
+                Some(binding_for(&run, &call, approval, now_elapsed)),
+            ));
+            install(&bed, active).await;
+
+            let step = bed.runtime.on_awaiting(&run).await;
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(
+                inspect(&bed, recorded).await,
+                Some((
+                    ExecutionStatus::Denied,
+                    EffectState::NotStarted,
+                    "approval expired".to_owned(),
+                )),
+                "a zero remaining wait resolves the expiry, never a busy loop"
+            );
+        });
+    }
+
+    #[test]
+    fn executing_a_call_with_no_recorded_tool_is_refused_before_dispatch() {
+        let mut bed = make_bed(Limits::m0_test(), false, Vec::new(), None, None);
+        let run = run_id("executing-no-current");
+        let rt = test_rt();
+        rt.block_on(async {
+            // An execution step with nothing to execute hands back to
+            // validation rather than inventing a call.
+            install(&bed, active_for(&run)).await;
+
+            let step = bed.runtime.on_executing(&run).await;
+            assert!(matches!(step, Ok(RunState::ValidatingTools)));
+            assert_eq!(bed.read.execution_count(), 0);
+            assert!(bed.control.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn executing_an_unregistered_or_changed_tool_is_denied_without_dispatch() {
+        let bed = make_bed(Limits::m0_test(), false, Vec::new(), None, None);
+        let run = run_id("executing-tool-changed");
+        let rt = test_rt();
+        rt.block_on(async {
+            // A tool identity the registry no longer carries.
+            let unknown = ToolCall::new(
+                run.clone(),
+                turn_id("topup"),
+                call_id("unknown"),
+                tool_id("host_absent"),
+                NormalizedArgs::new(r#"{"path":"src"}"#).expect("valid arguments"),
+            );
+            let mut active = active_for(&run);
+            active.current = Some(current_call(&unknown, None));
+            install(&bed, active).await;
+
+            let step = bed.runtime.on_executing(&run).await;
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(
+                inspect(&bed, recorded).await,
+                Some((
+                    ExecutionStatus::Denied,
+                    EffectState::NotStarted,
+                    "unknown tool".to_owned(),
+                )),
+                "a vanished tool is denied as not started"
+            );
+
+            // A tool identity that shares the name but not the revision.
+            let changed = ToolCall::new(
+                run.clone(),
+                turn_id("topup"),
+                call_id("changed"),
+                ToolId::new("host_read", M0_REVISION + 1).expect("valid tool identity"),
+                NormalizedArgs::new(r#"{"path":"src"}"#).expect("valid arguments"),
+            );
+            let mut active = active_for(&run);
+            active.current = Some(current_call(&changed, None));
+            install(&bed, active).await;
+
+            let step = bed.runtime.on_executing(&run).await;
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(
+                inspect(&bed, recorded).await,
+                Some((
+                    ExecutionStatus::Denied,
+                    EffectState::NotStarted,
+                    "tool revision changed".to_owned(),
+                )),
+                "a changed tool revision is denied as not started"
+            );
+            assert_eq!(bed.read.execution_count(), 0);
+        });
+    }
+
+    #[test]
+    fn a_recording_step_with_nothing_recorded_returns_to_validation() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("nothing-recorded");
+        let rt = test_rt();
+        rt.block_on(async {
+            let call = read_call(&run, call_id("recorded"));
+            let mut active = active_for(&run);
+            active.current = Some(current_call(&call, None));
+            install(&bed, active).await;
+
+            let step = bed.runtime.on_recording(&run).await;
+            assert!(
+                matches!(step, Ok(RunState::ValidatingTools)),
+                "a step with nothing to record returns to validation"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.outcomes.len()).await,
+                Some(0),
+                "no outcome is fabricated for an unrecorded call"
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.conversation.len()).await,
+                Some(0)
+            );
+            assert!(bed.control.try_recv().is_err());
+            assert_eq!(
+                inspect(&bed, |active| {
+                    active.outcome_slot.is_none() && active.force_terminal.is_none()
+                })
+                .await,
+                Some(true)
+            );
+        });
+    }
+}

@@ -901,3 +901,398 @@ mod tests {
         assert!(invalid.approval_preview(&write).is_err());
     }
 }
+
+/// Private-branch coverage unreachable from the public integration surface:
+/// the field layout and constants, the static diagnostic builder, and every
+/// branch of the path, command, redaction, escaping, scope, and parse
+/// helpers. Deterministic: fixed inputs only, no clock, no I/O, no threads.
+#[cfg(test)]
+mod cov_policy_private {
+    use super::*;
+    use nexus_core::{CallId, NormalizedArgs, RunId, TurnId};
+    use nexus_validation::{MAX_ARGS_DEPTH, MAX_ARGS_NODES};
+
+    fn call(tool: &str, revision: u32, args: &str) -> ToolCall {
+        ToolCall::new(
+            RunId::new("run-1").expect("valid"),
+            TurnId::new("turn-1").expect("valid"),
+            CallId::new("call-1").expect("valid"),
+            ToolId::new(tool, revision).expect("valid"),
+            NormalizedArgs::new(args).expect("valid args build"),
+        )
+    }
+
+    fn text(value: &str) -> Value {
+        Value::String(value.to_owned())
+    }
+
+    fn object(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect()
+    }
+
+    fn assert_invalid<T: std::fmt::Debug>(result: Result<T, AgentError>, message: &str) {
+        let error = result.expect_err("invalid input must be rejected");
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), message);
+    }
+
+    fn assert_denied<T: std::fmt::Debug>(result: Result<T, AgentError>, message: &str) {
+        let error = result.expect_err("a deviation must be denied");
+        assert_eq!(error.category(), ErrorCategory::PermissionDenied);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), message);
+    }
+
+    #[test]
+    fn private_policy_fields_and_constants_pin_the_m0_set() {
+        let policy = Policy::m0_test();
+        assert_eq!(
+            policy.auto_tools,
+            vec!["host_read".to_owned(), "host_search".to_owned()]
+        );
+        assert_eq!(policy.revision, M0_REVISION);
+        assert_eq!(AUTO_READ_TOOLS, ["host_read", "host_search"].as_slice());
+        assert_eq!(REDACTED_VALUE, "[redacted]");
+        assert_eq!(REDACTED_KEY, "[redacted-key]");
+        assert!(SECRET_KEY_MARKERS.contains(&"password"));
+        assert!(SECRET_KEY_MARKERS.contains(&"api_key"));
+        assert!(SECRET_VALUE_MARKERS.contains(&"-----begin"));
+        assert!(SECRET_VALUE_MARKERS.contains(&"client_secret"));
+
+        let custom = Policy::new(vec!["host_read".to_owned()], M0_REVISION + 1);
+        assert_eq!(custom.auto_tools, vec!["host_read".to_owned()]);
+        assert_eq!(custom.revision, M0_REVISION + 1);
+        let empty = Policy::new(Vec::new(), M0_REVISION);
+        assert!(empty.auto_tools.is_empty());
+    }
+
+    #[test]
+    fn policy_error_builds_static_do_not_retry_diagnostics() {
+        let denied = policy_error(ErrorCategory::PermissionDenied, "cov private denial");
+        assert_eq!(denied.category(), ErrorCategory::PermissionDenied);
+        assert_eq!(denied.message(), "cov private denial");
+        assert_eq!(denied.retry(), RetryGuidance::DoNotRetry);
+        assert!(denied.correlation().is_empty());
+
+        let invalid = policy_error(ErrorCategory::InvalidInput, "cov private invalid");
+        assert_eq!(invalid.category(), ErrorCategory::InvalidInput);
+        assert_eq!(invalid.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    #[test]
+    fn normalize_project_path_accepts_canonical_names_and_refuses_each_shape() {
+        for raw in [
+            "a",
+            "src/lib.rs",
+            "a-b_c.d/e",
+            "src/日本語.rs",
+            "src/my file.txt",
+        ] {
+            assert_eq!(
+                normalize_project_path(raw).expect("canonical path accepted"),
+                raw
+            );
+        }
+
+        let cases: &[(&str, &str)] = &[
+            ("", "tool path is empty"),
+            ("/etc/passwd", "tool path is absolute"),
+            ("/", "tool path is absolute"),
+            ("~", "tool path is outside the project scope"),
+            ("~/secrets", "tool path is outside the project scope"),
+            ("~user/x", "tool path is outside the project scope"),
+            ("src\\lib.rs", "tool path uses backslash separators"),
+            ("C:\\Users", "tool path uses backslash separators"),
+            ("\\\\server\\share", "tool path uses backslash separators"),
+            ("src/lib.rs:stream", "tool path contains invalid characters"),
+            ("C:/Users", "tool path contains invalid characters"),
+            ("a<b", "tool path contains invalid characters"),
+            ("a>b", "tool path contains invalid characters"),
+            ("a:b", "tool path contains invalid characters"),
+            ("a\"b", "tool path contains invalid characters"),
+            ("a|b", "tool path contains invalid characters"),
+            ("a?b", "tool path contains invalid characters"),
+            ("a*b", "tool path contains invalid characters"),
+            ("src/\u{1}lib.rs", "tool path contains invalid characters"),
+            ("src/\u{7f}lib.rs", "tool path contains invalid characters"),
+            ("src/\u{85}lib.rs", "tool path contains invalid characters"),
+            ("src//lib.rs", "tool path contains an empty component"),
+            ("src/", "tool path contains an empty component"),
+            (".", "tool path contains a parent traversal"),
+            ("..", "tool path contains a parent traversal"),
+            ("src/../etc", "tool path contains a parent traversal"),
+            ("src/./lib.rs", "tool path contains a parent traversal"),
+        ];
+        for &(raw, message) in cases {
+            assert_denied(normalize_project_path(raw), message);
+        }
+    }
+
+    #[test]
+    fn command_argument_covers_each_present_key_shape_and_precedence() {
+        assert_eq!(
+            command_argument(&object(&[])).expect("absent command is allowed"),
+            None
+        );
+
+        assert_eq!(
+            command_argument(&object(&[("command", text("run --flag"))]))
+                .expect("string command resolves"),
+            Some("run --flag".to_owned())
+        );
+        assert_eq!(
+            command_argument(&object(&[(
+                "argv",
+                Value::Array(vec![text("git"), text("status")]),
+            )]))
+            .expect("string-array argv resolves"),
+            Some("git status".to_owned())
+        );
+        assert_eq!(
+            command_argument(&object(&[("argv", text("run"))])).expect("string argv resolves"),
+            Some("run".to_owned())
+        );
+        // `command` is inspected before `argv`, independent of map order.
+        assert_eq!(
+            command_argument(&object(&[
+                ("argv", Value::Array(vec![text("ignored")])),
+                ("command", text("first")),
+            ]))
+            .expect("command wins"),
+            Some("first".to_owned())
+        );
+
+        for args in [
+            object(&[("command", text(""))]),
+            object(&[("argv", Value::Array(vec![]))]),
+            object(&[("command", Value::from(5))]),
+            object(&[("command", Value::Null)]),
+            object(&[("command", Value::Bool(true))]),
+            object(&[("argv", Value::Array(vec![Value::from(1)]))]),
+            object(&[("argv", Value::Array(vec![Value::Array(vec![text("x")])]))]),
+            object(&[("argv", Value::Object(Map::new()))]),
+            object(&[("command", text("")), ("argv", text("run"))]),
+        ] {
+            assert_denied(command_argument(&args), "tool command argument is invalid");
+        }
+    }
+
+    #[test]
+    fn redact_object_and_value_recurse_and_collapse_secret_members() {
+        let nested = object(&[("client_secret", text("s3cr3t")), ("mode", text("w"))]);
+        let args = object(&[
+            ("path", text("dst")),
+            ("password", text("hunter2")),
+            ("TOKEN", text("abc")),
+            ("apiKey", text("xyz")),
+            ("nested", Value::Object(nested.clone())),
+            (
+                "list",
+                Value::Array(vec![Value::Object(nested), text("plain"), Value::from(7)]),
+            ),
+            ("monkey", text("contains the key marker")),
+        ]);
+
+        let redacted = redact_object(&args);
+        // `path`, `nested`, and `list` carry no marker; `password`, `TOKEN`,
+        // `apiKey`, and `monkey` all collapse onto the single `[redacted-key]`
+        // entry, so four unique keys remain.
+        assert_eq!(redacted.len(), 4);
+        assert_eq!(redacted.get("path"), Some(&text("dst")));
+        assert!(!redacted.contains_key("password"));
+        assert!(!redacted.contains_key("TOKEN"));
+        assert!(!redacted.contains_key("apiKey"));
+        assert!(!redacted.contains_key("monkey"));
+        assert_eq!(redacted.get(REDACTED_KEY), Some(&text(REDACTED_VALUE)));
+
+        let nested = match redacted.get("nested") {
+            Some(Value::Object(map)) => map,
+            other => panic!("nested must stay an object: {other:?}"),
+        };
+        assert!(!nested.contains_key("client_secret"));
+        assert_eq!(nested.get(REDACTED_KEY), Some(&text(REDACTED_VALUE)));
+        assert_eq!(nested.get("mode"), Some(&text("w")));
+
+        let items = match redacted.get("list") {
+            Some(Value::Array(items)) => items,
+            other => panic!("list must stay an array: {other:?}"),
+        };
+        assert_eq!(items.len(), 3);
+        let first = match &items[0] {
+            Value::Object(map) => map,
+            other => panic!("the first list item must stay an object: {other:?}"),
+        };
+        assert_eq!(first.get(REDACTED_KEY), Some(&text(REDACTED_VALUE)));
+        assert_eq!(items[1], text("plain"));
+        assert_eq!(items[2], Value::from(7));
+
+        assert_eq!(redact_value(&Value::from(7)), Value::from(7));
+        assert_eq!(redact_value(&text("plain")), text("plain"));
+        assert_eq!(redact_value(&Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn secret_markers_match_case_insensitively_and_substring_wise() {
+        for key in [
+            "password",
+            "PASSWORD",
+            "passwd",
+            "my-secret",
+            "token",
+            "AUTH",
+            "bearer",
+            "cookie",
+            "private",
+            "apikey",
+            "api_key",
+            "session",
+            "key",
+            "monkey",
+            "Key",
+            "PASSWORD_HASH",
+        ] {
+            assert!(is_secret_key(key), "{key} must be secret-suspect");
+        }
+        for key in [
+            "path", "mode", "content", "argv", "command", "list", "nested", "name", "value",
+        ] {
+            assert!(!is_secret_key(key), "{key} must not be secret-suspect");
+        }
+
+        assert!(reject_secret_text("plain command text").is_ok());
+        assert!(reject_secret_text("").is_ok());
+        for value in [
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "Bearer abc",
+            "sk-live-0000",
+            "AKIA0000",
+            "ghp_0000",
+            "xoxb-0000",
+            "password=hunter2",
+            "PASSWD=hunter2",
+            "SECRET=abc",
+            "API_KEY=abc",
+            "Apikey=abc",
+            "CLIENT_SECRET=abc",
+        ] {
+            assert_denied(
+                reject_secret_text(value),
+                "tool arguments may contain secret material",
+            );
+        }
+    }
+
+    #[test]
+    fn escape_controls_escapes_every_control_including_del_and_c1() {
+        assert_eq!(escape_controls("plain"), "plain");
+        assert_eq!(escape_controls("日本語"), "日本語");
+        assert_eq!(escape_controls("\u{0}"), "\\u0000");
+        assert_eq!(escape_controls("\u{1}"), "\\u0001");
+        assert_eq!(escape_controls("\n"), "\\u000a");
+        assert_eq!(escape_controls("\u{7f}"), "\\u007f");
+        assert_eq!(escape_controls("\u{85}"), "\\u0085");
+        assert_eq!(escape_controls("\u{9f}"), "\\u009f");
+        assert_eq!(escape_controls("a\u{0}b\u{1f}c"), "a\\u0000b\\u001fc");
+
+        let escaped = escape_controls("quote \" and control \u{7f}");
+        assert!(escaped.contains("\\u007f"));
+        assert!(!escaped.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn bounded_scope_accepts_empty_and_the_exact_byte_bound() {
+        assert_eq!(
+            bounded_scope("").expect("empty scope is allowed").as_str(),
+            ""
+        );
+
+        let exact = "s".repeat(MAX_SCOPE_BYTES);
+        assert_eq!(
+            bounded_scope(&exact)
+                .expect("exact bound accepted")
+                .as_str(),
+            exact
+        );
+
+        // The refusal diagnostic is static: the rejected text is neither echoed
+        // nor truncated into it. The over-bound input therefore carries a
+        // sentinel prefix that any echo, whole or truncated, would reveal.
+        let sentinel = "scope-echo-sentinel";
+        let over = format!(
+            "{sentinel}{}",
+            "s".repeat(MAX_SCOPE_BYTES + 1 - sentinel.len())
+        );
+        assert_eq!(over.len(), MAX_SCOPE_BYTES + 1);
+        let error = bounded_scope(&over).expect_err("one over the bound is refused");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), "tool resource scope exceeds its bound");
+        assert!(
+            !error.message().contains(sentinel),
+            "static diagnostic must not echo or truncate the rejected scope"
+        );
+    }
+
+    #[test]
+    fn parse_object_args_returns_the_strict_map_and_keeps_parser_diagnostics() {
+        let good = call("host_read", M0_REVISION, r#"{ "path" : "src" }"#);
+        let map = parse_object_args(&good).expect("object-root arguments parse");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("path"), Some(&text("src")));
+
+        let malformed = call("host_read", M0_REVISION, r#"{oops}"#);
+        assert_invalid(
+            parse_object_args(&malformed),
+            "arguments are not valid JSON",
+        );
+
+        let duplicate = call("host_read", M0_REVISION, r#"{"path":"src","path":"dst"}"#);
+        assert_invalid(
+            parse_object_args(&duplicate),
+            "arguments contain a duplicate object key",
+        );
+
+        let mut nested = String::new();
+        for _ in 0..=MAX_ARGS_DEPTH {
+            nested.push('[');
+        }
+        for _ in 0..=MAX_ARGS_DEPTH {
+            nested.push(']');
+        }
+        let deep = call("host_read", M0_REVISION, &format!(r#"{{"a":{nested}}}"#));
+        let error = parse_object_args(&deep).expect_err("depth exhaustion is refused");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(error.message(), "argument depth budget exhausted");
+
+        let items = vec!["0"; MAX_ARGS_NODES].join(",");
+        let wide = call("host_read", M0_REVISION, &format!(r#"{{"a":[{items}]}}"#));
+        let error = parse_object_args(&wide).expect_err("node exhaustion is refused");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(error.message(), "argument node budget exhausted");
+    }
+
+    #[test]
+    fn is_auto_read_tool_accepts_exactly_the_two_m0_names() {
+        assert!(is_auto_read_tool("host_read"));
+        assert!(is_auto_read_tool("host_search"));
+        for name in [
+            "host_write",
+            "host_exec",
+            "host_delete",
+            "HOST_READ",
+            "Host_Search",
+            "host-read",
+            "host_search2",
+            "host_read ",
+            "",
+            "host",
+        ] {
+            assert!(!is_auto_read_tool(name), "{name:?}");
+        }
+    }
+}
