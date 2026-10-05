@@ -548,6 +548,10 @@ pub struct AppState {
     finished: Option<RunOutcome>,
     /// Last viewport geometry, for selection visibility math.
     viewport: (usize, usize),
+    /// Project directory shown in the header (the filesystem scope tools
+    /// are jailed to). `None` renders no segment, so tests and headless
+    /// transcripts that never set it are unaffected.
+    project_dir: Option<String>,
 }
 
 impl Default for AppState {
@@ -584,7 +588,20 @@ impl AppState {
             status: "idle".to_owned(),
             finished: None,
             viewport: (80, 20),
+            project_dir: None,
         }
+    }
+
+    /// Records the project directory for the header. Accepts the
+    /// canonicalized working directory; presentation abbreviates it.
+    pub fn set_project_dir(&mut self, dir: impl Into<String>) {
+        self.project_dir = Some(dir.into());
+    }
+
+    /// Returns the project directory, if one was recorded.
+    #[must_use]
+    pub fn project_dir(&self) -> Option<&str> {
+        self.project_dir.as_deref()
     }
 
     /// Applies one runtime event to presentation state. Returns false without
@@ -2918,5 +2935,13 @@ mod cov_state_private {
             !state.approval_decision_allowed(),
             "detail cut before storage can never be approved"
         );
+    }
+
+    #[test]
+    fn project_dir_is_absent_until_recorded() {
+        let mut state = AppState::new();
+        assert_eq!(state.project_dir(), None);
+        state.set_project_dir("/Volumes/work/proj");
+        assert_eq!(state.project_dir(), Some("/Volumes/work/proj"));
     }
 }

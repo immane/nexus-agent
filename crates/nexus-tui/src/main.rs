@@ -146,6 +146,24 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
     })
 }
 
+/// Project directory for the header: the working directory this process
+/// was launched in, which is also the default root real tools are jailed
+/// to. Canonicalized so symlinked launches display the real location.
+fn session_project_dir() -> Option<String> {
+    project_dir_from(std::env::current_dir())
+}
+
+/// Pure half of [`session_project_dir`]: canonicalize when possible, fall
+/// back to the raw directory (a deleted cwd still displays), or `None`
+/// when there is no directory or it is not representable text.
+fn project_dir_from(current: io::Result<std::path::PathBuf>) -> Option<String> {
+    let dir = current.ok()?;
+    std::fs::canonicalize(&dir)
+        .unwrap_or(dir)
+        .to_str()
+        .map(str::to_owned)
+}
+
 /// Boot model: the most recently used model, else the first favourite, else
 /// the first configured model, else nothing (provider-dependent work then
 /// reports not-ready).
@@ -471,12 +489,16 @@ impl Frontend {
     /// Builds a frontend over the already-loaded startup configuration, so
     /// the interactive and headless paths share one load and one document.
     fn with_config(session: SessionId, config: SessionConfig) -> Self {
-        Self {
+        let mut front = Self {
             config: config.config,
             config_path: config.path,
             active_model: config.active_model,
             ..Self::new(session)
+        };
+        if let Some(dir) = session_project_dir() {
+            front.state.set_project_dir(dir);
         }
+        front
     }
 
     /// Advances the active model through the configured models in admission
@@ -2609,6 +2631,33 @@ mod cov_main_topup {
             boot_model(&configured(3, &["m1"], &["m2"]).config).as_deref(),
             Some("m1"),
             "recent beats favourites"
+        );
+    }
+
+    #[test]
+    fn project_dir_prefers_canonical_location_and_survives_loss() {
+        let canonical = std::fs::canonicalize(".").expect("cwd canonicalizes");
+        assert_eq!(
+            project_dir_from(Ok(canonical.clone())),
+            canonical.to_str().map(str::to_owned)
+        );
+        assert_eq!(
+            project_dir_from(Ok(std::path::PathBuf::from("/nonexistent-nexus-dir-9f3a"))),
+            Some("/nonexistent-nexus-dir-9f3a".to_owned()),
+            "an unreadable directory still displays instead of hiding the scope"
+        );
+        assert_eq!(
+            project_dir_from(Err(io::Error::new(io::ErrorKind::NotFound, "gone"))),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_frontend_records_the_project_directory() {
+        let (_run, front) = frontend_with(configured(0, &[], &[]));
+        assert!(
+            front.state.project_dir().is_some(),
+            "the header names the jail scope from the first frame"
         );
     }
 

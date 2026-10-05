@@ -143,14 +143,42 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         .active_run()
         .map(|run| run.as_str())
         .unwrap_or("no run");
-    let header = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(" nexus-tui ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("M0-TEST "),
         Span::styled(format!("run:{run} "), Style::default().fg(Color::Cyan)),
         Span::raw(state.status()),
         Span::raw(format!(" focus:{focus:?}").to_lowercase()),
-    ]));
+    ];
+    // The directory trails every existing segment, so frames that never
+    // set it render byte-identically and narrow frames clip the path
+    // before any status marker.
+    if let Some(dir) = state.project_dir() {
+        spans.push(Span::raw(format!(" dir:{}", abbreviate_home(dir))));
+    }
+    let header = Paragraph::new(Line::from(spans));
     header.render(area, buf);
+}
+
+/// Abbreviates a display path by folding a leading home directory to `~`.
+/// Pure presentation: the stored directory is never rewritten.
+fn abbreviate_home(path: &str) -> String {
+    abbreviate_home_with(path, std::env::var("HOME").ok().as_deref())
+}
+
+/// Folds `home` to `~` when it is a real prefix (a full path component,
+/// not a string prefix like `/home/user2` under `/home/user`).
+fn abbreviate_home_with(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_owned();
+    };
+    if path == home {
+        return "~".to_owned();
+    }
+    match path.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_owned(),
+    }
 }
 
 fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
@@ -1692,6 +1720,57 @@ mod cov_render_private {
             preview.title.len(),
             MAX_TITLE_BYTES,
             "the bounded title is exactly the bound"
+        );
+    }
+
+    #[test]
+    fn header_hides_the_directory_until_one_is_recorded() {
+        let state = AppState::new();
+        let area = Rect::new(0, 0, 80, 1);
+        let header = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(!header.contains("dir:"), "{header:?}");
+        assert!(header.contains("focus:viewport"), "{header:?}");
+    }
+
+    #[test]
+    fn header_shows_the_recorded_directory_after_the_status_markers() {
+        let mut state = AppState::new();
+        state.set_project_dir("/Volumes/work/proj");
+        let area = Rect::new(0, 0, 120, 1);
+        let header = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(header.contains("focus:viewport"), "{header:?}");
+        assert!(header.contains("dir:/Volumes/work/proj"), "{header:?}");
+        assert!(
+            header.find("focus:viewport").expect("marker") < header.find("dir:").expect("dir"),
+            "narrow frames clip the path before any status marker: {header:?}"
+        );
+    }
+
+    #[test]
+    fn home_prefix_folds_to_a_tilde_on_component_boundaries() {
+        assert_eq!(
+            abbreviate_home_with("/home/user/proj", Some("/home/user")),
+            "~/proj"
+        );
+        assert_eq!(abbreviate_home_with("/home/user", Some("/home/user")), "~");
+        assert_eq!(
+            abbreviate_home_with("/home/user2/proj", Some("/home/user")),
+            "/home/user2/proj",
+            "string prefixes that are not components never fold"
+        );
+        assert_eq!(
+            abbreviate_home_with("/home/user/proj", None),
+            "/home/user/proj"
+        );
+        assert_eq!(
+            abbreviate_home_with("/home/user/proj", Some("")),
+            "/home/user/proj"
         );
     }
 }
