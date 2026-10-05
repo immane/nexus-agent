@@ -144,13 +144,13 @@ fn stop_body(text: &str) -> String {
 }
 
 #[test]
-fn capabilities_describe_text_and_tool_calls_without_streaming() {
+fn capabilities_describe_text_tool_calls_and_streaming() {
     let capabilities = OpenAiProvider::new("http://localhost:11434/v1", present_credential(), "m")
         .expect("provider builds")
         .capabilities();
     assert!(capabilities.text);
     assert!(capabilities.tool_calls);
-    assert!(!capabilities.streaming);
+    assert!(capabilities.streaming);
     assert!(capabilities.usage_reporting);
     assert_eq!(capabilities.max_context_items, None);
     assert_eq!(capabilities.max_output_bytes, None);
@@ -163,14 +163,36 @@ fn capabilities_describe_text_and_tool_calls_without_streaming() {
 }
 
 #[test]
+fn construction_accepts_https_with_verified_tls_bridge() {
+    let plain = OpenAiProvider::new("http://h/v1", present_credential(), "m").expect("http builds");
+    assert!(!plain.uses_tls());
+    let tls = OpenAiProvider::new("https://api.example.com/v1", present_credential(), "m")
+        .expect("https builds");
+    assert!(tls.uses_tls());
+    // Explicit ports still parse on both schemes.
+    assert!(
+        OpenAiProvider::new("https://h:8443/v1", present_credential(), "m")
+            .expect("explicit TLS port builds")
+            .uses_tls()
+    );
+    assert!(
+        !OpenAiProvider::new("http://h:11434/v1", present_credential(), "m")
+            .expect("explicit plain port builds")
+            .uses_tls()
+    );
+}
+
+#[test]
 fn construction_rejects_bad_endpoints_models_and_profiles() {
     for bad in [
-        "https://api.example.com/v1",
         "wss://api.example.com",
+        "ftp://api.example.com/v1",
         "api.example.com/v1",
         "",
         "http:///v1",
+        "https:///v1",
         "http://h:abc/v1",
+        "https://h:abc/v1",
     ] {
         assert!(
             OpenAiProvider::new(bad, present_credential(), "m").is_err(),
@@ -452,7 +474,8 @@ fn requests_carry_model_messages_tools_and_credentials() {
     assert!(head.contains("authorization: Bearer "));
     let payload: serde_json::Value = serde_json::from_str(body).expect("JSON body");
     assert_eq!(payload["model"], "test-model");
-    assert_eq!(payload["stream"], false);
+    assert_eq!(payload["stream"], true);
+    assert_eq!(payload["stream_options"]["include_usage"], true);
     let messages = payload["messages"].as_array().expect("messages");
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0]["role"], "user");
@@ -468,4 +491,174 @@ fn requests_carry_model_messages_tools_and_credentials() {
     let tools = payload["tools"].as_array().expect("tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["function"]["name"], "host_read");
+}
+
+/// Serves one canned raw HTTP response head plus body, then closes. Used for
+/// SSE (`text/event-stream`) and chunked-framing cases the JSON helper
+/// cannot express.
+fn serve_raw(head: &str, body: &str) -> (String, Served) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback binds");
+    let port = listener.local_addr().expect("port known").port();
+    let served = Served {
+        hits: Arc::new(AtomicUsize::new(0)),
+        request: Arc::new(Mutex::new(Vec::new())),
+    };
+    let captured = Served {
+        hits: Arc::clone(&served.hits),
+        request: Arc::clone(&served.request),
+    };
+    let head = head.to_owned();
+    let body = body.to_owned();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut seen = Vec::new();
+        let mut byte = [0u8; 1];
+        while !seen.ends_with(b"\r\n\r\n") {
+            match stream.read_exact(&mut byte) {
+                Ok(()) => seen.push(byte[0]),
+                Err(_) => break,
+            }
+            if seen.len() > 65_536 {
+                break;
+            }
+        }
+        let length: usize = String::from_utf8_lossy(&seen)
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("content-length:")
+                    .or_else(|| line.strip_prefix("Content-Length:"))
+            })
+            .filter_map(|value| value.trim().parse().ok())
+            .next()
+            .unwrap_or(0);
+        let mut rest = vec![0u8; length.min(1_048_576)];
+        let _ = stream.read_exact(&mut rest);
+        captured
+            .request
+            .lock()
+            .expect("request log writable")
+            .extend_from_slice(&seen);
+        captured
+            .request
+            .lock()
+            .expect("request log writable")
+            .extend_from_slice(&rest);
+        captured.hits.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+    });
+    (format!("http://127.0.0.1:{port}/v1"), served)
+}
+
+fn sse_head(body_len: usize) -> String {
+    format!(
+        "HTTP/1.1 200 Test\r\ncontent-type: text/event-stream\r\ncontent-length: {body_len}\r\nconnection: close\r\n\r\n"
+    )
+}
+
+#[test]
+fn sse_text_fragments_concatenate_to_one_delta() {
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"there\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\ndata: [DONE]\n";
+    let (base, served) = serve_raw(&sse_head(body.len()), body);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    assert_eq!(served.hits.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        &events[0],
+        ProviderEvent::TextDelta { item_key, text }
+        if item_key == "item-0" && text == "hello there"
+    ));
+    let terminal = finished(&events);
+    assert_eq!(terminal.reason(), FinishReason::Stop);
+    assert_eq!(
+        terminal.usage(),
+        Usage::new(Some(4), Some(2), UsageFinality::Final)
+    );
+}
+
+#[test]
+fn sse_tool_fragments_assemble_per_index_before_admission() {
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-9\",\"function\":{\"name\":\"host_read\",\"arguments\":\"{\\\"path\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":\\\"src\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n",
+    );
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    let ready: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::ToolCallReady(candidate) => Some(candidate),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].item_key(), "item-1");
+    assert_eq!(ready[0].provider_ref(), "call-9");
+    assert_eq!(finished(&events).reason(), FinishReason::ToolCalls);
+}
+
+#[test]
+fn sse_without_termination_is_a_truncation_not_a_stop() {
+    let body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let error = failed(provider(&base).stream(&base_request(), &live_context()));
+    assert_eq!(error.0, ErrorCategory::Protocol);
+}
+
+#[test]
+fn sse_claimed_tool_calls_without_items_still_violates_the_contract() {
+    let body =
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n";
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let error = failed(provider(&base).stream(&base_request(), &live_context()));
+    assert_eq!(error.0, ErrorCategory::Protocol);
+}
+
+#[test]
+fn chunked_sse_streams_parse_after_dechunking() {
+    let inner = "data: {\"choices\":[{\"delta\":{\"content\":\"ab\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"cd\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n";
+    let framed = format!(
+        "{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+        24,
+        &inner[..24],
+        inner.len() - 24,
+        &inner[24..]
+    );
+    let head = "HTTP/1.1 200 Test\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        .to_owned();
+    let (base, _) = serve_raw(&head, &framed);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    assert!(matches!(
+        &events[0],
+        ProviderEvent::TextDelta { item_key, text }
+        if item_key == "item-0" && text == "abcd"
+    ));
+    assert_eq!(finished(&events).reason(), FinishReason::Stop);
+}
+
+#[test]
+fn https_construction_accepts_explicit_and_default_ports() {
+    assert!(
+        OpenAiProvider::new("https://h/v1", present_credential(), "m")
+            .expect("default TLS port builds")
+            .uses_tls()
+    );
+    assert!(
+        OpenAiProvider::new("https://h:8443/v1/", present_credential(), "m")
+            .expect("explicit TLS port builds")
+            .uses_tls()
+    );
+}
+
+#[test]
+fn https_unreachable_peers_fail_protocol_not_unsupported() {
+    let provider = OpenAiProvider::new("https://127.0.0.1:9/", present_credential(), "m")
+        .expect("https provider builds");
+    let error = failed(provider.stream(&base_request(), &live_context()));
+    assert_eq!(error.0, ErrorCategory::Protocol);
 }
