@@ -10,6 +10,9 @@ edition = "2024"
 nexus-core = { path = "../nexus-core" }
 # Single-active-run execution loop shared with the TUI and headless paths.
 nexus-runtime = { path = "../nexus-runtime" }
+# User configuration: path resolution, strict load, atomic save, redacted
+# summary, and credential references (never values) for submit gating.
+nexus-config = { path = "../nexus-config" }
 # Scripted doubles for the test-only demo wiring (no real providers).
 nexus-fakes = { path = "../nexus-fakes" }
 # JSON for the HTTP API only: request parsing and event/snapshot encoding.

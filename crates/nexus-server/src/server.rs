@@ -5,14 +5,40 @@
 //! interaction goes through the shared Tokio handle. Event receivers live
 //! behind mutexes because `mpsc::Receiver` is `!Sync`; each session takes at
 //! most one SSE subscriber at a time.
+//!
+//! # User configuration
+//!
+//! [`Server::set_config`] installs one [`UserConfig`] plus the file it is
+//! persisted to. A server built by [`Server::new`] alone holds
+//! [`UserConfig::default_config`] with no path: submit selection then
+//! resolves nothing, favourites are refused, and recent-model recording
+//! stays in memory, so the existing demo wiring is unchanged.
+//!
+//! `submit` accepts an optional `"provider"` and `"model"`. Both must name
+//! configured identities (`400` otherwise) and, when they disagree about
+//! which provider owns the model, the pair is rejected. The selected
+//! provider's credential must resolve from the process environment at
+//! submit time (`503` otherwise). The diagnostic names only the provider
+//! id, which is a bounded lock identifier: no environment value can reach
+//! it. An accepted run with a selected model is remembered in a
+//! run-to-model map, and the SSE terminal event for that run records the
+//! use in the configuration and saves it.
+//!
+//! Persistence is best effort by design: a failed save is logged to stderr
+//! and the run, its stream, and the in-memory record all continue. Usage
+//! telemetry must never convert a completed run into a transport failure,
+//! and `record_use` is applied in memory before the save is attempted so
+//! the two can never disagree about what was used.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
     ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, ModelRequest,
     ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunId,
@@ -103,23 +129,52 @@ impl Session {
     }
 }
 
-/// Shared server state: the Tokio handle driving runtime ports plus every
-/// live session. Bound to loopback by the binary; there is no auth.
+/// Shared server state: the Tokio handle driving runtime ports, every live
+/// session, and the user configuration. Bound to loopback by the binary;
+/// there is no auth.
 pub struct Server {
     handle: tokio::runtime::Handle,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     next_session: AtomicU64,
+    /// The live configuration document. Every read and write goes through
+    /// this one lock so a run's usage record and the redacted summary can
+    /// never observe a half-applied change.
+    config: Mutex<UserConfig>,
+    /// File the configuration is persisted to. `None` keeps every change in
+    /// memory: a server without a configured path never writes a file.
+    config_path: Option<PathBuf>,
+    /// Accepted run id to the model id it was submitted with. Entries are
+    /// consumed by that run's SSE terminal event, so the map holds at most
+    /// the runs that were accepted but never streamed to a terminal.
+    run_models: Mutex<HashMap<String, String>>,
 }
 
 impl Server {
     /// Creates shared state around the Tokio handle used for `block_on`.
+    ///
+    /// The server starts with [`UserConfig::default_config`] and no
+    /// configuration path. Call [`Server::set_config`] before serving to
+    /// enable submit selection, favourites, and persisted recents.
     #[must_use]
     pub fn new(handle: tokio::runtime::Handle) -> Self {
         Self {
             handle,
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
+            config: Mutex::new(UserConfig::default_config()),
+            config_path: None,
+            run_models: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Installs the user configuration and the file it is saved to.
+    ///
+    /// `path` of `None` keeps later changes in memory only. Changing the
+    /// document never touches live runs: selection is resolved per submit
+    /// and a run's recorded model is already fixed at acceptance.
+    pub fn set_config(&mut self, config: UserConfig, path: Option<PathBuf>) {
+        *self.config.lock().expect("config lockable") = config;
+        self.config_path = path;
     }
 
     /// Creates a session with a fresh demo-wired runtime and returns its
@@ -222,6 +277,9 @@ impl Server {
                 Some(entry) => self.stream_events(&entry, run, stream),
                 None => Some(json_response(404, &json::error_body("unknown session"))),
             },
+            Route::Config => Some(self.config_summary()),
+            Route::AddFavourite => Some(self.add_favourite(body)),
+            Route::RemoveFavourite { model } => Some(self.remove_favourite(model)),
             Route::NotFound => Some(json_response(404, &json::error_body("unknown route"))),
         }
     }
@@ -238,9 +296,83 @@ impl Server {
         }
     }
 
+    /// Returns the redacted configuration summary: identities, labels,
+    /// credential variable names, favourites, and recents. The document
+    /// holds no secret values, so nothing here can disclose one.
+    fn config_summary(&self) -> Response {
+        let config = self.config.lock().expect("config lockable");
+        json_response(200, &body_json(summary(&config)))
+    }
+
+    /// Adds a favourite model and persists it. An unknown model is invalid
+    /// input (`400`) and a full list is a conflict (`409`), matching the
+    /// distinctions the configuration model already draws. A save failure
+    /// still leaves the in-memory change applied and reports `500`: the
+    /// edit succeeded, only its durability did not.
+    fn add_favourite(&self, body: &Value) -> Response {
+        let id = match body_str(body, "id") {
+            Some(id) => id.to_owned(),
+            None => {
+                return json_response(400, &json::error_body("favourite identity is invalid"));
+            }
+        };
+        let mut config = self.config.lock().expect("config lockable");
+        if config.model(&id).is_none() {
+            return json_response(400, &json::error_body("favourite model is unknown"));
+        }
+        match config.add_favourite(&id) {
+            Ok(()) => match self.persist(&config) {
+                Ok(()) => json_response(200, &Self::favourites_body(&config)),
+                Err(_) => json_response(500, &json::error_body("configuration could not be saved")),
+            },
+            Err(_) => json_response(409, &json::error_body("favourite list is full")),
+        }
+    }
+
+    /// Removes a favourite model and persists it. An id that is not a
+    /// favourite is a missing target (`404`); the model itself may still
+    /// exist, which is why this is not the same refusal as `add_favourite`.
+    fn remove_favourite(&self, model: &str) -> Response {
+        let mut config = self.config.lock().expect("config lockable");
+        match config.remove_favourite(model) {
+            Ok(()) => match self.persist(&config) {
+                Ok(()) => json_response(200, &Self::favourites_body(&config)),
+                Err(_) => json_response(500, &json::error_body("configuration could not be saved")),
+            },
+            Err(_) => json_response(404, &json::error_body("favourite is unknown")),
+        }
+    }
+
+    /// Builds the response body for a favourites change: the resulting
+    /// list in admission order. A `200` means the change is live in memory
+    /// and reached the file; a `500` means it is live in memory only.
+    fn favourites_body(config: &UserConfig) -> Vec<u8> {
+        body_json(serde_json::json!({ "favourites": config.favourites() }))
+    }
+
+    /// Writes the configuration to its configured path. With no path there
+    /// is nothing to save, which is a success: an unconfigured server
+    /// keeps every change in memory without reporting an error.
+    fn persist(&self, config: &UserConfig) -> Result<(), ConfigError> {
+        match self.config_path.as_deref() {
+            None => Ok(()),
+            Some(path) => save(config, path),
+        }
+    }
+
     /// Accepts a task for the session. Only `Accepted` mints a run; every
     /// other reply keeps the slot untouched.
+    ///
+    /// An optional `provider`/`model` pair selects the integration. Both
+    /// are validated against the configured document before the run is
+    /// submitted, so an invalid or unavailable selection never occupies the
+    /// session's single run slot and never mints a run. An accepted run
+    /// with a selected model is remembered for terminal-time recording.
     fn submit_run(&self, session: &Arc<Session>, body: &Value) -> Option<Response> {
+        let model = match self.select_model(body) {
+            Ok(model) => model,
+            Err(response) => return Some(response),
+        };
         let input = body_str(body, "input").unwrap_or("");
         let profile = body_str(body, "profile").unwrap_or(WEB_PROFILE);
         let command = match SubmitCommand::new(
@@ -263,6 +395,17 @@ impl Server {
             CommandReply::Accepted => 201,
             _ => crate::json::reply_status(reply.reply()),
         };
+        // Only an accepted run may be recorded: a rejected, busy, or
+        // missing reply mints nothing, so there is no run to attribute
+        // usage to.
+        if reply.reply() == CommandReply::Accepted
+            && let (Some(run), Some(model)) = (reply.run(), model.as_deref())
+        {
+            self.run_models
+                .lock()
+                .expect("run model map lockable")
+                .insert(run.as_str().to_owned(), model.to_owned());
+        }
         let body = match reply.run() {
             Some(run) => {
                 serde_json::json!({ "reply": crate::json::reply_name(reply.reply()), "run": run.as_str() })
@@ -270,6 +413,106 @@ impl Server {
             None => serde_json::json!({ "reply": crate::json::reply_name(reply.reply()) }),
         };
         Some(json_response(status, &body_json(body)))
+    }
+
+    /// Resolves the optional `provider`/`model` submit selection to the
+    /// model id whose use will be recorded at the run's terminal event.
+    ///
+    /// `Ok(None)` means no selection was requested: the run proceeds on the
+    /// demo wiring and records no usage. An unknown `provider` or `model`
+    /// is invalid input (`400`). When both name configured identities but
+    /// disagree about ownership, the pair is rejected rather than silently
+    /// preferring one field.
+    ///
+    /// A selection whose provider credential cannot be resolved is a
+    /// readiness failure (`503`), not bad input: the request is well-formed
+    /// and retryable once the environment is set. The body names only the
+    /// provider id, which the configuration charset bounds to lock
+    /// identifier text, so no credential value can reach the diagnostic.
+    fn select_model(&self, body: &Value) -> Result<Option<String>, Response> {
+        let provider_field = optional_text(body, "provider")?;
+        let model_field = optional_text(body, "model")?;
+        if provider_field.is_none() && model_field.is_none() {
+            return Ok(None);
+        }
+        // The document is locked once and released before any credential
+        // resolution: the environment lookup must never run while the
+        // configuration lock is held, so a slow or blocking resolution
+        // cannot stall every other config request.
+        let (provider_id, credential) = {
+            let config = self.config.lock().expect("config lockable");
+            let provider_id = match (provider_field, model_field) {
+                (Some(provider), Some(model)) => {
+                    let Some(entry) = config.model(model) else {
+                        return Err(json_response(
+                            400,
+                            &json::error_body("selected model is unknown"),
+                        ));
+                    };
+                    let Some(profile) = config.provider(provider) else {
+                        return Err(json_response(
+                            400,
+                            &json::error_body("selected provider is unknown"),
+                        ));
+                    };
+                    if entry.provider != profile.id {
+                        return Err(json_response(
+                            400,
+                            &json::error_body("selected model does not belong to that provider"),
+                        ));
+                    }
+                    profile.id.clone()
+                }
+                (Some(provider), None) => {
+                    let Some(profile) = config.provider(provider) else {
+                        return Err(json_response(
+                            400,
+                            &json::error_body("selected provider is unknown"),
+                        ));
+                    };
+                    profile.id.clone()
+                }
+                (None, Some(model)) => {
+                    let Some(entry) = config.model(model) else {
+                        return Err(json_response(
+                            400,
+                            &json::error_body("selected model is unknown"),
+                        ));
+                    };
+                    // A model entry always names an existing provider:
+                    // admission rejects the reference otherwise.
+                    config
+                        .provider(&entry.provider)
+                        .expect("model names a configured provider")
+                        .id
+                        .clone()
+                }
+                (None, None) => unreachable!("both-absent is handled above"),
+            };
+            let credential = config
+                .provider(&provider_id)
+                .expect("provider was resolved above")
+                .credential
+                .clone();
+            (provider_id, credential)
+        };
+        if resolve_credential(&credential).is_err() {
+            return Err(self.credential_unavailable(&provider_id));
+        }
+        Ok(model_field.map(str::to_owned))
+    }
+
+    /// Builds the credential-readiness refusal for one provider. The id
+    /// comes from the validated document, so it is bounded lock-identifier
+    /// text; the resolved value never appears here.
+    fn credential_unavailable(&self, provider: &str) -> Response {
+        json_response(
+            503,
+            &body_json(serde_json::json!({
+                "error": format!("provider credential is unavailable: {provider}"),
+                "retry": "set the referenced environment variable and retry",
+            })),
+        )
     }
 
     /// Returns the bounded snapshot for a known run of this session.
@@ -420,6 +663,14 @@ impl Server {
                 continue;
             }
             let terminal = event.is_terminal();
+            // Usage is recorded before the terminal frame is published, not
+            // after. A client that reads the terminal event is entitled to
+            // observe the recorded usage and the persisted file immediately
+            // afterwards; saving afterwards would leave a window in which
+            // the run looks finished but its usage is not yet durable.
+            if terminal {
+                self.record_model_use(run.as_str());
+            }
             let frame = format!(
                 "id: {}\ndata: {}\n\n",
                 event.seq(),
@@ -434,6 +685,35 @@ impl Server {
         }
         *session.streaming.lock().expect("stream flag lockable") = false;
         None
+    }
+
+    /// Records a finished run's selected model as recently used and saves
+    /// the document. A run submitted without a model has no entry and is
+    /// skipped without touching the configuration.
+    ///
+    /// The map entry is consumed on every call, terminal or not, so a
+    /// client that abandons the stream cannot leave a stale attribution
+    /// behind for a later run. Recording is applied to the in-memory
+    /// document first, so a failed save leaves usage visible in `GET
+    /// /config` and is reported on stderr rather than discarded; the run
+    /// itself has already finished and its outcome is never retracted.
+    fn record_model_use(&self, run: &str) {
+        let Some(model) = self
+            .run_models
+            .lock()
+            .expect("run model map lockable")
+            .remove(run)
+        else {
+            return;
+        };
+        let mut config = self.config.lock().expect("config lockable");
+        if let Err(error) = config.record_use(&model) {
+            eprintln!("nexus-server: model usage was not recorded ({error})");
+            return;
+        }
+        if let Err(error) = self.persist(&config) {
+            eprintln!("nexus-server: configuration could not be saved ({error})");
+        }
     }
 }
 
@@ -474,6 +754,12 @@ enum Route<'a> {
     },
     /// `GET /sessions/{sid}/runs/{rid}/events`.
     Events { session: &'a str, run: &'a str },
+    /// `GET /config`: the redacted configuration summary.
+    Config,
+    /// `POST /config/favourites` with `{"id": "<model id>"}`.
+    AddFavourite,
+    /// `DELETE /config/favourites/{mid}`.
+    RemoveFavourite { model: &'a str },
     /// Anything else.
     NotFound,
 }
@@ -502,6 +788,14 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
             decision: Decision::Deny,
         },
         ("GET", ["", "sessions", session, "runs", run, "events"]) => Route::Events { session, run },
+        ("GET", ["", "config"]) => Route::Config,
+        ("POST", ["", "config", "favourites"]) => Route::AddFavourite,
+        // An empty trailing segment is a malformed path, not a request to
+        // remove the empty id: `/config/favourites/` must not reach the
+        // handler as a well-formed removal.
+        ("DELETE", ["", "config", "favourites", model]) if !model.is_empty() => {
+            Route::RemoveFavourite { model }
+        }
         _ => Route::NotFound,
     }
 }
@@ -509,6 +803,23 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
 /// Extracts one string field from a JSON object body.
 fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
     body.get(key)?.as_str()
+}
+
+/// Reads an optional string selection field.
+///
+/// A field that is present but not a string is rejected instead of being
+/// read as absent: `{"model": 12}` is a malformed selection, and treating it
+/// as "no selection" would silently drop the caller's intent and dispatch an
+/// unselected run.
+fn optional_text<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, Response> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str())),
+        Some(_) => Err(json_response(
+            400,
+            &json::error_body("selection field is not text"),
+        )),
+    }
 }
 
 /// Builds a runtime reply body with its HTTP status.
@@ -535,6 +846,7 @@ fn json_response(status: u16, body: &[u8]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
 
     /// Live demo context: a 60s elapsed reading, never cancelled, no
@@ -588,6 +900,55 @@ mod tests {
     /// prove whether the shared script survived or was replaced.
     fn state(provider: &PerRunProvider) -> std::sync::MutexGuard<'_, PerRunState> {
         provider.current.lock().expect("demo provider lockable")
+    }
+
+    /// One provider whose credential cannot resolve. The name is chosen so
+    /// that no environment defines it, which is the only way to exercise the
+    /// refusal without mutating the process environment.
+    fn gated_config() -> UserConfig {
+        let mut config = UserConfig::default_config();
+        config
+            .add_provider(
+                ProviderProfile::new(
+                    "gated",
+                    "Gated",
+                    AdapterKind::Direct,
+                    None,
+                    CredentialRef::env_var("NEXUS_SERVER_UNIT_ABSENT_7C1E").expect("valid"),
+                    "m",
+                )
+                .expect("valid provider builds"),
+            )
+            .expect("provider admits");
+        config
+            .add_model(ModelEntry::new("gated-fast", "gated", "f").expect("valid"))
+            .expect("model admits");
+        config
+    }
+
+    /// A server carrying `gated_config` and no path, on a current handle.
+    fn server_with_gated_config() -> (Server, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("unit executor builds");
+        let mut server = Server::new(runtime.handle().clone());
+        server.set_config(gated_config(), None);
+        (server, runtime)
+    }
+
+    /// A JSON submit body naming the given optional selection fields.
+    fn submit_body(provider: Option<&str>, model: Option<&str>) -> Value {
+        let mut body = serde_json::Map::new();
+        body.insert("input".to_owned(), serde_json::json!("unit task"));
+        if let Some(provider) = provider {
+            body.insert("provider".to_owned(), serde_json::json!(provider));
+        }
+        if let Some(model) = model {
+            body.insert("model".to_owned(), serde_json::json!(model));
+        }
+        Value::Object(body)
     }
 
     #[test]
@@ -654,6 +1015,267 @@ mod tests {
         ] {
             assert_eq!(route_path(method, path), Route::NotFound, "{method} {path}");
         }
+    }
+
+    #[test]
+    fn config_routes_match_the_documented_methods_and_paths() {
+        assert_eq!(route_path("GET", "/config"), Route::Config);
+        assert_eq!(
+            route_path("POST", "/config/favourites"),
+            Route::AddFavourite
+        );
+        assert_eq!(
+            route_path("DELETE", "/config/favourites/sonnet"),
+            Route::RemoveFavourite { model: "sonnet" }
+        );
+    }
+
+    /// Each configuration route refuses the other methods, so a read cannot
+    /// be issued as a write or a removal as an addition.
+    #[test]
+    fn config_routes_reject_the_wrong_method() {
+        for (method, path) in [
+            ("POST", "/config"),
+            ("DELETE", "/config"),
+            ("GET", "/config/favourites"),
+            ("GET", "/config/favourites/sonnet"),
+            ("POST", "/config/favourites/sonnet"),
+            ("POST", "/config/favourites/sonnet/extra"),
+            ("DELETE", "/config/favourites"),
+            ("DELETE", "/config/favourites/"),
+        ] {
+            assert_eq!(route_path(method, path), Route::NotFound, "{method} {path}");
+        }
+    }
+
+    /// A submit without selection fields is not a selection request at all:
+    /// the demo wiring serves it and nothing is recorded against it. This is
+    /// the path every pre-configuration client uses.
+    #[test]
+    fn submit_without_selection_records_nothing() {
+        let (server, _runtime) = server_with_gated_config();
+        // `Response` has no `Debug`, so the outcome is matched rather than
+        // unwrapped through `expect`.
+        match server.select_model(&submit_body(None, None)) {
+            Ok(model) => assert_eq!(model, None, "no selection names no model"),
+            Err(response) => panic!("no selection is never refused: {}", response.status),
+        }
+    }
+
+    /// Every unresolvable selection is refused as a readiness failure, not
+    /// as invalid input, and the diagnostic names only the provider id.
+    #[test]
+    fn unresolvable_selections_are_refused_as_not_ready() {
+        let (server, _runtime) = server_with_gated_config();
+        for body in [
+            submit_body(None, Some("gated-fast")),
+            submit_body(Some("gated"), Some("gated-fast")),
+            submit_body(Some("gated"), None),
+        ] {
+            let response = server
+                .select_model(&body)
+                .expect_err("an unresolvable credential cannot be selected");
+            assert_eq!(response.status, 503, "{body}");
+            let reported = serde_json::from_slice::<Value>(&response.body).expect("JSON body");
+            let message = reported["error"].as_str().expect("diagnostic");
+            assert!(message.contains("gated"), "names the provider: {message}");
+            assert!(
+                !message.contains("NEXUS_SERVER_UNIT_ABSENT_7C1E"),
+                "carries no credential detail: {message}"
+            );
+        }
+    }
+
+    /// Unknown identities and an inconsistent pair are invalid input, which
+    /// is a different status and a different remedy from not-ready: the
+    /// request itself must change, not the environment.
+    #[test]
+    fn unknown_or_inconsistent_selections_are_invalid_input() {
+        let (server, _runtime) = server_with_gated_config();
+        for body in [
+            submit_body(Some("absent"), None),
+            submit_body(None, Some("absent")),
+            submit_body(Some("absent"), Some("gated-fast")),
+            submit_body(Some("gated"), Some("absent")),
+            // A present-but-non-string field is malformed input, not an
+            // absent selection.
+            serde_json::json!({ "input": "t", "model": 12 }),
+            serde_json::json!({ "input": "t", "provider": ["gated"] }),
+        ] {
+            let response = server
+                .select_model(&body)
+                .expect_err("an unknown identity cannot be selected");
+            assert_eq!(response.status, 400, "{body}");
+        }
+    }
+
+    /// A model that belongs to a different provider is refused rather than
+    /// resolved through whichever field happened to be read first: a
+    /// selection that silently contradicts itself is not a selection.
+    #[test]
+    fn a_model_from_another_provider_is_refused() {
+        let mut config = gated_config();
+        config
+            .add_provider(
+                ProviderProfile::new(
+                    "second",
+                    "Second",
+                    AdapterKind::Direct,
+                    None,
+                    CredentialRef::env_var("NEXUS_SERVER_UNIT_ABSENT_7C1E").expect("valid"),
+                    "m",
+                )
+                .expect("valid provider builds"),
+            )
+            .expect("provider admits");
+        config
+            .add_model(ModelEntry::new("second-fast", "second", "f").expect("valid"))
+            .expect("model admits");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("unit executor builds");
+        let mut server = Server::new(runtime.handle().clone());
+        server.set_config(config, None);
+
+        let response = server
+            .select_model(&submit_body(Some("gated"), Some("second-fast")))
+            .expect_err("the pair contradicts itself");
+        assert_eq!(response.status, 400);
+    }
+
+    /// Recording is idempotent per run because the map entry is consumed on
+    /// the first call: a second terminal event, or a client that abandons
+    /// the stream after one, cannot inflate a model's use count or leave a
+    /// stale attribution behind for a later run.
+    #[test]
+    fn recording_consumes_the_attribution_and_is_not_repeatable() {
+        let (server, _runtime) = server_with_gated_config();
+        server
+            .run_models
+            .lock()
+            .expect("run model map lockable")
+            .insert("run-x".to_owned(), "gated-fast".to_owned());
+
+        server.record_model_use("run-x");
+        assert_eq!(
+            server.config.lock().expect("config lockable").recent(),
+            ["gated-fast".to_owned()],
+            "the recorded use is visible immediately"
+        );
+        assert!(
+            server
+                .run_models
+                .lock()
+                .expect("run model map lockable")
+                .is_empty(),
+            "the attribution is consumed, not left behind"
+        );
+
+        server.record_model_use("run-x");
+        assert_eq!(
+            server.config.lock().expect("config lockable").recent(),
+            ["gated-fast".to_owned()],
+            "a second terminal event records nothing further"
+        );
+    }
+
+    /// A run with no recorded model is skipped entirely: an unselected run
+    /// must not invent a recent entry or touch the document.
+    #[test]
+    fn an_unselected_run_records_nothing() {
+        let (server, _runtime) = server_with_gated_config();
+        server.record_model_use("run-without-selection");
+        assert!(
+            server
+                .config
+                .lock()
+                .expect("config lockable")
+                .recent()
+                .is_empty()
+        );
+    }
+
+    /// The favourites handlers answer with the resulting list, so a client
+    /// never has to re-read the document to learn what changed. `save`
+    /// failing is reported as such while the in-memory change stands.
+    #[test]
+    fn favourites_handlers_report_the_resulting_list() {
+        let (server, _runtime) = server_with_gated_config();
+        let response = server.add_favourite(&serde_json::json!({ "id": "gated-fast" }));
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).expect("JSON body")["favourites"],
+            serde_json::json!(["gated-fast"])
+        );
+
+        let response = server.add_favourite(&serde_json::json!({ "id": "absent" }));
+        assert_eq!(response.status, 400, "an unknown model is invalid input");
+
+        let response = server.remove_favourite("gated-fast");
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).expect("JSON body")["favourites"],
+            serde_json::json!([])
+        );
+        let response = server.remove_favourite("gated-fast");
+        assert_eq!(response.status, 404, "removing twice is a missing target");
+    }
+
+    /// A removal that exists succeeds and is durable; one that does not is
+    /// a missing target, distinct from the unknown-model refusal of the
+    /// addition path even though both are "unknown" in different senses.
+    ///
+    /// Exercised here rather than over a socket because the blocking
+    /// transport in `http::read_request` refuses every method but `GET` and
+    /// `POST` before routing, so a `DELETE` cannot currently be delivered.
+    #[test]
+    fn removing_a_favourite_answers_with_the_resulting_list() {
+        let directory =
+            std::env::temp_dir().join(format!("nexus-server-unit-fav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temp directory is creatable");
+        let path = directory.join("config.json");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("unit executor builds");
+        let mut config = gated_config();
+        config
+            .add_favourite("gated-fast")
+            .expect("favourite admits");
+        nexus_config::save(&config, &path).expect("document saves");
+        let mut server = Server::new(runtime.handle().clone());
+        server.set_config(config, Some(path.clone()));
+
+        assert_eq!(server.remove_favourite("gated-fast").status, 200);
+        assert!(
+            nexus_config::load(&path)
+                .expect("document loads")
+                .expect("document exists")
+                .favourites()
+                .is_empty(),
+            "the removal reached the configured file"
+        );
+
+        // A model that exists but is not a favourite, an id that was never
+        // configured, and a repeated removal are all missing targets, and
+        // none of them disturbs the stored list.
+        assert_eq!(server.remove_favourite("gated-fast").status, 404);
+        assert_eq!(server.remove_favourite("absent").status, 404);
+        assert_eq!(server.remove_favourite("").status, 404);
+        assert!(
+            nexus_config::load(&path)
+                .expect("document loads")
+                .expect("document exists")
+                .favourites()
+                .is_empty(),
+            "a refused removal leaves the document untouched"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

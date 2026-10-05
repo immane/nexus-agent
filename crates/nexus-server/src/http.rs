@@ -105,7 +105,7 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
     if !version.starts_with("HTTP/") {
         return Err(bad(400, "request line is malformed"));
     }
-    if method != "GET" && method != "POST" {
+    if method != "GET" && method != "POST" && method != "DELETE" {
         return Err(bad(405, "method is not supported"));
     }
     if !path.starts_with('/') {
@@ -190,6 +190,7 @@ pub const fn reason(status: u16) -> &'static str {
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
         _ => "Unknown",
     }
 }

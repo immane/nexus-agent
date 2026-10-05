@@ -274,7 +274,6 @@ fn a_peer_that_closes_before_the_head_is_rejected() {
 fn unsupported_methods_are_rejected_with_405() {
     for raw in [
         "PUT /x HTTP/1.1\r\n\r\n",
-        "DELETE /x HTTP/1.1\r\n\r\n",
         "HEAD /x HTTP/1.1\r\n\r\n",
         "PATCH /x HTTP/1.1\r\n\r\n",
         "OPTIONS * HTTP/1.1\r\n\r\n",
@@ -596,6 +595,7 @@ fn reason_phrases_cover_the_emitted_statuses() {
         (431, "Request Header Fields Too Large"),
         (500, "Internal Server Error"),
         (501, "Not Implemented"),
+        (503, "Service Unavailable"),
     ] {
         assert_eq!(reason(status), phrase, "status {status}");
     }

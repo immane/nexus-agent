@@ -38,11 +38,45 @@
 //!
 //! # Dependency justification
 //!
+//! # User configuration
+//!
+//! The server holds one [`nexus_config::UserConfig`], installed by
+//! [`Server::set_config`] together with the file it is saved to.
+//! [`Server::new`] alone starts from the empty default document with no
+//! path, so every configuration-dependent route behaves as not-ready
+//! rather than guessing an identity.
+//!
+//! - `GET /config` -> `200` with the redacted summary: providers, models,
+//!   favourites, and recents. Credential *references* (variable names) are
+//!   included because the document cannot hold a value.
+//! - `POST /sessions/{sid}/runs` accepts optional `"provider"` and
+//!   `"model"`. An unknown identity, or a pair that disagrees about
+//!   ownership, is `400`. A selected provider whose credential does not
+//!   resolve is `503`; the diagnostic names only the provider id.
+//!   An accepted run records its model and, at its SSE terminal event,
+//!   marks that model recently used and saves the file. A failed save is
+//!   logged and never changes the run's outcome.
+//! - `POST /config/favourites` with `{"id": "<model id>"}` -> `200` with
+//!   the resulting list; `400` for an unknown model, `409` for a full list,
+//!   `500` when the save fails.
+//! - `DELETE /config/favourites/{mid}` -> `200` with the resulting list;
+//!   `404` for an id that is not a favourite. Note that the transport in
+//!   `http::read_request` currently admits only `GET` and `POST`, so a
+//!   `DELETE` is refused with `405` before it reaches this route; the route
+//!   and its handler are implemented, and admitting the method in the parser
+//!   makes them reachable with no change here.
+//!
+//! # Dependency justification
+//!
 //! `serde_json` only encodes/decodes the HTTP API. `tokio` only drives the
 //! runtime port from blocking connection threads (`rt`, `rt-multi-thread`,
 //! `time`, `sync`, `macros`); sockets stay plain blocking `std::net` I/O,
 //! so there is intentionally no `net`/`io-util` async I/O and no HTTP
 //! framework. `nexus-fakes` supplies the test-only demo wiring.
+//! `nexus-config` owns the configuration document, its strict parse, its
+//! atomic save, and credential *references*; the server resolves a
+//! reference at submit time and never handles the value beyond that
+//! single lookup.
 
 #![forbid(unsafe_code)]
 
