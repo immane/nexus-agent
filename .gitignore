@@ -1,1 +1,19 @@
+# Rust build output.
 /target/
+
+# Python bytecode and test caches (tools/perf runs on the system interpreter).
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+
+# Coverage artifacts (cargo llvm-cov / coverage.py).
+*.profraw
+*.profdata
+*.cover
+.coverage
+lcov.info/
+
+# macOS metadata.
+.DS_Store
