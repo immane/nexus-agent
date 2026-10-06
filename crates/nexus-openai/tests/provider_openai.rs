@@ -914,6 +914,40 @@ fn sse_reasoning_fragments_accumulate_withheld_from_sink() {
 }
 
 #[test]
+fn ollama_style_reasoning_fields_feed_the_same_accumulator() {
+    // SSE deltas.
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"again\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n",
+    );
+    let (base, _) = serve_raw(&sse_head(body.len()), body);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    let reasoning: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::ReasoningDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["think again".to_owned()]);
+
+    // Non-streaming message bodies.
+    let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi","reasoning":"because"},"finish_reason":"stop"}]}"#;
+    let (base, _) = serve(200, body, Duration::ZERO);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    let reasoning: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::ReasoningDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, vec!["because".to_owned()]);
+}
+
+#[test]
 fn json_reasoning_content_maps_to_a_reasoning_event() {
     let body = r#"{"choices":[{"message":{"role":"assistant","content":"hi","reasoning_content":"because"},"finish_reason":"stop"}]}"#;
     let (base, _) = serve(200, body, Duration::ZERO);

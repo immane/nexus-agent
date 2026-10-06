@@ -749,8 +749,14 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
         applied.content.push_str(fragment);
     }
     // Thinking-mode trace. Accumulated for echo on later turns; unlike
-    // text it never reaches the provisional sink.
-    if let Some(trace) = delta.get("reasoning_content").and_then(Value::as_str) {
+    // text it never reaches the provisional sink. Vendors disagree on the
+    // field name (DeepSeek `reasoning_content`, Ollama `reasoning`), so
+    // both feed the same accumulator.
+    if let Some(trace) = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(Value::as_str)
+    {
         acc.reasoning.push_str(trace);
     }
     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -1277,6 +1283,7 @@ fn merge_assistant(rendered: Vec<Value>) -> Option<Value> {
         if reasoning.is_none() {
             reasoning = message
                 .get("reasoning_content")
+                .or_else(|| message.get("reasoning"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
@@ -1512,7 +1519,10 @@ fn events_for_json(body: &[u8]) -> Vec<ProviderEvent> {
             text: text.to_owned(),
         });
     }
-    if let Some(trace) = message.get("reasoning_content").and_then(Value::as_str)
+    if let Some(trace) = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
         && !trace.is_empty()
     {
         events.push(ProviderEvent::ReasoningDelta {
