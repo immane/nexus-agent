@@ -1498,9 +1498,19 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             front.focus = next_focus(front.focus, pending);
         }
         Action::ParkFocus => {
-            // Esc steps back one rung: close the expanded detail first.
-            front.state.close_approval_detail();
-            front.focus = Focus::Viewport;
+            // Step back one rung, never cancelling or deciding: an open
+            // detail just closes (the card keeps focus so allow/deny stay
+            // one keypress away), the composer parks in the viewport for
+            // the viewport-only shortcuts, and anywhere else returns to
+            // the composer, where most work happens.
+            if front.state.approval_detail_open() {
+                front.state.close_approval_detail();
+            } else {
+                front.focus = match front.focus {
+                    Focus::Composer => Focus::Viewport,
+                    _ => Focus::Composer,
+                };
+            }
         }
         Action::InspectApproval => {
             if front.state.approval_detail_open() {
@@ -2892,7 +2902,17 @@ mod cov_main_private {
             .await
         );
 
-        // `Ctrl+C` with nothing cancellable exits instead of cancelling nothing.
+        // `Ctrl+C` with a non-empty draft clears it first instead of
+        // cancelling or quitting; the next press exits when idle.
+        assert!(
+            !handle_key(
+                &mut front,
+                &runtime,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+            )
+            .await
+        );
+        assert_eq!(front.state.composer(), "", "the draft is cleared first");
         assert!(!front.state.can_cancel());
         assert!(
             handle_key(
@@ -3914,8 +3934,67 @@ mod cov_main_topup {
 
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
         assert_eq!(front.focus, Focus::Viewport, "Esc parks in the viewport");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert_eq!(
+            front.focus,
+            Focus::Composer,
+            "Esc in the viewport returns home to the composer"
+        );
         assert!(!front.state.approval_detail_open(), "Esc never decides");
         assert_eq!(front.request_counter, 0, "no focus key issues a command");
+    }
+
+    #[tokio::test]
+    async fn composer_pages_and_folds_without_leaving_the_composer() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        for index in 0..30 {
+            front.state.record_submitted(&format!("entry {index}"));
+        }
+        front.state.set_viewport(40, 8);
+        front.focus = Focus::Composer;
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::PageUp)).await);
+        assert_eq!(front.focus, Focus::Composer, "paging keeps typing focus");
+        assert!(front.state.scrollback() > 0, "composer PgUp pages history");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::PageDown)).await);
+        assert_eq!(
+            front.state.scrollback(),
+            0,
+            "composer PgDn returns to the tail"
+        );
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
+        assert_eq!(front.focus, Focus::Composer, "folding keeps typing focus");
+        assert!(front.state.selected().is_some(), "Left selects and folds");
+        assert_eq!(
+            front.request_counter, 0,
+            "paging and folding issue no command"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_steps_back_one_rung_from_the_approval_card() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let run = run_id("run-esc-rungs");
+        let mut front = awaiting_approval(&run, "c1-0");
+        front.focus = Focus::ApprovalCard;
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('i'))).await);
+        assert!(front.state.approval_detail_open(), "i opens the detail");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert!(!front.state.approval_detail_open(), "Esc closes the detail");
+        assert_eq!(
+            front.focus,
+            Focus::ApprovalCard,
+            "the card keeps focus so allow/deny stay one keypress away"
+        );
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert_eq!(front.focus, Focus::Composer, "Esc then returns home");
+        assert!(
+            front.live_approval.is_some(),
+            "stepping back decides nothing"
+        );
     }
 
     #[tokio::test]

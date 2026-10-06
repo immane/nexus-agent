@@ -18,9 +18,12 @@
 //! | Composer | printable char | Type into the draft |
 //! | Composer | `Backspace` | Delete last draft char |
 //! | Composer | `Up`/`Down` | Previous/next submitted input (shown in the composer) |
+//! | Composer | `PageUp`/`PageDown` | Page the viewport (focus stays) |
+//! | Composer | `Left`/`Right` | Fold/unfold the selected entry (focus stays) |
 //! | Viewport | `Up`/`k`, `Down`/`j` | Move selection (scrolls) |
 //! | Viewport | `PageUp`/`PageDown` | Scroll one page |
 //! | Viewport | `Left`/`h`, `Right`/`l` | Fold/unfold the selected entry |
+//! | Viewport | `Esc` | Back to the composer (never cancels) |
 //! | Viewport | `m` | Cycle the active model (admission order) |
 //! | Viewport | `Tab` | Switch focus |
 //! | Viewport | `q` | Quit (test-only convenience) |
@@ -30,7 +33,7 @@
 //! | Approval | `Up`/`k`, `Down`/`j` | Scroll the expanded detail |
 //! | Approval | `PageUp`/`PageDown` | Page the expanded detail |
 //! | Approval | `Tab` | Switch focus |
-//! | Approval | `Esc` | Close the expanded detail, else park focus |
+//! | Approval | `Esc` | Close the expanded detail, else back to the composer |
 //! | Any | `Ctrl+C` | Clear the composer first; then cancel while cancellable (caller checks
 //! [`crate::AppState::can_cancel`]), else quit |
 //! | Any | `Ctrl+D` | Quit |
@@ -147,6 +150,9 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
         (Focus::Composer, KeyCode::Backspace) => Some(Action::Backspace),
         (Focus::Composer, KeyCode::Up) => Some(Action::ScrollUp),
         (Focus::Composer, KeyCode::Down) => Some(Action::ScrollDown),
+        (Focus::Composer, KeyCode::PageUp) => Some(Action::PageUp),
+        (Focus::Composer, KeyCode::PageDown) => Some(Action::PageDown),
+        (Focus::Composer, KeyCode::Left | KeyCode::Right) => Some(Action::FoldToggle),
         (Focus::Composer, KeyCode::Char(char)) if is_composable(char) => Some(Action::Type(char)),
         (Focus::Viewport, KeyCode::Up | KeyCode::Char('k')) => Some(Action::ScrollUp),
         (Focus::Viewport, KeyCode::Down | KeyCode::Char('j')) => Some(Action::ScrollDown),
@@ -159,6 +165,7 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
         (Focus::Viewport, KeyCode::Char('m')) => Some(Action::CycleModel),
         (Focus::Viewport, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::Viewport, KeyCode::Char('q')) => Some(Action::Quit),
+        (Focus::Viewport, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::ApprovalCard, KeyCode::Char('a')) => Some(Action::ApproveOnce),
         (Focus::ApprovalCard, KeyCode::Char('d')) => Some(Action::Deny),
         (Focus::ApprovalCard, KeyCode::Char('i')) => Some(Action::InspectApproval),

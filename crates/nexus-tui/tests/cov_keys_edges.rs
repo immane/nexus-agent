@@ -122,12 +122,18 @@ fn expected_special(focus: Focus, code: KeyCode) -> Option<Action> {
         (Focus::Composer, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::Composer, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::Composer, KeyCode::Backspace) => Some(Action::Backspace),
+        (Focus::Composer, KeyCode::Up) => Some(Action::ScrollUp),
+        (Focus::Composer, KeyCode::Down) => Some(Action::ScrollDown),
+        (Focus::Composer, KeyCode::PageUp) => Some(Action::PageUp),
+        (Focus::Composer, KeyCode::PageDown) => Some(Action::PageDown),
+        (Focus::Composer, KeyCode::Left | KeyCode::Right) => Some(Action::FoldToggle),
         (Focus::Viewport, KeyCode::Up) => Some(Action::ScrollUp),
         (Focus::Viewport, KeyCode::Down) => Some(Action::ScrollDown),
         (Focus::Viewport, KeyCode::PageUp) => Some(Action::PageUp),
         (Focus::Viewport, KeyCode::PageDown) => Some(Action::PageDown),
         (Focus::Viewport, KeyCode::Left | KeyCode::Right) => Some(Action::FoldToggle),
         (Focus::Viewport, KeyCode::Tab) => Some(Action::FocusSwitch),
+        (Focus::Viewport, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::ApprovalCard, KeyCode::Up) => Some(Action::ScrollUp),
         (Focus::ApprovalCard, KeyCode::Down) => Some(Action::ScrollDown),
         (Focus::ApprovalCard, KeyCode::PageUp) => Some(Action::PageUp),
@@ -210,12 +216,13 @@ fn control_characters_and_bidi_controls_are_never_typed() {
 
 #[test]
 fn focus_gaps_never_borrow_another_focus_binding() {
-    // `Esc` parks focus under the composer and the approval card only: the
-    // viewport has no `Esc` row, so it must not park or cancel there.
-    expect_none(
-        Focus::Viewport,
-        key(KeyCode::Esc),
-        "viewport has no Esc row",
+    // `Esc` parks focus from every card: the composer parks in the
+    // viewport, the viewport returns home, and the approval card steps
+    // back — but none of them cancels or decides.
+    assert_eq!(
+        map_key(Focus::Viewport, key(KeyCode::Esc)),
+        Some(Action::ParkFocus),
+        "viewport Esc returns to the composer"
     );
     assert_eq!(
         map_key(Focus::Composer, key(KeyCode::Esc)),
@@ -234,9 +241,10 @@ fn focus_gaps_never_borrow_another_focus_binding() {
         "no viewport submit row",
     );
     expect_none(Focus::ApprovalCard, key(KeyCode::Enter), "no approval row");
-    // The composer shows the previous/next submitted input right in the
-    // draft, so recall is always visible; paging is unbound there (the
-    // mouse wheel and Viewport keys cover free scrolling).
+    // The composer recalls submitted inputs right in the draft, so recall
+    // is always visible; it also pages and folds without leaving typing
+    // focus, so the viewport-only shortcuts stay one `Esc` away but are
+    // rarely needed.
     assert_eq!(
         map_key(Focus::Composer, key(KeyCode::Up)),
         Some(Action::ScrollUp),
@@ -247,11 +255,25 @@ fn focus_gaps_never_borrow_another_focus_binding() {
         Some(Action::ScrollDown),
         "composer Down recalls the next submitted input"
     );
-    expect_none(Focus::Composer, key(KeyCode::PageUp), "no composer paging");
-    expect_none(
-        Focus::Composer,
-        key(KeyCode::PageDown),
-        "no composer paging",
+    assert_eq!(
+        map_key(Focus::Composer, key(KeyCode::PageUp)),
+        Some(Action::PageUp),
+        "composer PgUp pages the viewport"
+    );
+    assert_eq!(
+        map_key(Focus::Composer, key(KeyCode::PageDown)),
+        Some(Action::PageDown),
+        "composer PgDn pages the viewport"
+    );
+    assert_eq!(
+        map_key(Focus::Composer, key(KeyCode::Left)),
+        Some(Action::FoldToggle),
+        "composer Left folds the selected entry"
+    );
+    assert_eq!(
+        map_key(Focus::Composer, key(KeyCode::Right)),
+        Some(Action::FoldToggle),
+        "composer Right unfolds the selected entry"
     );
     expect_none(
         Focus::ApprovalCard,

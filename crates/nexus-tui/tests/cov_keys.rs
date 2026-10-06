@@ -145,6 +145,36 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::ScrollDown,
         doc: "Composer | Down | Next submitted input",
     },
+    // Composer | PageUp/PageDown | Page the viewport (focus stays)
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::PageUp,
+        modifiers: NONE,
+        intent: Action::PageUp,
+        doc: "Composer | PageUp | Page the viewport (focus stays)",
+    },
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::PageDown,
+        modifiers: NONE,
+        intent: Action::PageDown,
+        doc: "Composer | PageDown | Page the viewport (focus stays)",
+    },
+    // Composer | Left/Right | Fold/unfold the selected entry (focus stays)
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::Left,
+        modifiers: NONE,
+        intent: Action::FoldToggle,
+        doc: "Composer | Left | Fold/unfold the selected entry (focus stays)",
+    },
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::Right,
+        modifiers: NONE,
+        intent: Action::FoldToggle,
+        doc: "Composer | Right | Fold/unfold the selected entry (focus stays)",
+    },
     // Viewport | Up/k, Down/j | Move selection (scrolls)
     Row {
         focus: Focus::Viewport,
@@ -241,6 +271,14 @@ const PUBLISHED_ROWS: &[Row] = &[
         modifiers: NONE,
         intent: Action::Quit,
         doc: "Viewport | q | Quit (test-only convenience)",
+    },
+    // Viewport | Esc | Back to the composer (never cancel)
+    Row {
+        focus: Focus::Viewport,
+        code: KeyCode::Esc,
+        modifiers: NONE,
+        intent: Action::ParkFocus,
+        doc: "Viewport | Esc | Back to the composer (never cancel)",
     },
     // Approval | a | Allow once (exact live call only)
     Row {
@@ -384,7 +422,6 @@ const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
     ("Newline", Focus::Composer),
     ("Type", Focus::Composer),
     ("Backspace", Focus::Composer),
-    ("FoldToggle", Focus::Viewport),
     ("CycleModel", Focus::Viewport),
     ("ApproveOnce", Focus::ApprovalCard),
     ("Deny", Focus::ApprovalCard),
@@ -397,7 +434,7 @@ const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
     ("FocusSwitch", &ALL_FOCUSES),
     ("Cancel", &ALL_FOCUSES),
     ("Quit", &ALL_FOCUSES),
-    ("ParkFocus", &[Focus::Composer, Focus::ApprovalCard]),
+    ("ParkFocus", &ALL_FOCUSES),
     (
         "ScrollUp",
         &[Focus::Composer, Focus::Viewport, Focus::ApprovalCard],
@@ -406,8 +443,15 @@ const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
         "ScrollDown",
         &[Focus::Composer, Focus::Viewport, Focus::ApprovalCard],
     ),
-    ("PageUp", &[Focus::Viewport, Focus::ApprovalCard]),
-    ("PageDown", &[Focus::Viewport, Focus::ApprovalCard]),
+    (
+        "PageUp",
+        &[Focus::Composer, Focus::Viewport, Focus::ApprovalCard],
+    ),
+    (
+        "PageDown",
+        &[Focus::Composer, Focus::Viewport, Focus::ApprovalCard],
+    ),
+    ("FoldToggle", &[Focus::Composer, Focus::Viewport]),
 ];
 
 /// Intents documented by a parameterized row rather than by a literal one.
@@ -449,8 +493,8 @@ const DOCUMENTED_CHORDS: &[(KeyCode, KeyModifiers)] = &[
 ];
 
 /// A short scripted session, in the order a user types it: draft text, a
-/// submitted run, a newline, viewport navigation including the `Esc` the
-/// viewport does not bind, then an approval inspected, allowed, and parked,
+/// submitted run, a newline, viewport navigation and the viewport `Esc`
+/// that returns home, then an approval inspected, allowed, and parked,
 /// and finally the two chords that end the session.
 const SESSION: &[(Focus, KeyCode, KeyModifiers)] = &[
     (Focus::Composer, KeyCode::Char('h'), NONE),
@@ -641,12 +685,12 @@ fn every_published_row_maps_to_its_documented_intent() {
 
 #[test]
 fn published_table_has_no_duplicate_or_conflicting_rows() {
-    // 38 literal rows: 8 composer, 13 viewport, 11 approval, and the 6
+    // 43 literal rows: 12 composer, 14 viewport, 11 approval, and the 6
     // focus-expanded `Any` rows (`Ctrl+C` and `Ctrl+D` in each focus). The
-    // 39th published row is parameterized over printable characters.
+    // 44th published row is parameterized over printable characters.
     assert_eq!(
         PUBLISHED_ROWS.len(),
-        38,
+        43,
         "the transcription lost or invented a published row"
     );
     // The oracle is only meaningful if it is a function: no `(focus, key,
@@ -749,7 +793,10 @@ fn intents_are_partitioned_by_focus() {
                 "Backspace",
                 "Cancel",
                 "FocusSwitch",
+                "FoldToggle",
                 "Newline",
+                "PageDown",
+                "PageUp",
                 "ParkFocus",
                 "Quit",
                 "ScrollDown",
@@ -767,6 +814,7 @@ fn intents_are_partitioned_by_focus() {
                 "FoldToggle",
                 "PageDown",
                 "PageUp",
+                "ParkFocus",
                 "Quit",
                 "ScrollDown",
                 "ScrollUp",
@@ -834,22 +882,22 @@ fn intents_are_partitioned_by_focus() {
 
 #[test]
 fn esc_parks_and_never_answers_or_decides() {
-    // The two published `Esc` rows park focus; the viewport documents no `Esc`
-    // row, so it is unbound there.
+    // Every focus publishes an `Esc` row that parks focus; none of them
+    // answers, cancels, submits, or quits.
     assert_eq!(
         map_key(Focus::Composer, KeyEvent::new(KeyCode::Esc, NONE)),
         Some(Action::ParkFocus),
         "the composer parks focus in the viewport"
     );
     assert_eq!(
+        map_key(Focus::Viewport, KeyEvent::new(KeyCode::Esc, NONE)),
+        Some(Action::ParkFocus),
+        "the viewport returns home to the composer"
+    );
+    assert_eq!(
         map_key(Focus::ApprovalCard, KeyEvent::new(KeyCode::Esc, NONE)),
         Some(Action::ParkFocus),
         "the approval card closes its detail or parks; it never decides"
-    );
-    assert_eq!(
-        map_key(Focus::Viewport, KeyEvent::new(KeyCode::Esc, NONE)),
-        None,
-        "the viewport documents no Esc row"
     );
     // The loud form of the contract: no `Esc` event, in any focus and under
     // any modifier, answers a pending approval, cancels, submits, or ends the
@@ -871,13 +919,14 @@ fn esc_parks_and_never_answers_or_decides() {
             );
         }
     }
-    // `Esc` is also the only key that can park: `ParkFocus` has exactly the two
-    // published producers, so parking can never be reached by accident.
+    // `Esc` is also the only key that can park: `ParkFocus` has exactly the
+    // three published producers, so parking can never be reached by accident.
     assert_eq!(
         producers_of("ParkFocus", &census_space()),
         vec![
             row_label(Focus::ApprovalCard, KeyCode::Esc, NONE),
             row_label(Focus::Composer, KeyCode::Esc, NONE),
+            row_label(Focus::Viewport, KeyCode::Esc, NONE),
         ],
         "ParkFocus is Esc's alone"
     );
@@ -1016,10 +1065,11 @@ fn approval_rows_answer_only_under_the_approval_card_and_never_alias() {
         vec![row_label(Focus::ApprovalCard, KeyCode::Char('d'), NONE)],
         "only `d` denies"
     );
-    // The arrow rows are shared across composer, viewport, and the approval
-    // card, and decide nothing; paging rows belong to the viewport and the
-    // approval card only (the composer pages nothing; the wheel covers it).
-    for family in ["ScrollUp", "ScrollDown"] {
+    // The arrow, paging, and fold rows reach the composer without leaving
+    // typing focus, and decide nothing. Paging and folding stay out of the
+    // approval card's decision rows by construction (no such intent exists
+    // there for fold; paging scrolls the detail).
+    for family in ["ScrollUp", "ScrollDown", "PageUp", "PageDown"] {
         assert_eq!(
             focuses_producing(family, &space),
             vec![
@@ -1027,16 +1077,14 @@ fn approval_rows_answer_only_under_the_approval_card_and_never_alias() {
                 String::from("Composer"),
                 String::from("Viewport")
             ],
-            "{family} navigates or scrolls detail and decides nothing"
+            "{family} navigates, pages, or scrolls detail and decides nothing"
         );
     }
-    for family in ["PageUp", "PageDown"] {
-        assert_eq!(
-            focuses_producing(family, &space),
-            vec![String::from("ApprovalCard"), String::from("Viewport")],
-            "{family} pages the viewport or detail and decides nothing"
-        );
-    }
+    assert_eq!(
+        focuses_producing("FoldToggle", &space),
+        vec![String::from("Composer"), String::from("Viewport")],
+        "folding never reaches the approval card and decides nothing"
+    );
     assert_eq!(
         map_key(Focus::ApprovalCard, KeyEvent::new(KeyCode::Esc, NONE)),
         Some(Action::ParkFocus),
@@ -1083,7 +1131,7 @@ fn the_tab_row_hands_the_keyboard_on_and_parking_never_re_arms_the_card() {
 #[test]
 fn a_scripted_session_maps_row_for_row() {
     // The session in order: draft text, submit, newline, hand over to the
-    // viewport, navigate and fold, an `Esc` the viewport does not bind, hand
+    // viewport, navigate and fold, an `Esc` that returns home, hand
     // over to the approval card, inspect, page, allow, park, and end.
     let observed_session: Vec<Option<String>> = SESSION
         .iter()
@@ -1100,7 +1148,7 @@ fn a_scripted_session_maps_row_for_row() {
             Some(String::from("ScrollDown")),
             Some(String::from("PageDown")),
             Some(String::from("FoldToggle")),
-            None,
+            Some(String::from("ParkFocus")),
             Some(String::from("FocusSwitch")),
             Some(String::from("InspectApproval")),
             Some(String::from("PageDown")),

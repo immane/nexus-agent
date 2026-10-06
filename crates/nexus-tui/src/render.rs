@@ -27,6 +27,81 @@ use ratatui::widgets::{
 use crate::keys::Focus;
 use crate::state::{AppState, ApprovalGeometry, PendingApprovalCard, wrapped_height};
 
+/// Welcome hero rows: the gradient banner plus breathing room and the
+/// subtitle, centered in a `width`-wide body. The caller guarantees the
+/// fit, so no row exceeds `width`.
+fn hero_lines() -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(EMPTY_ROWS);
+    lines.push(Line::from(""));
+    for (index, row) in LOGO.iter().enumerate() {
+        let (red, green, blue) = LOGO_GRADIENT[index];
+        lines.push(Line::from(Span::styled(
+            row.to_owned(),
+            Style::default()
+                .fg(Color::Rgb(red, green, blue))
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        EMPTY_SUBTITLE.to_owned(),
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+    lines
+}
+
+/// Small-terminal hero: the wordmark plus subtitle, left-aligned. Two rows.
+fn wordmark_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            WORDMARK.to_owned(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            EMPTY_SUBTITLE.to_owned(),
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    ]
+}
+
+/// Banner rows (single-cell glyphs only, so character count equals cell
+/// count; short rows leave trailing blanks).
+const LOGO: &[&str] = &[
+    "███╗   ██╗███████╗██╗  ██╗██╗   ██╗███████╗     █████╗  ██████╗ ███████╗███╗   ██╗████████╗",
+    "████╗  ██║██╔════╝╚██╗██╔╝██║   ██║██╔════╝    ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝",
+    "██╔██╗ ██║█████╗   ╚███╔╝ ██║   ██║███████╗    ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║",
+    "██║╚██╗██║██╔══╝   ██╔██╗ ██║   ██║╚════██║    ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║",
+    "██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝███████║    ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║",
+    "╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝    ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝",
+];
+
+/// Banner width in cells (the widest row; shorter rows leave blanks).
+const LOGO_WIDTH: u16 = 91;
+
+/// Green gradient, one entry per banner row.
+const LOGO_GRADIENT: [(u8, u8, u8); 6] = [
+    (74, 222, 128),
+    (63, 208, 116),
+    (52, 194, 105),
+    (42, 180, 94),
+    (32, 168, 84),
+    (22, 163, 74),
+];
+
+/// Banner rows plus the leading blank, breathing room, and the subtitle.
+const EMPTY_ROWS: usize = 9;
+
+/// Small-terminal hero height: wordmark plus subtitle.
+const WORDMARK_ROWS: usize = 2;
+
+/// Empty-state subtitle under the banner or wordmark.
+const EMPTY_SUBTITLE: &str = "M0-TEST demo · fast to start · small by design";
+
+/// Small-terminal wordmark, centered when the banner does not fit.
+const WORDMARK: &str = "nexus-agent";
+
 /// Minimum usable frame; smaller frames get a one-line notice instead of a
 /// clipped layout.
 const MIN_WIDTH: u16 = 20;
@@ -208,8 +283,19 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
     };
     state.set_viewport(text_width, content_height);
     let view = state.visible_lines(text_width, content_height);
+    let truncated = view.hidden_above > 0 || view.retention_truncated;
     let mut lines: Vec<Line> = Vec::with_capacity(content_height + 1);
-    if view.hidden_above > 0 || view.retention_truncated {
+    // Welcome hero: while the whole conversation fits the window, the logo
+    // owns the top of the body and content grows beneath it. Once history
+    // exceeds the window the hero yields every row to content, so it scrolls
+    // away naturally instead of competing for space.
+    let used = view.lines.len() + usize::from(truncated);
+    if !truncated && text_width >= LOGO_WIDTH as usize && used + EMPTY_ROWS <= content_height {
+        lines.extend(hero_lines());
+    } else if !truncated && text_width >= WORDMARK.len() && used + WORDMARK_ROWS <= content_height {
+        lines.extend(wordmark_lines());
+    }
+    if truncated {
         lines.push(Line::from(Span::styled(
             // Short enough to survive narrow frames: the bound notice must
             // itself never be clipped away.
@@ -838,6 +924,63 @@ mod tests {
         );
         assert!(frame.contains("i/esc close"), "expanded title names close");
         assert!(!state.approval_decision_allowed());
+    }
+
+    #[test]
+    fn empty_conversation_shows_the_left_aligned_banner() {
+        let (mut state, mut terminal) = harness(100, 30);
+        assert_eq!(state.entry_count(), 0, "a fresh view is empty");
+        draw(&mut state, &mut terminal, Focus::Composer);
+        let frame = screen(&terminal);
+        assert!(frame.contains("███╗   ██╗"), "banner present");
+        assert!(frame.contains("M0-TEST"), "subtitle present");
+        let row = frame
+            .lines()
+            .find(|row| row.contains("███╗"))
+            .expect("banner row");
+        assert!(
+            row.starts_with("█"),
+            "banner is left-aligned: {row:?}"
+        );
+    }
+
+    #[test]
+    fn empty_conversation_falls_back_to_the_wordmark_on_small_frames() {
+        for (width, height) in [(40, 10), (100, 8), (90, 30)] {
+            let (mut state, mut terminal) = harness(width, height);
+            draw(&mut state, &mut terminal, Focus::Composer);
+            let frame = screen(&terminal);
+            assert!(frame.contains("nexus-agent"), "wordmark present");
+            assert!(
+                !frame.contains("███╗"),
+                "no clipped banner at {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_messages_share_the_body_with_the_hero() {
+        let (mut state, mut terminal) = harness(100, 30);
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert!(screen(&terminal).contains("███╗"), "banner first");
+        state.record_submitted("hello");
+        draw(&mut state, &mut terminal, Focus::Composer);
+        let frame = screen(&terminal);
+        assert!(frame.contains("███╗"), "hero stays while content fits");
+        assert!(frame.contains("hello"), "the message stays");
+        for index in 0..30 {
+            state.record_submitted(&format!("message number {index}"));
+        }
+        draw(&mut state, &mut terminal, Focus::Composer);
+        let crowded = screen(&terminal);
+        assert!(
+            !crowded.contains("███╗"),
+            "the hero yields every row once history overflows"
+        );
+        assert!(
+            crowded.contains("presentation-truncated"),
+            "overflow is marked, not clipped silently"
+        );
     }
 
     #[test]
