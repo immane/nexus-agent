@@ -1,8 +1,9 @@
 //! `nexus-tools`: real tool executors behind narrow filesystem jails.
 //!
 //! This crate owns the real [`nexus_core::ToolPort`] implementations:
-//! [`ScopedReader`] (read-only `host_read`) and [`ScopedWriter`] (jailed
-//! `host_write`, approval-gated like any mutation), both at the M0
+//! [`ScopedReader`] (`host_read`), [`ScopedLister`] (`host_list`),
+//! [`ScopedSearcher`] (`host_search`), [`ScopedWriter`] (`host_write`), and
+//! [`ScopedPatcher`] (`host_patch`, approval-gated mutations), all at the M0
 //! revision so the existing scoped policy authorizes reads automatically
 //! and routes writes through approval. Every path is resolved against one
 //! canonical root and refused outside it; admission-time policy checks
@@ -41,4 +42,4 @@
 
 pub mod fs;
 
-pub use fs::{ScopedReader, ScopedWriter};
+pub use fs::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};

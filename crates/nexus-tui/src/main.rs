@@ -52,7 +52,7 @@ use nexus_core::{
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
-use nexus_tools::{ScopedReader, ScopedWriter};
+use nexus_tools::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
     Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, TOAST_TTL, TextSelection,
@@ -628,7 +628,10 @@ fn build_live_runtime(
             }
             vec![
                 Arc::new(ScopedReader::with_root(&canonical).map_err(io::Error::other)?),
+                Arc::new(ScopedLister::with_root(&canonical).map_err(io::Error::other)?),
+                Arc::new(ScopedSearcher::with_root(&canonical).map_err(io::Error::other)?),
                 Arc::new(ScopedWriter::with_root(&canonical).map_err(io::Error::other)?),
+                Arc::new(ScopedPatcher::with_root(&canonical).map_err(io::Error::other)?),
             ]
         }
     };

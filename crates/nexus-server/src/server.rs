@@ -46,7 +46,7 @@ use nexus_core::{
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
-use nexus_tools::{ScopedReader, ScopedWriter};
+use nexus_tools::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -59,8 +59,8 @@ const SSE_IDLE: Duration = Duration::from_secs(15);
 const WEB_PROFILE: &str = "web-test";
 
 /// Tool wiring for demo sessions. Fakes are the default: nothing touches
-/// the real filesystem. `RealFiles` executes `host_read` and `host_write`
-/// against the filesystem jailed to `root` (writes require approval); the root is
+/// the real filesystem. `RealFiles` executes jailed `host_read`, `host_list`,
+/// `host_search`, `host_write`, and `host_patch` tools (mutations require approval); the root is
 /// canonicalized and validated up front and per session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolsMode {
@@ -297,7 +297,19 @@ impl Server {
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
                 ),
                 Arc::new(
+                    ScopedLister::with_root(root)
+                        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+                ),
+                Arc::new(
+                    ScopedSearcher::with_root(root)
+                        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+                ),
+                Arc::new(
                     ScopedWriter::with_root(root)
+                        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+                ),
+                Arc::new(
+                    ScopedPatcher::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
                 ),
             ],

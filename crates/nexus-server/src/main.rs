@@ -26,10 +26,10 @@ fn usage() -> ! {
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
     eprintln!(
-        "  --tools real executes host_read and host_write against --tools-root (default: working directory);"
+        "  --tools real executes jailed host_read, host_list, host_search, host_write and host_patch against --tools-root (default: working directory);"
     );
     eprintln!(
-        "  writes still need an approval grant. The default --tools fake touches no real files."
+        "  mutations still need an approval grant. The default --tools fake touches no real files."
     );
     std::process::exit(2);
 }

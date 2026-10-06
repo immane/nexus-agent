@@ -31,7 +31,7 @@
 | `nexus-validation` | Closed M0 JSON/schema validator; strict duplicate-rejecting parse reused by config. |
 | `nexus-config` | Typed user config (providers, models, favourites, recents, **agent modes**) + versioned JSON file persistence. Modes: built-in `plan` (read-only) / `build`, customs via optional `modes` + `default_mode`; unknown ids and dangling defaults are explicit errors. Secrets only as env-var references; never stored, logged, or echoed. |
 | `nexus-fakes` | Scripted provider/tool/store doubles. Exhaustion fails explicitly, never idle-succeeds. |
-| `nexus-tools` | Real `host_read`/`host_write` against a canonicalized root jail (subdirs included, `..` refused). Reads automatic when scoped; writes always need approval. Escapes `Denied`/`NotStarted`; failures `Failed`/`Unknown`/`Uncertain`; budget-cut with flag; TOCTOU window documented. |
+| `nexus-tools` | Real `host_read`/`host_list`/`host_search`/`host_write`/`host_patch` against a canonicalized root jail. Listing is direct-child only; search recursively matches UTF-8 text lines; patch requires exactly one exact-text match in an existing UTF-8 file. Reads/list/search automatic when scoped; mutations always need approval. Escapes `Denied`/`NotStarted`; failures `Failed`/`Unknown`/`Uncertain`; output cuts flagged; TOCTOU window documented. |
 | `nexus-openai` | Real OpenAI-compatible chat adapter over blocking std I/O (`http` direct, `https` via system `openssl s_client`; no vendored TLS). Per-turn aggregate cap **8MB** (answer + reasoning + tool args). Accepts both `reasoning_content` (DeepSeek) and `reasoning` (Ollama) thinking fields into the same accumulator. Streams SSE incrementally, aggregates to one validated batch. Opts into incremental streaming. |
 | `nexus-runtime` | Single-active-run loop: scoped policy, live cancellation/deadlines, quarantined workers, contiguous per-run sequencing. **Read-only runs deny confirmation-required tools at dispatch** (no prompt, no grant); automatic reads still execute. `Runtime::try_new` validates everything up front. |
 | `nexus-server` | Loopback HTTP frontend (`127.0.0.1` only, no auth): one `Runtime` per session, SSE event streams, exact-identity approve/deny, per-session provider selection, `--tools real|fake`. |
@@ -84,7 +84,7 @@
 
 1. Model variants are display-only; no request field carries them until a provider needs one.
 2. Budgets still hardcoded (64/16/256); making them configurable is the next step (needs config schema + docs).
-3. No real tools besides `host_read`/`host_write`; headless still fake-only; no live path for it.
+3. Real filesystem tools are `host_read`/`host_list`/`host_search`/`host_write`/`host_patch`; headless still fake-only; no live path for it. No exec tool; discuss only after filesystem tools are settled.
 4. Ephemeral store only; no durable sessions/resume; no auth/TLS on server (localhost-only by design).
 5. Linux same-toolchain validation, exact toolchain pin, PTY/idle/streaming baselines still open.
 6. `docs/contracts/05-configuration.md` ("no format selected") is stale; contract-doc edits need explicit approval.

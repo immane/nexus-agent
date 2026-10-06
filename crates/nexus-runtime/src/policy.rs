@@ -1,11 +1,11 @@
 //! Approval policy for the M0 single-run loop.
 //!
-//! Only host-authorized scoped reads/searches proceed automatically; every
+//! Only host-authorized scoped reads, listings, and searches proceed automatically; every
 //! model-directed mutation and every command execution requires an explicit
 //! grant. Automatic execution is fail-closed: [`Policy::authorize`] accepts
 //! only a canonical logical project-relative `path` for the exact M0
 //! revision, and an invalid policy (wrong revision, or an auto-approved set
-//! beyond `host_read`/`host_search`) is rejected by [`Policy::validate`]
+//! beyond the scoped read/list/search tools) is rejected by [`Policy::validate`]
 //! before it can authorize or scope anything.
 //!
 //! Argument text is parsed with the strict workspace validator
@@ -38,7 +38,7 @@ use nexus_validation::parse_object;
 use nexus_validation::serde_json::{self, Map, Value};
 
 /// The only tool names the M0 policy may auto-approve.
-const AUTO_READ_TOOLS: &[&str] = &["host_read", "host_search"];
+const AUTO_READ_TOOLS: &[&str] = &["host_read", "host_list", "host_search"];
 
 /// Placeholder replacing a redacted JSON value.
 const REDACTED_VALUE: &str = "[redacted]";
@@ -90,7 +90,7 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// M0-test policy: `host_read`/`host_search` are automatic, everything
+    /// M0-test policy: `host_read`/`host_list`/`host_search` are automatic, everything
     /// else requires confirmation. Revision is [`M0_REVISION`].
     #[must_use]
     pub fn m0_test() -> Self {
@@ -126,7 +126,7 @@ impl Policy {
     }
 
     /// Validates the policy boundary: exact [`M0_REVISION`], and only
-    /// `host_read`/`host_search` may be automatic. An invalid policy fails
+    /// `host_read`/`host_list`/`host_search` may be automatic. An invalid policy fails
     /// closed in [`Self::authorize`] and [`Self::approval_scope`], so a
     /// custom set that names `host_write`/`host_exec` can never widen
     /// automatic execution. Diagnostics are static and never interpolate
@@ -195,7 +195,8 @@ impl Policy {
             ));
         }
         let args = parse_object_args(call)?;
-        if args.len() != 1 {
+        let expected_len = if name == "host_search" { 2 } else { 1 };
+        if args.len() != expected_len {
             return Err(policy_error(
                 ErrorCategory::PermissionDenied,
                 "automatic tool arguments are not a canonical path",
@@ -207,11 +208,25 @@ impl Policy {
                 "automatic tool arguments are not a canonical path",
             ));
         };
+        if raw_path == "." && name == "host_read" {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "tool path contains a parent traversal",
+            ));
+        }
         let path = normalize_project_path(raw_path)?;
-        let prefix = if name == "host_search" {
-            "search:"
-        } else {
-            "read:"
+        if name == "host_search"
+            && !matches!(args.get("query"), Some(Value::String(query)) if !query.is_empty())
+        {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "automatic tool arguments are not a canonical path",
+            ));
+        }
+        let prefix = match name {
+            "host_search" => "search:",
+            "host_list" => "list:",
+            _ => "read:",
         };
         bounded_scope(&format!("{prefix}{path}"))
     }
@@ -304,10 +319,14 @@ fn parse_object_args(call: &ToolCall) -> Result<Map<String, Value>, AgentError> 
 ///
 /// Logical scope only: no filesystem access, no symlink resolution, and no
 /// check/use-race guarantee. Rejects empty paths, absolute paths, `~`
-/// shorthand, parent traversal and empty/`.` components, backslash
+/// shorthand, parent traversal and empty components (except `.` for the jail
+/// root), backslash
 /// separators or drives, Windows-invalid characters, and control
 /// characters.
 fn normalize_project_path(raw: &str) -> Result<String, AgentError> {
+    if raw == "." {
+        return Ok(raw.to_owned());
+    }
     if raw.is_empty() {
         return Err(policy_error(
             ErrorCategory::PermissionDenied,
@@ -559,7 +578,7 @@ mod tests {
         let search = call(
             "host_search",
             M0_REVISION,
-            r#"{"path":"crates/nexus-core/src"}"#,
+            r#"{"path":"crates/nexus-core/src","query":"ToolCall"}"#,
         );
         assert_eq!(
             policy
@@ -1022,7 +1041,6 @@ mod cov_policy_private {
             ("src/\u{85}lib.rs", "tool path contains invalid characters"),
             ("src//lib.rs", "tool path contains an empty component"),
             ("src/", "tool path contains an empty component"),
-            (".", "tool path contains a parent traversal"),
             ("..", "tool path contains a parent traversal"),
             ("src/../etc", "tool path contains a parent traversal"),
             ("src/./lib.rs", "tool path contains a parent traversal"),

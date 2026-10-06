@@ -61,7 +61,7 @@ fn authorize_auto_approves_only_canonical_project_reads_and_searches() {
     let policy = Policy::m0_test();
     assert_eq!(policy.revision(), M0_REVISION);
     policy.validate().expect("the M0 policy validates");
-    for tool in ["host_read", "host_search"] {
+    for tool in ["host_read", "host_list", "host_search"] {
         assert!(
             !policy.requires_approval(&ToolId::new(tool, M0_REVISION).expect("valid")),
             "{tool} is automatic"
@@ -74,6 +74,8 @@ fn authorize_auto_approves_only_canonical_project_reads_and_searches() {
         ("host_read", "a-b_c.d/e", "read:a-b_c.d/e"),
         ("host_read", "src/日本語.rs", "read:src/日本語.rs"),
         ("host_read", "src/my file.txt", "read:src/my file.txt"),
+        ("host_list", "src", "list:src"),
+        ("host_list", ".", "list:."),
         ("host_search", "src", "search:src"),
         (
             "host_search",
@@ -87,7 +89,12 @@ fn authorize_auto_approves_only_canonical_project_reads_and_searches() {
         ),
     ];
     for (tool, path, expected) in cases {
-        let scoped = call(tool, M0_REVISION, &format!(r#"{{"path":"{path}"}}"#));
+        let args = if tool == "host_search" {
+            format!(r#"{{"path":"{path}","query":"needle"}}"#)
+        } else {
+            format!(r#"{{"path":"{path}"}}"#)
+        };
+        let scoped = call(tool, M0_REVISION, &args);
         let scope = policy
             .authorize(&scoped)
             .expect("a canonical project path authorizes");
@@ -98,7 +105,7 @@ fn authorize_auto_approves_only_canonical_project_reads_and_searches() {
         // identical scope and never mutates the policy.
         let repeated = policy.authorize(&scoped).expect("repeat authorizes");
         assert_eq!(repeated, scope, "{tool} {path}");
-        let equal = call(tool, M0_REVISION, &format!(r#"{{"path":"{path}"}}"#));
+        let equal = call(tool, M0_REVISION, &args);
         assert_eq!(
             policy.authorize(&equal).expect("equal call authorizes"),
             scope
@@ -111,6 +118,10 @@ fn authorize_refuses_mutations_and_commands_that_require_approval() {
     let policy = Policy::m0_test();
     let cases = [
         ("host_write", r#"{"path":"dst/file.txt","content":"hi"}"#),
+        (
+            "host_patch",
+            r#"{"path":"src/lib.rs","old_text":"old","new_text":"new"}"#,
+        ),
         ("host_exec", r#"{"argv":["git","status"]}"#),
         ("host_exec", r#"{"command":"cargo test"}"#),
         ("host_delete", r#"{"path":"dst/file.txt"}"#),
@@ -275,7 +286,14 @@ fn an_empty_automatic_set_requires_approval_for_every_tool() {
     let closed = Policy::try_new(Vec::new(), M0_REVISION).expect("conservative policy builds");
     assert_eq!(closed.revision(), M0_REVISION);
     closed.validate().expect("the empty set is valid");
-    for tool in ["host_read", "host_search", "host_write", "host_exec"] {
+    for tool in [
+        "host_read",
+        "host_list",
+        "host_search",
+        "host_write",
+        "host_patch",
+        "host_exec",
+    ] {
         let scoped = call(tool, M0_REVISION, r#"{"path":"src"}"#);
         assert!(closed.requires_approval(scoped.tool()), "{tool}");
         assert_denied(
@@ -479,7 +497,7 @@ fn authorize_scope_bound_is_exact_bytes_and_refusals_are_static() {
         .authorize(&call(
             "host_search",
             M0_REVISION,
-            &format!(r#"{{"path":"{search_path}"}}"#),
+            &format!(r#"{{"path":"{search_path}","query":"x"}}"#),
         ))
         .expect("the exact search bound is accepted");
     assert_eq!(scope.as_str().len(), MAX_SCOPE_BYTES);

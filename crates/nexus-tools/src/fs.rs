@@ -12,6 +12,12 @@ use nexus_core::{
 /// Tool name. Matches the policy auto-read set, so scoped reads stay
 /// automatic under the same authorization as the fake reader.
 pub const HOST_READ_TOOL: &str = "host_read";
+/// Tool name for listing direct children of a jailed directory.
+pub const HOST_LIST_TOOL: &str = "host_list";
+/// Tool name for searching text files under a jailed directory.
+pub const HOST_SEARCH_TOOL: &str = "host_search";
+/// Tool name for approval-gated exact text replacement.
+pub const HOST_PATCH_TOOL: &str = "host_patch";
 
 /// Closed input schema: exactly one `path` string, nothing else.
 pub const READ_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"#;
@@ -244,6 +250,523 @@ impl ToolPort for ScopedReader {
                 ErrorCategory::Internal,
                 "tool output could not be bounded",
             )),
+        }
+    }
+}
+
+/// Closed input schema for directory listing.
+pub const LIST_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"#;
+/// Closed input schema for recursive text search.
+pub const SEARCH_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"query":{"type":"string"}},"required":["path","query"],"additionalProperties":false}"#;
+const SEARCH_FILE_BYTES: u64 = 1_048_576;
+const LIST_ENTRY_LIMIT: usize = 10_000;
+
+/// Root-jailed directory listing tool. Lists direct children only.
+pub struct ScopedLister {
+    root: PathBuf,
+    spec: ToolSpec,
+}
+
+impl ScopedLister {
+    /// Bind the tool to an existing directory root.
+    pub fn with_root(root: &Path) -> Result<Self, AgentError> {
+        let root = canonical_root(root)?;
+        let spec = ToolSpec::new(
+            ToolId::new(HOST_LIST_TOOL, M0_REVISION).expect("static tool identity builds"),
+            "List direct children of a directory inside the tool root",
+            LIST_SCHEMA,
+        )
+        .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
+        Ok(Self { root, spec })
+    }
+    /// Bind to the process working directory.
+    pub fn with_current_dir() -> Result<Self, AgentError> {
+        Self::with_root(Path::new("."))
+    }
+    fn execute_inner(
+        &self,
+        call: &ToolCall,
+        context: &ToolContext,
+    ) -> Result<(String, bool), AgentError> {
+        let path = resolve_existing(&self.root, call.args().as_str())?;
+        if !path.is_dir() {
+            return Err(tool_error(
+                ErrorCategory::ToolFailure,
+                "directory cannot be listed",
+            ));
+        }
+        let mut entries = Vec::new();
+        let mut iterator = std::fs::read_dir(path)
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
+        while entries.len() < LIST_ENTRY_LIMIT {
+            match iterator.next() {
+                Some(Ok(entry)) => entries.push(entry),
+                Some(Err(_)) => {
+                    return Err(tool_error(
+                        ErrorCategory::ToolFailure,
+                        "directory cannot be listed",
+                    ));
+                }
+                None => break,
+            }
+        }
+        let mut truncated = entries.len() == LIST_ENTRY_LIMIT && iterator.next().is_some();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut output = String::new();
+        for entry in entries {
+            if context.is_cancelled() {
+                return Err(tool_error(
+                    ErrorCategory::Cancelled,
+                    "tool call was cancelled",
+                ));
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let suffix = if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                "/"
+            } else {
+                ""
+            };
+            if output
+                .len()
+                .saturating_add(name.len())
+                .saturating_add(suffix.len())
+                .saturating_add(1)
+                > context.output_budget_bytes()
+            {
+                truncated = true;
+                break;
+            }
+            output.push_str(&name);
+            output.push_str(suffix);
+            output.push('\n');
+        }
+        Ok((output, truncated))
+    }
+}
+
+/// Root-jailed recursive UTF-8 text search. Results contain relative path, line number and matching line.
+pub struct ScopedSearcher {
+    root: PathBuf,
+    spec: ToolSpec,
+}
+
+impl ScopedSearcher {
+    /// Bind the tool to an existing directory root.
+    pub fn with_root(root: &Path) -> Result<Self, AgentError> {
+        let root = canonical_root(root)?;
+        let spec = ToolSpec::new(
+            ToolId::new(HOST_SEARCH_TOOL, M0_REVISION).expect("static tool identity builds"),
+            "Search UTF-8 text files beneath a directory inside the tool root",
+            SEARCH_SCHEMA,
+        )
+        .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
+        Ok(Self { root, spec })
+    }
+    /// Bind to the process working directory.
+    pub fn with_current_dir() -> Result<Self, AgentError> {
+        Self::with_root(Path::new("."))
+    }
+    fn execute_inner(
+        &self,
+        call: &ToolCall,
+        context: &ToolContext,
+    ) -> Result<(String, bool), AgentError> {
+        let (directory, query) = parse_path_query(call.args().as_str())?;
+        let base = resolve_path(&self.root, &directory)?;
+        if !base.is_dir() || query.is_empty() {
+            return Err(tool_error(
+                ErrorCategory::InvalidInput,
+                "tool input is invalid",
+            ));
+        }
+        let mut stack = vec![base.clone()];
+        let mut output = String::new();
+        let mut truncated = false;
+        while let Some(dir) = stack.pop() {
+            if context.is_cancelled() {
+                return Err(tool_error(
+                    ErrorCategory::Cancelled,
+                    "tool call was cancelled",
+                ));
+            }
+            let entries = std::fs::read_dir(&dir).map_err(|_| {
+                tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
+            })?;
+            for entry in entries {
+                if context.is_cancelled() {
+                    return Err(tool_error(
+                        ErrorCategory::Cancelled,
+                        "tool call was cancelled",
+                    ));
+                }
+                let entry = entry.map_err(|_| {
+                    tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
+                })?;
+                let path = entry.path();
+                let canonical = std::fs::canonicalize(&path).map_err(|_| {
+                    tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
+                })?;
+                if !canonical.starts_with(&self.root) {
+                    continue;
+                }
+                let kind = entry.file_type().map_err(|_| {
+                    tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
+                })?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                if kind.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                let Ok(file) = File::open(&path) else {
+                    continue;
+                };
+                let mut limited = file.take(SEARCH_FILE_BYTES + 1);
+                let mut bytes = Vec::new();
+                if limited.read_to_end(&mut bytes).is_err() {
+                    continue;
+                }
+                if bytes.len() as u64 > SEARCH_FILE_BYTES {
+                    truncated = true;
+                    bytes.truncate(SEARCH_FILE_BYTES as usize);
+                }
+                let Ok(text) = std::str::from_utf8(&bytes) else {
+                    continue;
+                };
+                for (index, line) in text.lines().enumerate() {
+                    if line.contains(&query) {
+                        let relative = path.strip_prefix(&base).unwrap_or(&path).to_string_lossy();
+                        let record = format!("{relative}:{}:{line}\n", index + 1);
+                        if output.len().saturating_add(record.len()) > context.output_budget_bytes()
+                        {
+                            truncated = true;
+                            return Ok((output, truncated));
+                        }
+                        output.push_str(&record);
+                    }
+                }
+            }
+        }
+        Ok((output, truncated))
+    }
+}
+
+fn canonical_root(root: &Path) -> Result<PathBuf, AgentError> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
+    if !root.is_dir() {
+        return Err(tool_error(
+            ErrorCategory::InvalidInput,
+            "tool root is invalid",
+        ));
+    }
+    Ok(root)
+}
+fn parse_path_query(args: &str) -> Result<(String, String), AgentError> {
+    let value: serde_json::Value = serde_json::from_str(args)
+        .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool arguments are invalid"))?;
+    let path = value
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty() && !s.contains('\0'));
+    let query = value
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    match (path, query) {
+        (Some(path), Some(query)) => Ok((path.to_owned(), query.to_owned())),
+        _ => Err(tool_error(
+            ErrorCategory::InvalidInput,
+            "tool arguments are invalid",
+        )),
+    }
+}
+fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, AgentError> {
+    let joined = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        root.join(path)
+    };
+    let canonical = std::fs::canonicalize(joined)
+        .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be read"))?;
+    if !canonical.starts_with(root) {
+        return Err(tool_error(
+            ErrorCategory::PermissionDenied,
+            "path escapes the tool root",
+        ));
+    }
+    Ok(canonical)
+}
+fn resolve_existing(root: &Path, args: &str) -> Result<PathBuf, AgentError> {
+    let value: serde_json::Value = serde_json::from_str(args)
+        .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool arguments are invalid"))?;
+    let path = value
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty() && !s.contains('\0'))
+        .ok_or_else(|| tool_error(ErrorCategory::InvalidInput, "tool arguments are invalid"))?;
+    resolve_path(root, path)
+}
+fn read_result(
+    result: Result<(String, bool), AgentError>,
+    context: &ToolContext,
+    failure: &'static str,
+) -> ToolOutcome {
+    let (text, truncated) = match result {
+        Ok(value) => value,
+        Err(error) => return ScopedReader::failed(error),
+    };
+    match ToolOutcome::from_bounded_content(
+        ExecutionStatus::Succeeded,
+        EffectState::KnownNotApplied,
+        Evidence::HostObserved,
+        text,
+        truncated,
+    )
+    .and_then(|outcome| outcome.enforce_budget(context.output_budget_bytes()))
+    {
+        Ok(outcome) => outcome,
+        Err(_) => ToolOutcome::new(
+            ExecutionStatus::Failed,
+            EffectState::Unknown,
+            Evidence::Uncertain,
+            failure,
+            false,
+        )
+        .expect("static failure builds"),
+    }
+}
+impl ToolPort for ScopedLister {
+    fn describe(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+    fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+        if context.is_cancelled() {
+            return ScopedReader::failed(tool_error(
+                ErrorCategory::Cancelled,
+                "tool call was cancelled",
+            ));
+        }
+        match self.execute_inner(call, context) {
+            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                ScopedReader::denied()
+            }
+            result => read_result(result, context, "directory cannot be listed"),
+        }
+    }
+}
+impl ToolPort for ScopedSearcher {
+    fn describe(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+    fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+        if context.is_cancelled() {
+            return ScopedReader::failed(tool_error(
+                ErrorCategory::Cancelled,
+                "tool call was cancelled",
+            ));
+        }
+        match self.execute_inner(call, context) {
+            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                ScopedReader::denied()
+            }
+            result => read_result(result, context, "search cannot be completed"),
+        }
+    }
+}
+
+/// Closed input schema for a unique exact-text patch.
+pub const PATCH_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}"#;
+const PATCH_FILE_BYTES: u64 = 8 * 1_048_576;
+
+/// Approval-gated exact text patcher jailed to one canonical root.
+/// Requires exactly one occurrence of `old_text`; it never creates files.
+pub struct ScopedPatcher {
+    root: PathBuf,
+    spec: ToolSpec,
+}
+
+impl ScopedPatcher {
+    /// Bind the tool to an existing directory root.
+    pub fn with_root(root: &Path) -> Result<Self, AgentError> {
+        let root = canonical_root(root)?;
+        let spec = ToolSpec::new(
+            ToolId::new(HOST_PATCH_TOOL, M0_REVISION).expect("static tool identity builds"),
+            "Replace one unique exact text occurrence in an existing UTF-8 file inside the tool root. Requires approval.",
+            PATCH_SCHEMA,
+        )
+        .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
+        Ok(Self { root, spec })
+    }
+
+    /// Bind to the process working directory.
+    pub fn with_current_dir() -> Result<Self, AgentError> {
+        Self::with_root(Path::new("."))
+    }
+
+    fn apply(&self, call: &ToolCall, context: &ToolContext) -> Result<usize, AgentError> {
+        let value: serde_json::Value = serde_json::from_str(call.args().as_str())
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool arguments are invalid"))?;
+        let get = |key| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    tool_error(ErrorCategory::InvalidInput, "tool arguments are invalid")
+                })
+        };
+        let path = get("path")?;
+        let old_text = get("old_text")?;
+        let new_text = get("new_text")?;
+        if path.is_empty() || path.contains('\0') || old_text.is_empty() {
+            return Err(tool_error(
+                ErrorCategory::InvalidInput,
+                "tool arguments are invalid",
+            ));
+        }
+        let target = resolve_path(&self.root, path)?;
+        if !target.is_file() {
+            return Err(tool_error(
+                ErrorCategory::ToolFailure,
+                "file cannot be patched",
+            ));
+        }
+        let file = File::open(&target)
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        let mut limited = file.take(PATCH_FILE_BYTES + 1);
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; READ_CHUNK_BYTES];
+        loop {
+            if context.is_cancelled() {
+                return Err(tool_error(
+                    ErrorCategory::Cancelled,
+                    "tool call was cancelled",
+                ));
+            }
+            let read = limited
+                .read(&mut chunk)
+                .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if bytes.len() as u64 > PATCH_FILE_BYTES {
+                return Err(tool_error(
+                    ErrorCategory::ResourceLimit,
+                    "file exceeds patch limit",
+                ));
+            }
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "file is not valid text"))?;
+        let mut matches = text.match_indices(old_text);
+        let Some((index, _)) = matches.next() else {
+            return Err(tool_error(
+                ErrorCategory::InvalidInput,
+                "patch did not match exactly once",
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(tool_error(
+                ErrorCategory::InvalidInput,
+                "patch did not match exactly once",
+            ));
+        }
+        if context.is_cancelled() {
+            return Err(tool_error(
+                ErrorCategory::Cancelled,
+                "tool call was cancelled",
+            ));
+        }
+        let mut replacement = String::with_capacity(text.len() - old_text.len() + new_text.len());
+        replacement.push_str(&text[..index]);
+        replacement.push_str(new_text);
+        replacement.push_str(&text[index + old_text.len()..]);
+
+        let canonical = std::fs::canonicalize(&target)
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(tool_error(
+                ErrorCategory::PermissionDenied,
+                "path escapes the tool root",
+            ));
+        }
+        if !canonical.is_file() {
+            return Err(tool_error(
+                ErrorCategory::ToolFailure,
+                "file cannot be patched",
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target)
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        file.write_all(replacement.as_bytes())
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        Ok(replacement.len())
+    }
+}
+
+impl ToolPort for ScopedPatcher {
+    fn describe(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+    fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+        if context.is_cancelled() {
+            return ScopedWriter::failed(tool_error(
+                ErrorCategory::Cancelled,
+                "tool call was cancelled",
+            ));
+        }
+        match self.apply(call, context) {
+            Ok(bytes) => ToolOutcome::from_bounded_content(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                format!("patched file ({bytes} bytes after patch)"),
+                false,
+            )
+            .and_then(|outcome| outcome.enforce_budget(context.output_budget_bytes()))
+            .unwrap_or_else(|_| {
+                ToolOutcome::new(
+                    ExecutionStatus::Failed,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "patch result could not be bounded",
+                    false,
+                )
+                .expect("static failure builds")
+            }),
+            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                ScopedWriter::denied()
+            }
+            Err(error)
+                if error.category() == ErrorCategory::InvalidInput
+                    && error.message() == "patch did not match exactly once" =>
+            {
+                ToolOutcome::new(
+                    ExecutionStatus::Failed,
+                    EffectState::KnownNotApplied,
+                    Evidence::HostObserved,
+                    "patch did not match exactly once",
+                    false,
+                )
+                .expect("static patch refusal builds")
+            }
+            Err(error) if error.category() == ErrorCategory::ResourceLimit => ToolOutcome::new(
+                ExecutionStatus::Failed,
+                EffectState::KnownNotApplied,
+                Evidence::HostObserved,
+                "file exceeds patch limit",
+                false,
+            )
+            .expect("static patch limit builds"),
+            Err(error) => ScopedWriter::failed(error),
         }
     }
 }
