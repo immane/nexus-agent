@@ -16,9 +16,11 @@ use nexus_core::{
 };
 use serde_json::{Value, json};
 
-/// Maximum response body in bytes. Anything larger fails instead of
-/// allocating unboundedly.
-pub const MAX_RESPONSE_BYTES: usize = 1_048_576;
+/// Maximum aggregated response in bytes per turn, covering answer text,
+/// reasoning traces, and tool-call arguments together. Anything larger
+/// fails instead of allocating unboundedly. Sized for long-reasoning
+/// models, whose thinking traces alone can reach hundreds of kilobytes.
+pub const MAX_RESPONSE_BYTES: usize = 8_388_608;
 /// Maximum vendor model name in bytes, matching the configuration bound.
 pub const MAX_MODEL_LEN: usize = 128;
 /// Socket connect timeout. Reads use the remaining run deadline.

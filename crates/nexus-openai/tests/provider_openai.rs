@@ -428,7 +428,7 @@ fn slow_peers_hit_the_run_deadline() {
 
 #[test]
 fn oversized_replies_fail_resource_limit() {
-    let big = "x".repeat(1_200_000);
+    let big = "x".repeat(nexus_openai::provider::MAX_RESPONSE_BYTES + 1024);
     let (base, _) = serve(200, &stop_body(&big), Duration::ZERO);
     let error = failed(provider(&base).stream(&base_request(), &live_context()));
     assert_eq!(error.0, ErrorCategory::ResourceLimit);
