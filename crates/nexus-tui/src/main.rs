@@ -117,10 +117,14 @@ struct SessionConfig {
     config: UserConfig,
     path: Option<std::path::PathBuf>,
     active_model: Option<String>,
-    /// Jail for real file reads/writes, from `--tools-root`. `None` keeps every
-    /// tool scripted. Cloned with the template so every slot shares the
-    /// startup wiring while keeping its own runtime and selection.
+    /// Jail for real file reads/writes: `--tools-root`, else the working
+    /// directory. `None` (tests only) keeps every tool scripted. Cloned
+    /// with the template so every slot shares the startup wiring while
+    /// keeping its own runtime and selection.
     tools_root: Option<std::path::PathBuf>,
+    /// Scripted demo explicitly requested with `--demo`. Without it the
+    /// runtime never serves fakes, however unconfigured the selection is.
+    demo: bool,
 }
 
 /// Loads the user configuration for both the interactive and the headless
@@ -132,13 +136,22 @@ struct SessionConfig {
 /// would hide a broken document and then overwrite it on the first terminal
 /// outcome, destroying the user's actual settings.
 fn load_session_config() -> io::Result<SessionConfig> {
-    let tools_root = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
-        StartupAction::Run(args) => args.tools_root,
+    let args = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
+        StartupAction::Run(args) => args,
         StartupAction::Usage => startup_usage(),
     };
     let mut session = session_config_at(resolve_path(None))?;
-    session.tools_root = tools_root;
+    session.tools_root = resolve_tools_root(args.tools_root);
+    session.demo = args.demo;
     Ok(session)
+}
+
+/// Resolves the file-tool jail: an explicit `--tools-root` wins, otherwise
+/// the process working directory (subdirectories included; `..` escapes are
+/// still refused by the jail itself). Pure apart from reading the cwd, so
+/// the precedence is unit-testable.
+fn resolve_tools_root(cli: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    cli.or_else(|| std::env::current_dir().ok())
 }
 
 /// Same contract as [`load_session_config`] with the resolved path supplied
@@ -164,6 +177,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
         path,
         active_model,
         tools_root: None,
+        demo: false,
     })
 }
 
@@ -199,13 +213,18 @@ fn boot_model(config: &UserConfig) -> Option<String> {
 
 /// Startup arguments. The TUI takes no `--config` flag (see
 /// [`SessionConfig`]); the only flag names the jail real file reads and
-/// writes are confined to. Absent, every tool stays scripted: exactly the
-/// historical demo wiring.
+/// writes are confined to, the other explicitly opts into the scripted demo.
+/// Without `--demo` nothing scripted ever serves: unconfigured runs fail
+/// with a not-configured diagnostic instead of a silent fake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartupArgs {
-    /// Jail for real file reads and writes. `None` keeps every tool
-    /// scripted. Writes always need an approval grant, even when real.
+    /// Jail for real file reads and writes. Explicit `--tools-root`, else
+    /// the working directory by default; `None` (tests only) keeps every
+    /// tool scripted. Writes always need an approval grant, even when real.
     tools_root: Option<std::path::PathBuf>,
+    /// Serve the scripted demo wiring (fake provider/tools, canned
+    /// submission). The dev-version default is off.
+    demo: bool,
 }
 
 /// Argument-parser outcome: run with the parsed jail, or print usage.
@@ -222,10 +241,12 @@ enum StartupAction {
 /// into scripted mode on a mistyped flag.
 fn parse_startup_args(argv: &[String]) -> StartupAction {
     let mut tools_root: Option<std::path::PathBuf> = None;
+    let mut demo = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return StartupAction::Usage,
+            "--demo" => demo = true,
             "--tools-root" => match args.next() {
                 Some(value) if !value.is_empty() => {
                     tools_root = Some(std::path::PathBuf::from(value));
@@ -235,17 +256,18 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
             _ => return StartupAction::Usage,
         }
     }
-    StartupAction::Run(StartupArgs { tools_root })
+    StartupAction::Run(StartupArgs { tools_root, demo })
 }
 
 /// Prints usage and exits 2. Splitting the exit from the parser keeps
 /// every rejection path unit-testable.
 fn startup_usage() -> ! {
-    eprintln!("usage: nexus-tui [--tools-root PATH] [--help]");
-    eprintln!("  Without --tools-root every tool is scripted (demo wiring).");
-    eprintln!(
-        "  With it, host_read and host_write execute against PATH (jailed); writes still need approval."
-    );
+    eprintln!("usage: nexus-tui [--tools-root PATH] [--demo] [--help]");
+    eprintln!("  Without --demo the TUI attempts live wiring; unconfigured runs");
+    eprintln!("  fail with a not-configured diagnostic instead of serving fakes.");
+    eprintln!("  With --demo, every tool is scripted and one canned submission fires.");
+    eprintln!("  File tools are jailed to --tools-root, defaulting to the working directory");
+    eprintln!("  (subdirectories included); writes still need approval.");
     std::process::exit(2);
 }
 
@@ -258,6 +280,10 @@ fn startup_usage() -> ! {
 struct LiveSelection {
     config: UserConfig,
     active_model: Option<String>,
+    /// Scripted demo explicitly requested. The resolver serves fakes only
+    /// through this flag; an unconfigured selection without it fails
+    /// instead of silently demoing.
+    demo: bool,
 }
 
 /// Shared handle between a slot's [`Frontend`] and its provider.
@@ -281,7 +307,13 @@ fn resolve_live_adapter(
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> LiveResolve {
     let Some(model_id) = selection.active_model.as_deref() else {
-        return LiveResolve::Demo;
+        if selection.demo {
+            return LiveResolve::Demo;
+        }
+        return LiveResolve::Failed(
+            ErrorCategory::InvalidInput,
+            "no model configured: add a model or relaunch with --demo for the scripted demo",
+        );
     };
     let Some(entry) = selection.config.model(model_id) else {
         return LiveResolve::Failed(ErrorCategory::InvalidInput, "selected model is unknown");
@@ -477,6 +509,7 @@ impl PerRunProvider {
         Self::live(Arc::new(Mutex::new(LiveSelection {
             config: UserConfig::default_config(),
             active_model: None,
+            demo: true,
         })))
     }
 
@@ -562,8 +595,9 @@ impl PerRunProvider {
 
 /// Production composition over the startup configuration: the provider
 /// resolves per run from the slot's selection (demo script while nothing
-/// is selected, live adapter once it resolves), and file reads/writes are real
-/// and jailed only under an explicit `--tools-root`. Returns the shared
+/// is selected, live adapter once it resolves), and file reads/writes are
+/// real and jailed to the startup root (`--tools-root`, else the working
+/// directory). Returns the shared
 /// selection handle alongside so the frontend keeps it in sync on model
 /// switches.
 ///
@@ -601,6 +635,7 @@ fn build_live_runtime(
     let binding = Arc::new(Mutex::new(LiveSelection {
         config: session_config.config.clone(),
         active_model: session_config.active_model.clone(),
+        demo: session_config.demo,
     }));
     let provider = Arc::new(PerRunProvider::live(Arc::clone(&binding)));
     let (runtime, streams) = Runtime::try_new(config, provider, tools).map_err(io::Error::other)?;
@@ -629,10 +664,12 @@ fn wiring_notice(selection: &LiveSelection, tools_root: Option<&std::path::Path>
 fn main() {
     install_panic_hook();
     eprintln!(
-        "nexus-tui M0 TEST-ONLY demo: scripted fakes by default, ephemeral store. \
+        "nexus-tui dev: live wiring by default, ephemeral store. \
           A slot whose model resolves to a configured provider with a credential \
           uses the real adapter (network egress, billable); --tools-root enables \
-           real jailed reads/writes (writes require approval). No durable storage."
+           real jailed reads/writes (writes require approval). \
+           Without a configured provider, runs fail as not-configured; \
+           relaunch with --demo for the scripted demo. No durable storage."
     );
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -704,12 +741,22 @@ async fn run() -> io::Result<()> {
                 }
             }
             Err(error) => {
-                eprintln!("terminal setup failed ({error}); test transcript fallback");
+                if !session_config.demo {
+                    return Err(io::Error::other(format!(
+                        "terminal setup failed ({error}); relaunch with --demo for the scripted transcript fallback"
+                    )));
+                }
+                eprintln!("terminal setup failed ({error}); demo transcript fallback");
                 let (runtime, streams) = build_runtime()?;
                 headless(runtime, streams, session_config).await
             }
         }
     } else {
+        if !session_config.demo {
+            return Err(io::Error::other(
+                "no terminal attached; relaunch with --demo for the scripted transcript fallback",
+            ));
+        }
         let (runtime, streams) = build_runtime()?;
         headless(runtime, streams, session_config).await
     }
@@ -873,6 +920,10 @@ struct Frontend {
     /// Where [`Self::config`] came from. `None` means the platform exposes no
     /// config location, in which case usage is never written back.
     config_path: Option<std::path::PathBuf>,
+    /// Scripted demo explicitly requested with `--demo`, from
+    /// [`SessionConfig`]. Mirrored into the shared selection so runs
+    /// resolve fakes only through this flag.
+    demo: bool,
     /// Currently selected model id, or `None` when none is configured.
     active_model: Option<String>,
     /// Shared provider selection for this slot's runtime. `None` in unit
@@ -903,6 +954,7 @@ impl Frontend {
             config: UserConfig::default_config(),
             config_path: None,
             active_model: None,
+            demo: false,
             live: None,
             pending_session_cmds: Vec::new(),
         }
@@ -915,6 +967,7 @@ impl Frontend {
             config: config.config,
             config_path: config.path,
             active_model: config.active_model,
+            demo: config.demo,
             ..Self::new(session)
         };
         front.sync_model_display();
@@ -937,6 +990,7 @@ impl Frontend {
             *binding.lock().expect("live selection lockable") = LiveSelection {
                 config: self.config.clone(),
                 active_model: self.active_model.clone(),
+                demo: self.demo,
             };
         }
     }
@@ -1913,6 +1967,7 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     let mut front = Frontend::with_config(session, session_config.clone());
     front.state.set_session_label("s1");
     front.attach_live(live, session_config.tools_root.as_deref());
+    let demo = session_config.demo;
     let mut sessions = SessionRegistry::new(
         SessionSlot {
             label: "s1".to_owned(),
@@ -1926,11 +1981,12 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Canned M0 submission through the same command path as typed input. The
-    // draft is recorded and the run adopted only after `Accepted`. Gated on
-    // demo wiring: with a live adapter this would fire a real billable
-    // network call on every launch for a transcript nobody asked for.
-    if !sessions.active().front.is_live() {
+    // Canned submission through the same command path as typed input. The
+    // draft is recorded and the run adopted only after `Accepted`. Doubly
+    // gated: explicit `--demo` (never silent fakes in the dev version), and
+    // not-live (a live adapter would fire a real billable network call on
+    // every launch for a transcript nobody asked for).
+    if demo && !sessions.active().front.is_live() {
         let slot = sessions.active_mut();
         let submit = submit_command(
             slot.front.next_request(),
@@ -3637,6 +3693,7 @@ mod cov_main_topup {
             path: None,
             active_model: None,
             tools_root: None,
+            demo: false,
         }
     }
 
@@ -3677,6 +3734,7 @@ mod cov_main_topup {
             path: None,
             active_model,
             tools_root: None,
+            demo: false,
         }
     }
 
@@ -5083,6 +5141,14 @@ mod cov_live_wiring {
         }
     }
 
+    /// Unwraps the demo flag from the `Run` variant.
+    fn demo_flag(args: &[&str]) -> bool {
+        match parse_startup_args(&argv(args)) {
+            StartupAction::Run(parsed) => parsed.demo,
+            StartupAction::Usage => panic!("expected a run action for {args:?}"),
+        }
+    }
+
     /// Asserts the parser rejects the flags with usage.
     fn usage(args: &[&str]) {
         assert!(
@@ -5092,8 +5158,32 @@ mod cov_live_wiring {
     }
 
     #[test]
-    fn no_arguments_keep_every_tool_scripted() {
+    fn no_arguments_yield_no_explicit_jail() {
         assert_eq!(tools_root(&[]), None);
+    }
+
+    #[test]
+    fn tools_root_defaults_to_the_working_directory() {
+        let explicit = std::path::PathBuf::from("/srv/root");
+        assert_eq!(
+            resolve_tools_root(Some(explicit.clone())),
+            Some(explicit),
+            "an explicit flag always wins"
+        );
+        assert_eq!(
+            resolve_tools_root(None),
+            std::env::current_dir().ok(),
+            "absent, the jail is the working directory"
+        );
+    }
+
+    #[test]
+    fn demo_mode_is_an_explicit_opt_in_flag() {
+        assert!(!demo_flag(&[]), "the dev default serves no fakes");
+        assert!(demo_flag(&["--demo"]), "--demo opts in");
+        assert!(demo_flag(&["--demo", "--tools-root", "/srv/root"]));
+        assert!(demo_flag(&["--tools-root", "/srv/root", "--demo"]));
+        assert_eq!(tools_root(&["--demo"]), None);
     }
 
     #[test]
@@ -5136,7 +5226,31 @@ mod cov_live_wiring {
         LiveSelection {
             config,
             active_model: active_model.map(str::to_owned),
+            demo: true,
         }
+    }
+
+    #[test]
+    fn no_selection_without_demo_fails_instead_of_serving_fakes() {
+        let mut selection = LiveSelection {
+            config: UserConfig::default_config(),
+            active_model: None,
+            demo: false,
+        };
+        let resolved = resolve_live_adapter(&selection, |_| Some("secret".to_owned()));
+        assert!(
+            matches!(resolved, LiveResolve::Failed(_, _)),
+            "unconfigured dev runs fail instead of demoing"
+        );
+        if let LiveResolve::Failed(_, message) = resolved {
+            assert!(message.contains("--demo"), "the failure names the opt-in");
+        }
+        // The same selection with the flag serves the scripted demo.
+        selection.demo = true;
+        assert!(matches!(
+            resolve_live_adapter(&selection, |_| Some("secret".to_owned())),
+            LiveResolve::Demo
+        ));
     }
 
     #[test]
@@ -5144,6 +5258,7 @@ mod cov_live_wiring {
         let selection = LiveSelection {
             config: UserConfig::default_config(),
             active_model: None,
+            demo: true,
         };
         assert!(
             matches!(
@@ -5312,6 +5427,7 @@ mod cov_live_wiring {
         let selection = LiveSelection {
             config,
             active_model: Some("m0".to_owned()),
+            demo: true,
         };
         assert!(
             matches!(
@@ -5346,6 +5462,7 @@ mod cov_live_wiring {
             path: None,
             active_model: None,
             tools_root: Some(missing),
+            demo: false,
         };
         assert!(
             build_live_runtime(&session).is_err(),
@@ -5369,6 +5486,7 @@ mod cov_live_wiring {
             path: None,
             active_model: None,
             tools_root: None,
+            demo: false,
         };
         let (_runtime, _streams, live) = build_live_runtime(&session).expect("demo wiring builds");
         assert!(

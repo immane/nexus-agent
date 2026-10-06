@@ -245,7 +245,13 @@ const EMPTY_ROWS: usize = 9;
 const WORDMARK_ROWS: usize = 2;
 
 /// Empty-state subtitle under the banner or wordmark.
-const EMPTY_SUBTITLE: &str = "M0-TEST demo · fast to start · small by design";
+const EMPTY_SUBTITLE: &str = "nexus-agent dev · fast to start · small by design";
+
+/// Product version tags shown in the header and footer, replacing the
+/// retired M0-TEST branding. Baked in at compile time from the crate
+/// version (`concat!` needs literals, so one const per shape).
+const HEADER_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"), " ");
+const FOOTER_TAG: &str = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
 
 /// Small-terminal wordmark, centered when the banner does not fit.
 const WORDMARK: &str = "nexus-agent";
@@ -386,7 +392,7 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         .unwrap_or("no run");
     let mut spans = vec![
         Span::styled(" nexus-tui ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("M0-TEST "),
+        Span::raw(HEADER_TAG),
         Span::styled(format!("run:{run} "), Style::default().fg(Color::Cyan)),
         Span::raw(state.status()),
         Span::raw(format!(" focus:{focus:?}").to_lowercase()),
@@ -886,7 +892,7 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         ""
     };
     let mut spans = vec![
-        Span::raw(" m0-test "),
+        Span::raw(FOOTER_TAG),
         Span::styled(cancel_hint, Style::default().fg(Color::Yellow)),
         Span::styled(approval_hint, Style::default().fg(Color::Yellow)),
         Span::raw(" tab mode · enter submit · ↕ · m model · fold · approval i/a/d · ctrl+d quit "),
@@ -1148,7 +1154,7 @@ mod tests {
         let frame = screen(&terminal);
         assert!(frame.contains("nexus-tui"), "header present");
         assert!(frame.contains("composer (fixed)"), "fixed composer present");
-        assert!(frame.contains("m0-test"), "footer present");
+        assert!(frame.contains("v0.1.0"), "footer present");
         assert!(frame.contains("no run"), "accurate not-ready state");
     }
 
@@ -1328,7 +1334,7 @@ mod tests {
         draw(&mut state, &mut terminal, Focus::Composer);
         let frame = screen(&terminal);
         assert!(frame.contains("███╗   ██╗"), "banner present");
-        assert!(frame.contains("M0-TEST"), "subtitle present");
+        assert!(frame.contains("nexus-agent dev"), "subtitle present");
         let row = frame
             .lines()
             .find(|row| row.contains("███╗"))
@@ -2036,7 +2042,7 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(header.contains("nexus-tui"), "{header:?}");
-        assert!(header.contains("M0-TEST"), "{header:?}");
+        assert!(header.contains("v0.1.0"), "{header:?}");
         assert!(header.contains("run:no run"), "{header:?}");
         assert!(header.contains("idle"), "{header:?}");
         assert!(header.contains("focus:viewport"), "{header:?}");
@@ -2062,7 +2068,7 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.contains(" m0-test "), "{footer:?}");
+        assert!(footer.contains(" v0.1.0 "), "{footer:?}");
         assert!(footer.contains("idle"), "{footer:?}");
         assert!(
             !footer.contains("ctrl+c cancel"),

@@ -199,7 +199,7 @@ fn too_small_frames_get_one_notice_instead_of_a_clipped_layout() {
     // The notice names the app, so the header is identified by the state it
     // reports rather than by the product name, which the notice shares.
     assert!(!screen.contains("composer"), "{screen:?}");
-    assert!(!screen.contains("m0-test"), "{screen:?}");
+    assert!(!screen.contains("v0.1.0"), "{screen:?}");
     assert!(!screen.contains("run:"), "{screen:?}");
     assert!(!screen.contains("focus:"), "{screen:?}");
 
@@ -217,7 +217,7 @@ fn too_small_frames_get_one_notice_instead_of_a_clipped_layout() {
         assert_bounded(&rows, width, height);
         let screen = joined(&rows);
         assert!(!screen.contains("composer"), "{width}x{height}: {screen:?}");
-        assert!(!screen.contains("m0-test"), "{width}x{height}: {screen:?}");
+        assert!(!screen.contains("v0.1.0"), "{width}x{height}: {screen:?}");
         assert!(!screen.contains("run:"), "{width}x{height}: {screen:?}");
         assert!(!screen.contains("focus:"), "{width}x{height}: {screen:?}");
         assert!(!screen.contains('\x1b'), "{width}x{height}: {screen:?}");
@@ -237,7 +237,7 @@ fn too_small_frames_get_one_notice_instead_of_a_clipped_layout() {
         assert_bounded(&rows, width, height);
         let screen = joined(&rows);
         assert!(screen.contains("composer"), "{width}x{height}: {screen:?}");
-        assert!(screen.contains("m0-test"), "{width}x{height}: {screen:?}");
+        assert!(screen.contains("v0.1.0"), "{width}x{height}: {screen:?}");
         assert!(
             !screen.contains(TOO_SMALL_PREFIX),
             "{width}x{height}: {screen:?}"
@@ -267,7 +267,7 @@ fn composer_and_footer_survive_every_focus_and_the_smallest_frame() {
                 "{width}x{height} {focus:?}: composer missing: {screen:?}"
             );
             assert!(
-                screen.contains("m0-test"),
+                screen.contains("v0.1.0"),
                 "{width}x{height} {focus:?}: footer missing: {screen:?}"
             );
             assert!(
@@ -331,10 +331,9 @@ fn the_composer_body_is_clamped_and_never_pushes_the_footer_off_frame() {
         composer_row, 16,
         "the composer is clamped to five body rows plus its borders"
     );
-    assert_eq!(
-        row_holding(&rows, "m0-test"),
-        Some(23),
-        "the footer stays the last row"
+    assert!(
+        rows[23].contains("v0.1.0"),
+        "the footer stays the last row: {rows:?}"
     );
 }
 
@@ -360,17 +359,16 @@ fn a_pending_approval_cannot_starve_the_composer_or_the_footer() {
                 "{width}x{height} {focus:?}: card starved the composer: {screen:?}"
             );
             assert!(
-                screen.contains("m0-test"),
+                screen.contains("v0.1.0"),
                 "{width}x{height} {focus:?}: card starved the footer: {screen:?}"
             );
             assert!(
                 screen.contains("[i] inspect"),
                 "{width}x{height} {focus:?}: footer lost the inspect hint: {screen:?}"
             );
-            assert_eq!(
-                row_holding(&rows, "m0-test"),
-                Some(height as usize - 1),
-                "{width}x{height} {focus:?}: footer must stay the last row"
+            assert!(
+                rows[height as usize - 1].contains("v0.1.0"),
+                "{width}x{height} {focus:?}: footer must stay the last row: {rows:?}"
             );
             let composer_row = row_holding(&rows, "composer (fixed)").expect("composer block row");
             assert!(
