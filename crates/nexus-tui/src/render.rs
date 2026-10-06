@@ -25,7 +25,74 @@ use ratatui::widgets::{
 };
 
 use crate::keys::Focus;
+use crate::markdown::{MdStyle, StyledRun};
 use crate::state::{AppState, ApprovalGeometry, PendingApprovalCard, wrapped_height};
+
+/// Maps width-neutral Markdown style bits to terminal styling. Only color
+/// and modifiers change; the visible text (and its measured width) is
+/// untouched.
+fn markdown_style(style: MdStyle) -> Style {
+    let mut out = Style::default();
+    if style.contains(MdStyle::BOLD) || style.contains(MdStyle::HEADING) {
+        out = out.add_modifier(Modifier::BOLD);
+    }
+    if style.contains(MdStyle::ITALIC) || style.contains(MdStyle::QUOTE) {
+        out = out.add_modifier(Modifier::ITALIC);
+    }
+    if style.contains(MdStyle::STRIKE) {
+        out = out.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if style.contains(MdStyle::LINK) {
+        out = out.add_modifier(Modifier::UNDERLINED);
+    }
+    if style.contains(MdStyle::CODE) {
+        out = out.fg(Color::Yellow);
+    } else if style.contains(MdStyle::HEADING) {
+        out = out.fg(Color::LightBlue);
+    } else if style.contains(MdStyle::LINK) {
+        out = out.fg(Color::Cyan);
+    } else if style.contains(MdStyle::LINK_URL) || style.contains(MdStyle::QUOTE) {
+        out = out.add_modifier(Modifier::DIM);
+    }
+    out
+}
+
+/// Builds one body row from its visible text and style runs. Runs hold
+/// character offsets in line coordinates; gaps stay unstyled. An empty run
+/// list takes the plain fast path with identical output.
+fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
+    if runs.is_empty() {
+        return Line::from(text.to_owned());
+    }
+    // Character offsets to byte offsets (runs never split UTF-8).
+    let bytes: Vec<usize> = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let byte_at =
+        |char_index: usize| -> usize { bytes.get(char_index).copied().unwrap_or(text.len()) };
+    let mut spans = Vec::with_capacity(runs.len() * 2 + 1);
+    let mut cursor = 0usize;
+    for run in runs {
+        let from = byte_at(run.start);
+        let to = byte_at(run.start + run.len);
+        if from > byte_at(cursor) {
+            spans.push(Span::raw(text[byte_at(cursor)..from].to_owned()));
+        }
+        if from < to {
+            spans.push(Span::styled(
+                text[from..to].to_owned(),
+                markdown_style(run.style),
+            ));
+        }
+        cursor = cursor.max(run.start + run.len);
+    }
+    if cursor < text.chars().count() {
+        spans.push(Span::raw(text[byte_at(cursor)..].to_owned()));
+    }
+    Line::from(spans)
+}
 
 /// Welcome hero rows: the gradient banner plus breathing room and the
 /// subtitle, centered in a `width`-wide body. The caller guarantees the
@@ -305,8 +372,8 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
                 .add_modifier(Modifier::DIM),
         )));
     }
-    for line in view.lines {
-        lines.push(Line::from(line));
+    for (line, runs) in view.lines.iter().zip(&view.styles) {
+        lines.push(styled_line(line, runs));
     }
     let text_area = Rect {
         width: text_width as u16,
@@ -696,6 +763,57 @@ mod tests {
             rows.push(row);
         }
         rows.join("\n")
+    }
+
+    #[test]
+    fn styled_line_splits_runs_without_changing_text() {
+        let plain = styled_line("hello", &[]);
+        assert_eq!(plain.spans.len(), 1);
+        assert_eq!(plain.spans[0].content, "hello");
+
+        let styled = styled_line(
+            "  a bold word",
+            &[StyledRun {
+                start: 4,
+                len: 4,
+                style: MdStyle::BOLD,
+            }],
+        );
+        let content: String = styled
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(content, "  a bold word", "gaps stay, text is unchanged");
+        assert_eq!(styled.spans.len(), 3);
+        assert_eq!(styled.spans[1].content, "bold");
+        assert_eq!(
+            styled.spans[1].style.add_modifier,
+            Modifier::BOLD,
+            "the bold run maps to the bold modifier"
+        );
+        assert_eq!(styled.spans[0].style, Style::default());
+        assert_eq!(styled.spans[2].style, Style::default());
+    }
+
+    #[test]
+    fn styled_line_keeps_multibyte_runs_on_char_boundaries() {
+        let styled = styled_line(
+            "日本語 bold",
+            &[StyledRun {
+                start: 4,
+                len: 4,
+                style: MdStyle::CODE,
+            }],
+        );
+        let content: String = styled
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(content, "日本語 bold");
+        assert_eq!(styled.spans[1].content, "bold");
+        assert_eq!(styled.spans[1].style.fg, Some(Color::Yellow));
     }
 
     fn draw(state: &mut AppState, terminal: &mut Terminal<TestBackend>, focus: Focus) {

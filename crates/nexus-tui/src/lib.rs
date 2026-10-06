@@ -23,6 +23,7 @@
 
 pub mod decisions;
 pub mod keys;
+pub mod markdown;
 pub mod render;
 pub mod sanitize;
 pub mod slash;
@@ -31,6 +32,7 @@ pub mod terminal;
 
 pub use decisions::{approve_command, cancel_command, deny_command, submit_command};
 pub use keys::{Action, Focus, map_key, next_focus};
+pub use markdown::{MdStyle, StyledRun};
 pub use render::render;
 pub use slash::{SessionArgs, SlashCommand};
 pub use state::{AppState, EntryKind, PendingApprovalCard, RefreshGate, VisibleView};

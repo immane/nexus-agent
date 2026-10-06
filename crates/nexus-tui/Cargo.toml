@@ -57,3 +57,4 @@ crossterm = { version = "0.27" }
 # `time` (refresh ticks and bounded drains), `sync` (already the runtime's
 # channel types), `macros` (`select!` only). Mirrors nexus-runtime's set.
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }

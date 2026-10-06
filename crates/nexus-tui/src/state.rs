@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use nexus_core::{CallId, EventPayload, Limits, RunEvent, RunId, RunOutcome, TurnId, Usage};
 
 use crate::sanitize::{is_bidi_format, sanitize, sanitize_approval};
+use crate::{markdown, markdown::StyledRun};
 
 /// Presentation entry cap, tracking the M0-test retained-context budget
 /// (lock section 1: 128 retained context items). Older entries are dropped
@@ -266,20 +267,26 @@ impl Entry {
     fn compute_height(&self, width: usize) -> usize {
         // Every entry ends with one blank separator row so messages never
         // run together; see `render_range`, which must emit the same count.
-        let body = if self.folded {
+        // Assistant bodies render as Markdown: the parsed logical lines (not
+        // the raw stored lines) are what both height and rendering measure.
+        if self.folded {
             return wrapped_height(&folded_text(&self.title, self.lines.len()), width) + 1;
+        }
+        let body_width = body_width(width);
+        let mut height = wrapped_height(&self.title, width);
+        if self.kind == EntryKind::Assistant {
+            for rich in markdown::render_body(&self.lines, body_width) {
+                height += wrapped_height(&rich.visible_text(), body_width);
+            }
         } else {
-            let body_width = body_width(width);
-            let mut height = wrapped_height(&self.title, width);
             for line in &self.lines {
                 height += wrapped_height(line, body_width);
             }
-            if self.truncated {
-                height += wrapped_height(TRUNCATION_MARKER, body_width);
-            }
-            height
-        };
-        body + 1
+        }
+        if self.truncated {
+            height += wrapped_height(TRUNCATION_MARKER, body_width);
+        }
+        height + 1
     }
 
     /// Renders at most `take` wrapped lines of this entry into `out`,
@@ -287,53 +294,111 @@ impl Entry {
     /// an oversized entry intersecting the window materializes only the
     /// visible slice. Line counts match [`Entry::wrapped_len`] exactly,
     /// including the trailing blank separator row.
-    fn render_range(&self, width: usize, skip: usize, take: usize, out: &mut Vec<String>) {
+    ///
+    /// `runs_out` receives one style-run list per emitted line, in lockstep
+    /// with `out`: styles are width-neutral metadata and never change which
+    /// lines are emitted.
+    fn render_range(
+        &self,
+        width: usize,
+        skip: usize,
+        take: usize,
+        out: &mut Vec<String>,
+        runs_out: &mut Vec<Vec<StyledRun>>,
+    ) {
         if take == 0 {
             return;
         }
         let width = width.max(1);
         let limit = out.len().saturating_add(take);
+        let out_base = out.len();
+        let runs_base = runs_out.len();
         let mut index = 0usize;
+        // Single choke point for emission: text goes through `emit_line`
+        // (skip/take semantics in one place) and the style runs follow the
+        // same decision, shifted past the body indent so both vecs agree.
+        let mut emit = |text: &str, body: bool, row_runs: Vec<StyledRun>| -> bool {
+            let before = out.len();
+            let stop = emit_line(out, &mut index, skip, limit, text, body);
+            if out.len() > before {
+                let mut shifted = row_runs;
+                if body {
+                    for run in &mut shifted {
+                        run.start += BODY_INDENT;
+                    }
+                }
+                runs_out.push(shifted);
+            }
+            stop
+        };
         if self.folded {
             let marker = folded_text(&self.title, self.lines.len());
             for chunk in chunks(&marker, width) {
-                if emit_line(out, &mut index, skip, limit, chunk, false) {
+                if emit(chunk, false, Vec::new()) {
                     return;
                 }
             }
-            emit_line(out, &mut index, skip, limit, "", false);
+            emit("", false, Vec::new());
             return;
         }
         for chunk in chunks(&self.title, width) {
-            if emit_line(out, &mut index, skip, limit, chunk, false) {
+            if emit(chunk, false, Vec::new()) {
                 return;
             }
         }
-        if self.title.is_empty() && emit_line(out, &mut index, skip, limit, "", false) {
+        if self.title.is_empty() && emit("", false, Vec::new()) {
             return;
         }
         let body_width = body_width(width);
-        for line in &self.lines {
-            if line.is_empty() {
-                if emit_line(out, &mut index, skip, limit, "", true) {
-                    return;
-                }
-            } else {
-                for chunk in chunks(line, body_width) {
-                    if emit_line(out, &mut index, skip, limit, chunk, true) {
+        if self.kind == EntryKind::Assistant {
+            for rich in markdown::render_body(&self.lines, body_width) {
+                let text = rich.visible_text();
+                if text.is_empty() {
+                    // A blank logical line (blank code row, hard break) is
+                    // one row, mirroring `wrapped_height("") == 1`.
+                    if emit("", true, Vec::new()) {
                         return;
+                    }
+                    continue;
+                }
+                let line_runs = rich.runs();
+                let mut start = 0usize;
+                for chunk in chunks(&text, body_width) {
+                    let end = start + chunk.chars().count();
+                    if emit(chunk, true, markdown::slice_runs(&line_runs, start, end)) {
+                        return;
+                    }
+                    start = end;
+                }
+            }
+        } else {
+            for line in &self.lines {
+                if line.is_empty() {
+                    if emit("", true, Vec::new()) {
+                        return;
+                    }
+                } else {
+                    for chunk in chunks(line, body_width) {
+                        if emit(chunk, true, Vec::new()) {
+                            return;
+                        }
                     }
                 }
             }
         }
         if self.truncated {
             for chunk in chunks(TRUNCATION_MARKER, body_width) {
-                if emit_line(out, &mut index, skip, limit, chunk, true) {
+                if emit(chunk, true, Vec::new()) {
                     return;
                 }
             }
         }
-        emit_line(out, &mut index, skip, limit, "", false);
+        emit("", false, Vec::new());
+        debug_assert_eq!(
+            runs_out.len().saturating_sub(runs_base),
+            out.len().saturating_sub(out_base),
+            "every emitted line carries exactly one run list"
+        );
     }
 }
 
@@ -467,9 +532,16 @@ fn bounded_optional_text(raw: Option<&str>, max_bytes: usize) -> (Option<String>
 /// and rendering agree).
 #[cfg(test)]
 fn render_entry_lines(entry: &Entry, width: usize) -> Vec<String> {
+    render_entry_rows(entry, width).0
+}
+
+/// Rendered lines plus their style runs for one entry.
+#[cfg(test)]
+fn render_entry_rows(entry: &Entry, width: usize) -> (Vec<String>, Vec<Vec<StyledRun>>) {
     let mut out = Vec::new();
-    entry.render_range(width, 0, usize::MAX, &mut out);
-    out
+    let mut runs = Vec::new();
+    entry.render_range(width, 0, usize::MAX, &mut out, &mut runs);
+    (out, runs)
 }
 
 /// Live approval awaiting a decision. Decisions become
@@ -509,6 +581,10 @@ pub struct ApprovalGeometry {
 pub struct VisibleView {
     /// Rendered lines, oldest first, at most `height` entries.
     pub lines: Vec<String>,
+    /// Width-neutral style runs per rendered line, in lockstep with
+    /// [`VisibleView::lines`]: `styles[i]` styles `lines[i]` and is empty
+    /// for unstyled rows. Window slicing applies to both identically.
+    pub styles: Vec<Vec<StyledRun>>,
     /// Wrapped lines above the window (presentation-truncated view).
     pub hidden_above: usize,
     /// True when older entries were dropped from retention.
@@ -1037,6 +1113,7 @@ impl AppState {
         let window_start = total.saturating_sub(need);
         let mut hidden_above = window_start;
         let mut lines: Vec<String> = Vec::with_capacity(height.min(need));
+        let mut styles: Vec<Vec<StyledRun>> = Vec::with_capacity(height.min(need));
         let mut cursor = 0usize;
         for entry in &self.entries {
             if lines.len() >= need {
@@ -1050,21 +1127,31 @@ impl AppState {
             }
             let skip = window_start.saturating_sub(entry_start);
             let take = need - lines.len();
-            entry.render_range(width, skip, take, &mut lines);
+            entry.render_range(width, skip, take, &mut lines, &mut styles);
         }
         // Drop the below-the-fold scrollback, then cap to the body height.
+        // Both vecs stay in lockstep: every slice applies to the pair.
         if self.scrollback >= lines.len() {
             lines.clear();
+            styles.clear();
         } else {
             lines.truncate(lines.len() - self.scrollback);
+            styles.truncate(lines.len());
         }
         if lines.len() > height {
             let excess = lines.len() - height;
             lines.drain(..excess);
+            styles.drain(..excess);
             hidden_above += excess;
         }
+        debug_assert_eq!(
+            lines.len(),
+            styles.len(),
+            "styles ride alongside lines through every window slice"
+        );
         VisibleView {
             lines,
+            styles,
             hidden_above,
             retention_truncated: self.dropped_entries > 0,
         }
@@ -2809,11 +2896,11 @@ mod cov_state_private {
         entry.push_line("body");
 
         let mut none = Vec::new();
-        entry.render_range(40, 0, 0, &mut none);
+        entry.render_range(40, 0, 0, &mut none, &mut Vec::new());
         assert!(none.is_empty(), "a zero budget renders nothing");
 
         let mut past = Vec::new();
-        entry.render_range(40, 99, 10, &mut past);
+        entry.render_range(40, 99, 10, &mut past, &mut Vec::new());
         assert!(past.is_empty(), "a skip past the entry renders nothing");
 
         let full = render_entry_lines(&entry, 40);
@@ -2822,7 +2909,7 @@ mod cov_state_private {
             vec!["assistant".to_owned(), "  body".to_owned(), String::new()]
         );
         let mut slice = Vec::new();
-        entry.render_range(40, 1, 1, &mut slice);
+        entry.render_range(40, 1, 1, &mut slice, &mut Vec::new());
         assert_eq!(slice, vec![full[1].clone()], "only the requested window");
 
         let untitled = Entry::new(EntryKind::System, "");
@@ -2843,8 +2930,122 @@ mod cov_state_private {
             wrapped_height(&folded_text(&folded.title, 1), 40) + 1
         );
         let mut folded_slice = Vec::new();
-        folded.render_range(40, 1, 1, &mut folded_slice);
+        folded.render_range(40, 1, 1, &mut folded_slice, &mut Vec::new());
         assert_eq!(folded_slice, vec![all[1].clone()]);
+    }
+
+    #[test]
+    fn assistant_markdown_renders_styles_with_matching_heights() {
+        use crate::markdown::MdStyle;
+
+        let mut entry = Entry::new(EntryKind::Assistant, "assistant");
+        entry.push_line("# Title");
+        entry.push_line("a **bold** word");
+        entry.push_line("- item one");
+        entry.push_line("- item two");
+        let (rows, runs) = render_entry_rows(&entry, 40);
+        assert_eq!(
+            rows,
+            vec![
+                "assistant".to_owned(),
+                "  Title".to_owned(),
+                "  a bold word".to_owned(),
+                "  • item one".to_owned(),
+                "  • item two".to_owned(),
+                String::new(),
+            ]
+        );
+        assert_eq!(rows.len(), entry.wrapped_len(40), "heights match rendering");
+        assert_eq!(runs.len(), rows.len(), "one run list per row");
+        assert!(runs[0].is_empty(), "the title stays plain");
+        assert_eq!(
+            runs[1],
+            vec![StyledRun {
+                start: 2,
+                len: 5,
+                style: MdStyle::HEADING.union(MdStyle::BOLD),
+            }],
+            "the heading style sits past the indent"
+        );
+        assert_eq!(
+            runs[2],
+            vec![StyledRun {
+                start: 4,
+                len: 4,
+                style: MdStyle::BOLD,
+            }],
+            "only the bold word is styled"
+        );
+        assert!(
+            runs[3].is_empty() && runs[4].is_empty() && runs[5].is_empty(),
+            "bullets and the separator carry no styles"
+        );
+    }
+
+    #[test]
+    fn non_assistant_entries_ignore_markdown_syntax() {
+        let mut user = Entry::new(EntryKind::User, "you");
+        user.push_line("**not bold** `not code`");
+        let (rows, runs) = render_entry_rows(&user, 40);
+        assert_eq!(
+            rows,
+            vec![
+                "you".to_owned(),
+                "  **not bold** `not code`".to_owned(),
+                String::new(),
+            ]
+        );
+        assert!(runs.iter().all(Vec::is_empty));
+        assert_eq!(user.wrapped_len(40), rows.len());
+    }
+
+    #[test]
+    fn streaming_markdown_stays_plain_until_constructs_close() {
+        use nexus_core::{AssistantText, EventPayload, TurnId};
+
+        fn fragment(seq: u64, text: &str) -> RunEvent {
+            let session = cov_session();
+            let run = cov_run();
+            RunEvent::new(
+                session,
+                run,
+                seq,
+                EventPayload::AssistantTextDelta(
+                    AssistantText::new(TurnId::new("t1-0").expect("valid"), "item-0", text)
+                        .expect("fragment builds"),
+                ),
+            )
+        }
+
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        assert!(state.apply_event(&fragment(1, "```rust\nlet x = 1;\n")));
+        let open = state.visible_lines(80, 30);
+        assert_eq!(open.lines.len(), open.styles.len());
+        assert!(
+            open.lines.iter().any(|line| line.contains("```rust")),
+            "the unclosed opener stays literal: {open:?}"
+        );
+        assert!(
+            open.styles.iter().all(Vec::is_empty),
+            "no code styling while the fence is open: {open:?}"
+        );
+
+        assert!(state.apply_event(&fragment(2, "```\n")));
+        let closed = state.visible_lines(80, 30);
+        assert!(
+            !closed.lines.iter().any(|line| line.contains("```")),
+            "fence markers never render: {closed:?}"
+        );
+        assert!(
+            closed.styles.iter().any(|runs| !runs.is_empty()),
+            "the closed block gains code styling: {closed:?}"
+        );
+        assert_eq!(
+            state.total_height(80),
+            closed.lines.len(),
+            "the whole conversation fits, so heights match rows"
+        );
     }
 
     #[test]
