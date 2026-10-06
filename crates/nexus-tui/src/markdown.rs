@@ -338,10 +338,12 @@ fn wrap_cell(cell: &[RichSpan], width: usize) -> Vec<(String, Vec<StyledRun>)> {
     out
 }
 
-/// Lays out a finished table at `width` characters: content-derived column
-/// widths (shrunk widest-first when over budget), a header with a GitHub
-/// separator row, and wrapped cells. Every emitted line fits `width`, so
-/// downstream wrapping is the identity.
+/// Lays out a finished table at `width` cells: content-derived column
+/// widths (shrunk widest-first when over budget), a boxed header with a
+/// rule beneath it, and wrapped cells. Every emitted line fits `width`, so
+/// downstream wrapping is the identity. Box-drawing glyphs are single-cell
+/// and alignment still shows in the padding (markers have no room in the
+/// box style, so the colons are dropped).
 fn layout_table(builder: &TableBuilder, width: usize) -> Vec<RichLine> {
     let width = width.max(1);
     let ncols = builder
@@ -362,7 +364,8 @@ fn layout_table(builder: &TableBuilder, width: usize) -> Vec<RichLine> {
             natural[index] = natural[index].max(cell_len(cell));
         }
     }
-    // One `| ` opener, one ` | ` gap per column, one ` |` closer.
+    // One two-cell border per column edge (`│ ` opener, ` │ ` gaps,
+    // ` │` closer): same footprint as the pipe style it replaces.
     let avail = width.saturating_sub(3 * ncols + 1);
     let mut widths: Vec<usize> = natural.iter().map(|w| (*w).max(1)).collect();
     while widths.iter().sum::<usize>() > avail {
@@ -408,10 +411,13 @@ fn layout_table(builder: &TableBuilder, width: usize) -> Vec<RichLine> {
             }
             cells.push(wrapped);
         }
+        if is_header && row_index == 0 {
+            out.push(box_rule(&widths, ("\u{256d}", "\u{252c}", "\u{256e}")));
+        }
         let height = cells.iter().map(Vec::len).max().unwrap_or(1);
         for visual in 0..height {
             let mut spans = vec![RichSpan {
-                text: "| ".to_owned(),
+                text: "\u{2502} ".to_owned(),
                 style: MdStyle::PLAIN,
             }];
             for (col, wrapped) in cells.iter().enumerate() {
@@ -430,9 +436,9 @@ fn layout_table(builder: &TableBuilder, width: usize) -> Vec<RichLine> {
                 spans.extend(cell_spans);
                 spans.push(RichSpan {
                     text: if col + 1 == ncols {
-                        " |".to_owned()
+                        " \u{2502}".to_owned()
                     } else {
-                        " | ".to_owned()
+                        " \u{2502} ".to_owned()
                     },
                     style: MdStyle::PLAIN,
                 });
@@ -440,26 +446,33 @@ fn layout_table(builder: &TableBuilder, width: usize) -> Vec<RichLine> {
             out.push(RichLine { spans });
         }
         if is_header && row_index + 1 == head.len() {
-            // GitHub separator row with alignment markers.
-            let mut sep = String::from("|");
-            for (col, w) in widths.iter().enumerate() {
-                let marker = match aligns[col] {
-                    Alignment::Left => format!(":{}|", "-".repeat(w + 1)),
-                    Alignment::Right => format!("{}:|", "-".repeat(w + 1)),
-                    Alignment::Center => format!(":{}:|", "-".repeat(*w)),
-                    Alignment::None => format!("{}|", "-".repeat(w + 2)),
-                };
-                sep.push_str(&marker);
-            }
-            out.push(RichLine {
-                spans: vec![RichSpan {
-                    text: sep,
-                    style: MdStyle::PLAIN,
-                }],
-            });
+            out.push(box_rule(&widths, ("\u{251c}", "\u{253c}", "\u{2524}")));
         }
     }
+    // An empty table (no rows at all) renders nothing, not a lone rule.
+    if !out.is_empty() {
+        out.push(box_rule(&widths, ("\u{2570}", "\u{2534}", "\u{256f}")));
+    }
     out
+}
+
+/// Draws one horizontal box rule (`top`, `mid`, or `bottom` corner sets):
+/// each column gets its width plus one padding cell per side.
+fn box_rule(widths: &[usize], corners: (&str, &str, &str)) -> RichLine {
+    let mut text = String::from(corners.0);
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            text.push_str(corners.1);
+        }
+        text.push_str(&"\u{2500}".repeat(width + 2));
+    }
+    text.push_str(corners.2);
+    RichLine {
+        spans: vec![RichSpan {
+            text,
+            style: MdStyle::PLAIN,
+        }],
+    }
 }
 
 /// Converts pulldown-cmark events into logical lines.
@@ -485,6 +498,12 @@ struct BodyParser {
     /// Footnote definition currently collecting: its name plus a nested
     /// parser that accepts any block content (including tables).
     divert: Option<(String, Box<BodyParser>)>,
+    /// Nesting depth of block containers (quotes, lists, items, tables,
+    /// code, definitions). Only depth-0 boundaries separate top-level
+    /// blocks, so nested content stays tight.
+    block_depth: usize,
+    /// A finished top-level block wants air before the next one starts.
+    need_gap: bool,
 }
 
 impl BodyParser {
@@ -501,6 +520,35 @@ impl BodyParser {
             table: None,
             footnotes: Vec::new(),
             divert: None,
+            block_depth: 0,
+            need_gap: false,
+        }
+    }
+
+    /// Starts one blank separator row before a new top-level block, unless
+    /// this is the first block. Consumes the pending flag either way, so a
+    /// lone opener never accrues air it cannot spend.
+    fn gap_maybe(&mut self) {
+        if self.block_depth == 0 && self.need_gap && !self.lines.is_empty() {
+            self.push_line(RichLine::default());
+        }
+        if self.block_depth == 0 {
+            self.need_gap = false;
+        }
+    }
+
+    /// Enters one block container (depth-gated gaps apply inside never).
+    fn enter_block(&mut self) {
+        self.gap_maybe();
+        self.block_depth += 1;
+    }
+
+    /// Leaves one block container; a return to the top level arms the gap
+    /// for whatever block comes next.
+    fn exit_block(&mut self) {
+        self.block_depth = self.block_depth.saturating_sub(1);
+        if self.block_depth == 0 {
+            self.need_gap = true;
         }
     }
 
@@ -683,14 +731,17 @@ impl BodyParser {
                     // boundaries inside a cell are ignored, never rows.
                     if !self.cell_open() {
                         self.end_line();
+                        self.enter_block();
                     }
                 }
                 Tag::Heading { .. } => {
                     self.end_line();
+                    self.enter_block();
                     self.styles.push(MdStyle::HEADING.union(MdStyle::BOLD));
                 }
                 Tag::BlockQuote(kind) => {
                     self.end_line();
+                    self.enter_block();
                     // GFM admonitions (`> [!NOTE] ...`) keep their marker as
                     // a bold label; plain quotes stay style-only.
                     if let Some(kind) = kind {
@@ -712,10 +763,12 @@ impl BodyParser {
                 }
                 Tag::CodeBlock(_) => {
                     self.end_line();
+                    self.enter_block();
                     self.in_code_block = true;
                 }
                 Tag::List(first) => {
                     self.end_line();
+                    self.enter_block();
                     let depth = self.lists.len();
                     self.lists.push(ListContext {
                         ordered: first.is_some(),
@@ -725,6 +778,7 @@ impl BodyParser {
                 }
                 Tag::Item => {
                     self.end_line();
+                    self.enter_block();
                     let prefix = match self.lists.last_mut() {
                         Some(list) if list.ordered => {
                             let number = list.next;
@@ -741,20 +795,24 @@ impl BodyParser {
                 Tag::Strikethrough => self.styles.push(MdStyle::STRIKE),
                 Tag::Table(alignments) => {
                     self.end_line();
+                    self.enter_block();
                     self.table = Some(TableBuilder::new(alignments));
                 }
                 Tag::TableHead => {
+                    self.enter_block();
                     if let Some(builder) = self.table.as_mut() {
                         builder.in_head = true;
                     }
                 }
                 Tag::TableRow => {
+                    self.enter_block();
                     if let Some(builder) = self.table.as_mut() {
                         builder.close_cell();
                         builder.current_row = Vec::new();
                     }
                 }
                 Tag::TableCell => {
+                    self.enter_block();
                     if let Some(builder) = self.table.as_mut() {
                         builder.close_cell();
                         builder.current_cell = Vec::new();
@@ -762,13 +820,24 @@ impl BodyParser {
                     }
                 }
                 Tag::FootnoteDefinition(name) => {
+                    // No depth change: the matching End never reaches
+                    // `handle` (the feeder intercepts it), and nesting
+                    // lives in the diverted sub-parser.
                     self.end_line();
+                    self.gap_maybe();
                     self.divert = Some((name.into_string(), Box::new(BodyParser::new())));
                 }
-                Tag::DefinitionList => self.end_line(),
-                Tag::DefinitionListTitle => self.end_line(),
+                Tag::DefinitionList => {
+                    self.end_line();
+                    self.enter_block();
+                }
+                Tag::DefinitionListTitle => {
+                    self.end_line();
+                    self.enter_block();
+                }
                 Tag::DefinitionListDefinition => {
                     self.end_line();
+                    self.enter_block();
                     self.pending_prefix = Some("  ".to_owned());
                 }
                 Tag::Link { dest_url, .. } => {
@@ -786,6 +855,7 @@ impl BodyParser {
                 TagEnd::Paragraph => {
                     if !self.cell_open() {
                         self.end_line();
+                        self.exit_block();
                     }
                 }
                 TagEnd::Heading(..)
@@ -797,6 +867,7 @@ impl BodyParser {
                 | TagEnd::DefinitionListTitle
                 | TagEnd::DefinitionListDefinition => {
                     self.end_line();
+                    self.exit_block();
                     match tag {
                         TagEnd::Heading(..) | TagEnd::BlockQuote(..) => {
                             self.styles.pop();
@@ -814,6 +885,7 @@ impl BodyParser {
                             self.push_line(line);
                         }
                     }
+                    self.exit_block();
                 }
                 TagEnd::TableHead => {
                     if let Some(builder) = self.table.as_mut() {
@@ -822,16 +894,19 @@ impl BodyParser {
                         builder.close_row();
                         builder.in_head = false;
                     }
+                    self.exit_block();
                 }
                 TagEnd::TableRow => {
                     if let Some(builder) = self.table.as_mut() {
                         builder.close_row();
                     }
+                    self.exit_block();
                 }
                 TagEnd::TableCell => {
                     if let Some(builder) = self.table.as_mut() {
                         builder.close_cell();
                     }
+                    self.exit_block();
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     self.styles.pop();
@@ -935,6 +1010,8 @@ impl BodyParser {
             }
             Event::Rule => {
                 self.end_line();
+                self.gap_maybe();
+                self.need_gap = true;
                 let width = layout_width.max(1);
                 self.push_line(RichLine {
                     spans: vec![RichSpan {
@@ -971,6 +1048,8 @@ impl BodyParser {
                 // Display math stands alone; multiline content keeps one
                 // row per source line, all code-styled.
                 self.end_line();
+                self.gap_maybe();
+                self.need_gap = true;
                 let style = self.combined().union(MdStyle::CODE);
                 if math.contains('\n') {
                     self.push_line(RichLine {
@@ -1124,9 +1203,9 @@ fn escape_unclosed_fence(source: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
-/// Parses assistant body lines into logical styled lines. `rule_width` sizes
-/// the thematic-break rule so it fills exactly one wrapped row; it is the
-/// only width-dependent part of the output.
+/// Parses assistant body lines into logical styled lines. `rule_width`
+/// sizes the thematic-break rule and lays out tables so each fills exactly
+/// its rows; those are the only width-dependent parts of the output.
 #[must_use]
 pub fn render_body(lines: &[String], rule_width: usize) -> Vec<RichLine> {
     if lines.iter().all(|line| line.is_empty()) {
@@ -1257,7 +1336,7 @@ mod tests {
     #[test]
     fn lists_gain_bullets_numbers_and_indent() {
         let lines = render_body(&body("- a\n- b\n\n1. one\n2. two"), 78);
-        assert_eq!(visible(&lines), vec!["• a", "• b", "1. one", "2. two"]);
+        assert_eq!(visible(&lines), vec!["• a", "• b", "", "1. one", "2. two"]);
         assert!(lines.iter().all(|line| line.runs().is_empty()));
     }
 
@@ -1293,9 +1372,18 @@ mod tests {
     #[test]
     fn rule_fills_exactly_the_given_width() {
         let lines = render_body(&body("a\n\n---\n\nb"), 40);
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[1].visible_len(), 40);
-        assert!(lines[1].visible_text().chars().all(|char| char == '─'));
+        let rule: String = "\u{2500}".repeat(40);
+        assert_eq!(
+            visible(&lines),
+            vec![
+                "a".to_owned(),
+                String::new(),
+                rule,
+                String::new(),
+                "b".to_owned()
+            ]
+        );
+        assert_eq!(lines[2].visible_len(), 40);
     }
 
     #[test]
@@ -1363,11 +1451,64 @@ mod extended_tests {
     use super::*;
 
     #[test]
+    fn blocks_breathe_with_one_air_row_between_them() {
+        let lines = render_body(
+            &body("# Title\n\nfirst para\n\n- a\n- b\n\n> quoted\n\nlast"),
+            78,
+        );
+        assert_eq!(
+            visible(&lines),
+            vec![
+                "Title",
+                "",
+                "first para",
+                "",
+                "• a",
+                "• b",
+                "",
+                "quoted",
+                "",
+                "last",
+            ]
+        );
+    }
+
+    #[test]
+    fn single_blocks_and_plain_lines_gain_no_air() {
+        assert_eq!(
+            visible(&render_body(&body("just one"), 78)),
+            vec!["just one"]
+        );
+        assert_eq!(
+            visible(&render_body(&body("row one\nrow two"), 78)),
+            vec!["row one", "row two"],
+        );
+    }
+
+    #[test]
+    fn code_blocks_keep_inner_blanks_and_gain_outer_air() {
+        let lines = render_body(&body("before\n\n```\nx = 1;\n\ny = 2;\n```\n\nafter"), 78);
+        assert_eq!(
+            visible(&lines),
+            vec!["before", "", "x = 1;", "", "y = 2;", "", "after"]
+        );
+    }
+
+    #[test]
     fn tables_render_header_separator_and_rows() {
         let lines = render_body(&body("| a | b |\n|---|---|\n| 1 | 2 |"), 78);
-        assert_eq!(visible(&lines), vec!["| a | b |", "|---|---|", "| 1 | 2 |"]);
-        // The header row carries the bold style.
-        assert!(lines[0].runs()[0].style.contains(MdStyle::BOLD));
+        assert_eq!(
+            visible(&lines),
+            vec![
+                "\u{256d}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{256e}",
+                "\u{2502} a \u{2502} b \u{2502}",
+                "\u{251c}\u{2500}\u{2500}\u{2500}\u{253c}\u{2500}\u{2500}\u{2500}\u{2524}",
+                "\u{2502} 1 \u{2502} 2 \u{2502}",
+                "\u{2570}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{256f}",
+            ]
+        );
+        // The header row carries the bold style; rules stay plain.
+        assert!(lines[1].runs()[0].style.contains(MdStyle::BOLD));
         assert!(lines[2].runs().is_empty());
     }
 
@@ -1376,7 +1517,13 @@ mod extended_tests {
         let lines = render_body(&body("| l | r | c |\n|:--|--:|:--:|\n| ab | cd | ef |"), 78);
         assert_eq!(
             visible(&lines),
-            vec!["| l  |  r | c  |", "|:---|---:|:--:|", "| ab | cd | ef |"]
+            vec![
+                "\u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}",
+                "\u{2502} l  \u{2502}  r \u{2502} c  \u{2502}",
+                "\u{251c}\u{2500}\u{2500}\u{2500}\u{2500}\u{253c}\u{2500}\u{2500}\u{2500}\u{2500}\u{253c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2524}",
+                "\u{2502} ab \u{2502} cd \u{2502} ef \u{2502}",
+                "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
+            ]
         );
     }
 
@@ -1392,13 +1539,22 @@ mod extended_tests {
         }
         let text = visible(&lines).join("\n");
         assert!(text.contains("0123456789ab"), "{text:?}");
-        assert!(text.contains("| cdef"), "{text:?}");
+        assert!(text.contains("\u{2502} cdef"), "{text:?}");
     }
 
     #[test]
     fn tables_keep_empty_cells_aligned() {
         let lines = render_body(&body("| a | b |\n|---|---|\n|  | 2 |"), 78);
-        assert_eq!(visible(&lines), vec!["| a | b |", "|---|---|", "|   | 2 |"]);
+        assert_eq!(
+            visible(&lines),
+            vec![
+                "\u{256d}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{256e}",
+                "\u{2502} a \u{2502} b \u{2502}",
+                "\u{251c}\u{2500}\u{2500}\u{2500}\u{253c}\u{2500}\u{2500}\u{2500}\u{2524}",
+                "\u{2502}   \u{2502} 2 \u{2502}",
+                "\u{2570}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{256f}",
+            ]
+        );
     }
 
     #[test]
@@ -1407,7 +1563,13 @@ mod extended_tests {
         let lines = render_body(&body("| \u{4e2d}\u{6587} | x |\n|---|---|\n| 1 | 2 |"), 78);
         assert_eq!(
             visible(&lines),
-            vec!["| \u{4e2d}\u{6587} | x |", "|------|---|", "| 1    | 2 |"]
+            vec![
+                "\u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{256e}",
+                "\u{2502} \u{4e2d}\u{6587} \u{2502} x \u{2502}",
+                "\u{251c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{253c}\u{2500}\u{2500}\u{2500}\u{2524}",
+                "\u{2502} 1    \u{2502} 2 \u{2502}",
+                "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{256f}",
+            ]
         );
         for line in &lines {
             assert!(line.visible_len() <= 12, "{line:?}");
@@ -1417,8 +1579,17 @@ mod extended_tests {
     #[test]
     fn tables_style_inline_content_inside_cells() {
         let lines = render_body(&body("| a |\n|---|\n| **b** |"), 78);
-        assert_eq!(visible(&lines), vec!["| a |", "|---|", "| b |"]);
-        let runs = lines[2].runs();
+        assert_eq!(
+            visible(&lines),
+            vec![
+                "\u{256d}\u{2500}\u{2500}\u{2500}\u{256e}",
+                "\u{2502} a \u{2502}",
+                "\u{251c}\u{2500}\u{2500}\u{2500}\u{2524}",
+                "\u{2502} b \u{2502}",
+                "\u{2570}\u{2500}\u{2500}\u{2500}\u{256f}",
+            ]
+        );
+        let runs = lines[3].runs();
         assert_eq!(runs.len(), 1);
         assert!(runs[0].style.contains(MdStyle::BOLD));
     }
@@ -1426,7 +1597,7 @@ mod extended_tests {
     #[test]
     fn footnote_reference_links_and_definition_appends() {
         let lines = render_body(&body("see this[^1].\n\n[^1]: the note"), 78);
-        assert_eq!(visible(&lines), vec!["see this[^1].", "[^1]: the note"]);
+        assert_eq!(visible(&lines), vec!["see this[^1].", "", "[^1]: the note"]);
         let runs = lines[0].runs();
         assert_eq!(runs.len(), 1);
         assert!(runs[0].style.contains(MdStyle::LINK));
@@ -1443,7 +1614,7 @@ mod extended_tests {
         let lines = render_body(&body("a[^1]\n\n[^1]: first\n  second"), 78);
         assert_eq!(
             visible(&lines),
-            vec!["a[^1]", "[^1]: first", "      second"]
+            vec!["a[^1]", "", "[^1]: first", "      second"]
         );
     }
 

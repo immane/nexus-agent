@@ -3231,7 +3231,9 @@ mod cov_state_private {
             vec![
                 "assistant".to_owned(),
                 "  Title".to_owned(),
+                "  ".to_owned(),
                 "  a bold word".to_owned(),
+                "  ".to_owned(),
                 "  • item one".to_owned(),
                 "  • item two".to_owned(),
                 String::new(),
@@ -3250,7 +3252,7 @@ mod cov_state_private {
             "the heading style sits past the indent"
         );
         assert_eq!(
-            runs[2],
+            runs[3],
             vec![StyledRun {
                 start: 4,
                 len: 4,
@@ -3259,8 +3261,12 @@ mod cov_state_private {
             "only the bold word is styled"
         );
         assert!(
-            runs[3].is_empty() && runs[4].is_empty() && runs[5].is_empty(),
-            "bullets and the separator carry no styles"
+            runs[2].is_empty()
+                && runs[4].is_empty()
+                && runs[5].is_empty()
+                && runs[6].is_empty()
+                && runs[7].is_empty(),
+            "gaps, bullets, and the separator carry no styles"
         );
     }
 
@@ -3280,20 +3286,27 @@ mod cov_state_private {
             rows,
             vec![
                 "assistant".to_owned(),
-                "  | a | b |".to_owned(),
-                "  |---|---|".to_owned(),
-                "  | 1 | 2 |".to_owned(),
+                "  \u{256d}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{256e}"
+                    .to_owned(),
+                "  \u{2502} a \u{2502} b \u{2502}".to_owned(),
+                "  \u{251c}\u{2500}\u{2500}\u{2500}\u{253c}\u{2500}\u{2500}\u{2500}\u{2524}"
+                    .to_owned(),
+                "  \u{2502} 1 \u{2502} 2 \u{2502}".to_owned(),
+                "  \u{2570}\u{2500}\u{2500}\u{2500}\u{2534}\u{2500}\u{2500}\u{2500}\u{256f}"
+                    .to_owned(),
+                "  ".to_owned(),
                 "  note[^1]".to_owned(),
+                "  ".to_owned(),
                 "  [^1]: the footnote".to_owned(),
                 String::new(),
             ]
         );
         assert_eq!(rows.len(), entry.wrapped_len(40), "heights match rendering");
         assert_eq!(runs.len(), rows.len(), "one run list per row");
-        // Header bold, footnote reference linked, separator plain.
-        assert!(runs[1][0].style.contains(MdStyle::BOLD));
-        assert!(runs[4].iter().any(|run| run.style.contains(MdStyle::LINK)));
-        assert!(runs[2].iter().all(|run| !run.style.contains(MdStyle::BOLD)));
+        // Header bold, footnote reference linked, rules plain.
+        assert!(runs[2][0].style.contains(MdStyle::BOLD));
+        assert!(runs[7].iter().any(|run| run.style.contains(MdStyle::LINK)));
+        assert!(runs[3].iter().all(|run| !run.style.contains(MdStyle::BOLD)));
     }
 
     #[test]
