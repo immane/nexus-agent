@@ -123,6 +123,32 @@ Accepted in [Decision 01](docs/design/decisions/01-first-release-defaults.md); d
 | Authentication | API configuration with external credential references; browser login deferred. |
 | API relay | Relay is a provider plugin; support existing services first and keep local execution optional. |
 
+## Using the Frontends
+
+Both frontends submit to the same runtime, so policy is identical wherever you invoke it. The read-only mode is enforced at tool dispatch, not by convention.
+
+### Agent modes
+
+| Mode | Tool policy |
+| --- | --- |
+| `build` (default) | Full capability; file mutations and command execution still require explicit approval. |
+| `plan` | Read-only: confirmation-required tools are denied without prompting; automatic reads still run. |
+
+In the TUI, `Tab` in the composer cycles modes, and the composer border color and title name the active one. One-shot headless runs take `--mode plan|build|<custom>`. Further modes come from configuration:
+
+```json
+{
+  "modes": [{ "id": "review", "label": "Review", "read_only": true }],
+  "default_mode": "review"
+}
+```
+
+Built-in ids cannot be redefined, and unknown mode ids or dangling defaults fail explicitly instead of falling back silently.
+
+### TUI presentation
+
+Assistant messages render a Markdown subset (headings, emphasis, code, lists, quotes, tables, footnotes, math) with breathing room between blocks, and CJK text wraps by cell width. Left-drag selects conversation or composer text and releasing copies it to the clipboard (OSC 52, which most terminals honor); the wheel scrolls, and `Esc` steps back without ever cancelling. `/help` lists the keys and slash commands.
+
 ## Extensions
 
 Built-in and external tools share one semantic contract, but do not share the same transport cost.
@@ -175,7 +201,7 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Draft architecture, performance, security, and interface contracts.
 - [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
 - [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
-- [x] Build a testable core/runtime and minimal frontend (scripted fakes plus opt-in live providers and jailed file tools; last local verification: 1971 Rust tests passed / 0 failed across 142 targets, 253 Python harness tests passed with 1 platform skip; GitHub Actions runs the suite on Ubuntu and macOS).
+- [x] Build a testable core/runtime and minimal frontend (scripted fakes plus opt-in live providers and jailed file tools; last local verification: 2039 Rust tests passed / 0 failed with 9 intentionally-skipped redundancy layers, 253 Python harness tests passed with 1 platform skip; GitHub Actions runs the suite on Ubuntu and macOS).
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
 - [ ] Complete coding tools and mainstream model adapters (opt-in OpenAI-compatible streaming and file reads/writes are implemented; search, shell execution, and other provider protocols remain pending).
