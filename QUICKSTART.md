@@ -8,8 +8,8 @@
   HTTPS through the system `openssl` TLS bridge) and root-jailed file
   reads/writes (`nexus-tools`). No plugins, no durable history.
   **M0 acceptance is NOT complete** (see `docs/tasks/04-m0-gates.md`).
-- Historical gates (macOS; these counts predate the live integration fixes):
-  - Rust: **1898 passed / 0 failed** across 138 test targets
+- Last verified locally (macOS):
+  - Rust: **1971 passed / 0 failed** across 142 test targets
   - Python (`tools/perf`): **253 passed** (1 Linux-only test skipped on macOS)
   - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo doc --workspace -- -D warnings`: clean
   - Measured line coverage of production `src/`: **~97%** (`rustc -C instrument-coverage` + Xcode `llvm-cov`; re-measure after toolchain moves, as the two versions must agree; remaining gaps need a real PTY or unreachable defensive branches)
@@ -156,6 +156,37 @@ curl -s -X POST localhost:8471/sessions/$SID/runs -d '{"input":"x"}'    # fake d
 Unset `OLLAMA_API_KEY` and submit with `"provider":"ollama"` to see the
 `503` credential gate: no socket ever opens without a referenced secret.
 
+## Use a hosted model (e.g. DeepSeek)
+
+Same configuration shape with an `https` endpoint; export the referenced
+variable **before starting** (TUI or server) in the same shell. The value
+is referenced by name only, never embedded in JSON.
+
+```json
+{
+  "revision": 1,
+  "providers": [
+    {
+      "id": "deepseek",
+      "display_name": "DeepSeek",
+      "adapter": "direct",
+      "endpoint": "https://api.deepseek.com",
+      "credential": {"env": "DEEPSEEK_API_KEY"},
+      "default_model": "deepseek-flash"
+    }
+  ],
+  "models": [
+    {"id": "flash", "provider": "deepseek", "name": "deepseek-flash"}
+  ],
+  "favourites": ["flash"],
+  "recent": []
+}
+```
+
+Then select the `flash` model in the TUI and submit; requests are billable.
+Thinking traces are echoed back automatically, and follow-up tasks in the
+same session reuse the retained context described above.
+
 ## Perf harnesses
 
 ```sh
@@ -178,7 +209,7 @@ xcrun llvm-profdata merge -sparse /tmp/nexus-cov/*.profraw -o /tmp/nexus-cov/mer
 
 ## What NOT to expect
 
-- Provider transport is plain HTTP only (no TLS, no streaming SSE from the
-  model side); plugins and durable history do not exist (ephemeral store only).
+- Provider transport covers HTTP and HTTPS (HTTPS via the system `openssl`
+  bridge) with streaming SSE; plugins and durable history do not exist (ephemeral store only).
 - Recorded performance numbers are historical characterization, not acceptance evidence; PTY/idle/streaming baselines are still pending.
-- Same-toolchain Linux validation and exact toolchain pinning are still open blockers.
+- GitHub Actions runs the check suite on Ubuntu and macOS; exact toolchain pinning is still open.

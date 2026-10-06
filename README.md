@@ -136,7 +136,7 @@ MCP over stdio is the preferred initial external-tool transport candidate, kept 
 
 API relay is separate from tool plugins: a relay is a provider implementation behind the provider port, not a model-invoked tool. Existing relay services come first; local relay execution remains an optional boundary and never mandatory startup work.
 
-The initial coding distribution is intended to provide scoped reads, search, patch application, and command execution. Workflow, context selection, storage, and frontend replacement retain explicit boundaries without allowing arbitrary mutation of runtime internals.
+The initial coding distribution provides scoped reads and approval-gated full-file writes. Search, patch application, and command execution remain pending. Workflow, context selection, storage, and frontend replacement retain explicit boundaries without allowing arbitrary mutation of runtime internals.
 
 **An extensible core does not make every enabled plugin free.** Optional integrations should initialize on demand; heavy dependencies should remain outside the minimal build. Native dynamic-library loading, WASM runtimes, and arbitrary lifecycle hooks are not initial-core goals.
 
@@ -148,12 +148,12 @@ Coverage is organized by protocol family rather than by a growing list of vendor
 
 | Protocol family | Intended integration |
 | --- | --- |
-| OpenAI Chat Completions-compatible | Compatible hosted services and local endpoints. |
+| OpenAI Chat Completions-compatible | Implemented with streaming over HTTP/HTTPS (local endpoints and hosted services). |
 | OpenAI Responses | Responses streaming, function calls, and continuation state. |
 | Anthropic Messages | Content blocks, streaming, and tool use/results. |
 | Gemini native APIs | Native content/function representations and continuation requirements. |
 
-These are **coverage targets, not verified integrations**. Each adapter must declare capabilities, preserve tool-call identity and required continuation data, and validate its compatibility. A configurable base URL alone does not establish support.
+The remaining rows are **coverage targets, not verified integrations**. Each adapter must declare capabilities, preserve tool-call identity and required continuation data, and validate its compatibility. A configurable base URL alone does not establish support.
 
 First-release authentication uses API profiles with external credential references. Existing relay services integrate as provider plugins; local relay execution is optional and on demand.
 
@@ -175,7 +175,7 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Draft architecture, performance, security, and interface contracts.
 - [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
 - [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
-- [x] Build a testable core/runtime and minimal frontend (test-only fakes; historical workspace checks passed on macOS and Linux with 137 tests recorded, pending re-verification).
+- [x] Build a testable core/runtime and minimal frontend (scripted fakes plus opt-in live providers and jailed file tools; last local verification: 1971 Rust tests passed / 0 failed across 142 targets, 253 Python harness tests passed with 1 platform skip; GitHub Actions runs the suite on Ubuntu and macOS).
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
 - [ ] Complete coding tools and mainstream model adapters (opt-in OpenAI-compatible streaming and file reads/writes are implemented; search, shell execution, and other provider protocols remain pending).
