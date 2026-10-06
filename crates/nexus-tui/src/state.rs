@@ -609,6 +609,12 @@ pub struct ApprovalGeometry {
     pub clipped: bool,
 }
 
+/// Model variant cycle, in order: the default (shown as nothing) plus the
+/// named tiers. Variants are presentation-only for now: they name the
+/// composer title and ride no request field until a provider needs one.
+pub const MODEL_VARIANTS: [&str; 7] =
+    ["", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 /// Bottom-anchored visible window over the conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibleView {
@@ -749,6 +755,8 @@ pub struct AppState {
     /// Model selected in the composer, shown in its title. `None` renders
     /// the bare title, so frames that never select a model are unaffected.
     active_model: Option<String>,
+    /// Index into [`MODEL_VARIANTS`] of the active model variant.
+    variant_index: usize,
     /// Provider of the selected model, shown beside it when known.
     active_provider: Option<String>,
     /// Agent modes available to the composer, in cycle order: the built-in
@@ -806,6 +814,7 @@ impl AppState {
             project_dir: None,
             session_label: None,
             active_model: None,
+            variant_index: 0,
             active_provider: None,
             modes: vec![AgentMode::plan(), AgentMode::build()],
             mode_index: 1,
@@ -855,6 +864,25 @@ impl AppState {
     #[must_use]
     pub fn active_provider(&self) -> Option<&str> {
         self.active_provider.as_deref()
+    }
+
+    /// Returns the active model variant id: empty for the default, which
+    /// the composer title hides.
+    #[must_use]
+    pub fn variant(&self) -> &str {
+        MODEL_VARIANTS
+            .get(self.variant_index)
+            .copied()
+            .unwrap_or(MODEL_VARIANTS[0])
+    }
+
+    /// Advances to the next model variant, wrapping around to the default.
+    /// Returns the newly active variant id.
+    pub fn cycle_variant(&mut self) -> String {
+        if !MODEL_VARIANTS.is_empty() {
+            self.variant_index = (self.variant_index + 1) % MODEL_VARIANTS.len();
+        }
+        self.variant().to_owned()
     }
 
     /// Installs the composer mode list (built-ins plus configuration
@@ -3936,6 +3964,17 @@ mod cov_state_private {
         state.begin_body_selection(1, 0);
         assert!(state.toggle_fold(0));
         assert_eq!(state.text_selection(), None, "folding clears");
+    }
+
+    #[test]
+    fn model_variant_defaults_empty_and_cycles_in_order() {
+        let mut state = AppState::new();
+        assert_eq!(state.variant(), "");
+        for expected in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(state.cycle_variant(), expected);
+        }
+        assert_eq!(state.cycle_variant(), "", "wraps back to the default");
+        assert_eq!(state.variant(), "");
     }
 
     #[test]

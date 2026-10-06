@@ -839,18 +839,32 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
     // The selected model rides in the title, after the fixed marker every
     // existing test pins; an unselected model renders the bare title. The
     // mode rides right after the marker so the switch is always labeled.
-    let mut title = format!(" composer (fixed) · {} ", state.mode().id);
+    // The mode marker rides first; the model follows with its variant in
+    // bright yellow inside normally-colored parens (`flash(max)`), hidden
+    // entirely for the default variant.
+    let mut title = vec![Span::raw(format!(
+        " composer (fixed) · {} ",
+        state.mode().id
+    ))];
     if let Some(model) = state.active_model() {
-        title.push_str(&format!("· {model}"));
-        if let Some(provider) = state.active_provider() {
-            title.push_str(&format!(" @ {provider}"));
+        title.push(Span::raw(format!("· {model}")));
+        if !state.variant().is_empty() {
+            title.push(Span::raw("("));
+            title.push(Span::styled(
+                state.variant().to_owned(),
+                Style::default().fg(Color::LightYellow),
+            ));
+            title.push(Span::raw(")"));
         }
-        title.push(' ');
+        if let Some(provider) = state.active_provider() {
+            title.push(Span::raw(format!(" @ {provider}")));
+        }
+        title.push(Span::raw(" "));
     }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
-        .title(title);
+        .title(Line::from(title));
     let inner = block.inner(area);
     block.render(area, buf);
     // An empty focused composer shows a dimmed invitation instead of a
@@ -2433,6 +2447,50 @@ mod cov_render_private {
         assert_eq!(
             abbreviate_home_with("/home/user/proj", Some("")),
             "/home/user/proj"
+        );
+    }
+
+    #[test]
+    fn composer_title_shows_the_variant_yellow_in_plain_parens() {
+        use ratatui::style::Color;
+        let mut state = AppState::new();
+        state.set_active_model(Some("flash".to_owned()), Some("deepseek".to_owned()));
+        // The default variant hides entirely.
+        let area = Rect::new(0, 0, 80, 3);
+        let mut bare = Buffer::empty(area);
+        render_composer(&state, area, &mut bare, Focus::Composer);
+        let flat: String = text_rows(&bare)[0].chars().collect();
+        assert!(flat.contains("flash @ deepseek"), "{flat:?}");
+        assert!(!flat.contains("flash("), "{flat:?}");
+
+        // A named variant renders `flash(max)` with a bright-yellow
+        // `max` inside normally-colored parens.
+        for _ in 0..6 {
+            state.cycle_variant();
+        }
+        assert_eq!(state.variant(), "max");
+        let mut named = Buffer::empty(area);
+        render_composer(&state, area, &mut named, Focus::Composer);
+        let row = &text_rows(&named)[0];
+        assert!(row.contains("flash(max) @ deepseek"), "{row:?}");
+        let fg_of = |symbol: &str| {
+            named
+                .content
+                .iter()
+                .find(|cell| cell.symbol() == symbol)
+                .map(|cell| cell.fg)
+        };
+        assert_eq!(
+            fg_of("("),
+            fg_of("f"),
+            "parens match the surrounding title text, never the variant"
+        );
+        assert!(
+            named
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "m" && cell.fg == Color::LightYellow),
+            "the variant renders bright yellow: {row:?}"
         );
     }
 

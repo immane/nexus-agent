@@ -114,6 +114,14 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::CycleMode,
         doc: "Composer | Tab | Cycle the agent mode",
     },
+    // Composer | Ctrl+T | Cycle the model variant
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::Char('t'),
+        modifiers: KeyModifiers::CONTROL,
+        intent: Action::CycleVariant,
+        doc: "Composer | Ctrl+T | Cycle the model variant",
+    },
     // Composer | Esc | Park focus in the viewport (never cancel)
     Row {
         focus: Focus::Composer,
@@ -263,6 +271,14 @@ const PUBLISHED_ROWS: &[Row] = &[
         modifiers: NONE,
         intent: Action::FocusSwitch,
         doc: "Viewport | Tab | Switch focus",
+    },
+    // Viewport | Ctrl+T | Cycle the model variant
+    Row {
+        focus: Focus::Viewport,
+        code: KeyCode::Char('t'),
+        modifiers: KeyModifiers::CONTROL,
+        intent: Action::CycleVariant,
+        doc: "Viewport | Ctrl+T | Cycle the model variant",
     },
     // Viewport | q | Quit (test-only convenience)
     Row {
@@ -433,6 +449,7 @@ const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
 /// list of focuses that may reach them.
 const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
     ("FocusSwitch", &[Focus::Viewport, Focus::ApprovalCard]),
+    ("CycleVariant", &[Focus::Composer, Focus::Viewport]),
     ("Cancel", &ALL_FOCUSES),
     ("Quit", &ALL_FOCUSES),
     ("ParkFocus", &ALL_FOCUSES),
@@ -483,13 +500,14 @@ const NAMED_CODES: &[KeyCode] = &[
 ];
 
 /// The modifier chords the published table documents: `Ctrl+C`, `Ctrl+D`,
-/// `Ctrl+J`, and `Alt+Enter`. Only these are swept, so the census compares
-/// documented chords against documented chords; chord *negatives* are
-/// `cov_keys_edges.rs`’s subject.
+/// `Ctrl+J`, `Ctrl+T`, and `Alt+Enter`. Only these are swept, so the census
+/// compares documented chords against documented chords; chord *negatives*
+/// are `cov_keys_edges.rs`’s subject.
 const DOCUMENTED_CHORDS: &[(KeyCode, KeyModifiers)] = &[
     (KeyCode::Char('c'), KeyModifiers::CONTROL),
     (KeyCode::Char('d'), KeyModifiers::CONTROL),
     (KeyCode::Char('j'), KeyModifiers::CONTROL),
+    (KeyCode::Char('t'), KeyModifiers::CONTROL),
     (KeyCode::Enter, KeyModifiers::ALT),
 ];
 
@@ -537,6 +555,7 @@ fn intent_family(intent: &Action) -> &'static str {
         Action::PageDown => "PageDown",
         Action::FoldToggle => "FoldToggle",
         Action::CycleModel => "CycleModel",
+        Action::CycleVariant => "CycleVariant",
         Action::ApproveOnce => "ApproveOnce",
         Action::Deny => "Deny",
         Action::InspectApproval => "InspectApproval",
@@ -561,6 +580,7 @@ fn all_intents() -> Vec<Action> {
         Action::PageDown,
         Action::FoldToggle,
         Action::CycleModel,
+        Action::CycleVariant,
         Action::ApproveOnce,
         Action::Deny,
         Action::InspectApproval,
@@ -688,12 +708,12 @@ fn every_published_row_maps_to_its_documented_intent() {
 
 #[test]
 fn published_table_has_no_duplicate_or_conflicting_rows() {
-    // 43 literal rows: 12 composer, 14 viewport, 11 approval, and the 6
+    // 45 literal rows: 13 composer, 15 viewport, 11 approval, and the 6
     // focus-expanded `Any` rows (`Ctrl+C` and `Ctrl+D` in each focus). The
-    // 44th published row is parameterized over printable characters.
+    // 46th published row is parameterized over printable characters.
     assert_eq!(
         PUBLISHED_ROWS.len(),
-        43,
+        45,
         "the transcription lost or invented a published row"
     );
     // The oracle is only meaningful if it is a function: no `(focus, key,
@@ -796,6 +816,7 @@ fn intents_are_partitioned_by_focus() {
                 "Backspace",
                 "Cancel",
                 "CycleMode",
+                "CycleVariant",
                 "FoldToggle",
                 "Newline",
                 "PageDown",
@@ -813,6 +834,7 @@ fn intents_are_partitioned_by_focus() {
             vec![
                 "Cancel",
                 "CycleModel",
+                "CycleVariant",
                 "FocusSwitch",
                 "FoldToggle",
                 "PageDown",

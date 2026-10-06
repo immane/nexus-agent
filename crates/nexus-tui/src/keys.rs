@@ -14,6 +14,8 @@
 //! | Composer | `Enter` | Submit the draft |
 //! | Composer | `Alt+Enter` or `Ctrl+J` | Multiline newline |
 //! | Composer | `Tab` | Cycle the agent mode (`plan`/`build`/customs) |
+//! | Composer | `Ctrl+T` | Cycle the model variant |
+//! | Viewport | `Ctrl+T` | Cycle the model variant |
 //! | Composer | `Esc` | Park focus in the viewport (never cancel) |
 //! | Composer | printable char | Type into the draft |
 //! | Composer | `Backspace` | Delete last draft char |
@@ -95,6 +97,10 @@ pub enum Action {
     /// Cycle the active configured model. Bound in the viewport only, so
     /// the composer keeps typing `m` as ordinary text.
     CycleModel,
+    /// Cycle the active model variant. Bound in the composer and the
+    /// viewport (plain `t` still types); never in the approval card, whose
+    /// keys decide.
+    CycleVariant,
     /// Allow the exact live approval once.
     ApproveOnce,
     /// Refuse the live approval without executing.
@@ -138,6 +144,9 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
             KeyCode::Char('c') => Some(Action::Cancel),
             KeyCode::Char('d') => Some(Action::Quit),
             KeyCode::Char('j') if focus == Focus::Composer => Some(Action::Newline),
+            KeyCode::Char('t') if focus == Focus::Composer || focus == Focus::Viewport => {
+                Some(Action::CycleVariant)
+            }
             _ => None,
         };
     }

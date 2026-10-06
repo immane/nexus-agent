@@ -317,9 +317,9 @@ fn composer_quit_shortcut_does_not_quit_from_the_composer() {
 
 #[test]
 fn control_combos_outside_the_table_map_to_none() {
-    // Only `Ctrl+c` (cancel), `Ctrl+d` (quit), and Composer `Ctrl+j`
-    // (newline) are bound, so every other control chord must be dropped
-    // rather than aliased onto one of them.
+    // Only `Ctrl+c` (cancel), `Ctrl+d` (quit), Composer `Ctrl+j`
+    // (newline), and `Ctrl+t` (variant) are bound, so every other control
+    // chord must be dropped rather than aliased onto one of them.
     let stray_controls = [
         control('a'),
         control('r'),
@@ -337,8 +337,12 @@ fn control_combos_outside_the_table_map_to_none() {
     ];
     for focus in ALL_FOCUSES {
         for event in stray_controls {
-            expect_none(focus, event, "Ctrl is only bound to c, d, and Composer j");
-            expect_no_escape_hatch(focus, event, "Ctrl is only bound to c, d, j");
+            expect_none(
+                focus,
+                event,
+                "Ctrl is only bound to c, d, Composer j, and t",
+            );
+            expect_no_escape_hatch(focus, event, "Ctrl is only bound to c, d, j, and t");
         }
     }
     // `Ctrl+J` (uppercase, i.e. a real held Ctrl) is not the newline binding;

@@ -1865,6 +1865,10 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             }
         }
         Action::CycleModel => front.cycle_model(),
+        Action::CycleVariant => {
+            // Display-only: the title names the new variant at once.
+            front.state.cycle_variant();
+        }
         Action::FoldToggle => {
             if front.state.selected().is_none() {
                 front.state.move_selection(-1);
@@ -3549,9 +3553,7 @@ mod cov_main_private {
 #[cfg(test)]
 mod cov_main_topup {
     use super::*;
-    use crossterm::event::{
-        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use nexus_core::{
         ApprovalId, AssistantText, CallId, PersistenceState, RunFinished, RunOutcome, TurnId,
     };
@@ -4242,6 +4244,21 @@ mod cov_main_topup {
             "the word is echoed for correction"
         );
         assert!(transcript(&front).contains("/help"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_t_cycles_the_model_variant_in_composer_and_viewport() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.focus = Focus::Composer;
+        assert_eq!(front.state.variant(), "");
+        let ctrl_t = || KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert!(!handle_key(&mut front, &runtime, ctrl_t()).await);
+        assert_eq!(front.state.variant(), "minimal");
+        front.focus = Focus::Viewport;
+        assert!(!handle_key(&mut front, &runtime, ctrl_t()).await);
+        assert_eq!(front.state.variant(), "low");
+        assert_eq!(front.request_counter, 0, "cycling issues no command");
     }
 
     #[tokio::test]
