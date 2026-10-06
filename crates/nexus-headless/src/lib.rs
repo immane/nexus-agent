@@ -85,7 +85,7 @@ pub const OUTPUT_REV: &str = "m0-test-0";
 pub const FAKE_BANNER: &str = "nexus-headless: FAKE TEST-ONLY wiring rev m0-test-0 (scripted FakeProvider + FakeTool, ephemeral, NO approval handler; confirmation-required calls are denied). This is never a real task run.";
 
 /// Usage hint for stderr diagnostics.
-pub const USAGE: &str = "usage: nexus-headless <task>; prefix with 'deny:' to exercise headless denial, 'refuse:' for refusal";
+pub const USAGE: &str = "usage: nexus-headless [--mode plan|build|<custom>] <task>; prefix with 'deny:' to exercise headless denial, 'refuse:' for refusal";
 
 /// Exit code for a stdout consumer that closed early (broken pipe). The
 /// report is incomplete by construction, so this is deliberately distinct
@@ -346,12 +346,63 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Agent mode for one headless invocation: a validated name plus the tool
+/// policy the runtime enforces. `plan`/`build` are built-in; custom names
+/// resolve through user configuration by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessMode {
+    /// Mode identity echoed in diagnostics (id charset only).
+    pub name: String,
+    /// True when confirmation-required tools must be denied without
+    /// prompting.
+    pub read_only: bool,
+}
+
+impl HeadlessMode {
+    /// Built-in full-capability mode (the default).
+    #[must_use]
+    pub fn build() -> Self {
+        Self {
+            name: "build".to_owned(),
+            read_only: false,
+        }
+    }
+
+    /// Built-in read-only planning mode.
+    #[must_use]
+    pub fn plan() -> Self {
+        Self {
+            name: "plan".to_owned(),
+            read_only: true,
+        }
+    }
+
+    /// Custom mode with an explicit policy bit.
+    #[must_use]
+    pub fn custom(name: impl Into<String>, read_only: bool) -> Self {
+        Self {
+            name: name.into(),
+            read_only,
+        }
+    }
+}
+
 /// Submits `task`, drains both event channels to the terminal outcome, and
 /// builds the stdout lines plus exit code. Invalid input returns
 /// [`HeadlessError::Usage`]; operational failures return
 /// [`HeadlessError::Operation`].
 pub fn run_task(task: &str) -> Result<HeadlessReport, HeadlessError> {
-    block_on_with_shutdown(run_task_async(task), SHUTDOWN_TIMEOUT)?
+    run_task_with_mode(task, &HeadlessMode::build())
+}
+
+/// [`run_task`] in an explicit agent mode. The mode's `read_only` bit rides
+/// the submit into the runtime, which denies confirmation-required tools
+/// without prompting; automatic reads still execute.
+pub fn run_task_with_mode(
+    task: &str,
+    mode: &HeadlessMode,
+) -> Result<HeadlessReport, HeadlessError> {
+    block_on_with_shutdown(run_task_async(task, mode), SHUTDOWN_TIMEOUT)?
 }
 
 /// Runs one future on a fresh current-thread runtime, then stops waiting for
@@ -552,7 +603,7 @@ fn build_runtime(
     .map_err(|error| HeadlessError::Operation(format!("runtime registration failed: {error}")))
 }
 
-async fn run_task_async(task: &str) -> Result<HeadlessReport, HeadlessError> {
+async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessReport, HeadlessError> {
     let limits = Limits::m0_test();
     let provider: Arc<dyn nexus_core::ProviderPort + Send + Sync> =
         Arc::new(FakeProvider::new(script_for(task)));
@@ -567,7 +618,8 @@ async fn run_task_async(task: &str) -> Result<HeadlessReport, HeadlessError> {
     )
     .map_err(|_| {
         HeadlessError::Usage("task input is empty or exceeds the input budget".to_owned())
-    })?;
+    })?
+    .with_read_only(mode.read_only);
     let started = Instant::now();
     let response = runtime.submit(submit).await;
     if response.reply() != CommandReply::Accepted {
@@ -1008,6 +1060,26 @@ mod tests {
         assert_eq!(report.outcome, RunOutcome::Refused);
         assert_eq!(report.exit_code, 1);
         assert_stdout_hygiene(&report.lines);
+    }
+
+    #[test]
+    fn plan_mode_reads_but_denies_confirmation_tools() {
+        // Automatic reads still execute under plan.
+        let read = run_task_with_mode("hello", &HeadlessMode::plan()).expect("plan reads");
+        assert_eq!(read.outcome, RunOutcome::Completed);
+        assert_eq!(read.tool_started, 1);
+        assert_eq!(read.denied_calls, 0);
+        assert_eq!(read.exit_code, 0);
+
+        // Confirmation-required writes are denied without prompting.
+        let denied =
+            run_task_with_mode("deny: write it", &HeadlessMode::plan()).expect("plan denies");
+        assert_eq!(denied.outcome, RunOutcome::Completed);
+        assert_eq!(denied.tool_started, 0, "denied calls never start");
+        assert_eq!(denied.approval_required, 0, "plan never prompts");
+        assert_eq!(denied.denied_calls, 1);
+        assert_eq!(denied.exit_code, 3);
+        assert_stdout_hygiene(&denied.lines);
     }
 
     #[test]

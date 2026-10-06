@@ -175,6 +175,12 @@ struct ActiveRun {
     session: SessionId,
     request: RequestId,
     profile: String,
+    /// True when confirmation-required tools must be denied without
+    /// prompting. Copied from [`SubmitCommand::read_only`]: the frontend
+    /// sets it from the resolved agent mode and the runtime enforces it at
+    /// tool dispatch, so a read-only run can never execute a write no
+    /// matter which frontend submitted it.
+    read_only: bool,
     started: StdInstant,
     deadline: StdInstant,
     token: CancellationToken,
@@ -536,6 +542,7 @@ impl Runtime {
             session: command.session.clone(),
             request: command.request.clone(),
             profile: command.profile.clone(),
+            read_only: command.read_only,
             started: now,
             deadline,
             token: CancellationToken::new(),
@@ -1290,6 +1297,23 @@ impl Runtime {
         let Some(queued) = active.queue.pop_front() else {
             return Ok(RunState::Preparing);
         };
+        if queued.needs_approval && active.read_only {
+            // Read-only runs never prompt and never execute: the denial is
+            // recorded exactly like the no-handler denial below, so no
+            // approval card is minted and no grant can exist to approve.
+            let call = queued.call.call().clone();
+            active.outcome_slot = Some((
+                call,
+                denied_outcome("confirmation required but the run is read-only"),
+            ));
+            active.current = Some(CurrentCall {
+                call: queued.call,
+                item_key: queued.item_key,
+                provider_ref: queued.provider_ref,
+                binding: None,
+            });
+            return Ok(RunState::RecordingResult);
+        }
         if queued.needs_approval && !self.shared.has_approval_handler {
             let call = queued.call.call().clone();
             active.outcome_slot = Some((
@@ -4010,6 +4034,7 @@ mod cov_runtime_private {
             session: SessionId::new("sess-cov-private").expect("valid session id"),
             request: RequestId::new("req-cov-private").expect("valid request id"),
             profile: "cov-profile".to_owned(),
+            read_only: false,
             started: StdInstant::now(),
             deadline: StdInstant::now() + Duration::from_secs(60),
             token: CancellationToken::new(),
@@ -4847,6 +4872,7 @@ mod cov_runtime_topup_private {
             session: session_id(),
             request: RequestId::new("req-cov-topup").expect("valid request id"),
             profile: "cov-profile".to_owned(),
+            read_only: false,
             started: now,
             deadline: now + Duration::from_secs(60),
             token: CancellationToken::new(),

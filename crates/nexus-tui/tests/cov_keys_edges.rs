@@ -119,7 +119,7 @@ fn expect_no_escape_hatch(focus: Focus, key: KeyEvent, why: &str) {
 fn expected_special(focus: Focus, code: KeyCode) -> Option<Action> {
     match (focus, code) {
         (Focus::Composer, KeyCode::Enter) => Some(Action::Submit),
-        (Focus::Composer, KeyCode::Tab) => Some(Action::FocusSwitch),
+        (Focus::Composer, KeyCode::Tab) => Some(Action::CycleMode),
         (Focus::Composer, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::Composer, KeyCode::Backspace) => Some(Action::Backspace),
         (Focus::Composer, KeyCode::Up) => Some(Action::ScrollUp),
@@ -688,18 +688,26 @@ fn focus_cycles_are_closed_with_and_without_a_pending_approval() {
 
 #[test]
 fn tab_cycling_respects_the_pending_gate_before_any_decision_key() {
-    // Without a pending decision, two Tab presses leave focus where it
-    // started, so `a` can only ever be draft text.
-    let mut focus = Focus::Composer;
-    for _ in 0..2 {
-        assert_eq!(map_key(focus, key(KeyCode::Tab)), Some(Action::FocusSwitch));
-        focus = next_focus(focus, false);
-    }
-    assert_eq!(focus, Focus::Composer);
+    // In the composer Tab cycles the agent mode and keeps focus, so `a`
+    // can only ever be draft text there.
     assert_eq!(
-        map_key(focus, key(KeyCode::Char('a'))),
+        map_key(Focus::Composer, key(KeyCode::Tab)),
+        Some(Action::CycleMode)
+    );
+    assert_eq!(
+        map_key(Focus::Composer, key(KeyCode::Char('a'))),
         Some(Action::Type('a'))
     );
+
+    // Outside the composer Tab still hands the keyboard over.
+    for focus in [Focus::Viewport, Focus::ApprovalCard] {
+        assert_eq!(map_key(focus, key(KeyCode::Tab)), Some(Action::FocusSwitch));
+        assert_ne!(
+            next_focus(focus, false),
+            focus,
+            "a focus switch from {focus:?} must change cards"
+        );
+    }
 
     // With a pending decision, the second Tab parks on the approval card,
     // and only there do the decision keys mean anything.

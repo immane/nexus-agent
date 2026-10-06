@@ -160,3 +160,39 @@ fn broken_stdout_pipe_exits_without_panic() {
         "closed consumer stays quiet: {stderr}"
     );
 }
+
+#[test]
+fn mode_flag_marks_the_invocation_and_gates_writes() {
+    let output = run_with(&["--mode", "plan", "deny: write it"]);
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("mode=plan"),
+        "the invocation names its mode: {stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is utf-8");
+    assert!(!stdout.contains("kind=tool-started"), "{stdout}");
+    assert!(!stdout.contains("kind=approval-required"), "{stdout}");
+    assert!(stdout.contains("status=denied"), "{stdout}");
+}
+
+#[test]
+fn default_invocation_runs_in_build_mode() {
+    let output = run_with(&["hello"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("mode=build"),
+        "the default mode is marked: {stderr}"
+    );
+}
+
+#[test]
+fn unknown_mode_and_missing_value_are_usage_errors() {
+    for args in [&["--mode", "nope", "hello"][..], &["--mode"][..]] {
+        let output = run_with(args);
+        assert_eq!(output.status.code(), Some(2), "args {args:?}");
+        let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+        assert!(stderr.contains("usage:"), "{stderr}");
+    }
+}

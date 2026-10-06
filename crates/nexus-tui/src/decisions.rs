@@ -79,16 +79,19 @@ pub fn cancel_command(request: RequestId, run: &RunId) -> Command {
     })
 }
 
-/// Builds the submission command for validated composer input.
+/// Builds the submission command for validated composer input. `read_only`
+/// comes from the frontend's resolved agent mode and is enforced by the
+/// runtime at tool dispatch.
 pub fn submit_command(
     request: RequestId,
     session: SessionId,
     input: &str,
     profile: &str,
+    read_only: bool,
 ) -> Result<Command, AgentError> {
-    Ok(Command::Submit(SubmitCommand::new(
-        request, session, input, profile,
-    )?))
+    Ok(Command::Submit(
+        SubmitCommand::new(request, session, input, profile)?.with_read_only(read_only),
+    ))
 }
 
 #[cfg(test)]
@@ -211,10 +214,10 @@ mod tests {
     #[test]
     fn submit_validates_input_at_the_boundary() {
         let session = SessionId::new("sess-1").expect("valid");
-        let command = submit_command(request(), session.clone(), "do it", "m0-test")
+        let command = submit_command(request(), session.clone(), "do it", "m0-test", false)
             .expect("valid submit builds");
         assert!(matches!(command, Command::Submit(_)));
-        assert!(submit_command(request(), session.clone(), "", "m0-test").is_err());
+        assert!(submit_command(request(), session.clone(), "", "m0-test", false).is_err());
     }
 }
 
@@ -307,7 +310,7 @@ mod cov_decisions_private {
             approve_notice_command;
         let deny_notice: fn(RequestId, &RunId, &ApprovalNotice) -> Command = deny_notice_command;
         let cancel: fn(RequestId, &RunId) -> Command = cancel_command;
-        let submit: fn(RequestId, SessionId, &str, &str) -> Result<Command, AgentError> =
+        let submit: fn(RequestId, SessionId, &str, &str, bool) -> Result<Command, AgentError> =
             submit_command;
 
         let live = card("run tool host_write");
@@ -333,7 +336,7 @@ mod cov_decisions_private {
             Command::Cancel(_)
         ));
         assert!(matches!(
-            submit(request(), session(), "do it", "m0-test"),
+            submit(request(), session(), "do it", "m0-test", false),
             Ok(Command::Submit(_))
         ));
     }
@@ -358,8 +361,8 @@ mod cov_decisions_private {
             );
         }
 
-        let submitted =
-            submit_command(request(), session(), "do it", "m0-test").expect("valid input builds");
+        let submitted = submit_command(request(), session(), "do it", "m0-test", false)
+            .expect("valid input builds");
         assert_eq!(submitted.request().as_str(), "req-1");
     }
 
@@ -369,8 +372,8 @@ mod cov_decisions_private {
         // snapshot, history-listing, or history-loading commands.
         let live = card("run tool host_write");
         let published = notice("run tool host_write");
-        let submitted =
-            submit_command(request(), session(), "do it", "m0-test").expect("valid input builds");
+        let submitted = submit_command(request(), session(), "do it", "m0-test", false)
+            .expect("valid input builds");
         let commands = [
             approve_command(request(), &run("run-1"), &live),
             deny_command(request(), &run("run-1"), &live),
@@ -491,7 +494,7 @@ mod cov_decisions_private {
     fn submit_refuses_with_a_static_error_instead_of_panicking() {
         // The composer path returns the boundary error to the caller; it never
         // panics and never interpolates the rejected content.
-        let error = submit_command(request(), session(), "", "m0-test")
+        let error = submit_command(request(), session(), "", "m0-test", false)
             .expect_err("empty input is refused");
         assert_eq!(error.category(), ErrorCategory::InvalidInput);
         assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
@@ -499,7 +502,7 @@ mod cov_decisions_private {
         assert!(error.correlation().is_empty());
         assert_eq!(error.to_string(), "[invalid-input] submit input is invalid");
 
-        let profile_error = submit_command(request(), session(), "do it", "")
+        let profile_error = submit_command(request(), session(), "do it", "", false)
             .expect_err("empty profile is refused");
         assert_eq!(profile_error.message(), "submit profile is invalid");
     }

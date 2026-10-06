@@ -10,6 +10,9 @@ nexus-core = { path = "../nexus-core" }
 nexus-runtime = { path = "../nexus-runtime" }
 # Deterministic scripted provider/tools; the only model/tool wiring in M0.
 nexus-fakes = { path = "../nexus-fakes" }
+# Typed user configuration, used ONLY to resolve custom `--mode` ids to
+# their tool policy. Built-in `plan`/`build` never touch the filesystem.
+nexus-config = { path = "../nexus-config" }
 # Minimal async features (same set as nexus-runtime): `rt` drives the loop,
 # `time` bounds the consume wait, `sync` is pulled in for channel types,
 # `macros` supplies `select!` for the two-channel consumer. No net/io/fs.

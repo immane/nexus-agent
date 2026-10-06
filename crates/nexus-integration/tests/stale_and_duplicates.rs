@@ -224,6 +224,7 @@ fn tui_decisions_preserve_exact_approval_identity() {
             session,
             "do work",
             "m0-test",
+            false,
         )
         .expect("valid submit builds");
         assert!(
@@ -232,6 +233,7 @@ fn tui_decisions_preserve_exact_approval_identity() {
                 SessionId::new("sess-1").expect("valid"),
                 "",
                 "m0-test",
+                false,
             )
             .is_err()
         );

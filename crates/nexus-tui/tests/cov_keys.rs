@@ -106,13 +106,13 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::Newline,
         doc: "Composer | Ctrl+J | Multiline newline",
     },
-    // Composer | Tab | Switch focus
+    // Composer | Tab | Cycle the agent mode
     Row {
         focus: Focus::Composer,
         code: KeyCode::Tab,
         modifiers: NONE,
-        intent: Action::FocusSwitch,
-        doc: "Composer | Tab | Switch focus",
+        intent: Action::CycleMode,
+        doc: "Composer | Tab | Cycle the agent mode",
     },
     // Composer | Esc | Park focus in the viewport (never cancel)
     Row {
@@ -420,6 +420,7 @@ const PUBLISHED_ROWS: &[Row] = &[
 const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
     ("Submit", Focus::Composer),
     ("Newline", Focus::Composer),
+    ("CycleMode", Focus::Composer),
     ("Type", Focus::Composer),
     ("Backspace", Focus::Composer),
     ("CycleModel", Focus::Viewport),
@@ -431,7 +432,7 @@ const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
 /// The intents the published table shares between focuses, with the complete
 /// list of focuses that may reach them.
 const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
-    ("FocusSwitch", &ALL_FOCUSES),
+    ("FocusSwitch", &[Focus::Viewport, Focus::ApprovalCard]),
     ("Cancel", &ALL_FOCUSES),
     ("Quit", &ALL_FOCUSES),
     ("ParkFocus", &ALL_FOCUSES),
@@ -528,6 +529,7 @@ fn intent_family(intent: &Action) -> &'static str {
         Action::Submit => "Submit",
         Action::Newline => "Newline",
         Action::FocusSwitch => "FocusSwitch",
+        Action::CycleMode => "CycleMode",
         Action::ParkFocus => "ParkFocus",
         Action::ScrollUp => "ScrollUp",
         Action::ScrollDown => "ScrollDown",
@@ -551,6 +553,7 @@ fn all_intents() -> Vec<Action> {
         Action::Submit,
         Action::Newline,
         Action::FocusSwitch,
+        Action::CycleMode,
         Action::ParkFocus,
         Action::ScrollUp,
         Action::ScrollDown,
@@ -792,7 +795,7 @@ fn intents_are_partitioned_by_focus() {
             vec![
                 "Backspace",
                 "Cancel",
-                "FocusSwitch",
+                "CycleMode",
                 "FoldToggle",
                 "Newline",
                 "PageDown",
@@ -1010,7 +1013,7 @@ fn the_composer_line_keys_are_three_distinct_events() {
     // parameterized over characters only.
     for (code, expected) in [
         (KeyCode::Enter, Action::Submit),
-        (KeyCode::Tab, Action::FocusSwitch),
+        (KeyCode::Tab, Action::CycleMode),
         (KeyCode::Esc, Action::ParkFocus),
         (KeyCode::Backspace, Action::Backspace),
     ] {
@@ -1094,9 +1097,15 @@ fn approval_rows_answer_only_under_the_approval_card_and_never_alias() {
 
 #[test]
 fn the_tab_row_hands_the_keyboard_on_and_parking_never_re_arms_the_card() {
-    // Every focus's `Tab` row is `FocusSwitch`, and following it always lands
-    // the keyboard on a different card.
-    for focus in ALL_FOCUSES {
+    // Outside the composer `Tab` is `FocusSwitch`, and following it always
+    // lands the keyboard on a different card. In the composer `Tab` cycles
+    // the agent mode instead, where it gates the next submit.
+    assert_eq!(
+        map_key(Focus::Composer, KeyEvent::new(KeyCode::Tab, NONE)),
+        Some(Action::CycleMode),
+        "Tab is the mode row in the composer"
+    );
+    for focus in [Focus::Viewport, Focus::ApprovalCard] {
         assert_eq!(
             map_key(focus, KeyEvent::new(KeyCode::Tab, NONE)),
             Some(Action::FocusSwitch),
@@ -1144,7 +1153,7 @@ fn a_scripted_session_maps_row_for_row() {
             Some(String::from("Type")),
             Some(String::from("Submit")),
             Some(String::from("Newline")),
-            Some(String::from("FocusSwitch")),
+            Some(String::from("CycleMode")),
             Some(String::from("ScrollDown")),
             Some(String::from("PageDown")),
             Some(String::from("FoldToggle")),

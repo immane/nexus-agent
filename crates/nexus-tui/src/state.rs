@@ -23,6 +23,8 @@ use nexus_core::{CallId, EventPayload, Limits, RunEvent, RunId, RunOutcome, Turn
 use crate::sanitize::{is_bidi_format, sanitize, sanitize_approval};
 use crate::{markdown, markdown::StyledRun};
 
+use nexus_config::{AgentMode, MODE_BUILD};
+
 /// Presentation entry cap, tracking the M0-test retained-context budget
 /// (lock section 1: 128 retained context items). Older entries are dropped
 /// from presentation only; accepted conversation records are unaffected.
@@ -655,6 +657,13 @@ pub struct AppState {
     active_model: Option<String>,
     /// Provider of the selected model, shown beside it when known.
     active_provider: Option<String>,
+    /// Agent modes available to the composer, in cycle order: the built-in
+    /// `plan` and `build` first, then custom modes from configuration.
+    /// `Tab` in the composer cycles this list; the active mode names the
+    /// composer border and gates the next submit's tool policy.
+    modes: Vec<AgentMode>,
+    /// Index into [`AppState::modes`] of the active mode.
+    mode_index: usize,
     /// Latest usage counters observed on the live run. Cleared by the next
     /// `RunStarted` so a new run never wears the previous run's numbers.
     last_usage: Option<Usage>,
@@ -701,6 +710,8 @@ impl AppState {
             session_label: None,
             active_model: None,
             active_provider: None,
+            modes: vec![AgentMode::plan(), AgentMode::build()],
+            mode_index: 1,
             last_usage: None,
         }
     }
@@ -747,6 +758,36 @@ impl AppState {
     #[must_use]
     pub fn active_provider(&self) -> Option<&str> {
         self.active_provider.as_deref()
+    }
+
+    /// Installs the composer mode list (built-ins plus configuration
+    /// customs) and selects `default_id`, falling back to `build` and then
+    /// to the first mode so an unconfigured or dangling default can never
+    /// leave the composer modeless.
+    pub fn set_modes(&mut self, modes: Vec<AgentMode>, default_id: Option<&str>) {
+        self.modes = modes;
+        if self.modes.is_empty() {
+            self.modes = vec![AgentMode::plan(), AgentMode::build()];
+        }
+        self.mode_index = default_id
+            .and_then(|id| self.modes.iter().position(|mode| mode.id == id))
+            .or_else(|| self.modes.iter().position(|mode| mode.id == MODE_BUILD))
+            .unwrap_or(0);
+    }
+
+    /// Returns the active composer mode.
+    #[must_use]
+    pub fn mode(&self) -> &AgentMode {
+        self.modes.get(self.mode_index).unwrap_or(&self.modes[0])
+    }
+
+    /// Advances the composer to the next mode, wrapping around. Returns the
+    /// newly active mode id for notices and tests.
+    pub fn cycle_mode(&mut self) -> String {
+        if !self.modes.is_empty() {
+            self.mode_index = (self.mode_index + 1) % self.modes.len();
+        }
+        self.mode().id.clone()
     }
 
     /// Returns the latest usage counters observed on the live run.
@@ -3441,5 +3482,44 @@ mod cov_state_private {
         assert_eq!(state.project_dir(), None);
         state.set_project_dir("/Volumes/work/proj");
         assert_eq!(state.project_dir(), Some("/Volumes/work/proj"));
+    }
+
+    #[test]
+    fn composer_modes_default_to_build_and_cycle_in_order() {
+        let mut state = AppState::new();
+        assert_eq!(state.mode().id, "build");
+        assert!(!state.mode().read_only);
+        assert_eq!(state.cycle_mode(), "plan");
+        assert!(state.mode().read_only);
+        assert_eq!(state.cycle_mode(), "build");
+        assert!(!state.mode().read_only);
+    }
+
+    #[test]
+    fn composer_modes_follow_configuration_and_fall_back_safely() {
+        use nexus_config::AgentMode;
+
+        let mut state = AppState::new();
+        state.set_modes(
+            vec![
+                AgentMode::plan(),
+                AgentMode::build(),
+                AgentMode::custom("review", "Review", true).expect("valid mode"),
+            ],
+            Some("review"),
+        );
+        assert_eq!(state.mode().id, "review");
+        assert_eq!(state.cycle_mode(), "plan");
+        assert_eq!(state.cycle_mode(), "build");
+        assert_eq!(state.cycle_mode(), "review");
+
+        // A dangling default falls back to build, never to nothing.
+        state.set_modes(vec![AgentMode::plan(), AgentMode::build()], Some("missing"));
+        assert_eq!(state.mode().id, "build");
+
+        // An empty install resets to the built-ins.
+        state.set_modes(Vec::new(), None);
+        assert_eq!(state.mode().id, "build");
+        assert_eq!(state.cycle_mode(), "plan");
     }
 }

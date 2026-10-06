@@ -76,6 +76,7 @@ fn submit(input: &str, profile: &str) -> SubmitCommand {
         session: session(),
         input: input.to_owned(),
         profile: profile.to_owned(),
+        read_only: false,
     }
 }
 

@@ -214,6 +214,7 @@ dependencies = [
 name = "nexus-headless"
 version = "0.1.0"
 dependencies = [
+ "nexus-config",
  "nexus-core",
  "nexus-fakes",
  "nexus-runtime",

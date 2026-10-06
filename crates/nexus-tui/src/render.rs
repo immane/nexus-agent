@@ -645,14 +645,22 @@ fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
+    // The composer border names the active agent mode: read-only modes
+    // (plan and read-only customs) render amber, full-capability modes keep
+    // the focused green. Unfocused keeps the plain border as before.
     let style = if focus == Focus::Composer {
-        Style::default().fg(Color::Green)
+        if state.mode().read_only {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green)
+        }
     } else {
         Style::default()
     };
     // The selected model rides in the title, after the fixed marker every
-    // existing test pins; an unselected model renders the bare title.
-    let mut title = String::from(" composer (fixed) ");
+    // existing test pins; an unselected model renders the bare title. The
+    // mode rides right after the marker so the switch is always labeled.
+    let mut title = format!(" composer (fixed) · {} ", state.mode().id);
     if let Some(model) = state.active_model() {
         title.push_str(&format!("· {model}"));
         if let Some(provider) = state.active_provider() {
@@ -705,7 +713,7 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         Span::raw(" m0-test "),
         Span::styled(cancel_hint, Style::default().fg(Color::Yellow)),
         Span::styled(approval_hint, Style::default().fg(Color::Yellow)),
-        Span::raw(" tab focus · enter submit · ↕ · m model · fold · approval i/a/d · ctrl+d quit "),
+        Span::raw(" tab mode · enter submit · ↕ · m model · fold · approval i/a/d · ctrl+d quit "),
         Span::raw(
             format!(
                 "focus:{focus:?} stale:{} seq:{} dropped:{}",
@@ -2161,7 +2169,7 @@ mod cov_render_private {
         render_composer(&state, area, &mut bare, Focus::Composer);
         let rows = text_rows(&bare);
         assert!(rows[0].contains("composer (fixed)"), "{rows:?}");
-        assert!(!rows[0].contains('·'), "{rows:?}");
+        assert!(rows[0].contains("· build"), "the default mode is labeled");
 
         state.set_active_model(Some("demo".to_owned()), Some("acme".to_owned()));
         let mut named = Buffer::empty(area);
@@ -2176,6 +2184,31 @@ mod cov_render_private {
         render_composer(&state, area, &mut model_only, Focus::Composer);
         let rows = text_rows(&model_only);
         assert!(rows[0].contains("demo"), "{rows:?}");
+    }
+
+    #[test]
+    fn composer_border_names_the_mode_and_marks_read_only() {
+        use ratatui::style::Color;
+
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 40, 3);
+        // Build is the default: green border, labeled title.
+        let mut build = Buffer::empty(area);
+        render_composer(&state, area, &mut build, Focus::Composer);
+        assert_eq!(build.get(0, 0).fg, Color::Green);
+        assert!(text_rows(&build)[0].contains("· build"));
+
+        // Plan is read-only: amber border, labeled title.
+        assert_eq!(state.cycle_mode(), "plan");
+        let mut plan = Buffer::empty(area);
+        render_composer(&state, area, &mut plan, Focus::Composer);
+        assert_eq!(plan.get(0, 0).fg, Color::Yellow);
+        assert!(text_rows(&plan)[0].contains("· plan"));
+
+        // Unfocused keeps the plain border whatever the mode.
+        let mut parked = Buffer::empty(area);
+        render_composer(&state, area, &mut parked, Focus::Viewport);
+        assert_eq!(parked.get(0, 0).fg, Color::Reset);
     }
 
     #[test]

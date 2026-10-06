@@ -372,3 +372,74 @@ fn error_display_is_static_and_total() {
     let boxed: Box<dyn std::error::Error> = Box::new(error);
     assert!(boxed.source().is_none());
 }
+
+#[test]
+fn builtin_modes_resolve_without_configuration() {
+    use nexus_config::{AgentMode, MODE_BUILD, MODE_PLAN};
+
+    let config = UserConfig::default_config();
+    assert!(config.modes().is_empty());
+    assert_eq!(config.default_mode(), None);
+    let plan = config.resolve_mode(MODE_PLAN).expect("plan resolves");
+    assert_eq!(plan, AgentMode::plan());
+    assert!(plan.read_only);
+    let build = config.resolve_mode(MODE_BUILD).expect("build resolves");
+    assert_eq!(build, AgentMode::build());
+    assert!(!build.read_only);
+    assert_eq!(config.startup_mode(), AgentMode::build());
+    assert_eq!(config.resolve_mode("nope"), None);
+}
+
+#[test]
+fn custom_modes_admit_resolve_and_round_trip() {
+    use nexus_config::AgentMode;
+
+    let mut config = UserConfig::default_config();
+    config
+        .add_mode(AgentMode::custom("review", "Review", true).expect("valid mode"))
+        .expect("mode admits");
+    config.set_default_mode("review").expect("default admits");
+    assert_eq!(config.startup_mode().id, "review");
+    assert!(config.startup_mode().read_only);
+
+    let text = config.to_json();
+    let reloaded = UserConfig::from_json(&text).expect("modes round-trip");
+    assert_eq!(reloaded, config);
+
+    // Documents without modes still load and keep the old shape.
+    let legacy = UserConfig::from_json(
+        r#"{"revision":1,"providers":[],"models":[],"favourites":[],"recent":[]}"#,
+    )
+    .expect("legacy loads");
+    assert_eq!(legacy, UserConfig::default_config());
+    assert!(!legacy.to_json().contains("modes"));
+}
+
+#[test]
+fn mode_admission_is_closed_and_explicit() {
+    use nexus_config::AgentMode;
+
+    let mut config = UserConfig::default_config();
+    assert!(AgentMode::custom("plan", "Shadow", false).is_err());
+    assert!(AgentMode::custom("build", "Shadow", false).is_err());
+    assert!(AgentMode::custom("bad id!", "X", false).is_err());
+    assert!(AgentMode::custom("ok", "", false).is_err());
+    config
+        .add_mode(AgentMode::custom("review", "Review", true).expect("valid"))
+        .expect("admits");
+    assert!(
+        config
+            .add_mode(AgentMode::custom("review", "Again", false).expect("valid"))
+            .is_err(),
+        "duplicate custom ids are rejected"
+    );
+    assert!(config.set_default_mode("missing").is_err());
+    assert!(UserConfig::from_json(
+        r#"{"revision":1,"providers":[],"models":[],"favourites":[],"recent":[],"modes":[{"id":"plan","label":"Shadow","read_only":false}]}"#,
+    )
+    .is_err());
+    assert!(UserConfig::from_json(
+        r#"{"revision":1,"providers":[],"models":[],"favourites":[],"recent":[],"default_mode":"missing"}"#,
+    )
+    .is_err());
+}

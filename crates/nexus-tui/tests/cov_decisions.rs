@@ -133,7 +133,7 @@ fn crate_root_reexports_alias_the_decision_builders() {
     let _: fn(RequestId, &RunId, &PendingApprovalCard) -> Command = nexus_tui::approve_command;
     let _: fn(RequestId, &RunId, &PendingApprovalCard) -> Command = nexus_tui::deny_command;
     let _: fn(RequestId, &RunId) -> Command = nexus_tui::cancel_command;
-    let _: fn(RequestId, SessionId, &str, &str) -> Result<Command, AgentError> =
+    let _: fn(RequestId, SessionId, &str, &str, bool) -> Result<Command, AgentError> =
         nexus_tui::submit_command;
 
     let module_approve: fn(RequestId, &RunId, &PendingApprovalCard) -> Command =
@@ -145,9 +145,9 @@ fn crate_root_reexports_alias_the_decision_builders() {
     let root_deny: fn(RequestId, &RunId, &PendingApprovalCard) -> Command = nexus_tui::deny_command;
     let module_cancel: fn(RequestId, &RunId) -> Command = nexus_tui::decisions::cancel_command;
     let root_cancel: fn(RequestId, &RunId) -> Command = nexus_tui::cancel_command;
-    let module_submit: fn(RequestId, SessionId, &str, &str) -> Result<Command, AgentError> =
+    let module_submit: fn(RequestId, SessionId, &str, &str, bool) -> Result<Command, AgentError> =
         nexus_tui::decisions::submit_command;
-    let root_submit: fn(RequestId, SessionId, &str, &str) -> Result<Command, AgentError> =
+    let root_submit: fn(RequestId, SessionId, &str, &str, bool) -> Result<Command, AgentError> =
         nexus_tui::submit_command;
 
     assert!(
@@ -524,8 +524,14 @@ fn cancel_carries_no_approval_identity() {
 
 #[test]
 fn submit_binds_the_exact_validated_input() {
-    let command = submit_command(request("req-1"), session("sess-1"), "do it", "m0-test")
-        .expect("valid submit builds");
+    let command = submit_command(
+        request("req-1"),
+        session("sess-1"),
+        "do it",
+        "m0-test",
+        false,
+    )
+    .expect("valid submit builds");
 
     assert_eq!(
         command,
@@ -534,9 +540,30 @@ fn submit_binds_the_exact_validated_input() {
             session: session("sess-1"),
             input: "do it".to_owned(),
             profile: "m0-test".to_owned(),
+            read_only: false,
         })
     );
     assert_eq!(command.request().as_str(), "req-1");
+
+    // The read-only flag rides the builder into the submitted command.
+    let planned = submit_command(
+        request("req-2"),
+        session("sess-1"),
+        "do it",
+        "m0-test",
+        true,
+    )
+    .expect("valid submit builds");
+    assert!(
+        matches!(
+            planned,
+            Command::Submit(SubmitCommand {
+                read_only: true,
+                ..
+            })
+        ),
+        "plan mode submits read-only"
+    );
 }
 
 #[test]
@@ -547,15 +574,28 @@ fn submit_input_bounds_are_exact() {
     let profile_over_limit = "p".repeat(MAX_SUMMARY_BYTES + 1);
 
     assert!(
-        submit_command(request("req-1"), session("sess-1"), &at_limit, "m0-test").is_ok(),
+        submit_command(
+            request("req-1"),
+            session("sess-1"),
+            &at_limit,
+            "m0-test",
+            false
+        )
+        .is_ok(),
         "exactly MAX_INPUT_BYTES is accepted"
     );
-    let error = submit_command(request("req-1"), session("sess-1"), &over_limit, "m0-test")
-        .expect_err("MAX_INPUT_BYTES + 1 is rejected");
+    let error = submit_command(
+        request("req-1"),
+        session("sess-1"),
+        &over_limit,
+        "m0-test",
+        false,
+    )
+    .expect_err("MAX_INPUT_BYTES + 1 is rejected");
     assert_static_invalid_input(error, "submit input is invalid");
 
     assert!(
-        submit_command(request("req-1"), session("sess-1"), " ", "m0-test").is_ok(),
+        submit_command(request("req-1"), session("sess-1"), " ", "m0-test", false).is_ok(),
         "whitespace is non-empty input; emptiness alone is rejected"
     );
     assert!(
@@ -563,7 +603,8 @@ fn submit_input_bounds_are_exact() {
             request("req-1"),
             session("sess-1"),
             "do it",
-            &profile_at_limit
+            &profile_at_limit,
+            false
         )
         .is_ok(),
         "exactly MAX_SUMMARY_BYTES is accepted for the profile"
@@ -573,17 +614,18 @@ fn submit_input_bounds_are_exact() {
         session("sess-1"),
         "do it",
         &profile_over_limit,
+        false,
     )
     .expect_err("MAX_SUMMARY_BYTES + 1 is rejected");
     assert_static_invalid_input(error, "submit profile is invalid");
-    let error = submit_command(request("req-1"), session("sess-1"), "do it", "")
+    let error = submit_command(request("req-1"), session("sess-1"), "do it", "", false)
         .expect_err("empty profile");
     assert_static_invalid_input(error, "submit profile is invalid");
 }
 
 #[test]
 fn submit_rejects_empty_input_without_echoing_it() {
-    let error = submit_command(request("req-1"), session("sess-1"), "", "m0-test")
+    let error = submit_command(request("req-1"), session("sess-1"), "", "m0-test", false)
         .expect_err("empty input is rejected");
     assert_static_invalid_input(error, "submit input is invalid");
 
@@ -592,8 +634,14 @@ fn submit_rejects_empty_input_without_echoing_it() {
     let secret = "do it PASSWORD=hunter2 run-9 a9-9";
     let filler = "y".repeat(MAX_INPUT_BYTES);
     let rejected = format!("{secret}{filler}");
-    let error = submit_command(request("req-1"), session("sess-1"), &rejected, "m0-test")
-        .expect_err("oversized input is rejected");
+    let error = submit_command(
+        request("req-1"),
+        session("sess-1"),
+        &rejected,
+        "m0-test",
+        false,
+    )
+    .expect_err("oversized input is rejected");
     let rendered = error.to_string();
     assert_static_invalid_input(error, "submit input is invalid");
     for text in ["hunter2", "PASSWORD", "run-9", "a9-9", secret] {
@@ -609,11 +657,17 @@ fn submit_rejects_empty_input_without_echoing_it() {
 fn a_rejected_submit_is_side_effect_free() {
     // The host owns request identity, so a refusal must not consume it: the
     // same request id still builds a command for a valid input.
-    let refused = submit_command(request("req-7"), session("sess-7"), "", "m0-test");
+    let refused = submit_command(request("req-7"), session("sess-7"), "", "m0-test", false);
     assert!(refused.is_err());
 
-    let accepted =
-        submit_command(request("req-7"), session("sess-7"), "retry", "m0-test").expect("valid");
+    let accepted = submit_command(
+        request("req-7"),
+        session("sess-7"),
+        "retry",
+        "m0-test",
+        false,
+    )
+    .expect("valid");
     let Command::Submit(submit) = &accepted else {
         panic!("submit must emit Command::Submit");
     };

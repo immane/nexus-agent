@@ -30,6 +30,16 @@ pub const MAX_MODEL_NAME_LEN: usize = 128;
 pub const MAX_ENDPOINT_LEN: usize = 512;
 /// Maximum environment-variable name length in bytes.
 pub const MAX_ENV_VAR_LEN: usize = 64;
+/// Maximum agent modes in one document (built-ins excluded from the count).
+pub const MAX_MODES: usize = 16;
+/// Maximum agent-mode label length in bytes.
+pub const MAX_MODE_LABEL_LEN: usize = 64;
+
+/// Built-in read-only mode id: research and planning, never executes
+/// confirmation-required tools.
+pub const MODE_PLAN: &str = "plan";
+/// Built-in full-capability mode id: the default when no default is set.
+pub const MODE_BUILD: &str = "build";
 
 /// Returns true for the lock identifier charset: ASCII letters, digits,
 /// `-`, and `_`. Empty text is rejected by the length check first.
@@ -56,6 +66,9 @@ fn field_message(field: &str) -> &'static str {
     match field {
         "provider id" => "provider id is invalid",
         "model id" => "model id is invalid",
+        "mode id" => "mode id is invalid",
+        "mode label" => "mode label is invalid",
+        "default mode" => "default mode is invalid",
         "display name" => "display name is invalid",
         "adapter" => "adapter kind is invalid",
         "endpoint" => "endpoint is invalid",
@@ -247,6 +260,72 @@ impl ModelEntry {
     }
 }
 
+/// Agent interaction mode: an identity plus its tool policy. The built-ins
+/// are `plan` (read-only) and `build` (full capability); further modes may
+/// be defined in configuration. `read_only` is enforced by the runtime at
+/// tool dispatch: a read-only run executes automatic tools but denies
+/// confirmation-required calls without prompting. The mode identity itself
+/// is display metadata carried by frontends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMode {
+    /// Unique mode identity (built-ins `plan`/`build` or a custom id).
+    pub id: String,
+    /// Human-readable label shown in the composer and CLI.
+    pub label: String,
+    /// True when the runtime must deny confirmation-required tools.
+    pub read_only: bool,
+}
+
+impl AgentMode {
+    /// Built-in read-only planning mode.
+    #[must_use]
+    pub fn plan() -> Self {
+        Self {
+            id: MODE_PLAN.to_owned(),
+            label: "Plan".to_owned(),
+            read_only: true,
+        }
+    }
+
+    /// Built-in full-capability build mode.
+    #[must_use]
+    pub fn build() -> Self {
+        Self {
+            id: MODE_BUILD.to_owned(),
+            label: "Build".to_owned(),
+            read_only: false,
+        }
+    }
+
+    /// Builds a validated custom mode. Built-in ids are rejected so custom
+    /// definitions can never shadow or redefine them.
+    pub fn custom(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        read_only: bool,
+    ) -> Result<Self, ConfigError> {
+        let mode = Self {
+            id: id.into(),
+            label: label.into(),
+            read_only,
+        };
+        mode.validate()?;
+        if mode.id == MODE_PLAN || mode.id == MODE_BUILD {
+            return Err(invalid("mode id is invalid"));
+        }
+        Ok(mode)
+    }
+
+    /// Validates identifier shape and the label bound.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        check_id("mode id", &self.id)?;
+        if self.label.is_empty() || self.label.len() > MAX_MODE_LABEL_LEN {
+            return Err(invalid("mode label is invalid"));
+        }
+        Ok(())
+    }
+}
+
 /// Whole user configuration document: providers, models, favourites, and
 /// most-recent-first usage. Cross-references must resolve; removals that
 /// would dangle a reference fail instead of cascading.
@@ -256,6 +335,8 @@ pub struct UserConfig {
     models: Vec<ModelEntry>,
     favourites: Vec<String>,
     recent: Vec<String>,
+    modes: Vec<AgentMode>,
+    default_mode: Option<String>,
 }
 
 impl UserConfig {
@@ -268,6 +349,8 @@ impl UserConfig {
             models: Vec::new(),
             favourites: Vec::new(),
             recent: Vec::new(),
+            modes: Vec::new(),
+            default_mode: None,
         }
     }
 
@@ -293,6 +376,67 @@ impl UserConfig {
     #[must_use]
     pub fn recent(&self) -> &[String] {
         &self.recent
+    }
+
+    /// Returns custom mode definitions in admission order. The built-in
+    /// `plan` and `build` modes always exist and are never listed here.
+    #[must_use]
+    pub fn modes(&self) -> &[AgentMode] {
+        &self.modes
+    }
+
+    /// Returns the configured default mode id, if any. `None` means the
+    /// built-in `build` mode.
+    #[must_use]
+    pub fn default_mode(&self) -> Option<&str> {
+        self.default_mode.as_deref()
+    }
+
+    /// Resolves a mode id to its definition: built-ins first, then custom
+    /// modes. Unknown ids return `None` instead of falling back silently.
+    #[must_use]
+    pub fn resolve_mode(&self, id: &str) -> Option<AgentMode> {
+        match id {
+            MODE_PLAN => Some(AgentMode::plan()),
+            MODE_BUILD => Some(AgentMode::build()),
+            _ => self.modes.iter().find(|mode| mode.id == id).cloned(),
+        }
+    }
+
+    /// Effective startup mode: the configured default when it resolves,
+    /// otherwise the built-in `build` mode.
+    #[must_use]
+    pub fn startup_mode(&self) -> AgentMode {
+        self.default_mode
+            .as_deref()
+            .and_then(|id| self.resolve_mode(id))
+            .unwrap_or_else(AgentMode::build)
+    }
+
+    /// Admits a custom mode: unique id, bounded count, never a built-in id.
+    pub fn add_mode(&mut self, mode: AgentMode) -> Result<(), ConfigError> {
+        mode.validate()?;
+        if mode.id == MODE_PLAN || mode.id == MODE_BUILD {
+            return Err(invalid("mode id is invalid"));
+        }
+        if self.modes.iter().any(|existing| existing.id == mode.id) {
+            return Err(invalid("mode id is already registered"));
+        }
+        if self.modes.len() >= MAX_MODES {
+            return Err(invalid("mode list is full"));
+        }
+        self.modes.push(mode);
+        Ok(())
+    }
+
+    /// Sets the default mode. The id must resolve (built-in or admitted
+    /// custom) so startup can never select a missing mode.
+    pub fn set_default_mode(&mut self, id: &str) -> Result<(), ConfigError> {
+        if self.resolve_mode(id).is_none() {
+            return Err(invalid("default mode is invalid"));
+        }
+        self.default_mode = Some(id.to_owned());
+        Ok(())
     }
 
     /// Finds a provider by id.
@@ -439,6 +583,20 @@ impl UserConfig {
                     .collect(),
             ),
         );
+        // Custom modes and the default are omitted when unset so documents
+        // without them round-trip byte-identically to before.
+        if !self.modes.is_empty() {
+            document.insert(
+                "modes".to_owned(),
+                Value::Array(self.modes.iter().map(mode_json).collect()),
+            );
+        }
+        if let Some(default_mode) = &self.default_mode {
+            document.insert(
+                "default_mode".to_owned(),
+                Value::String(default_mode.clone()),
+            );
+        }
         Value::Object(document).to_string()
     }
 
@@ -451,7 +609,15 @@ impl UserConfig {
             .ok_or(invalid("configuration is invalid"))?;
         reject_unknown(
             document,
-            &["revision", "providers", "models", "favourites", "recent"],
+            &[
+                "revision",
+                "providers",
+                "models",
+                "favourites",
+                "recent",
+                "modes",
+                "default_mode",
+            ],
         )?;
         let revision = document
             .get("revision")
@@ -476,6 +642,29 @@ impl UserConfig {
             // through the same admission as live use so the order
             // round-trips exactly.
             config.record_use(id)?;
+        }
+        // Custom modes admit before the default so the default resolves
+        // through the same path as live configuration.
+        if let Some(modes) = document.get("modes") {
+            let modes = modes
+                .as_array()
+                .ok_or(invalid("configuration field is invalid"))?;
+            if modes.len() > MAX_MODES {
+                return Err(invalid("configuration field is invalid"));
+            }
+            for mode in modes {
+                let object = mode
+                    .as_object()
+                    .ok_or(invalid("configuration field is invalid"))?;
+                config.add_mode(parse_mode(object)?)?;
+            }
+        }
+        if let Some(default_mode) = document.get("default_mode") {
+            let id = default_mode
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .ok_or(invalid("default mode is invalid"))?;
+            config.set_default_mode(id)?;
         }
         Ok(config)
     }
@@ -521,6 +710,15 @@ fn model_json(entry: &ModelEntry) -> Value {
     object.insert("id".to_owned(), Value::String(entry.id.clone()));
     object.insert("provider".to_owned(), Value::String(entry.provider.clone()));
     object.insert("name".to_owned(), Value::String(entry.name.clone()));
+    Value::Object(object)
+}
+
+/// Serializes one custom agent mode.
+fn mode_json(mode: &AgentMode) -> Value {
+    let mut object = Map::new();
+    object.insert("id".to_owned(), Value::String(mode.id.clone()));
+    object.insert("label".to_owned(), Value::String(mode.label.clone()));
+    object.insert("read_only".to_owned(), Value::Bool(mode.read_only));
     Value::Object(object)
 }
 
@@ -636,5 +834,19 @@ fn parse_model(object: &Map<String, Value>) -> Result<ModelEntry, ConfigError> {
         require_str(object, "id")?.to_owned(),
         require_str(object, "provider")?.to_owned(),
         require_str(object, "name")?.to_owned(),
+    )
+}
+
+/// Parses one custom mode object with known fields only.
+fn parse_mode(object: &Map<String, Value>) -> Result<AgentMode, ConfigError> {
+    reject_unknown(object, &["id", "label", "read_only"])?;
+    let read_only = object
+        .get("read_only")
+        .and_then(Value::as_bool)
+        .ok_or(invalid("configuration field is invalid"))?;
+    AgentMode::custom(
+        require_str(object, "id")?.to_owned(),
+        require_str(object, "label")?.to_owned(),
+        read_only,
     )
 }

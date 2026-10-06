@@ -57,7 +57,10 @@
 pub mod model;
 pub mod store;
 
-pub use model::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile, UserConfig};
+pub use model::{
+    AdapterKind, AgentMode, CredentialRef, MODE_BUILD, MODE_PLAN, ModelEntry, ProviderProfile,
+    UserConfig,
+};
 pub use store::{
     CONFIG_ENV_VAR, CONFIG_FILE_NAME, ConfigError, ConfigErrorKind, default_path,
     default_path_with, load, resolve_credential, resolve_path, resolve_path_with, resolve_with,

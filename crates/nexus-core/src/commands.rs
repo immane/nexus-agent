@@ -38,6 +38,11 @@ pub struct SubmitCommand {
     pub input: String,
     /// Selected execution profile name.
     pub profile: String,
+    /// True when the run must deny confirmation-required tools without
+    /// prompting. Set from the frontend's resolved agent mode (`plan` sets
+    /// it); the runtime enforces it at tool dispatch. Defaults to false so
+    /// existing full-capability flows are unchanged.
+    pub read_only: bool,
 }
 
 impl SubmitCommand {
@@ -53,9 +58,18 @@ impl SubmitCommand {
             session,
             input: input.into(),
             profile: profile.into(),
+            read_only: false,
         };
         command.validate()?;
         Ok(command)
+    }
+
+    /// Marks the run read-only. Booleans need no validation; call
+    /// [`Self::validate`] again only after changing text fields.
+    #[must_use]
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     /// Validates bounded input at the frontend trust boundary. Reused by

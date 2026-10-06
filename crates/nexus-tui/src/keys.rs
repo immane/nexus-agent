@@ -13,7 +13,7 @@
 //! | --- | --- | --- |
 //! | Composer | `Enter` | Submit the draft |
 //! | Composer | `Alt+Enter` or `Ctrl+J` | Multiline newline |
-//! | Composer | `Tab` | Switch focus |
+//! | Composer | `Tab` | Cycle the agent mode (`plan`/`build`/customs) |
 //! | Composer | `Esc` | Park focus in the viewport (never cancel) |
 //! | Composer | printable char | Type into the draft |
 //! | Composer | `Backspace` | Delete last draft char |
@@ -76,6 +76,10 @@ pub enum Action {
     Newline,
     /// Cycle keyboard focus.
     FocusSwitch,
+    /// Cycle the composer agent mode (`plan`, `build`, then customs).
+    /// Bound in the composer only, where the mode gates the next submit;
+    /// the viewport and approval card keep `Tab` for focus switching.
+    CycleMode,
     /// Park focus in the viewport (never answers or cancels).
     ParkFocus,
     /// Move the viewport selection up.
@@ -145,7 +149,7 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
     }
     match (focus, key.code) {
         (Focus::Composer, KeyCode::Enter) => Some(Action::Submit),
-        (Focus::Composer, KeyCode::Tab) => Some(Action::FocusSwitch),
+        (Focus::Composer, KeyCode::Tab) => Some(Action::CycleMode),
         (Focus::Composer, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::Composer, KeyCode::Backspace) => Some(Action::Backspace),
         (Focus::Composer, KeyCode::Up) => Some(Action::ScrollUp),

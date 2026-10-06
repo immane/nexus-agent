@@ -720,13 +720,18 @@ fn oversize_task_is_a_usage_error_without_echoing_input() {
         "no data output on a usage error"
     );
     let lines: Vec<&str> = invocation.stderr.lines().collect();
-    assert_eq!(lines.len(), 3, "banner, one diagnostic, usage: {lines:?}");
+    assert_eq!(
+        lines.len(),
+        4,
+        "banner, mode, one diagnostic, usage: {lines:?}"
+    );
     assert_eq!(lines[0], FAKE_BANNER);
+    assert_eq!(lines[1], "nexus-headless: mode=build");
     assert!(
-        lines[1].starts_with("nexus-headless: error:"),
+        lines[2].starts_with("nexus-headless: error:"),
         "the rejection is a diagnostic: {lines:?}"
     );
-    assert_eq!(lines[2], USAGE);
+    assert_eq!(lines[3], USAGE);
     assert!(
         !invocation.stderr.contains(sentinel) && !invocation.stderr.contains(&filler),
         "rejected input never reaches diagnostics"
@@ -1054,7 +1059,11 @@ fn merged_stream_orders_the_banner_before_the_records() {
         summary.starts_with("nexus-headless: run="),
         "the run summary is last: {lines:?}"
     );
-    let body = &lines[1..lines.len() - 1];
+    assert_eq!(
+        lines[1], "nexus-headless: mode=build",
+        "the invocation names its mode after the banner: {lines:?}"
+    );
+    let body = &lines[2..lines.len() - 1];
     assert!(!body.is_empty(), "records follow the banner: {lines:?}");
     let prefix = format!("rev={OUTPUT_REV} ");
     for line in body {
@@ -1095,7 +1104,10 @@ fn broken_stdout_pipe_exits_without_panic() {
     let invocation = capture(child.wait_with_output().expect("binary waits"));
     invocation.assert_exit(EXIT_STDOUT_CLOSED_CODE, "a closed pipe has its own code");
     assert!(invocation.stdout.is_empty(), "no stdout survived the pipe");
-    assert_stderr_lines(&invocation.stderr, &[FAKE_BANNER]);
+    assert_stderr_lines(
+        &invocation.stderr,
+        &[FAKE_BANNER, "nexus-headless: mode=build"],
+    );
     for marker in ["panicked", "Broken pipe", "BrokenPipe", "run="] {
         assert!(
             !invocation.stderr.contains(marker),

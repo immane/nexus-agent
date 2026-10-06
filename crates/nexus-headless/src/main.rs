@@ -13,8 +13,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use nexus_headless::{
-    EXIT_STDOUT_CLOSED, FAKE_BANNER, HeadlessError, USAGE, outcome_name, run_task,
-    write_report_lines,
+    EXIT_STDOUT_CLOSED, FAKE_BANNER, HeadlessError, HeadlessMode, USAGE, outcome_name,
+    run_task_with_mode, write_report_lines,
 };
 
 /// Static diagnostic for argv that cannot be decoded as UTF-8. Argument
@@ -25,6 +25,29 @@ const INVALID_ARGV: &str = "nexus-headless: error: arguments must be valid UTF-8
 /// Static diagnostic when the finite report budget dropped event records.
 const TRUNCATED_REPORT: &str =
     "nexus-headless: note: report truncated by the event retention budget";
+
+/// Resolves a `--mode` id to its tool policy: the built-ins always
+/// resolve, customs resolve through user configuration. Unknown ids and
+/// unreadable configuration are usage errors with static diagnostics (the
+/// id itself is never echoed: it is caller text).
+fn resolve_mode(id: &str) -> Result<HeadlessMode, HeadlessError> {
+    match id {
+        "plan" => Ok(HeadlessMode::plan()),
+        "build" => Ok(HeadlessMode::build()),
+        _ => {
+            let path = nexus_config::resolve_path(None);
+            let config = path
+                .as_deref()
+                .and_then(|path| nexus_config::load(path).ok())
+                .flatten()
+                .ok_or(HeadlessError::Usage("unknown mode".to_owned()))?;
+            let mode = config
+                .resolve_mode(id)
+                .ok_or(HeadlessError::Usage("unknown mode".to_owned()))?;
+            Ok(HeadlessMode::custom(mode.id.clone(), mode.read_only))
+        }
+    }
+}
 
 fn main() -> ExitCode {
     write_stderr_line(FAKE_BANNER);
@@ -44,12 +67,39 @@ fn main() -> ExitCode {
             }
         }
     }
+    // A leading `--mode <id>` marks the agent mode for this invocation
+    // (built-in `plan`/`build`, or a custom id from configuration). Anything
+    // else, including a task that merely starts with `--mode` elsewhere, is
+    // task text.
+    let mut mode = HeadlessMode::build();
+    if parts.first().is_some_and(|flag| flag == "--mode") {
+        let Some(id) = parts.get(1).cloned() else {
+            write_stderr_line(USAGE);
+            return ExitCode::from(exit_code_u8(HeadlessError::USAGE_EXIT_CODE));
+        };
+        match resolve_mode(&id) {
+            Ok(resolved) => mode = resolved,
+            Err(_) => {
+                write_stderr_line(USAGE);
+                return ExitCode::from(exit_code_u8(HeadlessError::USAGE_EXIT_CODE));
+            }
+        }
+        parts.drain(..2);
+    }
     let task = parts.join(" ");
     if task.trim().is_empty() {
         write_stderr_line(USAGE);
         return ExitCode::from(exit_code_u8(HeadlessError::USAGE_EXIT_CODE));
     }
-    match run_task(&task) {
+    // The invocation names its mode on stderr before running, so one-shot
+    // calls are attributable in logs. Usage errors print nothing extra.
+    write_stderr_line(&format!("nexus-headless: mode={}", mode.name));
+    let task = parts.join(" ");
+    if task.trim().is_empty() {
+        write_stderr_line(USAGE);
+        return ExitCode::from(exit_code_u8(HeadlessError::USAGE_EXIT_CODE));
+    }
+    match run_task_with_mode(&task, &mode) {
         Ok(report) => {
             if let Err(error) = write_report_lines(&mut io::stdout().lock(), &report.lines) {
                 if error.kind() == io::ErrorKind::BrokenPipe {

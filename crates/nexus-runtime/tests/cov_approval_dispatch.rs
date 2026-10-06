@@ -907,3 +907,89 @@ fn denied_calls_consume_the_per_run_call_budget() {
         assert_contiguous(&data, &control);
     });
 }
+
+#[test]
+fn read_only_runs_deny_confirmation_tools_without_prompting() {
+    let rt = test_rt();
+    rt.block_on(async {
+        let args = r#"{"path":"src"}"#;
+        let mut bed = make_bed(
+            vec![
+                ScriptedProvider::tool_turn(vec![candidate(
+                    "item-0",
+                    "prov-ref-0",
+                    "host_write",
+                    args,
+                )]),
+                ScriptedProvider::stop_turn("done"),
+            ],
+            quick_config(),
+        );
+        let reply = bed
+            .runtime
+            .submit(submit_cmd("readonly").with_read_only(true))
+            .await;
+        assert_eq!(reply.reply(), CommandReply::Accepted);
+        let (data, control, _finished) =
+            drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert!(
+            !control.iter().any(is_approval_required),
+            "a read-only run never mints an approval card"
+        );
+        assert!(
+            tool_started_calls(&data).is_empty() && tool_started_calls(&control).is_empty(),
+            "the write never dispatches"
+        );
+        assert_eq!(
+            bed.write_tool.execution_count(),
+            0,
+            "no execution without a grant"
+        );
+        let finished = tool_finished_map(&control);
+        assert_eq!(finished.len(), 1);
+        let outcome = finished.values().next().expect("one tool outcome");
+        assert_eq!(
+            outcome.status(),
+            ExecutionStatus::Denied,
+            "the call is denied, not failed"
+        );
+        assert_single_terminal(&data, &control);
+    });
+}
+
+#[test]
+fn read_only_runs_still_execute_automatic_reads() {
+    let rt = test_rt();
+    rt.block_on(async {
+        let args = r#"{"path":"src"}"#;
+        let mut bed = make_bed(
+            vec![
+                ScriptedProvider::tool_turn(vec![candidate(
+                    "item-0",
+                    "prov-ref-0",
+                    "host_read",
+                    args,
+                )]),
+                ScriptedProvider::stop_turn("done"),
+            ],
+            quick_config(),
+        );
+        let reply = bed
+            .runtime
+            .submit(submit_cmd("readonly-read").with_read_only(true))
+            .await;
+        assert_eq!(reply.reply(), CommandReply::Accepted);
+        let (data, control, _finished) =
+            drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(
+            bed.read_tool.execution_count(),
+            1,
+            "automatic reads proceed in a read-only run"
+        );
+        assert!(
+            !control.iter().any(is_approval_required),
+            "automatic tools never prompt"
+        );
+        assert_single_terminal(&data, &control);
+    });
+}

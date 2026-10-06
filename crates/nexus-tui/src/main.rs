@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind, poll, read};
 use nexus_config::{
-    UserConfig, load as load_config, resolve_path, resolve_with, save as save_config,
+    AgentMode, UserConfig, load as load_config, resolve_path, resolve_with, save as save_config,
 };
 use nexus_core::{
     AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload, Limits,
@@ -915,6 +915,11 @@ impl Frontend {
             ..Self::new(session)
         };
         front.sync_model_display();
+        // Composer modes: built-ins first, then configuration customs, with
+        // the configured default (or `build`) selected.
+        let mut modes = vec![AgentMode::plan(), AgentMode::build()];
+        modes.extend(front.config.modes().iter().cloned());
+        front.state.set_modes(modes, front.config.default_mode());
         if let Some(dir) = session_project_dir() {
             front.state.set_project_dir(dir);
         }
@@ -1471,11 +1476,13 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
                 return handle_slash(front, command);
             }
             let request = front.next_request();
+            let read_only = front.state.mode().read_only;
             match submit_command(
                 request,
                 front.session.clone(),
                 front.state.composer(),
                 DEMO_PROFILE,
+                read_only,
             ) {
                 Ok(command) => {
                     let draft = front.state.composer().to_owned();
@@ -1496,6 +1503,12 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
         Action::FocusSwitch => {
             let pending = front.state.pending_approval().is_some();
             front.focus = next_focus(front.focus, pending);
+        }
+        Action::CycleMode => {
+            // Composer-only binding: the mode gates the next submit. No
+            // transcript entry is added; the composer border and title
+            // already report the switch where the user is looking.
+            front.state.cycle_mode();
         }
         Action::ParkFocus => {
             // Step back one rung, never cancelling or deciding: an open
@@ -1669,6 +1682,7 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
             slot.front.session.clone(),
             DEMO_INPUT,
             DEMO_PROFILE,
+            false,
         )
         .map_err(io::Error::other)?;
         let reply = slot.runtime.handle(submit).await.0;
@@ -1915,6 +1929,7 @@ async fn headless(
         front.session.clone(),
         DEMO_INPUT,
         DEMO_PROFILE,
+        false,
     )
     .map_err(io::Error::other)?;
     let reply = runtime.handle(submit).await.0;
@@ -2355,6 +2370,7 @@ mod tests {
             front.session.clone(),
             DEMO_INPUT,
             DEMO_PROFILE,
+            false,
         )
         .expect("valid submit builds");
         let reply = runtime.handle(submit).await.0;
@@ -2394,6 +2410,7 @@ mod tests {
             front.session.clone(),
             DEMO_INPUT,
             DEMO_PROFILE,
+            false,
         )
         .expect("valid submit builds");
         let reply = runtime.handle(submit).await.0;
@@ -2791,6 +2808,7 @@ mod cov_main_private {
             front.session.clone(),
             front.state.composer(),
             DEMO_PROFILE,
+            false,
         )
         .expect("valid submit builds");
         let reply = runtime.handle(command).await.0;
@@ -3074,6 +3092,7 @@ mod cov_main_private {
             front.session.clone(),
             DEMO_INPUT,
             DEMO_PROFILE,
+            false,
         )
         .expect("valid submit builds");
         let reply = runtime.handle(submit).await.0;
@@ -3924,13 +3943,23 @@ mod cov_main_topup {
         assert_eq!(front.state.composer(), "a");
 
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Tab)).await);
-        assert_eq!(front.focus, Focus::Viewport, "Tab leaves the composer");
-        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Tab)).await);
         assert_eq!(
             front.focus,
             Focus::Composer,
-            "no approval is pending, so the card is not reachable"
+            "Tab cycles the mode, not focus"
         );
+        assert_eq!(
+            front.state.mode().id,
+            "plan",
+            "build cycles to plan on the first Tab"
+        );
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Tab)).await);
+        assert_eq!(
+            front.state.mode().id,
+            "build",
+            "the second Tab wraps back to build"
+        );
+        assert_eq!(front.focus, Focus::Composer, "mode cycling keeps focus");
 
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
         assert_eq!(front.focus, Focus::Viewport, "Esc parks in the viewport");
@@ -4498,6 +4527,7 @@ mod cov_main_topup {
                 front.session.clone(),
                 task,
                 DEMO_PROFILE,
+                false,
             )
             .expect("valid submit builds");
             let reply = runtime.handle(submit).await.0;
