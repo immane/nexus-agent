@@ -47,6 +47,9 @@ nexus-tools = { path = "../nexus-tools" }
 # so there is exactly one terminal dependency. Its `TestBackend` gives
 # deterministic renderer tests without a PTY.
 ratatui = { version = "0.26", default-features = false, features = ["crossterm"] }
+# Cell widths for CJK-aware wrapping (`unicode-width 0.1` is already in
+# the lock file via ratatui, so this adds no new crate to the closure).
+unicode-width = "0.1"
 # `crossterm` 0.27 is ratatui 0.26's backend driver (same version it
 # depends on, so Cargo unifies them): raw-mode/alternate-screen setup and
 # key-event input only. All drawing goes through ratatui; there is still

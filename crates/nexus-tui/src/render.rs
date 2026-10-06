@@ -27,7 +27,7 @@ use ratatui::widgets::{
 use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
 use crate::state::{
-    AppState, ApprovalGeometry, PendingApprovalCard, PointerGeometry, wrapped_height,
+    AppState, ApprovalGeometry, PendingApprovalCard, PointerGeometry, chunks, wrapped_height,
 };
 
 /// Maps width-neutral Markdown style bits to terminal styling. Only color
@@ -685,13 +685,12 @@ fn push_detail_range(
             index += 1;
             continue;
         }
-        let chars: Vec<char> = field.chars().collect();
-        for chunk in chars.chunks(width) {
+        for chunk in chunks(field, width) {
             if index >= limit {
                 break;
             }
             if index >= skip {
-                out.push(chunk.iter().collect());
+                out.push(chunk.to_owned());
             }
             index += 1;
         }
@@ -709,12 +708,11 @@ fn push_wrapped(text: &str, width: usize, budget: usize, out: &mut Vec<String>) 
         return;
     }
     let width = width.max(1);
-    let chars: Vec<char> = text.chars().collect();
-    for chunk in chars.chunks(width) {
+    for chunk in chunks(text, width) {
         if out.len() >= budget {
             break;
         }
-        out.push(chunk.iter().collect());
+        out.push(chunk.to_owned());
     }
 }
 
@@ -2439,6 +2437,29 @@ mod cov_render_private {
         render_composer(&state, area, &mut model_only, Focus::Composer);
         let rows = text_rows(&model_only);
         assert!(rows[0].contains("demo"), "{rows:?}");
+    }
+
+    #[test]
+    fn cjk_lines_measure_in_cells_like_the_terminal_shows() {
+        // 79 CJK glyphs need 158 cells against a 78-cell body width:
+        // title + 3 wrapped body rows + separator. The truncating
+        // paragraph paints exactly those rows, so scrolling never drifts.
+        let mut state = AppState::new();
+        state.notice(&"\u{4e2d}".repeat(79));
+        assert_eq!(state.total_height(80), 1 + 3 + 1);
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = Buffer::empty(area);
+        render_body(&mut state, area, &mut buf);
+        let rows = text_rows(&buf);
+        let painted: Vec<&String> = rows.iter().filter(|row| row.contains("\u{4e2d}")).collect();
+        // 78 body cells hold 39 glyphs per row: 39 + 39 + 1 across 3 rows.
+        assert_eq!(painted.len(), 3);
+        for row in &painted {
+            assert!(
+                row.chars().count() <= 80,
+                "no painted row exceeds the frame: {row:?}"
+            );
+        }
     }
 
     #[test]

@@ -37,6 +37,6 @@ pub use render::render;
 pub use slash::{SessionArgs, SlashCommand};
 pub use state::{
     AppState, EntryKind, PendingApprovalCard, PointerGeometry, RefreshGate, SelPoint,
-    TextSelection, VisibleView,
+    TextSelection, VisibleView, cell_to_char_col,
 };
 pub use terminal::{TerminalGuard, install_panic_hook, restore_for_panic};

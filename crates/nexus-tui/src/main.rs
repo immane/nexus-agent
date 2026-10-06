@@ -56,7 +56,7 @@ use nexus_tools::{ScopedReader, ScopedWriter};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
     Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, TextSelection, cancel_command,
-    install_panic_hook, map_key, next_focus, render, submit_command,
+    cell_to_char_col, install_panic_hook, map_key, next_focus, render, submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -1211,13 +1211,15 @@ const WHEEL_LINES: usize = 3;
 /// starts a drag selection (body rows or the composer draft), dragging
 /// extends it, and release copies it to the clipboard. Focus is never moved
 /// by the mouse. Returns true when state changed and a redraw is due.
-/// Maps a terminal column onto a body content row, if the cell sits on
-/// one. Columns past the text width (scrollbar, margins) and rows over
-/// hero, notice, or empty space yield `None` and never anchor.
-fn body_hit(state: &AppState, column: u16, row: u16) -> Option<(usize, usize)> {
+/// Maps a terminal cell onto a body content position, if the cell sits
+/// on one. Columns past the text width (scrollbar, margins) and rows over
+/// hero, notice, or empty space yield `None` and never anchor. Terminal
+/// columns are cells; the returned column is a character index into the
+/// given window line, so CJK-wide glyphs map exactly.
+fn body_hit(state: &AppState, lines: &[String], column: u16, row: u16) -> Option<(usize, usize)> {
     let geo = state.pointer_geometry();
-    let col = (column as usize).saturating_sub(geo.body_x as usize);
-    if col >= geo.text_width.max(1) {
+    let cell = (column as usize).saturating_sub(geo.body_x as usize);
+    if cell >= geo.text_width.max(1) {
         return None;
     }
     let rel = (row as usize).saturating_sub(geo.body_y as usize);
@@ -1225,7 +1227,16 @@ fn body_hit(state: &AppState, column: u16, row: u16) -> Option<(usize, usize)> {
     if index >= geo.content_len {
         return None;
     }
-    Some((index, col))
+    let line = lines.get(index).map(String::as_str).unwrap_or("");
+    Some((index, cell_to_char_col(line, cell)))
+}
+
+/// Fresh window rows for hit mapping: the same window the renderer drew;
+// heights are cached so this never re-measures history.
+fn window_lines(state: &AppState) -> Vec<String> {
+    state
+        .visible_lines(state.viewport_width(), state.viewport_height())
+        .lines
 }
 
 /// Maps a terminal cell onto a composer draft character offset, if the
@@ -1237,11 +1248,11 @@ fn composer_hit(state: &AppState, column: u16, row: u16) -> Option<usize> {
     if rel_row >= geo.composer_rows.max(1) {
         return None;
     }
-    let col = (column as usize).saturating_sub((geo.composer_x + 1) as usize);
+    let cell = (column as usize).saturating_sub((geo.composer_x + 1) as usize);
     let mut offset = 0usize;
     for (index, line) in state.composer().lines().enumerate() {
         if index == rel_row {
-            return Some(offset + col.min(line.chars().count()));
+            return Some(offset + cell_to_char_col(line, cell));
         }
         offset += line.chars().count() + 1;
     }
@@ -1320,7 +1331,8 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
         MouseEventKind::Down(MouseButton::Left) => {
             // A new press replaces any previous selection outright; cells
             // outside both regions only clear.
-            if let Some((row, col)) = body_hit(&front.state, mouse.column, mouse.row) {
+            let window = window_lines(&front.state);
+            if let Some((row, col)) = body_hit(&front.state, &window, mouse.column, mouse.row) {
                 front.state.begin_body_selection(row, col);
             } else if let Some(offset) = composer_hit(&front.state, mouse.column, mouse.row) {
                 front.state.begin_composer_selection(offset);
@@ -1333,7 +1345,8 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             if front.state.text_selection().is_none() {
                 return false;
             }
-            if let Some((row, col)) = body_hit(&front.state, mouse.column, mouse.row) {
+            let window = window_lines(&front.state);
+            if let Some((row, col)) = body_hit(&front.state, &window, mouse.column, mouse.row) {
                 front.state.extend_body_selection(row, col);
             } else if let Some(offset) = composer_hit(&front.state, mouse.column, mouse.row) {
                 front.state.extend_composer_selection(offset);
@@ -4311,6 +4324,46 @@ mod cov_main_topup {
         assert!(
             transcript(&front).contains("selectable"),
             "the notice previews the yanked text"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_maps_wide_glyph_cells_to_characters() {
+        // "  \u{4e2d}\u{6587}\u{6d4b}\u{8bd5}\u{5185}\u{5bb9}": cells 2-3, 4-5, 6-7,
+        // 8-9, 10-11, 12-13. A cell drag 4..10 must yank chars 1..4.
+        let mut front = Frontend::new(session());
+        front
+            .state
+            .notice("\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}\u{5185}\u{5bb9}");
+        let mut terminal = fixed_terminal();
+        draw(&mut terminal, &mut front).expect("frame draws");
+        let geo = front.state.pointer_geometry();
+        let row = geo.body_y + geo.content_offset as u16 + 1;
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Down(MouseButton::Left), geo.body_x + 4)
+        ));
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Drag(MouseButton::Left), geo.body_x + 10)
+        ));
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Up(MouseButton::Left), geo.body_x + 10)
+        ));
+        assert!(
+            transcript(&front).contains("copied 3 chars"),
+            "three wide glyphs yanked"
+        );
+        assert!(
+            transcript(&front).contains("\u{6587}\u{6d4b}\u{8bd5}"),
+            "cell columns land on the right characters"
         );
     }
 

@@ -231,25 +231,32 @@ impl TableBuilder {
     }
 }
 
-/// Visible character count of one cell.
+/// Visible cell width of one cell (CJK glyphs need two cells).
 fn cell_len(cell: &[RichSpan]) -> usize {
-    cell.iter().map(|span| span.text.chars().count()).sum()
+    cell.iter()
+        .map(|span| crate::state::display_width(&span.text))
+        .sum()
 }
 
-/// Splits text into at most `width`-char slices on character boundaries,
+/// Splits text into at most `width`-cell slices on character boundaries,
 /// mirroring the wrapping measurement so layout math agrees with rendering.
+/// Wide glyphs are never split; a lone glyph wider than `width` still
+/// advances one glyph.
 fn char_chunks(text: &str, width: usize) -> Vec<&str> {
     let width = width.max(1);
+    let char_cells =
+        |char: char| -> usize { unicode_width::UnicodeWidthChar::width(char).unwrap_or(1) };
     let mut chunks = Vec::new();
     let mut start = 0usize;
-    let mut count = 0usize;
-    for (offset, _) in text.char_indices() {
-        if count == width {
+    let mut used = 0usize;
+    for (offset, char) in text.char_indices() {
+        let wide = char_cells(char);
+        if used > 0 && used + wide > width {
             chunks.push(&text[start..offset]);
             start = offset;
-            count = 0;
+            used = 0;
         }
-        count += 1;
+        used += wide;
     }
     if start < text.len() || text.is_empty() {
         chunks.push(&text[start..]);
@@ -257,9 +264,9 @@ fn char_chunks(text: &str, width: usize) -> Vec<&str> {
     chunks
 }
 
-/// Pads text to exactly `width` characters per the column alignment.
+/// Pads text to exactly `width` terminal cells per the column alignment.
 fn pad_cell(text: &str, width: usize, align: &Alignment) -> String {
-    let len = text.chars().count();
+    let len = crate::state::display_width(text);
     if len >= width {
         return text.to_owned();
     }
@@ -1392,6 +1399,19 @@ mod extended_tests {
     fn tables_keep_empty_cells_aligned() {
         let lines = render_body(&body("| a | b |\n|---|---|\n|  | 2 |"), 78);
         assert_eq!(visible(&lines), vec!["| a | b |", "|---|---|", "|   | 2 |"]);
+    }
+
+    #[test]
+    fn tables_measure_columns_in_cells() {
+        // "中" needs 2 cells: the column sizes 4 cells, not 2 chars.
+        let lines = render_body(&body("| \u{4e2d}\u{6587} | x |\n|---|---|\n| 1 | 2 |"), 78);
+        assert_eq!(
+            visible(&lines),
+            vec!["| \u{4e2d}\u{6587} | x |", "|------|---|", "| 1    | 2 |"]
+        );
+        for line in &lines {
+            assert!(line.visible_len() <= 12, "{line:?}");
+        }
     }
 
     #[test]

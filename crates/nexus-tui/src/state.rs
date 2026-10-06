@@ -433,7 +433,7 @@ fn emit_line(
 
 /// Iterator over at most `width`-char chunks of `text`, as borrowed slices
 /// (skipped chunks cost no allocation).
-struct Chunks<'a> {
+pub(crate) struct Chunks<'a> {
     text: &'a str,
     width: usize,
     start: usize,
@@ -446,12 +446,18 @@ impl<'a> Iterator for Chunks<'a> {
         if self.start >= self.text.len() {
             return None;
         }
+        // Cell-based: accumulate whole characters while they fit, so a
+        // wide glyph is never split across rows. A single glyph wider than
+        // the width still advances one glyph, never zero.
+        let mut cells = 0usize;
         let mut end = self.text.len();
-        for (count, (offset, _)) in self.text[self.start..].char_indices().enumerate() {
-            if count == self.width {
+        for (offset, char) in self.text[self.start..].char_indices() {
+            let wide = display_width_char(char);
+            if cells > 0 && cells + wide > self.width {
                 end = self.start + offset;
                 break;
             }
+            cells += wide;
         }
         let chunk = &self.text[self.start..end];
         self.start = end;
@@ -459,7 +465,7 @@ impl<'a> Iterator for Chunks<'a> {
     }
 }
 
-fn chunks(text: &str, width: usize) -> Chunks<'_> {
+pub(crate) fn chunks(text: &str, width: usize) -> Chunks<'_> {
     Chunks {
         text,
         width: width.max(1),
@@ -467,14 +473,39 @@ fn chunks(text: &str, width: usize) -> Chunks<'_> {
     }
 }
 
-/// Character-count wrapping height of one logical line (M0-test choice:
-/// counts chars, not terminal cell width; wide/CJK glyphs and tab expansion
-/// may misalign and are called out as a limitation, not silently remeasured
-/// here).
+/// Display width of one character in terminal cells. Unprintable widths
+/// fall back to 1, matching the historical count for tabs (whose true
+/// advance is position-dependent and stays a documented limitation).
+fn display_width_char(char: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(char).unwrap_or(1)
+}
+
+/// Display width of a whole line in terminal cells.
+pub(crate) fn display_width(text: &str) -> usize {
+    text.chars().map(display_width_char).sum()
+}
+
+/// Maps a terminal cell column onto a character index in `line`: the first
+/// character whose cells cover the column, or the line end when past it.
+/// Mouse columns are cells; downstream selection math stays in characters.
+pub fn cell_to_char_col(line: &str, cell: usize) -> usize {
+    let mut pos = 0usize;
+    for (index, char) in line.chars().enumerate() {
+        if pos + display_width_char(char) > cell {
+            return index;
+        }
+        pos += display_width_char(char);
+    }
+    line.chars().count()
+}
+
+/// Cell-count wrapping height of one logical line: what the terminal shows
+/// is what the viewport counts, including CJK-wide glyphs. (Tab expansion
+/// stays position-dependent and is still a documented limitation.)
 pub(crate) fn wrapped_height(line: &str, width: usize) -> usize {
     let width = width.max(1);
-    let chars = line.chars().count().max(1);
-    chars.div_ceil(width).max(1)
+    let cells = display_width(line).max(1);
+    cells.div_ceil(width).max(1)
 }
 
 /// Wrap width available to an indented body line.
@@ -3724,6 +3755,36 @@ mod cov_state_private {
         assert_eq!(state.project_dir(), None);
         state.set_project_dir("/Volumes/work/proj");
         assert_eq!(state.project_dir(), Some("/Volumes/work/proj"));
+    }
+
+    #[test]
+    fn wrapping_counts_cells_not_characters() {
+        // ASCII is unchanged: one char is one cell.
+        assert_eq!(display_width("hello"), 5);
+        assert_eq!(wrapped_height("hello", 5), 1);
+        assert_eq!(wrapped_height("hello!", 5), 2);
+        // CJK glyphs need two cells each.
+        assert_eq!(display_width("\u{4e2d}\u{6587}"), 4);
+        assert_eq!(wrapped_height("\u{4e2d}\u{6587}", 4), 1);
+        assert_eq!(wrapped_height("\u{4e2d}\u{6587}", 3), 2);
+        assert_eq!(wrapped_height("", 10), 1, "blank rows stay one row");
+        // Chunks never split a wide glyph.
+        let parts: Vec<&str> = chunks("\u{4e2d}a\u{6587}", 3).collect();
+        assert_eq!(parts, vec!["\u{4e2d}a", "\u{6587}"]);
+        // A lone glyph wider than the width still advances.
+        let tiny: Vec<&str> = chunks("\u{4e2d}", 1).collect();
+        assert_eq!(tiny, vec!["\u{4e2d}"]);
+    }
+
+    #[test]
+    fn cell_columns_map_onto_character_indexes() {
+        // "a\u{4e2d}b": cells 0, 1-2, 3.
+        assert_eq!(cell_to_char_col("a\u{4e2d}b", 0), 0);
+        assert_eq!(cell_to_char_col("a\u{4e2d}b", 1), 1);
+        assert_eq!(cell_to_char_col("a\u{4e2d}b", 2), 1);
+        assert_eq!(cell_to_char_col("a\u{4e2d}b", 3), 2);
+        assert_eq!(cell_to_char_col("a\u{4e2d}b", 99), 3);
+        assert_eq!(cell_to_char_col("", 0), 0);
     }
 
     #[test]
