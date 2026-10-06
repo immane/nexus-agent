@@ -38,7 +38,7 @@ use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyEvent, KeyEventKind, poll, read};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind, poll, read};
 use nexus_config::{
     UserConfig, load as load_config, resolve_path, resolve_with, save as save_config,
 };
@@ -1172,15 +1172,55 @@ async fn next_loop_step(
     }
 }
 
-/// Non-blocking next key press; non-key terminal events are drained and
-/// ignored, so resize/mouse traffic cannot stall the loop.
-fn read_key() -> io::Result<Option<KeyEvent>> {
+/// Non-blocking next input event; resize traffic is drained and ignored so
+/// it cannot stall the loop, while mouse wheel notches surface as scroll
+/// input beside key presses.
+fn read_input() -> io::Result<Option<Input>> {
     while poll(Duration::ZERO)? {
-        if let Event::Key(key) = read()? {
-            return Ok(Some(key));
+        match read()? {
+            Event::Key(key) => return Ok(Some(Input::Key(key))),
+            Event::Mouse(mouse) => return Ok(Some(Input::Mouse(mouse))),
+            _ => {}
         }
     }
     Ok(None)
+}
+
+/// One terminal input: a key press or a mouse report. Only wheel notches
+/// are acted on; other mouse traffic is drained and ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Input {
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+}
+
+/// Mouse wheel notches per scroll step (M0-test choice: a few wrapped lines
+/// per notch, never a full page jump).
+const WHEEL_LINES: usize = 3;
+
+/// Applies one mouse report. Wheel notches scroll the expanded approval
+/// detail while it is open, else the conversation viewport; focus is never
+/// moved by the mouse. Returns true when state changed and a redraw is due.
+fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if front.state.approval_detail_open() {
+                front.state.approval_detail_scroll(-(WHEEL_LINES as isize));
+            } else {
+                front.state.scroll_up(WHEEL_LINES);
+            }
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            if front.state.approval_detail_open() {
+                front.state.approval_detail_scroll(WHEEL_LINES as isize);
+            } else {
+                front.state.scroll_down(WHEEL_LINES);
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Outcome of one bounded keyboard batch.
@@ -1189,27 +1229,36 @@ struct KeyBatch {
     quit: bool,
 }
 
-/// Handles at most `limit` key events, so a paste or autorepeat burst cannot
-/// starve event application or redraws; remaining input is picked up on later
-/// ticks. Returns true when the TUI should exit.
+/// Handles at most `limit` input events, so a paste, autorepeat burst, or
+/// mouse wheel flurry cannot starve event application or redraws; remaining
+/// input is picked up on later ticks. Returns true when the TUI should exit.
 async fn handle_key_batch(
     front: &mut Frontend,
     runtime: &Runtime,
-    mut next: impl FnMut() -> io::Result<Option<KeyEvent>>,
+    mut next: impl FnMut() -> io::Result<Option<Input>>,
     limit: usize,
 ) -> io::Result<KeyBatch> {
     let mut handled = 0;
     for _ in 0..limit {
-        let Some(key) = next()? else { break };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        handled += 1;
-        if handle_key(front, runtime, key).await {
-            return Ok(KeyBatch {
-                handled,
-                quit: true,
-            });
+        let Some(input) = next()? else { break };
+        match input {
+            Input::Mouse(mouse) => {
+                if handle_mouse(front, mouse) {
+                    handled += 1;
+                }
+            }
+            Input::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                handled += 1;
+                if handle_key(front, runtime, key).await {
+                    return Ok(KeyBatch {
+                        handled,
+                        quit: true,
+                    });
+                }
+            }
         }
     }
     Ok(KeyBatch {
@@ -1463,14 +1512,24 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
         Action::ScrollUp => {
             if front.state.approval_detail_open() {
                 front.state.approval_detail_scroll(-1);
+            } else if front.focus == Focus::Composer {
+                // Previous submitted input, shown right in the composer so
+                // it is always visible. Free scrolling belongs to the mouse
+                // wheel and the Viewport paging keys.
+                front.state.recall_prev();
             } else {
+                // Previous message, selection-anchored.
                 front.state.move_selection(-1);
             }
         }
         Action::ScrollDown => {
             if front.state.approval_detail_open() {
                 front.state.approval_detail_scroll(1);
+            } else if front.focus == Focus::Composer {
+                // Next submitted input (or back to the live draft).
+                front.state.recall_next();
             } else {
+                // Next message (or back to the live tail).
                 front.state.move_selection(1);
             }
         }
@@ -1669,8 +1728,13 @@ async fn interactive_loop(
             LoopStep::Tick => {
                 let batch = {
                     let slot = sessions.active_mut();
-                    handle_key_batch(&mut slot.front, &slot.runtime, read_key, MAX_KEYS_PER_TICK)
-                        .await?
+                    handle_key_batch(
+                        &mut slot.front,
+                        &slot.runtime,
+                        read_input,
+                        MAX_KEYS_PER_TICK,
+                    )
+                    .await?
                 };
                 if batch.quit {
                     return Ok(());
@@ -2181,7 +2245,7 @@ mod tests {
                 }
                 let key = keys[index];
                 index += 1;
-                Ok(Some(key))
+                Ok(Some(Input::Key(key)))
             },
             MAX_KEYS_PER_TICK,
         )
@@ -2205,7 +2269,7 @@ mod tests {
                 }
                 let key = quit_keys[index];
                 index += 1;
-                Ok(Some(key))
+                Ok(Some(Input::Key(key)))
             },
             MAX_KEYS_PER_TICK,
         )
@@ -2885,7 +2949,7 @@ mod cov_main_private {
             &runtime,
             || {
                 reads += 1;
-                Ok(Some(press(KeyCode::F(1))))
+                Ok(Some(Input::Key(press(KeyCode::F(1)))))
             },
             0,
         )
@@ -2903,7 +2967,7 @@ mod cov_main_private {
             &runtime,
             || {
                 index += 1;
-                Ok(Some(press(KeyCode::F(1))))
+                Ok(Some(Input::Key(press(KeyCode::F(1)))))
             },
             4,
         )
@@ -2924,7 +2988,7 @@ mod cov_main_private {
             &mut front,
             &runtime,
             || {
-                let key = kinds.get(index).copied();
+                let key = kinds.get(index).copied().map(Input::Key);
                 index += 1;
                 Ok(key)
             },
@@ -2946,7 +3010,7 @@ mod cov_main_private {
             &mut front,
             &runtime,
             || {
-                let key = burst.get(index).copied();
+                let key = burst.get(index).copied().map(Input::Key);
                 index += 1;
                 Ok(key)
             },
@@ -2998,10 +3062,10 @@ mod cov_main_private {
                     return Ok(None);
                 }
                 read = true;
-                Ok(Some(KeyEvent::new(
+                Ok(Some(Input::Key(KeyEvent::new(
                     KeyCode::Char('d'),
                     KeyModifiers::CONTROL,
-                )))
+                ))))
             },
             MAX_KEYS_PER_TICK,
         )
@@ -3124,7 +3188,7 @@ mod cov_main_private {
 #[cfg(test)]
 mod cov_main_topup {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use nexus_core::{
         ApprovalId, AssistantText, CallId, PersistenceState, RunFinished, RunOutcome, TurnId,
     };
@@ -3905,6 +3969,63 @@ mod cov_main_topup {
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
         assert_eq!(front.state.selected(), Some(selected), "the fold toggles");
         assert!(front.state.entry_count() > 0);
+    }
+
+    #[tokio::test]
+    async fn composer_arrows_recall_submitted_inputs() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.state.record_submitted("first task");
+        front.state.record_submitted("second task");
+        front.focus = Focus::Composer;
+        assert_eq!(front.state.composer(), "");
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Up)).await);
+        assert_eq!(front.focus, Focus::Composer, "Up keeps typing focus");
+        assert_eq!(front.state.composer(), "second task");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Up)).await);
+        assert_eq!(front.state.composer(), "first task");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Up)).await);
+        assert_eq!(
+            front.state.composer(),
+            "first task",
+            "recall stops at the oldest"
+        );
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Down)).await);
+        assert_eq!(front.state.composer(), "second task");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Down)).await);
+        assert_eq!(
+            front.state.composer(),
+            "",
+            "Down past newest restores the draft"
+        );
+        assert_eq!(front.request_counter, 0, "recall issues no command");
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_viewport_without_moving_focus() {
+        let mut front = Frontend::new(session());
+        for index in 0..30 {
+            front.state.record_submitted(&format!("entry {index}"));
+        }
+        front.state.set_viewport(40, 8);
+        front.focus = Focus::Composer;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_mouse(&mut front, wheel(MouseEventKind::ScrollUp)));
+        assert!(front.state.scrollback() > 0, "wheel up scrolls history");
+        assert_eq!(front.focus, Focus::Composer, "the wheel never steals focus");
+        assert!(handle_mouse(&mut front, wheel(MouseEventKind::ScrollDown)));
+        assert_eq!(
+            front.state.scrollback(),
+            0,
+            "wheel down returns to the tail"
+        );
+        assert!(!handle_mouse(&mut front, wheel(MouseEventKind::Moved)));
     }
 
     #[tokio::test]

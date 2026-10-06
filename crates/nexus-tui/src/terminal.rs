@@ -18,6 +18,7 @@
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -26,13 +27,15 @@ use crossterm::terminal::{
 /// Process-wide ownership mirrors for the panic path; one session at a time.
 static RAW_OWNED: AtomicBool = AtomicBool::new(false);
 static ALTERNATE_OWNED: AtomicBool = AtomicBool::new(false);
+static MOUSE_OWNED: AtomicBool = AtomicBool::new(false);
 
-/// Separate ownership of raw mode and the alternate screen so cleanup never
-/// touches state this guard did not acquire.
+/// Separate ownership of raw mode, the alternate screen, and mouse capture
+/// so cleanup never touches state this guard did not acquire.
 #[derive(Debug, Clone, Copy, Default)]
 struct Ownership {
     raw: bool,
     alternate: bool,
+    mouse: bool,
     /// True once these bits have been mirrored into the process-wide flags.
     /// Until the first publish the panic path cannot have released them, so
     /// [`Ownership::sync_from_published`] must leave them alone.
@@ -44,6 +47,7 @@ impl Ownership {
     fn publish(&mut self) {
         RAW_OWNED.store(self.raw, Ordering::SeqCst);
         ALTERNATE_OWNED.store(self.alternate, Ordering::SeqCst);
+        MOUSE_OWNED.store(self.mouse, Ordering::SeqCst);
         self.published = true;
     }
 
@@ -57,10 +61,11 @@ impl Ownership {
         }
         self.raw &= RAW_OWNED.load(Ordering::SeqCst);
         self.alternate &= ALTERNATE_OWNED.load(Ordering::SeqCst);
+        self.mouse &= MOUSE_OWNED.load(Ordering::SeqCst);
     }
 }
 
-/// The four terminal operations a guard performs. Production calls
+/// The terminal operations a guard performs. Production calls
 /// crossterm; tests inject failures through this narrow boundary instead of
 /// using a terminal or a general mocking framework.
 trait TerminalIo {
@@ -68,6 +73,8 @@ trait TerminalIo {
     fn disable_raw(&mut self) -> io::Result<()>;
     fn enter_alternate(&mut self) -> io::Result<()>;
     fn leave_alternate(&mut self) -> io::Result<()>;
+    fn enable_mouse(&mut self) -> io::Result<()>;
+    fn disable_mouse(&mut self) -> io::Result<()>;
 }
 
 /// Crossterm-backed [`TerminalIo`] over stdout.
@@ -89,17 +96,26 @@ impl TerminalIo for CrosstermIo<'_> {
     fn leave_alternate(&mut self) -> io::Result<()> {
         execute!(self.0, LeaveAlternateScreen)
     }
+
+    fn enable_mouse(&mut self) -> io::Result<()> {
+        execute!(self.0, EnableMouseCapture)
+    }
+
+    fn disable_mouse(&mut self) -> io::Result<()> {
+        execute!(self.0, DisableMouseCapture)
+    }
 }
 
-/// Acquires raw mode and the alternate screen, recording each resource at
-/// the attempt: a write that fails while flushing can still have emitted
-/// part of the sequence, so rollback must cover it. On failure the partial
-/// acquisition is rolled back; steps whose rollback fails stay owned.
+/// Acquires raw mode, the alternate screen, and mouse capture, recording each
+/// resource at the attempt: a write that fails while flushing can still have
+/// emitted part of the sequence, so rollback must cover it. On failure the
+/// partial acquisition is rolled back; steps whose rollback fails stay owned.
 fn acquire(io: &mut impl TerminalIo, owned: &mut Ownership) -> io::Result<()> {
     io.enable_raw()?;
     owned.raw = true;
     owned.alternate = true;
-    if let Err(error) = io.enter_alternate() {
+    owned.mouse = true;
+    if let Err(error) = io.enter_alternate().and_then(|()| io.enable_mouse()) {
         let _ = restore(io, owned);
         return Err(error);
     }
@@ -112,10 +128,20 @@ fn acquire(io: &mut impl TerminalIo, owned: &mut Ownership) -> io::Result<()> {
 /// error.
 fn restore(io: &mut impl TerminalIo, owned: &mut Ownership) -> io::Result<()> {
     let mut first_error = None;
+    if owned.mouse {
+        match io.disable_mouse() {
+            Ok(()) => owned.mouse = false,
+            Err(error) => first_error = Some(error),
+        }
+    }
     if owned.alternate {
         match io.leave_alternate() {
             Ok(()) => owned.alternate = false,
-            Err(error) => first_error = Some(error),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
     }
     if owned.raw {
@@ -142,7 +168,6 @@ pub struct TerminalGuard {
     owned: Ownership,
     stdout: Stdout,
 }
-
 impl TerminalGuard {
     /// Enters raw mode and the alternate screen.
     pub fn setup() -> io::Result<Self> {
@@ -182,7 +207,7 @@ impl TerminalGuard {
     /// Whether this guard still owns terminal state.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.owned.raw || self.owned.alternate
+        self.owned.raw || self.owned.alternate || self.owned.mouse
     }
 }
 
@@ -198,6 +223,7 @@ fn restore_published(io: &mut impl TerminalIo) {
     let mut owned = Ownership {
         raw: RAW_OWNED.load(Ordering::SeqCst),
         alternate: ALTERNATE_OWNED.load(Ordering::SeqCst),
+        mouse: MOUSE_OWNED.load(Ordering::SeqCst),
         published: true,
     };
     let _ = restore(io, &mut owned);
@@ -265,6 +291,14 @@ mod tests {
         fn leave_alternate(&mut self) -> io::Result<()> {
             self.record("leave_alternate")
         }
+
+        fn enable_mouse(&mut self) -> io::Result<()> {
+            self.record("enable_mouse")
+        }
+
+        fn disable_mouse(&mut self) -> io::Result<()> {
+            self.record("disable_mouse")
+        }
     }
 
     /// Both resources acquired but not yet published (as during setup).
@@ -272,6 +306,7 @@ mod tests {
         Ownership {
             raw: true,
             alternate: true,
+            mouse: true,
             published: false,
         }
     }
@@ -281,14 +316,16 @@ mod tests {
         let mut io = FakeIo::default();
         let mut state = Ownership::default();
         acquire(&mut io, &mut state).expect("acquire succeeds");
-        assert!(state.raw && state.alternate);
+        assert!(state.raw && state.alternate && state.mouse);
         restore(&mut io, &mut state).expect("restore succeeds");
-        assert!(!state.raw && !state.alternate);
+        assert!(!state.raw && !state.alternate && !state.mouse);
         assert_eq!(
             io.calls,
             [
                 "enable_raw",
                 "enter_alternate",
+                "enable_mouse",
+                "disable_mouse",
                 "leave_alternate",
                 "disable_raw"
             ]
@@ -305,17 +342,48 @@ mod tests {
         let error = acquire(&mut io, &mut state).expect_err("enter failure propagates");
         assert_eq!(error.kind(), io::ErrorKind::Other);
         // A failed flush may still have written part of the sequence, so
-        // rollback attempts the leave as well as disabling raw mode.
+        // rollback attempts the leave as well as disabling raw mode. The
+        // enter failure happens before mouse capture is attempted.
         assert_eq!(
             io.calls,
             [
                 "enable_raw",
                 "enter_alternate",
+                "disable_mouse",
                 "leave_alternate",
                 "disable_raw"
             ]
         );
-        assert!(!state.raw && !state.alternate, "rollback cleared ownership");
+        assert!(
+            !state.raw && !state.alternate && !state.mouse,
+            "rollback cleared ownership"
+        );
+    }
+
+    #[test]
+    fn failed_mouse_capture_rolls_back_the_full_setup() {
+        let mut io = FakeIo {
+            failures: vec!["enable_mouse"],
+            ..FakeIo::default()
+        };
+        let mut state = Ownership::default();
+        let error = acquire(&mut io, &mut state).expect_err("mouse failure propagates");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            io.calls,
+            [
+                "enable_raw",
+                "enter_alternate",
+                "enable_mouse",
+                "disable_mouse",
+                "leave_alternate",
+                "disable_raw"
+            ]
+        );
+        assert!(
+            !state.raw && !state.alternate && !state.mouse,
+            "rollback cleared ownership"
+        );
     }
 
     #[test]
@@ -326,15 +394,19 @@ mod tests {
         };
         let mut state = Ownership::default();
         assert!(acquire(&mut io, &mut state).is_err());
-        assert!(state.raw && state.alternate, "failed cleanup stays owned");
+        assert!(
+            state.raw && state.alternate && !state.mouse,
+            "failed cleanup stays owned; mouse capture was released"
+        );
         io.failures.clear();
         restore(&mut io, &mut state).expect("retry succeeds");
-        assert!(!state.raw && !state.alternate);
+        assert!(!state.raw && !state.alternate && !state.mouse);
         assert_eq!(
             io.calls,
             [
                 "enable_raw",
                 "enter_alternate",
+                "disable_mouse",
                 "leave_alternate",
                 "disable_raw",
                 "leave_alternate",
@@ -352,8 +424,12 @@ mod tests {
         let mut state = owned();
         let error = restore(&mut io, &mut state).expect_err("first error surfaces");
         assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(io.calls, ["leave_alternate", "disable_raw"]);
+        assert_eq!(
+            io.calls,
+            ["disable_mouse", "leave_alternate", "disable_raw"]
+        );
         assert!(!state.raw, "raw mode was still released");
+        assert!(!state.mouse, "mouse capture was still released");
         assert!(state.alternate, "failed step stays owned for retry");
     }
 
@@ -372,23 +448,36 @@ mod tests {
         let _lock = PUBLISHED_FLAGS.lock().expect("flag lock");
         RAW_OWNED.store(true, Ordering::SeqCst);
         ALTERNATE_OWNED.store(true, Ordering::SeqCst);
+        MOUSE_OWNED.store(true, Ordering::SeqCst);
 
         let mut io = FakeIo::default();
         restore_published(&mut io);
-        assert_eq!(io.calls, ["leave_alternate", "disable_raw"]);
+        assert_eq!(
+            io.calls,
+            ["disable_mouse", "leave_alternate", "disable_raw"]
+        );
         assert!(!RAW_OWNED.load(Ordering::SeqCst));
         assert!(!ALTERNATE_OWNED.load(Ordering::SeqCst));
+        assert!(!MOUSE_OWNED.load(Ordering::SeqCst));
 
         // Failed panic cleanup stays published for the guard's Drop retry.
         RAW_OWNED.store(true, Ordering::SeqCst);
         ALTERNATE_OWNED.store(true, Ordering::SeqCst);
+        MOUSE_OWNED.store(true, Ordering::SeqCst);
         let mut failing = FakeIo {
             failures: vec!["leave_alternate"],
             ..FakeIo::default()
         };
         restore_published(&mut failing);
-        assert_eq!(failing.calls, ["leave_alternate", "disable_raw"]);
+        assert_eq!(
+            failing.calls,
+            ["disable_mouse", "leave_alternate", "disable_raw"]
+        );
         assert!(!RAW_OWNED.load(Ordering::SeqCst), "raw mode released");
+        assert!(
+            !MOUSE_OWNED.load(Ordering::SeqCst),
+            "mouse capture released"
+        );
         assert!(
             ALTERNATE_OWNED.load(Ordering::SeqCst),
             "failed step kept for retry"
@@ -396,6 +485,7 @@ mod tests {
 
         RAW_OWNED.store(false, Ordering::SeqCst);
         ALTERNATE_OWNED.store(false, Ordering::SeqCst);
+        MOUSE_OWNED.store(false, Ordering::SeqCst);
     }
 
     #[test]
@@ -403,6 +493,7 @@ mod tests {
         let _lock = PUBLISHED_FLAGS.lock().expect("flag lock");
         RAW_OWNED.store(false, Ordering::SeqCst);
         ALTERNATE_OWNED.store(false, Ordering::SeqCst);
+        MOUSE_OWNED.store(false, Ordering::SeqCst);
 
         struct PanickingIo;
 
@@ -422,6 +513,14 @@ mod tests {
             fn leave_alternate(&mut self) -> io::Result<()> {
                 Ok(())
             }
+
+            fn enable_mouse(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn disable_mouse(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
 
         let mut state = Ownership::default();
@@ -430,7 +529,7 @@ mod tests {
         }));
         assert!(result.is_err(), "simulated panic propagates");
         assert!(
-            state.raw && state.alternate,
+            state.raw && state.alternate && state.mouse,
             "resources acquired before the panic are recorded"
         );
 
@@ -438,20 +537,25 @@ mod tests {
         // unpublished bits with the still-false published flags.
         state.sync_from_published();
         assert!(
-            state.raw && state.alternate,
+            state.raw && state.alternate && state.mouse,
             "acquired-unpublished ownership is never lost"
         );
 
-        // Faulted cleanup keeps both steps owned; the retry releases them.
+        // Faulted cleanup keeps the still-owned steps; mouse capture was
+        // already released by the faulted attempt, so the retry covers only
+        // the screen and raw mode.
         let mut failing = FakeIo {
             failures: vec!["leave_alternate", "disable_raw"],
             ..FakeIo::default()
         };
         assert!(restore(&mut failing, &mut state).is_err());
-        assert!(state.raw && state.alternate, "failed cleanup stays owned");
+        assert!(
+            state.raw && state.alternate && !state.mouse,
+            "failed cleanup stays owned"
+        );
         let mut healthy = FakeIo::default();
         restore(&mut healthy, &mut state).expect("retry restores");
-        assert!(!state.raw && !state.alternate);
+        assert!(!state.raw && !state.alternate && !state.mouse);
         assert_eq!(healthy.calls, ["leave_alternate", "disable_raw"]);
     }
 
@@ -462,12 +566,13 @@ mod tests {
         let mut state = owned();
         state.publish();
         assert!(state.published);
-        // The panic path released both resources and published that.
+        // The panic path released every resource and published that.
         RAW_OWNED.store(false, Ordering::SeqCst);
         ALTERNATE_OWNED.store(false, Ordering::SeqCst);
+        MOUSE_OWNED.store(false, Ordering::SeqCst);
         state.sync_from_published();
         assert!(
-            !state.raw && !state.alternate,
+            !state.raw && !state.alternate && !state.mouse,
             "released bits stay released"
         );
 
@@ -476,11 +581,14 @@ mod tests {
         state.publish();
         RAW_OWNED.store(false, Ordering::SeqCst);
         ALTERNATE_OWNED.store(true, Ordering::SeqCst);
+        MOUSE_OWNED.store(false, Ordering::SeqCst);
         state.sync_from_published();
         assert!(!state.raw && state.alternate, "failed step stays owned");
+        assert!(!state.mouse, "released mouse capture stays released");
 
         RAW_OWNED.store(false, Ordering::SeqCst);
         ALTERNATE_OWNED.store(false, Ordering::SeqCst);
+        MOUSE_OWNED.store(false, Ordering::SeqCst);
     }
 
     #[test]
@@ -488,6 +596,7 @@ mod tests {
         let _lock = PUBLISHED_FLAGS.lock().expect("flag lock");
         RAW_OWNED.store(false, Ordering::SeqCst);
         ALTERNATE_OWNED.store(false, Ordering::SeqCst);
+        MOUSE_OWNED.store(false, Ordering::SeqCst);
         let mut guard = TerminalGuard {
             owned: Ownership::default(),
             stdout: io::stdout(),
@@ -524,9 +633,9 @@ mod cov_terminal_private {
     use super::*;
 
     /// Operations that acquire the session, in call order.
-    const SETUP_ORDER: [&str; 2] = ["enable_raw", "enter_alternate"];
+    const SETUP_ORDER: [&str; 3] = ["enable_raw", "enter_alternate", "enable_mouse"];
     /// Operations that release the session, in call order.
-    const RELEASE_ORDER: [&str; 2] = ["leave_alternate", "disable_raw"];
+    const RELEASE_ORDER: [&str; 3] = ["disable_mouse", "leave_alternate", "disable_raw"];
 
     /// [`TerminalIo`] double that records every call and can fail or panic on
     /// a chosen operation.
@@ -584,6 +693,14 @@ mod cov_terminal_private {
         fn leave_alternate(&mut self) -> io::Result<()> {
             self.record("leave_alternate")
         }
+
+        fn enable_mouse(&mut self) -> io::Result<()> {
+            self.record("enable_mouse")
+        }
+
+        fn disable_mouse(&mut self) -> io::Result<()> {
+            self.record("disable_mouse")
+        }
     }
 
     /// Both resources acquired but not yet published, as during setup.
@@ -591,6 +708,7 @@ mod cov_terminal_private {
         Ownership {
             raw: true,
             alternate: true,
+            mouse: true,
             published: false,
         }
     }
@@ -604,7 +722,7 @@ mod cov_terminal_private {
         acquire(&mut io, &mut owned).expect("setup succeeds");
         assert_eq!(io.calls, SETUP_ORDER);
         assert!(
-            owned.raw && owned.alternate,
+            owned.raw && owned.alternate && owned.mouse,
             "each step is recorded at the attempt"
         );
         assert!(
@@ -614,7 +732,10 @@ mod cov_terminal_private {
 
         restore(&mut io, &mut owned).expect("restore succeeds");
         assert_eq!(io.calls, [SETUP_ORDER, RELEASE_ORDER].concat());
-        assert!(!owned.raw && !owned.alternate, "both steps released");
+        assert!(
+            !owned.raw && !owned.alternate && !owned.mouse,
+            "every step released"
+        );
 
         // Releasing an already released session writes nothing.
         restore(&mut io, &mut owned).expect("nothing left to restore");
@@ -631,9 +752,9 @@ mod cov_terminal_private {
         let mut owned = Ownership::default();
         for _ in 0..2 {
             acquire(&mut io, &mut owned).expect("setup succeeds");
-            assert!(owned.raw && owned.alternate);
+            assert!(owned.raw && owned.alternate && owned.mouse);
             restore(&mut io, &mut owned).expect("restore succeeds");
-            assert!(!owned.raw && !owned.alternate);
+            assert!(!owned.raw && !owned.alternate && !owned.mouse);
         }
         assert_eq!(
             io.calls,
@@ -658,7 +779,7 @@ mod cov_terminal_private {
             "nothing was acquired, so there is nothing to roll back"
         );
         assert!(
-            !owned.raw && !owned.alternate,
+            !owned.raw && !owned.alternate && !owned.mouse,
             "an unacquired resource is never recorded as owned"
         );
     }
@@ -673,10 +794,20 @@ mod cov_terminal_private {
             "the caller sees the enter failure, not the rollback's"
         );
         // A failed flush may already have emitted part of the sequence, so
-        // rollback covers the alternate screen as well as raw mode.
-        assert_eq!(io.calls, [SETUP_ORDER, RELEASE_ORDER].concat());
+        // rollback covers the alternate screen as well as raw mode. The
+        // enter failure happens before mouse capture is attempted.
+        assert_eq!(
+            io.calls,
+            [
+                "enable_raw",
+                "enter_alternate",
+                "disable_mouse",
+                "leave_alternate",
+                "disable_raw"
+            ]
+        );
         assert!(
-            !owned.raw && !owned.alternate,
+            !owned.raw && !owned.alternate && !owned.mouse,
             "a complete rollback leaves nothing owned"
         );
     }
@@ -692,6 +823,7 @@ mod cov_terminal_private {
         );
         assert!(!owned.raw, "the raw-mode rollback succeeded");
         assert!(owned.alternate, "the failed leave stays owned");
+        assert!(!owned.mouse, "mouse capture was released");
 
         let mut retry = RecordingIo::default();
         restore(&mut retry, &mut owned).expect("the retry succeeds");
@@ -700,7 +832,7 @@ mod cov_terminal_private {
             ["leave_alternate"],
             "only the step that is still owned is retried"
         );
-        assert!(!owned.raw && !owned.alternate);
+        assert!(!owned.raw && !owned.alternate && !owned.mouse);
     }
 
     #[test]
@@ -710,11 +842,12 @@ mod cov_terminal_private {
         assert!(acquire(&mut io, &mut owned).is_err());
         assert!(owned.raw, "the failed raw-mode rollback stays owned");
         assert!(!owned.alternate, "the screen rollback succeeded");
+        assert!(!owned.mouse, "mouse capture was released");
 
         let mut retry = RecordingIo::default();
         restore(&mut retry, &mut owned).expect("the retry succeeds");
         assert_eq!(retry.calls, ["disable_raw"]);
-        assert!(!owned.raw && !owned.alternate);
+        assert!(!owned.raw && !owned.alternate && !owned.mouse);
     }
 
     #[test]
@@ -731,12 +864,13 @@ mod cov_terminal_private {
             "a failed step does not skip the step after it"
         );
         assert!(!owned.raw, "the step after the failure still ran");
+        assert!(!owned.mouse, "mouse capture was still released");
         assert!(owned.alternate, "only the failed step stays owned");
 
         let mut retry = RecordingIo::default();
         restore(&mut retry, &mut owned).expect("the retry succeeds");
         assert_eq!(retry.calls, ["leave_alternate"]);
-        assert!(!owned.raw && !owned.alternate);
+        assert!(!owned.raw && !owned.alternate && !owned.mouse);
     }
 
     #[test]
@@ -749,15 +883,19 @@ mod cov_terminal_private {
             "the first failure is the one reported"
         );
         assert_eq!(io.calls, RELEASE_ORDER);
-        assert!(owned.raw && owned.alternate, "both failed steps stay owned");
+        assert!(
+            owned.raw && owned.alternate && !owned.mouse,
+            "both failed steps stay owned"
+        );
 
         let mut retry = RecordingIo::default();
         restore(&mut retry, &mut owned).expect("the retry succeeds");
         assert_eq!(
-            retry.calls, RELEASE_ORDER,
+            retry.calls,
+            ["leave_alternate", "disable_raw"],
             "the retry reattempts every step that is still owned"
         );
-        assert!(!owned.raw && !owned.alternate);
+        assert!(!owned.raw && !owned.alternate && !owned.mouse);
     }
 
     #[test]
@@ -768,6 +906,7 @@ mod cov_terminal_private {
         let mut owned = Ownership {
             raw: true,
             alternate: false,
+            mouse: false,
             published: false,
         };
         let error = restore(&mut raw_only, &mut owned).expect_err("raw-mode failure surfaces");
@@ -785,6 +924,7 @@ mod cov_terminal_private {
         let mut owned = Ownership {
             raw: false,
             alternate: true,
+            mouse: false,
             published: false,
         };
         let error = restore(&mut screen_only, &mut owned).expect_err("leave failure surfaces");
@@ -815,11 +955,12 @@ mod cov_terminal_private {
         }));
         assert!(result.is_err(), "the interrupt propagates");
         assert_eq!(
-            io.calls, SETUP_ORDER,
+            io.calls,
+            ["enable_raw", "enter_alternate"],
             "the step after the interrupt is never attempted"
         );
         assert!(
-            owned.raw && owned.alternate,
+            owned.raw && owned.alternate && owned.mouse,
             "resources acquired before the interrupt stay recorded for `Drop`"
         );
         assert!(
@@ -837,18 +978,20 @@ mod cov_terminal_private {
         );
         assert!(!owned.published);
 
-        // A faulted teardown keeps both steps owned; the retry releases them.
+        // A faulted teardown keeps the still-owned steps; mouse capture was
+        // already released by the faulted attempt, so the retry covers only
+        // the screen and raw mode.
         let mut failing = RecordingIo::failing(["leave_alternate", "disable_raw"]);
         assert!(restore(&mut failing, &mut owned).is_err());
         assert!(
-            owned.raw && owned.alternate,
+            owned.raw && owned.alternate && !owned.mouse,
             "a failed teardown stays owned"
         );
 
         let mut healthy = RecordingIo::default();
         restore(&mut healthy, &mut owned).expect("the retry restores");
-        assert_eq!(healthy.calls, RELEASE_ORDER);
-        assert!(!owned.raw && !owned.alternate);
+        assert_eq!(healthy.calls, ["leave_alternate", "disable_raw"]);
+        assert!(!owned.raw && !owned.alternate && !owned.mouse);
     }
 
     #[test]
@@ -885,25 +1028,27 @@ mod cov_terminal_private {
             restore(&mut io, &mut owned)
         }));
         assert!(result.is_err(), "the panic propagates out of restore");
-        assert_eq!(io.calls, ["leave_alternate"]);
+        assert_eq!(io.calls, ["disable_mouse", "leave_alternate"]);
         assert!(owned.alternate, "the interrupted step stays owned");
         assert!(owned.raw, "the unattempted step stays owned");
+        assert!(!owned.mouse, "the completed step was released");
 
         let mut retry = RecordingIo::default();
         restore(&mut retry, &mut owned).expect("the retry restores both");
-        assert_eq!(retry.calls, RELEASE_ORDER);
-        assert!(!owned.raw && !owned.alternate);
+        assert_eq!(retry.calls, ["leave_alternate", "disable_raw"]);
+        assert!(!owned.raw && !owned.alternate && !owned.mouse);
     }
 
     #[test]
     fn is_active_reports_any_retained_resource() {
         // `mem::forget` keeps `Drop` — which publishes ownership — out of
         // this module; see the scope limit above.
-        fn active(raw: bool, alternate: bool) -> bool {
+        fn active(raw: bool, alternate: bool, mouse: bool) -> bool {
             let guard = TerminalGuard {
                 owned: Ownership {
                     raw,
                     alternate,
+                    mouse,
                     published: false,
                 },
                 stdout: io::stdout(),
@@ -912,13 +1057,20 @@ mod cov_terminal_private {
             std::mem::forget(guard);
             active
         }
-        assert!(!active(false, false), "an unowned guard is inactive");
-        assert!(active(true, false), "retained raw mode keeps it active");
+        assert!(!active(false, false, false), "an unowned guard is inactive");
         assert!(
-            active(false, true),
+            active(true, false, false),
+            "retained raw mode keeps it active"
+        );
+        assert!(
+            active(false, true, false),
             "a retained alternate screen keeps it active"
         );
-        assert!(active(true, true));
+        assert!(
+            active(false, false, true),
+            "retained mouse capture keeps it active"
+        );
+        assert!(active(true, true, true));
     }
 
     #[test]

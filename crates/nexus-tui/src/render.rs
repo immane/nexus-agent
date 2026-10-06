@@ -19,7 +19,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    Widget,
+};
 
 use crate::keys::Focus;
 use crate::state::{AppState, ApprovalGeometry, PendingApprovalCard, wrapped_height};
@@ -186,17 +189,25 @@ fn abbreviate_home_with(path: &str, home: Option<&str>) -> String {
 
 fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
     let (width, height) = (area.width as usize, area.height as usize);
+    // A one-cell scrollbar appears only when history exceeds the window; the
+    // text then wraps one cell narrower so the bar never covers content.
+    let needs_bar = state.total_height(width.saturating_sub(1).max(1)) > height;
+    let text_width = if needs_bar && width > 1 {
+        width - 1
+    } else {
+        width
+    };
     // Reserve one row for the indicator before materializing the window, so
     // the live tail is never the line clipped away. Heights are cached, so
     // this probe neither re-measures nor re-renders history.
-    let banner = state.truncation_indicator(width, height);
+    let banner = state.truncation_indicator(text_width, height);
     let content_height = if banner {
         height.saturating_sub(1).max(1)
     } else {
         height
     };
-    state.set_viewport(width, content_height);
-    let view = state.visible_lines(width, content_height);
+    state.set_viewport(text_width, content_height);
+    let view = state.visible_lines(text_width, content_height);
     let mut lines: Vec<Line> = Vec::with_capacity(content_height + 1);
     if view.hidden_above > 0 || view.retention_truncated {
         lines.push(Line::from(Span::styled(
@@ -211,7 +222,28 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
     for line in view.lines {
         lines.push(Line::from(line));
     }
-    Paragraph::new(lines).render(area, buf);
+    let text_area = Rect {
+        width: text_width as u16,
+        ..area
+    };
+    Paragraph::new(lines).render(text_area, buf);
+    if needs_bar && width > 1 {
+        let total = state.total_height(text_width);
+        let mut bar = ScrollbarState::new(total)
+            .position(view.hidden_above)
+            .viewport_content_length(content_height);
+        let bar_area = Rect {
+            x: area.x + area.width.saturating_sub(1),
+            width: 1,
+            ..area
+        };
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("▐")
+            .render(bar_area, buf, &mut bar);
+    }
 }
 
 /// Builds the bounded, wrapped approval card. The compact card shows all
@@ -520,7 +552,7 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         Span::raw(" m0-test "),
         Span::styled(cancel_hint, Style::default().fg(Color::Yellow)),
         Span::styled(approval_hint, Style::default().fg(Color::Yellow)),
-        Span::raw(" tab focus · enter submit · m model · fold ←/→ · approval i/a/d · ctrl+d quit "),
+        Span::raw(" tab focus · enter submit · ↕ · m model · fold · approval i/a/d · ctrl+d quit "),
         Span::raw(
             format!(
                 "focus:{focus:?} stale:{} seq:{} dropped:{}",
@@ -1573,9 +1605,12 @@ mod cov_render_private {
             6,
             "the notice row is reserved before the window is materialized"
         );
-        let view = state.visible_lines(40, state.viewport_height());
+        let view = state.visible_lines(39, state.viewport_height());
+        // The scrollbar owns the last body column, so the notice text is
+        // compared without it.
+        let notice_text: String = rows[0].chars().take(39).collect();
         assert_eq!(
-            rows[0].trim_end(),
+            notice_text.trim_end(),
             format!("… {}↑ presentation-truncated", view.hidden_above),
             "the notice reports the exact hidden-line count"
         );

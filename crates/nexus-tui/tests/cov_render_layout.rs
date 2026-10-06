@@ -266,8 +266,12 @@ fn drawn_as(drawn: &str, model: &str) -> bool {
 /// The body region must hold exactly the window the renderer measured: an
 /// optional bound notice, then one screen row per presented line, and nothing
 /// else. This is the agreement between wrapped heights and drawn rows.
+///
+/// When history exceeds the window the renderer shows a one-cell scrollbar
+/// and wraps the text one cell narrower, so the model is built at that same
+/// text width and the bar column is excluded from every comparison.
 fn assert_body_matches_measurement(state: &AppState, rows: &[String], width: u16) {
-    let width = width as usize;
+    let width = (width as usize).max(1);
     let body = body_region(rows);
     let content_height = state.viewport_height();
     assert!(
@@ -275,13 +279,26 @@ fn assert_body_matches_measurement(state: &AppState, rows: &[String], width: u16
         "measured viewport {content_height} fits the {} body rows",
         body.len()
     );
-    let view = state.visible_lines(width, content_height);
+    let bar = width > 1 && state.total_height(width - 1) > body.len();
+    let text_width = if bar { width - 1 } else { width };
+    let view = state.visible_lines(text_width, content_height);
+    let text_of = |row: &String| {
+        if bar {
+            row.chars().take(text_width).collect::<String>()
+        } else {
+            row.clone()
+        }
+    };
     assert!(
         view.lines.iter().all(|line| !line.trim().is_empty()),
         "the transcript has no blank lines, so a blank row is padding"
     );
     let notice = usize::from(view.hidden_above > 0 || view.retention_truncated);
-    let drawn = body.iter().filter(|row| !row.trim().is_empty()).count();
+    let drawn = body
+        .iter()
+        .map(text_of)
+        .filter(|row| !row.trim().is_empty())
+        .count();
     assert_eq!(
         drawn,
         notice + view.lines.len(),
@@ -294,6 +311,7 @@ fn assert_body_matches_measurement(state: &AppState, rows: &[String], width: u16
     assert!(
         body[notice..notice + view.lines.len()]
             .iter()
+            .map(text_of)
             .zip(&view.lines)
             .all(|(row, line)| row.trim_end() == line.trim_end()),
         "drawn rows match the presented lines"
@@ -301,6 +319,7 @@ fn assert_body_matches_measurement(state: &AppState, rows: &[String], width: u16
     assert!(
         body[notice + view.lines.len()..]
             .iter()
+            .map(text_of)
             .all(|row| row.trim().is_empty()),
         "no rows are drawn beyond the measured window"
     );

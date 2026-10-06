@@ -17,6 +17,7 @@
 //! | Composer | `Esc` | Park focus in the viewport (never cancel) |
 //! | Composer | printable char | Type into the draft |
 //! | Composer | `Backspace` | Delete last draft char |
+//! | Composer | `Up`/`Down` | Previous/next submitted input (shown in the composer) |
 //! | Viewport | `Up`/`k`, `Down`/`j` | Move selection (scrolls) |
 //! | Viewport | `PageUp`/`PageDown` | Scroll one page |
 //! | Viewport | `Left`/`h`, `Right`/`l` | Fold/unfold the selected entry |
@@ -143,6 +144,8 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
         (Focus::Composer, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::Composer, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::Composer, KeyCode::Backspace) => Some(Action::Backspace),
+        (Focus::Composer, KeyCode::Up) => Some(Action::ScrollUp),
+        (Focus::Composer, KeyCode::Down) => Some(Action::ScrollDown),
         (Focus::Composer, KeyCode::Char(char)) if is_composable(char) => Some(Action::Type(char)),
         (Focus::Viewport, KeyCode::Up | KeyCode::Char('k')) => Some(Action::ScrollUp),
         (Focus::Viewport, KeyCode::Down | KeyCode::Char('j')) => Some(Action::ScrollDown),

@@ -130,6 +130,21 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::Backspace,
         doc: "Composer | Backspace | Delete last draft char",
     },
+    // Composer | Up/Down | Previous/next submitted input in the composer
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::Up,
+        modifiers: NONE,
+        intent: Action::ScrollUp,
+        doc: "Composer | Up | Previous submitted input",
+    },
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::Down,
+        modifiers: NONE,
+        intent: Action::ScrollDown,
+        doc: "Composer | Down | Next submitted input",
+    },
     // Viewport | Up/k, Down/j | Move selection (scrolls)
     Row {
         focus: Focus::Viewport,
@@ -383,8 +398,14 @@ const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
     ("Cancel", &ALL_FOCUSES),
     ("Quit", &ALL_FOCUSES),
     ("ParkFocus", &[Focus::Composer, Focus::ApprovalCard]),
-    ("ScrollUp", &[Focus::Viewport, Focus::ApprovalCard]),
-    ("ScrollDown", &[Focus::Viewport, Focus::ApprovalCard]),
+    (
+        "ScrollUp",
+        &[Focus::Composer, Focus::Viewport, Focus::ApprovalCard],
+    ),
+    (
+        "ScrollDown",
+        &[Focus::Composer, Focus::Viewport, Focus::ApprovalCard],
+    ),
     ("PageUp", &[Focus::Viewport, Focus::ApprovalCard]),
     ("PageDown", &[Focus::Viewport, Focus::ApprovalCard]),
 ];
@@ -620,12 +641,12 @@ fn every_published_row_maps_to_its_documented_intent() {
 
 #[test]
 fn published_table_has_no_duplicate_or_conflicting_rows() {
-    // 36 literal rows: 6 composer, 13 viewport, 11 approval, and the 6
+    // 38 literal rows: 8 composer, 13 viewport, 11 approval, and the 6
     // focus-expanded `Any` rows (`Ctrl+C` and `Ctrl+D` in each focus). The
-    // 37th published row is parameterized over printable characters.
+    // 39th published row is parameterized over printable characters.
     assert_eq!(
         PUBLISHED_ROWS.len(),
-        36,
+        38,
         "the transcription lost or invented a published row"
     );
     // The oracle is only meaningful if it is a function: no `(focus, key,
@@ -731,6 +752,8 @@ fn intents_are_partitioned_by_focus() {
                 "Newline",
                 "ParkFocus",
                 "Quit",
+                "ScrollDown",
+                "ScrollUp",
                 "Submit",
                 "Type",
             ],
@@ -993,13 +1016,25 @@ fn approval_rows_answer_only_under_the_approval_card_and_never_alias() {
         vec![row_label(Focus::ApprovalCard, KeyCode::Char('d'), NONE)],
         "only `d` denies"
     );
-    // The approval card's navigation rows are shared with the viewport and
-    // decide nothing.
-    for family in ["ScrollUp", "ScrollDown", "PageUp", "PageDown"] {
+    // The arrow rows are shared across composer, viewport, and the approval
+    // card, and decide nothing; paging rows belong to the viewport and the
+    // approval card only (the composer pages nothing; the wheel covers it).
+    for family in ["ScrollUp", "ScrollDown"] {
+        assert_eq!(
+            focuses_producing(family, &space),
+            vec![
+                String::from("ApprovalCard"),
+                String::from("Composer"),
+                String::from("Viewport")
+            ],
+            "{family} navigates or scrolls detail and decides nothing"
+        );
+    }
+    for family in ["PageUp", "PageDown"] {
         assert_eq!(
             focuses_producing(family, &space),
             vec![String::from("ApprovalCard"), String::from("Viewport")],
-            "{family} scrolls the expanded detail and decides nothing"
+            "{family} pages the viewport or detail and decides nothing"
         );
     }
     assert_eq!(

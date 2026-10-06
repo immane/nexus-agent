@@ -234,7 +234,20 @@ fn focus_gaps_never_borrow_another_focus_binding() {
         "no viewport submit row",
     );
     expect_none(Focus::ApprovalCard, key(KeyCode::Enter), "no approval row");
-    expect_none(Focus::Composer, key(KeyCode::Up), "no composer navigation");
+    // The composer shows the previous/next submitted input right in the
+    // draft, so recall is always visible; paging is unbound there (the
+    // mouse wheel and Viewport keys cover free scrolling).
+    assert_eq!(
+        map_key(Focus::Composer, key(KeyCode::Up)),
+        Some(Action::ScrollUp),
+        "composer Up recalls the previous submitted input"
+    );
+    assert_eq!(
+        map_key(Focus::Composer, key(KeyCode::Down)),
+        Some(Action::ScrollDown),
+        "composer Down recalls the next submitted input"
+    );
+    expect_none(Focus::Composer, key(KeyCode::PageUp), "no composer paging");
     expect_none(
         Focus::Composer,
         key(KeyCode::PageDown),

@@ -52,6 +52,9 @@ pub const MAX_APPROVAL_FIELD_BYTES: usize = 4 * nexus_core::commands::MAX_SUMMAR
 pub const MAX_APPROVAL_CARD_BYTES: usize = 3 * MAX_APPROVAL_FIELD_BYTES;
 /// Composer cap tracking the command input bound.
 pub const MAX_COMPOSER_BYTES: usize = nexus_core::commands::MAX_INPUT_BYTES;
+/// Maximum recalled composer inputs (M0-test choice). Older submissions
+/// are forgotten first; the bound keeps recall memory finite.
+pub const MAX_HISTORY_ENTRIES: usize = 128;
 /// Maximum redraw rate: event-driven redraws are coalesced to at most one
 /// frame per interval so a saturated stream cannot force full relayouts.
 pub const MAX_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
@@ -514,6 +517,14 @@ pub struct AppState {
     /// Presentation-only drops; accepted records are unaffected.
     pub dropped_entries: usize,
     composer: String,
+    /// Submitted inputs for composer recall, oldest first, bounded by
+    /// [`MAX_HISTORY_ENTRIES`]. `Up` walks older, `Down` walks newer.
+    composer_history: Vec<String>,
+    /// Recalled history index (`None` means the live draft is shown).
+    history_cursor: Option<usize>,
+    /// Live draft stashed when recall starts; restored when `Down` walks
+    /// past the newest entry.
+    history_stash: String,
     /// Entry index selected in the viewport (None follows the live tail).
     selected: Option<usize>,
     /// Wrapped lines hidden below the viewport bottom.
@@ -581,6 +592,9 @@ impl AppState {
             retained_bytes: 0,
             dropped_entries: 0,
             composer: String::new(),
+            composer_history: Vec::new(),
+            history_cursor: None,
+            history_stash: String::new(),
             selected: None,
             scrollback: 0,
             pending_approval: None,
@@ -926,14 +940,61 @@ impl AppState {
 
     /// Records a user submission in the viewport (the runtime send itself
     /// goes through a [`nexus_core::Command`], never through this method).
+    /// The sanitized input also joins the bounded recall history, and any
+    /// in-progress recall is abandoned.
     pub fn record_submitted(&mut self, input: &str) {
+        let clean = sanitize(input);
         let mut entry = Entry::new(EntryKind::User, "you");
-        for line in sanitize(input).split('\n') {
+        for line in clean.split('\n') {
             entry.push_line(line);
         }
         self.push_entry(entry);
         self.scrollback = 0;
         self.selected = None;
+        if !clean.is_empty() && self.composer_history.last() != Some(&clean) {
+            self.composer_history.push(clean);
+            while self.composer_history.len() > MAX_HISTORY_ENTRIES {
+                self.composer_history.remove(0);
+            }
+        }
+        self.history_cursor = None;
+        self.history_stash.clear();
+    }
+
+    /// Recalls the previous submitted input into the composer (`Up`).
+    /// Returns false when there is no history to show. Manual edits abandon
+    /// the recall position (see [`AppState::composer_type`]).
+    pub fn recall_prev(&mut self) -> bool {
+        if self.composer_history.is_empty() {
+            return false;
+        }
+        let cursor = match self.history_cursor {
+            None => {
+                self.history_stash = std::mem::take(&mut self.composer);
+                self.composer_history.len() - 1
+            }
+            Some(index) => index.saturating_sub(1),
+        };
+        self.history_cursor = Some(cursor);
+        self.composer = self.composer_history[cursor].clone();
+        true
+    }
+
+    /// Recalls the next submitted input (`Down`); walking past the newest
+    /// entry restores the stashed live draft. Returns false when no recall
+    /// is in progress.
+    pub fn recall_next(&mut self) -> bool {
+        let Some(cursor) = self.history_cursor else {
+            return false;
+        };
+        if cursor + 1 < self.composer_history.len() {
+            self.history_cursor = Some(cursor + 1);
+            self.composer = self.composer_history[cursor + 1].clone();
+        } else {
+            self.history_cursor = None;
+            self.composer = std::mem::take(&mut self.history_stash);
+        }
+        true
     }
 
     /// Total wrapped height of all retained entries at `width`, using cached
@@ -1118,6 +1179,7 @@ impl AppState {
         }
         if self.composer.len() + char.len_utf8() <= MAX_COMPOSER_BYTES {
             self.composer.push(char);
+            self.abandon_recall();
         }
     }
 
@@ -1125,12 +1187,24 @@ impl AppState {
     pub fn composer_newline(&mut self) {
         if self.composer.len() < MAX_COMPOSER_BYTES {
             self.composer.push('\n');
+            self.abandon_recall();
         }
     }
 
     /// Deletes the last composer char. Returns false when already empty.
     pub fn composer_backspace(&mut self) -> bool {
-        self.composer.pop().is_some()
+        let removed = self.composer.pop().is_some();
+        if removed {
+            self.abandon_recall();
+        }
+        removed
+    }
+
+    /// A manual edit leaves recall mode: the draft is live again and the
+    /// stash is dropped, so the next `Up` restarts from the newest entry.
+    fn abandon_recall(&mut self) {
+        self.history_cursor = None;
+        self.history_stash.clear();
     }
 
     /// Clears the composer draft, returning the stashed text.
@@ -2309,6 +2383,62 @@ mod tests {
         assert!(!state.composer_backspace());
     }
 
+    #[test]
+    fn composer_recall_walks_submissions_and_restores_the_draft() {
+        let mut state = AppState::new();
+        assert!(!state.recall_prev(), "no history recalls nothing");
+        assert!(!state.recall_next(), "no recall in progress");
+        state.record_submitted("first");
+        state.record_submitted("second");
+        state.composer_type('d');
+        state.composer_type('r');
+        assert_eq!(state.composer(), "dr");
+        assert!(state.recall_prev());
+        assert_eq!(state.composer(), "second");
+        assert!(state.recall_prev());
+        assert_eq!(state.composer(), "first");
+        assert!(state.recall_prev());
+        assert_eq!(state.composer(), "first", "recall stops at the oldest");
+        assert!(state.recall_next());
+        assert_eq!(state.composer(), "second");
+        assert!(state.recall_next());
+        assert_eq!(state.composer(), "dr", "the stashed draft is restored");
+        assert!(!state.recall_next(), "recall ended");
+    }
+
+    #[test]
+    fn composer_edits_and_new_submits_abandon_recall() {
+        let mut state = AppState::new();
+        state.record_submitted("first");
+        state.record_submitted("second");
+        assert!(state.recall_prev());
+        assert_eq!(state.composer(), "second");
+        state.composer_type('!');
+        assert_eq!(state.composer(), "second!");
+        // The edit abandoned recall: Up restarts from the newest entry.
+        assert!(state.recall_prev());
+        assert_eq!(state.composer(), "second");
+        state.record_submitted("third");
+        assert!(!state.recall_next(), "a submit abandons recall");
+        assert!(state.recall_prev());
+        assert_eq!(state.composer(), "third");
+    }
+
+    #[test]
+    fn composer_history_is_bounded_and_skips_empty_submits() {
+        let mut state = AppState::new();
+        state.record_submitted("");
+        assert!(!state.recall_prev(), "empty submits leave no history");
+        for index in 0..(MAX_HISTORY_ENTRIES + 10) {
+            state.record_submitted(&format!("task {index}"));
+        }
+        // The oldest entries were forgotten; the newest is recalled first.
+        assert!(state.recall_prev());
+        assert_eq!(
+            state.composer(),
+            format!("task {}", MAX_HISTORY_ENTRIES + 9)
+        );
+    }
     #[test]
     fn composer_type_rejects_control_and_bidi_chars_directly() {
         let mut state = AppState::new();
