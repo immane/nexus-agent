@@ -1584,6 +1584,14 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             front.focus = Focus::Composer;
         }
         Action::Cancel => {
+            // A non-empty draft goes first: the press clears it (and leaves
+            // recall mode) instead of cancelling or quitting. The next press
+            // then cancels a live run, or quits when there is nothing to
+            // cancel, so quitting always takes two deliberate presses.
+            if !front.state.composer().is_empty() {
+                front.state.composer_take();
+                return false;
+            }
             if !front.state.can_cancel() {
                 return true;
             }
@@ -4123,6 +4131,36 @@ mod cov_main_topup {
         // A terminal outcome returns focus for the next task.
         assert!(front.apply_events(vec![finished(&run, 3)]));
         assert_eq!(front.focus, Focus::Composer);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_clears_the_draft_before_cancelling_or_quitting() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.state.composer_type('h');
+        front.state.composer_type('i');
+
+        // First press clears the draft: no quit, no runtime command.
+        assert!(!handle_key(&mut front, &runtime, ctrl('c')).await);
+        assert_eq!(front.state.composer(), "");
+        assert_eq!(front.request_counter, 0, "clearing issues no command");
+
+        // Second press, with an empty draft and nothing live, quits.
+        assert!(!front.state.can_cancel());
+        assert!(handle_key(&mut front, &runtime, ctrl('c')).await);
+
+        // While streaming, a draft is still cleared first; the run survives
+        // until the next press cancels it.
+        let run = run_id("run-cancel-after-clear");
+        let mut live = Frontend::new(session());
+        live.merger.adopt(&run);
+        live.apply_events(vec![started(&run, 0)]);
+        live.state.composer_type('x');
+        assert!(!handle_key(&mut live, &runtime, ctrl('c')).await);
+        assert_eq!(live.state.composer(), "");
+        assert_eq!(live.request_counter, 0, "clearing does not cancel");
+        assert!(!handle_key(&mut live, &runtime, ctrl('c')).await);
+        assert_eq!(live.request_counter, 1, "the second press cancels");
     }
 
     #[tokio::test]

@@ -102,7 +102,7 @@ impl SlashCommand {
          /session [new|list|switch] — manage conversation sessions\n\
          /quit — leave the TUI\n\
          keys: Tab focus · Enter submit · Up/Down recall input · mouse wheel scrolls · Left/Right fold · Esc parks (never cancels) · \
-         Ctrl+C cancels · Ctrl+D quits"
+         Ctrl+C clears the composer, then cancels a live run, then quits · Ctrl+D quits"
     }
 }
 

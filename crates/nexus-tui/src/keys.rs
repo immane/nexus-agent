@@ -31,7 +31,7 @@
 //! | Approval | `PageUp`/`PageDown` | Page the expanded detail |
 //! | Approval | `Tab` | Switch focus |
 //! | Approval | `Esc` | Close the expanded detail, else park focus |
-//! | Any | `Ctrl+C` | Cancel while cancellable (caller checks
+//! | Any | `Ctrl+C` | Clear the composer first; then cancel while cancellable (caller checks
 //! [`crate::AppState::can_cancel`]), else quit |
 //! | Any | `Ctrl+D` | Quit |
 //!
@@ -95,7 +95,8 @@ pub enum Action {
     /// Open or close the expanded approval detail. Inspection only: it
     /// displays hidden rows and never issues a decision.
     InspectApproval,
-    /// Cancel streaming work or a pending approval.
+    /// Clear the composer if it holds a draft, else cancel streaming work
+    /// or a pending approval.
     Cancel,
     /// Leave the TUI.
     Quit,

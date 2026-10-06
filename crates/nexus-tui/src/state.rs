@@ -1207,8 +1207,11 @@ impl AppState {
         self.history_stash.clear();
     }
 
-    /// Clears the composer draft, returning the stashed text.
+    /// Clears the composer draft, returning the stashed text. Leaving
+    /// recall mode as well, so a cleared draft never resurrects recalled
+    /// history on the next key.
     pub fn composer_take(&mut self) -> String {
+        self.abandon_recall();
         std::mem::take(&mut self.composer)
     }
 

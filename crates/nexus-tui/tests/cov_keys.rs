@@ -326,27 +326,27 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::ParkFocus,
         doc: "Approval | Esc | Close the expanded detail, else park focus",
     },
-    // Any | Ctrl+C | Cancel while cancellable (the caller checks can_cancel)
+    // Any | Ctrl+C | Clear the composer first, else cancel/quit
     Row {
         focus: Focus::Composer,
         code: KeyCode::Char('c'),
         modifiers: KeyModifiers::CONTROL,
         intent: Action::Cancel,
-        doc: "Any | Ctrl+C | Cancel while cancellable, else quit",
+        doc: "Any | Ctrl+C | Clear composer, else cancel or quit",
     },
     Row {
         focus: Focus::Viewport,
         code: KeyCode::Char('c'),
         modifiers: KeyModifiers::CONTROL,
         intent: Action::Cancel,
-        doc: "Any | Ctrl+C | Cancel while cancellable, else quit",
+        doc: "Any | Ctrl+C | Clear composer, else cancel or quit",
     },
     Row {
         focus: Focus::ApprovalCard,
         code: KeyCode::Char('c'),
         modifiers: KeyModifiers::CONTROL,
         intent: Action::Cancel,
-        doc: "Any | Ctrl+C | Cancel while cancellable, else quit",
+        doc: "Any | Ctrl+C | Clear composer, else cancel or quit",
     },
     // Any | Ctrl+D | Quit
     Row {
