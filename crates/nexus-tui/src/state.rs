@@ -612,8 +612,7 @@ pub struct ApprovalGeometry {
 /// Model variant cycle, in order: the default (shown as nothing) plus the
 /// named tiers. Variants are presentation-only for now: they name the
 /// composer title and ride no request field until a provider needs one.
-pub const MODEL_VARIANTS: [&str; 7] =
-    ["", "minimal", "low", "medium", "high", "xhigh", "max"];
+pub const MODEL_VARIANTS: [&str; 7] = ["", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Bottom-anchored visible window over the conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]

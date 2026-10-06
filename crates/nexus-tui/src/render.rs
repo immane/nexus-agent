@@ -954,7 +954,10 @@ mod tests {
                 state.composer_type(char);
             }
             draw(&mut state, &mut terminal, Focus::Composer);
-            assert_eq!(state.composer_take(), "\u{7528}\u{8868}\u{683c}\u{5217}\u{51fa}\u{6765}");
+            assert_eq!(
+                state.composer_take(),
+                "\u{7528}\u{8868}\u{683c}\u{5217}\u{51fa}\u{6765}"
+            );
             state.notice("run r1 finished: Completed");
             draw(&mut state, &mut terminal, Focus::Composer);
             let rows: Vec<String> = screen(&terminal).lines().map(str::to_owned).collect();
@@ -2610,7 +2613,6 @@ mod cov_render_private {
             .clone();
         assert!(!faded.contains("gone"), "{faded:?}");
     }
-
 
     #[test]
     fn composer_border_names_the_mode_and_marks_read_only() {

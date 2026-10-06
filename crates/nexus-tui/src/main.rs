@@ -1383,10 +1383,10 @@ fn clipboard_command(
             return Some(("wl-copy", &[] as &[&str]));
         }
         if probe("xclip") {
-            return Some(("xclip", &["-selection", "clipboard"]));
+            return Some(("xclip", &["-selection", "clipboard"] as &[&str]));
         }
         if probe("xsel") {
-            return Some(("xsel", &["--clipboard", "--input"]));
+            return Some(("xsel", &["--clipboard", "--input"] as &[&str]));
         }
     }
     None
@@ -4529,7 +4529,7 @@ mod cov_main_topup {
             let xclip = |name: &str| name == "xclip";
             assert_eq!(
                 clipboard_command(&xclip),
-                Some(("xclip", &["-selection", "clipboard"]))
+                Some(("xclip", &["-selection", "clipboard"] as &[&str]))
             );
             // Wayland first when both exist.
             let both = |name: &str| name == "wl-copy" || name == "xclip";
