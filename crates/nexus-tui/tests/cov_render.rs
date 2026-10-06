@@ -529,7 +529,7 @@ fn retention_drops_are_bounded_counted_and_visible() {
         "retention drops must be visible: {screen:?}"
     );
     assert!(
-        screen.contains("entry 177"),
+        screen.contains(&format!("entry {}", MAX_RETAINED_ENTRIES + 49)),
         "the newest retained entry stays visible: {screen:?}"
     );
     assert!(

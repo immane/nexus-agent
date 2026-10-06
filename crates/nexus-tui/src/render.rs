@@ -942,6 +942,45 @@ fn counter(value: Option<u64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frames_never_duplicate_the_composer_text_or_leave_stale_draft() {
+        // Two consecutive frames through one backend (which keeps cells the
+        // new frame never repaints, like a real terminal): a draft frame,
+        // then submitted-and-cleared. The draft must vanish completely and
+        // the empty-draft placeholder must appear exactly once.
+        for (width, height) in [(80u16, 24u16), (100, 30), (120, 40)] {
+            let (mut state, mut terminal) = harness(width, height);
+            for char in "\u{7528}\u{8868}\u{683c}\u{5217}\u{51fa}\u{6765}".chars() {
+                state.composer_type(char);
+            }
+            draw(&mut state, &mut terminal, Focus::Composer);
+            assert_eq!(state.composer_take(), "\u{7528}\u{8868}\u{683c}\u{5217}\u{51fa}\u{6765}");
+            state.notice("run r1 finished: Completed");
+            draw(&mut state, &mut terminal, Focus::Composer);
+            let rows: Vec<String> = screen(&terminal).lines().map(str::to_owned).collect();
+            let boxes = rows
+                .iter()
+                .filter(|row| row.contains("composer (fixed)"))
+                .count();
+            assert_eq!(boxes, 1, "one composer box at {width}x{height}: {rows:?}");
+            let placeholders = rows
+                .iter()
+                .filter(|row| row.contains("Type a task"))
+                .count();
+            assert_eq!(
+                placeholders, 1,
+                "placeholder exactly once at {width}x{height}: {rows:?}"
+            );
+            assert!(
+                !rows.iter().any(|row| row.contains("\u{7528}\u{8868}")),
+                "no stale draft cells at {width}x{height}: {rows:?}"
+            );
+            assert!(
+                rows[height as usize - 1].contains("v0.1.0"),
+                "footer pinned last at {width}x{height}: {rows:?}"
+            );
+        }
+    }
     use super::*;
     use nexus_core::{
         ApprovalId, ApprovalNotice, CallId, EventPayload, RequestId, RunEvent, SessionId,
@@ -2571,6 +2610,7 @@ mod cov_render_private {
             .clone();
         assert!(!faded.contains("gone"), "{faded:?}");
     }
+
 
     #[test]
     fn composer_border_names_the_mode_and_marks_read_only() {

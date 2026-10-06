@@ -10,11 +10,11 @@ Source: P0 consistency review of all draft contracts, designs, decisions, and ta
    | Budget | M0-test value |
    | --- | --- |
    | Model turns per run | 8 |
-   | Tool calls per run | 16 |
-   | Tool calls per turn | 8, declared order, sequential |
+   | Tool calls per run | 64 |
+   | Tool calls per turn | 16, declared order, sequential |
    | Run duration | 300 s (monotonic clock) |
    | Per-tool timeout | 60 s |
-   | Retained context items | 128 |
+   | Retained context items | 256 |
    | Streamed tool-argument assembly | 65,536 bytes |
    | Tool output (progress + final share one budget) | 262,144 bytes |
    | Event data channel | 1,024 events |

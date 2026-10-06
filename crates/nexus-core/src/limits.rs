@@ -49,15 +49,18 @@ impl Limits {
     /// M0-TEST: model turns per run. Not a product default.
     pub const M0_TEST_MODEL_TURNS_PER_RUN: u32 = 8;
     /// M0-TEST: tool calls per run. Not a product default.
-    pub const M0_TEST_TOOL_CALLS_PER_RUN: u32 = 16;
+    pub const M0_TEST_TOOL_CALLS_PER_RUN: u32 = 64;
     /// M0-TEST: tool calls per turn. Not a product default.
-    pub const M0_TEST_TOOL_CALLS_PER_TURN: u32 = 8;
+    pub const M0_TEST_TOOL_CALLS_PER_TURN: u32 = 16;
     /// M0-TEST: run duration in seconds. Not a product default.
     pub const M0_TEST_RUN_DURATION_SECS: u64 = 300;
     /// M0-TEST: per-tool timeout in seconds. Not a product default.
     pub const M0_TEST_PER_TOOL_TIMEOUT_SECS: u64 = 60;
     /// M0-TEST: retained context items. Not a product default.
-    pub const M0_TEST_RETAINED_CONTEXT_ITEMS: usize = 128;
+    /// Raised alongside the 64-call run budget: a maxed-out run banks two
+    /// context items per call, so the ceiling must clear that plus turns
+    /// and margin.
+    pub const M0_TEST_RETAINED_CONTEXT_ITEMS: usize = 256;
     /// M0-TEST: streamed tool-argument assembly budget in bytes. Not a product default.
     pub const M0_TEST_ARG_ASSEMBLY_BYTES: usize = 65_536;
     /// M0-TEST: tool output budget in bytes, shared by progress and final. Not a product default.
@@ -242,11 +245,11 @@ mod tests {
     fn m0_test_constants_match_lock_table() {
         let limits = Limits::m0_test();
         assert_eq!(limits.max_model_turns_per_run, 8);
-        assert_eq!(limits.max_tool_calls_per_run, 16);
-        assert_eq!(limits.max_tool_calls_per_turn, 8);
+        assert_eq!(limits.max_tool_calls_per_run, 64);
+        assert_eq!(limits.max_tool_calls_per_turn, 16);
         assert_eq!(limits.run_duration, Duration::from_secs(300));
         assert_eq!(limits.per_tool_timeout, Duration::from_secs(60));
-        assert_eq!(limits.retained_context_items, 128);
+        assert_eq!(limits.retained_context_items, 256);
         assert_eq!(limits.max_arg_assembly_bytes, 65_536);
         assert_eq!(limits.max_tool_output_bytes, 262_144);
         assert_eq!(limits.event_data_capacity, 1_024);
@@ -349,11 +352,11 @@ mod tests {
         let limits = Limits::m0_test();
         let cases: Vec<(&str, Result<(), AgentError>)> = vec![
             ("turns", limits.check_model_turns(8)),
-            ("calls-run", limits.check_tool_calls_for_run(16)),
-            ("calls-turn", limits.check_tool_calls_for_turn(8)),
+            ("calls-run", limits.check_tool_calls_for_run(64)),
+            ("calls-turn", limits.check_tool_calls_for_turn(16)),
             ("assembly", limits.check_arg_assembly_bytes(65_537)),
             ("output", limits.check_tool_output_bytes(262_145)),
-            ("context", limits.check_context_items(129)),
+            ("context", limits.check_context_items(257)),
             ("concurrency", limits.check_concurrent_ops(8)),
             ("data-channel", limits.check_event_data_buffered(1_024)),
             ("control-channel", limits.check_event_control_buffered(128)),

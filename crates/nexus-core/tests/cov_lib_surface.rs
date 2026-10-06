@@ -1088,7 +1088,7 @@ fn provider_surface_smoke() {
         Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize
     );
     assert_eq!(MAX_CONVERSATION_BYTES, 1_048_576);
-    assert_eq!(MAX_TOOL_DEFINITION_BYTES, 1_048_576);
+    assert_eq!(MAX_TOOL_DEFINITION_BYTES, 2_097_152);
     assert_eq!(MAX_PROFILE_LEN, 128);
     assert_eq!(MAX_CREDENTIAL_REF_LEN, 128);
     assert!(!DEFAULT_ADAPTER_IDENTITY.is_empty());
@@ -1324,7 +1324,7 @@ fn module_level_items_resolve_and_match_root_reexports() {
         nexus_core::provider::MAX_TOOL_DEFINITIONS,
         Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize
     );
-    assert_eq!(nexus_core::provider::MAX_TOOL_DEFINITION_BYTES, 1_048_576);
+    assert_eq!(nexus_core::provider::MAX_TOOL_DEFINITION_BYTES, 2_097_152);
     assert_eq!(nexus_core::tool::MAX_TOOL_DESCRIPTION_LEN, 1024);
     assert_eq!(nexus_core::tool::MAX_SCHEMA_BYTES, 65_536);
 

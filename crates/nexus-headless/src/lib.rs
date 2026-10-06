@@ -129,11 +129,11 @@ pub const MAX_REPORT_BYTES: usize = 262_144;
 pub const MAX_MANDATORY_EVENTS: usize = 256;
 
 /// M0-TEST: finite encoded-byte budget for mandatory control lines,
-/// measured on the exact formatted line. It covers the M0 worst case (16
+/// measured on the exact formatted line. It covers the M0 worst case (64
 /// tool-finished payloads at the 262,144-byte output budget, percent-encoded
 /// at three characters per byte) with headroom. Exceeding it refuses the
 /// report with an explicit operation error, never a silent drop.
-pub const MAX_MANDATORY_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_MANDATORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Terminal report for one headless task.
 pub struct HeadlessReport {

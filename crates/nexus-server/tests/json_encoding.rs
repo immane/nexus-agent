@@ -1033,20 +1033,28 @@ fn snapshot_json_encodes_known_outcomes_in_order_within_the_bound() {
     }
     assert_eq!(summaries.len(), 51, "every admissible combination is built");
     let bound = Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize;
+    // Cycle the matrix to the bound: the bound exceeds the admissible
+    // combinations, and repetition keeps construction order checkable.
+    let summaries: Vec<OutcomeSummary> = (0..bound)
+        .map(|index| summaries[index % summaries.len()].clone())
+        .collect();
+    let expected: Vec<Value> = (0..bound)
+        .map(|index| expected[index % expected.len()].clone())
+        .collect();
     let snapshot = Snapshot::new(
         session(),
         run(),
         Some(3),
         RunLifecycle::Active,
         Vec::new(),
-        summaries[..bound].to_vec(),
+        summaries,
         false,
     )
     .expect("a snapshot at the known-outcome bound builds");
     let encoded = snapshot_json(&snapshot);
     assert_eq!(
         encoded["known_outcomes"],
-        Value::Array(expected[..bound].to_vec()),
+        Value::Array(expected),
         "known outcomes keep their construction order"
     );
 }

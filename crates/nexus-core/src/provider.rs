@@ -32,7 +32,8 @@ pub const MAX_CONVERSATION_BYTES: usize = 1_048_576;
 pub const MAX_TOOL_DEFINITIONS: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize;
 /// Maximum aggregate tool-definition payload in bytes: tool identity name
 /// plus description plus schema text (M0-TEST representation choice).
-pub const MAX_TOOL_DEFINITION_BYTES: usize = 1_048_576;
+/// Sized to admit sixteen maximum-length specs with headroom.
+pub const MAX_TOOL_DEFINITION_BYTES: usize = 2_097_152;
 
 /// Named credential reference resolved only for the selected integration
 /// when needed. Never a secret value.

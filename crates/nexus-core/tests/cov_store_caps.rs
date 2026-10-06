@@ -69,7 +69,7 @@ fn store_test_caps_are_finite_positive_and_pinned() {
 
     // Pin the documented M0-test choices so a cap change is a conscious test
     // update, not silent drift.
-    assert_eq!(MAX_STORED_MESSAGES, 128);
+    assert_eq!(MAX_STORED_MESSAGES, 256);
     assert_eq!(MAX_SESSIONS, 64);
     assert_eq!(MAX_INTENT_RECORDS, 256);
     assert_eq!(MAX_OUTCOME_RECORDS, 256);

@@ -35,11 +35,11 @@ fn lock_table_values_are_pinned_by_the_public_constants() {
     // deliberate: editing a constant without the lock table must fail here
     // instead of passing by comparing the constant with itself.
     assert_eq!(Limits::M0_TEST_MODEL_TURNS_PER_RUN, 8);
-    assert_eq!(Limits::M0_TEST_TOOL_CALLS_PER_RUN, 16);
-    assert_eq!(Limits::M0_TEST_TOOL_CALLS_PER_TURN, 8);
+    assert_eq!(Limits::M0_TEST_TOOL_CALLS_PER_RUN, 64);
+    assert_eq!(Limits::M0_TEST_TOOL_CALLS_PER_TURN, 16);
     assert_eq!(Limits::M0_TEST_RUN_DURATION_SECS, 300);
     assert_eq!(Limits::M0_TEST_PER_TOOL_TIMEOUT_SECS, 60);
-    assert_eq!(Limits::M0_TEST_RETAINED_CONTEXT_ITEMS, 128);
+    assert_eq!(Limits::M0_TEST_RETAINED_CONTEXT_ITEMS, 256);
     assert_eq!(Limits::M0_TEST_ARG_ASSEMBLY_BYTES, 65_536);
     assert_eq!(Limits::M0_TEST_TOOL_OUTPUT_BYTES, 262_144);
     assert_eq!(Limits::M0_TEST_EVENT_DATA_CAPACITY, 1_024);
