@@ -35,5 +35,8 @@ pub use keys::{Action, Focus, map_key, next_focus};
 pub use markdown::{MdStyle, StyledRun};
 pub use render::render;
 pub use slash::{SessionArgs, SlashCommand};
-pub use state::{AppState, EntryKind, PendingApprovalCard, RefreshGate, VisibleView};
+pub use state::{
+    AppState, EntryKind, PendingApprovalCard, PointerGeometry, RefreshGate, SelPoint,
+    TextSelection, VisibleView,
+};
 pub use terminal::{TerminalGuard, install_panic_hook, restore_for_panic};

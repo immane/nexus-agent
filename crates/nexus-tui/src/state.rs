@@ -593,6 +593,50 @@ pub struct VisibleView {
     pub retention_truncated: bool,
 }
 
+/// One endpoint of a drag selection: a visible-window row plus the
+/// character column inside it. Rows index the current window output,
+/// never retained entries, so any scroll or content change clears the
+/// selection instead of letting it drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelPoint {
+    /// Window row (0 is the oldest visible line).
+    pub row: usize,
+    /// Character column inside the row.
+    pub col: usize,
+}
+
+/// Drag-selected text: either conversation rows or a composer draft
+/// range. At most one is active; a new press replaces it outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSelection {
+    /// Conversation rows between two window points, inclusive.
+    Body { anchor: SelPoint, head: SelPoint },
+    /// Composer draft range as character offsets (newlines count).
+    Composer { anchor: usize, head: usize },
+}
+
+/// Last rendered pointer geometry: where the body content and the
+/// composer draft sit in terminal cells. Recorded by the renderer each
+/// frame (mirroring [`ApprovalGeometry`); mouse handling reads it back
+/// to map terminal coordinates onto window rows and draft offsets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PointerGeometry {
+    /// Body area origin (terminal cells).
+    pub body_x: u16,
+    pub body_y: u16,
+    /// Content columns per row (excludes the scrollbar column).
+    pub text_width: usize,
+    /// Non-content rows (hero, truncation notice) above the content.
+    pub content_offset: usize,
+    /// Content rows shown.
+    pub content_len: usize,
+    /// Composer area origin and inner geometry (inside the border).
+    pub composer_x: u16,
+    pub composer_y: u16,
+    pub composer_inner_w: usize,
+    pub composer_rows: usize,
+}
+
 /// The full frontend presentation model.
 #[derive(Debug)]
 pub struct AppState {
@@ -612,6 +656,10 @@ pub struct AppState {
     history_stash: String,
     /// Entry index selected in the viewport (None follows the live tail).
     selected: Option<usize>,
+    /// Drag-selected text, if any. Window-anchored and transient:
+    /// cleared by scrolling, content changes, edits, and `Esc`, so a
+    /// rendered highlight can never outlive the rows it was made from.
+    text_selection: Option<TextSelection>,
     /// Wrapped lines hidden below the viewport bottom.
     scrollback: usize,
     pending_approval: Option<PendingApprovalCard>,
@@ -642,6 +690,8 @@ pub struct AppState {
     last_seq: Option<u64>,
     status: String,
     finished: Option<RunOutcome>,
+    /// Last rendered pointer geometry for mouse mapping.
+    pointer_geometry: PointerGeometry,
     /// Last viewport geometry, for selection visibility math.
     viewport: (usize, usize),
     /// Project directory shown in the header (the filesystem scope tools
@@ -688,6 +738,7 @@ impl AppState {
             history_cursor: None,
             history_stash: String::new(),
             selected: None,
+            text_selection: None,
             scrollback: 0,
             pending_approval: None,
             approval_args_preview: None,
@@ -706,6 +757,7 @@ impl AppState {
             status: "idle".to_owned(),
             finished: None,
             viewport: (80, 20),
+            pointer_geometry: PointerGeometry::default(),
             project_dir: None,
             session_label: None,
             active_model: None,
@@ -835,6 +887,9 @@ impl AppState {
             self.resolve_approval();
         }
         self.last_seq = Some(event.seq());
+        // Accepted content can move rows under a live highlight, so a
+        // drag selection never survives a new event.
+        self.clear_text_selection();
         match event.payload() {
             EventPayload::RunStarted { .. } => {
                 self.streaming = true;
@@ -1067,6 +1122,7 @@ impl AppState {
     /// The sanitized input also joins the bounded recall history, and any
     /// in-progress recall is abandoned.
     pub fn record_submitted(&mut self, input: &str) {
+        self.clear_text_selection();
         let clean = sanitize(input);
         let mut entry = Entry::new(EntryKind::User, "you");
         for line in clean.split('\n') {
@@ -1089,6 +1145,7 @@ impl AppState {
     /// Returns false when there is no history to show. Manual edits abandon
     /// the recall position (see [`AppState::composer_type`]).
     pub fn recall_prev(&mut self) -> bool {
+        self.clear_text_selection();
         if self.composer_history.is_empty() {
             return false;
         }
@@ -1108,6 +1165,7 @@ impl AppState {
     /// entry restores the stashed live draft. Returns false when no recall
     /// is in progress.
     pub fn recall_next(&mut self) -> bool {
+        self.clear_text_selection();
         let Some(cursor) = self.history_cursor else {
             return false;
         };
@@ -1200,6 +1258,7 @@ impl AppState {
 
     /// Moves the viewport selection; the live tail re-follows on new output.
     pub fn move_selection(&mut self, delta: isize) {
+        self.clear_text_selection();
         if self.entries.is_empty() {
             return;
         }
@@ -1260,6 +1319,7 @@ impl AppState {
         match self.entries.get_mut(index) {
             Some(entry) => {
                 entry.folded = !entry.folded;
+                self.clear_text_selection();
                 true
             }
             None => false,
@@ -1268,6 +1328,7 @@ impl AppState {
 
     /// Folds every retained entry; manual folds are separate per entry.
     pub fn fold_all(&mut self) {
+        self.clear_text_selection();
         for entry in &mut self.entries {
             entry.folded = true;
         }
@@ -1275,6 +1336,7 @@ impl AppState {
 
     /// Unfolds every retained entry.
     pub fn unfold_all(&mut self) {
+        self.clear_text_selection();
         for entry in &mut self.entries {
             entry.folded = false;
         }
@@ -1283,6 +1345,7 @@ impl AppState {
     /// Scrolls the viewport up by `lines` wrapped lines, clamped to the
     /// available history.
     pub fn scroll_up(&mut self, lines: usize) {
+        self.clear_text_selection();
         let (width, height) = (self.viewport.0.max(1), self.viewport.1.max(1));
         let total = self.total_height(width);
         let max = total.saturating_sub(height.min(total));
@@ -1291,6 +1354,7 @@ impl AppState {
 
     /// Scrolls the viewport down by `lines` wrapped lines.
     pub fn scroll_down(&mut self, lines: usize) {
+        self.clear_text_selection();
         self.scrollback = self.scrollback.saturating_sub(lines);
         if self.scrollback == 0 {
             self.selected = None;
@@ -1309,6 +1373,7 @@ impl AppState {
     /// enters only through [`Self::composer_newline`], and the keyboard layer
     /// already filters these chars.
     pub fn composer_type(&mut self, char: char) {
+        self.clear_text_selection();
         if char.is_control() || is_bidi_format(char) {
             return;
         }
@@ -1320,6 +1385,7 @@ impl AppState {
 
     /// Starts a new composer line.
     pub fn composer_newline(&mut self) {
+        self.clear_text_selection();
         if self.composer.len() < MAX_COMPOSER_BYTES {
             self.composer.push('\n');
             self.abandon_recall();
@@ -1328,6 +1394,7 @@ impl AppState {
 
     /// Deletes the last composer char. Returns false when already empty.
     pub fn composer_backspace(&mut self) -> bool {
+        self.clear_text_selection();
         let removed = self.composer.pop().is_some();
         if removed {
             self.abandon_recall();
@@ -1346,6 +1413,7 @@ impl AppState {
     /// recall mode as well, so a cleared draft never resurrects recalled
     /// history on the next key.
     pub fn composer_take(&mut self) -> String {
+        self.clear_text_selection();
         self.abandon_recall();
         std::mem::take(&mut self.composer)
     }
@@ -1598,6 +1666,131 @@ impl AppState {
         self.selected
     }
 
+    /// Starts a body selection at one window point, replacing any
+    /// previous selection outright.
+    pub fn begin_body_selection(&mut self, row: usize, col: usize) {
+        self.text_selection = Some(TextSelection::Body {
+            anchor: SelPoint { row, col },
+            head: SelPoint { row, col },
+        });
+    }
+
+    /// Extends the live body selection to a new head point. A no-op
+    /// unless a body selection is in progress.
+    pub fn extend_body_selection(&mut self, row: usize, col: usize) {
+        if let Some(TextSelection::Body { head, .. }) = self.text_selection.as_mut() {
+            *head = SelPoint { row, col };
+        }
+    }
+
+    /// Starts a composer selection at one draft character offset.
+    pub fn begin_composer_selection(&mut self, offset: usize) {
+        self.text_selection = Some(TextSelection::Composer {
+            anchor: offset,
+            head: offset,
+        });
+    }
+
+    /// Extends the live composer selection. A no-op unless a composer
+    /// selection is in progress.
+    pub fn extend_composer_selection(&mut self, offset: usize) {
+        if let Some(TextSelection::Composer { head, .. }) = self.text_selection.as_mut() {
+            *head = offset;
+        }
+    }
+
+    /// Clears any drag selection. Called wherever rows or the draft can
+    /// move: scrolling, folding, edits, submits, and new events.
+    pub fn clear_text_selection(&mut self) {
+        self.text_selection = None;
+    }
+
+    /// Borrows the live drag selection, if any.
+    #[must_use]
+    pub fn text_selection(&self) -> Option<TextSelection> {
+        self.text_selection
+    }
+
+    /// Normalized body selection as `(row, start, len)` per covered
+    /// window row, columns clamped to each line. Covered blank rows
+    /// keep a zero-length entry so yanked text preserves line breaks.
+    /// `None` when no body selection is live. The caller supplies the
+    /// same window rows the highlight was drawn from.
+    #[must_use]
+    pub fn selection_body_rows(&self, lines: &[String]) -> Option<Vec<(usize, usize, usize)>> {
+        let (anchor, head) = match self.text_selection {
+            Some(TextSelection::Body { anchor, head }) => (anchor, head),
+            _ => return None,
+        };
+        let (first, last) = if (anchor.row, anchor.col) <= (head.row, head.col) {
+            (anchor, head)
+        } else {
+            (head, anchor)
+        };
+        if lines.is_empty() || first.row >= lines.len() {
+            return None;
+        }
+        let mut rows = Vec::new();
+        let last_row = last.row.min(lines.len() - 1);
+        for (row, line) in lines.iter().enumerate().take(last_row + 1).skip(first.row) {
+            let len = line.chars().count();
+            let (start, end) = if first.row == last.row {
+                (first.col.min(len), last.col.min(len))
+            } else if row == first.row {
+                (first.col.min(len), len)
+            } else if row == last.row {
+                (0, last.col.min(len))
+            } else {
+                (0, len)
+            };
+            let (start, end) = (start.min(end), start.max(end));
+            rows.push((row, start, end - start));
+        }
+        Some(rows)
+    }
+
+    /// Selected body text for the given window rows, joined as shown.
+    /// `None` when no body selection is live or no row is covered; an
+    /// all-blank cover yields an empty string, which callers treat as
+    /// nothing to copy.
+    #[must_use]
+    pub fn body_selection_text(&self, lines: &[String]) -> Option<String> {
+        let rows = self.selection_body_rows(lines)?;
+        if rows.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for (index, (row, start, len)) in rows.iter().enumerate() {
+            if index > 0 {
+                out.push('\n');
+            }
+            let text = lines.get(*row).map(String::as_str).unwrap_or("");
+            out.extend(text.chars().skip(*start).take(*len));
+        }
+        Some(out)
+    }
+
+    /// Normalized composer selection as `(start, len)` draft character
+    /// offsets, clamped to the draft. Empty and non-composer selections
+    /// yield `None`.
+    #[must_use]
+    pub fn composer_selection_range(&self) -> Option<(usize, usize)> {
+        let (anchor, head) = match self.text_selection {
+            Some(TextSelection::Composer { anchor, head }) => (anchor, head),
+            _ => return None,
+        };
+        let len = self.composer.chars().count();
+        let (start, end) = (anchor.min(head).min(len), anchor.max(head).min(len));
+        (start < end).then_some((start, end - start))
+    }
+
+    /// Selected composer text for the normalized range.
+    #[must_use]
+    pub fn composer_selection_text(&self) -> Option<String> {
+        let (start, len) = self.composer_selection_range()?;
+        Some(self.composer.chars().skip(start).take(len).collect())
+    }
+
     /// Lines hidden below the viewport bottom.
     #[must_use]
     pub fn scrollback(&self) -> usize {
@@ -1608,6 +1801,23 @@ impl AppState {
     #[must_use]
     pub fn viewport_height(&self) -> usize {
         self.viewport.1
+    }
+
+    /// Last viewport body width in columns, for selection math.
+    #[must_use]
+    pub fn viewport_width(&self) -> usize {
+        self.viewport.0
+    }
+
+    /// Records the pointer geometry the renderer just laid out.
+    pub fn set_pointer_geometry(&mut self, geometry: PointerGeometry) {
+        self.pointer_geometry = geometry;
+    }
+
+    /// Returns the last recorded pointer geometry.
+    #[must_use]
+    pub fn pointer_geometry(&self) -> PointerGeometry {
+        self.pointer_geometry
     }
 
     /// Full retained transcript (titles plus sanitized body lines) for the
@@ -3024,6 +3234,38 @@ mod cov_state_private {
     }
 
     #[test]
+    fn assistant_tables_and_footnotes_survive_the_full_window() {
+        use crate::markdown::MdStyle;
+
+        let mut entry = Entry::new(EntryKind::Assistant, "assistant");
+        entry.push_line("| a | b |");
+        entry.push_line("|---|---|");
+        entry.push_line("| 1 | 2 |");
+        entry.push_line("");
+        entry.push_line("note[^1]");
+        entry.push_line("[^1]: the footnote");
+        let (rows, runs) = render_entry_rows(&entry, 40);
+        assert_eq!(
+            rows,
+            vec![
+                "assistant".to_owned(),
+                "  | a | b |".to_owned(),
+                "  |---|---|".to_owned(),
+                "  | 1 | 2 |".to_owned(),
+                "  note[^1]".to_owned(),
+                "  [^1]: the footnote".to_owned(),
+                String::new(),
+            ]
+        );
+        assert_eq!(rows.len(), entry.wrapped_len(40), "heights match rendering");
+        assert_eq!(runs.len(), rows.len(), "one run list per row");
+        // Header bold, footnote reference linked, separator plain.
+        assert!(runs[1][0].style.contains(MdStyle::BOLD));
+        assert!(runs[4].iter().any(|run| run.style.contains(MdStyle::LINK)));
+        assert!(runs[2].iter().all(|run| !run.style.contains(MdStyle::BOLD)));
+    }
+
+    #[test]
     fn non_assistant_entries_ignore_markdown_syntax() {
         let mut user = Entry::new(EntryKind::User, "you");
         user.push_line("**not bold** `not code`");
@@ -3482,6 +3724,81 @@ mod cov_state_private {
         assert_eq!(state.project_dir(), None);
         state.set_project_dir("/Volumes/work/proj");
         assert_eq!(state.project_dir(), Some("/Volumes/work/proj"));
+    }
+
+    #[test]
+    fn body_selection_normalizes_clamps_and_yanks() {
+        let mut state = AppState::new();
+        state.notice("alpha");
+        state.notice("beta!");
+        // Window rows: [system, "  alpha", "", system, "  beta!", ""].
+        let rows = state.visible_lines(80, 30).lines;
+        assert_eq!(rows.len(), 6);
+
+        state.begin_body_selection(1, 2);
+        state.extend_body_selection(1, 7);
+        assert_eq!(
+            state.selection_body_rows(&rows),
+            Some(vec![(1, 2, 5)]),
+            "one row selects within itself"
+        );
+        assert_eq!(state.body_selection_text(&rows).as_deref(), Some("alpha"));
+
+        // Reversed drags normalize and columns clamp to each line.
+        state.begin_body_selection(4, 99);
+        state.extend_body_selection(1, 0);
+        assert_eq!(
+            state.selection_body_rows(&rows),
+            Some(vec![(1, 0, 7), (2, 0, 0), (3, 0, 6), (4, 0, 7)]),
+        );
+        assert_eq!(
+            state.body_selection_text(&rows).as_deref(),
+            Some("  alpha\n\nsystem\n  beta!"),
+            "blank rows keep their line break"
+        );
+
+        // A press without a drag covers nothing to copy.
+        state.begin_body_selection(0, 0);
+        assert_eq!(
+            state.body_selection_text(&rows).as_deref(),
+            Some(""),
+            "a point selection yanks empty"
+        );
+    }
+
+    #[test]
+    fn composer_selection_clamps_to_the_draft() {
+        let mut state = AppState::new();
+        for char in "hi there".chars() {
+            state.composer_type(char);
+        }
+        state.begin_composer_selection(3);
+        state.extend_composer_selection(8);
+        assert_eq!(state.composer_selection_range(), Some((3, 5)));
+        assert_eq!(state.composer_selection_text().as_deref(), Some("there"));
+        // Reversed and over-long heads normalize and clamp.
+        state.begin_composer_selection(99);
+        state.extend_composer_selection(0);
+        assert_eq!(state.composer_selection_range(), Some((0, 8)));
+    }
+
+    #[test]
+    fn selection_clears_on_scroll_content_and_edits() {
+        let mut state = AppState::new();
+        state.notice("alpha");
+        state.begin_body_selection(1, 0);
+        state.extend_body_selection(1, 3);
+        assert!(state.text_selection().is_some());
+        state.scroll_up(1);
+        assert_eq!(state.text_selection(), None, "scrolling clears");
+
+        state.begin_body_selection(1, 0);
+        state.composer_type('x');
+        assert_eq!(state.text_selection(), None, "edits clear");
+
+        state.begin_body_selection(1, 0);
+        assert!(state.toggle_fold(0));
+        assert_eq!(state.text_selection(), None, "folding clears");
     }
 
     #[test]

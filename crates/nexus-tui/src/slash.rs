@@ -101,7 +101,7 @@ impl SlashCommand {
          /usage — show observed input/output tokens\n\
          /session [new|list|switch] — manage conversation sessions\n\
          /quit — leave the TUI\n\
-         keys: Tab mode (composer) / focus (elsewhere) · Enter submit · Up/Down recall input · PgUp/PgDn page · Left/Right fold · wheel scrolls · Esc home (never cancels) · \
+         keys: Tab mode (composer) / focus (elsewhere) · Enter submit · Up/Down recall input · PgUp/PgDn page · Left/Right fold · wheel scrolls · drag selects, release copies · Esc home (never cancels) · \
          Ctrl+C clears the composer, then cancels a live run, then quits · Ctrl+D quits"
     }
 }

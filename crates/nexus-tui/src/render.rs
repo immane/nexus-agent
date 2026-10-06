@@ -26,7 +26,9 @@ use ratatui::widgets::{
 
 use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
-use crate::state::{AppState, ApprovalGeometry, PendingApprovalCard, wrapped_height};
+use crate::state::{
+    AppState, ApprovalGeometry, PendingApprovalCard, PointerGeometry, wrapped_height,
+};
 
 /// Maps width-neutral Markdown style bits to terminal styling. Only color
 /// and modifiers change; the visible text (and its measured width) is
@@ -45,6 +47,9 @@ fn markdown_style(style: MdStyle) -> Style {
     if style.contains(MdStyle::LINK) {
         out = out.add_modifier(Modifier::UNDERLINED);
     }
+    if style.contains(MdStyle::SELECTED) {
+        out = out.add_modifier(Modifier::REVERSED);
+    }
     if style.contains(MdStyle::CODE) {
         out = out.fg(Color::Yellow);
     } else if style.contains(MdStyle::HEADING) {
@@ -60,6 +65,81 @@ fn markdown_style(style: MdStyle) -> Style {
 /// Builds one body row from its visible text and style runs. Runs hold
 /// character offsets in line coordinates; gaps stay unstyled. An empty run
 /// list takes the plain fast path with identical output.
+/// Overlays one `(start, len)` highlight window onto sorted,
+/// non-overlapping style runs, splitting at every boundary so the
+/// output stays sorted and non-overlapping with combined styles.
+/// Unstyled gaps inside the window gain the overlay style on a plain
+/// base, so the highlight never drops characters.
+fn merge_selected(runs: &[StyledRun], start: usize, len: usize) -> Vec<StyledRun> {
+    if len == 0 {
+        return runs.to_vec();
+    }
+    let end = start + len;
+    let mut bounds = vec![start, end];
+    for run in runs {
+        let (rs, re) = (run.start, run.start + run.len);
+        if re <= start || rs >= end {
+            continue;
+        }
+        bounds.push(rs.max(start));
+        bounds.push(re.min(end));
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    let style_at = |pos: usize| -> MdStyle {
+        runs.iter()
+            .find(|run| pos >= run.start && pos < run.start + run.len)
+            .map(|run| run.style)
+            .unwrap_or(MdStyle::PLAIN)
+    };
+    // Runs outside the window pass through; straddling runs keep their
+    // outer slices; the window itself rebuilds from the boundaries.
+    let mut merged = Vec::with_capacity(runs.len() + bounds.len());
+    for run in runs {
+        let (rs, re) = (run.start, run.start + run.len);
+        if re <= start || rs >= end {
+            merged.push(*run);
+        } else {
+            if rs < start {
+                merged.push(StyledRun {
+                    start: rs,
+                    len: start - rs,
+                    style: run.style,
+                });
+            }
+            if re > end {
+                merged.push(StyledRun {
+                    start: end,
+                    len: re - end,
+                    style: run.style,
+                });
+            }
+        }
+    }
+    let mut pieces: Vec<StyledRun> = Vec::with_capacity(bounds.len());
+    for pair in bounds.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        if from < to {
+            pieces.push(StyledRun {
+                start: from,
+                len: to - from,
+                style: style_at(from).union(MdStyle::SELECTED),
+            });
+        }
+    }
+    // Splice the rebuilt window between the untouched runs.
+    let mut out = Vec::with_capacity(merged.len() + pieces.len());
+    out.extend(
+        merged
+            .iter()
+            .filter(|run| run.start + run.len <= start)
+            .copied(),
+    );
+    out.extend(pieces);
+    out.extend(merged.iter().filter(|run| run.start >= end).copied());
+    out
+}
+
 fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
     if runs.is_empty() {
         return Line::from(text.to_owned());
@@ -280,6 +360,23 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
         render_approval(layout, card_area, buf);
     }
     render_composer(state, regions.composer, buf, focus);
+    // Composer pointer geometry: origin plus the inner draft grid the
+    // draft rows map onto (one row per draft line inside the border).
+    // Capped like the composer area itself, so clicks never map onto
+    // clipped (invisible) draft rows.
+    let composer_rows = state
+        .composer()
+        .lines()
+        .count()
+        .max(1)
+        .min(MAX_COMPOSER_BODY as usize);
+    state.set_pointer_geometry(PointerGeometry {
+        composer_x: regions.composer.x,
+        composer_y: regions.composer.y,
+        composer_inner_w: regions.composer.width.saturating_sub(2) as usize,
+        composer_rows,
+        ..state.pointer_geometry()
+    });
     render_footer(state, regions.footer, buf, focus);
 }
 
@@ -372,9 +469,24 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
                 .add_modifier(Modifier::DIM),
         )));
     }
-    for (line, runs) in view.lines.iter().zip(&view.styles) {
-        lines.push(styled_line(line, runs));
+    // Drag-selection highlight: window-anchored ranges merge onto the
+    // existing runs, so markdown styling survives under the selection.
+    let selected = state.selection_body_rows(&view.lines);
+    let selected_row = |index: usize| -> Option<(usize, usize)> {
+        selected.as_ref().and_then(|rows| {
+            rows.iter()
+                .find(|(row, _, _)| *row == index)
+                .map(|(_, start, len)| (*start, *len))
+        })
+    };
+    for (index, (line, runs)) in view.lines.iter().zip(&view.styles).enumerate() {
+        match selected_row(index) {
+            Some((start, len)) => lines.push(styled_line(line, &merge_selected(runs, start, len))),
+            None => lines.push(styled_line(line, runs)),
+        }
     }
+    let shown = view.lines.len();
+    let content_offset = lines.len().saturating_sub(shown);
     let text_area = Rect {
         width: text_width as u16,
         ..area
@@ -397,6 +509,17 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
             .thumb_symbol("▐")
             .render(bar_area, buf, &mut bar);
     }
+    // Pointer geometry for mouse mapping: body origin, content width,
+    // and how many leading rows (hero, truncation notice) sit above the
+    // content. Content rows map 1:1 onto the window lines.
+    state.set_pointer_geometry(PointerGeometry {
+        body_x: area.x,
+        body_y: area.y,
+        text_width,
+        content_offset,
+        content_len: shown,
+        ..state.pointer_geometry()
+    });
 }
 
 /// Builds the bounded, wrapped approval card. The compact card shows all
@@ -644,6 +767,42 @@ fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).render(inner, buf);
 }
 
+/// Builds the composer line with a reversed-video selection over
+/// `[start, start + len)` draft characters. The caret rides at the head
+/// (end) of the selection while focused; newlines split rows exactly as
+/// the plain path renders them.
+fn composer_selected_line(draft: &str, start: usize, len: usize, focused: bool) -> Line<'static> {
+    let end = start + len;
+    let selected = Style::default().add_modifier(Modifier::REVERSED);
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut caret_done = !focused;
+    let flush = |plain: &mut String, spans: &mut Vec<Span>| {
+        if !plain.is_empty() {
+            spans.push(Span::raw(std::mem::take(plain)));
+        }
+    };
+    for (index, char) in draft.chars().enumerate() {
+        if focused && !caret_done && index == end {
+            flush(&mut plain, &mut spans);
+            spans.push(Span::raw("▊"));
+            caret_done = true;
+        }
+        if index >= start && index < end {
+            flush(&mut plain, &mut spans);
+            spans.push(Span::styled(char.to_string(), selected));
+        } else {
+            plain.push(char);
+        }
+    }
+    if focused && !caret_done {
+        flush(&mut plain, &mut spans);
+        spans.push(Span::raw("▊"));
+    }
+    flush(&mut plain, &mut spans);
+    Line::from(spans)
+}
+
 fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
     // The composer border names the active agent mode: read-only modes
     // (plan and read-only customs) render amber, full-capability modes keep
@@ -678,6 +837,7 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
     // bare caret; anything typed replaces it, and other focuses render
     // the draft (or nothing) exactly as before.
     let draft = state.composer().to_owned();
+    let selected = state.composer_selection_range();
     let line = if draft.is_empty() && focus == Focus::Composer {
         Line::from(vec![
             Span::styled(
@@ -686,6 +846,8 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
             ),
             Span::raw("▊"),
         ])
+    } else if let Some((start, len)) = selected {
+        composer_selected_line(&draft, start, len, focus == Focus::Composer)
     } else {
         let mut text = draft;
         if focus == Focus::Composer {
@@ -771,6 +933,99 @@ mod tests {
             rows.push(row);
         }
         rows.join("\n")
+    }
+
+    #[test]
+    fn selected_runs_union_onto_existing_styles_without_gaps() {
+        use crate::markdown::MdStyle;
+        let runs = vec![
+            StyledRun {
+                start: 0,
+                len: 4,
+                style: MdStyle::BOLD,
+            },
+            StyledRun {
+                start: 7,
+                len: 3,
+                style: MdStyle::PLAIN,
+            },
+        ];
+        let merged = merge_selected(&runs, 2, 6);
+        assert_eq!(
+            merged,
+            vec![
+                StyledRun {
+                    start: 0,
+                    len: 2,
+                    style: MdStyle::BOLD
+                },
+                StyledRun {
+                    start: 2,
+                    len: 2,
+                    style: MdStyle::BOLD.union(MdStyle::SELECTED)
+                },
+                StyledRun {
+                    start: 4,
+                    len: 3,
+                    style: MdStyle::SELECTED
+                },
+                StyledRun {
+                    start: 7,
+                    len: 1,
+                    style: MdStyle::PLAIN.union(MdStyle::SELECTED)
+                },
+                StyledRun {
+                    start: 8,
+                    len: 2,
+                    style: MdStyle::PLAIN
+                },
+            ],
+            "straddling heads survive, gaps highlight plain"
+        );
+    }
+
+    #[test]
+    fn selected_style_maps_to_reversed_video() {
+        use crate::markdown::MdStyle;
+        let line = styled_line(
+            "ab",
+            &[StyledRun {
+                start: 0,
+                len: 2,
+                style: MdStyle::SELECTED,
+            }],
+        );
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].style.add_modifier, Modifier::REVERSED);
+    }
+
+    #[test]
+    fn composer_selection_highlights_and_parks_the_caret_at_the_head() {
+        let line = composer_selected_line("hello", 1, 3, true);
+        let content: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(content, ["hell", "\u{258a}", "o"].concat());
+        let marked: String = line.spans[1..4]
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(marked, "ell");
+        assert!(
+            line.spans[1..4]
+                .iter()
+                .all(|span| span.style.add_modifier == Modifier::REVERSED),
+            "every selected char reverses"
+        );
+        let plain = composer_selected_line("hello", 1, 3, false);
+        let flat: String = plain
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(flat, "hello");
     }
 
     #[test]

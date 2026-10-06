@@ -38,7 +38,9 @@ use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind, poll, read};
+use crossterm::event::{
+    Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind, poll, read,
+};
 use nexus_config::{
     AgentMode, UserConfig, load as load_config, resolve_path, resolve_with, save as save_config,
 };
@@ -53,7 +55,7 @@ use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 use nexus_tools::{ScopedReader, ScopedWriter};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, cancel_command,
+    Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, TextSelection, cancel_command,
     install_panic_hook, map_key, next_focus, render, submit_command,
 };
 use ratatui::Terminal;
@@ -1191,8 +1193,9 @@ fn read_input() -> io::Result<Option<Input>> {
     Ok(None)
 }
 
-/// One terminal input: a key press or a mouse report. Only wheel notches
-/// are acted on; other mouse traffic is drained and ignored.
+/// One terminal input: a key press or a mouse report. Wheel, press, drag,
+/// and release drive scrolling and drag selection; other mouse traffic is
+/// drained and ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Input {
     Key(KeyEvent),
@@ -1204,8 +1207,98 @@ enum Input {
 const WHEEL_LINES: usize = 3;
 
 /// Applies one mouse report. Wheel notches scroll the expanded approval
-/// detail while it is open, else the conversation viewport; focus is never
-/// moved by the mouse. Returns true when state changed and a redraw is due.
+/// detail while it is open, else the conversation viewport; a left press
+/// starts a drag selection (body rows or the composer draft), dragging
+/// extends it, and release copies it to the clipboard. Focus is never moved
+/// by the mouse. Returns true when state changed and a redraw is due.
+/// Maps a terminal column onto a body content row, if the cell sits on
+/// one. Columns past the text width (scrollbar, margins) and rows over
+/// hero, notice, or empty space yield `None` and never anchor.
+fn body_hit(state: &AppState, column: u16, row: u16) -> Option<(usize, usize)> {
+    let geo = state.pointer_geometry();
+    let col = (column as usize).saturating_sub(geo.body_x as usize);
+    if col >= geo.text_width.max(1) {
+        return None;
+    }
+    let rel = (row as usize).saturating_sub(geo.body_y as usize);
+    let index = rel.checked_sub(geo.content_offset)?;
+    if index >= geo.content_len {
+        return None;
+    }
+    Some((index, col))
+}
+
+/// Maps a terminal cell onto a composer draft character offset, if the
+/// cell sits on a draft row. Columns clamp to the line end; rows past
+/// the last draft line yield `None`.
+fn composer_hit(state: &AppState, column: u16, row: u16) -> Option<usize> {
+    let geo = state.pointer_geometry();
+    let rel_row = (row as usize).saturating_sub((geo.composer_y + 1) as usize);
+    if rel_row >= geo.composer_rows.max(1) {
+        return None;
+    }
+    let col = (column as usize).saturating_sub((geo.composer_x + 1) as usize);
+    let mut offset = 0usize;
+    for (index, line) in state.composer().lines().enumerate() {
+        if index == rel_row {
+            return Some(offset + col.min(line.chars().count()));
+        }
+        offset += line.chars().count() + 1;
+    }
+    // A trailing-newline draft has one more (empty) visual row.
+    (rel_row == state.composer().lines().count()).then_some(offset)
+}
+
+/// Yank text is the exact visible selection: window rows as drawn for
+/// the body, the draft substring for the composer.
+fn selection_text(state: &AppState) -> Option<String> {
+    match state.text_selection() {
+        Some(TextSelection::Composer { .. }) => state.composer_selection_text(),
+        Some(TextSelection::Body { .. }) => {
+            let viewport = (state.viewport_width(), state.viewport_height());
+            let view = state.visible_lines(viewport.0, viewport.1);
+            state.body_selection_text(&view.lines)
+        }
+        None => None,
+    }
+}
+
+/// Minimal base64 (RFC 4648 alphabet) for the OSC 52 clipboard write.
+/// Hand-rolled so selection adds no dependency.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut word = 0u32;
+        for byte in chunk {
+            word = (word << 8) | u32::from(*byte);
+        }
+        word <<= 8 * (3 - chunk.len());
+        for _ in 0..chunk.len() + 1 {
+            out.push(ALPHABET[(word >> 18) as usize & 63] as char);
+            word = (word << 6) & 0xFF_FFFF;
+        }
+        for _ in chunk.len() + 1..4 {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Copies text to the system clipboard through OSC 52. Returns whether
+/// the sequence was written; terminals decide whether to honor it, so
+/// callers report the copy and never claim more. Silent outside a
+/// terminal (notably under test harnesses with piped stdout).
+fn yank_to_clipboard(text: &str) -> bool {
+    if text.is_empty() || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return false;
+    }
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let encoded = base64_encode(text.as_bytes());
+    write!(stdout, "\x1b]52;c;{encoded}\x07").is_ok() && stdout.flush().is_ok()
+}
+
 fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -1222,6 +1315,48 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             } else {
                 front.state.scroll_down(WHEEL_LINES);
             }
+            true
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // A new press replaces any previous selection outright; cells
+            // outside both regions only clear.
+            if let Some((row, col)) = body_hit(&front.state, mouse.column, mouse.row) {
+                front.state.begin_body_selection(row, col);
+            } else if let Some(offset) = composer_hit(&front.state, mouse.column, mouse.row) {
+                front.state.begin_composer_selection(offset);
+            } else {
+                front.state.clear_text_selection();
+            }
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if front.state.text_selection().is_none() {
+                return false;
+            }
+            if let Some((row, col)) = body_hit(&front.state, mouse.column, mouse.row) {
+                front.state.extend_body_selection(row, col);
+            } else if let Some(offset) = composer_hit(&front.state, mouse.column, mouse.row) {
+                front.state.extend_composer_selection(offset);
+            } else {
+                return false;
+            }
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // An empty cover (a bare click, or only blank rows) copies
+            // nothing and reports nothing.
+            let text = match selection_text(&front.state) {
+                Some(text) if !text.is_empty() => text,
+                _ => return false,
+            };
+            // Release copies and keeps the highlight as confirmation; the
+            // next press, scroll, edit, or `Esc` clears it.
+            yank_to_clipboard(&text);
+            let chars = text.chars().count();
+            let preview: String = text.chars().take(48).collect();
+            front
+                .state
+                .notice(&format!("copied {chars} chars to clipboard: {preview}"));
             true
         }
         _ => false,
@@ -1511,6 +1646,7 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             front.state.cycle_mode();
         }
         Action::ParkFocus => {
+            front.state.clear_text_selection();
             // Step back one rung, never cancelling or deciding: an open
             // detail just closes (the card keeps focus so allow/deny stay
             // one keypress away), the composer parks in the viewport for
@@ -3235,7 +3371,9 @@ mod cov_main_private {
 #[cfg(test)]
 mod cov_main_topup {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use nexus_core::{
         ApprovalId, AssistantText, CallId, PersistenceState, RunFinished, RunOutcome, TurnId,
     };
@@ -4116,6 +4254,107 @@ mod cov_main_topup {
             "Down past newest restores the draft"
         );
         assert_eq!(front.request_counter, 0, "recall issues no command");
+    }
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        for (raw, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("hello", "aGVsbG8="),
+            ("\u{65e5}\u{672c}", "5pel5pys"),
+        ] {
+            assert_eq!(base64_encode(raw.as_bytes()), encoded, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn mouse_drag_selects_body_text_and_release_reports_the_copy() {
+        let mut front = Frontend::new(session());
+        front.state.notice("selectable words here");
+        let mut terminal = fixed_terminal();
+        draw(&mut terminal, &mut front).expect("frame draws");
+        let geo = front.state.pointer_geometry();
+        assert!(geo.content_len > 0, "content rows exist");
+        // The body line reads "  selectable words here": drag over
+        // "selectable" (columns 2..12 of content row 1).
+        let row = geo.body_y + geo.content_offset as u16 + 1;
+        let press = |column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        let drag = |column| MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_mouse(&mut front, press(geo.body_x + 2)));
+        assert!(handle_mouse(&mut front, drag(geo.body_x + 12)));
+        assert!(handle_mouse(
+            &mut front,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: geo.body_x + 12,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }
+        ));
+        assert!(
+            transcript(&front).contains("copied 10 chars"),
+            "release reports the copy"
+        );
+        assert!(
+            transcript(&front).contains("selectable"),
+            "the notice previews the yanked text"
+        );
+    }
+
+    #[test]
+    fn mouse_drag_selects_the_composer_draft() {
+        let mut front = Frontend::new(session());
+        type_draft(&mut front, "hello world");
+        let mut terminal = fixed_terminal();
+        draw(&mut terminal, &mut front).expect("frame draws");
+        let geo = front.state.pointer_geometry();
+        let row = geo.composer_y + 1;
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Down(MouseButton::Left), geo.composer_x + 1)
+        ));
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Drag(MouseButton::Left), geo.composer_x + 6)
+        ));
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Up(MouseButton::Left), geo.composer_x + 6)
+        ));
+        assert!(
+            transcript(&front).contains("copied 5 chars"),
+            "the draft substring is yanked"
+        );
+        // A bare click copies nothing and reports nothing.
+        let before = transcript(&front).len();
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Down(MouseButton::Left), geo.composer_x + 1)
+        ));
+        assert!(!handle_mouse(
+            &mut front,
+            at(MouseEventKind::Up(MouseButton::Left), geo.composer_x + 1)
+        ));
+        assert_eq!(transcript(&front).len(), before, "bare clicks stay silent");
     }
 
     #[test]
