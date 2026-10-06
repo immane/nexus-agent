@@ -213,6 +213,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn composer_submit_and_newline_are_distinct() {
         assert_eq!(
             map_key(Focus::Composer, key(KeyCode::Enter)),
@@ -231,6 +232,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn esc_parks_but_never_cancels_or_decides() {
         for focus in [Focus::Composer, Focus::Viewport, Focus::ApprovalCard] {
             let action = map_key(focus, key(KeyCode::Esc));
@@ -245,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn approval_intents_require_the_approval_focus() {
         assert_eq!(
             map_key(Focus::ApprovalCard, key(KeyCode::Char('a'))),
@@ -263,6 +266,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn inspect_and_detail_scroll_require_the_approval_focus() {
         assert_eq!(
             map_key(Focus::ApprovalCard, key(KeyCode::Char('i'))),
@@ -302,6 +306,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn repeat_and_release_events_do_not_map() {
         let repeat = KeyEvent::new_with_kind(
             KeyCode::Char('a'),
@@ -321,6 +326,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn composer_typing_rejects_control_and_bidi_chars() {
         for char in [
             '\x1b', '\n', '\r', '\t', '\x7f', '\u{200F}', '\u{202E}', '\u{2066}',
@@ -342,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn ctrl_c_cancels_from_any_focus_ctrl_d_quits() {
         for focus in [Focus::Composer, Focus::Viewport, Focus::ApprovalCard] {
             assert_eq!(map_key(focus, ctrl('c')), Some(Action::Cancel));
@@ -350,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn model_cycling_is_viewport_only_and_the_composer_keeps_typing() {
         assert_eq!(
             map_key(Focus::Viewport, key(KeyCode::Char('m'))),
@@ -372,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn focus_cycles_through_a_live_approval_card() {
         assert_eq!(next_focus(Focus::Composer, false), Focus::Viewport);
         assert_eq!(next_focus(Focus::Viewport, false), Focus::Composer);

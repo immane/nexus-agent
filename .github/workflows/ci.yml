@@ -14,7 +14,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
+  fmt:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  clippy:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -26,8 +56,49 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Prebuilt nextest: `cargo test` runs test binaries largely serially
+      # (minutes, dominated by process-spawning suites); nextest
+      # parallelizes binaries and tests across all cores (seconds).
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
         with:
-          components: rustfmt, clippy
+          tool: nextest@0.9.146
+
+      - name: Tests
+        run: cargo nextest run --workspace --locked --no-fail-fast
+
+      # `#[ignore]`d tests are redundant-by-contract layers skipped for
+      # local speed; CI still runs them so the marks never rot.
+      - name: Tests (ignored redundancy layers)
+        run: cargo nextest run --workspace --locked --no-fail-fast --run-ignored ignored-only
+
+  doc:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --locked
+
+  perf:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
@@ -35,19 +106,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Tests
-        run: cargo test --workspace --locked --no-fail-fast
-
-      - name: Docs
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --no-deps --locked
-
+      # Real-sleep harness methodology tests (~1-2 min): platform-independent
+      # and isolated here so they never gate the main test signal.
       - name: Perf harness tests
         run: python -m unittest discover -s tools/perf -p 'test_*.py' -v

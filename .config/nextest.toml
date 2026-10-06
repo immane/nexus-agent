@@ -1,0 +1,11 @@
+# nextest profile for this workspace: `cargo nextest run --workspace`.
+#
+# Why nextest: `cargo test` runs test binaries largely serially (a full
+# workspace run takes minutes, dominated by process-spawning suites such as
+# the headless CLI tests); nextest parallelizes binaries and tests across
+# all cores (seconds, same 2000+ tests). Plain `cargo test` keeps working.
+
+[profile.default]
+# Flag timing regressions visibly without failing: nothing in the suite
+# legitimately approaches this; the slowest timing gates sit near 1.5s.
+slow-timeout = { period = "10s" }
