@@ -668,6 +668,18 @@ pub struct PointerGeometry {
     pub composer_rows: usize,
 }
 
+/// Copy-confirmation lifetime: long enough to be seen, then the next
+/// tick clears it without touching the transcript.
+pub const TOAST_TTL: Duration = Duration::from_secs(2);
+
+/// A transient header toast: copy confirmations live outside the
+/// transcript so they never pollute history or scrollback.
+#[derive(Debug, Clone)]
+struct Toast {
+    text: String,
+    deadline: Instant,
+}
+
 /// The full frontend presentation model.
 #[derive(Debug)]
 pub struct AppState {
@@ -694,6 +706,7 @@ pub struct AppState {
     /// Wrapped lines hidden below the viewport bottom.
     scrollback: usize,
     pending_approval: Option<PendingApprovalCard>,
+    toast: Option<Toast>,
     /// Exact-arguments preview from the runtime notice. Kept outside
     /// [`PendingApprovalCard`] so the existing public fields stay
     /// source-compatible; exposed via [`AppState::approval_args_preview`].
@@ -772,6 +785,7 @@ impl AppState {
             text_selection: None,
             scrollback: 0,
             pending_approval: None,
+            toast: None,
             approval_args_preview: None,
             approval_geometry: None,
             approval_field_truncated: false,
@@ -1823,6 +1837,37 @@ impl AppState {
     }
 
     /// Lines hidden below the viewport bottom.
+    /// Shows a header toast for `ttl`. Replaces any live toast.
+    pub fn set_toast(&mut self, text: impl Into<String>, ttl: Duration) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            deadline: Instant::now() + ttl,
+        });
+    }
+
+    /// Borrows the live toast text, if one is showing. Expired toasts
+    /// read as absent without needing a mutation.
+    #[must_use]
+    pub fn toast(&self) -> Option<&str> {
+        self.toast.as_ref().and_then(|toast| {
+            if Instant::now() < toast.deadline {
+                Some(toast.text.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Clears a just-expired toast, reporting whether a redraw is due.
+    /// The tick calls this so the confirmation vanishes on its own.
+    pub fn poll_toast_expired(&mut self) -> bool {
+        let expired = matches!(&self.toast, Some(toast) if Instant::now() >= toast.deadline);
+        if expired {
+            self.toast = None;
+        }
+        expired
+    }
+
     #[must_use]
     pub fn scrollback(&self) -> usize {
         self.scrollback
@@ -1924,6 +1969,24 @@ impl RefreshGate {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn toast_shows_while_live_and_clears_on_expiry() {
+        let mut state = AppState::new();
+        assert_eq!(state.toast(), None);
+        assert!(!state.poll_toast_expired(), "nothing to clear");
+        state.set_toast("copied 3 chars", Duration::from_secs(3600));
+        assert_eq!(state.toast(), Some("copied 3 chars"));
+        assert!(!state.poll_toast_expired(), "a live toast stays");
+        assert_eq!(state.toast(), Some("copied 3 chars"));
+        state.set_toast("gone", Duration::ZERO);
+        assert_eq!(state.toast(), None, "expired reads as absent");
+        assert!(state.poll_toast_expired(), "expiry reports once");
+        assert!(!state.poll_toast_expired(), "second poll is quiet");
+        assert_eq!(state.toast(), None);
+    }
+
     use super::*;
     use nexus_core::{ApprovalNotice, RequestId, SessionId};
 

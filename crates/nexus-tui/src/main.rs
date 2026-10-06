@@ -55,8 +55,9 @@ use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 use nexus_tools::{ScopedReader, ScopedWriter};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, TextSelection, cancel_command,
-    cell_to_char_col, install_panic_hook, map_key, next_focus, render, submit_command,
+    Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, TOAST_TTL, TextSelection,
+    cancel_command, cell_to_char_col, install_panic_hook, map_key, next_focus, render,
+    submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -1296,12 +1297,104 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Copies text to the system clipboard through OSC 52. Returns whether
-/// the sequence was written; terminals decide whether to honor it, so
-/// callers report the copy and never claim more. Silent outside a
-/// terminal (notably under test harnesses with piped stdout).
+/// Copies text to the system clipboard, silently on every path: no
+/// notice, no diagnostic. A platform helper goes first (`pbcopy` on macOS,
+/// `wl-copy`/`xclip`/`xsel` on Linux), because helpers work in every
+/// terminal while OSC 52 is honored only by some. OSC 52 stays as the
+/// fallback for the rest. Empty text never copies.
 fn yank_to_clipboard(text: &str) -> bool {
-    if text.is_empty() || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if text.is_empty() {
+        return false;
+    }
+    if write_clipboard_helper(text) {
+        return true;
+    }
+    write_osc52(text)
+}
+
+/// Selects the platform clipboard helper (program plus argv), or `None`
+/// when no known helper is installed. `probe` reports an executable on
+/// `PATH`; callers pass the real lookup, tests inject fakes so no process
+/// ever spawns there.
+fn clipboard_command(
+    probe: &dyn Fn(&str) -> bool,
+) -> Option<(&'static str, &'static [&'static str])> {
+    #[cfg(target_os = "macos")]
+    if probe("pbcopy") {
+        return Some(("pbcopy", &[] as &[&str]));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if probe("wl-copy") {
+            return Some(("wl-copy", &[] as &[&str]));
+        }
+        if probe("xclip") {
+            return Some(("xclip", &["-selection", "clipboard"]));
+        }
+        if probe("xsel") {
+            return Some(("xsel", &["--clipboard", "--input"]));
+        }
+    }
+    None
+}
+
+/// True when `name` resolves to an executable file on `PATH`.
+fn executable_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .any(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                path.is_file()
+                    && path
+                        .metadata()
+                        .map(|meta| meta.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                path.is_file()
+            }
+        })
+}
+
+/// Feeds text to the platform helper's stdin and reaps it. Every failure
+/// (missing helper, failed spawn, broken pipe, bad exit) falls through to
+/// the OSC 52 fallback via a false return.
+fn write_clipboard_helper(text: &str) -> bool {
+    use std::io::Write as _;
+    let Some((program, args)) = clipboard_command(&executable_on_path) else {
+        return false;
+    };
+    let mut child = match std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(text.as_bytes()).is_ok())
+        .unwrap_or(false);
+    // stdin drops here, so the helper sees EOF and exits; reaping never
+    // claims success the helper did not report.
+    wrote && child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
+/// Writes the OSC 52 clipboard sequence. Returns whether the bytes went
+/// out; terminals decide whether to honor them. Silent outside a terminal
+/// (notably under test harnesses with piped stdout).
+fn write_osc52(text: &str) -> bool {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         return false;
     }
     use std::io::Write as _;
@@ -1356,20 +1449,18 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            // An empty cover (a bare click, or only blank rows) copies
-            // nothing and reports nothing.
+            // Release copies at once and confirms with a header toast that
+            // fades on its own; the transcript stays clean. The highlight
+            // clears with the copy. An empty cover copies nothing.
             let text = match selection_text(&front.state) {
                 Some(text) if !text.is_empty() => text,
                 _ => return false,
             };
-            // Release copies and keeps the highlight as confirmation; the
-            // next press, scroll, edit, or `Esc` clears it.
             yank_to_clipboard(&text);
-            let chars = text.chars().count();
-            let preview: String = text.chars().take(48).collect();
+            front.state.clear_text_selection();
             front
                 .state
-                .notice(&format!("copied {chars} chars to clipboard: {preview}"));
+                .set_toast(format!("copied {} chars", text.chars().count()), TOAST_TTL);
             true
         }
         _ => false,
@@ -1756,7 +1847,22 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             front.focus = Focus::Composer;
         }
         Action::Cancel => {
-            // A non-empty draft goes first: the press clears it (and leaves
+            // A live selection copies first, silently: the highlight
+            // clears as the only feedback, and the draft below survives
+            // untouched. An empty cover (a bare click) is dropped so the
+            // press falls through instead of swallowing it.
+            match selection_text(&front.state) {
+                Some(text) if !text.is_empty() => {
+                    yank_to_clipboard(&text);
+                    front.state.clear_text_selection();
+                    front
+                        .state
+                        .set_toast(format!("copied {} chars", text.chars().count()), TOAST_TTL);
+                    return false;
+                }
+                _ => front.state.clear_text_selection(),
+            }
+            // A non-empty draft goes next: the press clears it (and leaves
             // recall mode) instead of cancelling or quitting. The next press
             // then cancels a live run, or quits when there is nothing to
             // cancel, so quitting always takes two deliberate presses.
@@ -1921,6 +2027,9 @@ async fn interactive_loop(
                     return Ok(());
                 }
                 dirty |= batch.handled > 0;
+                // A just-expired copy toast needs one last frame to vanish;
+                // without input the loop would otherwise hold it forever.
+                dirty |= sessions.active_mut().front.state.poll_toast_expired();
                 // Drain queued session intents against the registry in
                 // recording order: creation moves the active slot, so later
                 // intents resolve after earlier ones.
@@ -4283,8 +4392,78 @@ mod cov_main_topup {
         }
     }
 
+    #[tokio::test]
+    async fn ctrl_c_copies_a_live_selection_silently_before_the_draft() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        type_draft(&mut front, "hello world");
+        let mut terminal = fixed_terminal();
+        draw(&mut terminal, &mut front).expect("frame draws");
+        let geo = front.state.pointer_geometry();
+        let row = geo.composer_y + 1;
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Down(MouseButton::Left), geo.composer_x + 1)
+        ));
+        assert!(handle_mouse(
+            &mut front,
+            at(MouseEventKind::Drag(MouseButton::Left), geo.composer_x + 6)
+        ));
+        assert_eq!(
+            front.state.composer_selection_text().as_deref(),
+            Some("hello")
+        );
+        // The first Ctrl+C copies the live selection silently: the
+        // draft survives and the loop stays up.
+        assert!(!handle_key(&mut front, &runtime, ctrl('c')).await);
+        assert_eq!(front.state.text_selection(), None, "highlight cleared");
+        assert_eq!(
+            front.state.toast(),
+            Some("copied 5 chars"),
+            "the copy confirms with a toast"
+        );
+        assert_eq!(front.state.composer(), "hello world", "draft untouched");
+        assert!(
+            !transcript(&front).contains("copied"),
+            "the copy reports nothing"
+        );
+        // The next Ctrl+C resumes the documented order: draft first.
+        assert!(!handle_key(&mut front, &runtime, ctrl('c')).await);
+        assert_eq!(front.state.composer(), "", "draft cleared second");
+    }
+
     #[test]
-    fn mouse_drag_selects_body_text_and_release_reports_the_copy() {
+    fn clipboard_helper_prefers_platform_tools_in_order() {
+        // Nothing installed: no helper, OSC 52 fallback applies.
+        assert_eq!(clipboard_command(&|_| false), None);
+        #[cfg(target_os = "macos")]
+        {
+            let probe = |name: &str| name == "pbcopy";
+            assert_eq!(clipboard_command(&probe), Some(("pbcopy", &[] as &[&str])));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let none = |_: &str| false;
+            assert_eq!(clipboard_command(&none), None);
+            let xclip = |name: &str| name == "xclip";
+            assert_eq!(
+                clipboard_command(&xclip),
+                Some(("xclip", &["-selection", "clipboard"]))
+            );
+            // Wayland first when both exist.
+            let both = |name: &str| name == "wl-copy" || name == "xclip";
+            assert_eq!(clipboard_command(&both), Some(("wl-copy", &[] as &[&str])));
+        }
+    }
+
+    #[test]
+    fn mouse_drag_selects_body_text_and_release_toasts_silently() {
         let mut front = Frontend::new(session());
         front.state.notice("selectable words here");
         let mut terminal = fixed_terminal();
@@ -4317,13 +4496,19 @@ mod cov_main_topup {
                 modifiers: KeyModifiers::empty(),
             }
         ));
-        assert!(
-            transcript(&front).contains("copied 10 chars"),
-            "release reports the copy"
+        assert_eq!(
+            front.state.toast(),
+            Some("copied 10 chars"),
+            "release confirms with a toast"
+        );
+        assert_eq!(
+            front.state.text_selection(),
+            None,
+            "the highlight clears with the copy"
         );
         assert!(
-            transcript(&front).contains("selectable"),
-            "the notice previews the yanked text"
+            !transcript(&front).contains("copied"),
+            "the transcript stays clean"
         );
     }
 
@@ -4357,18 +4542,15 @@ mod cov_main_topup {
             &mut front,
             at(MouseEventKind::Up(MouseButton::Left), geo.body_x + 10)
         ));
-        assert!(
-            transcript(&front).contains("copied 3 chars"),
-            "three wide glyphs yanked"
-        );
-        assert!(
-            transcript(&front).contains("\u{6587}\u{6d4b}\u{8bd5}"),
-            "cell columns land on the right characters"
+        assert_eq!(
+            front.state.toast(),
+            Some("copied 3 chars"),
+            "three wide glyphs copied"
         );
     }
 
     #[test]
-    fn mouse_drag_selects_the_composer_draft() {
+    fn mouse_drag_selects_the_composer_draft_and_release_toasts() {
         let mut front = Frontend::new(session());
         type_draft(&mut front, "hello world");
         let mut terminal = fixed_terminal();
@@ -4393,9 +4575,14 @@ mod cov_main_topup {
             &mut front,
             at(MouseEventKind::Up(MouseButton::Left), geo.composer_x + 6)
         ));
+        assert_eq!(
+            front.state.toast(),
+            Some("copied 5 chars"),
+            "the draft substring is copied"
+        );
         assert!(
-            transcript(&front).contains("copied 5 chars"),
-            "the draft substring is yanked"
+            !transcript(&front).contains("copied"),
+            "the transcript stays clean"
         );
         // A bare click copies nothing and reports nothing.
         let before = transcript(&front).len();

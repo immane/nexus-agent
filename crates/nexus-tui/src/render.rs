@@ -27,7 +27,8 @@ use ratatui::widgets::{
 use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
 use crate::state::{
-    AppState, ApprovalGeometry, PendingApprovalCard, PointerGeometry, chunks, wrapped_height,
+    AppState, ApprovalGeometry, PendingApprovalCard, PointerGeometry, chunks, display_width,
+    wrapped_height,
 };
 
 /// Maps width-neutral Markdown style bits to terminal styling. Only color
@@ -361,20 +362,18 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
     }
     render_composer(state, regions.composer, buf, focus);
     // Composer pointer geometry: origin plus the inner draft grid the
-    // draft rows map onto (one row per draft line inside the border).
-    // Capped like the composer area itself, so clicks never map onto
-    // clipped (invisible) draft rows.
-    let composer_rows = state
-        .composer()
-        .lines()
-        .count()
-        .max(1)
-        .min(MAX_COMPOSER_BODY as usize);
+    // draft rows map onto (one row per draft line inside the border,
+    // capped like the composer area itself).
     state.set_pointer_geometry(PointerGeometry {
         composer_x: regions.composer.x,
         composer_y: regions.composer.y,
         composer_inner_w: regions.composer.width.saturating_sub(2) as usize,
-        composer_rows,
+        composer_rows: state
+            .composer()
+            .lines()
+            .count()
+            .max(1)
+            .min(MAX_COMPOSER_BODY as usize),
         ..state.pointer_geometry()
     });
     render_footer(state, regions.footer, buf, focus);
@@ -400,6 +399,23 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
     }
     if let Some(dir) = state.project_dir() {
         spans.push(Span::raw(format!(" dir:{}", abbreviate_home(dir))));
+    }
+    // A live copy toast rides the top-right corner: right-aligned past the
+    // content, shown only when it fits, so narrow frames clip it instead of
+    // overlapping text. It lives outside the transcript by construction.
+    if let Some(text) = state.toast() {
+        let used: usize = spans
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        let mark = text.chars().count();
+        if used + mark < area.width as usize {
+            spans.push(Span::raw(" ".repeat(area.width as usize - used - mark)));
+            spans.push(Span::styled(
+                text.to_owned(),
+                Style::default().fg(Color::Black).bg(Color::Green),
+            ));
+        }
     }
     let header = Paragraph::new(Line::from(spans));
     header.render(area, buf);
@@ -492,6 +508,17 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
         ..area
     };
     Paragraph::new(lines).render(text_area, buf);
+    // Pointer geometry for mouse mapping: body origin, content width, and
+    // how many leading rows (hero, truncation notice) sit above the
+    // content. Content rows map 1:1 onto the window lines.
+    state.set_pointer_geometry(PointerGeometry {
+        body_x: area.x,
+        body_y: area.y,
+        text_width,
+        content_offset,
+        content_len: shown,
+        ..state.pointer_geometry()
+    });
     if needs_bar && width > 1 {
         let total = state.total_height(text_width);
         let mut bar = ScrollbarState::new(total)
@@ -509,17 +536,6 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
             .thumb_symbol("▐")
             .render(bar_area, buf, &mut bar);
     }
-    // Pointer geometry for mouse mapping: body origin, content width,
-    // and how many leading rows (hero, truncation notice) sit above the
-    // content. Content rows map 1:1 onto the window lines.
-    state.set_pointer_geometry(PointerGeometry {
-        body_x: area.x,
-        body_y: area.y,
-        text_width,
-        content_offset,
-        content_len: shown,
-        ..state.pointer_geometry()
-    });
 }
 
 /// Builds the bounded, wrapped approval card. The compact card shows all
@@ -2460,6 +2476,36 @@ mod cov_render_private {
                 "no painted row exceeds the frame: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn header_toast_rides_top_right_only_while_live() {
+        use std::time::Duration;
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 80, 1);
+        let plain = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Composer)
+        })[0]
+            .clone();
+        assert!(!plain.contains("copied"), "{plain:?}");
+
+        state.set_toast("copied 3 chars", Duration::from_secs(3600));
+        let marked = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Composer)
+        })[0]
+            .clone();
+        assert!(marked.contains("copied 3 chars"), "{marked:?}");
+        assert!(
+            marked.find("copied").expect("toast") > marked.find("focus:").expect("header"),
+            "the toast sits right of the content: {marked:?}"
+        );
+
+        state.set_toast("gone", Duration::ZERO);
+        let faded = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Composer)
+        })[0]
+            .clone();
+        assert!(!faded.contains("gone"), "{faded:?}");
     }
 
     #[test]
