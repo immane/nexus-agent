@@ -86,9 +86,16 @@ class TimeoutSampleBoundsTests(unittest.TestCase):
         self.assertIsNotNone(timed_out["max_rss"])
         self.assertIsNotNone(small["max_rss"])
 
-        stats = startup.summarize_samples([dict(timed_out, index=0), dict(small, index=1)])
+        # Force the invalid sample's RSS above the successful one so the test
+        # verifies summary filtering, not incidental process-memory variance.
+        invalid_with_high_rss = dict(
+            timed_out, index=0, max_rss=small["max_rss"] + 1
+        )
+        stats = startup.summarize_samples(
+            [invalid_with_high_rss, dict(small, index=1)]
+        )
         self.assertEqual(stats["max_rss"], small["max_rss"])
-        self.assertLess(small["max_rss"], timed_out["max_rss"])
+        self.assertGreater(invalid_with_high_rss["max_rss"], small["max_rss"])
 
 
 class LaunchErrorSampleTests(unittest.TestCase):
