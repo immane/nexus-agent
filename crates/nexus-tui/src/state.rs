@@ -738,6 +738,7 @@ pub struct AppState {
     pub seq_rejected: u64,
     last_seq: Option<u64>,
     status: String,
+    tool_spinner_frame: usize,
     finished: Option<RunOutcome>,
     /// Last rendered pointer geometry for mouse mapping.
     pointer_geometry: PointerGeometry,
@@ -807,6 +808,7 @@ impl AppState {
             seq_rejected: 0,
             last_seq: None,
             status: "idle".to_owned(),
+            tool_spinner_frame: 0,
             finished: None,
             viewport: (80, 20),
             pointer_geometry: PointerGeometry::default(),
@@ -1013,6 +1015,7 @@ impl AppState {
             }
             EventPayload::ToolStarted(info) => {
                 self.streaming = true;
+                self.tool_spinner_frame = 0;
                 self.status = "executing tool".to_owned();
                 self.push_tool(
                     format!("tool {} started", info.call.as_str()),
@@ -1046,21 +1049,30 @@ impl AppState {
                 }
             }
             EventPayload::ToolFinished(info) => {
-                self.push_tool(
-                    format!("tool {} finished", info.call.as_str()),
-                    vec![format!(
-                        "status={:?} effect={:?} evidence={:?}{} {}",
-                        info.outcome.status(),
-                        info.outcome.effect(),
-                        info.outcome.evidence(),
-                        if info.outcome.is_truncated() {
-                            " truncated"
-                        } else {
-                            ""
-                        },
-                        sanitize(info.outcome.content()),
-                    )],
+                let output = sanitize(info.outcome.content());
+                let output_lines: Vec<String> = output.lines().map(str::to_owned).collect();
+                let truncated = if info.outcome.is_truncated() {
+                    " · truncated"
+                } else {
+                    ""
+                };
+                let title = format!(
+                    "tool {} · {:?} · {} lines / {} chars{truncated}",
+                    info.call.as_str(),
+                    info.outcome.status(),
+                    output_lines.len(),
+                    output.chars().count(),
                 );
+                let mut lines = vec![format!(
+                    "{:?} · {:?} · {} lines · {} chars",
+                    info.outcome.effect(),
+                    info.outcome.evidence(),
+                    output_lines.len(),
+                    output.chars().count(),
+                )];
+                lines.extend(output_lines);
+                let fold_output = output.lines().count() > 4 || output.len() > 320;
+                self.push_tool_with_fold(title, lines, fold_output);
                 if self
                     .pending_approval
                     .as_ref()
@@ -1176,10 +1188,15 @@ impl AppState {
     }
 
     fn push_tool(&mut self, title: String, lines: Vec<String>) {
+        self.push_tool_with_fold(title, lines, false);
+    }
+
+    fn push_tool_with_fold(&mut self, title: String, lines: Vec<String>, folded: bool) {
         let mut entry = Entry::new(EntryKind::Tool, &title);
         for line in lines {
             entry.push_line(&line);
         }
+        entry.folded = folded;
         self.push_entry(entry);
     }
 
@@ -1692,6 +1709,22 @@ impl AppState {
         &self.status
     }
 
+    /// Advances the tool-execution spinner when a tool is active.
+    /// Returns true when a redraw can show a different frame.
+    pub fn tick_tool_animation(&mut self) -> bool {
+        if !matches!(self.status.as_str(), "running" | "executing tool") {
+            return false;
+        }
+        self.tool_spinner_frame = (self.tool_spinner_frame + 1) % 4;
+        true
+    }
+
+    /// Current tool spinner frame, in the range `0..4`.
+    #[must_use]
+    pub fn tool_spinner_frame(&self) -> usize {
+        self.tool_spinner_frame
+    }
+
     /// Records a frontend notice (replies, errors) as a system entry.
     pub fn notice(&mut self, line: &str) {
         let clean = sanitize(line);
@@ -2016,6 +2049,61 @@ mod tests {
 
     use super::*;
     use nexus_core::{ApprovalNotice, RequestId, SessionId};
+
+    #[test]
+    fn tool_spinner_advances_only_while_a_tool_executes() {
+        let mut state = AppState::new();
+        assert!(!state.tick_tool_animation());
+        assert_eq!(state.tool_spinner_frame(), 0);
+        state.status = "running".to_owned();
+        for expected in 1..=4 {
+            assert!(state.tick_tool_animation());
+            assert_eq!(state.tool_spinner_frame(), expected % 4);
+        }
+        state.status = "executing tool".to_owned();
+        assert!(state.tick_tool_animation());
+        state.status = "finished: Completed".to_owned();
+        assert!(!state.tick_tool_animation());
+        assert_eq!(state.tool_spinner_frame(), 1);
+    }
+
+    #[test]
+    fn large_tool_results_are_folded_but_retained_for_expansion() {
+        use nexus_core::{EffectState, Evidence, ExecutionStatus, ToolFinishedInfo, ToolOutcome};
+
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let (session, run) = session_run();
+        let content = (0..12)
+            .map(|line| format!("entry-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outcome = ToolOutcome::new(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownNotApplied,
+            Evidence::HostObserved,
+            &content,
+            false,
+        )
+        .expect("bounded test output builds");
+        let event = RunEvent::new(
+            session,
+            run,
+            1,
+            EventPayload::ToolFinished(ToolFinishedInfo {
+                call: CallId::new("call-1").expect("valid"),
+                outcome,
+            }),
+        );
+        assert!(state.apply_event(&event));
+        let entry = state.entry(1).expect("tool result is retained");
+        assert!(entry.folded, "large output starts collapsed");
+        assert!(entry.lines.iter().any(|line| line == "entry-11"));
+        assert!(entry.title.contains("12 lines / 97 chars"));
+        assert!(entry.lines[0].contains("12 lines"));
+        assert!(state.toggle_fold(1), "the selected output can be expanded");
+        assert!(!state.entry(1).expect("entry remains").folded);
+    }
 
     #[test]
     fn approval_fields_visibly_escape_invisible_characters_before_bounding() {

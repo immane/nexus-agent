@@ -2093,6 +2093,7 @@ async fn interactive_loop(
                 // A just-expired copy toast needs one last frame to vanish;
                 // without input the loop would otherwise hold it forever.
                 dirty |= sessions.active_mut().front.state.poll_toast_expired();
+                dirty |= sessions.active_mut().front.state.tick_tool_animation();
                 // Drain queued session intents against the registry in
                 // recording order: creation moves the active slot, so later
                 // intents resolve after earlier ones.

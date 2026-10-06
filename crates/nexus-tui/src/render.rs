@@ -394,7 +394,17 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         Span::styled(" nexus-tui ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(HEADER_TAG),
         Span::styled(format!("run:{run} "), Style::default().fg(Color::Cyan)),
-        Span::raw(state.status()),
+        if matches!(state.status(), "running" | "executing tool") {
+            const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+            Span::styled(
+                format!("{} {}", SPINNER[state.tool_spinner_frame()], state.status()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(state.status())
+        },
         Span::raw(format!(" focus:{focus:?}").to_lowercase()),
     ];
     // The directory trails every existing segment, so frames that never
@@ -909,7 +919,7 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         Span::raw(FOOTER_TAG),
         Span::styled(cancel_hint, Style::default().fg(Color::Yellow)),
         Span::styled(approval_hint, Style::default().fg(Color::Yellow)),
-        Span::raw(" tab mode · enter submit · ↕ · m model · fold · approval i/a/d · ctrl+d quit "),
+        Span::raw(" tab · enter · ↑↓ select · ←→ fold · m model · approval i/a/d · ctrl+d quit "),
         Span::raw(
             format!(
                 "focus:{focus:?} stale:{} seq:{} dropped:{}",
@@ -987,6 +997,7 @@ mod tests {
     use super::*;
     use nexus_core::{
         ApprovalId, ApprovalNotice, CallId, EventPayload, RequestId, RunEvent, SessionId,
+        ToolStartedInfo,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1523,6 +1534,27 @@ mod tests {
         draw(&mut state, &mut terminal, Focus::Viewport);
         let frame = screen(&terminal);
         assert!(!frame.contains('\x1b'), "title cannot inject escapes");
+    }
+
+    #[test]
+    fn tool_execution_header_animates_between_tick_frames() {
+        let (mut state, mut terminal) = harness(100, 16);
+        started(&mut state, 0);
+        let tool_started = RunEvent::new(
+            SessionId::new("sess-1").expect("valid"),
+            nexus_core::RunId::new("run-1").expect("valid"),
+            1,
+            EventPayload::ToolStarted(ToolStartedInfo {
+                call: CallId::new("call-1").expect("valid"),
+            }),
+        );
+        assert!(state.apply_event(&tool_started));
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(screen(&terminal).contains("| executing tool"));
+
+        assert!(state.tick_tool_animation());
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(screen(&terminal).contains("/ executing tool"));
     }
 }
 
