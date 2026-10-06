@@ -375,7 +375,7 @@ fn correlation_marker_net_covers_keys_and_values() {
         assert_eq!(
             data.push(*secret, "safe-value"),
             Err(ErrorBuildError::SuspectedSecret),
-            "marker-shaped key {secret:?} must not enter correlation data"
+            "marker-shaped key must not enter correlation data"
         );
         assert!(data.is_empty(), "rejected entries never persist");
     }
