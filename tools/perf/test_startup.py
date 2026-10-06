@@ -30,7 +30,7 @@ SCRIPT = os.path.join(HERE, "startup.py")
 POSIX_WAIT4 = hasattr(os, "wait4")
 POSIX_SHELL = os.name == "posix"
 BENIGN = [sys.executable, "-c", "pass"]
-HOG = [sys.executable, "-c", "b = b'x' * (48 << 20)"]
+HOG = [sys.executable, "-c", "b = b'x' * (128 << 20)"]
 
 
 class PercentileTests(unittest.TestCase):
@@ -285,7 +285,7 @@ class TargetRssTests(unittest.TestCase):
     def test_purge_helper_rss_not_attributed_to_target(self):
         hog = startup.measure_once(HOG, timeout=30)
         self.assertEqual(hog["outcome"], "ok", hog)
-        purge_cmd = f"{shlex.quote(sys.executable)} -c \"b = b'x' * (48 << 20)\""
+        purge_cmd = f"{shlex.quote(sys.executable)} -c \"b = b'x' * (128 << 20)\""
         samples = startup.run_batch(BENIGN, 1, timeout=30, purge_cmd=purge_cmd)
         self.assertEqual(samples[0]["outcome"], "ok", samples[0])
         self.assertLess(samples[0]["max_rss"], hog["max_rss"] // 2)

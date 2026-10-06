@@ -944,6 +944,12 @@ def run_measurement(cfg, argv, run_index=0):
                 if pump(step_deadline) == "exited":
                     exited_during_window = True
                     break
+                # The child may exit between the pump's last poll and return.
+                # Recheck before querying live process metrics to avoid
+                # collecting a sample for a process already known to be gone.
+                if target.check_exit():
+                    exited_during_window = True
+                    break
                 rss = sample_rss(target.pid)
                 if rss["rss_bytes"] is not None:
                     rss_samples.append(rss["rss_bytes"])
