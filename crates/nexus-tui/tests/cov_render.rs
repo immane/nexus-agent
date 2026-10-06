@@ -428,10 +428,11 @@ fn wrapping_matches_the_measured_width_and_keeps_the_live_tail() {
             view.lines
         );
         // The run start is a system entry above the assistant entry, so the assistant
-        // title is located rather than assumed to be the first row.
+        // title is located rather than assumed to be the first row. The last
+        // line is the entry's blank separator row, not body text.
         let start = row_holding(&view.lines, "assistant")
             .unwrap_or_else(|| panic!("no assistant entry at width {width}: {view:?}"));
-        let body: String = view.lines[start + 1..]
+        let body: String = view.lines[start + 1..view.lines.len() - 1]
             .iter()
             .map(|line| {
                 line.strip_prefix("  ").unwrap_or_else(|| {
@@ -446,7 +447,7 @@ fn wrapping_matches_the_measured_width_and_keeps_the_live_tail() {
         // Every rendered body row but the last is exactly the indent plus a
         // full-width chunk.
         let body_width = width as usize - 2;
-        for line in &view.lines[start + 1..view.lines.len() - 1] {
+        for line in &view.lines[start + 1..view.lines.len() - 2] {
             assert_eq!(line.chars().count(), 2 + body_width, "{line:?}");
         }
     }

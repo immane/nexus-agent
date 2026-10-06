@@ -938,10 +938,7 @@ mod tests {
             .lines()
             .find(|row| row.contains("███╗"))
             .expect("banner row");
-        assert!(
-            row.starts_with("█"),
-            "banner is left-aligned: {row:?}"
-        );
+        assert!(row.starts_with("█"), "banner is left-aligned: {row:?}");
     }
 
     #[test]
@@ -1034,7 +1031,9 @@ mod tests {
         draw(&mut state, &mut terminal, Focus::Viewport);
         assert!(state.scrollback() > 0, "page position survives the redraw");
         let scrolled = screen(&terminal);
-        assert!(scrolled.contains("entry 24"), "older content is visible");
+        // Three rows per entry (title, body, separator) with a six-row
+        // page: the window sits on entries 26-27.
+        assert!(scrolled.contains("entry 26"), "older content is visible");
         assert!(!scrolled.contains("entry 29"), "tail moved out of view");
         draw(&mut state, &mut terminal, Focus::Viewport);
         assert_eq!(scrolled, screen(&terminal), "no drift between frames");
@@ -1757,8 +1756,16 @@ mod cov_render_private {
             format!("… {}↑ presentation-truncated", view.hidden_above),
             "the notice reports the exact hidden-line count"
         );
+        // The scrollbar owns the last body column here, so content rows are
+        // compared without it.
+        let text_of = |row: &String| row.chars().take(39).collect::<String>();
         assert!(
-            rows.last().expect("body row").contains("message 19"),
+            rows.iter()
+                .map(text_of)
+                .rev()
+                .find(|row| !row.trim().is_empty())
+                .expect("body row")
+                .contains("message 19"),
             "the live tail is never the row clipped away: {rows:?}"
         );
 

@@ -289,24 +289,29 @@ fn assert_body_matches_measurement(state: &AppState, rows: &[String], width: u16
             row.clone()
         }
     };
-    assert!(
-        view.lines.iter().all(|line| !line.trim().is_empty()),
-        "the transcript has no blank lines, so a blank row is padding"
-    );
+    // Blank rows are entry separators and appear in the model itself; the
+    // row-by-row equality below pins each one exactly, so padding is still
+    // caught by the trailing-blank check.
     let notice = usize::from(view.hidden_above > 0 || view.retention_truncated);
-    let drawn = body
+    assert!(
+        notice + view.lines.len() <= body.len(),
+        "the window fits the body region"
+    );
+    // Non-blank counts agree (blank separator rows are validated by the
+    // row-by-row equality below, not by omission).
+    let drawn_nonblank = body[notice..notice + view.lines.len()]
         .iter()
         .map(text_of)
         .filter(|row| !row.trim().is_empty())
         .count();
+    let model_nonblank = view
+        .lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     assert_eq!(
-        drawn,
-        notice + view.lines.len(),
+        drawn_nonblank, model_nonblank,
         "every measured line is drawn exactly once"
-    );
-    assert!(
-        notice + view.lines.len() <= body.len(),
-        "the window fits the body region"
     );
     assert!(
         body[notice..notice + view.lines.len()]

@@ -264,24 +264,29 @@ impl Entry {
     }
 
     fn compute_height(&self, width: usize) -> usize {
-        if self.folded {
-            return wrapped_height(&folded_text(&self.title, self.lines.len()), width);
-        }
-        let body_width = body_width(width);
-        let mut height = wrapped_height(&self.title, width);
-        for line in &self.lines {
-            height += wrapped_height(line, body_width);
-        }
-        if self.truncated {
-            height += wrapped_height(TRUNCATION_MARKER, body_width);
-        }
-        height
+        // Every entry ends with one blank separator row so messages never
+        // run together; see `render_range`, which must emit the same count.
+        let body = if self.folded {
+            return wrapped_height(&folded_text(&self.title, self.lines.len()), width) + 1;
+        } else {
+            let body_width = body_width(width);
+            let mut height = wrapped_height(&self.title, width);
+            for line in &self.lines {
+                height += wrapped_height(line, body_width);
+            }
+            if self.truncated {
+                height += wrapped_height(TRUNCATION_MARKER, body_width);
+            }
+            height
+        };
+        body + 1
     }
 
     /// Renders at most `take` wrapped lines of this entry into `out`,
     /// skipping the first `skip` lines. Skipped lines are never allocated, so
     /// an oversized entry intersecting the window materializes only the
-    /// visible slice. Line counts match [`Entry::wrapped_len`] exactly.
+    /// visible slice. Line counts match [`Entry::wrapped_len`] exactly,
+    /// including the trailing blank separator row.
     fn render_range(&self, width: usize, skip: usize, take: usize, out: &mut Vec<String>) {
         if take == 0 {
             return;
@@ -296,6 +301,7 @@ impl Entry {
                     return;
                 }
             }
+            emit_line(out, &mut index, skip, limit, "", false);
             return;
         }
         for chunk in chunks(&self.title, width) {
@@ -327,6 +333,7 @@ impl Entry {
                 }
             }
         }
+        emit_line(out, &mut index, skip, limit, "", false);
     }
 }
 
@@ -1910,22 +1917,23 @@ mod tests {
     #[test]
     fn wrapped_heights_match_rendered_lines_at_available_width() {
         let mut entry = Entry::new(EntryKind::Assistant, "assistant");
-        // Body width at total width 80 is 78: 79 chars wrap to two lines.
+        // Body width at total width 80 is 78: 79 chars wrap to two lines,
+        // plus the title row and the trailing separator row.
         entry.push_line(&"a".repeat(79));
-        assert_eq!(entry.wrapped_len(80), 3);
-        assert_eq!(render_entry_lines(&entry, 80).len(), 3);
-        assert_eq!(entry.wrapped_len(40), 4);
-        assert_eq!(render_entry_lines(&entry, 40).len(), 4);
+        assert_eq!(entry.wrapped_len(80), 4);
+        assert_eq!(render_entry_lines(&entry, 80).len(), 4);
+        assert_eq!(entry.wrapped_len(40), 5);
+        assert_eq!(render_entry_lines(&entry, 40).len(), 5);
         let mut folded = Entry::new(EntryKind::Assistant, "assistant");
         folded.push_line("body");
         folded.folded = true;
-        let expected = wrapped_height(&folded_text("assistant", 1), 40);
+        let expected = wrapped_height(&folded_text("assistant", 1), 40) + 1;
         assert_eq!(folded.wrapped_len(40), expected);
         assert_eq!(render_entry_lines(&folded, 40).len(), expected);
         let mut truncated = Entry::new(EntryKind::Assistant, "assistant");
         truncated.push_line("body");
         truncated.truncated = true;
-        let expected = 2 + wrapped_height(TRUNCATION_MARKER, 38);
+        let expected = 3 + wrapped_height(TRUNCATION_MARKER, 38);
         assert_eq!(truncated.wrapped_len(40), expected);
         assert_eq!(render_entry_lines(&truncated, 40).len(), expected);
         for line in render_entry_lines(&truncated, 40) {
@@ -2809,24 +2817,30 @@ mod cov_state_private {
         assert!(past.is_empty(), "a skip past the entry renders nothing");
 
         let full = render_entry_lines(&entry, 40);
-        assert_eq!(full, vec!["assistant".to_owned(), "  body".to_owned()]);
+        assert_eq!(
+            full,
+            vec!["assistant".to_owned(), "  body".to_owned(), String::new()]
+        );
         let mut slice = Vec::new();
         entry.render_range(40, 1, 1, &mut slice);
         assert_eq!(slice, vec![full[1].clone()], "only the requested window");
 
         let untitled = Entry::new(EntryKind::System, "");
-        assert_eq!(render_entry_lines(&untitled, 40), vec![String::new()]);
-        assert_eq!(untitled.wrapped_len(40), 1, "height and rendering agree");
+        assert_eq!(
+            render_entry_lines(&untitled, 40),
+            vec![String::new(), String::new()]
+        );
+        assert_eq!(untitled.wrapped_len(40), 2, "height and rendering agree");
 
         // A fold marker that wraps at this width still honors the window.
         let mut folded = Entry::new(EntryKind::Assistant, &"t".repeat(45));
         folded.push_line("hidden");
         folded.folded = true;
         let all = render_entry_lines(&folded, 40);
-        assert_eq!(all.len(), 2, "the fold marker wraps at this width");
+        assert_eq!(all.len(), 3, "the fold marker wraps at this width");
         assert_eq!(
             folded.wrapped_len(40),
-            wrapped_height(&folded_text(&folded.title, 1), 40)
+            wrapped_height(&folded_text(&folded.title, 1), 40) + 1
         );
         let mut folded_slice = Vec::new();
         folded.render_range(40, 1, 1, &mut folded_slice);
@@ -2837,8 +2851,9 @@ mod cov_state_private {
     fn the_height_cache_memoizes_on_every_fingerprint_field() {
         let mut entry = Entry::new(EntryKind::Assistant, "assistant");
         entry.push_line(&"a".repeat(50));
-        // Title 1 row plus 50 body chars at body width 38 = 2 rows.
-        assert_eq!(entry.wrapped_len(40), 3);
+        // Title 1 row plus 50 body chars at body width 38 = 2 rows,
+        // plus the trailing separator row.
+        assert_eq!(entry.wrapped_len(40), 4);
         let key = live_key(&entry, 40);
         assert_eq!(key.lines, 1);
         assert_eq!(key.title_len, "assistant".len());
@@ -2873,7 +2888,7 @@ mod cov_state_private {
             },
         ] {
             poison(&entry, changed);
-            assert_eq!(entry.wrapped_len(40), 3, "{changed:?} must be a cache miss");
+            assert_eq!(entry.wrapped_len(40), 4, "{changed:?} must be a cache miss");
         }
 
         // The cached key tracks the entry: one field moved, height redone.
@@ -2884,7 +2899,7 @@ mod cov_state_private {
         assert_eq!(updated.tail_len, key.tail_len + 5);
         assert_eq!(
             entry.height_cache.get().expect("cache").height,
-            3,
+            4,
             "55 chars still wrap to two body rows at width 38"
         );
 
@@ -2893,7 +2908,7 @@ mod cov_state_private {
         let truncated = entry.wrapped_len(40);
         assert_eq!(
             truncated,
-            3 + wrapped_height(TRUNCATION_MARKER, body_width(40))
+            4 + wrapped_height(TRUNCATION_MARKER, body_width(40))
         );
         assert_eq!(render_entry_lines(&entry, 40).len(), truncated);
     }
@@ -2973,10 +2988,10 @@ mod cov_state_private {
         );
         assert_eq!(
             render_entry_lines(entry, 40),
-            vec!["system".to_owned(), "  ".to_owned()],
+            vec!["system".to_owned(), "  ".to_owned(), String::new()],
             "the blank body row still renders indented"
         );
-        assert_eq!(entry.wrapped_len(40), 2, "height and rendering agree");
+        assert_eq!(entry.wrapped_len(40), 3, "height and rendering agree");
 
         let mut live = filled_state();
         live.move_selection(1);

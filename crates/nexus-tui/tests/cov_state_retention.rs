@@ -299,7 +299,15 @@ fn folding_collapses_an_entry_to_its_title_marker() {
     let transcript = state.transcript();
     let bytes = state.retained_bytes();
     let unfolded_height = state.total_height(80);
-    assert_eq!(unfolded, vec!["you", "  line one", "  line two"]);
+    assert_eq!(
+        unfolded,
+        vec![
+            "you".to_owned(),
+            "  line one".to_owned(),
+            "  line two".to_owned(),
+            String::new()
+        ]
+    );
 
     assert!(state.toggle_fold(index));
     assert!(
@@ -315,10 +323,10 @@ fn folding_collapses_an_entry_to_its_title_marker() {
     );
     assert_eq!(
         state.visible_lines(80, 50).lines,
-        vec!["you  [folded, 2 lines]"],
-        "a folded entry renders exactly its title marker"
+        vec!["you  [folded, 2 lines]".to_owned(), String::new()],
+        "a folded entry renders its title marker plus the separator row"
     );
-    assert_eq!(state.total_height(80), 1);
+    assert_eq!(state.total_height(80), 2);
     assert!(state.total_height(80) < unfolded_height);
     assert_eq!(state.retained_bytes(), bytes, "folding changes no bytes");
     assert_eq!(state.transcript(), transcript, "folding changes no content");
@@ -386,20 +394,30 @@ fn fold_all_and_unfold_all_cover_retained_entries_without_touching_retention() {
 
     assert_eq!(
         state.total_height(80),
-        state.entry_count(),
-        "each folded entry collapses to one marker line"
+        2 * state.entry_count(),
+        "each folded entry collapses to a marker line plus its separator"
     );
-    let folded = state.visible_lines(80, state.entry_count()).lines;
-    assert_eq!(folded.len(), state.entry_count());
-    assert!(folded.iter().all(|line| line.contains("[folded,")));
+    let folded = state.visible_lines(80, 2 * state.entry_count()).lines;
+    assert_eq!(folded.len(), 2 * state.entry_count());
+    assert!(
+        folded
+            .iter()
+            .step_by(2)
+            .all(|line| line.contains("[folded,")),
+        "every other row is a fold marker"
+    );
+    assert!(
+        folded.iter().skip(1).step_by(2).all(|line| line.is_empty()),
+        "markers alternate with blank separator rows"
+    );
     assert!(
         !folded.iter().any(|line| line.contains("[output truncated")),
         "a folded entry hides its truncation marker too"
     );
     assert!(!folded.iter().any(|line| line.contains("kept ")));
     assert_eq!(
-        folded.last().map(String::as_str),
-        Some("you  [folded, 1 lines]"),
+        folded[folded.len() - 2].as_str(),
+        "you  [folded, 1 lines]",
         "the folded window stays anchored to the newest retained entry"
     );
 
@@ -687,8 +705,8 @@ fn truncated_multibyte_entry_renders_only_valid_utf8() {
     );
     assert_eq!(view.lines.first().map(String::as_str), Some(USER_TITLE));
     assert_eq!(
-        view.lines.last().map(|line| line.trim_start()),
-        Some(TRUNCATION_MARK)
+        view.lines[view.lines.len() - 2].trim_start(),
+        TRUNCATION_MARK
     );
     assert!(
         view.lines.iter().all(|line| line.chars().count() <= width),
@@ -698,7 +716,7 @@ fn truncated_multibyte_entry_renders_only_valid_utf8() {
         view.lines.iter().all(|line| !line.contains('\u{FFFD}')),
         "no replacement character appears at a cut point"
     );
-    let body: String = view.lines[1..view.lines.len() - 1]
+    let body: String = view.lines[1..view.lines.len() - 2]
         .iter()
         .map(|line| line.strip_prefix("  ").expect("body lines are indented"))
         .collect();

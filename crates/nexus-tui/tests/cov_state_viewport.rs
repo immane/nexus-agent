@@ -39,7 +39,7 @@ const WIDTH: usize = 80;
 const HEIGHT: usize = 10;
 
 /// Wrapped lines contributed by one `notice` entry at [`WIDTH`].
-const NOTICE_LINES: usize = 2;
+const NOTICE_LINES: usize = 3;
 
 fn session() -> SessionId {
     SessionId::new("sess-1").expect("valid session id")
@@ -143,26 +143,31 @@ fn visible_window_is_the_exact_tail_of_the_conversation() {
     let state = state_with_notices(20);
     assert_eq!(
         state.total_height(WIDTH),
-        40,
-        "20 two-line entries at {WIDTH} columns"
+        60,
+        "20 three-line entries at {WIDTH} columns"
     );
 
     let window = state.visible_lines(WIDTH, HEIGHT).lines;
     assert_eq!(window.len(), HEIGHT, "the window is filled");
     assert_eq!(
         window,
-        whole_transcript(&state)[30..],
+        whole_transcript(&state)[50..],
         "bottom anchoring shows the newest wrapped lines"
     );
     assert_eq!(
+        window[HEIGHT - 2].as_str(),
+        "  n19",
+        "the newest body line sits above the trailing separator"
+    );
+    assert_eq!(
         window.last().map(String::as_str),
-        Some("  n19"),
-        "the newest body line is the last visible line"
+        Some(""),
+        "every entry ends with a blank separator row"
     );
 
     let shrunk = state.visible_lines(WIDTH, 4).lines;
-    assert_eq!(shrunk, whole_transcript(&state)[36..]);
-    assert_eq!(shrunk.last().map(String::as_str), Some("  n19"));
+    assert_eq!(shrunk, whole_transcript(&state)[56..]);
+    assert_eq!(shrunk[2].as_str(), "  n19");
 }
 
 #[test]
@@ -186,7 +191,7 @@ fn hidden_above_counts_exactly_the_lines_above_the_window() {
     let almost = state.visible_lines(WIDTH, total - 2);
     assert_eq!(almost.hidden_above, 2);
     assert_eq!(almost.lines.len(), total - 2);
-    assert_eq!(almost.lines.last().map(String::as_str), Some("  n19"));
+    assert_eq!(almost.lines[almost.lines.len() - 2].as_str(), "  n19");
 
     // Exactly the content height: nothing is hidden.
     let exact = state.visible_lines(WIDTH, total);
@@ -199,7 +204,7 @@ fn hidden_above_counts_exactly_the_lines_above_the_window() {
 fn a_frame_taller_than_the_content_hides_nothing() {
     let state = state_with_notices(3);
     let total = state.total_height(WIDTH);
-    assert_eq!(total, 6);
+    assert_eq!(total, 9);
 
     // At or above the content height everything is shown, with no rows
     // wasted on the hidden-lines indicator.
@@ -235,18 +240,26 @@ fn a_frame_taller_than_the_content_hides_nothing() {
             height,
             "the frame is filled to capacity at height {height}"
         );
-        assert_eq!(
-            view.lines.last().map(String::as_str),
-            Some("  n2"),
-            "the newest line stays anchored at height {height}"
-        );
+        if height == 1 {
+            assert_eq!(
+                view.lines,
+                vec![String::new()],
+                "a one-row frame shows the trailing separator"
+            );
+        } else {
+            assert_eq!(
+                view.lines[view.lines.len() - 2].as_str(),
+                "  n2",
+                "the newest line stays anchored at height {height}"
+            );
+        }
         assert!(state.truncation_indicator(WIDTH, height));
     }
     assert_eq!(state.visible_lines(WIDTH, 1).lines.len(), 1);
     assert_eq!(
         state.visible_lines(WIDTH, 1).lines,
-        vec!["  n2".to_owned()],
-        "a one-row frame shows the newest line, not the oldest"
+        vec![String::new()],
+        "a one-row frame shows the newest separator row, not the oldest"
     );
 }
 
@@ -285,7 +298,7 @@ fn degenerate_geometry_is_clamped_instead_of_panicking() {
 fn truncation_indicator_is_reserved_only_when_content_is_hidden() {
     let state = state_with_notices(20);
     let total = state.total_height(WIDTH);
-    assert_eq!(total, 40);
+    assert_eq!(total, 60);
 
     assert!(
         state.truncation_indicator(WIDTH, HEIGHT),
@@ -340,10 +353,7 @@ fn dropped_entries_keep_the_indicator_on_even_a_spacious_frame() {
     // `n0` is the entry that was dropped, so the newest retained one is the
     // last of the `MAX_RETAINED_ENTRIES` entries pushed after it.
     let newest = format!("  n{MAX_RETAINED_ENTRIES}");
-    assert_eq!(
-        short.lines.last().map(String::as_str),
-        Some(newest.as_str())
-    );
+    assert_eq!(short.lines[short.lines.len() - 2].as_str(), newest.as_str());
 }
 
 #[test]
@@ -396,7 +406,7 @@ fn every_rendered_line_is_sanitized_and_width_bounded() {
 fn folding_shrinks_the_layout_without_dropping_history() {
     let mut state = state_with_notices(6);
     let unfolded = state.total_height(WIDTH);
-    assert_eq!(unfolded, 12);
+    assert_eq!(unfolded, 18);
 
     // One body line per entry: folding collapses each entry to its marker.
     state.fold_all();
@@ -504,7 +514,7 @@ fn scroll_down_saturates_at_the_tail_and_releases_the_selection() {
     state.move_selection(-8);
     assert_eq!(state.selected(), Some(12));
     let pinned = state.scrollback();
-    assert_eq!(pinned, 6, "the window scrolled to keep the selection");
+    assert_eq!(pinned, 14, "the window scrolled to keep the selection");
 
     state.scroll_down(2);
     assert_eq!(state.scrollback(), pinned - 2);
@@ -517,7 +527,7 @@ fn scroll_down_saturates_at_the_tail_and_releases_the_selection() {
     );
     let view = state.visible_lines(WIDTH, HEIGHT);
     assert_eq!(view.hidden_above, state.total_height(WIDTH) - HEIGHT);
-    assert_eq!(view.lines.last().map(String::as_str), Some("  n19"));
+    assert_eq!(view.lines[view.lines.len() - 2].as_str(), "  n19");
 }
 
 #[test]
@@ -525,7 +535,7 @@ fn growing_the_frame_re_clamps_an_impossible_scroll_position() {
     let mut state = state_with_notices(20);
     state.set_viewport(WIDTH, 4);
     state.scroll_up(usize::MAX);
-    assert_eq!(state.scrollback(), 36);
+    assert_eq!(state.scrollback(), 56);
     assert_eq!(state.visible_lines(WIDTH, 4).hidden_above, 0);
 
     // A taller frame cannot keep a scroll position that no longer exists.
@@ -544,8 +554,8 @@ fn growing_the_frame_re_clamps_an_impossible_scroll_position() {
     assert_eq!(view.lines.first().map(String::as_str), Some("system"));
     assert_eq!(
         view.lines.last().map(String::as_str),
-        Some("  n4"),
-        "HEIGHT rows of two-line entries end on the fifth notice"
+        Some("system"),
+        "HEIGHT rows of three-line entries end on the fourth notice title"
     );
 }
 
@@ -571,7 +581,7 @@ fn shrinking_the_frame_keeps_a_valid_scroll_position() {
     );
     assert_eq!(view.lines.len(), HEIGHT);
     assert!(
-        view.lines.iter().any(|line| *line == "  n12"),
+        view.lines.iter().any(|line| *line == "  n15"),
         "the first body line five rows above the tail is visible: {:?}",
         view.lines
     );
@@ -608,13 +618,11 @@ fn page_scroll_survives_every_frame_recalculation() {
     // One page down returns exactly to the live tail.
     state.scroll_down(HEIGHT);
     assert_eq!(state.scrollback(), 0);
+    let tail = state.visible_lines(WIDTH, HEIGHT).lines;
     assert_eq!(
-        state
-            .visible_lines(WIDTH, HEIGHT)
-            .lines
-            .last()
-            .map(String::as_str),
-        Some("  n19")
+        tail[tail.len() - 2].as_str(),
+        "  n19",
+        "the newest body line sits above the trailing separator"
     );
 
     // Scrolling back up lands on exactly the same page.
@@ -673,13 +681,11 @@ fn a_scrolled_view_is_not_stolen_by_streaming_output() {
     // Scrolling back to the tail re-follows the newest output.
     state.scroll_down(usize::MAX);
     assert_eq!(state.scrollback(), 0);
+    let tail = state.visible_lines(WIDTH, HEIGHT).lines;
     assert_eq!(
-        state
-            .visible_lines(WIDTH, HEIGHT)
-            .lines
-            .last()
-            .map(String::as_str),
-        Some("  and a question")
+        tail[tail.len() - 2].as_str(),
+        "  and a question",
+        "the newest body line sits above the trailing separator"
     );
 }
 
@@ -698,7 +704,7 @@ fn submitting_resets_the_scroll_position_and_the_selection() {
     assert_eq!(state.selected(), None, "the selection is cleared");
     let view = state.visible_lines(WIDTH, HEIGHT);
     assert_eq!(view.hidden_above, state.total_height(WIDTH) - HEIGHT);
-    assert_eq!(view.lines.last().map(String::as_str), Some("  new turn"));
+    assert_eq!(view.lines[view.lines.len() - 2].as_str(), "  new turn");
 }
 
 #[test]
@@ -726,7 +732,7 @@ fn selection_movement_is_bounded_at_both_ends() {
 
     state.move_selection(isize::MIN);
     assert_eq!(state.selected(), Some(0), "movement clamps at the oldest");
-    assert_eq!(state.scrollback(), 36, "the window scrolled to the oldest");
+    assert_eq!(state.scrollback(), 56, "the window scrolled to the oldest");
     state.move_selection(-1);
     assert_eq!(state.selected(), Some(0));
 
