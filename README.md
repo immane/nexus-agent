@@ -14,6 +14,25 @@ Developer checks and optional low-value tests: [Testing](docs/testing.md).
 > [!IMPORTANT]
 > Nexus Agent has an M0 **test-only implementation** (TUI reports `v0.1.1-alpha`) with opt-in OpenAI-compatible live providers and development-mode file tools plus sandboxed command execution; storage remains ephemeral and plugins are not implemented. Real tools default to development mode: operations inside the project root and temp directories are automatic, access to other paths needs approval (allow once, or grant that directory for the session), and `--strict-tools` restores project-jailed reads with per-call confirmation. See [QUICKSTART.md](QUICKSTART.md) for live wiring and limitations. **M0 acceptance is not complete**. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and broader capabilities below describe the proposed architecture, not stable features.
 
+## Screenshots
+
+<div align="center">
+<table>
+<tr>
+<td align="center" width="50%">
+<img src="docs/images/title.jpg" alt="nexus-tui title screen" />
+<br />
+<sub>Title screen — live adapter, sandboxed exec, first reply</sub>
+</td>
+<td align="center" width="50%">
+<img src="docs/images/message.jpg" alt="nexus-tui conversation view" />
+<br />
+<sub>Conversation view — architecture, status, and remaining work</sub>
+</td>
+</tr>
+</table>
+</div>
+
 ## Design Goals
 
 | Priority | Direction |
