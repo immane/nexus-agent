@@ -1802,7 +1802,7 @@ impl AppState {
     /// with nothing else, so pausing the UI cannot desync it.
     #[must_use]
     pub fn caret_visible(&self) -> bool {
-        self.caret_ticks / CARET_BLINK_TICKS % 2 == 0
+        (self.caret_ticks / CARET_BLINK_TICKS).is_multiple_of(2)
     }
 
     /// Advances the caret blink clock one UI tick. Returns true when the
