@@ -62,7 +62,7 @@ const WEB_PROFILE: &str = "web-test";
 
 /// Tool wiring for demo sessions. Fakes are the default: nothing touches
 /// the real filesystem. `RealFiles` executes jailed `host_read`, `host_list`,
-/// `host_search`, `host_write`, `host_patch`, and sandboxed `host_exec` tools (mutations and exec require approval); the root is
+/// `host_search`, `host_write`, `host_patch`, and sandboxed `host_exec` tools (strict mutations and exec require approval); the root is
 /// canonicalized and validated up front and per session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolsMode {
@@ -73,6 +73,8 @@ pub enum ToolsMode {
         /// Canonical jail root.
         root: std::path::PathBuf,
     },
+    /// Development file/exec tools with session-scoped external grants.
+    Development { root: std::path::PathBuf },
 }
 
 /// Test-only demo provider: serves a fresh scripted demo script for every
@@ -235,8 +237,11 @@ impl Server {
     /// Real roots are validated eagerly so an unreadable jail fails at
     /// startup, never at the first submit.
     pub fn set_tools_mode(&mut self, mode: ToolsMode) -> Result<(), nexus_core::AgentError> {
-        if let ToolsMode::RealFiles { root } = &mode {
+        if let ToolsMode::RealFiles { root } | ToolsMode::Development { root } = &mode {
             ScopedReader::with_root(root)?;
+        }
+        if let ToolsMode::Development { root } = &mode {
+            Policy::development(root)?;
         }
         self.tools_mode = mode;
         Ok(())
@@ -281,7 +286,11 @@ impl Server {
         let session = SessionId::new(&token).expect("counter session id is valid");
         let config = RuntimeConfig {
             limits: nexus_core::Limits::m0_test(),
-            policy: Policy::m0_test(),
+            policy: match &self.tools_mode {
+                ToolsMode::Development { root } => Policy::development(root)
+                    .map_err(|_| SessionError::new(500, "tool permissions are invalid"))?,
+                _ => Policy::m0_test(),
+            },
             has_approval_handler: true,
         };
         let provider: Arc<dyn nexus_core::ProviderPort + Send + Sync> = match provider {
@@ -293,6 +302,15 @@ impl Server {
                 Arc::new(FakeTool::read_only()),
                 Arc::new(FakeTool::mutation()),
             ],
+            ToolsMode::Development { root } => {
+                let mut tools = nexus_tools::development_file_tools(root)
+                    .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?;
+                tools
+                    .push(Arc::new(SandboxedExecutor::development(root).map_err(
+                        |_| SessionError::new(500, "tool wiring is invalid"),
+                    )?));
+                tools
+            }
             ToolsMode::RealFiles { root } => vec![
                 Arc::new(
                     ScopedReader::with_root(root)
@@ -787,13 +805,30 @@ impl Server {
         let runtime = session.runtime.lock().expect("runtime lockable");
         let reply = match decision {
             Decision::Approve => {
+                if body.get("scope").is_some_and(|value| !value.is_string()) {
+                    return Some(json_response(
+                        400,
+                        &json::error_body("approval scope is invalid"),
+                    ));
+                }
                 let command = ApproveCommand {
                     request: session.request_id(),
                     approval,
                     run,
                     call,
                 };
-                self.handle.block_on(runtime.approve(command))
+                match body_str(body, "scope") {
+                    None | Some("once") => self.handle.block_on(runtime.approve(command)),
+                    Some("session-directory") => self
+                        .handle
+                        .block_on(runtime.approve_session_directory(command)),
+                    _ => {
+                        return Some(json_response(
+                            400,
+                            &json::error_body("approval scope is invalid"),
+                        ));
+                    }
+                }
             }
             Decision::Deny => {
                 let command = DenyCommand {

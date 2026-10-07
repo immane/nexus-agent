@@ -1086,6 +1086,19 @@ impl AppState {
                     bounded_text(&notice.scope_summary, MAX_APPROVAL_FIELD_BYTES);
                 let (args, args_cut) =
                     bounded_optional_text(notice.args_preview.as_deref(), MAX_APPROVAL_FIELD_BYTES);
+                let (args, args_cut) = if let Some(directory) = &notice.session_directory {
+                    let (directory, directory_cut) =
+                        bounded_text(directory, MAX_APPROVAL_FIELD_BYTES);
+                    let display = format!(
+                        "{}\n[s] allow directory for this session (read/write + descendants): {}",
+                        args.as_deref().unwrap_or(""),
+                        directory
+                    );
+                    let (display, display_cut) = bounded_text(&display, MAX_APPROVAL_FIELD_BYTES);
+                    (Some(display), args_cut || directory_cut || display_cut)
+                } else {
+                    (args, args_cut)
+                };
                 self.pending_approval = Some(PendingApprovalCard {
                     approval: notice.approval.clone(),
                     call: notice.call.clone(),
@@ -3067,6 +3080,7 @@ mod tests {
             scope_summary: "scope".to_owned(),
             args_preview: None,
             expires_at_elapsed: Duration::from_secs(120),
+            session_directory: None,
         };
         let event = RunEvent::new(session, run, 1, EventPayload::ApprovalRequired(notice));
         assert!(state.apply_event(&event));
@@ -3086,6 +3100,42 @@ mod tests {
             !state.approval_decision_allowed(),
             "lost detail can never be approved even after full inspection"
         );
+    }
+
+    #[test]
+    fn session_directory_option_is_visible_and_untrusted_detail_is_bounded() {
+        use nexus_core::{ApprovalId, CallId};
+        for oversized in [false, true] {
+            let mut state = AppState::new();
+            state.apply_event(&started(0));
+            let (session, run) = session_run();
+            let mut notice = ApprovalNotice::new(
+                ApprovalId::new("a-directory").unwrap(),
+                CallId::new("c-directory").unwrap(),
+                "read external file",
+                "path:/etc/hosts",
+                Duration::from_secs(120),
+            )
+            .unwrap();
+            notice.session_directory = Some(if oversized {
+                "x".repeat(MAX_APPROVAL_FIELD_BYTES * 3)
+            } else {
+                "/etc".to_owned()
+            });
+            state.apply_event(&RunEvent::new(
+                session,
+                run,
+                1,
+                EventPayload::ApprovalRequired(notice),
+            ));
+            let preview = state.approval_args_preview().unwrap();
+            assert!(preview.contains("[s] allow directory for this session"));
+            assert!(preview.len() <= MAX_APPROVAL_FIELD_BYTES);
+            assert_eq!(state.approval_detail_truncated(), oversized);
+            if !oversized {
+                assert!(preview.contains("/etc"));
+            }
+        }
     }
 
     #[test]
@@ -3235,6 +3285,7 @@ mod tests {
             summary: "run tool host_write".to_owned(),
             scope_summary: "project scope".to_owned(),
             args_preview: Some(hostile),
+            session_directory: None,
             expires_at_elapsed: Duration::from_secs(120),
         };
         let event = RunEvent::new(session, run, 1, EventPayload::ApprovalRequired(notice));

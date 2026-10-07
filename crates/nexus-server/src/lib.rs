@@ -31,6 +31,8 @@
 //!   collected from the `approval-required` event. The server never infers
 //!   or completes identities; mismatches are rejected (`404`) or reported
 //!   (`409`) by the runtime, exactly as over the in-process port.
+//!   Approval additionally accepts `"scope":"session-directory"` for
+//!   the runtime-published directory in development mode (default: once).
 //! - `GET /sessions/{sid}/runs/{rid}/events` -> `text/event-stream`. One
 //!   subscriber per session at a time (`409` while one is attached); each
 //!   event is emitted once as `data: {...}` with the per-run sequence in
@@ -76,10 +78,12 @@
 //! `time`, `sync`, `macros`); sockets stay plain blocking `std::net` I/O,
 //! so there is intentionally no `net`/`io-util` async I/O and no HTTP
 //! framework. `nexus-fakes` supplies the test-only demo wiring.
-//! `nexus-tools` supplies the opt-in real root-jailed file tools:
-//! `--tools real` executes `host_read` and `host_write` against
-//! `--tools-root` (default: the working directory); writes still need an
-//! approval grant.
+//! `nexus-tools` supplies opt-in real filesystem and sandboxed exec tools.
+//! `--tools real` defaults to development mode with `--tools-root` as the
+//! project (default: working directory): project/temp operations are automatic,
+//! external file access requires approval/session directory grants, and exec
+//! has broad non-protected reads but bounded writes and no network.
+//! `--strict-tools` retains jailed reads and approval-required writes/exec.
 //! `nexus-config` owns the configuration document, its strict parse, its
 //! atomic save, and credential *references*; the server resolves a
 //! reference at submit time and never handles the value beyond that

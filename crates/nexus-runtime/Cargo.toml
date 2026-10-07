@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+nexus-permissions = { path = "../nexus-permissions" }
 # Core domain types plus the synchronous provider/tool ports (P2). All
 # behavior (lifecycle, policy, events) lives in this crate.
 nexus-core = { path = "../nexus-core" }

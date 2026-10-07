@@ -246,10 +246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-permissions"
+version = "0.1.0"
+
+[[package]]
 name = "nexus-runtime"
 version = "0.1.0"
 dependencies = [
  "nexus-core",
+ "nexus-permissions",
  "nexus-validation",
  "serde_json",
  "tokio",
@@ -274,6 +279,7 @@ name = "nexus-tools"
 version = "0.1.0"
 dependencies = [
  "nexus-core",
+ "nexus-permissions",
  "serde_json",
 ]
 

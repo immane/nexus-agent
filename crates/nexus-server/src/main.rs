@@ -21,15 +21,15 @@ const DEFAULT_PORT: u16 = 8471;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
     eprintln!(
-        "  --tools real executes jailed filesystem tools and sandboxed host_exec against --tools-root (default: working directory);"
+        "  --tools real executes filesystem tools and sandboxed host_exec with --tools-root as the project (default: working directory);"
     );
     eprintln!(
-        "  mutations and host_exec still need approval; the default --tools fake touches no real files."
+        "  real tools default to development mode; --strict-tools requires approval for writes/exec. Fake tools touch no real files."
     );
     std::process::exit(2);
 }
@@ -44,6 +44,7 @@ enum CliAction {
         config: Option<String>,
         tools_real: bool,
         tools_root: Option<String>,
+        strict_tools: bool,
     },
     /// Print usage and exit 2.
     Usage,
@@ -54,10 +55,12 @@ fn parse_args(argv: &[String]) -> CliAction {
     let mut config: Option<String> = None;
     let mut tools_real = false;
     let mut tools_root: Option<String> = None;
+    let mut strict_tools = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return CliAction::Usage,
+            "--strict-tools" => strict_tools = true,
             "--port" => match args.next().and_then(|value| value.parse().ok()) {
                 Some(value) => port = value,
                 None => return CliAction::Usage,
@@ -86,6 +89,7 @@ fn parse_args(argv: &[String]) -> CliAction {
         config,
         tools_real,
         tools_root,
+        strict_tools,
     }
 }
 
@@ -119,13 +123,14 @@ fn load_user_config(explicit: Option<&str>) -> (UserConfig, Option<PathBuf>) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let (port, explicit_config, tools_real, tools_root) = match parse_args(&argv) {
+    let (port, explicit_config, tools_real, tools_root, strict_tools) = match parse_args(&argv) {
         CliAction::Run {
             port,
             config,
             tools_real,
             tools_root,
-        } => (port, config, tools_real, tools_root),
+            strict_tools,
+        } => (port, config, tools_real, tools_root, strict_tools),
         CliAction::Usage => usage(),
     };
     let (config, path) = load_user_config(explicit_config.as_deref());
@@ -158,15 +163,21 @@ fn main() {
         // Fail fast on an unreadable jail: a missing default working
         // directory and an explicit bad root are both startup errors.
         let root = tools_root.unwrap_or_else(|| ".".to_owned());
-        let mode = ToolsMode::RealFiles {
-            root: std::path::PathBuf::from(&root),
+        let mode = if strict_tools {
+            ToolsMode::RealFiles {
+                root: PathBuf::from(&root),
+            }
+        } else {
+            ToolsMode::Development {
+                root: PathBuf::from(&root),
+            }
         };
         if let Err(error) = server.set_tools_mode(mode) {
             eprintln!("nexus-server: real tool root is unusable ({error}): {root}");
             std::process::exit(1);
         }
         eprintln!(
-            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (real jailed reads and writes at {root}, writes need approval, {providers}, no auth; never expose)"
+            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (real tools at {root}, strict={strict_tools}, {providers}, no auth; never expose)"
         );
     } else {
         eprintln!(
@@ -218,6 +229,7 @@ mod cov_main_args {
                 config,
                 tools_real,
                 tools_root,
+                strict_tools: _,
             } => (port, config, tools_real, tools_root),
             CliAction::Usage => panic!("expected a run action for {args:?}"),
         }
@@ -258,6 +270,26 @@ mod cov_main_args {
         // Pin the advertised default so a constant change is a deliberate,
         // reviewable edit rather than a silent contract drift.
         assert_eq!(DEFAULT_PORT, 8471);
+    }
+
+    #[test]
+    fn real_tools_default_to_development_and_strict_is_explicit() {
+        assert!(matches!(
+            parse_args(&argv(&["--tools", "real"])),
+            CliAction::Run {
+                tools_real: true,
+                strict_tools: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["--tools", "real", "--strict-tools"])),
+            CliAction::Run {
+                tools_real: true,
+                strict_tools: true,
+                ..
+            }
+        ));
     }
 
     /// `--port N` is the only way to move the listener off the default, so a

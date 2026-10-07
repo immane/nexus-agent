@@ -145,3 +145,82 @@ fn mac_sandbox_denies_network_access() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn development_python_runs_with_stdlib_temp_files_and_protected_credentials() {
+    let root = TempRoot::new();
+    std::fs::write(root.0.join(".env"), "sandbox-secret").unwrap();
+    let executor = SandboxedExecutor::development(&root.0).unwrap();
+    assert!(executor.sandbox_available());
+    let mut interpreters = 0;
+    for python in ["python3", "python"] {
+        if !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|path| path.join(python).is_file())
+        {
+            continue;
+        }
+        interpreters += 1;
+        let script = "import pathlib,tempfile,ssl,json,socket; pathlib.Path('ok.txt').write_text('ok'); f=tempfile.TemporaryFile(); f.write(b'ok'); f.close();\ntry: pathlib.Path('.env').read_text(); raise AssertionError('credential readable')\nexcept PermissionError: pass\ntry: s=socket.socket(); s.connect(('127.0.0.1',9)); raise AssertionError('network permitted')\nexcept PermissionError: pass\nprint('python-ok')";
+        let result = executor.execute(
+            &call(&serde_json::json!({"argv":[python,"-c",script]}).to_string()),
+            &context(),
+        );
+        assert_eq!(
+            result.status(),
+            ExecutionStatus::Succeeded,
+            "{python}: {}",
+            result.content()
+        );
+        assert!(result.content().contains("python-ok"));
+    }
+    assert!(
+        interpreters > 0,
+        "Python regression requires an installed interpreter"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn development_external_writes_require_a_bound_declared_directory() {
+    let root = TempRoot::new();
+    let executor = SandboxedExecutor::development(&root.0).unwrap();
+    assert!(executor.sandbox_available());
+    // A project outside both /tmp and the process temp directory.
+    let outside = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
+    let file = outside.join(format!("nexus-sandbox-write-{}", std::process::id()));
+    assert!(!file.exists());
+    let args = serde_json::json!({"argv":["/usr/bin/touch",file]});
+    let refused = executor.execute(&call(&args.to_string()), &context());
+    assert_eq!(
+        refused.status(),
+        ExecutionStatus::Failed,
+        "{}",
+        refused.content()
+    );
+    assert!(!file.exists());
+    let args = serde_json::json!({"argv":["/usr/bin/touch",file], "write_dir":outside});
+    let refused = executor.execute(&call(&args.to_string()), &context());
+    assert_eq!(refused.status(), ExecutionStatus::Denied);
+    let context = ToolContext::new(
+        4096,
+        Duration::ZERO,
+        false,
+        ApprovedScope::new(format!("exec-directory:{}", outside.display())).unwrap(),
+    )
+    .unwrap();
+    let allowed = executor.execute(&call(&args.to_string()), &context);
+    let exists = file.exists();
+    if exists {
+        std::fs::remove_file(&file).unwrap();
+    }
+    assert_eq!(
+        allowed.status(),
+        ExecutionStatus::Succeeded,
+        "{}",
+        allowed.content()
+    );
+    assert!(exists);
+}

@@ -26,7 +26,7 @@ Keyboard operation must cover submission, multiline editing, focus, scrolling, f
 
 Project-scoped reads/searches are automatic only when host policy permits them. Every model-directed file mutation and command execution requires confirmation under the default policy.
 
-Show the exact operation's safe summary, affected scope, and a diff or command preview where applicable. Offer allow-once and deny without silently enabling global automatic approval. Send the decision through the runtime command interface; the frontend never executes the operation itself.
+Show the exact operation's safe summary, affected scope, and a diff or command preview where applicable. Offer allow-once (`a`) and deny (`d`); external development approvals also display the canonical directory and offer `s` for read/write access to that directory and descendants for this session only. Both allowing actions require full inspection when detail is clipped. No option silently enables global automatic approval. Send the decision through the runtime command interface; the frontend never executes the operation itself. Real tools default to development mode; `--strict-tools` preserves the original strict policy.
 
 Cancellation must remain available while output streams or an approval is pending. No shortcut should accidentally approve an operation or change the permission baseline.
 

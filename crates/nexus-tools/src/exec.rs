@@ -1,4 +1,4 @@
-//! Approval-gated argv execution behind mandatory OS sandbox backends.
+//! Runtime-authorized argv execution behind mandatory OS sandbox backends.
 
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
@@ -15,11 +15,13 @@ pub const HOST_EXEC_TOOL: &str = "host_exec";
 const OUTPUT_LIMIT: usize = 65_536;
 const EXEC_SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}},"required":["argv"],"additionalProperties":false}"#;
 
-/// Approval-gated executor used by the real-tools composition roots.
+/// Sandboxed executor used by the real-tools composition roots.
 pub struct SandboxedExecutor {
     root: PathBuf,
     backend: Backend,
     spec: ToolSpec,
+    development: Option<nexus_permissions::DirectoryPolicy>,
+    path: std::ffi::OsString,
 }
 
 #[derive(Clone)]
@@ -52,6 +54,12 @@ impl SandboxFailure {
 
 impl SandboxedExecutor {
     pub fn with_root(root: &Path) -> Result<Self, nexus_core::AgentError> {
+        let mut executor = Self::unprobed(root)?;
+        executor.probe();
+        Ok(executor)
+    }
+
+    fn unprobed(root: &Path) -> Result<Self, nexus_core::AgentError> {
         let root = std::fs::canonicalize(root)
             .map_err(|_| error(ErrorCategory::InvalidInput, "exec root is invalid"))?;
         if !root.is_dir() {
@@ -64,14 +72,38 @@ impl SandboxedExecutor {
             EXEC_SCHEMA,
         )
         .map_err(|_| error(ErrorCategory::Internal, "exec description is invalid"))?;
-        let mut executor = Self {
+        Ok(Self {
             root,
             backend,
             spec,
-        };
-        if executor.sandbox_available() {
-            let mut probe = executor.command(&["/usr/bin/true"]);
-            configure_environment(&mut probe, &executor.root);
+            development: None,
+            path: "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
+        })
+    }
+
+    /// Development execution keeps the host PATH but never inherits secrets.
+    /// Reads are broad with protected paths; writes stay bounded by the OS.
+    pub fn development(root: &Path) -> Result<Self, nexus_core::AgentError> {
+        let mut executor = Self::unprobed(root)?;
+        executor.development = Some(
+            nexus_permissions::DirectoryPolicy::new(root)
+                .map_err(|_| error(ErrorCategory::InvalidInput, "permissions root is invalid"))?,
+        );
+        executor.path = std::env::var_os("PATH").unwrap_or_else(|| executor.path.clone());
+        executor.spec = ToolSpec::new(ToolId::new(HOST_EXEC_TOOL, M0_REVISION).expect("static tool id"),
+            "Run argv in the development OS sandbox, no shell or network. Project and temporary writes are automatic; declare write_dir to request an external writable directory. Other files are broadly readable except protected paths.",
+            r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"write_dir":{"type":"string","minLength":1}},"required":["argv"],"additionalProperties":false}"#)
+            .map_err(|_| error(ErrorCategory::Internal, "exec description is invalid"))?;
+        executor.probe();
+        Ok(executor)
+    }
+
+    // Verify only the selected profile. No fallback to another mode or to
+    // unsandboxed execution if isolation fails.
+    fn probe(&mut self) {
+        if self.sandbox_available() {
+            let mut probe = self.command(&["/usr/bin/true"], None);
+            self.configure_environment(&mut probe);
             match probe
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -79,11 +111,21 @@ impl SandboxedExecutor {
                 .status()
             {
                 Ok(status) if status.success() => {}
-                Ok(_) => executor.backend = Backend::Unavailable(SandboxFailure::ProbeFailed),
-                Err(_) => executor.backend = Backend::Unavailable(SandboxFailure::LaunchFailed),
+                Ok(_) => self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed),
+                Err(_) => self.backend = Backend::Unavailable(SandboxFailure::LaunchFailed),
             }
         }
-        Ok(executor)
+    }
+
+    fn configure_environment(&self, command: &mut Command) {
+        configure_environment(command, &self.root);
+        command.env("PATH", &self.path);
+        if let Some(policy) = &self.development {
+            if let Some(temporary) = policy.temporary().last() {
+                command.env("TMPDIR", temporary);
+            }
+            command.env("PYTHONDONTWRITEBYTECODE", "1");
+        }
     }
 
     #[must_use]
@@ -104,10 +146,12 @@ impl SandboxedExecutor {
         })?;
         let args: serde_json::Value =
             serde_json::from_str(call.args().as_str()).map_err(|_| Failure::Invalid)?;
-        if !args
-            .as_object()
-            .is_some_and(|object| object.len() == 1 && object.contains_key("argv"))
-        {
+        if !args.as_object().is_some_and(|object| {
+            object.contains_key("argv")
+                && object
+                    .keys()
+                    .all(|key| key == "argv" || self.development.is_some() && key == "write_dir")
+        }) {
             return Err(Failure::Invalid);
         }
         let argv = args
@@ -124,17 +168,40 @@ impl SandboxedExecutor {
             strings.push(value);
         }
 
-        let mut command = self.command(&strings);
+        let write_dir = if let Some(value) = args.get("write_dir") {
+            let policy = self.development.as_ref().ok_or(Failure::Invalid)?;
+            let path = policy
+                .resolve(value.as_str().ok_or(Failure::Invalid)?)
+                .map_err(|_| Failure::Permission)?;
+            if !path.is_dir()
+                || context.scope().as_str() != format!("exec-directory:{}", path.to_string_lossy())
+            {
+                return Err(Failure::Permission);
+            }
+            Some(path)
+        } else {
+            None
+        };
+        let mut command = self.command(&strings, write_dir.as_deref());
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        configure_environment(&mut command, &self.root);
+        self.configure_environment(&mut command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Resolving an external write directory can block on the host
+        // filesystem; cancellation/deadlines may change before spawning.
+        context.check_active().map_err(|_| {
+            if context.is_cancelled() {
+                Failure::Cancelled
+            } else {
+                Failure::TimedOut
+            }
+        })?;
         let mut child = command.spawn().map_err(|_| Failure::Spawn)?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -192,11 +259,14 @@ impl SandboxedExecutor {
         }
     }
 
-    fn command(&self, argv: &[&str]) -> Command {
+    fn command(&self, argv: &[&str], write_dir: Option<&Path>) -> Command {
         match &self.backend {
             #[cfg(target_os = "macos")]
             Backend::MacOs(sandbox) => {
-                let profile = mac_profile(&self.root);
+                let profile = self.development.as_ref().map_or_else(
+                    || mac_profile(&self.root),
+                    |policy| mac_development_profile(policy, write_dir),
+                );
                 let mut command = Command::new(sandbox);
                 command.arg("-p").arg(profile).arg("--").args(argv);
                 command
@@ -204,6 +274,9 @@ impl SandboxedExecutor {
             #[cfg(target_os = "linux")]
             Backend::Linux(bwrap) => {
                 let mut command = Command::new(bwrap);
+                if self.development.is_some() {
+                    command.args(["--ro-bind", "/", "/"]);
+                }
                 command.args([
                     "--die-with-parent",
                     "--new-session",
@@ -214,8 +287,18 @@ impl SandboxedExecutor {
                     "/dev",
                 ]);
                 for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
-                    if Path::new(path).exists() {
+                    if self.development.is_none() && Path::new(path).exists() {
                         command.args(["--ro-bind", path, path]);
+                    }
+                }
+                if let Some(policy) = &self.development {
+                    for path in policy
+                        .temporary()
+                        .iter()
+                        .map(PathBuf::as_path)
+                        .chain(write_dir)
+                    {
+                        command.arg("--bind").arg(path).arg(path);
                     }
                 }
                 let mut parents: Vec<_> = self.root.ancestors().collect();
@@ -225,12 +308,27 @@ impl SandboxedExecutor {
                     .skip(1)
                     .take_while(|path| *path != self.root)
                 {
-                    command.args(["--dir"]).arg(parent);
+                    if self.development.is_none() {
+                        command.args(["--dir"]).arg(parent);
+                    }
+                }
+                command.args(["--bind"]).arg(&self.root).arg(&self.root);
+                // Masks must follow every writable bind, or a later project/
+                // directory mount could expose credentials again.
+                if let Some(policy) = &self.development {
+                    for path in policy.protected() {
+                        if path.is_dir() {
+                            command
+                                .arg("--tmpfs")
+                                .arg(path)
+                                .arg("--remount-ro")
+                                .arg(path);
+                        } else if path.is_file() {
+                            command.arg("--ro-bind").arg("/dev/null").arg(path);
+                        }
+                    }
                 }
                 command
-                    .args(["--bind"])
-                    .arg(&self.root)
-                    .arg(&self.root)
                     .args(["--chdir"])
                     .arg(&self.root)
                     .args(["--", argv[0]])
@@ -267,8 +365,32 @@ fn mac_profile(root: &Path) -> String {
     // macOS process startup needs access to the root directory itself.
     // A literal grants only that directory, not its children (subpath "/").
     format!(
-        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow mach-lookup)\n(allow file-read* (literal \"/\"))\n(allow file-read* (subpath \"/System\"))\n(allow file-read* (subpath \"/usr\"))\n(allow file-read* (subpath \"/bin\"))\n(allow file-read* (subpath \"/sbin\"))\n(allow file-read* (subpath \"/Library\"))\n(allow file-read* (subpath \"/opt/homebrew\"))\n(allow file-read* (subpath \"/usr/local\"))\n(allow file-read* (subpath \"/private/var/db\"))\n(allow file-read* (subpath \"/private/tmp\"))\n(allow file-read* (subpath \"/dev\"))\n(allow file-read* (subpath \"{root}\"))\n(allow file-write* (subpath \"{root}\"))\n"
+        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow mach-lookup)\n(allow file-read* (literal \"/\"))\n(allow file-read-metadata (literal \"/opt\"))\n(allow file-read* (subpath \"/System\"))\n(allow file-read* (subpath \"/usr\"))\n(allow file-read* (subpath \"/bin\"))\n(allow file-read* (subpath \"/sbin\"))\n(allow file-read* (subpath \"/Library\"))\n(allow file-read* (subpath \"/opt/homebrew\"))\n(allow file-read* (subpath \"/usr/local\"))\n(allow file-read* (subpath \"/private/var/db\"))\n(allow file-read* (subpath \"/private/tmp\"))\n(allow file-read* (subpath \"/dev\"))\n(allow file-read* (subpath \"{root}\"))\n(allow file-write* (subpath \"{root}\"))\n"
     )
+}
+
+#[cfg(target_os = "macos")]
+fn mac_development_profile(
+    policy: &nexus_permissions::DirectoryPolicy,
+    write_dir: Option<&Path>,
+) -> String {
+    let mut profile = "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow mach-lookup)\n(allow file-read*)\n".to_owned();
+    for path in std::iter::once(policy.root())
+        .chain(policy.temporary().iter().map(PathBuf::as_path))
+        .chain(write_dir)
+    {
+        profile.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            sbpl_quote(&path.to_string_lossy())
+        ));
+    }
+    for path in policy.protected() {
+        profile.push_str(&format!(
+            "(deny file-read* file-write* (subpath \"{}\"))\n",
+            sbpl_quote(&path.to_string_lossy())
+        ));
+    }
+    profile
 }
 
 #[cfg(target_os = "macos")]
@@ -321,6 +443,7 @@ fn find_backend() -> Backend {
 }
 
 enum Failure {
+    Permission,
     Unavailable(SandboxFailure),
     Invalid,
     Spawn,
@@ -341,6 +464,13 @@ impl ToolPort for SandboxedExecutor {
     fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
         let result = self.run(call, context);
         let (status, effect, evidence, content, truncated) = match result {
+            Err(Failure::Permission) => (
+                ExecutionStatus::Denied,
+                EffectState::NotStarted,
+                Evidence::HostObserved,
+                "exec write directory is not authorized".to_owned(),
+                false,
+            ),
             Ok((output, truncated)) => (
                 ExecutionStatus::Succeeded,
                 EffectState::Unknown,

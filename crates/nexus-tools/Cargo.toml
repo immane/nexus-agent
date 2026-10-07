@@ -9,6 +9,7 @@ name = "behavior"
 path = "tests/behavior.rs"
 
 [dependencies]
+nexus-permissions = { path = "../nexus-permissions" }
 # Core domain types plus the synchronous tool port. Behavior (lifecycle,
 # policy, events) stays in nexus-runtime; this crate only executes admitted
 # calls against the real filesystem inside one rooted jail.

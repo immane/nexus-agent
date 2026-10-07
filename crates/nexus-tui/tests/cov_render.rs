@@ -751,6 +751,7 @@ fn a_field_cut_at_the_storage_bound_never_unlocks_the_gate() {
         scope_summary: "project scope".to_owned(),
         args_preview: None,
         expires_at_elapsed: Duration::from_secs(120),
+        session_directory: None,
     };
     let mut state = started_state();
     let event = RunEvent::new(

@@ -70,7 +70,7 @@ Unknown effects forbid blind retry. A caller timeout does not establish that an 
 
 ## Required Tests
 
-Cover registration/schema failure, incomplete calls, automatic scoped reads/searches, confirmation for mutations and apparently read-only commands, headless denial without a handler, denied/stale/consumed approvals, changed arguments, scope enforcement, output limits, cleanup, timeout with uncertain effects, and prevention of blind replay.
+Cover registration/schema failure, incomplete calls, automatic scoped reads/searches, strict confirmation for mutations and apparently read-only commands, development project/temp automatic operations, external-path approval and session-directory reuse/isolation, read-only denial of automatic mutations, headless denial of confirmation-required calls without a handler, denied/stale/consumed approvals, changed arguments, scope enforcement, protected paths, output limits, cleanup, timeout with uncertain effects, and prevention of blind replay.
 
 ## Related Documents
 

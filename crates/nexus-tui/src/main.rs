@@ -119,11 +119,12 @@ struct SessionConfig {
     config: UserConfig,
     path: Option<std::path::PathBuf>,
     active_model: Option<String>,
-    /// Jail for real file reads/writes: `--tools-root`, else the working
+    /// Project root for real file reads/writes: `--tools-root`, else the working
     /// directory. `None` (tests only) keeps every tool scripted. Cloned
     /// with the template so every slot shares the startup wiring while
     /// keeping its own runtime and selection.
     tools_root: Option<std::path::PathBuf>,
+    strict_tools: bool,
     /// Scripted demo explicitly requested with `--demo`. Without it the
     /// runtime never serves fakes, however unconfigured the selection is.
     demo: bool,
@@ -145,6 +146,7 @@ fn load_session_config() -> io::Result<SessionConfig> {
     let mut session = session_config_at(resolve_path(None))?;
     session.tools_root = resolve_tools_root(args.tools_root);
     session.demo = args.demo;
+    session.strict_tools = args.strict_tools;
     Ok(session)
 }
 
@@ -179,6 +181,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
         path,
         active_model,
         tools_root: None,
+        strict_tools: false,
         demo: false,
     })
 }
@@ -214,15 +217,16 @@ fn boot_model(config: &UserConfig) -> Option<String> {
 }
 
 /// Startup arguments. The TUI takes no `--config` flag (see
-/// [`SessionConfig`]); the only flag names the jail real file reads and
-/// writes are confined to, the other explicitly opts into the scripted demo.
+/// [`SessionConfig`]); flags select the project root, strict permissions,
+/// or the scripted demo.
 /// Without `--demo` nothing scripted ever serves: unconfigured runs fail
 /// with a not-configured diagnostic instead of a silent fake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartupArgs {
+    strict_tools: bool,
     /// Jail for real file reads and writes. Explicit `--tools-root`, else
     /// the working directory by default; `None` (tests only) keeps every
-    /// tool scripted. Writes always need an approval grant, even when real.
+    /// tool scripted. Development writes in this root are automatic.
     tools_root: Option<std::path::PathBuf>,
     /// Serve the scripted demo wiring (fake provider/tools, canned
     /// submission). The dev-version default is off.
@@ -237,18 +241,20 @@ enum StartupAction {
     Usage,
 }
 
-/// Parses the process arguments. Only `--tools-root PATH` and
-/// `--help`/`-h` are recognized: anything else (including a bare word,
+/// Parses the supported project, permission, demo, and help flags.
+/// Anything else (including a bare word,
 /// which the historical parser ignored) is usage, never a silent boot
 /// into scripted mode on a mistyped flag.
 fn parse_startup_args(argv: &[String]) -> StartupAction {
     let mut tools_root: Option<std::path::PathBuf> = None;
     let mut demo = false;
+    let mut strict_tools = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return StartupAction::Usage,
             "--demo" => demo = true,
+            "--strict-tools" => strict_tools = true,
             "--tools-root" => match args.next() {
                 Some(value) if !value.is_empty() => {
                     tools_root = Some(std::path::PathBuf::from(value));
@@ -258,18 +264,23 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
             _ => return StartupAction::Usage,
         }
     }
-    StartupAction::Run(StartupArgs { tools_root, demo })
+    StartupAction::Run(StartupArgs {
+        tools_root,
+        demo,
+        strict_tools,
+    })
 }
 
 /// Prints usage and exits 2. Splitting the exit from the parser keeps
 /// every rejection path unit-testable.
 fn startup_usage() -> ! {
-    eprintln!("usage: nexus-tui [--tools-root PATH] [--demo] [--help]");
+    eprintln!("usage: nexus-tui [--tools-root PATH] [--strict-tools] [--demo] [--help]");
     eprintln!("  Without --demo the TUI attempts live wiring; unconfigured runs");
     eprintln!("  fail with a not-configured diagnostic instead of serving fakes.");
     eprintln!("  With --demo, every tool is scripted and one canned submission fires.");
-    eprintln!("  File tools are jailed to --tools-root, defaulting to the working directory");
-    eprintln!("  (subdirectories included); writes still need approval.");
+    eprintln!("  Project root is --tools-root, defaulting to the working directory.");
+    eprintln!("  Development tools are default: project/temp operations need no approval.");
+    eprintln!("  --strict-tools keeps jailed reads and approval-required writes/exec.");
     std::process::exit(2);
 }
 
@@ -610,7 +621,12 @@ fn build_live_runtime(
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let config = RuntimeConfig {
         limits: Limits::m0_test(),
-        policy: Policy::m0_test(),
+        policy: match &session_config.tools_root {
+            Some(root) if !session_config.strict_tools => {
+                Policy::development(root).map_err(io::Error::other)?
+            }
+            _ => Policy::m0_test(),
+        },
         has_approval_handler: true,
     };
     let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = match &session_config.tools_root {
@@ -628,6 +644,14 @@ fn build_live_runtime(
                     "tools root is unusable",
                 ));
             }
+            if !session_config.strict_tools {
+                let mut tools =
+                    nexus_tools::development_file_tools(&canonical).map_err(io::Error::other)?;
+                tools.push(Arc::new(
+                    SandboxedExecutor::development(&canonical).map_err(io::Error::other)?,
+                ));
+                return runtime_with_tools(session_config, config, tools);
+            }
             vec![
                 Arc::new(ScopedReader::with_root(&canonical).map_err(io::Error::other)?),
                 Arc::new(ScopedLister::with_root(&canonical).map_err(io::Error::other)?),
@@ -638,6 +662,14 @@ fn build_live_runtime(
             ]
         }
     };
+    runtime_with_tools(session_config, config, tools)
+}
+
+fn runtime_with_tools(
+    session_config: &SessionConfig,
+    config: RuntimeConfig,
+    tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>>,
+) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let binding = Arc::new(Mutex::new(LiveSelection {
         config: session_config.config.clone(),
         active_model: session_config.active_model.clone(),
@@ -1216,7 +1248,7 @@ impl Frontend {
 /// One frontend loop step: a merged channel event, the persistent tick, or
 /// both channels closed.
 enum LoopStep {
-    Event(RunEvent),
+    Event(Box<RunEvent>),
     Tick,
     Closed,
 }
@@ -1232,11 +1264,11 @@ async fn next_loop_step(
 ) -> LoopStep {
     tokio::select! {
         event = data.recv() => match event {
-            Some(event) => LoopStep::Event(event),
+            Some(event) => LoopStep::Event(Box::new(event)),
             None => LoopStep::Closed,
         },
         event = control.recv() => match event {
-            Some(event) => LoopStep::Event(event),
+            Some(event) => LoopStep::Event(Box::new(event)),
             None => LoopStep::Closed,
         },
         _ = interval.tick() => LoopStep::Tick,
@@ -1777,7 +1809,16 @@ fn settle_submit(front: &mut Frontend, draft: &str, reply: &CommandResponse) -> 
 
 /// Handles one key event. Returns true when the TUI should exit.
 async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> bool {
-    let Some(action) = map_key(front.focus, key) else {
+    let directory_approval = front.focus == Focus::ApprovalCard
+        && key.kind == KeyEventKind::Press
+        && key.modifiers.is_empty()
+        && key.code == crossterm::event::KeyCode::Char('s');
+    let action = if directory_approval {
+        Some(Action::ApproveOnce)
+    } else {
+        map_key(front.focus, key)
+    };
+    let Some(action) = action else {
         return false;
     };
     match action {
@@ -1914,9 +1955,19 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
                 );
                 return false;
             }
+            if directory_approval && notice.session_directory.is_none() {
+                front
+                    .state
+                    .notice("no session directory grant is offered for this approval");
+                return false;
+            }
             let request = front.next_request();
             let command = if action == Action::ApproveOnce {
-                approve_notice_command(request, &run, &notice)
+                if directory_approval {
+                    nexus_tui::decisions::approve_session_directory_command(request, &run, &notice)
+                } else {
+                    approve_notice_command(request, &run, &notice)
+                }
             } else {
                 deny_notice_command(request, &run, &notice)
             };
@@ -1924,6 +1975,12 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             front
                 .state
                 .notice(&format!("decision reply: {:?}", reply.reply()));
+            if matches!(
+                reply.reply(),
+                nexus_core::CommandReply::Rejected | nexus_core::CommandReply::Busy
+            ) {
+                return false;
+            }
             front.state.resolve_approval();
             front.live_approval = None;
             // The card is gone: hand the keyboard back to the composer so
@@ -2094,7 +2151,7 @@ async fn interactive_loop(
                 // serving: the next `Accepted` submit adopts a new run.
                 // Only quit, close, or an I/O error ends the loop.
                 let slot = sessions.active_mut();
-                if absorb(&mut slot.front, event, &mut slot.streams) {
+                if absorb(&mut slot.front, *event, &mut slot.streams) {
                     draw(terminal, &mut slot.front)?;
                 }
             }
@@ -2287,7 +2344,7 @@ async fn headless(
                 LoopStep::Closed => break,
                 LoopStep::Event(event) => {
                     event_since_tick = true;
-                    let pushed = front.merger.push(event);
+                    let pushed = front.merger.push(*event);
                     if apply_headless(&runtime, &mut front, pushed).await {
                         break;
                     }
@@ -2727,7 +2784,7 @@ mod tests {
             match next_loop_step(&mut interval, &mut streams.data, &mut streams.control).await {
                 LoopStep::Closed => break,
                 LoopStep::Event(event) => {
-                    let pushed = front.merger.push(event);
+                    let pushed = front.merger.push(*event);
                     front.apply_events(pushed);
                 }
                 LoopStep::Tick => {}
@@ -3723,6 +3780,7 @@ mod cov_main_topup {
             active_model: None,
             tools_root: None,
             demo: false,
+            strict_tools: true,
         }
     }
 
@@ -3764,6 +3822,7 @@ mod cov_main_topup {
             active_model,
             tools_root: None,
             demo: false,
+            strict_tools: true,
         }
     }
 
@@ -4876,6 +4935,32 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
+    async fn session_directory_key_requires_full_detail_and_a_published_directory() {
+        let (runtime, _streams) = build_runtime().unwrap();
+        let mut front = awaiting_approval(&run_id("run-directory-key"), "c1-0");
+        front.focus = Focus::ApprovalCard;
+        handle_key(&mut front, &runtime, press(KeyCode::Char('s'))).await;
+        assert_eq!(front.request_counter, 0);
+        assert!(front.live_approval.is_some());
+        front.state.set_approval_geometry(ApprovalGeometry {
+            inner_width: 80,
+            inner_rows: 10,
+            detail_rows: 6,
+            clipped: false,
+        });
+        handle_key(&mut front, &runtime, press(KeyCode::Char('s'))).await;
+        assert_eq!(front.request_counter, 0);
+        assert!(
+            front.live_approval.is_some(),
+            "strict approval offers no directory grant"
+        );
+        front.live_approval.as_mut().unwrap().1.session_directory = Some("/etc".to_owned());
+        handle_key(&mut front, &runtime, press(KeyCode::Char('s'))).await;
+        assert_eq!(front.request_counter, 1);
+        assert!(transcript(&front).contains("decision reply"));
+    }
+
+    #[tokio::test]
     async fn deny_needs_no_measurement_and_allow_once_without_a_notice_is_refused() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let run = run_id("run-deny");
@@ -5197,7 +5282,7 @@ mod cov_main_topup {
             match next_loop_step(interval, &mut streams.data, &mut streams.control).await {
                 LoopStep::Closed => break,
                 LoopStep::Event(event) => {
-                    let pushed = front.merger.push(event);
+                    let pushed = front.merger.push(*event);
                     front.apply_events(pushed);
                 }
                 LoopStep::Tick => {}
@@ -5616,6 +5701,7 @@ mod cov_live_wiring {
             active_model: None,
             tools_root: Some(missing),
             demo: false,
+            strict_tools: true,
         };
         assert!(
             build_live_runtime(&session).is_err(),
@@ -5640,6 +5726,7 @@ mod cov_live_wiring {
             active_model: None,
             tools_root: None,
             demo: false,
+            strict_tools: true,
         };
         let (_runtime, _streams, live) = build_live_runtime(&session).expect("demo wiring builds");
         assert!(
@@ -5648,5 +5735,25 @@ mod cov_live_wiring {
             "no handle means demo, even beside a live-capable runtime"
         );
         drop(live);
+    }
+
+    #[test]
+    fn startup_defaults_to_development_and_accepts_strict_tools() {
+        let args = vec!["nexus-tui".to_owned()];
+        assert!(matches!(
+            parse_startup_args(&args),
+            StartupAction::Run(StartupArgs {
+                strict_tools: false,
+                ..
+            })
+        ));
+        let args = vec!["nexus-tui".to_owned(), "--strict-tools".to_owned()];
+        assert!(matches!(
+            parse_startup_args(&args),
+            StartupAction::Run(StartupArgs {
+                strict_tools: true,
+                ..
+            })
+        ));
     }
 }

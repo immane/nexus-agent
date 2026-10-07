@@ -178,6 +178,9 @@ pub enum Command {
     Cancel(CancelCommand),
     /// Approve a live approval.
     Approve(ApproveCommand),
+    /// Approve the bound call and its displayed external directory for this
+    /// session only. The runtime, not the client, determines the directory.
+    ApproveSessionDirectory(ApproveCommand),
     /// Refuse a live approval.
     Deny(DenyCommand),
     /// Request a bounded run snapshot.
@@ -196,6 +199,7 @@ impl Command {
             Self::Submit(command) => &command.request,
             Self::Cancel(command) => &command.request,
             Self::Approve(command) => &command.request,
+            Self::ApproveSessionDirectory(command) => &command.request,
             Self::Deny(command) => &command.request,
             Self::GetSnapshot(command) => &command.request,
             Self::ListSessions(command) => &command.request,
@@ -313,6 +317,9 @@ pub struct ApprovalNotice {
     /// Caller-redacted bounded preview of the exact normalized arguments
     /// that would execute, if one was attached.
     pub args_preview: Option<String>,
+    /// Optional canonical external directory offered for session-only read/
+    /// write access, including descendants. Absent in strict mode.
+    pub session_directory: Option<String>,
     /// Monotonic expiry reading.
     pub expires_at_elapsed: Duration,
 }
@@ -335,6 +342,7 @@ impl ApprovalNotice {
             summary: summary.into(),
             scope_summary: scope_summary.into(),
             args_preview: None,
+            session_directory: None,
             expires_at_elapsed,
         };
         notice.validate()?;
@@ -367,6 +375,13 @@ impl ApprovalNotice {
     /// again for publicly mutated fields. Diagnostics are static and never
     /// interpolate the rejected content.
     pub fn validate(&self) -> Result<(), AgentError> {
+        if self
+            .session_directory
+            .as_ref()
+            .is_some_and(|directory| !is_bounded_safe_text(directory, MAX_SUMMARY_BYTES))
+        {
+            return Err(command_error("approval session directory is invalid"));
+        }
         if !is_bounded_safe_text(&self.summary, MAX_SUMMARY_BYTES) {
             return Err(command_error("approval summary is invalid"));
         }

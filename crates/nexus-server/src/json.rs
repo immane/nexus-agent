@@ -107,6 +107,7 @@ pub fn notice_json(notice: &ApprovalNotice) -> Value {
         "summary": notice.summary,
         "scope": notice.scope_summary,
         "args_preview": notice.args_preview,
+        "session_directory": notice.session_directory,
     })
 }
 

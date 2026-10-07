@@ -1144,6 +1144,7 @@ fn forged_notice(seq: u64, summary: String, scope: String, args: Option<String>)
             summary,
             scope_summary: scope,
             args_preview: args,
+            session_directory: None,
             expires_at_elapsed: EXPIRY,
         }),
     )

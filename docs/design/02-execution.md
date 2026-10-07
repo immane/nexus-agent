@@ -30,7 +30,7 @@ The runtime validates complete tool calls before dispatch. The baseline waits fo
 
 Multiple calls from a turn execute in declared order initially. Safe bounded parallelism may be added after measuring a concrete workload; conflicting mutations must not race by default.
 
-The accepted default policy permits scoped reads/searches and asks before model-directed mutations or any command execution. Validate stable input facts once at their owning boundary; check mutable grant validity, cancellation, and deadlines immediately before dispatch, including after an approval or storage wait.
+The accepted default is development policy: project/temp file operations and sandboxed exec are automatic; external file-tool paths and declared external exec write directories need approval or an in-memory session directory grant. Strict mode preserves jailed reads and confirmation for mutations/exec. Validate stable input facts once at their owning boundary; check mutable grant validity, target scope, cancellation, and deadlines immediately before dispatch, including after an approval or storage wait.
 
 When headless operation has no explicit approval handler, deny a confirmation-required call and expose its permission outcome. Do not wait forever for absent terminal input or switch into automatic approval.
 

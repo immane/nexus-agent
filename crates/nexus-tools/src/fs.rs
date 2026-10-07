@@ -265,6 +265,7 @@ const LIST_ENTRY_LIMIT: usize = 10_000;
 pub struct ScopedLister {
     root: PathBuf,
     spec: ToolSpec,
+    protected: Option<nexus_permissions::DirectoryPolicy>,
 }
 
 impl ScopedLister {
@@ -277,7 +278,18 @@ impl ScopedLister {
             LIST_SCHEMA,
         )
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
-        Ok(Self { root, spec })
+        Ok(Self {
+            root,
+            spec,
+            protected: None,
+        })
+    }
+    pub(crate) fn with_protected_paths(
+        mut self,
+        policy: nexus_permissions::DirectoryPolicy,
+    ) -> Self {
+        self.protected = Some(policy);
+        self
     }
     /// Bind to the process working directory.
     pub fn with_current_dir() -> Result<Self, AgentError> {
@@ -320,6 +332,15 @@ impl ScopedLister {
                     "tool call was cancelled",
                 ));
             }
+            if self.protected.as_ref().is_some_and(|policy| {
+                policy.is_protected(&entry.path())
+                    || entry
+                        .path()
+                        .canonicalize()
+                        .is_ok_and(|path| policy.is_protected(&path))
+            }) {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let suffix = if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                 "/"
@@ -348,6 +369,7 @@ impl ScopedLister {
 pub struct ScopedSearcher {
     root: PathBuf,
     spec: ToolSpec,
+    protected: Option<nexus_permissions::DirectoryPolicy>,
 }
 
 impl ScopedSearcher {
@@ -360,7 +382,18 @@ impl ScopedSearcher {
             SEARCH_SCHEMA,
         )
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
-        Ok(Self { root, spec })
+        Ok(Self {
+            root,
+            spec,
+            protected: None,
+        })
+    }
+    pub(crate) fn with_protected_paths(
+        mut self,
+        policy: nexus_permissions::DirectoryPolicy,
+    ) -> Self {
+        self.protected = Some(policy);
+        self
     }
     /// Bind to the process working directory.
     pub fn with_current_dir() -> Result<Self, AgentError> {
@@ -403,10 +436,24 @@ impl ScopedSearcher {
                     tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
                 })?;
                 let path = entry.path();
+                if self
+                    .protected
+                    .as_ref()
+                    .is_some_and(|policy| policy.is_protected(&path))
+                {
+                    continue;
+                }
                 let canonical = std::fs::canonicalize(&path).map_err(|_| {
                     tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
                 })?;
                 if !canonical.starts_with(&self.root) {
+                    continue;
+                }
+                if self
+                    .protected
+                    .as_ref()
+                    .is_some_and(|policy| policy.is_protected(&canonical))
+                {
                     continue;
                 }
                 let kind = entry.file_type().map_err(|_| {

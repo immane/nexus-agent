@@ -566,9 +566,10 @@ fn notice_json_carries_the_exact_decision_identity_without_a_preview() {
             "summary": "run tool host_write",
             "scope": "project scope",
             "args_preview": null,
+            "session_directory": null,
         })
     );
-    assert_eq!(field_count(&encoded), 5);
+    assert_eq!(field_count(&encoded), 6);
 }
 
 #[test]
@@ -583,7 +584,7 @@ fn notice_json_carries_an_attached_args_preview_verbatim() {
     assert_eq!(encoded["call"], "call-1", "identity is unchanged");
     assert_eq!(encoded["summary"], "run tool host_write");
     assert_eq!(encoded["scope"], "project scope");
-    assert_eq!(field_count(&encoded), 5);
+    assert_eq!(field_count(&encoded), 6);
 }
 
 #[test]

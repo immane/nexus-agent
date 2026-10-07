@@ -93,6 +93,7 @@ struct Shared {
     effective_output_budget: usize,
     context_items_bound: usize,
     policy: Policy,
+    session_directories: StdMutex<HashMap<SessionId, Vec<std::path::PathBuf>>>,
     has_approval_handler: bool,
     provider: Arc<dyn ProviderPort + Send + Sync>,
     tools: HashMap<String, RegisteredTool>,
@@ -140,6 +141,14 @@ struct QuarantineMeta {
 
 struct PendingApproval {
     binding: ApprovalBinding,
+    directory: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    Once,
+    SessionDirectory,
+    Deny,
 }
 
 struct QueuedCall {
@@ -407,6 +416,7 @@ impl Runtime {
             effective_output_budget,
             context_items_bound,
             policy: config.policy,
+            session_directories: StdMutex::new(HashMap::new()),
             has_approval_handler: config.has_approval_handler,
             provider,
             tools: registry,
@@ -454,6 +464,9 @@ impl Runtime {
             Command::Submit(command) => (self.submit(command).await, None),
             Command::Cancel(command) => (self.cancel(command).await, None),
             Command::Approve(command) => (self.approve(command).await, None),
+            Command::ApproveSessionDirectory(command) => {
+                (self.approve_session_directory(command).await, None)
+            }
             Command::Deny(command) => (self.deny(command).await, None),
             Command::GetSnapshot(command) => self.get_snapshot(command).await,
             Command::ListSessions(command) => (
@@ -622,7 +635,18 @@ impl Runtime {
             command.run,
             command.call,
             command.approval,
-            true,
+            ApprovalDecision::Once,
+        )
+        .await
+    }
+
+    pub async fn approve_session_directory(&self, command: ApproveCommand) -> CommandResponse {
+        self.resolve_grant(
+            command.request,
+            command.run,
+            command.call,
+            command.approval,
+            ApprovalDecision::SessionDirectory,
         )
         .await
     }
@@ -634,7 +658,7 @@ impl Runtime {
             command.run,
             command.call,
             command.approval,
-            false,
+            ApprovalDecision::Deny,
         )
         .await
     }
@@ -645,7 +669,7 @@ impl Runtime {
         run: RunId,
         call: CallId,
         approval: ApprovalId,
-        decision: bool,
+        decision: ApprovalDecision,
     ) -> CommandResponse {
         let mut state = self.shared.state.lock().await;
         let Some(active) = state.active.as_mut() else {
@@ -664,8 +688,84 @@ impl Runtime {
         {
             return CommandResponse::new(request, CommandReply::StaleOrUnknownTarget, Some(run));
         }
+        if decision == ApprovalDecision::SessionDirectory {
+            if active.cancelled
+                || active.token.is_cancelled()
+                || active.read_only
+                || StdInstant::now() >= active.deadline
+            {
+                return CommandResponse::new(
+                    request,
+                    CommandReply::StaleOrUnknownTarget,
+                    Some(run),
+                );
+            }
+            if !active.current.as_ref().is_some_and(|current| {
+                current.call.call() == &call
+                    && pending
+                        .binding
+                        .check_valid_for_dispatch(
+                            current.call.run(),
+                            current.call.call(),
+                            current.call.tool(),
+                            current.call.args(),
+                            self.shared.policy.revision(),
+                            now,
+                        )
+                        .is_ok()
+                    && self
+                        .shared
+                        .policy
+                        .approval_scope(&current.call)
+                        .as_ref()
+                        .ok()
+                        == Some(pending.binding.scope())
+            }) {
+                return CommandResponse::new(
+                    request,
+                    CommandReply::StaleOrUnknownTarget,
+                    Some(run),
+                );
+            }
+            let directory = active
+                .current
+                .as_ref()
+                .and_then(|current| self.shared.policy.approval_directory(&current.call).ok())
+                .flatten();
+            let Some(directory) = directory else {
+                return CommandResponse::new(
+                    request,
+                    CommandReply::StaleOrUnknownTarget,
+                    Some(run),
+                );
+            };
+            if pending.directory.as_ref() != Some(&directory) {
+                return CommandResponse::new(
+                    request,
+                    CommandReply::StaleOrUnknownTarget,
+                    Some(run),
+                );
+            }
+            let mut sessions = self
+                .shared
+                .session_directories
+                .lock()
+                .expect("session permissions lock");
+            if !sessions.contains_key(&active.session) && sessions.len() >= 128 {
+                return CommandResponse::new(request, CommandReply::Rejected, Some(run));
+            }
+            let directories = sessions.entry(active.session.clone()).or_default();
+            if !directories.contains(&directory) {
+                if directories.len() >= 64 {
+                    return CommandResponse::new(request, CommandReply::Rejected, Some(run));
+                }
+                directories.push(directory);
+            }
+        }
         active.pending.remove(&approval);
-        active.decided.insert(approval, decision);
+        active
+            .decided
+            .insert(approval, decision != ApprovalDecision::Deny);
         active.wake.notify_one();
         CommandResponse::new(request, CommandReply::Accepted, Some(run))
     }
@@ -1294,10 +1394,31 @@ impl Runtime {
         if StdInstant::now() >= active.deadline {
             return Err(Terminal::limit("run duration exhausted"));
         }
-        let Some(queued) = active.queue.pop_front() else {
+        let Some(mut queued) = active.queue.pop_front() else {
             return Ok(RunState::Preparing);
         };
-        if queued.needs_approval && active.read_only {
+        if self.shared.policy.is_development() {
+            queued.needs_approval = self
+                .shared
+                .policy
+                .call_requires_approval(
+                    &queued.call,
+                    self.shared
+                        .session_directories
+                        .lock()
+                        .expect("session permissions lock")
+                        .get(&active.session)
+                        .map_or(&[], Vec::as_slice),
+                )
+                .unwrap_or(true);
+        }
+        if active.read_only
+            && (queued.needs_approval
+                || matches!(
+                    queued.call.tool().name(),
+                    "host_write" | "host_patch" | "host_exec"
+                ))
+        {
             // Read-only runs never prompt and never execute: the denial is
             // recorded exactly like the no-handler denial below, so no
             // approval card is minted and no grant can exist to approve.
@@ -1377,7 +1498,7 @@ impl Runtime {
             self.shared.policy.revision(),
         );
         let summary = format!("run tool {}", queued.call.tool().name());
-        let notice = ApprovalNotice::new(
+        let mut notice = ApprovalNotice::new(
             approval.clone(),
             queued.call.call().clone(),
             summary,
@@ -1387,10 +1508,21 @@ impl Runtime {
         .map_err(Terminal::failed)?
         .with_args_preview(preview)
         .map_err(Terminal::failed)?;
+        notice.session_directory = self
+            .shared
+            .policy
+            .approval_directory(&queued.call)
+            .map_err(Terminal::failed)?
+            .map(|path| path.to_string_lossy().into_owned());
+        notice.validate().map_err(Terminal::failed)?;
         active.pending.insert(
             approval.clone(),
             PendingApproval {
                 binding: binding.clone(),
+                directory: notice
+                    .session_directory
+                    .as_ref()
+                    .map(std::path::PathBuf::from),
             },
         );
         active.current = Some(CurrentCall {
@@ -1628,7 +1760,15 @@ impl Runtime {
             }
             let scope = match current.binding.as_ref() {
                 Some(binding) => binding.scope().clone(),
-                None => match self.shared.policy.authorize(&call) {
+                None => match self.shared.policy.authorize_with_directories(
+                    &call,
+                    self.shared
+                        .session_directories
+                        .lock()
+                        .expect("session permissions lock")
+                        .get(&active.session)
+                        .map_or(&[], Vec::as_slice),
+                ) {
                     Ok(scope) => scope,
                     Err(_) => {
                         active.outcome_slot = Some((
@@ -1639,6 +1779,15 @@ impl Runtime {
                     }
                 },
             };
+            if self.shared.policy.is_development()
+                && self.shared.policy.approval_scope(&call).as_ref().ok() != Some(&scope)
+            {
+                active.outcome_slot = Some((
+                    call.call().clone(),
+                    denied_outcome("filesystem target changed after authorization"),
+                ));
+                return Ok(RunState::RecordingResult);
+            }
             let tool_deadline = now
                 .checked_add(self.shared.limits.per_tool_timeout)
                 .map_or(active.deadline, |candidate| candidate.min(active.deadline));
@@ -3035,6 +3184,301 @@ mod tests {
             Runtime::try_new(quick_config(), provider, wrong_revision).is_err(),
             "non-M0 revisions fail exact equality"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_directory_grants_cover_queued_calls_and_stay_session_local() {
+        let root = std::env::temp_dir();
+        let args = r#"{"path":"/etc/hosts"}"#;
+        let mut config = quick_config();
+        config.policy = Policy::development(&root).unwrap();
+        let turn = || {
+            FakeProvider::tool_turn(vec![
+                CallCandidate::new("item-1", "ref-1", "host_read", args).unwrap(),
+                CallCandidate::new("item-2", "ref-2", "host_write", args).unwrap(),
+            ])
+        };
+        let mut bed = bed_with(
+            vec![
+                turn(),
+                FakeProvider::stop_turn("done"),
+                turn(),
+                FakeProvider::stop_turn("done"),
+                turn(),
+                FakeProvider::stop_turn("done"),
+            ],
+            config,
+            Duration::ZERO,
+        );
+        test_rt().block_on(async {
+            let first = bed.runtime.submit(submit_cmd("directory-first")).await;
+            let notice = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = bed.control.recv().await.unwrap();
+                    if let EventPayload::ApprovalRequired(notice) = event.payload() {
+                        break notice.clone();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                notice.session_directory.as_deref(),
+                Some(std::fs::canonicalize("/etc").unwrap().to_str().unwrap())
+            );
+            let command = ApproveCommand {
+                request: RequestId::new("directory-grant").unwrap(),
+                run: first.run().unwrap().clone(),
+                call: notice.call.clone(),
+                approval: notice.approval.clone(),
+            };
+            assert_eq!(
+                bed.runtime
+                    .approve_session_directory(command.clone())
+                    .await
+                    .reply(),
+                CommandReply::Accepted
+            );
+            assert_eq!(
+                bed.runtime.approve_session_directory(command).await.reply(),
+                CommandReply::StaleOrUnknownTarget
+            );
+            let (events, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert!(
+                !events
+                    .control
+                    .iter()
+                    .any(|event| matches!(event.payload(), EventPayload::ApprovalRequired(_)))
+            );
+            assert_eq!(bed.write_tool.executed.load(Ordering::SeqCst), 1);
+            bed.runtime.submit(submit_cmd("directory-second")).await;
+            let (events, _) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert!(
+                !events
+                    .control
+                    .iter()
+                    .any(|event| matches!(event.payload(), EventPayload::ApprovalRequired(_)))
+            );
+            let mut other = submit_cmd("directory-other");
+            other.session = SessionId::new("sess-other").unwrap();
+            let other = bed.runtime.submit(other).await;
+            let approval = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let event = bed.control.recv().await.unwrap();
+                    if let EventPayload::ApprovalRequired(notice) = event.payload() {
+                        break notice.clone();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(approval.session_directory, notice.session_directory);
+            bed.runtime
+                .cancel(CancelCommand {
+                    request: RequestId::new("cancel-other").unwrap(),
+                    run: other.run().unwrap().clone(),
+                })
+                .await;
+            collect_until_finished(&mut bed.data, &mut bed.control).await;
+        });
+    }
+
+    #[test]
+    fn development_automatic_writes_are_denied_in_read_only_runs() {
+        let root = std::env::temp_dir();
+        let mut config = quick_config();
+        config.policy = Policy::development(&root).unwrap();
+        let mut bed = bed_with(
+            vec![
+                FakeProvider::tool_turn(vec![candidate(
+                    "host_write",
+                    r#"{"path":"nexus-plan-write"}"#,
+                )]),
+                FakeProvider::stop_turn("done"),
+            ],
+            config,
+            Duration::ZERO,
+        );
+        test_rt().block_on(async {
+            bed.runtime
+                .submit(submit_cmd("development-plan").with_read_only(true))
+                .await;
+            let (events, _) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(bed.write_tool.executed.load(Ordering::SeqCst), 0);
+            assert!(
+                tool_finished_map(&events)
+                    .values()
+                    .all(|outcome| outcome.status() == ExecutionStatus::Denied)
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_allow_once_and_cancelled_approvals_never_cache_directories() {
+        let mut config = quick_config();
+        config.policy = Policy::development(&std::env::temp_dir()).unwrap();
+        let turn =
+            || FakeProvider::tool_turn(vec![candidate("host_read", r#"{"path":"/etc/hosts"}"#)]);
+        let mut bed = bed_with(
+            vec![turn(), FakeProvider::stop_turn("done"), turn()],
+            config,
+            Duration::ZERO,
+        );
+        test_rt().block_on(async {
+            let first = bed.runtime.submit(submit_cmd("development-once")).await;
+            let events = collect_until_approval_or_finished(&mut bed.data, &mut bed.control).await;
+            let (approval, call) = find_approval(&events);
+            assert_eq!(
+                bed.runtime
+                    .approve(ApproveCommand {
+                        request: RequestId::new("allow-once").unwrap(),
+                        run: first.run().unwrap().clone(),
+                        approval,
+                        call
+                    })
+                    .await
+                    .reply(),
+                CommandReply::Accepted
+            );
+            collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert!(
+                bed.runtime
+                    .shared
+                    .session_directories
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            let second = bed.runtime.submit(submit_cmd("development-cancel")).await;
+            let events = collect_until_approval_or_finished(&mut bed.data, &mut bed.control).await;
+            let (approval, call) = find_approval(&events);
+            bed.runtime
+                .cancel(CancelCommand {
+                    request: RequestId::new("cancel-directory").unwrap(),
+                    run: second.run().unwrap().clone(),
+                })
+                .await;
+            let response = bed
+                .runtime
+                .approve_session_directory(ApproveCommand {
+                    request: RequestId::new("late-directory").unwrap(),
+                    run: second.run().unwrap().clone(),
+                    approval,
+                    call,
+                })
+                .await;
+            assert_ne!(response.reply(), CommandReply::Accepted);
+            assert!(
+                bed.runtime
+                    .shared
+                    .session_directories
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            collect_until_finished(&mut bed.data, &mut bed.control).await;
+        });
+    }
+
+    #[test]
+    fn development_project_writes_are_automatic_without_an_approval_handler() {
+        let mut config = quick_config();
+        config.policy = Policy::development(&std::env::temp_dir()).unwrap();
+        config.has_approval_handler = false;
+        let mut bed = bed_with(
+            vec![
+                FakeProvider::tool_turn(vec![candidate(
+                    "host_write",
+                    r#"{"path":"nexus-automatic-write"}"#,
+                )]),
+                FakeProvider::stop_turn("done"),
+            ],
+            config,
+            Duration::ZERO,
+        );
+        test_rt().block_on(async {
+            bed.runtime.submit(submit_cmd("development-headless")).await;
+            let (events, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert_eq!(bed.write_tool.executed.load(Ordering::SeqCst), 1);
+            assert!(
+                !events
+                    .control
+                    .iter()
+                    .any(|event| matches!(event.payload(), EventPayload::ApprovalRequired(_)))
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_changed_symlink_target_cannot_create_a_directory_grant() {
+        let root =
+            std::env::temp_dir().join(format!("nexus-runtime-grant-link-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let link = root.join("external");
+        std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
+        let mut config = quick_config();
+        config.policy = Policy::development(&root).unwrap();
+        let mut bed = bed_with(
+            vec![
+                FakeProvider::tool_turn(vec![candidate("host_read", r#"{"path":"external"}"#)]),
+                FakeProvider::stop_turn("done"),
+            ],
+            config,
+            Duration::ZERO,
+        );
+        test_rt().block_on(async {
+            let run = bed
+                .runtime
+                .submit(submit_cmd("changed-link"))
+                .await
+                .run()
+                .unwrap()
+                .clone();
+            let events = collect_until_approval_or_finished(&mut bed.data, &mut bed.control).await;
+            let (approval, call) = find_approval(&events);
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("/usr/bin/true", &link).unwrap();
+            let reply = bed
+                .runtime
+                .approve_session_directory(ApproveCommand {
+                    request: RequestId::new("changed-directory").unwrap(),
+                    run: run.clone(),
+                    approval: approval.clone(),
+                    call: call.clone(),
+                })
+                .await;
+            assert_eq!(reply.reply(), CommandReply::StaleOrUnknownTarget);
+            assert!(
+                bed.runtime
+                    .shared
+                    .session_directories
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+            bed.runtime
+                .deny(DenyCommand {
+                    request: RequestId::new("deny-changed").unwrap(),
+                    run,
+                    approval,
+                    call,
+                })
+                .await;
+            collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(bed.read_tool.executed.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]
@@ -5291,6 +5735,7 @@ mod cov_runtime_topup_private {
                 approval.clone(),
                 PendingApproval {
                     binding: binding_for(&run, &call, approval, Duration::from_secs(60)),
+                    directory: None,
                 },
             );
             install(&bed, active).await;

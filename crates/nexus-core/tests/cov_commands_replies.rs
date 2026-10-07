@@ -57,6 +57,7 @@ fn command_kind(command: &Command) -> &'static str {
         Command::Submit(_) => "submit",
         Command::Cancel(_) => "cancel",
         Command::Approve(_) => "approve",
+        Command::ApproveSessionDirectory(_) => "approve-session-directory",
         Command::Deny(_) => "deny",
         Command::GetSnapshot(_) => "get-snapshot",
         Command::ListSessions(_) => "list-sessions",
@@ -93,6 +94,16 @@ fn distinct_commands() -> Vec<(&'static str, &'static str, Command)> {
             "approve",
             Command::Approve(ApproveCommand {
                 request: request("req-approve"),
+                approval: approval.clone(),
+                run: run.clone(),
+                call: call.clone(),
+            }),
+        ),
+        (
+            "req-approve-directory",
+            "approve-session-directory",
+            Command::ApproveSessionDirectory(ApproveCommand {
+                request: request("req-approve-directory"),
                 approval: approval.clone(),
                 run: run.clone(),
                 call: call.clone(),
@@ -141,6 +152,7 @@ fn set_request(command: &mut Command, replacement: RequestId) {
         Command::Submit(command) => command.request = replacement,
         Command::Cancel(command) => command.request = replacement,
         Command::Approve(command) => command.request = replacement,
+        Command::ApproveSessionDirectory(command) => command.request = replacement,
         Command::Deny(command) => command.request = replacement,
         Command::GetSnapshot(command) => command.request = replacement,
         Command::ListSessions(command) => command.request = replacement,
@@ -174,7 +186,7 @@ fn reply_taxonomy_is_exhaustive_and_pairwise_distinct() {
 #[test]
 fn every_command_variant_exposes_its_own_request() {
     let cases = distinct_commands();
-    assert_eq!(cases.len(), 7, "one case per Command variant");
+    assert_eq!(cases.len(), 8, "one case per Command variant");
     let mut seen = Vec::new();
     for (raw, kind, command) in &cases {
         assert_eq!(

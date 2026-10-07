@@ -1,8 +1,9 @@
 //! Approval policy for the M0 single-run loop.
 //!
-//! Only host-authorized scoped reads, listings, and searches proceed automatically; every
-//! model-directed mutation and every command execution requires an explicit
-//! grant. Automatic execution is fail-closed: [`Policy::authorize`] accepts
+//! Strict mode permits only scoped reads/listings/searches automatically.
+//! Development mode additionally permits project/temp mutations and sandboxed
+//! exec, with session directory grants owned by the runtime. Strict automatic
+//! execution is fail-closed: [`Policy::authorize`] accepts
 //! only a canonical logical project-relative `path` for the exact M0
 //! revision, and an invalid policy (wrong revision, or an auto-approved set
 //! beyond the scoped read/list/search tools) is rejected by [`Policy::validate`]
@@ -24,10 +25,9 @@
 //! must still pre-redact at the source, and a returned preview is not a
 //! secret-free guarantee.
 //!
-//! This module makes logical-path decisions only: it performs no filesystem
-//! access and claims no symlink, nonexistent-target, or check/use-race
-//! protection; concrete adapters must re-validate real paths before touching
-//! a filesystem.
+//! Strict mode uses logical paths. Development mode resolves canonical host
+//! paths through the shared directory policy; concrete adapters revalidate
+//! them. Neither check claims race-free filesystem capabilities.
 
 use nexus_core::approval::MAX_SCOPE_BYTES;
 use nexus_core::commands::MAX_SUMMARY_BYTES;
@@ -87,6 +87,7 @@ const SECRET_VALUE_MARKERS: &[&str] = &[
 pub struct Policy {
     auto_tools: Vec<String>,
     revision: u32,
+    development: Option<nexus_permissions::DirectoryPolicy>,
 }
 
 impl Policy {
@@ -114,7 +115,117 @@ impl Policy {
         Self {
             auto_tools,
             revision,
+            development: None,
         }
+    }
+
+    /// Host-authorized development mode. Existing constructors retain the
+    /// strict policy for compatibility and security regression tests.
+    pub fn development(root: &std::path::Path) -> Result<Self, AgentError> {
+        let mut policy = Self::m0_test();
+        policy.development = Some(
+            nexus_permissions::DirectoryPolicy::new(root)
+                .map_err(|message| policy_error(ErrorCategory::InvalidInput, message))?,
+        );
+        Ok(policy)
+    }
+
+    pub fn is_development(&self) -> bool {
+        self.development.is_some()
+    }
+
+    /// Per-call decision; a tool name alone cannot decide external access.
+    pub fn call_requires_approval(
+        &self,
+        call: &ToolCall,
+        directories: &[std::path::PathBuf],
+    ) -> Result<bool, AgentError> {
+        let Some(policy) = &self.development else {
+            return Ok(self.requires_approval(call.tool()));
+        };
+        let target = self.development_target(call)?;
+        if let Some(path) = target {
+            Ok(!policy.is_automatic(&path)
+                && !directories
+                    .iter()
+                    .any(|directory| path.starts_with(directory)))
+        } else {
+            Ok(call.tool().name() != "host_exec")
+        }
+    }
+
+    pub fn authorize_with_directories(
+        &self,
+        call: &ToolCall,
+        directories: &[std::path::PathBuf],
+    ) -> Result<ApprovedScope, AgentError> {
+        if !self.is_development() {
+            return self.authorize(call);
+        }
+        if self.call_requires_approval(call, directories)? {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "external directory needs approval",
+            ));
+        }
+        self.approval_scope(call)
+    }
+
+    pub fn approval_directory(
+        &self,
+        call: &ToolCall,
+    ) -> Result<Option<std::path::PathBuf>, AgentError> {
+        let Some(policy) = &self.development else {
+            return Ok(None);
+        };
+        self.development_target(call)?
+            .filter(|path| !policy.is_automatic(path))
+            .map_or(Ok(None), |path| Ok(policy.directory(&path).ok()))
+    }
+
+    fn development_target(
+        &self,
+        call: &ToolCall,
+    ) -> Result<Option<std::path::PathBuf>, AgentError> {
+        self.validate()?;
+        if call.tool().revision() != self.revision {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "tool revision does not match the policy revision",
+            ));
+        }
+        let policy = self.development.as_ref().ok_or_else(|| {
+            policy_error(ErrorCategory::Internal, "development policy is unavailable")
+        })?;
+        let args = parse_object_args(call)?;
+        let value = match call.tool().name() {
+            "host_read" | "host_list" | "host_search" | "host_write" | "host_patch" => {
+                args.get("path")
+            }
+            "host_exec" => {
+                let Some(value) = args.get("write_dir") else {
+                    return Ok(None);
+                };
+                Some(value)
+            }
+            _ => return Ok(None),
+        };
+        let path = value.and_then(Value::as_str).ok_or_else(|| {
+            policy_error(
+                ErrorCategory::PermissionDenied,
+                "tool path argument is invalid",
+            )
+        })?;
+        let target = policy
+            .resolve(path)
+            .map_err(|message| policy_error(ErrorCategory::PermissionDenied, message))?;
+        if call.tool().name() == "host_exec" && !target.is_dir() {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "exec write directory must exist",
+            ));
+        }
+        Ok(Some(target))
     }
 
     /// Builds a validated policy, rejecting anything but the exact M0
@@ -246,6 +357,21 @@ impl Policy {
     /// approval prompt must not make two different commands look identical.
     pub fn approval_scope(&self, call: &ToolCall) -> Result<ApprovedScope, AgentError> {
         self.validate()?;
+        if self.is_development() {
+            return match self.development_target(call)? {
+                Some(path) => bounded_scope(&format!(
+                    "{}:{}",
+                    if call.tool().name() == "host_exec" {
+                        "exec-directory"
+                    } else {
+                        "path"
+                    },
+                    path.to_string_lossy()
+                )),
+                None if call.tool().name() == "host_exec" => bounded_scope("exec:workspace"),
+                None => bounded_scope(&format!("tool:{}", call.tool().name())),
+            };
+        }
         let args = parse_object_args(call)?;
         if let Some(value) = args.get("path") {
             let Value::String(raw_path) = value else {

@@ -3,11 +3,11 @@
 //! This crate owns the real [`nexus_core::ToolPort`] implementations:
 //! [`ScopedReader`] (`host_read`), [`ScopedLister`] (`host_list`),
 //! [`ScopedSearcher`] (`host_search`), [`ScopedWriter`] (`host_write`), and
-//! [`ScopedPatcher`] (`host_patch`, approval-gated mutations), and
-//! [`SandboxedExecutor`] (`host_exec`, approval-gated OS-sandboxed argv), all at the M0
-//! revision so the existing scoped policy authorizes reads automatically
-//! and routes writes/exec through approval. Filesystem paths resolve against
-//! one canonical root; `host_exec` runs only behind an available mandatory
+//! [`ScopedPatcher`] (`host_patch`), and [`SandboxedExecutor`] (`host_exec`,
+//! OS-sandboxed argv), all at the M0 revision. Strict adapters use one jail;
+//! [`development_file_tools`] accepts exact canonical runtime scopes for
+//! external paths too. Runtime policy decides approvals, not the adapters.
+//! `host_exec` runs only behind an available mandatory
 //! platform sandbox and never falls back to an unsandboxed process.
 //!
 //! # Jail model
@@ -37,11 +37,14 @@
 //!
 //! `nexus-core` supplies the port, outcome, and budget types. `serde_json`
 //! only decodes the already-validated argument object; schema validation
-//! stays at registration.
+//! stays at registration. `nexus-permissions` shares canonical directory and
+//! protected-path rules with runtime policy without a runtime/tools dependency.
 
 #![forbid(unsafe_code)]
 
+mod development;
 mod exec;
+pub use development::development_file_tools;
 pub mod fs;
 
 pub use exec::SandboxedExecutor;

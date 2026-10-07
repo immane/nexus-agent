@@ -19,6 +19,7 @@ Machine-readable result/event output needs a documented wire revision before rel
 | `Submit` | Correlated request containing session, input, and selected execution profile; accepts a new run or rejects explicitly |
 | `Cancel` | Targets an existing run; stops future dispatch and requests cancellation of active work |
 | `Approve` | Targets a live approval and its run/call identity; cannot change the approved arguments |
+| `ApproveSessionDirectory` | Approves that exact call and the runtime-published directory for this session only; clients cannot supply a new directory or arguments |
 | `Deny` | Refuses a live approval without executing its call |
 | `GetSnapshot` | Requests a bounded consistent view of a known run and its last event sequence |
 | `ListSessions` | Explicit bounded/paged history metadata lookup; does not load all conversation contents or execute work |
@@ -50,7 +51,7 @@ The runtime is the sole publisher of authoritative ordering; adapters report thr
 | `RunStarted` | Accepted run identity and effective profile summary |
 | `AssistantTextDelta` | Ordered presentation fragment for an identified turn/item |
 | `ToolCallPreview` | Optional, non-executable progress for a proposed call |
-| `ApprovalRequired` | Exact approval identity, safe action summary, and expiry |
+| `ApprovalRequired` | Exact approval identity, safe action summary, expiry, and optional bounded canonical `session_directory` |
 | `ToolStarted` | An authorized admitted call has entered execution; carries call/tool identity and an optional bounded, policy-redacted argument preview |
 | `ToolOutput` | Optional bounded progress, with explicit truncation state |
 | `ToolFinished` | Actual outcome and effect/evidence summary |

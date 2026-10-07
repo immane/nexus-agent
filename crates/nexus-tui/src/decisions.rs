@@ -4,8 +4,8 @@
 //! built here as a typed [`nexus_core::Command`] and submitted to
 //! `Runtime::handle`. There is no second policy path by construction: this
 //! module cannot invoke providers or tools (it does not depend on them),
-//! cannot change bound arguments, and cannot grant anything beyond the exact
-//! live approval identity the runtime published.
+//! cannot change bound arguments, and can request directory grants only
+//! through the exact live approval identity the runtime published.
 
 use nexus_core::{
     AgentError, ApprovalNotice, ApproveCommand, CancelCommand, Command, DenyCommand, RequestId,
@@ -24,6 +24,22 @@ use crate::state::PendingApprovalCard;
 #[must_use]
 pub fn approve_notice_command(request: RequestId, run: &RunId, notice: &ApprovalNotice) -> Command {
     Command::Approve(ApproveCommand {
+        request,
+        approval: notice.approval.clone(),
+        run: run.clone(),
+        call: notice.call.clone(),
+    })
+}
+
+/// The runtime resolves the directory from its pending approval; clients
+/// send no arbitrary directory or new arguments with this decision.
+#[must_use]
+pub fn approve_session_directory_command(
+    request: RequestId,
+    run: &RunId,
+    notice: &ApprovalNotice,
+) -> Command {
+    Command::ApproveSessionDirectory(ApproveCommand {
         request,
         approval: notice.approval.clone(),
         run: run.clone(),
@@ -301,7 +317,7 @@ mod cov_decisions_private {
     }
 
     #[test]
-    fn builder_surface_is_exactly_the_six_documented_builders() {
+    fn builder_surface_is_exactly_the_seven_documented_builders() {
         // Pinning each signature keeps a changed parameter list (for example a
         // card-summary argument, or a defaulted run) a compile error here.
         let approve_card: fn(RequestId, &RunId, &PendingApprovalCard) -> Command = approve_command;
@@ -309,6 +325,8 @@ mod cov_decisions_private {
         let approve_notice: fn(RequestId, &RunId, &ApprovalNotice) -> Command =
             approve_notice_command;
         let deny_notice: fn(RequestId, &RunId, &ApprovalNotice) -> Command = deny_notice_command;
+        let approve_directory: fn(RequestId, &RunId, &ApprovalNotice) -> Command =
+            approve_session_directory_command;
         let cancel: fn(RequestId, &RunId) -> Command = cancel_command;
         let submit: fn(RequestId, SessionId, &str, &str, bool) -> Result<Command, AgentError> =
             submit_command;
@@ -326,6 +344,10 @@ mod cov_decisions_private {
         assert!(matches!(
             approve_notice(request(), &run("run-1"), &published),
             Command::Approve(_)
+        ));
+        assert!(matches!(
+            approve_directory(request(), &run("run-1"), &published),
+            Command::ApproveSessionDirectory(_)
         ));
         assert!(matches!(
             deny_notice(request(), &run("run-1"), &published),
@@ -349,6 +371,7 @@ mod cov_decisions_private {
             approve_command(request(), &run("run-1"), &live),
             deny_command(request(), &run("run-1"), &live),
             approve_notice_command(request(), &run("run-1"), &published),
+            approve_session_directory_command(request(), &run("run-1"), &published),
             deny_notice_command(request(), &run("run-1"), &published),
             cancel_command(request(), &run("run-1")),
         ];
@@ -378,6 +401,7 @@ mod cov_decisions_private {
             approve_command(request(), &run("run-1"), &live),
             deny_command(request(), &run("run-1"), &live),
             approve_notice_command(request(), &run("run-1"), &published),
+            approve_session_directory_command(request(), &run("run-1"), &published),
             deny_notice_command(request(), &run("run-1"), &published),
             cancel_command(request(), &run("run-1")),
             submitted,
@@ -388,6 +412,7 @@ mod cov_decisions_private {
                 Command::Submit(_)
                 | Command::Cancel(_)
                 | Command::Approve(_)
+                | Command::ApproveSessionDirectory(_)
                 | Command::Deny(_) => {}
                 other => panic!("decisions must not emit {other:?}"),
             }
@@ -456,6 +481,16 @@ mod cov_decisions_private {
             );
             assert_no_display_text(&[approve, deny], &label);
         }
+    }
+
+    #[test]
+    fn session_directory_builder_copies_identity_but_sends_no_directory() {
+        let mut published = notice("run tool host_read");
+        published.session_directory = Some("/arbitrary/client-path".to_owned());
+        assert_eq!(
+            approve_session_directory_command(request(), &run("run-1"), &published),
+            Command::ApproveSessionDirectory(expected_approve())
+        );
     }
 
     #[test]

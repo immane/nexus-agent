@@ -8,7 +8,7 @@ Source: choices explicitly confirmed by the project owner after the [project fou
 
 | Area | Accepted requirement |
 | --- | --- |
-| Tool permissions | Approved project-scoped reads and searches run automatically; file mutations and command execution require confirmation. |
+| Tool permissions | Development mode defaults to automatic project/temp operations and sandboxed exec; file tools accessing external directories require approval, with optional session-only directory grants. Preserve strict mode with project-jailed reads and confirmation for mutations/exec. |
 | TUI | Use the official Grok Build full-screen interaction style as a reference, with an independently implemented lightweight Rust frontend. |
 | Sessions | Automatically save locally outside the project; start a new conversation by default and restore history only on explicit selection. |
 | Entry points | Ship both the TUI and a headless entry point using the same runtime and policy boundary. |
@@ -18,7 +18,7 @@ Source: choices explicitly confirmed by the project owner after the [project fou
 
 ## Consequences
 
-Automatic reads remain subject to scope and host restrictions. Commands require confirmation even when they appear read-only; a working directory is not an OS permission boundary. Headless calls requiring confirmation are denied when no explicit approval handler is configured.
+Automatic access remains subject to scope and host restrictions. Development exec may read most non-protected host files without prompting; external writes require a declared approved directory, and network is disabled. A working directory is not an OS permission boundary. Strict commands require confirmation even when they appear read-only. Headless calls requiring confirmation are denied when no explicit approval handler is configured. Session directory grants never persist across restart or restore.
 
 Automatic session writes are host-managed persistence under the configured storage policy, not model-directed permission to modify arbitrary files. Restoring history does not replay operations, restart interrupted work, or reinstate old call approvals.
 
@@ -30,7 +30,7 @@ Code simplicity must not remove input validation, authorization, deadlines, canc
 
 ## Alternatives Not Selected
 
-- Automatic file edits or command execution as the default permission policy.
+- Unrestricted automatic external writes or persisted/global directory grants.
 - Inline-only terminal interaction instead of the selected full-screen reference.
 - Automatic restoration of the latest session or default ephemeral conversations.
 - A TUI-only first release or mandatory account login before interaction.
