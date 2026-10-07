@@ -20,15 +20,15 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
-    Widget,
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    StatefulWidget, Widget,
 };
 
 use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
 use crate::state::{
-    AppState, ApprovalGeometry, EntryKind, PendingApprovalCard, PointerGeometry, chunks,
-    display_width, wrapped_height,
+    AppState, ApprovalGeometry, EntryKind, MAX_PICKER_VISIBLE_ROWS, PendingApprovalCard,
+    PointerGeometry, chunks, display_width, wrapped_height,
 };
 
 /// Maps width-neutral Markdown style bits to terminal styling. Only color
@@ -398,6 +398,82 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
         ..state.pointer_geometry()
     });
     render_footer(state, regions.footer, buf, focus);
+    render_overlay(state, area, buf);
+}
+
+/// Centered modal dialog, painted last so it sits above every region.
+/// Only the model picker exists today; the geometry clamps to the frame
+/// so narrow or short terminals clip the list instead of overflowing.
+fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
+    if !state.overlay_open() {
+        return;
+    }
+    let matches = state.picker_matches();
+    let visible = matches.len().min(MAX_PICKER_VISIBLE_ROWS);
+    // Prefer a 24..=56-cell dialog, shrinking with the frame on tiny
+    // terminals instead of overflowing it.
+    let width = match area.width.saturating_sub(4).min(56) {
+        narrow if narrow < 24 => narrow.min(area.width),
+        wide => wide,
+    };
+    // Filter row plus visible matches inside the border; an empty match
+    // list still reserves its explicit notice row.
+    let height = (visible.max(1) as u16 + 3).min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    Clear.render(popup, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" model ")
+        .title_bottom(" ↑↓ navigate · enter select · esc close ");
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    if inner.height == 0 {
+        return;
+    }
+    let selected = state.picker_selected().min(matches.len().saturating_sub(1));
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(matches.len().saturating_sub(visible));
+    let mut rows = Vec::with_capacity(visible + 1);
+    rows.push(Line::from(vec![
+        Span::raw("> "),
+        Span::raw(state.picker_filter().to_owned()),
+        Span::raw("▊"),
+    ]));
+    let active = state.active_model().map(str::to_owned);
+    for (row, index) in matches.iter().skip(start).take(visible).enumerate() {
+        let Some(choice) = state.model_choices().get(*index) else {
+            continue;
+        };
+        let mut label = format!("{} @ {}", choice.id, choice.provider);
+        if active.as_deref() == Some(choice.id.as_str()) {
+            label.push_str(" ●");
+        }
+        // Hard-truncate to the popup width so long ids cannot overflow.
+        let label: String = label.chars().take(inner.width as usize - 2).collect();
+        if start + row == selected {
+            rows.push(Line::from(vec![
+                Span::raw("▸ "),
+                Span::styled(label, Style::default().add_modifier(Modifier::REVERSED)),
+            ]));
+        } else {
+            rows.push(Line::from(vec![Span::raw("  "), Span::raw(label)]));
+        }
+    }
+    if matches.is_empty() {
+        rows.push(Line::from(vec![Span::styled(
+            "(no matches)",
+            Style::default().add_modifier(Modifier::DIM),
+        )]));
+    }
+    Paragraph::new(rows).render(inner, buf);
 }
 
 fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
@@ -2450,6 +2526,85 @@ mod cov_render_private {
         assert!(!state.caret_visible());
         state.composer_type('b');
         assert!(state.caret_visible(), "typing never lands in a blink gap");
+    }
+
+    fn picker_choices() -> Vec<crate::state::ModelChoice> {
+        vec![
+            crate::state::ModelChoice {
+                id: "m0".to_owned(),
+                provider: "demo-provider".to_owned(),
+            },
+            crate::state::ModelChoice {
+                id: "m1".to_owned(),
+                provider: "demo-provider".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn model_picker_lists_choices_and_marks_the_cursor() {
+        let mut state = AppState::new();
+        state.set_active_model(Some("m0".to_owned()), Some("demo-provider".to_owned()));
+        state.open_model_picker(picker_choices());
+        let area = Rect::new(0, 0, 80, 24);
+        let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
+        assert!(rows.iter().any(|row| row.contains(" model ")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("m0 @ demo-provider")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("m1 @ demo-provider")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("●")),
+            "the active model is marked: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("▸")),
+            "the cursor names its row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn model_picker_filter_narrows_and_empty_reports_explicitly() {
+        let mut state = AppState::new();
+        state.open_model_picker(picker_choices());
+        state.picker_push('1');
+        assert_eq!(state.picker_matches(), vec![1]);
+        let area = Rect::new(0, 0, 80, 24);
+        let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
+        assert!(
+            rows.iter().any(|row| row.contains("m1 @ demo-provider")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("m0 @")),
+            "filtered rows stay hidden: {rows:?}"
+        );
+        state.picker_push('z');
+        assert!(state.picker_matches().is_empty());
+        let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
+        assert!(
+            rows.iter().any(|row| row.contains("(no matches)")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn closed_picker_renders_no_dialog_chrome() {
+        let state = AppState::new();
+        let area = Rect::new(0, 0, 80, 24);
+        let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
+        assert!(
+            !rows.iter().any(|row| row.contains("▸")),
+            "no cursor without a dialog: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("(no matches)")),
+            "{rows:?}"
+        );
     }
 
     #[test]

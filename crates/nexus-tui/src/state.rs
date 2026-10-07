@@ -777,6 +777,50 @@ struct Toast {
     deadline: Instant,
 }
 
+/// Maximum picker filter bytes (M0-test choice). The filter is
+/// presentation-only and never reaches the runtime.
+pub const MAX_PICKER_FILTER_BYTES: usize = 128;
+/// Maximum picker rows shown at once; longer matches scroll.
+pub const MAX_PICKER_VISIBLE_ROWS: usize = 10;
+
+/// One configured model offered by the model picker: display only, the
+/// runtime selection still goes through the exact configured id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    /// Configured model id; confirmation selects exactly this id.
+    pub id: String,
+    /// Provider label shown beside the id.
+    pub provider: String,
+}
+
+/// Transient picker state for the model dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPicker {
+    /// Case-insensitive substring filter over `id` and `provider`.
+    filter: String,
+    /// Cursor into the *filtered* choice list.
+    selected: usize,
+}
+
+impl ModelPicker {
+    /// True when the choice matches the current filter (empty matches all).
+    fn matches(&self, choice: &ModelChoice) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let needle = self.filter.to_lowercase();
+        choice.id.to_lowercase().contains(&needle)
+            || choice.provider.to_lowercase().contains(&needle)
+    }
+}
+
+/// Single active overlay: at most one dialog captures the keyboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overlay {
+    /// Searchable configured-model list opened by bare `/model`.
+    ModelPicker(ModelPicker),
+}
+
 /// The full frontend presentation model.
 #[derive(Debug)]
 pub struct AppState {
@@ -868,6 +912,15 @@ pub struct AppState {
     /// Latest usage counters observed on the live run. Cleared by the next
     /// `RunStarted` so a new run never wears the previous run's numbers.
     last_usage: Option<Usage>,
+    /// Configured-model snapshot offered while the model picker is open.
+    /// Populated from configuration when the picker opens; confirmation
+    /// still validates against live configuration, so a stale snapshot
+    /// can never select an unknown id.
+    model_choices: Vec<ModelChoice>,
+    /// Active modal dialog, if any. While set, keyboard input routes to
+    /// the overlay first and never falls through to composer, viewport,
+    /// or approval shortcuts.
+    overlay: Option<Overlay>,
 }
 
 impl Default for AppState {
@@ -921,6 +974,8 @@ impl AppState {
             modes: vec![AgentMode::plan(), AgentMode::build()],
             mode_index: 1,
             last_usage: None,
+            model_choices: Vec::new(),
+            overlay: None,
         }
     }
 
@@ -1845,6 +1900,113 @@ impl AppState {
         self.composer_caret = 0;
         self.touch_caret();
         std::mem::take(&mut self.composer)
+    }
+
+    /// True while a modal dialog captures the keyboard.
+    #[must_use]
+    pub fn overlay_open(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Opens the model picker over a snapshot of configured choices.
+    /// The snapshot is display-only; confirming validates the id against
+    /// live configuration, so staleness can never invent a selection.
+    pub fn open_model_picker(&mut self, choices: Vec<ModelChoice>) {
+        self.model_choices = choices;
+        self.overlay = Some(Overlay::ModelPicker(ModelPicker {
+            filter: String::new(),
+            selected: 0,
+        }));
+    }
+
+    /// Closes any open dialog without applying it.
+    pub fn dismiss_overlay(&mut self) {
+        self.overlay = None;
+    }
+
+    /// Current picker filter text (empty when no picker is open).
+    #[must_use]
+    pub fn picker_filter(&self) -> &str {
+        match &self.overlay {
+            Some(Overlay::ModelPicker(picker)) => &picker.filter,
+            None => "",
+        }
+    }
+
+    /// Cursor into the current filtered choice list (0 when closed).
+    #[must_use]
+    pub fn picker_selected(&self) -> usize {
+        match &self.overlay {
+            Some(Overlay::ModelPicker(picker)) => picker.selected,
+            None => 0,
+        }
+    }
+
+    /// Indices of [`Self::model_choices`] matching the picker filter, in
+    /// configuration order. Shared by rendering and confirmation so both
+    /// always agree on what the cursor points at.
+    #[must_use]
+    pub fn picker_matches(&self) -> Vec<usize> {
+        let picker = match &self.overlay {
+            Some(Overlay::ModelPicker(picker)) => picker,
+            None => return Vec::new(),
+        };
+        self.model_choices
+            .iter()
+            .enumerate()
+            .filter(|(_, choice)| picker.matches(choice))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Appends one char to the picker filter, resetting the cursor to the
+    /// first match. Control and bidi characters are rejected like composer
+    /// input, since the filter renders unsanitized.
+    pub fn picker_push(&mut self, char: char) {
+        if char.is_control() || is_bidi_format(char) {
+            return;
+        }
+        if let Some(Overlay::ModelPicker(picker)) = &mut self.overlay
+            && picker.filter.len() + char.len_utf8() <= MAX_PICKER_FILTER_BYTES
+        {
+            picker.filter.push(char);
+            picker.selected = 0;
+        }
+    }
+
+    /// Deletes the last picker filter char, resetting the cursor.
+    pub fn picker_backspace(&mut self) {
+        if let Some(Overlay::ModelPicker(picker)) = &mut self.overlay {
+            picker.filter.pop();
+            picker.selected = 0;
+        }
+    }
+
+    /// Moves the picker cursor over `count` visible matches, saturating at
+    /// both ends so navigation never wraps onto an unintended row.
+    pub fn picker_move(&mut self, delta: isize, count: usize) {
+        if let Some(Overlay::ModelPicker(picker)) = &mut self.overlay {
+            let max = count.saturating_sub(1);
+            let next = (picker.selected as isize + delta).clamp(0, max as isize);
+            picker.selected = next as usize;
+        }
+    }
+
+    /// Confirms the cursor over `count` visible matches, returning the
+    /// cursor when it names a real row. Callers map through
+    /// [`Self::picker_matches`]; `None` means nothing to confirm.
+    #[must_use]
+    pub fn picker_confirm(&self, count: usize) -> Option<usize> {
+        match &self.overlay {
+            Some(Overlay::ModelPicker(picker)) if picker.selected < count => Some(picker.selected),
+            _ => None,
+        }
+    }
+
+    /// Configured-model snapshot shown while the picker is open.
+    #[must_use]
+    pub fn model_choices(&self) -> &[ModelChoice] {
+        &self.model_choices
     }
 
     /// True while output streams or an approval awaits a decision.

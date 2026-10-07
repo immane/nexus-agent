@@ -97,7 +97,7 @@ impl SlashCommand {
     #[must_use]
     pub fn help_text() -> &'static str {
         "/help — list commands\n\
-         /model [name] — show or switch the active model\n\
+         /model [name] — pick or switch the active model\n\
          /usage — show observed input/output tokens\n\
          /session [new|list|switch] — manage conversation sessions\n\
          /quit — leave the TUI\n\

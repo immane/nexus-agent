@@ -57,9 +57,9 @@ use nexus_tools::{
 };
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, TOAST_TTL, TextSelection,
-    cancel_command, cell_to_char_col, install_panic_hook, map_key, next_focus, render,
-    submit_command,
+    Action, AppState, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate, SessionArgs,
+    SlashCommand, TOAST_TTL, TextSelection, cancel_command, cell_to_char_col, install_panic_hook,
+    map_key, next_focus, render, submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -1096,6 +1096,32 @@ impl Frontend {
         self.sync_live_binding();
     }
 
+    /// Selects exactly the named configured model, mirroring it into the
+    /// display and live binding. Unknown ids report the available list and
+    /// change nothing: a failed switch never invents or clears a selection.
+    fn select_model(&mut self, name: &str) {
+        if self.config.model(name).is_some() {
+            self.active_model = Some(name.to_owned());
+            self.sync_model_display();
+            self.sync_live_binding();
+            self.state.notice(&format!("model: {name}"));
+        } else {
+            let mut ids: Vec<&str> = self
+                .config
+                .models()
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect();
+            ids.sort_unstable();
+            if ids.is_empty() {
+                self.state.notice("unknown model (no configured models)");
+            } else {
+                self.state
+                    .notice(&format!("unknown model: available: {}", ids.join(", ")));
+            }
+        }
+    }
+
     /// Mirrors the selected model (and its provider, when the id still
     /// resolves) into presentation state. Unknown ids clear the display
     /// instead of showing a stale name.
@@ -1191,6 +1217,10 @@ impl Frontend {
             }
         }
         if !had_pending && self.state.pending_approval().is_some() {
+            // A newly arrived approval takes keyboard focus at once; any
+            // open dialog steps aside so its keys cannot shadow the
+            // decision shortcuts.
+            self.state.dismiss_overlay();
             self.focus = Focus::ApprovalCard;
         }
         false
@@ -1635,34 +1665,26 @@ fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
             false
         }
         SlashCommand::Model(None) => {
-            match front.active_model.as_deref() {
-                Some(model) => front.state.notice(&format!("model: {model}")),
-                None => front.state.notice("no model selected"),
+            // Bare `/model` opens the searchable picker; the exact-name
+            // form below stays for direct switches.
+            let choices: Vec<ModelChoice> = front
+                .config
+                .models()
+                .iter()
+                .map(|entry| ModelChoice {
+                    id: entry.id.clone(),
+                    provider: entry.provider.clone(),
+                })
+                .collect();
+            if choices.is_empty() {
+                front.state.notice("no configured models");
+            } else {
+                front.state.open_model_picker(choices);
             }
             false
         }
         SlashCommand::Model(Some(name)) => {
-            if front.config.model(&name).is_some() {
-                front.active_model = Some(name.clone());
-                front.sync_model_display();
-                front.sync_live_binding();
-                front.state.notice(&format!("model: {name}"));
-            } else {
-                let mut ids: Vec<&str> = front
-                    .config
-                    .models()
-                    .iter()
-                    .map(|entry| entry.id.as_str())
-                    .collect();
-                ids.sort_unstable();
-                if ids.is_empty() {
-                    front.state.notice("unknown model (no configured models)");
-                } else {
-                    front
-                        .state
-                        .notice(&format!("unknown model: available: {}", ids.join(", ")));
-                }
-            }
+            front.select_model(&name);
             false
         }
         SlashCommand::Usage => {
@@ -1808,7 +1830,93 @@ fn settle_submit(front: &mut Frontend, draft: &str, reply: &CommandResponse) -> 
 }
 
 /// Handles one key event. Returns true when the TUI should exit.
+/// Routes one key event to the open modal dialog. Returns true only when
+/// the loop must exit (`Ctrl+D`); every other key is consumed by the
+/// dialog, so composer, viewport, and approval shortcuts cannot fire
+/// behind it. `Esc` dismisses without applying. (`Ctrl+C` never reaches
+/// here: the caller falls through to the normal cancel path so
+/// cancellation stays responsive while a dialog is open.)
+fn handle_overlay_key(front: &mut Frontend, key: KeyEvent) -> bool {
+    use crossterm::event::KeyCode;
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    if key
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        return matches!(key.code, KeyCode::Char('d'));
+    }
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => front.state.dismiss_overlay(),
+        KeyCode::Enter => confirm_model_picker(front),
+        KeyCode::Up => move_picker(front, -1),
+        KeyCode::Down => move_picker(front, 1),
+        KeyCode::PageUp => move_picker(front, -(MAX_PICKER_VISIBLE_ROWS as isize)),
+        KeyCode::PageDown => move_picker(front, MAX_PICKER_VISIBLE_ROWS as isize),
+        KeyCode::Home => {
+            let count = front.state.picker_matches().len();
+            front.state.picker_move(isize::MIN, count);
+        }
+        KeyCode::End => {
+            let count = front.state.picker_matches().len();
+            front.state.picker_move(isize::MAX, count);
+        }
+        KeyCode::Backspace => front.state.picker_backspace(),
+        KeyCode::Char(char) => front.state.picker_push(char),
+        _ => {}
+    }
+    false
+}
+
+/// Moves the picker cursor; the match count is re-derived so navigation
+/// always agrees with what rendering shows.
+fn move_picker(front: &mut Frontend, delta: isize) {
+    let count = front.state.picker_matches().len();
+    front.state.picker_move(delta, count);
+}
+
+/// Confirms the highlighted picker row: maps the cursor through the live
+/// filtered matches onto the snapshot id, then runs the same exact-id
+/// selection as `/model <name>`. An empty match list just dismisses.
+fn confirm_model_picker(front: &mut Frontend) {
+    let matches = front.state.picker_matches();
+    let id = front
+        .state
+        .picker_confirm(matches.len())
+        .and_then(|cursor| matches.get(cursor))
+        .and_then(|index| front.state.model_choices().get(*index))
+        .map(|choice| choice.id.clone());
+    front.state.dismiss_overlay();
+    if let Some(id) = id {
+        front.select_model(&id);
+    }
+}
+
+/// Whether the key is a `Ctrl+C` press: the one key that bypasses an open
+/// dialog so cancellation never waits behind it.
+fn is_overlay_cancel(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        && matches!(key.code, crossterm::event::KeyCode::Char('c'))
+}
+
 async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> bool {
+    // A modal dialog owns the keyboard: nothing falls through to the
+    // composer, viewport, or approval shortcuts while it is open, except
+    // `Ctrl+C`, which dismisses the dialog and continues into the normal
+    // cancel path.
+    if front.state.overlay_open() && !is_overlay_cancel(key) {
+        return handle_overlay_key(front, key);
+    }
+    if is_overlay_cancel(key) {
+        front.state.dismiss_overlay();
+    }
     let directory_approval = front.focus == Focus::ApprovalCard
         && key.kind == KeyEventKind::Press
         && key.modifiers.is_empty()
@@ -2140,14 +2248,15 @@ async fn interactive_loop(
             }
             LoopStep::Event(event) => {
                 event_since_tick = true;
-                dirty = true;
                 // A terminal outcome stays on screen and the loop keeps
                 // serving: the next `Accepted` submit adopts a new run.
-                // Only quit, close, or an I/O error ends the loop.
+                // Only quit, close, or an I/O error ends the loop. Stream
+                // updates render through the gate at the end of the
+                // iteration: drawing here as well would paint terminal
+                // outcomes twice in one pass under output load.
                 let slot = sessions.active_mut();
-                if absorb(&mut slot.front, *event, &mut slot.streams) {
-                    draw(terminal, &mut slot.front)?;
-                }
+                absorb(&mut slot.front, *event, &mut slot.streams);
+                dirty = true;
             }
             LoopStep::Tick => {
                 let batch = {
@@ -2182,10 +2291,11 @@ async fn interactive_loop(
                     let flushed = slot.front.merger.flush();
                     slot.front.report_merger();
                     if !flushed.is_empty() {
+                        // As above: leave the actual frame to the gate so a
+                        // terminal outcome behind a reorder gap is painted
+                        // once, not twice.
+                        slot.front.apply_events(flushed);
                         dirty = true;
-                        if slot.front.apply_events(flushed) {
-                            draw(terminal, &mut slot.front)?;
-                        }
                     }
                 }
                 event_since_tick = false;
@@ -4255,9 +4365,16 @@ mod cov_main_topup {
         front.focus = Focus::Composer;
         type_draft(&mut front, "/model");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(front.request_counter, 0, "opening the picker is local");
+        assert!(
+            front.state.overlay_open(),
+            "bare /model opens the picker instead of reporting"
+        );
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(!front.state.overlay_open(), "confirming closes the picker");
         assert!(
             transcript(&front).contains("model: m0"),
-            "bare /model reports the selection"
+            "confirming the first row selects it"
         );
 
         type_draft(&mut front, "/model m1");
@@ -4280,6 +4397,70 @@ mod cov_main_topup {
         assert!(
             transcript(&front).contains("m0"),
             "failures list what exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_picker_filters_navigates_confirms_and_cancels() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (_run, mut front) = frontend_with(configured(3, &[], &[]));
+        front.focus = Focus::Composer;
+        type_draft(&mut front, "/model");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(front.state.overlay_open());
+        assert_eq!(front.state.picker_matches().len(), 3);
+
+        // Narrow to one row, then confirm it.
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('m'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('2'))).await);
+        assert_eq!(front.state.picker_matches().len(), 1);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(!front.state.overlay_open(), "confirm closes the picker");
+        assert_eq!(front.active_model.as_deref(), Some("m2"));
+        assert!(
+            transcript(&front).contains("model: m2"),
+            "confirmation runs the exact-id selection"
+        );
+
+        // Reopen and cancel: the selection is untouched.
+        type_draft(&mut front, "/model");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Down)).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert!(!front.state.overlay_open(), "esc dismisses");
+        assert_eq!(front.active_model.as_deref(), Some("m2"));
+    }
+
+    #[tokio::test]
+    async fn model_picker_keys_never_reach_the_composer() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (_run, mut front) = frontend_with(configured(2, &[], &[]));
+        front.focus = Focus::Composer;
+        type_draft(&mut front, "/model");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        // `a`/`d` decide approvals; behind the picker they are filter text.
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('a'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('d'))).await);
+        assert_eq!(front.state.composer(), "", "the draft is untouched");
+        assert_eq!(front.state.picker_filter(), "ad");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert_eq!(front.active_model.as_deref(), Some("m0"));
+    }
+
+    #[tokio::test]
+    async fn approval_arrival_dismisses_the_model_picker() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (run, mut front) = frontend_with(configured(2, &[], &[]));
+        front.focus = Focus::Composer;
+        type_draft(&mut front, "/model");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(front.state.overlay_open());
+
+        front.apply_events(vec![started(&run, 0), approval(&run, 1, "call-1")]);
+        assert_eq!(front.focus, Focus::ApprovalCard);
+        assert!(
+            !front.state.overlay_open(),
+            "the approval owns the keyboard, not the picker"
         );
     }
 
