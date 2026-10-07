@@ -2,3 +2,16 @@
 resolver = "2"
 # Glob so parallel slices can add crates without editing this file.
 members = ["crates/*"]
+
+# Keep useful panic/backtrace locations without emitting full variable/type
+# debug information into every development and test executable.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Opt in when interactive debugging needs local variables and full types.
+[profile.debugging]
+inherits = "dev"
+debug = true

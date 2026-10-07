@@ -67,13 +67,11 @@ jobs:
         with:
           tool: nextest@0.9.146
 
-      - name: Tests
-        run: cargo nextest run --workspace --locked --no-fail-fast
-
-      # `#[ignore]`d tests are redundant-by-contract layers skipped for
-      # local speed; CI still runs them so the marks never rot.
-      - name: Tests (ignored redundancy layers)
-        run: cargo nextest run --workspace --locked --no-fail-fast --run-ignored ignored-only
+      # Optional low-value targets are not even built by default locally.
+      # CI also exercises ignored redundancy checks so they cannot rot.
+      # Run the full suite once, rather than repeating the behavioral suite.
+      - name: Tests (complete suite)
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast --run-ignored all
 
   doc:
     timeout-minutes: 15

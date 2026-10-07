@@ -2,6 +2,11 @@
 name = "nexus-server"
 version = "0.1.0"
 edition = "2024"
+autotests = false
+
+[[test]]
+name = "behavior"
+path = "tests/behavior.rs"
 
 [dependencies]
 # Core domain types plus the synchronous provider/tool ports. Behavior

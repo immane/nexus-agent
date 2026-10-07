@@ -2,6 +2,20 @@
 name = "nexus-tui"
 version = "0.1.0"
 edition = "2024"
+autotests = false
+
+[features]
+# Redundant coverage of the test-only keymap, not the binary's real keymap.
+low-value-tests = []
+
+[[test]]
+name = "behavior"
+path = "tests/behavior.rs"
+
+[[test]]
+name = "low_value"
+path = "tests/low_value.rs"
+required-features = ["low-value-tests"]
 
 [[bin]]
 name = "nexus-tui"

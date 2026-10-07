@@ -126,6 +126,7 @@ fn assert_static_invalid_input(error: AgentError, expected_message: &str) {
 }
 
 #[test]
+#[ignore = "low-value: root/module aliases; decision binding behavior is covered separately"]
 fn crate_root_reexports_alias_the_decision_builders() {
     // The four re-exported names must be the `decisions` items themselves, not
     // shadowing wrappers: a wrapper could drift from the builder it fronts

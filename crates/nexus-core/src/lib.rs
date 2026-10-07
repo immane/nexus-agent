@@ -62,6 +62,7 @@ mod cov_lib_private {
     }
 
     #[test]
+    #[ignore = "low-value: root/module type aliases; public behavioral suites remain enabled"]
     fn root_reexports_alias_defining_modules() {
         macro_rules! alias_all {
             ($module:ident :: { $($name:ident),+ $(,)? }) => {
@@ -107,6 +108,7 @@ mod cov_lib_private {
     }
 
     #[test]
+    #[ignore = "low-value: root/module trait aliases checked by compilation of callers"]
     fn root_traits_alias_defining_modules() {
         fn takes_provider_port(_: &dyn crate::ProviderPort) {}
         let _: fn(&dyn crate::provider::ProviderPort) = takes_provider_port;
@@ -117,6 +119,7 @@ mod cov_lib_private {
     }
 
     #[test]
+    #[ignore = "low-value: root/module constant aliases; boundary tests remain enabled"]
     fn root_constants_alias_defining_modules() {
         assert_eq!(crate::M0_REVISION, crate::ids::M0_REVISION);
         assert_eq!(

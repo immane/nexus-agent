@@ -69,6 +69,8 @@ Follow explicit user instructions and applicable project-specific rules. More sp
 
 ## 8. Validation
 
+- For this workspace, follow `docs/testing.md`: run affected-package Cargo checks sequentially; do not run concurrent Cargo commands against the same target directory. Routine development uses the default test features and skips low-value/ignored tests. Run the complete optional suite only for explicit full validation or when editing its subject. TUI/server/tools integration modules must be registered in their `tests/behavior.rs` entry points.
+
 - Choose checks appropriate to the change and the available environment. Use the project's existing formatting, linting, type-checking, build, and test commands as applicable.
 - Add or update meaningful tests for behavioral changes. Cover relevant boundaries, failures, and regressions rather than implementation details alone.
 - Prefer deterministic tests. Use test doubles at external boundaries where appropriate; keep live-service tests and paid operations opt-in.

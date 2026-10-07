@@ -9,6 +9,8 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 
 [Documentation](docs/index.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
+Developer checks and optional low-value tests: [Testing](docs/testing.md).
+
 > [!IMPORTANT]
 > Nexus Agent has an M0 **test-only implementation** with opt-in OpenAI-compatible live providers and root-jailed file reads/writes; storage remains ephemeral and plugins are not implemented. See [QUICKSTART.md](QUICKSTART.md) for live wiring and limitations. **M0 acceptance is not complete**. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and broader capabilities below describe the proposed architecture, not stable features.
 

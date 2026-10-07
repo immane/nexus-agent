@@ -1,9 +1,10 @@
 # nextest profile for this workspace: `cargo nextest run --workspace`.
 #
 # Why nextest: `cargo test` runs test binaries largely serially (a full
-# workspace run takes minutes, dominated by process-spawning suites such as
-# the headless CLI tests); nextest parallelizes binaries and tests across
-# all cores (seconds, same 2000+ tests). Plain `cargo test` keeps working.
+# workspace run can spend significant time building/linking test targets).
+# nextest parallelizes tests; it does not remove Cargo build or discovery cost.
+# Plain `cargo test` keeps working. Low-value targets are Cargo-feature gated
+# and redundant individual checks are ignored; see docs/testing.md.
 
 [profile.default]
 # Flag timing regressions visibly without failing: nothing in the suite

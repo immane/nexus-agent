@@ -91,6 +91,7 @@ fn assert_tool_port<T: ToolPort>(_: &T) {}
 fn assert_session_store<T: SessionStore>(_: &T) {}
 
 #[test]
+#[ignore = "low-value: root/module aliases, not fake provider or tool behavior"]
 fn root_reexports_alias_their_defining_modules() {
     let provider = FakeProvider::new(vec![]);
     same_type(&provider, &nexus_fakes::provider::FakeProvider::new(vec![]));
