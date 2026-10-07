@@ -1656,6 +1656,8 @@ impl Runtime {
                 run,
                 EventPayload::ToolStarted(ToolStartedInfo {
                     call: call.call().clone(),
+                    tool: call.tool().clone(),
+                    args_preview: self.shared.policy.approval_preview(&call).ok(),
                 }),
             ) == ControlOutcome::Closed
             {
@@ -3085,6 +3087,41 @@ mod tests {
     }
 
     #[test]
+    fn automatic_tool_started_identifies_the_tool_and_only_publishes_safe_arguments() {
+        for (args, preview) in [
+            (r#"{"path":"src"}"#, Some(r#"host_read {"path":"src"}"#)),
+            (r#"{"path":"api_key=hidden"}"#, None),
+        ] {
+            let mut bed = bed_with(
+                vec![
+                    FakeProvider::tool_turn(vec![candidate("host_read", args)]),
+                    FakeProvider::stop_turn("done"),
+                ],
+                quick_config(),
+                Duration::ZERO,
+            );
+            test_rt().block_on(async {
+                let reply = bed.runtime.submit(submit_cmd("automatic-preview")).await;
+                assert_eq!(reply.reply(), CommandReply::Accepted);
+                let (collected, finished) =
+                    collect_until_finished(&mut bed.data, &mut bed.control).await;
+                assert_eq!(finished.outcome(), RunOutcome::Completed);
+                let info = collected
+                    .control
+                    .iter()
+                    .find_map(|event| match event.payload() {
+                        EventPayload::ToolStarted(info) => Some(info),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(info.tool.name(), "host_read");
+                assert_eq!(info.args_preview.as_deref(), preview);
+                assert_eq!(bed.read_tool.executed.load(Ordering::SeqCst), 1);
+            });
+        }
+    }
+
+    #[test]
     fn approval_exact_tuple_executes() {
         let args = r#"{"path":"src"}"#;
         let mut bed = bed_with(
@@ -3119,6 +3156,19 @@ mod tests {
             collected.data.extend(rest.data);
             assert_eq!(finished.outcome(), RunOutcome::Completed);
             assert_eq!(tool_started_calls(&collected), vec![call]);
+            let info = collected
+                .control
+                .iter()
+                .find_map(|event| match event.payload() {
+                    EventPayload::ToolStarted(info) => Some(info),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(info.tool.name(), "host_write");
+            assert_eq!(
+                info.args_preview.as_deref(),
+                Some(r#"host_write {"path":"src"}"#)
+            );
             assert_eq!(bed.write_tool.executed.load(Ordering::SeqCst), 1);
             let seen = bed.write_tool.seen_args.lock().expect("readable");
             assert_eq!(seen.as_slice(), &[args.to_owned()]);

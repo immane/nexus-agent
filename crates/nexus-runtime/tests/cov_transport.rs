@@ -79,6 +79,8 @@ fn payloads() -> Vec<(&'static str, EventPayload)> {
             "ToolStarted",
             EventPayload::ToolStarted(ToolStartedInfo {
                 call: call("call-transport"),
+                tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+                args_preview: None,
             }),
         ),
         (

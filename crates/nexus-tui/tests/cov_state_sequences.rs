@@ -242,6 +242,8 @@ fn tool_started(run: &str, seq: u64, call: &str) -> RunEvent {
         seq,
         EventPayload::ToolStarted(ToolStartedInfo {
             call: CallId::new(call).expect("call id builds"),
+            tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+            args_preview: None,
         }),
     )
 }

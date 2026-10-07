@@ -34,6 +34,11 @@ Start a new conversation by default. History listing/restoration are explicit se
 
 ## Event Envelope
 
+The current server's `tool-started` JSON detail includes `call`, `tool` (name),
+`revision` (tool revision), and `args_preview` (safe preview or null). The Rust
+`ToolStartedInfo` requires a tool identity and an optional preview, validated at
+publication. These display fields convey no approval or dispatch authority.
+
 Each run event contains `SessionId`, `RunId`, a runtime-assigned increasing sequence number, and its typed payload. Turn/call/approval identities are included when relevant. Assign sequence numbers after text batching so published events remain contiguous.
 
 The runtime is the sole publisher of authoritative ordering; adapters report through it. Replies and events may arrive through different channels, so frontends MUST NOT assume cross-channel arrival order. `RunStarted` includes the originating request identity for reconciliation.
@@ -46,7 +51,7 @@ The runtime is the sole publisher of authoritative ordering; adapters report thr
 | `AssistantTextDelta` | Ordered presentation fragment for an identified turn/item |
 | `ToolCallPreview` | Optional, non-executable progress for a proposed call |
 | `ApprovalRequired` | Exact approval identity, safe action summary, and expiry |
-| `ToolStarted` | An authorized admitted call has entered execution |
+| `ToolStarted` | An authorized admitted call has entered execution; carries call/tool identity and an optional bounded, policy-redacted argument preview |
 | `ToolOutput` | Optional bounded progress, with explicit truncation state |
 | `ToolFinished` | Actual outcome and effect/evidence summary |
 | `UsageUpdated` | Available usage information, labeled provisional or final |

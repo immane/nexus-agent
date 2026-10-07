@@ -69,6 +69,8 @@ const LINE_OVERHEAD: usize = size_of::<String>();
 const BODY_INDENT: usize = 2;
 /// Rendered when an entry hit its byte bound.
 const TRUNCATION_MARKER: &str = "[output truncated to presentation bound]";
+/// Default compact tool output, counted in logical lines before wrapping.
+pub const TOOL_PREVIEW_LINES: usize = 10;
 
 /// Conversation entry kind for grouping and rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +107,7 @@ struct HeightKey {
     truncated: bool,
     title_len: usize,
     tail_len: usize,
+    compact_prefix: Option<usize>,
 }
 
 /// Cached wrapped height for one width.
@@ -124,7 +127,8 @@ pub struct Entry {
     pub title: String,
     /// Sanitized body lines (no embedded newlines).
     pub lines: Vec<String>,
-    /// Folded entries render as their title plus a marker only.
+    /// Folded tool outputs retain their parameters and last ten output lines;
+    /// other folded entries render as their title plus a marker only.
     pub folded: bool,
     /// True when title or body text was cut to [`MAX_ENTRY_BYTES`].
     pub truncated: bool,
@@ -137,6 +141,11 @@ pub struct Entry {
     open_line: bool,
     /// Cached wrapped height, invalidated by the fingerprint above.
     height_cache: Cell<Option<HeightCache>>,
+    /// Metadata rows preceding output; always visible in compact tool mode.
+    compact_prefix: Option<usize>,
+    /// Run-scoped identity prevents repeated call IDs in later runs aliasing.
+    tool_call: Option<(RunId, CallId)>,
+    tool_name: Option<nexus_core::ToolId>,
 }
 
 impl Entry {
@@ -153,6 +162,9 @@ impl Entry {
             stream: None,
             open_line: false,
             height_cache: Cell::new(None),
+            compact_prefix: None,
+            tool_call: None,
+            tool_name: None,
         }
     }
 
@@ -206,6 +218,18 @@ impl Entry {
     }
 
     fn push_new_line(&mut self, text: &str) {
+        self.height_cache.set(None);
+        if let Some(prefix) = self.compact_prefix {
+            // Preserve metadata and the newest output within the existing
+            // byte budget, rather than freezing a prefix of long output.
+            while self.lines.len() > prefix
+                && MAX_ENTRY_BYTES.saturating_sub(self.bytes) < LINE_OVERHEAD + text.len()
+            {
+                let removed = self.lines.remove(prefix);
+                self.bytes -= LINE_OVERHEAD + removed.len();
+                self.truncated = true;
+            }
+        }
         let remaining = MAX_ENTRY_BYTES.saturating_sub(self.bytes);
         if remaining < LINE_OVERHEAD {
             self.truncated = true;
@@ -216,14 +240,29 @@ impl Entry {
             self.bytes += LINE_OVERHEAD + text.len();
             self.lines.push(text.to_owned());
         } else {
-            let prefix = safe_prefix(text, capacity);
-            self.bytes += LINE_OVERHEAD + prefix.len();
-            self.lines.push(prefix.to_owned());
+            let retained = if self.compact_prefix.is_some() {
+                safe_suffix(text, capacity)
+            } else {
+                safe_prefix(text, capacity)
+            };
+            self.bytes += LINE_OVERHEAD + retained.len();
+            self.lines.push(retained.to_owned());
             self.truncated = true;
         }
     }
 
     fn append_open(&mut self, text: &str) {
+        self.height_cache.set(None);
+        if self.compact_prefix.is_some() {
+            let Some(mut line) = self.lines.pop() else {
+                self.push_new_line(text);
+                return;
+            };
+            self.bytes -= LINE_OVERHEAD + line.len();
+            line.push_str(text);
+            self.push_new_line(&line);
+            return;
+        }
         let Some(last) = self.lines.last_mut() else {
             self.push_new_line(text);
             return;
@@ -255,6 +294,7 @@ impl Entry {
             truncated: self.truncated,
             title_len: self.title.len(),
             tail_len: self.lines.last().map_or(0, String::len),
+            compact_prefix: self.compact_prefix,
         };
         if let Some(cache) = self.height_cache.get()
             && cache.key == key
@@ -271,17 +311,17 @@ impl Entry {
         // run together; see `render_range`, which must emit the same count.
         // Assistant bodies render as Markdown: the parsed logical lines (not
         // the raw stored lines) are what both height and rendering measure.
-        if self.folded {
+        if self.folded && self.compact_prefix.is_none() {
             return wrapped_height(&folded_text(&self.title, self.lines.len()), width) + 1;
         }
         let body_width = body_width(width);
-        let mut height = wrapped_height(&self.title, width);
+        let mut height = wrapped_height(&self.display_title(), width);
         if self.kind == EntryKind::Assistant {
             for rich in markdown::render_body(&self.lines, body_width) {
                 height += wrapped_height(&rich.visible_text(), body_width);
             }
         } else {
-            for line in &self.lines {
+            for line in self.visible_body() {
                 height += wrapped_height(line, body_width);
             }
         }
@@ -333,7 +373,7 @@ impl Entry {
             }
             stop
         };
-        if self.folded {
+        if self.folded && self.compact_prefix.is_none() {
             let marker = folded_text(&self.title, self.lines.len());
             for chunk in chunks(&marker, width) {
                 if emit(chunk, false, Vec::new()) {
@@ -343,12 +383,13 @@ impl Entry {
             emit("", false, Vec::new());
             return;
         }
-        for chunk in chunks(&self.title, width) {
+        let title = self.display_title();
+        for chunk in chunks(&title, width) {
             if emit(chunk, false, Vec::new()) {
                 return;
             }
         }
-        if self.title.is_empty() && emit("", false, Vec::new()) {
+        if title.is_empty() && emit("", false, Vec::new()) {
             return;
         }
         let body_width = body_width(width);
@@ -374,7 +415,7 @@ impl Entry {
                 }
             }
         } else {
-            for line in &self.lines {
+            for line in self.visible_body() {
                 if line.is_empty() {
                     if emit("", true, Vec::new()) {
                         return;
@@ -402,6 +443,48 @@ impl Entry {
             "every emitted line carries exactly one run list"
         );
     }
+
+    fn visible_body(&self) -> impl Iterator<Item = &String> {
+        let prefix = self.compact_prefix.unwrap_or(0).min(self.lines.len());
+        let start = if self.folded && self.compact_prefix.is_some() {
+            prefix.max(self.lines.len().saturating_sub(TOOL_PREVIEW_LINES))
+        } else {
+            prefix
+        };
+        self.lines[..prefix]
+            .iter()
+            .chain(self.lines[start..].iter())
+    }
+
+    fn display_title(&self) -> String {
+        match self.compact_prefix {
+            Some(prefix) if self.folded => {
+                let hidden = self.lines.len().saturating_sub(prefix + TOOL_PREVIEW_LINES);
+                format!(
+                    "{}  [▸ preview · {hidden} earlier lines · click to expand]",
+                    self.title
+                )
+            }
+            Some(_) => format!("{}  [▾ expanded · click to collapse]", self.title),
+            None => self.title.clone(),
+        }
+    }
+
+    fn title_height(&self, width: usize) -> usize {
+        if self.folded && self.compact_prefix.is_none() {
+            wrapped_height(&folded_text(&self.title, self.lines.len()), width)
+        } else {
+            wrapped_height(&self.display_title(), width)
+        }
+    }
+}
+
+fn safe_suffix(text: &str, capacity: usize) -> &str {
+    let mut start = text.len().saturating_sub(capacity);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// Appends one wrapped line, honoring the skip offset and take budget.
@@ -504,8 +587,12 @@ pub fn cell_to_char_col(line: &str, cell: usize) -> usize {
 /// stays position-dependent and is still a documented limitation.)
 pub(crate) fn wrapped_height(line: &str, width: usize) -> usize {
     let width = width.max(1);
-    let cells = display_width(line).max(1);
-    cells.div_ceil(width).max(1)
+    if line.is_ascii() {
+        return line.len().div_ceil(width).max(1);
+    }
+    // Wide glyphs cannot be split to fill a leftover cell. Counting actual
+    // chunks keeps card height and click mapping aligned with rendering.
+    chunks(line, width).count().max(1)
 }
 
 /// Wrap width available to an indented body line.
@@ -623,6 +710,8 @@ pub struct VisibleView {
     /// [`VisibleView::lines`]: `styles[i]` styles `lines[i]` and is empty
     /// for unstyled rows. Window slicing applies to both identically.
     pub styles: Vec<Vec<StyledRun>>,
+    /// Entry kind on title rows only; body rows keep their existing styles.
+    pub titles: Vec<Option<EntryKind>>,
     /// Wrapped lines above the window (presentation-truncated view).
     pub hidden_above: usize,
     /// True when older entries were dropped from retention.
@@ -984,9 +1073,10 @@ impl AppState {
                 }
             }
             EventPayload::ToolCallPreview { item_key } => {
-                self.push_tool(
+                self.push_tool_with_fold(
                     format!("preview {item_key}"),
                     vec!["proposed call (not executable, never authorizes)".to_owned()],
+                    true,
                 );
             }
             EventPayload::ApprovalRequired(notice) => {
@@ -1007,42 +1097,68 @@ impl AppState {
                 self.approval_geometry = None;
                 self.approval_field_truncated = summary_cut || scope_cut || args_cut;
                 self.reset_approval_detail();
-                self.push_tool(
-                    format!("approval requested for {}", notice.call.as_str()),
-                    vec![summary],
+                let mut entry = Entry::new(
+                    EntryKind::Tool,
+                    &format!("approval requested for {}", notice.call.as_str()),
                 );
+                entry.tool_call = Some((event.run().clone(), notice.call.clone()));
+                entry.push_line(&summary);
+                if let Some(preview) = &self.approval_args_preview {
+                    for line in preview.lines() {
+                        entry.push_line(line);
+                    }
+                }
+                entry.folded = true;
+                self.push_entry(entry);
                 self.status = "awaiting approval".to_owned();
             }
             EventPayload::ToolStarted(info) => {
                 self.streaming = true;
                 self.tool_spinner_frame = 0;
                 self.status = "executing tool".to_owned();
-                self.push_tool(
-                    format!("tool {} started", info.call.as_str()),
-                    vec!["authorized call entered execution".to_owned()],
+                let mut entry = Entry::new(
+                    EntryKind::Tool,
+                    &format!("{} · {} · running", info.tool.name(), info.call.as_str()),
                 );
+                entry.tool_call = Some((event.run().clone(), info.call.clone()));
+                entry.tool_name = Some(info.tool.clone());
+                let preview = info
+                    .args_preview
+                    .as_deref()
+                    .unwrap_or("[parameters unavailable for safe display]");
+                for line in sanitize_approval(preview).lines() {
+                    entry.push_line(line);
+                }
+                entry.folded = true;
+                self.push_entry(entry);
             }
             EventPayload::ToolOutput(progress) => {
                 let clean = sanitize(&progress.preview);
+                let name =
+                    self.entries
+                        .iter()
+                        .rev()
+                        .find(|entry| {
+                            entry.tool_call.as_ref().is_some_and(|(run, call)| {
+                                run == event.run() && call == &progress.call
+                            })
+                        })
+                        .and_then(|entry| entry.tool_name.as_ref())
+                        .map(|tool| tool.name());
+                let title = name.map_or_else(
+                    || format!("tool {} output", progress.call.as_str()),
+                    |name| format!("{name} · {} · output", progress.call.as_str()),
+                );
                 let key = StreamKey::ToolOutput {
                     call: progress.call.clone(),
                 };
                 if clean.is_empty() {
                     if progress.truncated {
-                        self.ensure_stream_entry(
-                            EntryKind::Tool,
-                            &format!("tool {} output", progress.call.as_str()),
-                            key,
-                        );
+                        self.ensure_stream_entry(EntryKind::Tool, &title, key);
                         self.mutate_tail(Entry::mark_truncated);
                     }
                 } else {
-                    self.push_stream_fragment(
-                        EntryKind::Tool,
-                        &format!("tool {} output", progress.call.as_str()),
-                        key,
-                        &clean,
-                    );
+                    self.push_stream_fragment(EntryKind::Tool, &title, key, &clean);
                     if progress.truncated {
                         self.mutate_tail(Entry::mark_truncated);
                     }
@@ -1056,23 +1172,42 @@ impl AppState {
                 } else {
                     ""
                 };
+                let source = self.entries.iter().rev().find(|entry| {
+                    entry
+                        .tool_call
+                        .as_ref()
+                        .is_some_and(|(run, call)| run == event.run() && call == &info.call)
+                });
+                let name = source
+                    .and_then(|entry| entry.tool_name.as_ref())
+                    .map_or_else(
+                        || format!("tool {}", info.call.as_str()),
+                        |tool| format!("{} · {}", tool.name(), info.call.as_str()),
+                    );
+                let mut lines = source.map(|entry| entry.lines.clone()).unwrap_or_default();
                 let title = format!(
-                    "tool {} · {:?} · {} lines / {} chars{truncated}",
-                    info.call.as_str(),
+                    "{name} · {:?} · {} lines / {} chars{truncated}",
                     info.outcome.status(),
                     output_lines.len(),
                     output.chars().count(),
                 );
-                let mut lines = vec![format!(
+                lines.push(format!(
                     "{:?} · {:?} · {} lines · {} chars",
                     info.outcome.effect(),
                     info.outcome.evidence(),
                     output_lines.len(),
                     output.chars().count(),
-                )];
-                lines.extend(output_lines);
-                let fold_output = output.lines().count() > 4 || output.len() > 320;
-                self.push_tool_with_fold(title, lines, fold_output);
+                ));
+                let mut entry = Entry::new(EntryKind::Tool, &title);
+                for line in lines {
+                    entry.push_line(&line);
+                }
+                entry.compact_prefix = Some(entry.lines.len());
+                for line in output_lines {
+                    entry.push_line(&line);
+                }
+                entry.folded = true;
+                self.push_entry(entry);
                 if self
                     .pending_approval
                     .as_ref()
@@ -1141,22 +1276,29 @@ impl AppState {
 
     /// Mutates the tail entry and re-accounts its retained bytes.
     fn mutate_tail(&mut self, change: impl FnOnce(&mut Entry)) {
-        let delta = {
+        let (before, after) = {
             let tail = self.entries.back_mut().expect("tail entry exists");
             let before = tail.retained_bytes();
             change(tail);
-            tail.retained_bytes() - before
+            (before, tail.retained_bytes())
         };
-        self.retained_bytes += delta;
+        self.retained_bytes = self.retained_bytes - before + after;
         self.trim_retention();
     }
 
     fn ensure_stream_entry(&mut self, kind: EntryKind, title: &str, stream: StreamKey) {
         let adjacent = self.entries.back().is_some_and(|tail| {
-            tail.kind == kind && !tail.folded && tail.stream.as_ref() == Some(&stream)
+            tail.kind == kind
+                && (!tail.folded || tail.compact_prefix.is_some())
+                && tail.stream.as_ref() == Some(&stream)
         });
         if !adjacent {
-            self.push_entry(Entry::new_stream(kind, title, stream));
+            let mut entry = Entry::new_stream(kind, title, stream);
+            if kind == EntryKind::Tool {
+                entry.compact_prefix = Some(0);
+                entry.folded = true;
+            }
+            self.push_entry(entry);
         }
     }
 
@@ -1187,6 +1329,7 @@ impl AppState {
         self.mutate_tail(|entry| entry.push_line(&line));
     }
 
+    #[cfg(test)]
     fn push_tool(&mut self, title: String, lines: Vec<String>) {
         self.push_tool_with_fold(title, lines, false);
     }
@@ -1302,6 +1445,7 @@ impl AppState {
         let mut hidden_above = window_start;
         let mut lines: Vec<String> = Vec::with_capacity(height.min(need));
         let mut styles: Vec<Vec<StyledRun>> = Vec::with_capacity(height.min(need));
+        let mut titles = Vec::with_capacity(height.min(need));
         let mut cursor = 0usize;
         for entry in &self.entries {
             if lines.len() >= need {
@@ -1315,21 +1459,30 @@ impl AppState {
             }
             let skip = window_start.saturating_sub(entry_start);
             let take = need - lines.len();
+            let before = lines.len();
             entry.render_range(width, skip, take, &mut lines, &mut styles);
+            let header_rows = entry.title_height(width);
+            titles.extend(
+                (skip..skip + lines.len() - before)
+                    .map(|row| (row < header_rows).then_some(entry.kind)),
+            );
         }
         // Drop the below-the-fold scrollback, then cap to the body height.
         // Both vecs stay in lockstep: every slice applies to the pair.
         if self.scrollback >= lines.len() {
             lines.clear();
             styles.clear();
+            titles.clear();
         } else {
             lines.truncate(lines.len() - self.scrollback);
             styles.truncate(lines.len());
+            titles.truncate(lines.len());
         }
         if lines.len() > height {
             let excess = lines.len() - height;
             lines.drain(..excess);
             styles.drain(..excess);
+            titles.drain(..excess);
             hidden_above += excess;
         }
         debug_assert_eq!(
@@ -1340,6 +1493,7 @@ impl AppState {
         VisibleView {
             lines,
             styles,
+            titles,
             hidden_above,
             retention_truncated: self.dropped_entries > 0,
         }
@@ -1391,6 +1545,17 @@ impl AppState {
             start += len;
         }
         let (sel_start, sel_end) = selected_range;
+        if sel_end.saturating_sub(sel_start) > height {
+            // An expanded card cannot fit at once. Keep a window already
+            // inside it; otherwise pin its header. Following its bottom on
+            // the next redraw would make the collapse affordance disappear.
+            let window_start = total.saturating_sub(self.scrollback + height);
+            if window_start < sel_start || window_start + height > sel_end {
+                self.scrollback = total.saturating_sub(sel_start + height);
+            }
+            self.scrollback = self.scrollback.min(max_scroll);
+            return;
+        }
         let bottom_hidden = total.saturating_sub(sel_end);
         if bottom_hidden < self.scrollback {
             // Selection moved down past the window: follow it.
@@ -1413,6 +1578,85 @@ impl AppState {
             }
             None => false,
         }
+    }
+
+    /// Maps a visible row to a tool header, including wrapped header rows.
+    /// Uses the same heights/window as rendering; body and separator rows do
+    /// not toggle, so output remains available for drag selection.
+    #[must_use]
+    pub fn tool_header_at(&self, row: usize) -> Option<usize> {
+        let (width, height) = self.viewport;
+        let position = self
+            .total_height(width)
+            .saturating_sub(height.max(1) + self.scrollback)
+            + row;
+        let mut start = 0;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let header = if entry.folded && entry.compact_prefix.is_none() {
+                folded_text(&entry.title, entry.lines.len())
+            } else {
+                entry.display_title()
+            };
+            if entry.kind == EntryKind::Tool
+                && (start..start + wrapped_height(&header, width)).contains(&position)
+            {
+                return Some(index);
+            }
+            start += entry.wrapped_len(width);
+        }
+        None
+    }
+
+    /// Visible tool card under a pointer, excluding blank separator rows.
+    #[must_use]
+    pub fn tool_entry_at(&self, row: usize) -> Option<usize> {
+        if row >= self.viewport.1 {
+            return None;
+        }
+        let (width, height) = self.viewport;
+        let position = self
+            .total_height(width)
+            .saturating_sub(height + self.scrollback)
+            + row;
+        let mut start = 0;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let len = entry.wrapped_len(width);
+            if entry.kind == EntryKind::Tool
+                && (start..start + len.saturating_sub(1)).contains(&position)
+            {
+                return Some(index);
+            }
+            start += len;
+        }
+        None
+    }
+
+    /// Monotonic retained-entry identity, stable when new events or retention
+    /// drops arrive between a pointer press and release.
+    #[must_use]
+    pub fn tool_identity_at(&self, row: usize) -> Option<usize> {
+        self.tool_entry_at(row)
+            .map(|index| self.dropped_entries + index)
+    }
+
+    /// Inspection only: pin the clicked card in view without changing input
+    /// focus, dispatching a command, or granting an approval.
+    pub fn toggle_tool_at_row(&mut self, row: usize) -> bool {
+        let Some(index) = self.tool_entry_at(row) else {
+            return false;
+        };
+        self.toggle_fold(index);
+        self.selected = Some(index);
+        let (width, height) = self.viewport;
+        let start: usize = self
+            .entries
+            .iter()
+            .take(index)
+            .map(|entry| entry.wrapped_len(width))
+            .sum();
+        self.scrollback = self.total_height(width).saturating_sub(start + height);
+        self.ensure_visible();
+        true
     }
 
     /// Folds every retained entry; manual folds are separate per entry.
@@ -1738,10 +1982,30 @@ impl AppState {
     /// Caches the last viewport geometry for selection math. Preserves an
     /// existing scroll position when nothing is selected.
     pub fn set_viewport(&mut self, width: usize, height: usize) {
+        let header_pinned = self.selected.is_some_and(|index| {
+            let start: usize = self
+                .entries
+                .iter()
+                .take(index)
+                .map(|entry| entry.wrapped_len(self.viewport.0))
+                .sum();
+            self.total_height(self.viewport.0)
+                .saturating_sub(self.scrollback + self.viewport.1)
+                == start
+        });
         self.viewport = (width.max(1), height.max(1));
         let (width, height) = self.viewport;
         let total = self.total_height(width);
         let max_scroll = total.saturating_sub(height.min(total));
+        if header_pinned && let Some(index) = self.selected {
+            let start: usize = self
+                .entries
+                .iter()
+                .take(index)
+                .map(|entry| entry.wrapped_len(width))
+                .sum();
+            self.scrollback = total.saturating_sub(start + height);
+        }
         self.scrollback = self.scrollback.min(max_scroll);
         self.ensure_visible();
     }
@@ -2101,8 +2365,156 @@ mod tests {
         assert!(entry.lines.iter().any(|line| line == "entry-11"));
         assert!(entry.title.contains("12 lines / 97 chars"));
         assert!(entry.lines[0].contains("12 lines"));
+        let compact = render_entry_lines(entry, 160);
+        assert!(compact[0].contains("2 earlier lines"));
+        assert!(!compact.iter().any(|line| line.trim() == "entry-0"));
+        assert!(!compact.iter().any(|line| line.trim() == "entry-1"));
+        assert_eq!(
+            compact
+                .iter()
+                .filter(|line| line.trim().starts_with("entry-"))
+                .count(),
+            10
+        );
+        assert!(compact.iter().any(|line| line.trim() == "entry-11"));
         assert!(state.toggle_fold(1), "the selected output can be expanded");
         assert!(!state.entry(1).expect("entry remains").folded);
+        assert!(
+            render_entry_lines(state.entry(1).unwrap(), 160)
+                .iter()
+                .any(|line| line.trim() == "entry-0")
+        );
+    }
+
+    #[test]
+    fn compact_tool_retains_parameters_and_tail_with_consistent_wrapping() {
+        let mut entry = Entry::new(EntryKind::Tool, "host_exec · Succeeded");
+        entry.push_line(r#"host_exec {"argv":["cargo","test"]}"#);
+        entry.compact_prefix = Some(1);
+        for n in 0..25 {
+            entry.push_line(&format!("output-{n}: 中文"));
+        }
+        for folded in [true, false] {
+            entry.folded = folded;
+            for width in [1, 7, 30, 120] {
+                let rendered = render_entry_lines(&entry, width);
+                assert_eq!(entry.wrapped_len(width), rendered.len());
+                let mut slice = Vec::new();
+                entry.render_range(width, 2, 5, &mut slice, &mut Vec::new());
+                assert_eq!(
+                    slice,
+                    rendered.iter().skip(2).take(5).cloned().collect::<Vec<_>>()
+                );
+            }
+        }
+        entry.folded = true;
+        let compact = render_entry_lines(&entry, 120);
+        assert_eq!(compact[1].trim(), r#"host_exec {"argv":["cargo","test"]}"#);
+        assert!(compact[2].contains("output-15:"));
+        assert!(compact[11].contains("output-24:"));
+    }
+
+    #[test]
+    fn long_tool_output_preserves_the_tail_within_retention_budget() {
+        let mut state = AppState::new();
+        let mut entry = Entry::new_stream(
+            EntryKind::Tool,
+            "host_search",
+            StreamKey::ToolOutput {
+                call: CallId::new("tail-call").unwrap(),
+            },
+        );
+        entry.compact_prefix = Some(0);
+        entry.folded = true;
+        state.push_entry(entry);
+        for n in 0..500 {
+            state
+                .mutate_tail(|entry| entry.append_text(&format!("line-{n}: {}\n", "x".repeat(80))));
+            // Exercise cache reuse while eviction keeps line counts stable.
+            let entry = state.entry(0).unwrap();
+            assert_eq!(entry.wrapped_len(50), render_entry_lines(entry, 50).len());
+        }
+        let entry = state.entry(0).unwrap();
+        assert!(entry.truncated);
+        assert!(entry.retained_bytes() <= MAX_ENTRY_BYTES);
+        assert_eq!(state.retained_bytes(), entry.retained_bytes());
+        let compact = render_entry_lines(entry, 160);
+        assert!(compact.iter().any(|line| line.contains("line-499:")));
+        assert_eq!(
+            compact
+                .iter()
+                .filter(|line| line.trim().starts_with("line-"))
+                .count(),
+            10
+        );
+        assert!(
+            compact
+                .iter()
+                .any(|line| line.contains("presentation bound"))
+        );
+    }
+
+    #[test]
+    fn tool_start_and_result_show_the_same_safe_invocation() {
+        use nexus_core::{
+            EffectState, Evidence, ExecutionStatus, M0_REVISION, ToolFinishedInfo, ToolId,
+            ToolOutcome, ToolStartedInfo,
+        };
+        let mut state = AppState::new();
+        state.apply_event(&started(0));
+        let (session, run) = session_run();
+        let call = CallId::new("visible-call").unwrap();
+        let preview = r#"host_exec {"argv":["printf","hello world"]}"#;
+        state.apply_event(&RunEvent::new(
+            session.clone(),
+            run.clone(),
+            1,
+            EventPayload::ToolStarted(ToolStartedInfo {
+                call: call.clone(),
+                tool: ToolId::new("host_exec", M0_REVISION).unwrap(),
+                args_preview: Some(preview.to_owned()),
+            }),
+        ));
+        state.apply_event(&RunEvent::new(
+            session,
+            run,
+            2,
+            EventPayload::ToolFinished(ToolFinishedInfo {
+                call,
+                outcome: ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownApplied,
+                    Evidence::HostObserved,
+                    "hello world",
+                    false,
+                )
+                .unwrap(),
+            }),
+        ));
+        assert!(
+            state.entry(1).unwrap().folded,
+            "started calls default to collapsed"
+        );
+        assert!(
+            !render_entry_lines(state.entry(1).unwrap(), 160)
+                .iter()
+                .any(|line| line.trim() == preview)
+        );
+        state.toggle_fold(1);
+        for index in [1, 2] {
+            let entry = state.entry(index).unwrap();
+            assert!(entry.title.contains("host_exec"));
+            assert!(
+                render_entry_lines(entry, 160)
+                    .iter()
+                    .any(|line| line.trim() == preview)
+            );
+        }
+        assert!(
+            render_entry_lines(state.entry(2).unwrap(), 160)
+                .iter()
+                .any(|line| line.trim() == "hello world")
+        );
     }
 
     #[test]

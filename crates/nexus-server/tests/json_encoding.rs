@@ -657,11 +657,16 @@ fn event_json_tool_started_carries_the_call_identity() {
         5,
         EventPayload::ToolStarted(ToolStartedInfo {
             call: call("call-7"),
+            tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+            args_preview: Some(r#"host_read {"path":"src"}"#.to_owned()),
         }),
     ));
     assert_eq!(encoded["kind"], "tool-started");
     assert_eq!(encoded["terminal"], false);
-    assert_eq!(encoded["detail"], json!({ "call": "call-7" }));
+    assert_eq!(
+        encoded["detail"],
+        json!({ "call": "call-7", "tool": "host_read", "revision": nexus_core::M0_REVISION, "args_preview": r#"host_read {"path":"src"}"# })
+    );
 }
 
 #[test]
@@ -796,6 +801,8 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
         (
             EventPayload::ToolStarted(ToolStartedInfo {
                 call: call("call-7"),
+                tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+                args_preview: None,
             }),
             "tool-started",
             false,

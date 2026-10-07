@@ -1733,6 +1733,8 @@ mod cov_topup_private {
             seq,
             EventPayload::ToolStarted(ToolStartedInfo {
                 call: CallId::new("c1-0").expect("valid call"),
+                tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+                args_preview: None,
             }),
         )
     }

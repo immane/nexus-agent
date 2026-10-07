@@ -942,6 +942,8 @@ struct Frontend {
     /// the batch, where runtimes can be built. At most one push per Enter
     /// keypress, drained every tick, so the queue stays tiny.
     pending_session_cmds: Vec<SessionArgs>,
+    /// Stable tool-card identity; committed on release, never on a drag.
+    pointer_press: Option<usize>,
 }
 
 impl Frontend {
@@ -963,6 +965,7 @@ impl Frontend {
             demo: false,
             live: None,
             pending_session_cmds: Vec::new(),
+            pointer_press: None,
         }
     }
 
@@ -1279,6 +1282,9 @@ const WHEEL_LINES: usize = 3;
 /// given window line, so CJK-wide glyphs map exactly.
 fn body_hit(state: &AppState, lines: &[String], column: u16, row: u16) -> Option<(usize, usize)> {
     let geo = state.pointer_geometry();
+    if column < geo.body_x || row < geo.body_y {
+        return None;
+    }
     let cell = (column as usize).saturating_sub(geo.body_x as usize);
     if cell >= geo.text_width.max(1) {
         return None;
@@ -1466,6 +1472,7 @@ fn write_osc52(text: &str) -> bool {
 fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
+            front.pointer_press = None;
             if front.state.approval_detail_open() {
                 front.state.approval_detail_scroll(-(WHEEL_LINES as isize));
             } else {
@@ -1474,6 +1481,7 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::ScrollDown => {
+            front.pointer_press = None;
             if front.state.approval_detail_open() {
                 front.state.approval_detail_scroll(WHEEL_LINES as isize);
             } else {
@@ -1482,10 +1490,12 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            front.pointer_press = None;
             // A new press replaces any previous selection outright; cells
             // outside both regions only clear.
             let window = window_lines(&front.state);
             if let Some((row, col)) = body_hit(&front.state, &window, mouse.column, mouse.row) {
+                front.pointer_press = front.state.tool_identity_at(row);
                 front.state.begin_body_selection(row, col);
             } else if let Some(offset) = composer_hit(&front.state, mouse.column, mouse.row) {
                 front.state.begin_composer_selection(offset);
@@ -1495,6 +1505,7 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            front.pointer_press = None;
             if front.state.text_selection().is_none() {
                 return false;
             }
@@ -1509,6 +1520,15 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             true
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(identity) = front.pointer_press.take() {
+                let window = window_lines(&front.state);
+                if let Some((row, _)) = body_hit(&front.state, &window, mouse.column, mouse.row)
+                    && front.state.tool_identity_at(row) == Some(identity)
+                    && front.state.toggle_tool_at_row(row)
+                {
+                    return true;
+                }
+            }
             // Release copies at once and confirms with a header toast that
             // fades on its own; the transcript stays clean. The highlight
             // clears with the copy. An empty cover copies nothing.
@@ -4542,6 +4562,115 @@ mod cov_main_topup {
             let both = |name: &str| name == "wl-copy" || name == "xclip";
             assert_eq!(clipboard_command(&both), Some(("wl-copy", &[] as &[&str])));
         }
+    }
+
+    #[test]
+    fn tool_header_click_expands_on_release_and_drag_does_not_fold() {
+        use nexus_core::{EffectState, Evidence, ExecutionStatus, ToolFinishedInfo, ToolOutcome};
+        let mut front = Frontend::new(session());
+        let run = run_id("run-tool-click");
+        front.state.apply_event(&started(&run, 0));
+        let output = (0..20)
+            .map(|n| format!("output-{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        front.state.apply_event(&RunEvent::new(
+            session(),
+            run.clone(),
+            1,
+            EventPayload::ToolFinished(ToolFinishedInfo {
+                call: CallId::new("call-click").unwrap(),
+                outcome: ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownNotApplied,
+                    Evidence::HostObserved,
+                    output,
+                    false,
+                )
+                .unwrap(),
+            }),
+        ));
+        let mut terminal = fixed_terminal();
+        for expanded in [true, false] {
+            draw(&mut terminal, &mut front).unwrap();
+            let geo = front.state.pointer_geometry();
+            let window = window_lines(&front.state);
+            let row = if expanded {
+                window
+                    .iter()
+                    .position(|line| line.trim() == "output-19")
+                    .unwrap()
+            } else {
+                (0..window.len())
+                    .find(|row| front.state.tool_header_at(*row) == Some(1))
+                    .unwrap()
+            };
+            let at = |kind| MouseEvent {
+                kind,
+                column: geo.body_x + 1,
+                row: geo.body_y + geo.content_offset as u16 + row as u16,
+                modifiers: KeyModifiers::empty(),
+            };
+            let before = front.state.entry(1).unwrap().folded;
+            assert!(handle_mouse(
+                &mut front,
+                at(MouseEventKind::Down(MouseButton::Left))
+            ));
+            assert_eq!(front.state.entry(1).unwrap().folded, before);
+            if expanded {
+                front.state.apply_event(&RunEvent::new(
+                    session(),
+                    run.clone(),
+                    2,
+                    EventPayload::UsageUpdated(nexus_core::Usage::new(
+                        None,
+                        None,
+                        nexus_core::UsageFinality::Provisional,
+                    )),
+                ));
+                assert!(
+                    front.state.text_selection().is_none(),
+                    "runtime updates clear selection during a click"
+                );
+                draw(&mut terminal, &mut front).unwrap();
+            }
+            assert!(handle_mouse(
+                &mut front,
+                at(MouseEventKind::Up(MouseButton::Left))
+            ));
+            assert_eq!(front.state.entry(1).unwrap().folded, !expanded);
+            assert_eq!(front.focus, Focus::Composer);
+            assert!(front.live_approval.is_none());
+        }
+        draw(&mut terminal, &mut front).unwrap();
+        let geo = front.state.pointer_geometry();
+        let window = window_lines(&front.state);
+        let row = (0..window.len())
+            .find(|row| front.state.tool_header_at(*row) == Some(1))
+            .unwrap();
+        let at = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: geo.body_y + geo.content_offset as u16 + row as u16,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse(
+            &mut front,
+            at(MouseEventKind::Down(MouseButton::Left), geo.body_x + 1),
+        );
+        handle_mouse(
+            &mut front,
+            at(MouseEventKind::Drag(MouseButton::Left), geo.body_x + 4),
+        );
+        handle_mouse(
+            &mut front,
+            at(MouseEventKind::Up(MouseButton::Left), geo.body_x + 4),
+        );
+        assert!(
+            front.state.entry(1).unwrap().folded,
+            "drag copies, never toggles"
+        );
+        assert!(body_hit(&front.state, &window, geo.body_x, geo.body_y - 1).is_none());
     }
 
     #[test]

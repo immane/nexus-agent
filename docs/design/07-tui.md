@@ -1,6 +1,6 @@
 # TUI and Headless Frontends
 
-Status: Draft design implementing the accepted [first-release defaults](decisions/01-first-release-defaults.md). No frontend currently exists.
+Status: Draft design implementing the accepted [first-release defaults](decisions/01-first-release-defaults.md). Implemented tool-output inspection is documented below; the remaining sections are design guidance.
 
 ## Reference and Scope
 
@@ -35,6 +35,30 @@ Cancellation must remain available while output streams or an approval is pendin
 Start a new conversation by default. Automatic saves use the configured local store outside the project. Listing or selecting previous sessions is explicit and bounded; restoration never reruns old tools or restores their grants.
 
 Batch stream updates, cache layout where useful, and process visible entries rather than reparsing all history. Bound retained text, output, and caches; report presentation truncation separately from accepted conversation records. Render untrusted content without allowing terminal control-sequence injection.
+
+## Implemented Tool-output Inspection
+
+The current TUI identifies each admitted tool when execution begins, including
+automatic read/list/search calls. Proposed-call, approval-transcript, and
+started-call entries default to collapsed; expansion shows their safe details.
+Finished results keep the policy-redacted invocation visible alongside status and effect
+evidence. Compact tool results and streamed progress show the last **10 logical
+output lines** (wrapping may use more terminal rows), with a hidden-line count.
+Click a tool card (header or output) to expand/collapse its retained output;
+Left/Right remains the keyboard alternative. Dragging still selects text for
+copying, even over headers. Click identity is independent of text selection, so
+runtime events clearing a highlight do not cancel an otherwise valid click. None
+of these inspection actions executes a tool or grants approval.
+
+Tool-output retention stays byte-bounded: on overflow, older output is dropped
+in favor of the newest lines, metadata is preserved, and presentation truncation
+is marked explicitly. Expanded output is the retained content, not a promise to
+recover discarded bytes. An unsafe or over-bound argument preview is omitted
+with an explicit unavailable label rather than displaying raw arguments.
+
+Entry titles use role-specific colors: user green, assistant cyan, tools yellow,
+and system dark gray. Body text keeps its normal/Markdown styling; selection
+highlighting is preserved on colored titles, including wrapped and scrolled rows.
 
 ## Headless Entry Point
 

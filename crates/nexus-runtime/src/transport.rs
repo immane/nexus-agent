@@ -149,6 +149,8 @@ mod cov_transport_private {
                 "ToolStarted",
                 EventPayload::ToolStarted(ToolStartedInfo {
                     call: call("call-cov"),
+                    tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+                    args_preview: None,
                 }),
             ),
             (

@@ -127,7 +127,15 @@ pub fn event_json(event: &RunEvent) -> Value {
             ("tool-call-preview", json!({ "item": item_key }))
         }
         EventPayload::ApprovalRequired(notice) => ("approval-required", notice_json(notice)),
-        EventPayload::ToolStarted(info) => ("tool-started", json!({ "call": info.call.as_str() })),
+        EventPayload::ToolStarted(info) => (
+            "tool-started",
+            json!({
+                "call": info.call.as_str(),
+                "tool": info.tool.name(),
+                "revision": info.tool.revision(),
+                "args_preview": info.args_preview,
+            }),
+        ),
         EventPayload::ToolOutput(progress) => (
             "tool-output",
             json!({ "call": progress.call.as_str(), "preview": progress.preview, "truncated": progress.truncated }),

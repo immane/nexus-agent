@@ -847,7 +847,11 @@ fn command_surface_smoke() {
     assert_eq!(notice.args_preview(), Some(r#"{"path":"src"}"#));
     notice.validate().expect("notice stays valid");
 
-    let started = ToolStartedInfo { call: call.clone() };
+    let started = ToolStartedInfo {
+        call: call.clone(),
+        tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+        args_preview: None,
+    };
     assert_eq!(started.call, call);
     let progress = ToolProgress::new(call.clone(), "working", false).expect("valid progress");
     assert_eq!(progress.call, call);

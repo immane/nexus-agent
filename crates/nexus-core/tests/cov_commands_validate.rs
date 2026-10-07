@@ -615,7 +615,11 @@ fn event_payload_validates_text_variants_and_accepts_opaque_variants() {
         EventPayload::AssistantTextDelta(
             AssistantText::new(turn(), "item-0", "hi").expect("valid delta builds"),
         ),
-        EventPayload::ToolStarted(ToolStartedInfo { call: call() }),
+        EventPayload::ToolStarted(ToolStartedInfo {
+            call: call(),
+            tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+            args_preview: None,
+        }),
         EventPayload::ToolFinished(ToolFinishedInfo {
             call: call(),
             outcome: valid_outcome(),
@@ -635,6 +639,36 @@ fn event_payload_validates_text_variants_and_accepts_opaque_variants() {
     ];
     for payload in opaque {
         payload.validate().expect("constructed payload validates");
+    }
+}
+
+#[test]
+fn tool_started_preview_is_bounded_and_safe_at_publication() {
+    let mut info = ToolStartedInfo {
+        call: call(),
+        tool: nexus_core::ToolId::new("host_exec", nexus_core::M0_REVISION).unwrap(),
+        args_preview: None,
+    };
+    info.validate().unwrap();
+    for preview in [
+        "x".repeat(MAX_SUMMARY_BYTES),
+        r#"host_exec {"argv":["printf","hello"]}"#.to_owned(),
+    ] {
+        info.args_preview = Some(preview);
+        EventPayload::ToolStarted(info.clone()).validate().unwrap();
+    }
+    for preview in [
+        "x".repeat(MAX_SUMMARY_BYTES + 1),
+        "api_key=secret-value".to_owned(),
+        String::new(),
+    ] {
+        info.args_preview = Some(preview);
+        assert_invalid(
+            EventPayload::ToolStarted(info.clone())
+                .validate()
+                .unwrap_err(),
+            "tool started preview is invalid",
+        );
     }
 }
 
@@ -679,7 +713,11 @@ fn run_event_terminal_detection_covers_every_nonterminal_payload() {
             item_key: "item-0".to_owned(),
         },
         EventPayload::ApprovalRequired(notice("run tool", "project scope")),
-        EventPayload::ToolStarted(ToolStartedInfo { call: call() }),
+        EventPayload::ToolStarted(ToolStartedInfo {
+            call: call(),
+            tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+            args_preview: None,
+        }),
         EventPayload::ToolOutput(ToolProgress::new(call(), "ok", false).expect("valid progress")),
         EventPayload::ToolFinished(ToolFinishedInfo {
             call: call(),

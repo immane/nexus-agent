@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use crate::error::{AgentError, ErrorCategory, RetryGuidance, is_bounded_safe_text};
-use crate::ids::{ApprovalId, CallId, RequestId, RunId, SessionId, TurnId};
+use crate::ids::{ApprovalId, CallId, RequestId, RunId, SessionId, ToolId, TurnId};
 use crate::limits::Limits;
 use crate::outcomes::{
     CommandReply, EffectState, Evidence, ExecutionStatus, RunFinished, RunOutcome, ToolOutcome,
@@ -387,6 +387,25 @@ impl ApprovalNotice {
 pub struct ToolStartedInfo {
     /// Executing call.
     pub call: CallId,
+    /// Admitted tool identity (not an authorization grant).
+    pub tool: ToolId,
+    /// Bounded, policy-redacted operation preview; absent when it cannot be
+    /// displayed safely. Never raw model arguments.
+    pub args_preview: Option<String>,
+}
+
+impl ToolStartedInfo {
+    /// Revalidates public preview text at the event publishing boundary.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if self
+            .args_preview
+            .as_ref()
+            .is_some_and(|preview| !is_bounded_safe_text(preview, MAX_SUMMARY_BYTES))
+        {
+            return Err(command_error("tool started preview is invalid"));
+        }
+        Ok(())
+    }
 }
 
 /// Optional bounded progress with explicit truncation state.
@@ -479,9 +498,9 @@ impl EventPayload {
                 Ok(())
             }
             Self::ApprovalRequired(notice) => notice.validate(),
+            Self::ToolStarted(info) => info.validate(),
             Self::ToolOutput(progress) => progress.validate(),
             Self::RunStarted { .. }
-            | Self::ToolStarted(_)
             | Self::ToolFinished(_)
             | Self::UsageUpdated(_)
             | Self::RunFinished(_) => Ok(()),

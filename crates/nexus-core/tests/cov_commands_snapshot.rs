@@ -206,7 +206,11 @@ fn only_run_finished_payloads_are_terminal() {
             item_key: "item-0".to_owned(),
         },
         EventPayload::ApprovalRequired(notice),
-        EventPayload::ToolStarted(ToolStartedInfo { call: call.clone() }),
+        EventPayload::ToolStarted(ToolStartedInfo {
+            call: call.clone(),
+            tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+            args_preview: None,
+        }),
         EventPayload::ToolOutput(
             ToolProgress::new(call.clone(), "progress", false).expect("valid progress builds"),
         ),

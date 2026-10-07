@@ -27,8 +27,8 @@ use ratatui::widgets::{
 use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
 use crate::state::{
-    AppState, ApprovalGeometry, PendingApprovalCard, PointerGeometry, chunks, display_width,
-    wrapped_height,
+    AppState, ApprovalGeometry, EntryKind, PendingApprovalCard, PointerGeometry, chunks,
+    display_width, wrapped_height,
 };
 
 /// Maps width-neutral Markdown style bits to terminal styling. Only color
@@ -173,6 +173,21 @@ fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
         spans.push(Span::raw(text[byte_at(cursor)..].to_owned()));
     }
     Line::from(spans)
+}
+
+fn entry_title_style(kind: EntryKind) -> Style {
+    match kind {
+        EntryKind::User => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        EntryKind::Assistant => Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
+        EntryKind::Tool => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        EntryKind::System => Style::default().fg(Color::DarkGray),
+    }
 }
 
 /// Welcome hero rows: the gradient banner plus breathing room and the
@@ -512,10 +527,14 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
         })
     };
     for (index, (line, runs)) in view.lines.iter().zip(&view.styles).enumerate() {
-        match selected_row(index) {
-            Some((start, len)) => lines.push(styled_line(line, &merge_selected(runs, start, len))),
-            None => lines.push(styled_line(line, runs)),
+        let mut rendered = match selected_row(index) {
+            Some((start, len)) => styled_line(line, &merge_selected(runs, start, len)),
+            None => styled_line(line, runs),
+        };
+        if let Some(kind) = view.titles[index] {
+            rendered = rendered.style(entry_title_style(kind));
         }
+        lines.push(rendered);
     }
     let shown = view.lines.len();
     let content_offset = lines.len().saturating_sub(shown);
@@ -1020,6 +1039,106 @@ mod tests {
             rows.push(row);
         }
         rows.join("\n")
+    }
+
+    #[test]
+    fn entry_titles_are_colored_without_tinting_bodies_or_losing_selection() {
+        use nexus_core::{
+            AssistantText, EffectState, Evidence, ExecutionStatus, RunId, ToolFinishedInfo,
+            ToolOutcome, TurnId,
+        };
+        let mut state = AppState::new();
+        state.notice("plain system body");
+        state.record_submitted("plain user body");
+        let session = SessionId::new("color-session").unwrap();
+        let run = RunId::new("color-run").unwrap();
+        state.apply_event(&RunEvent::new(
+            session.clone(),
+            run.clone(),
+            0,
+            EventPayload::RunStarted {
+                request: RequestId::new("color-request").unwrap(),
+            },
+        ));
+        state.apply_event(&RunEvent::new(
+            session.clone(),
+            run.clone(),
+            1,
+            EventPayload::AssistantTextDelta(
+                AssistantText::new(
+                    TurnId::new("color-turn").unwrap(),
+                    "text",
+                    "plain assistant body",
+                )
+                .unwrap(),
+            ),
+        ));
+        state.apply_event(&RunEvent::new(
+            session,
+            run,
+            2,
+            EventPayload::ToolFinished(ToolFinishedInfo {
+                call: CallId::new("color-call").unwrap(),
+                outcome: ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownNotApplied,
+                    Evidence::HostObserved,
+                    "plain tool body",
+                    false,
+                )
+                .unwrap(),
+            }),
+        ));
+        let area = Rect::new(0, 0, 65, 35);
+        let mut buffer = Buffer::empty(area);
+        render_body(&mut state, area, &mut buffer);
+        let view = state.visible_lines(state.viewport_width(), state.viewport_height());
+        let geo = state.pointer_geometry();
+        let mut kinds = Vec::new();
+        for (row, kind) in view.titles.iter().enumerate() {
+            let cell = buffer.get(0, geo.content_offset as u16 + row as u16);
+            if let Some(kind) = kind {
+                assert_eq!(cell.fg, entry_title_style(*kind).fg.unwrap());
+                kinds.push(*kind);
+            } else if !view.lines[row].is_empty() {
+                assert_eq!(
+                    cell.fg,
+                    Color::Reset,
+                    "title color must not bleed into body indentation"
+                );
+            }
+        }
+        for kind in [
+            EntryKind::User,
+            EntryKind::Assistant,
+            EntryKind::Tool,
+            EntryKind::System,
+        ] {
+            assert!(kinds.contains(&kind));
+        }
+        let row = view
+            .titles
+            .iter()
+            .position(|kind| *kind == Some(EntryKind::Tool))
+            .unwrap();
+        state.begin_body_selection(row, 0);
+        state.extend_body_selection(row, 4);
+        render_body(&mut state, area, &mut buffer);
+        let cell = buffer.get(
+            0,
+            state.pointer_geometry().content_offset as u16 + row as u16,
+        );
+        assert_eq!(cell.fg, Color::Yellow);
+        assert!(cell.modifier.contains(Modifier::REVERSED));
+        state.scroll_up(4);
+        render_body(
+            &mut state,
+            Rect::new(0, 0, 25, 12),
+            &mut Buffer::empty(Rect::new(0, 0, 25, 12)),
+        );
+        let sliced = state.visible_lines(state.viewport_width(), state.viewport_height());
+        assert_eq!(sliced.titles.len(), sliced.lines.len());
+        assert_eq!(sliced.styles.len(), sliced.lines.len());
     }
 
     #[test]
@@ -1546,6 +1665,8 @@ mod tests {
             1,
             EventPayload::ToolStarted(ToolStartedInfo {
                 call: CallId::new("call-1").expect("valid"),
+                tool: nexus_core::ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+                args_preview: None,
             }),
         );
         assert!(state.apply_event(&tool_started));
