@@ -46,7 +46,9 @@ use nexus_core::{
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
-use nexus_tools::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};
+use nexus_tools::{
+    SandboxedExecutor, ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -60,7 +62,7 @@ const WEB_PROFILE: &str = "web-test";
 
 /// Tool wiring for demo sessions. Fakes are the default: nothing touches
 /// the real filesystem. `RealFiles` executes jailed `host_read`, `host_list`,
-/// `host_search`, `host_write`, and `host_patch` tools (mutations require approval); the root is
+/// `host_search`, `host_write`, `host_patch`, and sandboxed `host_exec` tools (mutations and exec require approval); the root is
 /// canonicalized and validated up front and per session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolsMode {
@@ -310,6 +312,10 @@ impl Server {
                 ),
                 Arc::new(
                     ScopedPatcher::with_root(root)
+                        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+                ),
+                Arc::new(
+                    SandboxedExecutor::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
                 ),
             ],

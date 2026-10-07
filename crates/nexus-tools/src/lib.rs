@@ -3,11 +3,12 @@
 //! This crate owns the real [`nexus_core::ToolPort`] implementations:
 //! [`ScopedReader`] (`host_read`), [`ScopedLister`] (`host_list`),
 //! [`ScopedSearcher`] (`host_search`), [`ScopedWriter`] (`host_write`), and
-//! [`ScopedPatcher`] (`host_patch`, approval-gated mutations), all at the M0
+//! [`ScopedPatcher`] (`host_patch`, approval-gated mutations), and
+//! [`SandboxedExecutor`] (`host_exec`, approval-gated OS-sandboxed argv), all at the M0
 //! revision so the existing scoped policy authorizes reads automatically
-//! and routes writes through approval. Every path is resolved against one
-//! canonical root and refused outside it; admission-time policy checks
-//! stay the outer boundary, the jail is the inner one.
+//! and routes writes/exec through approval. Filesystem paths resolve against
+//! one canonical root; `host_exec` runs only behind an available mandatory
+//! platform sandbox and never falls back to an unsandboxed process.
 //!
 //! # Jail model
 //!
@@ -40,6 +41,8 @@
 
 #![forbid(unsafe_code)]
 
+mod exec;
 pub mod fs;
 
+pub use exec::SandboxedExecutor;
 pub use fs::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};

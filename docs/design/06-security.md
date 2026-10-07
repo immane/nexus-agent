@@ -1,6 +1,6 @@
 # Security and Trust Boundaries
 
-Status: Draft design. No authorization implementation, sandbox, or isolation guarantee currently exists.
+Status: Draft design. Host authorization is implemented; `host_exec` currently uses the platform sandbox backend when the real-files tools mode is enabled. This is not a general untrusted-plugin boundary.
 
 ## Trust Model
 
@@ -53,6 +53,12 @@ Before claiming support for untrusted plugins, define and implement an isolation
 Specify how policies are enforced by the OS, how unsupported restrictions fail closed, and which escapes or platform limitations remain. Do not select a particular sandbox technology merely to fill this document.
 
 Isolation must fit behind executor boundaries rather than adding sandbox APIs to domain messages. Until implemented and tested, the supported trust model remains explicitly trusted code.
+
+### `host_exec` v1 boundary
+
+The opt-in real-files tools mode registers `host_exec`; its mandatory backend must pass a startup probe (`sandbox-exec` on macOS, `bwrap` on Linux), otherwise calls are denied without spawning a command. It never falls back to an unsandboxed child, and other filesystem tools remain available. Calls accept a non-empty argv array and do not invoke a shell. Each call remains approval-required and is bound to its exact normalized arguments by runtime approval handling. The working directory is the configured tools root. The project root is writable; macOS grants reads only to the project and selected system/toolchain locations, while Linux exposes selected system directories read-only and binds only the project writable. Both backends deny network access. The process receives a cleared environment with a small PATH and placeholder HOME.
+
+The current executor bounds captured stdout/stderr, checks cancellation and deadlines while polling, and terminates/waits for the sandbox process group. Linux additionally uses a PID namespace and `--die-with-parent`; effects after cancellation or timeout remain `Unknown`, since termination does not establish rollback. Deliberately detached descendants and sandbox escapes are not claimed to be contained. Backend installation/availability is not proof against every OS sandbox escape. Linux `bwrap` behavior must be adversarially validated on a supported Linux host before claiming Linux isolation; unsupported or missing backends fail closed.
 
 ## Required Safety Tests
 

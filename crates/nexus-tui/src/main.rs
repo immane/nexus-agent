@@ -52,7 +52,9 @@ use nexus_core::{
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
-use nexus_tools::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};
+use nexus_tools::{
+    SandboxedExecutor, ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter,
+};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
     Action, AppState, Focus, RefreshGate, SessionArgs, SlashCommand, TOAST_TTL, TextSelection,
@@ -632,6 +634,7 @@ fn build_live_runtime(
                 Arc::new(ScopedSearcher::with_root(&canonical).map_err(io::Error::other)?),
                 Arc::new(ScopedWriter::with_root(&canonical).map_err(io::Error::other)?),
                 Arc::new(ScopedPatcher::with_root(&canonical).map_err(io::Error::other)?),
+                Arc::new(SandboxedExecutor::with_root(&canonical).map_err(io::Error::other)?),
             ]
         }
     };
@@ -657,7 +660,7 @@ fn wiring_notice(selection: &LiveSelection, tools_root: Option<&std::path::Path>
     let tools = match tools_root {
         None => "scripted tools".to_owned(),
         Some(root) => format!(
-            "real reads/writes at {} (writes require approval)",
+            "real file tools + sandboxed exec at {} (writes/exec require approval)",
             root.display()
         ),
     };
@@ -670,7 +673,7 @@ fn main() {
         "nexus-tui dev: live wiring by default, ephemeral store. \
           A slot whose model resolves to a configured provider with a credential \
           uses the real adapter (network egress, billable); --tools-root enables \
-           real jailed reads/writes (writes require approval). \
+           real jailed file tools + sandboxed exec (writes/exec require approval). \
            Without a configured provider, runs fail as not-configured; \
            relaunch with --demo for the scripted demo. No durable storage."
     );
@@ -5310,8 +5313,8 @@ mod cov_live_wiring {
         );
         assert!(notice.contains("unavailable"));
         assert!(!notice.contains("demo script"));
-        assert!(notice.contains("real reads/writes"));
-        assert!(notice.contains("writes require approval"));
+        assert!(notice.contains("real file tools + sandboxed exec"));
+        assert!(notice.contains("writes/exec require approval"));
     }
 
     #[test]
