@@ -98,6 +98,16 @@ fn approval_scope_resolves_path_command_and_tool_fallback_exactly() {
     // Path scope: canonical project-relative path.
     let write = call("host_write", r#"{"path":"dst/file.txt","content":"hi"}"#);
     assert_eq!(resolved_scope(&policy, &write), "path:dst/file.txt");
+    assert_eq!(
+        resolved_scope(&policy, &call("host_list", r#"{"path":"."}"#)),
+        "path:."
+    );
+    // Scope resolution describes a resource, not adapter input validation or
+    // authorization to mutate the jail root.
+    assert_eq!(
+        resolved_scope(&policy, &call("host_write", r#"{"path":"."}"#)),
+        "path:."
+    );
 
     // Path resolution precedes command extraction: the command text must not
     // leak into the label of a call that also names a path.
@@ -215,7 +225,6 @@ fn approval_scope_refuses_invalid_path_and_command_arguments() {
             "tool path contains a parent traversal",
         ),
         (r#"{"path":"./x"}"#, "tool path contains a parent traversal"),
-        (r#"{"path":"."}"#, "tool path contains a parent traversal"),
     ] {
         let error = assert_refused(
             policy.approval_scope(&call("host_write", args)),

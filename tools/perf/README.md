@@ -74,6 +74,13 @@ bytes on macOS, kilobytes on Linux; the unit is printed and recorded.
 Max RSS is summarized over successful samples only. On platforms without
 `os.wait4`, timing still works but RSS is reported as unavailable.
 
+Linux child high-water RSS can include the pre-exec fork footprint of the
+launching process. Exact-child attribution does not guarantee post-exec-only
+memory accounting. Run the CLI from a small, fresh harness process rather than
+embedding measurements in a large long-lived Python process. RSS magnitude tests
+use a freshly exec'd harness for this reason; they retain their allocation and
+helper-contamination checks and do not subtract or clamp the kernel evidence.
+
 ## Warm vs cold
 
 - **Warm-cache**: back-to-back launches; the OS filesystem cache is hot.

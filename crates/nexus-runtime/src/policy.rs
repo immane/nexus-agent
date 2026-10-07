@@ -971,10 +971,17 @@ mod cov_policy_private {
         let policy = Policy::m0_test();
         assert_eq!(
             policy.auto_tools,
-            vec!["host_read".to_owned(), "host_search".to_owned()]
+            vec![
+                "host_read".to_owned(),
+                "host_list".to_owned(),
+                "host_search".to_owned()
+            ]
         );
         assert_eq!(policy.revision, M0_REVISION);
-        assert_eq!(AUTO_READ_TOOLS, ["host_read", "host_search"].as_slice());
+        assert_eq!(
+            AUTO_READ_TOOLS,
+            ["host_read", "host_list", "host_search"].as_slice()
+        );
         assert_eq!(REDACTED_VALUE, "[redacted]");
         assert_eq!(REDACTED_KEY, "[redacted-key]");
         assert!(SECRET_KEY_MARKERS.contains(&"password"));

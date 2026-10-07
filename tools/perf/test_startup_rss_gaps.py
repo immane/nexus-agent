@@ -69,6 +69,34 @@ def rss_bytes(raw):
     return raw * 1024
 
 
+def isolated_measurement(operation, argv, **kwargs):
+    """Measure from a small, freshly exec'd harness, not the discovery process.
+
+    Linux wait4 includes the child's pre-exec RSS: a fork from the full unittest
+    runner can exceed the benign target's budget before the target even starts.
+    Keep the real measurement and the existing thresholds, but isolate the
+    measurement parent from unrelated tests' allocations.
+    """
+    worker = (
+        "import json, sys, startup\n"
+        "request = json.load(sys.stdin)\n"
+        "result = getattr(startup, request['operation'])(request['argv'], **request['kwargs'])\n"
+        "json.dump(result, sys.stdout)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", worker], cwd=HERE,
+        input=json.dumps({"operation": operation, "argv": argv, "kwargs": kwargs}),
+        capture_output=True, text=True,
+        timeout=kwargs.get("timeout", 60) * (kwargs.get("n", 1) * 2 + 1) + 30,
+        check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def measure_rss(argv, timeout):
+    return isolated_measurement("measure_once", argv, timeout=timeout)
+
+
 def zombie_child_pids():
     """Pids of this process' children currently in the zombie state."""
     out = subprocess.run([PS, "-o", "pid=,ppid=,stat="],
@@ -142,8 +170,8 @@ def _nested_hog_purge_cmd(alloc_mb=128):
 class ExactChildRssTests(unittest.TestCase):
     def test_reported_rss_tracks_the_targets_own_allocation(self):
         """The value is a real measurement of this child, not a constant."""
-        big = startup.measure_once(HOG, timeout=60)
-        small = startup.measure_once(BENIGN, timeout=60)
+        big = measure_rss(HOG, timeout=60)
+        small = measure_rss(BENIGN, timeout=60)
         self.assertEqual(big["outcome"], "ok", big)
         self.assertEqual(small["outcome"], "ok", small)
         self.assertIsInstance(big["max_rss"], int)
@@ -155,8 +183,8 @@ class ExactChildRssTests(unittest.TestCase):
 
     def test_repeated_launches_of_one_target_report_comparable_rss(self):
         """Each launch is attributed separately; a stale mark would drift."""
-        first = startup.measure_once(BENIGN, timeout=60)
-        second = startup.measure_once(BENIGN, timeout=60)
+        first = measure_rss(BENIGN, timeout=60)
+        second = measure_rss(BENIGN, timeout=60)
         self.assertEqual(first["outcome"], "ok", first)
         self.assertEqual(second["outcome"], "ok", second)
         for sample in (first, second):
@@ -166,8 +194,8 @@ class ExactChildRssTests(unittest.TestCase):
 
     def test_summary_max_rss_is_the_largest_successful_child_value(self):
         """Exactly the biggest child's own number: not summed, not accumulated."""
-        hog = startup.measure_once(HOG, timeout=60)
-        small = startup.measure_once(BENIGN, timeout=60)
+        hog = measure_rss(HOG, timeout=60)
+        small = measure_rss(BENIGN, timeout=60)
         self.assertEqual(hog["outcome"], "ok", hog)
         self.assertEqual(small["outcome"], "ok", small)
         stats = startup.summarize_samples([dict(hog, index=0), dict(small, index=1)])
@@ -198,20 +226,29 @@ class ExactChildRssTests(unittest.TestCase):
         self.assertNotIn("unavailable", method)
         self.assertIn("directly waited", method)
 
+    def test_benign_target_budget_is_independent_of_test_runner_memory(self):
+        # Reproduce a large discovery process without weakening the RSS budget.
+        allocation = bytearray(BIG_ALLOC * MiB)
+        sample = measure_rss(BENIGN, timeout=60)
+        self.assertEqual(sample["outcome"], "ok", sample)
+        self.assertLess(rss_bytes(sample["max_rss"]), UPPER_BOUND_RSS, sample)
+        self.assertEqual(len(allocation), BIG_ALLOC * MiB)
+
 
 @unittest.skipUnless(POSIX_WAIT4 and NEEDS_RSS and POSIX_SHELL,
                      "purge attribution needs a POSIX shell and os.wait4")
 class PurgeHelperRssTests(unittest.TestCase):
     def test_hogging_purge_helper_before_every_sample_leaves_target_rss_small(self):
         cmd = _hog_purge_cmd()
-        samples = startup.run_batch(BENIGN, 3, timeout=60, purge_cmd=cmd)
+        samples = isolated_measurement("run_batch", BENIGN, n=3, timeout=60, purge_cmd=cmd)
         self.assertEqual([s["outcome"] for s in samples], ["ok"] * 3, samples)
         for index, sample in enumerate(samples):
             self.assertLess(rss_bytes(sample["max_rss"]), UPPER_BOUND_RSS,
                             f"sample {index} absorbed the purge helper's RSS: {sample}")
 
     def test_purge_helper_with_its_own_hogging_descendant_is_not_attributed(self):
-        samples = startup.run_batch(BENIGN, 1, timeout=60, purge_cmd=_nested_hog_purge_cmd())
+        samples = isolated_measurement("run_batch", BENIGN, n=1, timeout=60,
+                                       purge_cmd=_nested_hog_purge_cmd())
         self.assertEqual(samples[0]["outcome"], "ok", samples[0])
         self.assertLess(rss_bytes(samples[0]["max_rss"]), UPPER_BOUND_RSS, samples[0])
 
@@ -269,10 +306,10 @@ class SuccessfulSampleRssSummaryTests(unittest.TestCase):
                          "measured exclusion needs os.wait4 with a known unit")
     def test_measured_nonzero_and_timeout_targets_are_excluded_from_the_summary(self):
         failed = [
-            startup.measure_once(NONZERO_HOG, timeout=60),
-            startup.measure_once(TIMEOUT_HOG, timeout=1.0),
+            measure_rss(NONZERO_HOG, timeout=60),
+            measure_rss(TIMEOUT_HOG, timeout=1.0),
         ]
-        good = startup.measure_once(BENIGN, timeout=60)
+        good = measure_rss(BENIGN, timeout=60)
         self.assertEqual([s["outcome"] for s in failed], ["nonzero", "timeout"], failed)
         self.assertEqual(good["outcome"], "ok", good)
         # The discarded samples really did carry RSS evidence, so the summary
