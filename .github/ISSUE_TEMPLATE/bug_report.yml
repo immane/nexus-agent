@@ -1,0 +1,74 @@
+name: Bug report
+description: Report a reproducible defect in Nexus Agent.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report behavior that differs from the documented/current implementation.
+        **Never include API keys, credentials, private source, or unredacted personal data.**
+  - type: input
+    id: summary
+    attributes:
+      label: What happened?
+      description: A concise description of the defect.
+      placeholder: The TUI exits after...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Nexus Agent version or commit
+      description: The version shown by `:help`, or the Git commit being tested.
+      placeholder: 0.1.1-alpha / 0123abc
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Relevant environment
+      description: Terminal, Rust/toolchain details, provider/model (omit account identifiers), and whether this is the scripted or live-provider path.
+      render: text
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Smallest sequence of inputs or commands that reproduces the issue.
+      placeholder: |
+        1. Start nexus-tui with...
+        2. Enter...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted diagnostics
+      description: Include relevant error text or logs after removing secrets and private data.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked existing issues and the documented project status.
+          required: true
+        - label: I removed credentials, tokens, and private data from this report.
+          required: true

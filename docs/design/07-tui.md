@@ -31,6 +31,11 @@ Enter or Tab inserts the selected completion, and a subsequent Enter executes
 the command. Esc first closes the popup without moving focus. `@` path
 completion is display/insertion only and does not read or attach file content.
 
+Interactive TUI runtimes allow up to 64 model turns per run to accommodate
+coding workflows with inspect/edit/check and recovery cycles. Other finite
+M0-test resource limits remain unchanged; this is a TUI-specific override,
+not a change to the shared runtime or headless defaults.
+
 ## Approvals
 
 Project-scoped reads/searches are automatic only when host policy permits them. Every model-directed file mutation and command execution requires confirmation under the default policy.

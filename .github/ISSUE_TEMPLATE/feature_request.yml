@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a user-facing capability or workflow improvement.
+title: "feature: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first. Nexus Agent is still test-only; proposals should respect its runtime, policy, and resource-limit boundaries.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Who needs this, and what are they unable to do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the desired user-visible behavior without prescribing unnecessary internals.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and trade-offs
+      description: Existing workarounds, safety considerations, or simpler alternatives.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - TUI / accessibility
+        - Coding tools
+        - Model/provider integration
+        - Headless usage
+        - Configuration
+        - Sessions / persistence
+        - Documentation
+        - Other
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the README, project status, and existing issues.
+          required: true
+        - label: This proposal does not assume that draft designs are implemented features.
+          required: true

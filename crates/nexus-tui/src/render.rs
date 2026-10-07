@@ -479,10 +479,13 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
 }
 
 /// Centered modal dialog, painted last so it sits above every region.
-/// Only the model picker exists today; the geometry clamps to the frame
-/// so narrow or short terminals clip the list instead of overflowing.
+/// Dialog geometry clamps to the frame on narrow or short terminals.
 fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     if !state.overlay_open() {
+        return;
+    }
+    if state.help_open() {
+        render_help_dialog(state, area, buf);
         return;
     }
     let matches = state.picker_matches();
@@ -559,6 +562,192 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
         )]));
     }
     Paragraph::new(rows).render(inner, buf);
+}
+
+fn help_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(" {title} "),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn help_row(label: &str, description: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {label:<28}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(description.to_owned(), Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// One help surface for the full command set, keyboard reference, and the
+/// runtime/build context useful when reporting issues.
+fn help_lines(state: &AppState) -> Vec<Line<'static>> {
+    let model = state.active_model().unwrap_or("not selected");
+    let session = state.session_label().unwrap_or("default");
+    let mut lines = vec![help_section("NEXUS AGENT")];
+    lines.push(help_row(
+        "Version",
+        &format!(
+            "nexus-tui {} · M0 test-only build",
+            env!("CARGO_PKG_VERSION")
+        ),
+    ));
+    lines.push(help_row(
+        "Platform",
+        &format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
+    ));
+    lines.push(help_row("Terminal UI", "Ratatui 0.26.3 · Crossterm 0.27.0"));
+    lines.push(help_row(
+        "Runtime",
+        "M0-test resource policy · ephemeral sessions",
+    ));
+    lines.push(help_row("Model", model));
+    lines.push(help_row("Session", session));
+    lines.push(Line::default());
+
+    lines.push(help_section("DESKTOP COMMANDS  ·  type : then Enter"));
+    lines.push(help_row(
+        ":help",
+        "Open this command, shortcut, and version guide",
+    ));
+    lines.push(help_row(
+        ":m  ·  :model",
+        "Open the configured model picker",
+    ));
+    lines.push(help_row(":m <id>", "Select the exact configured model ID"));
+    lines.push(help_row(
+        ":model <id>",
+        "Select the exact configured model ID",
+    ));
+    lines.push(help_row(
+        ":model set <id>",
+        "Select an exact configured model ID",
+    ));
+    lines.push(help_row(":usage", "Show the last observed token usage"));
+    lines.push(help_row(":s", "List local sessions"));
+    lines.push(help_row(":session", "Show the active session"));
+    lines.push(help_row(
+        ":session new",
+        "Create and switch to a new session",
+    ));
+    lines.push(help_row(":session list", "List local sessions"));
+    lines.push(help_row(
+        ":session switch <target>",
+        "Switch by index, label, or ID",
+    ));
+    lines.push(help_row(
+        ":session help  ·  usage",
+        "Show session command usage",
+    ));
+    lines.push(help_row(":q  ·  :quit", "Exit Nexus Agent"));
+    lines.push(Line::default());
+
+    lines.push(help_section("COMPOSER"));
+    lines.push(help_row("Enter", "Submit the task"));
+    lines.push(help_row("Ctrl+J / Alt+Enter", "Insert a newline"));
+    lines.push(help_row("Left / Right", "Move the text caret"));
+    lines.push(help_row(
+        "Up / Down",
+        "Recall previous / next submitted draft",
+    ));
+    lines.push(help_row("Tab", "Cycle agent mode (plan / build / custom)"));
+    lines.push(help_row("Esc", "Step focus back one level"));
+    lines.push(help_row(
+        "@<path>",
+        "Suggest a project path; inserts a reference only",
+    ));
+    lines.push(Line::default());
+
+    lines.push(help_section("CONVERSATION VIEWPORT"));
+    lines.push(help_row(
+        "j / k  ·  ↑ / ↓",
+        "Move through conversation entries",
+    ));
+    lines.push(help_row(
+        "gg / G",
+        "Jump to oldest / newest conversation content",
+    ));
+    lines.push(help_row("H / M / L", "Jump to top / middle / bottom"));
+    lines.push(help_row("Ctrl+F / Ctrl+B", "Scroll one page down / up"));
+    lines.push(help_row("Ctrl+D / Ctrl+U", "Scroll half a page down / up"));
+    lines.push(help_row("PageUp / PageDown", "Scroll one page up / down"));
+    lines.push(help_row("i / o", "Edit draft / open a fresh composer line"));
+    lines.push(help_row(
+        "m  ·  Ctrl+T",
+        "Cycle model / cycle model variant",
+    ));
+    lines.push(help_row(":", "Open the editable desktop command line"));
+    lines.push(help_row(
+        "Tab / Esc",
+        "Change focus / park focus in viewport",
+    ));
+    lines.push(Line::default());
+
+    lines.push(help_section("APPROVALS & CANCEL"));
+    lines.push(help_row(
+        "a / d",
+        "Approve once / deny the selected operation",
+    ));
+    lines.push(help_row("i", "Inspect full approval details"));
+    lines.push(help_row(
+        "Ctrl+C",
+        "Clear draft, else cancel run, else quit",
+    ));
+    lines.push(help_row("q", "Ordinary input; does not quit"));
+    lines.push(Line::default());
+    lines.push(help_row(
+        "Help dialog",
+        "↑ / ↓ or j / k scroll · PgUp / PgDn page · Esc close",
+    ));
+    lines
+}
+
+fn render_help_dialog(state: &AppState, area: Rect, buf: &mut Buffer) {
+    if area.width < 12 || area.height < 5 {
+        return;
+    }
+    let width = area.width.saturating_sub(4).min(88);
+    let height = area.height.saturating_sub(2).min(30);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    Clear.render(popup, buf);
+    for y in popup.top()..popup.bottom() {
+        for x in popup.left()..popup.right() {
+            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .title(format!(
+            " Nexus Agent · Help · v{} ",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .title_bottom(" ↑↓ / j k scroll · PgUp / PgDn page · Enter / Esc close ");
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    if inner.is_empty() {
+        return;
+    }
+    let content = help_lines(state);
+    let visible: Vec<Line<'static>> = content
+        .into_iter()
+        .skip(state.help_scroll())
+        .take(inner.height as usize)
+        .collect();
+    Paragraph::new(visible)
+        .style(Style::default().bg(Color::Black))
+        .render(inner, buf);
 }
 
 fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
@@ -2676,6 +2865,54 @@ mod cov_render_private {
         assert!(
             rows.iter().any(|row| row.contains("▸")),
             "the cursor names its row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn help_dialog_lists_commands_shortcuts_versions_and_scrolls() {
+        let mut state = AppState::new();
+        state.set_active_model(
+            Some("example-model".to_owned()),
+            Some("example-provider".to_owned()),
+        );
+        state.open_help();
+        let area = Rect::new(0, 0, 100, 32);
+        let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Nexus Agent") && row.contains("Help")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(env!("CARGO_PKG_VERSION"))),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains(":session switch")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Ctrl+J / Alt+Enter")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("example-model")),
+            "active model is included: {rows:?}"
+        );
+        state.scroll_help(18);
+        let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
+        assert!(
+            rows.iter().any(|row| row.contains("CONVERSATION VIEWPORT")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("Ctrl+F / Ctrl+B")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("APPROVALS & CANCEL")),
+            "{rows:?}"
         );
     }
 

@@ -819,6 +819,14 @@ impl ModelPicker {
 pub enum Overlay {
     /// Searchable configured-model list opened by bare `:model`.
     ModelPicker(ModelPicker),
+    /// Scrollable keyboard and command reference.
+    Help(HelpDialog),
+}
+
+/// Transient scroll position for the help dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpDialog {
+    scroll: usize,
 }
 
 /// A command or file completion row. `insert` is kept separate from its
@@ -1962,6 +1970,39 @@ impl AppState {
         }));
     }
 
+    /// Opens the unified help dialog without adding a transcript entry.
+    pub fn open_help(&mut self) {
+        self.command_line = None;
+        self.clear_completions();
+        self.overlay = Some(Overlay::Help(HelpDialog { scroll: 0 }));
+    }
+
+    /// Whether the help dialog owns keyboard focus.
+    #[must_use]
+    pub fn help_open(&self) -> bool {
+        matches!(self.overlay.as_ref(), Some(Overlay::Help(_)))
+    }
+
+    /// Current help content scroll offset.
+    #[must_use]
+    pub fn help_scroll(&self) -> usize {
+        match &self.overlay {
+            Some(Overlay::Help(help)) => help.scroll,
+            _ => 0,
+        }
+    }
+
+    /// Scrolls the help content while keeping the offset bounded.
+    pub fn scroll_help(&mut self, lines: isize) {
+        if let Some(Overlay::Help(help)) = &mut self.overlay {
+            help.scroll = if lines < 0 {
+                help.scroll.saturating_sub(lines.unsigned_abs())
+            } else {
+                help.scroll.saturating_add(lines as usize).min(64)
+            };
+        }
+    }
+
     /// Closes any open dialog without applying it.
     pub fn dismiss_overlay(&mut self) {
         self.overlay = None;
@@ -2141,6 +2182,7 @@ impl AppState {
     pub fn picker_filter(&self) -> &str {
         match &self.overlay {
             Some(Overlay::ModelPicker(picker)) => &picker.filter,
+            Some(Overlay::Help(_)) => "",
             None => "",
         }
     }
@@ -2150,6 +2192,7 @@ impl AppState {
     pub fn picker_selected(&self) -> usize {
         match &self.overlay {
             Some(Overlay::ModelPicker(picker)) => picker.selected,
+            Some(Overlay::Help(_)) => 0,
             None => 0,
         }
     }
@@ -2161,6 +2204,7 @@ impl AppState {
     pub fn picker_matches(&self) -> Vec<usize> {
         let picker = match &self.overlay {
             Some(Overlay::ModelPicker(picker)) => picker,
+            Some(Overlay::Help(_)) => return Vec::new(),
             None => return Vec::new(),
         };
         self.model_choices

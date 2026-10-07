@@ -83,13 +83,22 @@ const MAX_KEYS_PER_TICK: usize = 32;
 /// skipped as explicitly counted presentation gaps, never reordered.
 const MAX_REORDER_EVENTS: usize = 256;
 const DEMO_SESSION: &str = "sess-tui-m0-test";
+/// The M0 fixture default is intentionally small, but interactive coding
+/// runs need room for inspect/edit/check/retry cycles.
+const TUI_MODEL_TURNS_PER_RUN: u32 = 64;
+
+fn tui_runtime_limits() -> Limits {
+    let mut limits = Limits::m0_test();
+    limits.max_model_turns_per_run = TUI_MODEL_TURNS_PER_RUN;
+    limits
+}
 
 /// Fallible production composition: the runtime validates limits, provider
 /// capabilities, and every tool registration before any run can start, so an
 /// invalid demo wiring is an explicit startup error, never a hung run.
 fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
     let config = RuntimeConfig {
-        limits: Limits::m0_test(),
+        limits: tui_runtime_limits(),
         policy: Policy::m0_test(),
         has_approval_handler: true,
     };
@@ -620,7 +629,7 @@ fn build_live_runtime(
     session_config: &SessionConfig,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let config = RuntimeConfig {
-        limits: Limits::m0_test(),
+        limits: tui_runtime_limits(),
         policy: match &session_config.tools_root {
             Some(root) if !session_config.strict_tools => {
                 Policy::development(root).map_err(io::Error::other)?
@@ -1163,16 +1172,14 @@ impl Frontend {
             ("session".into(), "Show or manage local sessions".into()),
             ("s".into(), "List sessions".into()),
             ("q".into(), "Quit the TUI".into()),
+            ("quit".into(), "Quit the TUI".into()),
         ];
         if input.starts_with("model ") {
             candidates.clear();
-            candidates.extend([
-                (
-                    "model set ".into(),
-                    "Set an exact configured model ID".into(),
-                ),
-                ("model help".into(), "Show model command usage".into()),
-            ]);
+            candidates.push((
+                "model set ".into(),
+                "Set an exact configured model ID".into(),
+            ));
             if let Some(prefix) = input.strip_prefix("model set ") {
                 candidates.extend(
                     self.config
@@ -1205,6 +1212,8 @@ impl Frontend {
                     "session switch ".into(),
                     "Switch to a session by index or ID".into(),
                 ),
+                ("session help".into(), "Show session command usage".into()),
+                ("session usage".into(), "Show session command usage".into()),
             ];
         }
         candidates.retain(|(candidate, _)| candidate.starts_with(input));
@@ -1903,14 +1912,14 @@ async fn handle_key_batch(
 }
 
 /// Executes a local desktop command. Returns true only when the loop must
-/// exit (`/quit`); everything else answers inline and keeps the session
+/// exit (`:quit`); everything else answers inline or opens a dialog and keeps the session
 /// alive. Model switches reuse the same admission-order selection as the
 /// `m` key, so both paths always agree on what is active. Session commands
 /// borrow the registry; every other command answers on the active front.
 fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
     match command {
         SlashCommand::Help => {
-            front.state.notice(SlashCommand::help_text());
+            front.state.open_help();
             false
         }
         SlashCommand::Model(None) => {
@@ -2076,6 +2085,17 @@ fn handle_overlay_key(front: &mut Frontend, key: KeyEvent) -> bool {
         return false;
     }
     if !key.modifiers.is_empty() {
+        return false;
+    }
+    if front.state.help_open() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => front.state.dismiss_overlay(),
+            KeyCode::Up | KeyCode::Char('k') => front.state.scroll_help(-1),
+            KeyCode::Down | KeyCode::Char('j') => front.state.scroll_help(1),
+            KeyCode::PageUp => front.state.scroll_help(-10),
+            KeyCode::PageDown => front.state.scroll_help(10),
+            _ => {}
+        }
         return false;
     }
     match key.code {
@@ -2259,8 +2279,14 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             crossterm::event::KeyCode::Tab => front.accept_completion(),
             crossterm::event::KeyCode::Enter => {
                 if !front.state.completions().is_empty() {
-                    front.accept_completion();
-                    return false;
+                    let command_is_complete =
+                        front.state.selected_completion().is_some_and(|candidate| {
+                            Some(candidate.insert.as_str()) == front.state.command_line()
+                        });
+                    if !command_is_complete {
+                        front.accept_completion();
+                        return false;
+                    }
                 }
                 let command = front.state.take_command_line().unwrap_or_default();
                 let input = format!(":{command}");
@@ -4166,6 +4192,23 @@ mod cov_main_topup {
     use ratatui::layout::Rect;
     use ratatui::{TerminalOptions, Viewport};
 
+    #[test]
+    fn interactive_runtime_raises_only_the_model_turn_budget_to_64() {
+        let limits = tui_runtime_limits();
+        assert_eq!(limits.max_model_turns_per_run, 64);
+        assert_eq!(
+            limits.max_tool_calls_per_run,
+            Limits::M0_TEST_TOOL_CALLS_PER_RUN
+        );
+        assert_eq!(
+            limits.run_duration,
+            Duration::from_secs(Limits::M0_TEST_RUN_DURATION_SECS)
+        );
+        limits
+            .validate()
+            .expect("interactive limits remain finite and valid");
+    }
+
     fn session() -> SessionId {
         SessionId::new("sess-topup").expect("valid")
     }
@@ -6015,6 +6058,7 @@ mod cov_main_topup {
         front.focus = Focus::Viewport;
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(':'))).await);
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('m'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('o'))).await);
         assert!(
             front
                 .state
@@ -6024,7 +6068,7 @@ mod cov_main_topup {
         );
         assert!(!front.state.overlay_open(), "typing only shows suggestions");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
-        assert_eq!(front.state.command_line(), Some("m"));
+        assert_eq!(front.state.command_line(), Some("model"));
         assert!(!front.state.overlay_open(), "first Enter only completes");
         assert_eq!(front.focus, Focus::Viewport);
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
@@ -6041,6 +6085,31 @@ mod cov_main_topup {
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
         assert!(front.state.completions().is_empty());
         assert!(front.state.colon_pending());
+        assert_eq!(front.focus, Focus::Viewport);
+    }
+
+    #[tokio::test]
+    async fn help_command_opens_modal_and_escape_closes_it_without_transcript_text() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.focus = Focus::Viewport;
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(':'))).await);
+        for ch in "help".chars() {
+            assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(ch))).await);
+        }
+        let transcript_before = front.state.transcript().len();
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(front.state.help_open());
+        assert_eq!(front.state.transcript().len(), transcript_before);
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('j'))).await);
+        assert!(
+            front.state.help_open(),
+            "modal navigation stays in the dialog"
+        );
+        assert_eq!(front.state.composer(), "", "keys cannot reach the composer");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert!(!front.state.overlay_open());
         assert_eq!(front.focus, Focus::Viewport);
     }
 

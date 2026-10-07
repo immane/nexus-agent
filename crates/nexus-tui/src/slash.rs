@@ -111,16 +111,17 @@ impl SlashCommand {
         Some(command)
     }
 
-    /// Short help listing, rendered as one transcript notice.
+    /// Short textual command index; interactive help uses the scrollable UI
+    /// dialog and includes additional runtime/build context.
     #[must_use]
     pub fn help_text() -> &'static str {
-        ":help — list commands\n\
-         :m — open the model picker\n\
-         :model set <id> — select an exact configured model\n\
+        ":help — open the help dialog\n\
+         :m, :model — open the model picker\n\
+         :m <id>, :model <id>, :model set <id> — select an exact configured model\n\
          :usage — show observed input/output tokens\n\
-         :session [new|list|switch] — manage conversation sessions\n\
-         :q — leave the TUI\n\
-         desktop: press : to enter a command, Tab to complete, Enter to execute · composer: @path inserts a project reference only · i/o edit · q does not quit · Esc home · Ctrl+C clears the composer, then cancels a live run, then quits"
+         :s — list sessions; :session [new|list|switch <target>|help] — manage sessions\n\
+         :q, :quit — leave the TUI\n\
+         Type : then Enter to open commands; Enter executes. @path suggestions insert a reference only."
     }
 }
 

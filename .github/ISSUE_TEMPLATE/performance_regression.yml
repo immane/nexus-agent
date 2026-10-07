@@ -1,0 +1,58 @@
+name: Performance regression
+description: Report a reproducible slowdown or resource-usage regression.
+title: "perf: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Comparable measurements help distinguish a regression from build-cache, terminal, or provider variability. Do not attach credentials or private project data.
+  - type: input
+    id: version
+    attributes:
+      label: Affected version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload and reproduction steps
+      description: Include the command, terminal dimensions, project scale, and whether the provider/tools were scripted or live.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements
+      description: Before/after values, units, repetitions, cache state, and measurement method (startup, redraw, CPU, RSS, etc.).
+      placeholder: |
+        Before:
+        After:
+        Measurement method:
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Relevant diagnostics
+      description: Add redacted logs or profiler summaries. Do not include secrets or private source.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I compared the same workload and measurement method.
+          required: true
+        - label: I removed credentials, tokens, and private data.
+          required: true
