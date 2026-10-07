@@ -37,8 +37,8 @@ Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 | Priority | Direction |
 | --- | --- |
-| **Fast startup** | Target at most **100 ms** to become locally interactive in the first release, then keep reducing it. |
-| **Small footprint** | Minimize executable size, memory, idle CPU, and background work using measured baselines. |
+| **Fast startup** | Target at most **100 ms** to become locally interactive in the first release, and keep reducing startup time. |
+| **Small footprint** | Keep reducing executable size, memory, idle CPU, and background work using measured baselines. |
 | **Clear boundaries** | Separate domain logic, execution, integrations, and presentation. |
 | **Broad model coverage** | Adapt mainstream protocols without requiring a different SDK for every vendor. |
 | **Explicit extensibility** | Support direct Rust tools and cross-language external plugins through narrow contracts. |
@@ -46,6 +46,18 @@ Developer checks and optional low-value tests: [Testing](docs/testing.md).
 | **Linux and macOS first** | Treat both as first-release acceptance platforms; defer Windows. |
 
 The startup target includes local configuration and interface initialization, but not model responses or optional plugin readiness. It is a goal for documented reference environments, **not a measured result or a guarantee on arbitrary hardware**. See the [performance design](docs/design/05-performance.md).
+
+### Current executable sizes
+
+Measured from the optimized, unstripped Cargo release binaries built on **macOS arm64** for this checkout (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`):
+
+| Executable | File size |
+| --- | ---: |
+| `nexus-headless` | 1,674,336 bytes (1.60 MiB) |
+| `nexus-tui` | 3,480,752 bytes (3.32 MiB) |
+| Both binaries | 5,155,088 bytes (4.92 MiB) |
+
+These are platform- and build-profile-specific file sizes, not compressed download sizes or cross-platform guarantees. We will continue working to keep Nexus Agent lightweight and fast; the 100 ms first-interactive startup target remains a goal, and measurements for it are still pending.
 
 ## Architecture
 
