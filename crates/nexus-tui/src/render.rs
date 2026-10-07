@@ -1364,7 +1364,7 @@ mod tests {
                 "no stale draft cells at {width}x{height}: {rows:?}"
             );
             assert!(
-                rows[height as usize - 1].contains("v0.1.1-alpha"),
+                rows[height as usize - 1].contains(concat!("v", env!("CARGO_PKG_VERSION"))),
                 "footer pinned last at {width}x{height}: {rows:?}"
             );
         }
@@ -1696,7 +1696,10 @@ mod tests {
         let frame = screen(&terminal);
         assert!(frame.contains("nexus-tui"), "header present");
         assert!(frame.contains("composer (fixed)"), "fixed composer present");
-        assert!(frame.contains("v0.1.1-alpha"), "footer present");
+        assert!(
+            frame.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "footer present"
+        );
         assert!(frame.contains("no run"), "accurate not-ready state");
     }
 
@@ -1726,7 +1729,10 @@ mod tests {
             state.approval_decision_allowed(),
             "fully visible card may be decided"
         );
-        assert!(frame.contains("v0.1.1-alpha"), "footer remains present");
+        assert!(
+            frame.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "footer remains present"
+        );
     }
 
     #[test]
@@ -1734,12 +1740,12 @@ mod tests {
         let (mut state, mut terminal) = harness(120, 24);
         started(&mut state, 0);
         draw(&mut state, &mut terminal, Focus::ApprovalCard);
-        assert!(screen(&terminal).contains("v0.1.1-alpha"));
+        assert!(screen(&terminal).contains(concat!("v", env!("CARGO_PKG_VERSION"))));
         assert!(state.apply_event(&approval_event(1, "run tool host_write", "project scope")));
         draw(&mut state, &mut terminal, Focus::ApprovalCard);
         let compact = screen(&terminal);
         assert!(
-            compact.contains("v0.1.1-alpha"),
+            compact.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
             "minimal footer stays visible"
         );
         state.inspect_approval();
@@ -1795,7 +1801,10 @@ mod tests {
             "clipped card cannot be approved"
         );
         assert!(frame.contains("detail clipped"), "clip is explicit");
-        assert!(frame.contains("v0.1.1-alpha"), "footer remains visible");
+        assert!(
+            frame.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "footer remains visible"
+        );
         assert!(
             !frame.contains("[a] allow once"),
             "no decision affordance on a clipped card"
@@ -2596,7 +2605,10 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(header.contains("nexus-tui"), "{header:?}");
-        assert!(header.contains("v0.1.1-alpha"), "{header:?}");
+        assert!(
+            header.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "{header:?}"
+        );
         assert!(header.contains("run:no run"), "{header:?}");
         assert!(header.contains("idle"), "{header:?}");
         assert!(!header.contains("focus:"), "{header:?}");
@@ -2619,21 +2631,32 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.contains(" v0.1.1-alpha "), "{footer:?}");
+        assert!(
+            footer.contains(format!(" {} ", concat!("v", env!("CARGO_PKG_VERSION"))).as_str()),
+            "{footer:?}"
+        );
         assert!(footer.contains("idle"), "{footer:?}");
         assert!(
             !footer.contains("ctrl+c cancel"),
             "an idle run offers no cancel: {footer:?}"
         );
         assert!(!footer.contains("[i]"), "{footer:?}");
-        assert_eq!(footer.trim_start(), "v0.1.1-alpha idle", "{footer:?}");
+        assert_eq!(
+            footer.trim_start(),
+            format!("{} idle", concat!("v", env!("CARGO_PKG_VERSION"))),
+            "{footer:?}"
+        );
 
         assert!(state.apply_event(&started(0)));
         let footer = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert_eq!(footer.trim_start(), "v0.1.1-alpha running", "{footer:?}");
+        assert_eq!(
+            footer.trim_start(),
+            format!("{} running", concat!("v", env!("CARGO_PKG_VERSION"))),
+            "{footer:?}"
+        );
 
         assert!(state.apply_event(&approval(1, "run tool host_write", "project scope")));
         let footer = rows_of(area, |buf| {
@@ -2671,10 +2694,13 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(armed.trim_start().starts_with(":▊"), "{armed:?}");
-        assert!(armed.trim_end().ends_with("v0.1.1-alpha idle"), "{armed:?}");
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
         assert!(
-            armed.find(":▊").expect("left command")
-                < armed.find("v0.1.1-alpha").expect("right status"),
+            armed.trim_end().ends_with(&format!("{version} idle")),
+            "{armed:?}"
+        );
+        assert!(
+            armed.find(":▊").expect("left command") < armed.find(version).expect("right status"),
             "command precedes version/status: {armed:?}"
         );
     }

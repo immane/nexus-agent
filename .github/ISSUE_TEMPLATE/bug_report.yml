@@ -20,7 +20,7 @@ body:
     attributes:
       label: Nexus Agent version or commit
       description: The version shown by `:help`, or the Git commit being tested.
-      placeholder: 0.1.1-alpha / 0123abc
+      placeholder: Version shown by :help / 0123abc
     validations:
       required: true
   - type: dropdown

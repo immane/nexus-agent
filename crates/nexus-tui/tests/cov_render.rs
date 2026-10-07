@@ -199,7 +199,10 @@ fn too_small_frames_get_one_notice_instead_of_a_clipped_layout() {
     // The notice names the app, so the header is identified by the state it
     // reports rather than by the product name, which the notice shares.
     assert!(!screen.contains("composer"), "{screen:?}");
-    assert!(!screen.contains("v0.1.1-alpha"), "{screen:?}");
+    assert!(
+        !screen.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+        "{screen:?}"
+    );
     assert!(!screen.contains("run:"), "{screen:?}");
     assert!(!screen.contains("focus:"), "{screen:?}");
 
@@ -218,7 +221,7 @@ fn too_small_frames_get_one_notice_instead_of_a_clipped_layout() {
         let screen = joined(&rows);
         assert!(!screen.contains("composer"), "{width}x{height}: {screen:?}");
         assert!(
-            !screen.contains("v0.1.1-alpha"),
+            !screen.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
             "{width}x{height}: {screen:?}"
         );
         assert!(!screen.contains("run:"), "{width}x{height}: {screen:?}");
@@ -241,7 +244,7 @@ fn too_small_frames_get_one_notice_instead_of_a_clipped_layout() {
         let screen = joined(&rows);
         assert!(screen.contains("composer"), "{width}x{height}: {screen:?}");
         assert!(
-            screen.contains("v0.1.1-alpha"),
+            screen.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
             "{width}x{height}: {screen:?}"
         );
         assert!(
@@ -273,7 +276,7 @@ fn composer_and_footer_survive_every_focus_and_the_smallest_frame() {
                 "{width}x{height} {focus:?}: composer missing: {screen:?}"
             );
             assert!(
-                screen.contains("v0.1.1-alpha"),
+                screen.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
                 "{width}x{height} {focus:?}: footer missing: {screen:?}"
             );
             assert!(
@@ -326,7 +329,7 @@ fn the_composer_body_is_clamped_and_never_pushes_the_footer_off_frame() {
         "the composer is clamped to five body rows plus its borders"
     );
     assert!(
-        rows[23].contains("v0.1.1-alpha"),
+        rows[23].contains(concat!("v", env!("CARGO_PKG_VERSION"))),
         "the footer stays the last row: {rows:?}"
     );
 }
@@ -353,11 +356,11 @@ fn a_pending_approval_cannot_starve_the_composer_or_the_footer() {
                 "{width}x{height} {focus:?}: card starved the composer: {screen:?}"
             );
             assert!(
-                screen.contains("v0.1.1-alpha"),
+                screen.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
                 "{width}x{height} {focus:?}: card starved the footer: {screen:?}"
             );
             assert!(
-                rows[height as usize - 1].contains("v0.1.1-alpha"),
+                rows[height as usize - 1].contains(concat!("v", env!("CARGO_PKG_VERSION"))),
                 "{width}x{height} {focus:?}: footer must stay the last row: {rows:?}"
             );
             let composer_row = row_holding(&rows, "composer (fixed)").expect("composer block row");

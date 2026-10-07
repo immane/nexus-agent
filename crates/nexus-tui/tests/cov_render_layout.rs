@@ -467,7 +467,11 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
         !footer.contains("pgup/pgdn"),
         "no card, no page hint: {footer}"
     );
-    assert_eq!(footer.trim_start(), "v0.1.1-alpha running", "{footer}");
+    assert_eq!(
+        footer.trim_start(),
+        format!("{} running", concat!("v", env!("CARGO_PKG_VERSION"))),
+        "{footer}"
+    );
 
     assert!(state.apply_event(&approval_event(
         1,
@@ -479,7 +483,10 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     let footer = footer_row(&frame_rows(&terminal)).to_owned();
     assert_eq!(
         footer.trim_start(),
-        "v0.1.1-alpha awaiting approval",
+        format!(
+            "{} awaiting approval",
+            concat!("v", env!("CARGO_PKG_VERSION"))
+        ),
         "{footer}"
     );
     assert!(
@@ -492,7 +499,10 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     let footer = footer_row(&frame_rows(&terminal)).to_owned();
     assert_eq!(
         footer.trim_start(),
-        "v0.1.1-alpha awaiting approval",
+        format!(
+            "{} awaiting approval",
+            concat!("v", env!("CARGO_PKG_VERSION"))
+        ),
         "{footer}"
     );
 
@@ -500,7 +510,10 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     draw(&mut state, &mut terminal, Focus::ApprovalCard);
     assert_eq!(
         footer_row(&frame_rows(&terminal)).trim_start(),
-        "v0.1.1-alpha awaiting approval"
+        format!(
+            "{} awaiting approval",
+            concat!("v", env!("CARGO_PKG_VERSION"))
+        )
     );
 
     state.resolve_approval();
