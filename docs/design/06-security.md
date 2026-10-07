@@ -60,6 +60,8 @@ The opt-in real-files tools mode registers `host_exec`; its mandatory backend mu
 
 The current executor bounds captured stdout/stderr, checks cancellation and deadlines while polling, and terminates/waits for the sandbox process group. Linux additionally uses a PID namespace and `--die-with-parent`; effects after cancellation or timeout remain `Unknown`, since termination does not establish rollback. Deliberately detached descendants and sandbox escapes are not claimed to be contained. Backend installation/availability is not proof against every OS sandbox escape. Linux `bwrap` behavior must be adversarially validated on a supported Linux host before claiming Linux isolation; unsupported or missing backends fail closed.
 
+On macOS the system `/usr/bin/sandbox-exec` is located independently of PATH. The profile permits reading the root directory itself with `(literal "/")`, needed for process startup; it does not grant recursive root access with `(subpath "/")`. Startup probing uses the same cleared environment and working directory as execution. Denials distinguish a missing backend program, a program that could not be launched, and an unsuccessful initialization probe, without exposing raw probe output or falling back to ordinary execution.
+
 ## Required Safety Tests
 
 Test denied and stale approvals, changed tool definitions, malformed calls, output limits, control-sequence handling, scoped file operations, cancellation after effects, and recovery of uncertain operations. Add platform-specific adversarial tests before making isolation claims.

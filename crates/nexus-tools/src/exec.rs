@@ -28,7 +28,26 @@ enum Backend {
     MacOs(PathBuf),
     #[cfg(target_os = "linux")]
     Linux(PathBuf),
-    Unavailable,
+    Unavailable(SandboxFailure),
+}
+
+#[derive(Clone, Copy)]
+enum SandboxFailure {
+    Missing,
+    LaunchFailed,
+    ProbeFailed,
+}
+
+impl SandboxFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Missing => "required exec sandbox program was not found",
+            Self::LaunchFailed => "exec sandbox program was found but could not be started",
+            Self::ProbeFailed => {
+                "exec sandbox program was found but its initialization probe failed"
+            }
+        }
+    }
 }
 
 impl SandboxedExecutor {
@@ -50,16 +69,18 @@ impl SandboxedExecutor {
             backend,
             spec,
         };
-        if !matches!(executor.backend, Backend::Unavailable) {
-            let available = executor
-                .command(&["/usr/bin/true"])
+        if executor.sandbox_available() {
+            let mut probe = executor.command(&["/usr/bin/true"]);
+            configure_environment(&mut probe, &executor.root);
+            match probe
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .is_ok_and(|status| status.success());
-            if !available {
-                executor.backend = Backend::Unavailable;
+            {
+                Ok(status) if status.success() => {}
+                Ok(_) => executor.backend = Backend::Unavailable(SandboxFailure::ProbeFailed),
+                Err(_) => executor.backend = Backend::Unavailable(SandboxFailure::LaunchFailed),
             }
         }
         Ok(executor)
@@ -67,12 +88,12 @@ impl SandboxedExecutor {
 
     #[must_use]
     pub fn sandbox_available(&self) -> bool {
-        !matches!(self.backend, Backend::Unavailable)
+        !matches!(self.backend, Backend::Unavailable(_))
     }
 
     fn run(&self, call: &ToolCall, context: &ToolContext) -> Result<(String, bool), Failure> {
-        if !self.sandbox_available() {
-            return Err(Failure::Unavailable);
+        if let Backend::Unavailable(reason) = self.backend {
+            return Err(Failure::Unavailable(reason));
         }
         context.check_active().map_err(|_| {
             if context.is_cancelled() {
@@ -109,14 +130,8 @@ impl SandboxedExecutor {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        configure_environment(&mut command, &self.root);
         command
-            .current_dir(&self.root)
-            .env_clear()
-            .env(
-                "PATH",
-                "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-            )
-            .env("HOME", "/nonexistent")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -222,9 +237,20 @@ impl SandboxedExecutor {
                     .args(&argv[1..]);
                 command
             }
-            Backend::Unavailable => Command::new("/nonexistent/nexus-sandbox-unavailable"),
+            Backend::Unavailable(_) => unreachable!("unavailable sandboxes never build commands"),
         }
     }
+}
+
+fn configure_environment(command: &mut Command, root: &Path) {
+    command
+        .current_dir(root)
+        .env_clear()
+        .env(
+            "PATH",
+            "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
+        .env("HOME", "/nonexistent");
 }
 
 fn read_bounded(reader: impl Read, limit: usize) -> IoResult<(Vec<u8>, bool)> {
@@ -238,8 +264,10 @@ fn read_bounded(reader: impl Read, limit: usize) -> IoResult<(Vec<u8>, bool)> {
 #[cfg(target_os = "macos")]
 fn mac_profile(root: &Path) -> String {
     let root = sbpl_quote(&root.to_string_lossy());
+    // macOS process startup needs access to the root directory itself.
+    // A literal grants only that directory, not its children (subpath "/").
     format!(
-        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow mach-lookup)\n(allow file-read* (subpath \"/System\"))\n(allow file-read* (subpath \"/usr\"))\n(allow file-read* (subpath \"/bin\"))\n(allow file-read* (subpath \"/sbin\"))\n(allow file-read* (subpath \"/Library\"))\n(allow file-read* (subpath \"/opt/homebrew\"))\n(allow file-read* (subpath \"/usr/local\"))\n(allow file-read* (subpath \"/private/var/db\"))\n(allow file-read* (subpath \"/private/tmp\"))\n(allow file-read* (subpath \"/dev\"))\n(allow file-read* (subpath \"{root}\"))\n(allow file-write* (subpath \"{root}\"))\n"
+        "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow mach-lookup)\n(allow file-read* (literal \"/\"))\n(allow file-read* (subpath \"/System\"))\n(allow file-read* (subpath \"/usr\"))\n(allow file-read* (subpath \"/bin\"))\n(allow file-read* (subpath \"/sbin\"))\n(allow file-read* (subpath \"/Library\"))\n(allow file-read* (subpath \"/opt/homebrew\"))\n(allow file-read* (subpath \"/usr/local\"))\n(allow file-read* (subpath \"/private/var/db\"))\n(allow file-read* (subpath \"/private/tmp\"))\n(allow file-read* (subpath \"/dev\"))\n(allow file-read* (subpath \"{root}\"))\n(allow file-write* (subpath \"{root}\"))\n"
     )
 }
 
@@ -270,11 +298,15 @@ fn terminate_process_group(child: &mut std::process::Child) {
 
 fn find_backend() -> Backend {
     #[cfg(target_os = "macos")]
+    if Path::new("/usr/bin/sandbox-exec").is_file() {
+        return Backend::MacOs(PathBuf::from("/usr/bin/sandbox-exec"));
+    }
+    #[cfg(target_os = "macos")]
     let (name, make) = ("sandbox-exec", Backend::MacOs as fn(PathBuf) -> Backend);
     #[cfg(target_os = "linux")]
     let (name, make) = ("bwrap", Backend::Linux as fn(PathBuf) -> Backend);
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Backend::Unavailable;
+    return Backend::Unavailable(SandboxFailure::Missing);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -282,14 +314,14 @@ fn find_backend() -> Backend {
             .map(|dir| dir.join(name))
             .find(|p| p.is_file())
         else {
-            return Backend::Unavailable;
+            return Backend::Unavailable(SandboxFailure::Missing);
         };
         make(binary)
     }
 }
 
 enum Failure {
-    Unavailable,
+    Unavailable(SandboxFailure),
     Invalid,
     Spawn,
     Wait,
@@ -344,11 +376,11 @@ impl ToolPort for SandboxedExecutor {
                 "argv is invalid".to_owned(),
                 false,
             ),
-            Err(Failure::Unavailable) => (
+            Err(Failure::Unavailable(reason)) => (
                 ExecutionStatus::Denied,
                 EffectState::NotStarted,
                 Evidence::HostObserved,
-                "required exec sandbox is unavailable".to_owned(),
+                reason.message().to_owned(),
                 false,
             ),
             Err(Failure::Spawn) => (
