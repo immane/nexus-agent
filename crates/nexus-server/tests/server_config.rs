@@ -36,12 +36,15 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use nexus_config::{
     AdapterKind, CredentialRef, ModelEntry, ProviderProfile, UserConfig, load, save,
 };
 use serde_json::Value;
+
+use crate::support::serve_mock;
 
 /// Read timeout for one framed request/response round trip.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,6 +108,14 @@ fn create_session(port: u16) -> String {
     let (status, body) = post(port, "/sessions", "{}");
     assert_eq!(status, 201, "a session is created: {body}");
     body["session"].as_str().expect("session token").to_owned()
+}
+
+/// Mints a session bound to the given provider/model selection and returns
+/// its token, asserting the binding is accepted.
+fn create_bound_session(port: u16, body: &str) -> String {
+    let (status, reply) = post(port, "/sessions", body);
+    assert_eq!(status, 201, "the session binds: {reply}");
+    reply["session"].as_str().expect("session token").to_owned()
 }
 
 /// Submits one task and returns the accepted run id, asserting acceptance.
@@ -199,17 +210,24 @@ fn resolvable_probe() -> &'static str {
 /// the configured charset while making accidental presence implausible.
 const ABSENT_CREDENTIAL: &str = "NEXUS_SERVER_CONFIG_ABSENT_9F3A";
 
-/// Builds a provider whose credential reference is `credential`.
-fn provider(id: &str, credential: &str) -> ProviderProfile {
+/// Builds a provider whose credential reference is `credential` and whose
+/// endpoint is `endpoint`.
+fn provider_at(id: &str, credential: &str, endpoint: &str) -> ProviderProfile {
     ProviderProfile::new(
         id,
         format!("{id} display"),
         AdapterKind::Direct,
-        Some("https://api.example.com".to_owned()),
+        Some(endpoint.to_owned()),
         CredentialRef::env_var(credential).expect("valid credential reference"),
         "default-model",
     )
     .expect("valid provider builds")
+}
+
+/// Builds a provider pointing at a placeholder endpoint. Selection and
+/// credential gating never open a socket, so the address is never dialed.
+fn provider(id: &str, credential: &str) -> ProviderProfile {
+    provider_at(id, credential, "https://api.example.com")
 }
 
 /// Builds a model bound to `provider_id`.
@@ -218,11 +236,11 @@ fn model(id: &str, provider_id: &str) -> ModelEntry {
 }
 
 /// A document with one provider and two models, all gated behind
-/// `credential`.
-fn configured(credential: &str) -> UserConfig {
+/// `credential`, with the provider pointed at `endpoint`.
+fn configured_at(credential: &str, endpoint: &str) -> UserConfig {
     let mut config = UserConfig::default_config();
     config
-        .add_provider(provider("acme", credential))
+        .add_provider(provider_at("acme", credential, endpoint))
         .expect("provider admits");
     config
         .add_model(model("fast", "acme"))
@@ -231,6 +249,12 @@ fn configured(credential: &str) -> UserConfig {
         .add_model(model("strong", "acme"))
         .expect("model admits");
     config
+}
+
+/// A document with one provider and two models, all gated behind
+/// `credential`, at the placeholder endpoint.
+fn configured(credential: &str) -> UserConfig {
+    configured_at(credential, "https://api.example.com")
 }
 
 /// A document with `count` models, for the bounded favourites list.
@@ -279,188 +303,205 @@ fn read_back(path: &Path) -> UserConfig {
         .expect("document exists")
 }
 
-/// A resolvable selection is accepted and its run completes; the refusal
-/// paths that a missing credential produces are the subject of the next
-/// test.
+/// A bound session runs the adapter it was created with, and a submit that
+/// omits the selection still records the session's bound model, not a value
+/// derived from the request.
 #[test]
-fn a_resolvable_selection_is_accepted_and_its_run_completes() {
+fn a_bound_session_completes_and_records_its_bound_model() {
+    let (base, mock) = serve_mock();
     let probe = resolvable_probe();
-    let path = temp_config("resolvable");
-    let port = spawn_server(configured(probe), Some(path.clone()));
-    let session = create_session(port);
+    let path = temp_config("bound-completion");
+    let port = spawn_server(configured_at(probe, &base), Some(path.clone()));
+    let session = create_bound_session(port, r#"{"provider":"acme","model":"fast"}"#);
 
-    let (status, body) = post(
-        port,
-        &format!("/sessions/{session}/runs"),
-        r#"{"input":"selected task","provider":"acme","model":"fast"}"#,
+    // The request omits the selection entirely: the omitted fields use the
+    // session binding.
+    let run = submit(port, &session, r#"{"input":"selected task"}"#);
+    drive_to_terminal(port, &session, &run);
+
+    assert!(
+        mock.hits.load(Ordering::SeqCst) >= 1,
+        "the session's bound adapter was actually invoked"
     );
-    assert_eq!(status, 201, "a resolvable selection is accepted: {body}");
-    let run = body["run"].as_str().expect("run id");
-    drive_to_terminal(port, &session, run);
+    let raw = String::from_utf8_lossy(&mock.request.lock().expect("request readable").clone())
+        .into_owned();
+    assert!(
+        raw.contains(r#""model":"fast-model""#),
+        "the bound model reached the adapter: {raw}"
+    );
 
     let (status, snapshot) = get(port, &format!("/sessions/{session}/snapshot?run={run}"));
     assert_eq!(status, 200);
     assert_eq!(snapshot["lifecycle"], "finalized");
     assert_eq!(snapshot["outcome"], "completed");
 
-    // Selection is recorded at the terminal event and survives a
-    // save/load round trip through the configured file.
-    let persisted = read_back(&path);
+    // Usage is recorded against the bound model and survives a save/load
+    // round trip through the configured file.
     assert_eq!(
-        persisted.recent(),
+        read_back(&path).recent(),
         ["fast".to_owned()],
-        "the run's model is the one recently used"
+        "the run's bound model is the one recently used"
     );
     let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
 }
 
-/// A provider whose credential cannot be resolved is a readiness failure,
-/// not bad input: the request is well-formed and would succeed once the
-/// environment is set. The run slot stays untouched and nothing is recorded.
+/// A submit selection that names anything other than the session binding is
+/// refused before the runtime is touched: no run is minted, the adapter is
+/// never invoked, and history is unchanged. The session stays usable for its
+/// own model afterwards.
 #[test]
-fn an_unresolvable_credential_is_a_readiness_failure_naming_only_the_provider() {
-    let path = temp_config("absent-credential");
-    let port = spawn_server(configured(ABSENT_CREDENTIAL), Some(path.clone()));
+fn a_conflicting_submit_selection_is_rejected_without_minting_a_run() {
+    let (base, mock) = serve_mock();
+    let probe = resolvable_probe();
+    let path = temp_config("submit-conflict");
+    let port = spawn_server(configured_at(probe, &base), Some(path.clone()));
+    let session = create_bound_session(port, r#"{"provider":"acme","model":"fast"}"#);
+
+    for (case, body) in [
+        ("another model", r#"{"input":"t","model":"strong"}"#),
+        ("another provider", r#"{"input":"t","provider":"nope"}"#),
+        (
+            "a mismatched pair",
+            r#"{"input":"t","provider":"acme","model":"strong"}"#,
+        ),
+    ] {
+        let (status, reply) = post(port, &format!("/sessions/{session}/runs"), body);
+        assert_eq!(status, 400, "{case} conflicts with the binding: {reply}");
+        assert!(reply.get("run").is_none(), "{case} mints no run: {reply}");
+    }
+    assert_eq!(
+        mock.hits.load(Ordering::SeqCst),
+        0,
+        "no refused selection reached the adapter"
+    );
+    assert!(!path.exists(), "refusals alter no history");
+
+    // Repeating the binding (or omitting it) is still accepted.
+    let run = submit(
+        port,
+        &session,
+        r#"{"input":"t","provider":"acme","model":"fast"}"#,
+    );
+    drive_to_terminal(port, &session, &run);
+    assert_eq!(read_back(&path).recent(), ["fast".to_owned()]);
+    let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
+}
+
+/// A demo session runs the scripted fakes, so an explicit live selection is
+/// a mismatch rather than a model to record: it is refused without touching
+/// the network, and the demo script still completes with no usage recorded.
+#[test]
+fn a_demo_session_refuses_a_live_selection() {
+    let (base, mock) = serve_mock();
+    let probe = resolvable_probe();
+    let path = temp_config("demo-mismatch");
+    let port = spawn_server(configured_at(probe, &base), Some(path.clone()));
     let session = create_session(port);
 
     for (case, body) in [
-        ("model only", r#"{"input":"t","model":"fast"}"#.to_owned()),
+        ("provider only", r#"{"input":"t","provider":"acme"}"#),
+        ("model only", r#"{"input":"t","model":"fast"}"#),
         (
             "provider and model",
-            r#"{"input":"t","provider":"acme","model":"fast"}"#.to_owned(),
-        ),
-        (
-            "provider only",
-            r#"{"input":"t","provider":"acme"}"#.to_owned(),
+            r#"{"input":"t","provider":"acme","model":"fast"}"#,
         ),
     ] {
-        let (status, reply) = post(port, &format!("/sessions/{session}/runs"), &body);
-        assert_eq!(status, 503, "{case} is unavailable, not invalid: {reply}");
+        let (status, reply) = post(port, &format!("/sessions/{session}/runs"), body);
+        assert_eq!(status, 400, "{case} is a demo/live mismatch: {reply}");
+        assert!(reply.get("run").is_none(), "{case} mints no run: {reply}");
+    }
+    assert_eq!(
+        mock.hits.load(Ordering::SeqCst),
+        0,
+        "no live selection reached the network"
+    );
+
+    let run = submit(port, &session, r#"{"input":"demo task"}"#);
+    drive_to_terminal(port, &session, &run);
+    assert!(
+        !path.exists(),
+        "an unselected demo run records nothing and writes nothing"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
+}
+
+/// A session selection is validated where it binds: an absent credential is
+/// a readiness failure (`503`) with no network touch, while unknown
+/// identities and malformed shapes are invalid input (`400`).
+#[test]
+fn an_unknown_or_unavailable_creation_selection_is_an_explicit_failure() {
+    let (base, mock) = serve_mock();
+    let path = temp_config("creation-gating");
+
+    // Missing credential: readiness, not bad input, and no socket opens.
+    let port = spawn_server(configured_at(ABSENT_CREDENTIAL, &base), Some(path.clone()));
+    for body in [
+        r#"{"provider":"acme"}"#,
+        r#"{"provider":"acme","model":"fast"}"#,
+    ] {
+        let (status, reply) = post(port, "/sessions", body);
+        assert_eq!(status, 503, "{body} is not ready: {reply}");
         let message = reply["error"].as_str().expect("diagnostic");
         assert!(
-            message.contains("acme"),
-            "{case} names the provider so the user can act: {message}"
-        );
-        assert!(
             !message.contains(ABSENT_CREDENTIAL),
-            "{case} diagnostic carries no credential detail: {message}"
+            "{body} carries no credential detail: {message}"
         );
-        assert!(reply.get("run").is_none(), "{case} mints no run: {reply}");
     }
-
-    // The refused submits never occupied the slot, so a run with no
-    // selection is still accepted afterwards.
-    let run = submit(port, &session, r#"{"input":"unselected task"}"#);
-    drive_to_terminal(port, &session, &run);
-    let (status, summary) = get(port, "/config");
-    assert_eq!(status, 200);
     assert_eq!(
-        summary["recent"],
-        serde_json::json!([]),
-        "a refused selection and an unselected run record no usage"
+        mock.hits.load(Ordering::SeqCst),
+        0,
+        "an unavailable credential is discovered without a network touch"
     );
-    // Nothing was ever recorded, so nothing was ever written either: the
-    // refusals must not create a document as a side effect.
-    assert!(
-        !path.exists(),
-        "no usage means no file: refusals do not write a document"
-    );
-    let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
-}
 
-/// Every unknown or inconsistent selection is invalid input, refused before
-/// the runtime is touched so it can never mint a run.
-#[test]
-fn unknown_or_inconsistent_selections_are_invalid_input() {
+    // Unknown identities and malformed shapes are invalid input.
     let probe = resolvable_probe();
-    let path = temp_config("selection-validation");
-    let port = spawn_server(configured(probe), Some(path.clone()));
-    let session = create_session(port);
-
-    // The served document is the configured one, so the summary check
-    // below is about a loaded file rather than about defaults.
-    let (status, summary) = get(port, "/config");
-    assert_eq!(status, 200);
-    assert_eq!(summary["providers"][0]["id"], "acme");
-
-    for (case, body) in [
-        (
-            "unknown provider",
-            r#"{"input":"t","provider":"nope"}"#.to_owned(),
-        ),
-        (
-            "unknown model",
-            r#"{"input":"t","model":"nope"}"#.to_owned(),
-        ),
-        (
-            "unknown provider with a known model",
-            r#"{"input":"t","provider":"nope","model":"fast"}"#.to_owned(),
-        ),
-        (
-            "unknown model with a known provider",
-            r#"{"input":"t","provider":"acme","model":"nope"}"#.to_owned(),
-        ),
-        (
-            "a model field that is not text",
-            r#"{"input":"t","model":12}"#.to_owned(),
-        ),
-        (
-            "a provider field that is not text",
-            r#"{"input":"t","provider":["acme"]}"#.to_owned(),
-        ),
+    let port = spawn_server(configured_at(probe, &base), Some(path.clone()));
+    for body in [
+        r#"{"provider":"nope"}"#,
+        r#"{"provider":"acme","model":"nope"}"#,
+        r#"{"model":"fast"}"#,
+        r#"{"provider":42}"#,
     ] {
-        let (status, reply) = post(port, &format!("/sessions/{session}/runs"), &body);
-        assert_eq!(status, 400, "{case} is invalid input: {reply}");
-        assert!(reply.get("run").is_none(), "{case} mints no run: {reply}");
+        let (status, reply) = post(port, "/sessions", body);
+        assert_eq!(status, 400, "{body} is invalid input: {reply}");
     }
-
-    // None of the refusals recorded usage or consumed the single slot.
-    assert!(
-        !path.exists(),
-        "no usage was recorded, so nothing was saved"
-    );
-    let run = submit(port, &session, r#"{"input":"still available"}"#);
-    drive_to_terminal(port, &session, &run);
-    assert!(
-        !path.exists(),
-        "an unselected run records nothing and writes nothing"
-    );
     let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
 }
 
-/// A model that belongs to a different provider is refused rather than
-/// silently resolved through whichever field the server read first.
+/// A model that belongs to a different provider is refused both when it
+/// would bind a session and when a bound session's submit names it, rather
+/// than being resolved through whichever field was read first.
 #[test]
-fn a_model_from_another_provider_is_refused() {
+fn a_model_from_another_provider_is_refused_at_creation_and_submit() {
+    let (base, _mock) = serve_mock();
     let probe = resolvable_probe();
     let path = temp_config("cross-provider");
-    let mut config = configured(probe);
+    let mut config = configured_at(probe, &base);
     config
-        .add_provider(provider("other", probe))
+        .add_provider(provider_at("other", probe, &base))
         .expect("second provider admits");
     config
         .add_model(model("foreign", "other"))
         .expect("foreign model admits");
     let port = spawn_server(config, Some(path.clone()));
 
-    let session = create_session(port);
+    // A pair that contradicts itself cannot bind a session.
+    let (status, reply) = post(
+        port,
+        "/sessions",
+        r#"{"provider":"acme","model":"foreign"}"#,
+    );
+    assert_eq!(status, 400, "a mismatched pair is invalid: {reply}");
+
+    // A bound session refuses a different provider's model at submit.
+    let session = create_bound_session(port, r#"{"provider":"acme","model":"fast"}"#);
     let (status, reply) = post(
         port,
         &format!("/sessions/{session}/runs"),
-        r#"{"input":"t","provider":"acme","model":"foreign"}"#,
-    );
-    assert_eq!(status, 400, "a mismatched pair is invalid: {reply}");
-    assert!(reply.get("run").is_none(), "no run is minted: {reply}");
-
-    // The matching pair for each provider is accepted, so the refusal is
-    // about the mismatch and not about either identity being unknown.
-    let run = submit(
-        port,
-        &session,
         r#"{"input":"t","provider":"other","model":"foreign"}"#,
     );
-    drive_to_terminal(port, &session, &run);
-    assert_eq!(read_back(&path).recent(), ["foreign".to_owned()]);
+    assert_eq!(status, 400, "the submit contradicts the binding: {reply}");
+    assert!(reply.get("run").is_none(), "no run is minted: {reply}");
     let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
 }
 
@@ -621,27 +662,20 @@ fn removing_a_favourite_arrives_over_the_wire() {
     let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
 }
 
-/// Sessions are independent: each records the model *it* selected, and one
-/// session's run never appears in another's attribution. Recents is shared
-/// server state, so both models must appear, and the run ids differ.
+/// Sessions are independent: each records the model *it* was bound to, and
+/// one session's run never appears in another's attribution. Recents is
+/// shared server state, so both models must appear, and the run ids differ.
 #[test]
 fn selection_is_isolated_per_session() {
+    let (base, _mock) = serve_mock();
     let probe = resolvable_probe();
     let path = temp_config("session-isolation");
-    let port = spawn_server(configured(probe), Some(path.clone()));
-    let first = create_session(port);
-    let second = create_session(port);
+    let port = spawn_server(configured_at(probe, &base), Some(path.clone()));
+    let first = create_bound_session(port, r#"{"provider":"acme","model":"fast"}"#);
+    let second = create_bound_session(port, r#"{"provider":"acme","model":"strong"}"#);
 
-    let first_run = submit(
-        port,
-        &first,
-        r#"{"input":"first","provider":"acme","model":"fast"}"#,
-    );
-    let second_run = submit(
-        port,
-        &second,
-        r#"{"input":"second","provider":"acme","model":"strong"}"#,
-    );
+    let first_run = submit(port, &first, r#"{"input":"first"}"#);
+    let second_run = submit(port, &second, r#"{"input":"second"}"#);
     assert_ne!(first_run, second_run, "sessions mint distinct runs");
 
     // Both streams are driven to their terminals before either usage is
@@ -676,21 +710,21 @@ fn selection_is_isolated_per_session() {
 }
 
 /// The most-recent-first ordering is the configuration model's rule, and
-/// the server preserves it across repeated uses of different models and
-/// across a save/load round trip.
+/// the server preserves it across repeated runs of differently bound
+/// sessions and across a save/load round trip.
 #[test]
 fn recents_are_ordered_most_recent_first_across_a_save_and_load_round_trip() {
+    let (base, _mock) = serve_mock();
     let probe = resolvable_probe();
     let path = temp_config("recents-order");
-    let port = spawn_server(configured(probe), Some(path.clone()));
-    let session = create_session(port);
+    let port = spawn_server(configured_at(probe, &base), Some(path.clone()));
 
     for model_id in ["fast", "strong", "fast"] {
-        let run = submit(
+        let session = create_bound_session(
             port,
-            &session,
-            &format!(r#"{{"input":"t","provider":"acme","model":"{model_id}"}}"#),
+            &format!(r#"{{"provider":"acme","model":"{model_id}"}}"#),
         );
+        let run = submit(port, &session, r#"{"input":"t"}"#);
         drive_to_terminal(port, &session, &run);
     }
 

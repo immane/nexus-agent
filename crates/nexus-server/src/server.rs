@@ -10,19 +10,28 @@
 //!
 //! [`Server::set_config`] installs one [`UserConfig`] plus the file it is
 //! persisted to. A server built by [`Server::new`] alone holds
-//! [`UserConfig::default_config`] with no path: submit selection then
-//! resolves nothing, favourites are refused, and recent-model recording
-//! stays in memory, so the existing demo wiring is unchanged.
+//! [`UserConfig::default_config`] with no path: sessions can only be
+//! unbound (live selections fail as unknown identities), favourites are
+//! refused, and recent-model recording stays in memory, so the existing
+//! demo wiring is unchanged.
 //!
-//! `submit` accepts an optional `"provider"` and `"model"`. Both must name
-//! configured identities (`400` otherwise) and, when they disagree about
-//! which provider owns the model, the pair is rejected. The selected
-//! provider's credential must resolve from the process environment at
-//! submit time (`503` otherwise). The diagnostic names only the provider
-//! id, which is a bounded lock identifier: no environment value can reach
-//! it. An accepted run with a selected model is remembered in a
-//! run-to-model map, and the SSE terminal event for that run records the
-//! use in the configuration and saves it.
+//! A session's provider and model are fixed when it is created
+//! (`POST /sessions` with an optional `"provider"`/`"model"`). Both must
+//! name configured identities (`400` otherwise), the pair must agree about
+//! which provider owns the model, and the provider's credential must
+//! resolve from the process environment (`503` otherwise). The diagnostic
+//! names only the provider id, which is a bounded lock identifier: no
+//! environment value can reach it. A session created without a selection is
+//! unbound and serves the scripted demo wiring.
+//!
+//! `submit` may repeat the session's own `"provider"`/`"model"` or omit
+//! both. An omitted field uses the session binding, and any other value is
+//! refused (`400`) before the runtime is touched, so a request can never
+//! invoke one model while recording another. A demo session refuses any
+//! live selection rather than recording a model that never ran. An accepted
+//! run is remembered in a run-to-model map keyed by the session's bound
+//! model, and the SSE terminal event records the use in the configuration
+//! and saves it.
 //!
 //! Persistence is best effort by design: a failed save is logged to stderr
 //! and the run, its stream, and the in-memory record all continue. Usage
@@ -134,6 +143,12 @@ impl ProviderPort for PerRunProvider {
 /// One web session: an owned runtime plus its unconsumed event receivers.
 pub struct Session {
     session: SessionId,
+    /// Configured provider id this session was bound to at creation, or
+    /// `None` for the demo wiring. Fixed for the session's lifetime.
+    provider: Option<String>,
+    /// Configured model id bound at creation. `None` means the provider
+    /// default (or the demo wiring).
+    model: Option<String>,
     runtime: Mutex<Runtime>,
     data: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
     control: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
@@ -277,6 +292,10 @@ impl Server {
         if provider.is_none() && model.is_some() {
             return Err(SessionError::new(400, "selected model needs a provider"));
         }
+        // The validated identities are retained so a later submit can be
+        // checked against what this session actually dispatches to.
+        let bound_provider = provider.map(str::to_owned);
+        let bound_model = model.map(str::to_owned);
         let provider = match provider {
             None => None,
             Some(id) => Some(self.select_provider(id, model)?),
@@ -342,6 +361,8 @@ impl Server {
             .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
         let entry = Arc::new(Session {
             session,
+            provider: bound_provider,
+            model: bound_model,
             runtime: Mutex::new(runtime),
             data: Mutex::new(streams.data),
             control: Mutex::new(streams.control),
@@ -387,7 +408,7 @@ impl Server {
         };
         let (profile, vendor) = profile;
         let vendor = vendor.unwrap_or(profile.default_model.clone());
-        nexus_config::resolve_credential(&profile.credential)
+        resolve_credential(&profile.credential)
             .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
             .map_err(|_| SessionError::new(400, "selected provider is invalid"))
@@ -579,16 +600,18 @@ impl Server {
     /// Accepts a task for the session. Only `Accepted` mints a run; every
     /// other reply keeps the slot untouched.
     ///
-    /// An optional `provider`/`model` pair selects the integration. Both
-    /// are validated against the configured document before the run is
-    /// submitted, so an invalid or unavailable selection never occupies the
-    /// session's single run slot and never mints a run. An accepted run
-    /// with a selected model is remembered for terminal-time recording.
+    /// The request may repeat the session's bound `provider`/`model` or omit
+    /// them. An omitted field uses the binding and any other value is
+    /// refused before the runtime is touched, so a conflicting selection
+    /// never occupies the session's single run slot, mints a run, or records
+    /// a model that did not run. An accepted run with a bound model is
+    /// remembered for terminal-time recording.
     fn submit_run(&self, session: &Arc<Session>, body: &Value) -> Option<Response> {
-        let model = match self.select_model(body) {
-            Ok(model) => model,
-            Err(response) => return Some(response),
-        };
+        let model =
+            match resolve_selection(session.provider.as_deref(), session.model.as_deref(), body) {
+                Ok(model) => model,
+                Err(response) => return Some(response),
+            };
         let input = body_str(body, "input").unwrap_or("");
         let profile = body_str(body, "profile").unwrap_or(WEB_PROFILE);
         let command = match SubmitCommand::new(
@@ -629,106 +652,6 @@ impl Server {
             None => serde_json::json!({ "reply": crate::json::reply_name(reply.reply()) }),
         };
         Some(json_response(status, &body_json(body)))
-    }
-
-    /// Resolves the optional `provider`/`model` submit selection to the
-    /// model id whose use will be recorded at the run's terminal event.
-    ///
-    /// `Ok(None)` means no selection was requested: the run proceeds on the
-    /// demo wiring and records no usage. An unknown `provider` or `model`
-    /// is invalid input (`400`). When both name configured identities but
-    /// disagree about ownership, the pair is rejected rather than silently
-    /// preferring one field.
-    ///
-    /// A selection whose provider credential cannot be resolved is a
-    /// readiness failure (`503`), not bad input: the request is well-formed
-    /// and retryable once the environment is set. The body names only the
-    /// provider id, which the configuration charset bounds to lock
-    /// identifier text, so no credential value can reach the diagnostic.
-    fn select_model(&self, body: &Value) -> Result<Option<String>, Response> {
-        let provider_field = optional_text(body, "provider")?;
-        let model_field = optional_text(body, "model")?;
-        if provider_field.is_none() && model_field.is_none() {
-            return Ok(None);
-        }
-        // The document is locked once and released before any credential
-        // resolution: the environment lookup must never run while the
-        // configuration lock is held, so a slow or blocking resolution
-        // cannot stall every other config request.
-        let (provider_id, credential) = {
-            let config = self.config.lock().expect("config lockable");
-            let provider_id = match (provider_field, model_field) {
-                (Some(provider), Some(model)) => {
-                    let Some(entry) = config.model(model) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected model is unknown"),
-                        ));
-                    };
-                    let Some(profile) = config.provider(provider) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected provider is unknown"),
-                        ));
-                    };
-                    if entry.provider != profile.id {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected model does not belong to that provider"),
-                        ));
-                    }
-                    profile.id.clone()
-                }
-                (Some(provider), None) => {
-                    let Some(profile) = config.provider(provider) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected provider is unknown"),
-                        ));
-                    };
-                    profile.id.clone()
-                }
-                (None, Some(model)) => {
-                    let Some(entry) = config.model(model) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected model is unknown"),
-                        ));
-                    };
-                    // A model entry always names an existing provider:
-                    // admission rejects the reference otherwise.
-                    config
-                        .provider(&entry.provider)
-                        .expect("model names a configured provider")
-                        .id
-                        .clone()
-                }
-                (None, None) => unreachable!("both-absent is handled above"),
-            };
-            let credential = config
-                .provider(&provider_id)
-                .expect("provider was resolved above")
-                .credential
-                .clone();
-            (provider_id, credential)
-        };
-        if resolve_credential(&credential).is_err() {
-            return Err(self.credential_unavailable(&provider_id));
-        }
-        Ok(model_field.map(str::to_owned))
-    }
-
-    /// Builds the credential-readiness refusal for one provider. The id
-    /// comes from the validated document, so it is bounded lock-identifier
-    /// text; the resolved value never appears here.
-    fn credential_unavailable(&self, provider: &str) -> Response {
-        json_response(
-            503,
-            &body_json(serde_json::json!({
-                "error": format!("provider credential is unavailable: {provider}"),
-                "retry": "set the referenced environment variable and retry",
-            })),
-        )
     }
 
     /// Returns the bounded snapshot for a known run of this session.
@@ -1128,6 +1051,50 @@ fn optional_text<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, Resp
     }
 }
 
+/// Resolves a submit request's optional `provider`/`model` fields against
+/// the selection a session was bound to at creation.
+///
+/// An omitted field uses the binding, so the return value is the bound model
+/// id whose use the terminal event records (or `None` when the session is
+/// unbound or bound to a provider default). Any field that names something
+/// other than the binding is refused (`400`): the session's adapter is fixed
+/// at creation, so accepting a different value could only misattribute the
+/// run. A demo session therefore refuses every live selection rather than
+/// recording a model that never executed.
+fn resolve_selection(
+    bound_provider: Option<&str>,
+    bound_model: Option<&str>,
+    body: &Value,
+) -> Result<Option<String>, Response> {
+    let provider_field = optional_text(body, "provider")?;
+    let model_field = optional_text(body, "model")?;
+    let Some(bound_provider) = bound_provider else {
+        return if provider_field.is_none() && model_field.is_none() {
+            Ok(None)
+        } else {
+            Err(selection_mismatch())
+        };
+    };
+    if provider_field.is_some_and(|requested| requested != bound_provider) {
+        return Err(selection_mismatch());
+    }
+    match model_field {
+        None => Ok(bound_model.map(str::to_owned)),
+        Some(requested) if bound_model == Some(requested) => Ok(bound_model.map(str::to_owned)),
+        Some(_) => Err(selection_mismatch()),
+    }
+}
+
+/// The refusal for a submit selection that contradicts the session binding.
+/// Static: no caller text is echoed, and the message names neither the
+/// requested nor the bound identity.
+fn selection_mismatch() -> Response {
+    json_response(
+        400,
+        &json::error_body("submit selection conflicts with the session binding"),
+    )
+}
+
 /// Builds a runtime reply body with its HTTP status.
 fn command_reply(reply: nexus_core::CommandResponse) -> Response {
     let status = crate::json::reply_status(reply.reply());
@@ -1354,72 +1321,65 @@ mod tests {
         }
     }
 
-    /// A submit without selection fields is not a selection request at all:
-    /// the demo wiring serves it and nothing is recorded against it. This is
-    /// the path every pre-configuration client uses.
+    /// An unbound session records nothing, while a bound session records its
+    /// own model even when the request omits the selection fields.
     #[test]
-    fn submit_without_selection_records_nothing() {
-        let (server, _runtime) = server_with_gated_config();
+    fn omitted_selection_uses_the_session_binding() {
         // `Response` has no `Debug`, so the outcome is matched rather than
         // unwrapped through `expect`.
-        match server.select_model(&submit_body(None, None)) {
-            Ok(model) => assert_eq!(model, None, "no selection names no model"),
+        match resolve_selection(None, None, &submit_body(None, None)) {
+            Ok(model) => assert_eq!(model, None, "the demo wiring names no model"),
             Err(response) => panic!("no selection is never refused: {}", response.status),
+        }
+        match resolve_selection(Some("gated"), Some("gated-fast"), &submit_body(None, None)) {
+            Ok(model) => assert_eq!(model.as_deref(), Some("gated-fast")),
+            Err(response) => panic!("omitted fields use the binding: {}", response.status),
         }
     }
 
-    /// Every unresolvable selection is refused as a readiness failure, not
-    /// as invalid input, and the diagnostic names only the provider id.
+    /// A session whose selected provider credential cannot resolve fails at
+    /// creation as a readiness failure, so no run can be minted against it.
     #[test]
-    fn unresolvable_selections_are_refused_as_not_ready() {
+    fn a_session_with_an_unresolvable_credential_is_not_ready() {
         let (server, _runtime) = server_with_gated_config();
-        for body in [
-            submit_body(None, Some("gated-fast")),
-            submit_body(Some("gated"), Some("gated-fast")),
-            submit_body(Some("gated"), None),
-        ] {
-            let response = server
-                .select_model(&body)
-                .expect_err("an unresolvable credential cannot be selected");
-            assert_eq!(response.status, 503, "{body}");
-            let reported = serde_json::from_slice::<Value>(&response.body).expect("JSON body");
-            let message = reported["error"].as_str().expect("diagnostic");
-            assert!(message.contains("gated"), "names the provider: {message}");
+        for (provider, model) in [(Some("gated"), Some("gated-fast")), (Some("gated"), None)] {
+            let error = server
+                .create_session_with(provider, model)
+                .expect_err("an unresolvable credential cannot be bound");
+            assert_eq!(error.status(), 503, "{provider:?}/{model:?}");
             assert!(
-                !message.contains("NEXUS_SERVER_UNIT_ABSENT_7C1E"),
-                "carries no credential detail: {message}"
+                !error.message().contains("NEXUS_SERVER_UNIT_ABSENT_7C1E"),
+                "carries no credential detail: {}",
+                error.message()
             );
         }
     }
 
-    /// Unknown identities and an inconsistent pair are invalid input, which
-    /// is a different status and a different remedy from not-ready: the
+    /// Unknown identities and an inconsistent pair are invalid input at
+    /// creation, which is a different status and remedy from not-ready: the
     /// request itself must change, not the environment.
     #[test]
-    fn unknown_or_inconsistent_selections_are_invalid_input() {
+    fn unknown_or_inconsistent_creation_selections_are_invalid_input() {
         let (server, _runtime) = server_with_gated_config();
-        for body in [
-            submit_body(Some("absent"), None),
-            submit_body(None, Some("absent")),
-            submit_body(Some("absent"), Some("gated-fast")),
-            submit_body(Some("gated"), Some("absent")),
-            // A present-but-non-string field is malformed input, not an
-            // absent selection.
-            serde_json::json!({ "input": "t", "model": 12 }),
-            serde_json::json!({ "input": "t", "provider": ["gated"] }),
+        for (provider, model) in [
+            (Some("absent"), None),
+            (Some("gated"), Some("absent")),
+            (Some("absent"), Some("gated-fast")),
+            (None, Some("gated-fast")),
         ] {
-            let response = server
-                .select_model(&body)
-                .expect_err("an unknown identity cannot be selected");
-            assert_eq!(response.status, 400, "{body}");
+            let error = server
+                .create_session_with(provider, model)
+                .expect_err("an unknown identity cannot be bound");
+            assert_eq!(error.status(), 400, "{provider:?}/{model:?}");
         }
     }
 
-    /// A model that belongs to a different provider is refused rather than
-    /// resolved through whichever field happened to be read first: a
-    /// selection that silently contradicts itself is not a selection.
+    /// A model that belongs to a different provider is refused at creation
+    /// rather than resolved through whichever field happened to be read
+    /// first: a selection that silently contradicts itself is not a
+    /// selection.
     #[test]
-    fn a_model_from_another_provider_is_refused() {
+    fn a_model_from_another_provider_is_refused_at_creation() {
         let mut config = gated_config();
         config
             .add_provider(
@@ -1445,10 +1405,42 @@ mod tests {
         let mut server = Server::new(runtime.handle().clone());
         server.set_config(config, None);
 
-        let response = server
-            .select_model(&submit_body(Some("gated"), Some("second-fast")))
+        let error = server
+            .create_session_with(Some("gated"), Some("second-fast"))
             .expect_err("the pair contradicts itself");
-        assert_eq!(response.status, 400);
+        assert_eq!(error.status(), 400);
+    }
+
+    /// A submit selection that contradicts the session binding is refused,
+    /// including any live selection on a demo session. A malformed
+    /// (non-string) field is refused rather than read as absent.
+    #[test]
+    fn a_submit_selection_that_conflicts_with_the_binding_is_refused() {
+        for body in [
+            submit_body(Some("other"), None),
+            submit_body(Some("gated"), Some("other")),
+            submit_body(None, Some("other")),
+        ] {
+            let response = resolve_selection(Some("gated"), Some("gated-fast"), &body)
+                .expect_err("a conflicting selection cannot run");
+            assert_eq!(response.status, 400, "{body}");
+        }
+        for body in [
+            submit_body(Some("gated"), None),
+            submit_body(None, Some("gated-fast")),
+        ] {
+            let response = resolve_selection(None, None, &body)
+                .expect_err("the demo wiring has no live model to record");
+            assert_eq!(response.status, 400, "{body}");
+        }
+        for body in [
+            serde_json::json!({ "input": "t", "model": 12 }),
+            serde_json::json!({ "input": "t", "provider": ["gated"] }),
+        ] {
+            let response = resolve_selection(Some("gated"), Some("gated-fast"), &body)
+                .expect_err("a non-string selection field is malformed");
+            assert_eq!(response.status, 400, "{body}");
+        }
     }
 
     /// Recording is idempotent per run because the map entry is consumed on
