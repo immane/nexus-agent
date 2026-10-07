@@ -235,6 +235,30 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::CycleModel,
         doc: "Viewport | m | Cycle the active model (admission order)",
     },
+    // Viewport | i | Edit in the composer (vim insert)
+    Row {
+        focus: Focus::Viewport,
+        code: KeyCode::Char('i'),
+        modifiers: NONE,
+        intent: Action::Insert,
+        doc: "Viewport | i | Edit in the composer (vim insert)",
+    },
+    // Viewport | o | Edit in the composer on a fresh line (vim open-line)
+    Row {
+        focus: Focus::Viewport,
+        code: KeyCode::Char('o'),
+        modifiers: NONE,
+        intent: Action::OpenLine,
+        doc: "Viewport | o | Edit in the composer on a fresh line (vim open-line)",
+    },
+    // Viewport | : | Arm a viewport `:` command
+    Row {
+        focus: Focus::Viewport,
+        code: KeyCode::Char(':'),
+        modifiers: NONE,
+        intent: Action::Colon,
+        doc: "Viewport | : | Arm a viewport `:` command",
+    },
     // Viewport | Tab | Switch focus
     Row {
         focus: Focus::Viewport,
@@ -250,14 +274,6 @@ const PUBLISHED_ROWS: &[Row] = &[
         modifiers: KeyModifiers::CONTROL,
         intent: Action::CycleVariant,
         doc: "Viewport | Ctrl+T | Cycle the model variant",
-    },
-    // Viewport | q | Quit (test-only convenience)
-    Row {
-        focus: Focus::Viewport,
-        code: KeyCode::Char('q'),
-        modifiers: NONE,
-        intent: Action::Quit,
-        doc: "Viewport | q | Quit (test-only convenience)",
     },
     // Viewport | Esc | Back to the composer (never cancel)
     Row {
@@ -373,36 +389,14 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::Cancel,
         doc: "Any | Ctrl+C | Clear composer, else cancel or quit",
     },
-    // Any | Ctrl+D | Quit
-    Row {
-        focus: Focus::Composer,
-        code: KeyCode::Char('d'),
-        modifiers: KeyModifiers::CONTROL,
-        intent: Action::Quit,
-        doc: "Any | Ctrl+D | Quit",
-    },
-    Row {
-        focus: Focus::Viewport,
-        code: KeyCode::Char('d'),
-        modifiers: KeyModifiers::CONTROL,
-        intent: Action::Quit,
-        doc: "Any | Ctrl+D | Quit",
-    },
-    Row {
-        focus: Focus::ApprovalCard,
-        code: KeyCode::Char('d'),
-        modifiers: KeyModifiers::CONTROL,
-        intent: Action::Quit,
-        doc: "Any | Ctrl+D | Quit",
-    },
 ];
 
 /// The intents the published table gives to exactly one focus. Each row of
 /// [`PUBLISHED_ROWS`] must sit under the focus named here, which cross-checks
 /// the row transcription against the focus partition independently.
 ///
-/// The remaining families are shared (`FocusSwitch`, `Cancel`, `Quit`,
-/// `ParkFocus`, and the four scrolling/paging intents) and are pinned by
+/// The remaining families are shared (`FocusSwitch`, `Cancel`, `ParkFocus`,
+/// and the four scrolling/paging intents) and are pinned by
 /// [`SHARED_FAMILIES`].
 const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
     ("Submit", Focus::Composer),
@@ -413,6 +407,9 @@ const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
     ("CaretLeft", Focus::Composer),
     ("CaretRight", Focus::Composer),
     ("CycleModel", Focus::Viewport),
+    ("Insert", Focus::Viewport),
+    ("OpenLine", Focus::Viewport),
+    ("Colon", Focus::Viewport),
     ("ApproveOnce", Focus::ApprovalCard),
     ("Deny", Focus::ApprovalCard),
     ("InspectApproval", Focus::ApprovalCard),
@@ -424,7 +421,6 @@ const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
     ("FocusSwitch", &[Focus::Viewport, Focus::ApprovalCard]),
     ("CycleVariant", &[Focus::Composer, Focus::Viewport]),
     ("Cancel", &ALL_FOCUSES),
-    ("Quit", &ALL_FOCUSES),
     ("ParkFocus", &ALL_FOCUSES),
     (
         "ScrollUp",
@@ -452,9 +448,9 @@ const PARAMETERIZED_FAMILIES: &[&str] = &["Type"];
 
 /// Characters that stand in for the parameterized composer row: every one of
 /// them means something *elsewhere* in the keyset (the decision keys, the
-/// navigation keys, the viewport quit key, and a shifted letter),
-/// so none of them may be special-cased as text.
-const COMPOSER_TYPE_SAMPLE: &[char] = &['a', 'd', 'i', 'k', 'j', 'q', 'A', ' '];
+/// navigation keys, the viewport insert/command keys, and a shifted
+/// letter), so none of them may be special-cased as text.
+const COMPOSER_TYPE_SAMPLE: &[char] = &['a', 'd', 'i', 'o', ':', 'k', 'j', 'q', 'A', ' '];
 
 /// Named (non-character) key codes fed to the keyset by the producer census,
 /// in a fixed order: exactly the named keys the published table binds.
@@ -471,13 +467,12 @@ const NAMED_CODES: &[KeyCode] = &[
     KeyCode::PageDown,
 ];
 
-/// The modifier chords the published table documents: `Ctrl+C`, `Ctrl+D`,
-/// `Ctrl+J`, `Ctrl+T`, and `Alt+Enter`. Only these are swept, so the census
+/// The modifier chords the published table documents: `Ctrl+C`, `Ctrl+J`,
+/// `Ctrl+T`, and `Alt+Enter`. Only these are swept, so the census
 /// compares documented chords against documented chords; chord *negatives*
 /// are `cov_keys_edges.rs`’s subject.
 const DOCUMENTED_CHORDS: &[(KeyCode, KeyModifiers)] = &[
     (KeyCode::Char('c'), KeyModifiers::CONTROL),
-    (KeyCode::Char('d'), KeyModifiers::CONTROL),
     (KeyCode::Char('j'), KeyModifiers::CONTROL),
     (KeyCode::Char('t'), KeyModifiers::CONTROL),
     (KeyCode::Enter, KeyModifiers::ALT),
@@ -486,7 +481,7 @@ const DOCUMENTED_CHORDS: &[(KeyCode, KeyModifiers)] = &[
 /// A short scripted session, in the order a user types it: draft text, a
 /// submitted run, a newline, viewport navigation and the viewport `Esc`
 /// that returns home, then an approval inspected, allowed, and parked,
-/// and finally the two chords that end the session.
+/// and finally the two strokes that end the session.
 const SESSION: &[(Focus, KeyCode, KeyModifiers)] = &[
     (Focus::Composer, KeyCode::Char('h'), NONE),
     (Focus::Composer, KeyCode::Char('i'), NONE),
@@ -504,7 +499,6 @@ const SESSION: &[(Focus, KeyCode, KeyModifiers)] = &[
     (Focus::Composer, KeyCode::Char('a'), NONE),
     (Focus::Composer, KeyCode::Backspace, NONE),
     (Focus::Composer, KeyCode::Char('c'), KeyModifiers::CONTROL),
-    (Focus::Composer, KeyCode::Char('d'), KeyModifiers::CONTROL),
 ];
 
 /// Variant name of an intent, dropping the typed character so sets of intents
@@ -527,12 +521,14 @@ fn intent_family(intent: &Action) -> &'static str {
         Action::CaretLeft => "CaretLeft",
         Action::CaretRight => "CaretRight",
         Action::CycleModel => "CycleModel",
+        Action::Insert => "Insert",
+        Action::OpenLine => "OpenLine",
+        Action::Colon => "Colon",
         Action::CycleVariant => "CycleVariant",
         Action::ApproveOnce => "ApproveOnce",
         Action::Deny => "Deny",
         Action::InspectApproval => "InspectApproval",
         Action::Cancel => "Cancel",
-        Action::Quit => "Quit",
         Action::Type(_) => "Type",
         Action::Backspace => "Backspace",
     }
@@ -553,12 +549,14 @@ fn all_intents() -> Vec<Action> {
         Action::CaretLeft,
         Action::CaretRight,
         Action::CycleModel,
+        Action::Insert,
+        Action::OpenLine,
+        Action::Colon,
         Action::CycleVariant,
         Action::ApproveOnce,
         Action::Deny,
         Action::InspectApproval,
         Action::Cancel,
-        Action::Quit,
         Action::Type('x'),
         Action::Backspace,
     ]
@@ -681,12 +679,12 @@ fn every_published_row_maps_to_its_documented_intent() {
 
 #[test]
 fn published_table_has_no_duplicate_or_conflicting_rows() {
-    // 41 literal rows: 13 composer, 11 viewport, 11 approval, and the 6
-    // focus-expanded `Any` rows (`Ctrl+C` and `Ctrl+D` in each focus). The
-    // 42nd published row is parameterized over printable characters.
+    // 40 literal rows: 13 composer, 13 viewport, 11 approval, and the 3
+    // focus-expanded `Any` rows (`Ctrl+C` in each focus). The
+    // 41st published row is parameterized over printable characters.
     assert_eq!(
         PUBLISHED_ROWS.len(),
-        41,
+        40,
         "the transcription lost or invented a published row"
     );
     // The oracle is only meaningful if it is a function: no `(focus, key,
@@ -796,7 +794,6 @@ fn intents_are_partitioned_by_focus() {
                 "PageDown",
                 "PageUp",
                 "ParkFocus",
-                "Quit",
                 "ScrollDown",
                 "ScrollUp",
                 "Submit",
@@ -807,13 +804,15 @@ fn intents_are_partitioned_by_focus() {
             Focus::Viewport,
             vec![
                 "Cancel",
+                "Colon",
                 "CycleModel",
                 "CycleVariant",
                 "FocusSwitch",
+                "Insert",
+                "OpenLine",
                 "PageDown",
                 "PageUp",
                 "ParkFocus",
-                "Quit",
                 "ScrollDown",
                 "ScrollUp",
             ],
@@ -829,7 +828,6 @@ fn intents_are_partitioned_by_focus() {
                 "PageDown",
                 "PageUp",
                 "ParkFocus",
-                "Quit",
                 "ScrollDown",
                 "ScrollUp",
             ],
@@ -911,7 +909,6 @@ fn esc_parks_and_never_answers_or_decides() {
                         | Some(Action::Deny)
                         | Some(Action::InspectApproval)
                         | Some(Action::Submit)
-                        | Some(Action::Quit)
                 ),
                 "Esc under {focus:?} with {modifiers:?} produced {action:?}"
             );
@@ -1156,7 +1153,7 @@ fn the_tab_row_hands_the_keyboard_on_and_parking_never_re_arms_the_card() {
 fn a_scripted_session_maps_row_for_row() {
     // The session in order: draft text, submit, newline, hand over to the
     // viewport, navigate, an `Esc` that returns home, hand
-    // over to the approval card, inspect, page, allow, park, and end.
+    // over to the approval card, inspect, page, allow, and park.
     let observed_session: Vec<Option<String>> = SESSION
         .iter()
         .map(|(focus, code, modifiers)| observed(*focus, *code, *modifiers))
@@ -1180,7 +1177,6 @@ fn a_scripted_session_maps_row_for_row() {
             Some(String::from("Type")),
             Some(String::from("Backspace")),
             Some(String::from("Cancel")),
-            Some(String::from("Quit")),
         ],
         "the scripted session must produce the documented intent sequence"
     );

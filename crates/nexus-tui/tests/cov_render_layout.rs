@@ -467,10 +467,7 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
         !footer.contains("pgup/pgdn"),
         "no card, no page hint: {footer}"
     );
-    assert!(
-        footer.contains("approval i/a/d"),
-        "the footer keeps the approval keyset: {footer}"
-    );
+    assert_eq!(footer.trim_start(), "v0.1.1-alpha running", "{footer}");
 
     assert!(state.apply_event(&approval_event(
         1,
@@ -480,13 +477,10 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     )));
     draw(&mut state, &mut terminal, Focus::ApprovalCard);
     let footer = footer_row(&frame_rows(&terminal)).to_owned();
-    assert!(
-        footer.contains("[i] inspect"),
-        "a pending approval names the inspect key: {footer}"
-    );
-    assert!(
-        !footer.contains("[i] close"),
-        "the closed detail does not name close: {footer}"
+    assert_eq!(
+        footer.trim_start(),
+        "v0.1.1-alpha awaiting approval",
+        "{footer}"
     );
     assert!(
         state.approval_decision_allowed(),
@@ -496,29 +490,21 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     state.inspect_approval();
     draw(&mut state, &mut terminal, Focus::ApprovalCard);
     let footer = footer_row(&frame_rows(&terminal)).to_owned();
-    assert!(
-        footer.contains("[i] close") && footer.contains("pgup/pgdn"),
-        "the open detail names close and its page keys: {footer}"
-    );
-    assert!(
-        !footer.contains("[i] inspect"),
-        "inspect is replaced by close: {footer}"
+    assert_eq!(
+        footer.trim_start(),
+        "v0.1.1-alpha awaiting approval",
+        "{footer}"
     );
 
     state.close_approval_detail();
     draw(&mut state, &mut terminal, Focus::ApprovalCard);
-    assert!(
-        footer_row(&frame_rows(&terminal)).contains("[i] inspect"),
-        "closing the detail restores the inspect hint"
+    assert_eq!(
+        footer_row(&frame_rows(&terminal)).trim_start(),
+        "v0.1.1-alpha awaiting approval"
     );
 
     state.resolve_approval();
     draw(&mut state, &mut terminal, Focus::ApprovalCard);
-    let footer = footer_row(&frame_rows(&terminal)).to_owned();
-    assert!(
-        !footer.contains("[i] inspect") && !footer.contains("[i] close"),
-        "a decided card leaves no inspect hint: {footer}"
-    );
     assert!(
         !frame_rows(&terminal)
             .iter()

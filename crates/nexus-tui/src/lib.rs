@@ -36,8 +36,8 @@ pub use markdown::{MdStyle, StyledRun};
 pub use render::render;
 pub use slash::{SessionArgs, SlashCommand};
 pub use state::{
-    AppState, EntryKind, MAX_PICKER_VISIBLE_ROWS, ModelChoice, Overlay, PendingApprovalCard,
-    PointerGeometry, RefreshGate, SelPoint, TOAST_TTL, TextSelection, VisibleView,
-    cell_to_char_col,
+    AppState, CompletionItem, EntryKind, MAX_PICKER_VISIBLE_ROWS, ModelChoice, Overlay,
+    PendingApprovalCard, PointerGeometry, RefreshGate, SelPoint, TOAST_TTL, TextSelection,
+    ViewportLandmark, VisibleView, cell_to_char_col,
 };
 pub use terminal::{TerminalGuard, install_panic_hook, restore_for_panic};

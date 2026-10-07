@@ -100,7 +100,6 @@ fn expect_no_escape_hatch(focus: Focus, key: KeyEvent, why: &str) {
         Action::Deny,
         Action::InspectApproval,
         Action::Cancel,
-        Action::Quit,
         Action::Submit,
     ];
     match map_key(focus, key) {
@@ -152,7 +151,9 @@ fn expected_ascii_char(focus: Focus, char: char) -> Option<Action> {
         (Focus::Viewport, 'k') => Some(Action::ScrollUp),
         (Focus::Viewport, 'j') => Some(Action::ScrollDown),
         (Focus::Viewport, 'm') => Some(Action::CycleModel),
-        (Focus::Viewport, 'q') => Some(Action::Quit),
+        (Focus::Viewport, 'i') => Some(Action::Insert),
+        (Focus::Viewport, 'o') => Some(Action::OpenLine),
+        (Focus::Viewport, ':') => Some(Action::Colon),
         (Focus::ApprovalCard, 'a') => Some(Action::ApproveOnce),
         (Focus::ApprovalCard, 'd') => Some(Action::Deny),
         (Focus::ApprovalCard, 'i') => Some(Action::InspectApproval),
@@ -312,15 +313,15 @@ fn focus_gaps_never_borrow_another_focus_binding() {
 }
 
 #[test]
-fn composer_quit_shortcut_does_not_quit_from_the_composer() {
-    // `q` quits the viewport but is ordinary draft text in the composer.
+fn q_is_prompt_text_or_unbound_never_a_quit_shortcut() {
     assert_eq!(
         map_key(Focus::Composer, key(KeyCode::Char('q'))),
         Some(Action::Type('q'))
     );
-    assert_eq!(
-        map_key(Focus::Viewport, key(KeyCode::Char('q'))),
-        Some(Action::Quit)
+    expect_none(
+        Focus::Viewport,
+        key(KeyCode::Char('q')),
+        "quit requires the :q command line and Enter",
     );
     expect_none(
         Focus::ApprovalCard,
@@ -331,9 +332,9 @@ fn composer_quit_shortcut_does_not_quit_from_the_composer() {
 
 #[test]
 fn control_combos_outside_the_table_map_to_none() {
-    // Only `Ctrl+c` (cancel), `Ctrl+d` (quit), Composer `Ctrl+j`
-    // (newline), and `Ctrl+t` (variant) are bound, so every other control
-    // chord must be dropped rather than aliased onto one of them.
+    // Only `Ctrl+c` (cancel), Composer `Ctrl+j` (newline), and `Ctrl+t`
+    // (variant) are bound, so every other control chord must be dropped
+    // rather than aliased onto one of them.
     let stray_controls = [
         control('a'),
         control('r'),
@@ -351,12 +352,8 @@ fn control_combos_outside_the_table_map_to_none() {
     ];
     for focus in ALL_FOCUSES {
         for event in stray_controls {
-            expect_none(
-                focus,
-                event,
-                "Ctrl is only bound to c, d, Composer j, and t",
-            );
-            expect_no_escape_hatch(focus, event, "Ctrl is only bound to c, d, j, and t");
+            expect_none(focus, event, "Ctrl is only bound to c, Composer j, and t");
+            expect_no_escape_hatch(focus, event, "Ctrl is only bound to c, j, and t");
         }
     }
     // `Ctrl+J` (uppercase, i.e. a real held Ctrl) is not the newline binding;
@@ -439,7 +436,8 @@ fn alt_decorative_approval_letters_never_decide() {
 #[test]
 fn control_is_screened_before_alt() {
     // A CONTROL-bearing event never reaches the ALT rows: `Ctrl+Alt+j` is
-    // still the composer newline and `Ctrl+Alt+d` is still the quit chord.
+    // still the composer newline, and `Ctrl+Alt+d` is unbound now that the
+    // quit chord is gone.
     let control_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
     assert_eq!(
         map_key(Focus::Composer, chord(KeyCode::Char('j'), control_alt)),
@@ -451,7 +449,7 @@ fn control_is_screened_before_alt() {
     );
     assert_eq!(
         map_key(Focus::Viewport, chord(KeyCode::Char('d'), control_alt)),
-        Some(Action::Quit)
+        None
     );
     // ...and it never reaches the bare table, so it cannot approve.
     assert_eq!(
@@ -537,16 +535,25 @@ fn approval_decisions_require_the_approval_focus() {
             Some(expected),
             "{char:?} under the approval card"
         );
-        // The same letter elsewhere can only type text or do nothing.
+        // The same letter elsewhere can only type text or do nothing: `a`
+        // and `d` stay unbound in the viewport, while `i` edits there.
+        if char == 'i' {
+            assert_eq!(
+                map_key(Focus::Viewport, key(KeyCode::Char(char))),
+                Some(Action::Insert),
+                "{char:?} in the viewport edits, never decides"
+            );
+        } else {
+            assert_eq!(
+                map_key(Focus::Viewport, key(KeyCode::Char(char))),
+                None,
+                "{char:?} in the viewport is unbound"
+            );
+        }
         assert_eq!(
             map_key(Focus::Composer, key(KeyCode::Char(char))),
             Some(Action::Type(char)),
             "{char:?} in the composer is draft text"
-        );
-        assert_eq!(
-            map_key(Focus::Viewport, key(KeyCode::Char(char))),
-            None,
-            "{char:?} in the viewport is unbound"
         );
     }
 }

@@ -26,8 +26,10 @@
 //! | Viewport | `PageUp`/`PageDown` | Scroll one page |
 //! | Viewport | `Esc` | Back to the composer (never cancels) |
 //! | Viewport | `m` | Cycle the active model (admission order) |
+//! | Viewport | `i` | Edit in the composer (vim insert) |
+//! | Viewport | `o` | Edit in the composer on a fresh line (vim open-line) |
+//! | Viewport | `:` | Open the editable desktop command line |
 //! | Viewport | `Tab` | Switch focus |
-//! | Viewport | `q` | Quit (test-only convenience) |
 //! | Approval | `a` | Allow once (exact live call only) |
 //! | Approval | `d` | Deny without executing |
 //! | Approval | `i` | Open/close the expanded detail (inspection only) |
@@ -37,7 +39,6 @@
 //! | Approval | `Esc` | Close the expanded detail, else back to the composer |
 //! | Any | `Ctrl+C` | Clear the composer first; then cancel while cancellable (caller checks
 //! [`crate::AppState::can_cancel`]), else quit |
-//! | Any | `Ctrl+D` | Quit |
 //!
 //! Approval/deny intents are only produced while [`Focus::ApprovalCard`]
 //! owns the keyboard; the DO-NOT-COPY list (always-approve toggles,
@@ -98,6 +99,14 @@ pub enum Action {
     /// Cycle the active configured model. Bound in the viewport only, so
     /// the composer keeps typing `m` as ordinary text.
     CycleModel,
+    /// Focus the composer for editing (vim `insert`). Viewport only.
+    Insert,
+    /// Focus the composer and start a fresh line (vim `open-line`).
+    /// Viewport only.
+    OpenLine,
+    /// Open the editable viewport command line. Desktop commands are
+    /// parsed and executed only after Enter.
+    Colon,
     /// Cycle the active model variant. Bound in the composer and the
     /// viewport (plain `t` still types); never in the approval card, whose
     /// keys decide.
@@ -112,8 +121,6 @@ pub enum Action {
     /// Clear the composer if it holds a draft, else cancel streaming work
     /// or a pending approval.
     Cancel,
-    /// Leave the TUI.
-    Quit,
     /// Type a char into the composer.
     Type(char),
     /// Delete the last composer char.
@@ -143,7 +150,6 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Cancel),
-            KeyCode::Char('d') => Some(Action::Quit),
             KeyCode::Char('j') if focus == Focus::Composer => Some(Action::Newline),
             KeyCode::Char('t') if focus == Focus::Composer || focus == Focus::Viewport => {
                 Some(Action::CycleVariant)
@@ -174,8 +180,10 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
         (Focus::Viewport, KeyCode::PageUp) => Some(Action::PageUp),
         (Focus::Viewport, KeyCode::PageDown) => Some(Action::PageDown),
         (Focus::Viewport, KeyCode::Char('m')) => Some(Action::CycleModel),
+        (Focus::Viewport, KeyCode::Char('i')) => Some(Action::Insert),
+        (Focus::Viewport, KeyCode::Char('o')) => Some(Action::OpenLine),
+        (Focus::Viewport, KeyCode::Char(':')) => Some(Action::Colon),
         (Focus::Viewport, KeyCode::Tab) => Some(Action::FocusSwitch),
-        (Focus::Viewport, KeyCode::Char('q')) => Some(Action::Quit),
         (Focus::Viewport, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::ApprovalCard, KeyCode::Char('a')) => Some(Action::ApproveOnce),
         (Focus::ApprovalCard, KeyCode::Char('d')) => Some(Action::Deny),
@@ -280,13 +288,16 @@ mod tests {
             Some(Action::InspectApproval),
             "i opens the detail inspector under the approval card"
         );
-        // Outside the approval card, `i` is ordinary text or unbound: it can
-        // never open the inspector or decide anything.
+        // Outside the approval card, `i` is ordinary text or viewport
+        // editing: it can never open the inspector or decide anything.
         assert_eq!(
             map_key(Focus::Composer, key(KeyCode::Char('i'))),
             Some(Action::Type('i'))
         );
-        assert_eq!(map_key(Focus::Viewport, key(KeyCode::Char('i'))), None);
+        assert_eq!(
+            map_key(Focus::Viewport, key(KeyCode::Char('i'))),
+            Some(Action::Insert)
+        );
         assert_ne!(
             map_key(Focus::Viewport, key(KeyCode::Char('i'))),
             Some(Action::InspectApproval)
@@ -356,10 +367,9 @@ mod tests {
 
     #[test]
     #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
-    fn ctrl_c_cancels_from_any_focus_ctrl_d_quits() {
+    fn ctrl_c_cancels_from_any_focus() {
         for focus in [Focus::Composer, Focus::Viewport, Focus::ApprovalCard] {
             assert_eq!(map_key(focus, ctrl('c')), Some(Action::Cancel));
-            assert_eq!(map_key(focus, ctrl('d')), Some(Action::Quit));
         }
     }
 

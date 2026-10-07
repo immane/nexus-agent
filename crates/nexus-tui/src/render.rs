@@ -16,7 +16,7 @@
 //! the first row). The footer and card titles name the key.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -398,7 +398,84 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
         ..state.pointer_geometry()
     });
     render_footer(state, regions.footer, buf, focus);
+    render_completions(state, area, regions.composer, buf);
     render_overlay(state, area, buf);
+}
+
+/// Renders completion candidates next to the input that owns them. Command
+/// suggestions sit immediately above the composer. This keeps both editable
+/// text areas and the footer unobscured.
+fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Buffer) {
+    let items = state.completions();
+    if items.is_empty() || area.width < 16 {
+        return;
+    }
+    let command_mode = state.command_line().is_some();
+    // Keep both the composer draft and the footer command line unobscured.
+    // The popup occupies the viewport immediately above the composer.
+    let anchor_y = composer.y;
+    let available = anchor_y.saturating_sub(area.y.saturating_add(1));
+    if available < 3 {
+        return;
+    }
+    let rows = items.len().min(5).min(available.saturating_sub(2) as usize);
+    if rows == 0 {
+        return;
+    }
+    let height = rows as u16 + 2;
+    let width = area.width.min(72);
+    let popup = Rect::new(area.x, anchor_y.saturating_sub(height), width, height);
+    Clear.render(popup, buf);
+    for y in popup.top()..popup.bottom() {
+        for x in popup.left()..popup.right() {
+            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray).bg(Color::Black))
+        .title(if command_mode {
+            " commands "
+        } else {
+            " project files "
+        })
+        .title_bottom(" ↑↓ move · Enter/Tab insert · Esc close ");
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let first = state.completion_window_start(rows);
+    for (row, (index, item)) in items.iter().enumerate().skip(first).take(rows).enumerate() {
+        let selected = state.completion_is_selected(index);
+        let background = if selected {
+            Color::DarkGray
+        } else {
+            Color::Black
+        };
+        let mut spans = vec![Span::styled(
+            item.label.as_str(),
+            Style::default()
+                .fg(if selected {
+                    Color::LightYellow
+                } else {
+                    Color::White
+                })
+                .bg(background)
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )];
+        if !item.info.is_empty() {
+            spans.push(Span::styled(
+                format!("  ·  {}", item.info),
+                Style::default().fg(Color::Gray).bg(background),
+            ));
+        }
+        Paragraph::new(Line::from(spans)).render(
+            Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+            buf,
+        );
+    }
 }
 
 /// Centered modal dialog, painted last so it sits above every region.
@@ -426,9 +503,17 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
         height,
     );
     Clear.render(popup, buf);
+    // Opaque backdrop: cleared cells would otherwise let a transparent
+    // terminal background (wallpaper, compositor blur) show through the
+    // dialog, mixing it with the conversation behind it.
+    for y in popup.top()..popup.bottom() {
+        for x in popup.left()..popup.right() {
+            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+        }
+    }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
+        .border_style(Style::default().fg(Color::Green).bg(Color::Black))
         .title(" model ")
         .title_bottom(" ↑↓ navigate · enter select · esc close ");
     let inner = block.inner(popup);
@@ -982,7 +1067,7 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         // The hint never moves: the caret covers its first character
         // instead of taking a cell of its own, so blinking cannot make
         // the invitation jump back and forth.
-        let hint = "Type a task or /help for commands";
+        let hint = "Type a task · : commands · @ project files";
         let dim = Style::default().add_modifier(Modifier::DIM);
         if show_caret {
             let mut chars = hint.chars();
@@ -1029,51 +1114,26 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
 }
 
 fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
-    let cancel_hint = if state.can_cancel() {
-        "ctrl+c cancel"
+    let status = if state.can_cancel() {
+        state.status()
     } else {
         "idle"
     };
-    let approval_hint = if state.approval_detail_open() {
-        " [i] close · pgup/pgdn "
-    } else if state.pending_approval().is_some() {
-        " [i] inspect "
-    } else {
-        ""
-    };
-    let mut spans = vec![
-        Span::raw(FOOTER_TAG),
-        Span::styled(cancel_hint, Style::default().fg(Color::Yellow)),
-        Span::styled(approval_hint, Style::default().fg(Color::Yellow)),
-        Span::raw(" tab · enter · ↑↓ select · m model · approval i/a/d · ctrl+d quit "),
-        Span::raw(
-            format!(
-                "stale:{} seq:{} dropped:{}",
-                state.stale_rejected, state.seq_rejected, state.dropped_entries
-            )
-            .to_lowercase(),
-        ),
-    ];
-    // Context usage trails every existing segment, so frames without
-    // observed usage render byte-identically and narrow frames clip the
-    // counters before any status marker. Unknown stays `?`, never zero.
-    if let Some(usage) = state.last_usage() {
-        spans.push(Span::raw(format!(
-            " ctx in:{} out:{}",
-            counter(usage.input_tokens()),
-            counter(usage.output_tokens())
-        )));
-    }
-    let footer = Paragraph::new(Line::from(spans));
-    footer.render(area, buf);
-}
+    let right_text = format!("{FOOTER_TAG}{status}");
+    let right_width = display_width(&right_text).min(area.width as usize) as u16;
+    Paragraph::new(right_text)
+        .alignment(Alignment::Right)
+        .render(area, buf);
 
-/// Renders an optional usage counter: the exact number, or `?` for
-/// unknown. Unknown is never fabricated as zero.
-fn counter(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "?".to_owned())
+    if let Some(command) = state.command_line() {
+        let text = format!(":{command}▊");
+        let left_width = area.width.saturating_sub(right_width);
+        if left_width > 0 {
+            Paragraph::new(text)
+                .style(Style::default().fg(Color::Yellow))
+                .render(Rect::new(area.x, area.y, left_width, area.height), buf);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1477,10 +1537,7 @@ mod tests {
             state.approval_decision_allowed(),
             "fully visible card may be decided"
         );
-        assert!(
-            frame.contains("[i] inspect"),
-            "footer names the inspect key while an approval is pending"
-        );
+        assert!(frame.contains("v0.1.1-alpha"), "footer remains present");
     }
 
     #[test]
@@ -1488,25 +1545,20 @@ mod tests {
         let (mut state, mut terminal) = harness(120, 24);
         started(&mut state, 0);
         draw(&mut state, &mut terminal, Focus::ApprovalCard);
-        assert!(
-            !screen(&terminal).contains("[i] inspect"),
-            "no inspect hint without a live approval"
-        );
+        assert!(screen(&terminal).contains("v0.1.1-alpha"));
         assert!(state.apply_event(&approval_event(1, "run tool host_write", "project scope")));
         draw(&mut state, &mut terminal, Focus::ApprovalCard);
         let compact = screen(&terminal);
         assert!(
-            compact.contains("[i] inspect"),
-            "pending approval names inspect"
+            compact.contains("v0.1.1-alpha"),
+            "minimal footer stays visible"
         );
-        assert!(compact.contains("approval i/a/d"), "footer lists i/a/d");
         state.inspect_approval();
         draw(&mut state, &mut terminal, Focus::ApprovalCard);
         let expanded = screen(&terminal);
-        assert!(expanded.contains("[i] close"), "open detail names close");
         assert!(
-            expanded.contains("i/esc close"),
-            "expanded title names the close keys"
+            expanded.contains("approval detail"),
+            "expanded detail remains visible"
         );
     }
 
@@ -1554,10 +1606,7 @@ mod tests {
             "clipped card cannot be approved"
         );
         assert!(frame.contains("detail clipped"), "clip is explicit");
-        assert!(
-            frame.contains("[i] inspect"),
-            "clipped card names the inspect key"
-        );
+        assert!(frame.contains("v0.1.1-alpha"), "footer remains visible");
         assert!(
             !frame.contains("[a] allow once"),
             "no decision affordance on a clipped card"
@@ -2388,30 +2437,57 @@ mod cov_render_private {
             "an idle run offers no cancel: {footer:?}"
         );
         assert!(!footer.contains("[i]"), "{footer:?}");
-        assert!(footer.contains("stale:0 seq:0 dropped:0"), "{footer:?}");
+        assert_eq!(footer.trim_start(), "v0.1.1-alpha idle", "{footer:?}");
 
         assert!(state.apply_event(&started(0)));
         let footer = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.contains("ctrl+c cancel"), "{footer:?}");
+        assert_eq!(footer.trim_start(), "v0.1.1-alpha running", "{footer:?}");
 
         assert!(state.apply_event(&approval(1, "run tool host_write", "project scope")));
         let footer = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.contains("[i] inspect"), "{footer:?}");
-        assert!(footer.contains("approval i/a/d"), "{footer:?}");
+        assert!(
+            footer.trim_end().ends_with("awaiting approval"),
+            "{footer:?}"
+        );
 
         state.inspect_approval();
         let footer = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.contains("[i] close"), "{footer:?}");
-        assert!(footer.contains("pgup/pgdn"), "{footer:?}");
+        assert!(
+            footer.trim_end().ends_with("awaiting approval"),
+            "{footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_marks_a_pending_colon_command() {
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 160, 1);
+        let plain = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(!plain.trim_end().ends_with(" :"), "{plain:?}");
+        state.arm_colon();
+        let armed = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(armed.trim_start().starts_with(":▊"), "{armed:?}");
+        assert!(armed.trim_end().ends_with("v0.1.1-alpha idle"), "{armed:?}");
+        assert!(
+            armed.find(":▊").expect("left command")
+                < armed.find("v0.1.1-alpha").expect("right status"),
+            "command precedes version/status: {armed:?}"
+        );
     }
 
     #[test]
@@ -2542,6 +2618,42 @@ mod cov_render_private {
     }
 
     #[test]
+    fn completion_candidates_render_above_the_footer() {
+        let mut state = AppState::new();
+        state.arm_colon();
+        state.set_completion_items(vec![
+            crate::state::CompletionItem {
+                insert: "model".to_owned(),
+                label: "model".to_owned(),
+                info: "Select or inspect the active model".to_owned(),
+            },
+            crate::state::CompletionItem {
+                insert: "model set ".to_owned(),
+                label: "model set".to_owned(),
+                info: "Set an exact configured model ID".to_owned(),
+            },
+        ]);
+        let area = Rect::new(0, 0, 80, 16);
+        let composer = Rect::new(0, 12, 80, 3);
+        let footer = Rect::new(0, 15, 80, 1);
+        let rows = rows_of(area, |buf| render_completions(&state, area, composer, buf));
+        assert!(rows.iter().any(|row| row.contains("commands")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("model set") && row.contains("Set an exact")),
+            "{rows:?}"
+        );
+        assert!(
+            rows[composer.y as usize].trim().is_empty(),
+            "popup does not paint over the composer: {rows:?}"
+        );
+        assert!(
+            !rows[footer.y as usize].contains("model"),
+            "footer stays clear: {rows:?}"
+        );
+    }
+
+    #[test]
     fn model_picker_lists_choices_and_marks_the_cursor() {
         let mut state = AppState::new();
         state.set_active_model(Some("m0".to_owned()), Some("demo-provider".to_owned()));
@@ -2605,6 +2717,26 @@ mod cov_render_private {
             !rows.iter().any(|row| row.contains("(no matches)")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn model_picker_paints_an_opaque_backdrop() {
+        use ratatui::style::Color;
+        let mut state = AppState::new();
+        state.open_model_picker(picker_choices());
+        // Two choices at 80x24 center a 56x5 dialog at (12, 9).
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        render_overlay(&state, area, &mut buffer);
+        for (x, y, symbol) in [(12, 9, "┌"), (67, 9, "┐"), (12, 13, "└")] {
+            let cell = buffer.get(x, y);
+            assert_eq!(cell.symbol(), symbol, "dialog corner at ({x}, {y})");
+            assert_eq!(
+                cell.bg,
+                Color::Black,
+                "the dialog covers the conversation behind it at ({x}, {y})"
+            );
+        }
     }
 
     #[test]
@@ -3063,7 +3195,7 @@ mod cov_render_private {
     }
 
     #[test]
-    fn footer_shows_observed_usage_and_never_zeroes_unknown() {
+    fn footer_stays_minimal_when_usage_changes() {
         use nexus_core::{EventPayload, RunEvent, RunId, SessionId, Usage, UsageFinality};
         let mut state = AppState::new();
         let area = Rect::new(0, 0, 200, 1);
@@ -3087,12 +3219,12 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(shown.contains("ctx in:10 out:?"), "{shown:?}");
+        assert!(shown.trim_end().ends_with("running"), "{shown:?}");
         assert!(state.apply_event(&usage(2, Some(10), Some(3))));
         let shown = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(shown.contains("ctx in:10 out:3"), "{shown:?}");
+        assert!(shown.trim_end().ends_with("running"), "{shown:?}");
     }
 }

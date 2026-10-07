@@ -57,9 +57,9 @@ use nexus_tools::{
 };
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate, SessionArgs,
-    SlashCommand, TOAST_TTL, TextSelection, cancel_command, cell_to_char_col, install_panic_hook,
-    map_key, next_focus, render, submit_command,
+    Action, AppState, CompletionItem, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate,
+    SessionArgs, SlashCommand, TOAST_TTL, TextSelection, cancel_command, cell_to_char_col,
+    install_panic_hook, map_key, next_focus, render, submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -969,13 +969,15 @@ struct Frontend {
     /// right after [`Frontend::with_config`] and refresh it on every
     /// model switch so the next run resolves the new selection.
     live: Option<LiveHandle>,
-    /// Queued `/session` intents in recording order: key handling appends on
+    /// Queued `:session` intents in recording order: key handling appends on
     /// the active front, and the loop drains them against the registry after
     /// the batch, where runtimes can be built. At most one push per Enter
     /// keypress, drained every tick, so the queue stays tiny.
     pending_session_cmds: Vec<SessionArgs>,
     /// Stable tool-card identity; committed on release, never on a drag.
     pointer_press: Option<usize>,
+    /// First `g` in a viewport `gg` jump is waiting for its second key.
+    g_pending: bool,
 }
 
 impl Frontend {
@@ -998,6 +1000,7 @@ impl Frontend {
             live: None,
             pending_session_cmds: Vec::new(),
             pointer_press: None,
+            g_pending: false,
         }
     }
 
@@ -1122,6 +1125,144 @@ impl Frontend {
         }
     }
 
+    /// Opens the searchable model picker over the configured models, or
+    /// reports that nothing is configured. Shared by bare `:model` and `:m`.
+    fn open_model_picker(&mut self) {
+        let choices: Vec<ModelChoice> = self
+            .config
+            .models()
+            .iter()
+            .map(|entry| ModelChoice {
+                id: entry.id.clone(),
+                provider: entry.provider.clone(),
+            })
+            .collect();
+        if choices.is_empty() {
+            self.state.notice("no configured models");
+        } else {
+            self.state.open_model_picker(choices);
+        }
+    }
+
+    fn refresh_command_completions(&mut self) {
+        let Some(input) = self.state.command_line() else {
+            self.state.clear_completions();
+            return;
+        };
+        let mut candidates: Vec<(String, String)> = vec![
+            (
+                "help".into(),
+                "Show desktop commands and keyboard help".into(),
+            ),
+            ("m".into(), "Open the model picker".into()),
+            ("model".into(), "Select or inspect the active model".into()),
+            (
+                "usage".into(),
+                "Show observed input/output token usage".into(),
+            ),
+            ("session".into(), "Show or manage local sessions".into()),
+            ("s".into(), "List sessions".into()),
+            ("q".into(), "Quit the TUI".into()),
+        ];
+        if input.starts_with("model ") {
+            candidates.clear();
+            candidates.extend([
+                (
+                    "model set ".into(),
+                    "Set an exact configured model ID".into(),
+                ),
+                ("model help".into(), "Show model command usage".into()),
+            ]);
+            if let Some(prefix) = input.strip_prefix("model set ") {
+                candidates.extend(
+                    self.config
+                        .models()
+                        .iter()
+                        .map(|model| {
+                            (
+                                format!("model set {}", model.id),
+                                format!("Use model from {}", model.provider),
+                            )
+                        })
+                        .filter(|(candidate, _)| {
+                            candidate.starts_with(&format!("model set {prefix}"))
+                        }),
+                );
+            }
+        } else if input == "s" {
+            candidates = vec![
+                ("s".into(), "List sessions".into()),
+                ("session".into(), "Show or manage local sessions".into()),
+            ];
+        } else if input.starts_with("session ") {
+            candidates = vec![
+                (
+                    "session new".into(),
+                    "Create and switch to a new session".into(),
+                ),
+                ("session list".into(), "List available sessions".into()),
+                (
+                    "session switch ".into(),
+                    "Switch to a session by index or ID".into(),
+                ),
+            ];
+        }
+        candidates.retain(|(candidate, _)| candidate.starts_with(input));
+        self.state.set_completion_items(
+            candidates
+                .into_iter()
+                .map(|(insert, info)| CompletionItem {
+                    label: insert.clone(),
+                    insert,
+                    info,
+                })
+                .collect(),
+        );
+    }
+
+    fn refresh_file_completions(&mut self) {
+        let Some((_, _, query)) = self.state.composer_at_token() else {
+            self.state.clear_completions();
+            return;
+        };
+        let Some(root) = self.state.project_dir() else {
+            self.state.clear_completions();
+            return;
+        };
+        self.state.set_completion_items(
+            find_project_paths(std::path::Path::new(root), &query)
+                .into_iter()
+                .map(|path| CompletionItem {
+                    info: if path.ends_with('/') {
+                        "Directory · continue path".to_owned()
+                    } else {
+                        "Project file · reference only".to_owned()
+                    },
+                    label: path.clone(),
+                    insert: path,
+                })
+                .collect(),
+        );
+    }
+
+    fn accept_completion(&mut self) {
+        let Some(candidate) = self
+            .state
+            .selected_completion()
+            .map(|candidate| candidate.insert.clone())
+        else {
+            return;
+        };
+        if self.state.command_line().is_none()
+            && let Some((start, end, _)) = self.state.composer_at_token()
+        {
+            self.state.complete_composer_token(start, end, &candidate);
+            return;
+        }
+        self.state.set_command_line(candidate);
+        self.state.clear_completions();
+    }
+
     /// Mirrors the selected model (and its provider, when the id still
     /// resolves) into presentation state. Unknown ids clear the display
     /// instead of showing a stale name.
@@ -1210,6 +1351,7 @@ impl Frontend {
             }
             if terminal {
                 self.focus = Focus::Composer;
+                self.state.clear_colon();
                 // The run completed, so this model is genuinely "used":
                 // record it before the notice history moves on.
                 self.record_active_model_use();
@@ -1221,6 +1363,7 @@ impl Frontend {
             // open dialog steps aside so its keys cannot shadow the
             // decision shortcuts.
             self.state.dismiss_overlay();
+            self.state.clear_colon();
             self.focus = Focus::ApprovalCard;
         }
         false
@@ -1531,7 +1674,113 @@ fn write_osc52(text: &str) -> bool {
     write!(stdout, "\x1b]52;c;{encoded}\x07").is_ok() && stdout.flush().is_ok()
 }
 
+/// Bounded, symlink-free path completion beneath the canonical project root.
+/// It only returns relative names; it never opens or attaches file contents.
+fn find_project_paths(root: &std::path::Path, query: &str) -> Vec<String> {
+    use std::time::{Duration, Instant};
+    const MAX_VISITED: usize = 1_000;
+    const MAX_DEPTH: usize = 5;
+    const MAX_RESULTS: usize = 10;
+    const BUDGET: Duration = Duration::from_millis(12);
+    const EXCLUDED: &[&str] = &[
+        ".git",
+        ".nexus",
+        ".next",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "target",
+        "vendor",
+    ];
+
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return Vec::new();
+    };
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let query = query.to_lowercase();
+    let started = Instant::now();
+    let mut visited = 0usize;
+    let mut stack = vec![(root.clone(), String::new(), 0usize)];
+    let mut matches = Vec::<(bool, String)>::new();
+    while let Some((directory, prefix, depth)) = stack.pop() {
+        if visited >= MAX_VISITED || started.elapsed() >= BUDGET {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        let remaining = MAX_VISITED.saturating_sub(visited);
+        let mut entries: Vec<_> = entries
+            .take(remaining.saturating_add(1))
+            .filter_map(Result::ok)
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            visited += 1;
+            if visited > MAX_VISITED || started.elapsed() >= BUDGET {
+                break;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name.is_empty()
+                || name.chars().any(|char| {
+                    char.is_control()
+                        || nexus_tui::sanitize::sanitize(&char.to_string()) != char.to_string()
+                })
+            {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // file_type does not follow symlinks; symlink targets are never
+            // traversed or offered as paths.
+            if file_type.is_symlink() {
+                continue;
+            }
+            let relative = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let is_dir = file_type.is_dir();
+            if !is_dir || depth < MAX_DEPTH {
+                let needle = relative.to_lowercase();
+                if query.is_empty() || needle.contains(&query) {
+                    let display = if is_dir {
+                        format!("{relative}/")
+                    } else {
+                        relative.clone()
+                    };
+                    matches.push((needle.starts_with(&query), display));
+                }
+            }
+            if is_dir && depth < MAX_DEPTH && !EXCLUDED.contains(&name.as_str()) {
+                stack.push((entry.path(), relative, depth + 1));
+            }
+        }
+    }
+    matches.sort_by(|(prefix_a, path_a), (prefix_b, path_b)| {
+        prefix_b.cmp(prefix_a).then_with(|| path_a.cmp(path_b))
+    });
+    matches
+        .into_iter()
+        .take(MAX_RESULTS)
+        .map(|(_, path)| path)
+        .collect()
+}
+
 fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
+    // The mouse never completes a `:` command: a press disarms it so a
+    // later letter cannot fire behind a click.
+    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+        front.state.clear_colon();
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             front.pointer_press = None;
@@ -1653,7 +1902,7 @@ async fn handle_key_batch(
     })
 }
 
-/// Executes a local slash command. Returns true only when the loop must
+/// Executes a local desktop command. Returns true only when the loop must
 /// exit (`/quit`); everything else answers inline and keeps the session
 /// alive. Model switches reuse the same admission-order selection as the
 /// `m` key, so both paths always agree on what is active. Session commands
@@ -1665,22 +1914,9 @@ fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
             false
         }
         SlashCommand::Model(None) => {
-            // Bare `/model` opens the searchable picker; the exact-name
+            // Bare `:model` opens the searchable picker; the exact-name
             // form below stays for direct switches.
-            let choices: Vec<ModelChoice> = front
-                .config
-                .models()
-                .iter()
-                .map(|entry| ModelChoice {
-                    id: entry.id.clone(),
-                    provider: entry.provider.clone(),
-                })
-                .collect();
-            if choices.is_empty() {
-                front.state.notice("no configured models");
-            } else {
-                front.state.open_model_picker(choices);
-            }
+            front.open_model_picker();
             false
         }
         SlashCommand::Model(Some(name)) => {
@@ -1708,7 +1944,7 @@ fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
         SlashCommand::Unknown(word) => {
             front
                 .state
-                .notice(&format!("unknown command /{word} — type /help"));
+                .notice(&format!("unknown command :{word} — type :help"));
             false
         }
         SlashCommand::Session(args) => {
@@ -1730,7 +1966,7 @@ fn handle_slash(front: &mut Frontend, command: SlashCommand) -> bool {
 /// from growing either without bound.
 const MAX_SESSIONS: usize = 16;
 
-/// Executes a `/session` command against the registry. Returns true only
+/// Executes a `:session` command against the registry. Returns true only
 /// when the loop must exit (never for session commands: they always answer
 /// inline and keep every session alive).
 fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) -> bool {
@@ -1782,7 +2018,7 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
                     .active_mut()
                     .front
                     .state
-                    .notice(&format!("unknown session {target} — type /session list"));
+                    .notice(&format!("unknown session {target} — type :session list"));
                 false
             }
             Some(index) => {
@@ -1829,23 +2065,15 @@ fn settle_submit(front: &mut Frontend, draft: &str, reply: &CommandResponse) -> 
     true
 }
 
-/// Handles one key event. Returns true when the TUI should exit.
-/// Routes one key event to the open modal dialog. Returns true only when
-/// the loop must exit (`Ctrl+D`); every other key is consumed by the
-/// dialog, so composer, viewport, and approval shortcuts cannot fire
-/// behind it. `Esc` dismisses without applying. (`Ctrl+C` never reaches
-/// here: the caller falls through to the normal cancel path so
+/// Routes one key event to the open modal dialog. Every key is consumed
+/// by the dialog, so composer, viewport, and approval shortcuts cannot
+/// fire behind it. `Esc` dismisses without applying. (`Ctrl+C` never
+/// reaches here: the caller falls through to the normal cancel path so
 /// cancellation stays responsive while a dialog is open.)
 fn handle_overlay_key(front: &mut Frontend, key: KeyEvent) -> bool {
     use crossterm::event::KeyCode;
     if key.kind != KeyEventKind::Press {
         return false;
-    }
-    if key
-        .modifiers
-        .contains(crossterm::event::KeyModifiers::CONTROL)
-    {
-        return matches!(key.code, KeyCode::Char('d'));
     }
     if !key.modifiers.is_empty() {
         return false;
@@ -1881,7 +2109,7 @@ fn move_picker(front: &mut Frontend, delta: isize) {
 
 /// Confirms the highlighted picker row: maps the cursor through the live
 /// filtered matches onto the snapshot id, then runs the same exact-id
-/// selection as `/model <name>`. An empty match list just dismisses.
+/// selection as `:model set <name>`. An empty match list just dismisses.
 fn confirm_model_picker(front: &mut Frontend) {
     let matches = front.state.picker_matches();
     let id = front
@@ -1906,7 +2134,169 @@ fn is_overlay_cancel(key: KeyEvent) -> bool {
         && matches!(key.code, crossterm::event::KeyCode::Char('c'))
 }
 
+/// Viewport-only Vim navigation. `None` leaves the key to the ordinary
+/// focus map; `Some` means it was consumed.
+fn handle_vim_viewport_key(front: &mut Frontend, key: KeyEvent) -> Option<bool> {
+    if front.focus != Focus::Viewport || key.kind != KeyEventKind::Press {
+        front.g_pending = false;
+        return None;
+    }
+    let height = front.state.viewport_height().max(1);
+    if key
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        front.g_pending = false;
+        return match key.code {
+            crossterm::event::KeyCode::Char('f') => {
+                front.state.scroll_down(height);
+                Some(false)
+            }
+            crossterm::event::KeyCode::Char('b') => {
+                front.state.scroll_up(height);
+                Some(false)
+            }
+            crossterm::event::KeyCode::Char('d') => {
+                front.state.scroll_down((height / 2).max(1));
+                Some(false)
+            }
+            crossterm::event::KeyCode::Char('u') => {
+                front.state.scroll_up((height / 2).max(1));
+                Some(false)
+            }
+            _ => None,
+        };
+    }
+    let shift_only = key.modifiers == crossterm::event::KeyModifiers::SHIFT;
+    if !key.modifiers.is_empty() && !shift_only {
+        front.g_pending = false;
+        return None;
+    }
+    let code = key.code;
+    if front.g_pending {
+        front.g_pending = false;
+        if code == crossterm::event::KeyCode::Char('g') {
+            front
+                .state
+                .scroll_landmark(nexus_tui::ViewportLandmark::Top);
+            return Some(false);
+        }
+    }
+    match code {
+        crossterm::event::KeyCode::Char('g') => {
+            front.g_pending = true;
+            Some(false)
+        }
+        crossterm::event::KeyCode::Char('G') => {
+            front
+                .state
+                .scroll_landmark(nexus_tui::ViewportLandmark::Bottom);
+            Some(false)
+        }
+        crossterm::event::KeyCode::Char('H') => {
+            front
+                .state
+                .scroll_landmark(nexus_tui::ViewportLandmark::Top);
+            Some(false)
+        }
+        crossterm::event::KeyCode::Char('M') => {
+            front
+                .state
+                .scroll_landmark(nexus_tui::ViewportLandmark::Middle);
+            Some(false)
+        }
+        crossterm::event::KeyCode::Char('L') => {
+            front
+                .state
+                .scroll_landmark(nexus_tui::ViewportLandmark::Bottom);
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// Handles one key event. Returns true when the TUI should exit.
 async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> bool {
+    if !front.state.colon_pending()
+        && !front.state.overlay_open()
+        && let Some(quit) = handle_vim_viewport_key(front, key)
+    {
+        return quit;
+    }
+    // The viewport command line owns input until Enter executes or Esc
+    // dismisses it. No command has side effects while being typed.
+    if front.state.colon_pending() {
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+            && key.code == crossterm::event::KeyCode::Char('c')
+        {
+            front.state.clear_colon();
+            return false;
+        }
+        if key.code == crossterm::event::KeyCode::Esc && !front.state.completions().is_empty() {
+            front.state.clear_completions();
+            return false;
+        }
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        match key.code {
+            crossterm::event::KeyCode::Esc => front.state.clear_colon(),
+            crossterm::event::KeyCode::Backspace => {
+                front.state.command_line_backspace();
+                front.refresh_command_completions();
+            }
+            crossterm::event::KeyCode::Char(char) => {
+                front.state.command_line_push(char);
+                front.refresh_command_completions();
+            }
+            crossterm::event::KeyCode::Up => front.state.move_completion(-1),
+            crossterm::event::KeyCode::Down => front.state.move_completion(1),
+            crossterm::event::KeyCode::Tab => front.accept_completion(),
+            crossterm::event::KeyCode::Enter => {
+                if !front.state.completions().is_empty() {
+                    front.accept_completion();
+                    return false;
+                }
+                let command = front.state.take_command_line().unwrap_or_default();
+                let input = format!(":{command}");
+                if let Some(command) = SlashCommand::parse(&input) {
+                    return handle_slash(front, command);
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if !front.state.completions().is_empty() {
+        match key.code {
+            crossterm::event::KeyCode::Up if front.focus == Focus::Composer => {
+                front.state.move_completion(-1);
+                return false;
+            }
+            crossterm::event::KeyCode::Down if front.focus == Focus::Composer => {
+                front.state.move_completion(1);
+                return false;
+            }
+            crossterm::event::KeyCode::Tab if front.focus == Focus::Composer => {
+                front.accept_completion();
+                return false;
+            }
+            crossterm::event::KeyCode::Enter if front.focus == Focus::Composer => {
+                front.accept_completion();
+                return false;
+            }
+            crossterm::event::KeyCode::Esc => {
+                front.state.clear_completions();
+                return false;
+            }
+            _ => {}
+        }
+    }
     // A modal dialog owns the keyboard: nothing falls through to the
     // composer, viewport, or approval shortcuts while it is open, except
     // `Ctrl+C`, which dismisses the dialog and continues into the normal
@@ -1916,6 +2306,7 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
     }
     if is_overlay_cancel(key) {
         front.state.dismiss_overlay();
+        front.state.clear_colon();
     }
     let directory_approval = front.focus == Focus::ApprovalCard
         && key.kind == KeyEventKind::Press
@@ -1933,15 +2324,6 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
         Action::Submit => {
             if front.state.composer().trim().is_empty() {
                 return false;
-            }
-            let draft = front.state.composer().to_owned();
-            if let Some(command) = SlashCommand::parse(&draft) {
-                // Slash commands route locally: the draft is recorded and
-                // cleared like any submit, but no runtime command is issued
-                // and the run slot is untouched.
-                front.state.record_submitted(&draft);
-                front.state.composer_take();
-                return handle_slash(front, command);
             }
             let request = front.next_request();
             let read_only = front.state.mode().read_only;
@@ -1963,14 +2345,28 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
                 Err(_) => front.state.notice("submit rejected: input invalid"),
             }
         }
-        Action::Newline => front.state.composer_newline(),
-        Action::Type(char) => front.state.composer_type(char),
+        Action::Newline => {
+            front.state.composer_newline();
+            front.state.clear_completions();
+        }
+        Action::Type(char) => {
+            front.state.composer_type(char);
+            front.refresh_file_completions();
+        }
         Action::Backspace => {
             front.state.composer_backspace();
+            front.refresh_file_completions();
         }
-        Action::CaretLeft => front.state.caret_left(),
-        Action::CaretRight => front.state.caret_right(),
+        Action::CaretLeft => {
+            front.state.caret_left();
+            front.refresh_file_completions();
+        }
+        Action::CaretRight => {
+            front.state.caret_right();
+            front.refresh_file_completions();
+        }
         Action::FocusSwitch => {
+            front.state.clear_colon();
             let pending = front.state.pending_approval().is_some();
             front.focus = next_focus(front.focus, pending);
         }
@@ -1982,6 +2378,7 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
         }
         Action::ParkFocus => {
             front.state.clear_text_selection();
+            front.state.clear_colon();
             // Step back one rung, never cancelling or deciding: an open
             // detail just closes (the card keeps focus so allow/deny stay
             // one keypress away), the composer parks in the viewport for
@@ -2042,6 +2439,19 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             }
         }
         Action::CycleModel => front.cycle_model(),
+        Action::Insert => {
+            front.state.clear_colon();
+            front.focus = Focus::Composer;
+        }
+        Action::OpenLine => {
+            front.state.clear_colon();
+            front.focus = Focus::Composer;
+            front.state.composer_newline();
+        }
+        Action::Colon => {
+            front.state.arm_colon();
+            front.refresh_command_completions();
+        }
         Action::CycleVariant => {
             // Display-only: the title names the new variant at once.
             front.state.cycle_variant();
@@ -2129,7 +2539,6 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
                 None => front.state.notice("nothing cancellable"),
             }
         }
-        Action::Quit => return true,
     }
     false
 }
@@ -2146,7 +2555,7 @@ struct InteractiveReport {
 /// further tasks can be submitted; it exits on quit, channel close, or
 /// error, cancelling live work first. Conversations live in a session
 /// registry: the first slot serves the canned submission, further slots
-/// arrive through `/session new`, and only the active slot is polled.
+/// arrive through `:session new`, and only the active slot is polled.
 async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
@@ -2795,9 +3204,13 @@ mod tests {
         assert!(!batch.quit);
         assert_eq!(index, MAX_KEYS_PER_TICK, "the batch stops at the bound");
 
+        // The vim `:q` sequence ends the batch at once.
+        front.focus = Focus::Viewport;
         let quit_keys = [
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
             KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()),
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
         ];
         let mut index = 0;
         let batch = handle_key_batch(
@@ -2816,7 +3229,7 @@ mod tests {
         .await
         .expect("key source never fails");
         assert!(batch.quit);
-        assert_eq!(batch.handled, 2);
+        assert_eq!(batch.handled, 3);
     }
 
     #[tokio::test]
@@ -3417,15 +3830,14 @@ mod cov_main_private {
         assert!(front.merger.active_run().is_none());
         assert_eq!(user_line_count(&front), 0);
 
-        // `Ctrl+D` leaves the loop from any focus.
+        // The vim `:q` sequence leaves the loop from the viewport.
+        front.focus = Focus::Viewport;
         assert!(
-            handle_key(
-                &mut front,
-                &runtime,
-                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
-            )
-            .await
+            !handle_key(&mut front, &runtime, press(KeyCode::Char(':'))).await,
+            "arming consumes the colon"
         );
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('q'))).await);
+        assert!(handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
 
         // `Ctrl+C` with a non-empty draft clears it first instead of
         // cancelling or quitting; the next press exits when idle.
@@ -3554,8 +3966,11 @@ mod cov_main_private {
         assert!(!batch.quit);
 
         // A quit ends the batch at once: the rest of the burst is unread.
+        front.focus = Focus::Viewport;
         let burst = [
-            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            press(KeyCode::Char(':')),
+            press(KeyCode::Char('q')),
+            press(KeyCode::Enter),
             press(KeyCode::F(1)),
         ];
         let mut index = 0;
@@ -3572,8 +3987,8 @@ mod cov_main_private {
         .await
         .expect("key source never fails");
         assert!(batch.quit, "the loop exits on the quit key");
-        assert_eq!(batch.handled, 1);
-        assert_eq!(index, 1, "no key after the quit is handled");
+        assert_eq!(batch.handled, 3);
+        assert_eq!(index, 3, "no key after the quit is handled");
 
         // A failing key source surfaces as an error, never a silent empty batch.
         let failed = handle_key_batch(
@@ -3607,26 +4022,27 @@ mod cov_main_private {
         assert!(front.merger.active_run().is_some());
 
         // The user quits before any event has been merged.
-        let mut read = false;
+        front.focus = Focus::Viewport;
+        let quit_keys = [
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        ];
+        let mut index = 0;
         let batch = handle_key_batch(
             &mut front,
             &runtime,
             || {
-                if read {
-                    return Ok(None);
-                }
-                read = true;
-                Ok(Some(Input::Key(KeyEvent::new(
-                    KeyCode::Char('d'),
-                    KeyModifiers::CONTROL,
-                ))))
+                let key = quit_keys.get(index).copied().map(Input::Key);
+                index += 1;
+                Ok(key)
             },
             MAX_KEYS_PER_TICK,
         )
         .await
         .expect("key source never fails");
         assert!(batch.quit);
-        assert_eq!(batch.handled, 1);
+        assert_eq!(batch.handled, 3);
         assert!(
             !front.merger.is_finalized(),
             "quitting early leaves the run live"
@@ -4044,7 +4460,7 @@ mod cov_main_topup {
 
         assert!(!handle_session_command(&mut sessions, &SessionArgs::Usage));
         assert!(
-            transcript(&sessions.active().front).contains("/session new"),
+            transcript(&sessions.active().front).contains(":session new"),
             "usage explains instead of guessing"
         );
 
@@ -4331,45 +4747,53 @@ mod cov_main_topup {
         }
     }
 
+    fn type_command(front: &mut Frontend, command: &str) {
+        front.focus = Focus::Viewport;
+        front.state.arm_colon();
+        for char in command.chars() {
+            front.state.command_line_push(char);
+        }
+    }
+
     #[tokio::test]
-    async fn slash_commands_route_locally_without_touching_the_runtime() {
+    async fn slash_prefix_is_prompt_text_not_a_desktop_command() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
-        front.focus = Focus::Composer;
         type_draft(&mut front, "/help");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
-        assert_eq!(front.request_counter, 0, "no runtime command is issued");
-        assert_eq!(front.state.composer(), "", "the draft is cleared");
-        assert_eq!(user_line_count(&front), 1, "the command is recorded once");
+        assert_eq!(
+            front.request_counter, 1,
+            "slash input is submitted as a task"
+        );
+        assert_eq!(front.state.composer(), "", "the accepted task is cleared");
+        assert_eq!(user_line_count(&front), 1);
         assert!(
-            transcript(&front).contains("/model"),
-            "help lists the commands"
+            !transcript(&front).contains("/model —"),
+            "slash input was not routed to local help"
         );
     }
 
     #[tokio::test]
-    async fn slash_quit_leaves_the_loop() {
+    async fn desktop_q_quit_requires_enter() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
-        type_draft(&mut front, "/quit");
+        front.focus = Focus::Viewport;
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('q'))).await);
+        type_command(&mut front, "q");
         assert!(handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert_eq!(front.request_counter, 0, "quitting issues no command");
     }
 
     #[tokio::test]
-    async fn slash_model_switches_and_reports() {
+    async fn desktop_model_commands_open_picker_and_set_exact_id() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let (_run, mut front) = frontend_with(configured(2, &[], &[]));
         assert_eq!(front.active_model.as_deref(), Some("m0"));
 
-        front.focus = Focus::Composer;
-        type_draft(&mut front, "/model");
+        type_command(&mut front, "m");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert_eq!(front.request_counter, 0, "opening the picker is local");
-        assert!(
-            front.state.overlay_open(),
-            "bare /model opens the picker instead of reporting"
-        );
+        assert!(front.state.overlay_open(), "bare :m opens the picker");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert!(!front.state.overlay_open(), "confirming closes the picker");
         assert!(
@@ -4377,13 +4801,13 @@ mod cov_main_topup {
             "confirming the first row selects it"
         );
 
-        type_draft(&mut front, "/model m1");
+        type_command(&mut front, "model set m1");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert_eq!(front.active_model.as_deref(), Some("m1"));
         assert_eq!(front.state.active_model(), Some("m1"), "display follows");
         assert_eq!(front.request_counter, 0, "switching is local");
 
-        type_draft(&mut front, "/model ghost");
+        type_command(&mut front, "model set ghost");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert_eq!(
             front.active_model.as_deref(),
@@ -4404,8 +4828,7 @@ mod cov_main_topup {
     async fn model_picker_filters_navigates_confirms_and_cancels() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let (_run, mut front) = frontend_with(configured(3, &[], &[]));
-        front.focus = Focus::Composer;
-        type_draft(&mut front, "/model");
+        type_command(&mut front, "m");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert!(front.state.overlay_open());
         assert_eq!(front.state.picker_matches().len(), 3);
@@ -4423,7 +4846,7 @@ mod cov_main_topup {
         );
 
         // Reopen and cancel: the selection is untouched.
-        type_draft(&mut front, "/model");
+        type_command(&mut front, "m");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Down)).await);
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
@@ -4435,8 +4858,7 @@ mod cov_main_topup {
     async fn model_picker_keys_never_reach_the_composer() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let (_run, mut front) = frontend_with(configured(2, &[], &[]));
-        front.focus = Focus::Composer;
-        type_draft(&mut front, "/model");
+        type_command(&mut front, "m");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         // `a`/`d` decide approvals; behind the picker they are filter text.
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('a'))).await);
@@ -4451,8 +4873,7 @@ mod cov_main_topup {
     async fn approval_arrival_dismisses_the_model_picker() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let (run, mut front) = frontend_with(configured(2, &[], &[]));
-        front.focus = Focus::Composer;
-        type_draft(&mut front, "/model");
+        type_command(&mut front, "model");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert!(front.state.overlay_open());
 
@@ -4465,11 +4886,53 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
+    async fn viewport_insert_keys_return_to_the_composer() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (_run, mut front) = frontend_with(configured(2, &[], &[]));
+        front.focus = Focus::Viewport;
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('i'))).await);
+        assert_eq!(front.focus, Focus::Composer);
+        assert_eq!(front.state.composer(), "", "insert types nothing");
+
+        front.focus = Focus::Viewport;
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('o'))).await);
+        assert_eq!(front.focus, Focus::Composer);
+        assert_eq!(
+            front.state.composer(),
+            "\n",
+            "open-line starts a fresh line"
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_commands_wait_for_enter_and_escape_cancels() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (_run, mut front) = frontend_with(configured(2, &[], &[]));
+        front.focus = Focus::Viewport;
+
+        // Typing a command has no side effects until Enter.
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(':'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('m'))).await);
+        assert!(!front.state.overlay_open());
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(front.state.overlay_open());
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+
+        // Single q never quits; only the executed :q command does.
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('q'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(':'))).await);
+        for char in "q".chars() {
+            assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(char))).await);
+        }
+        assert!(handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+    }
+
+    #[tokio::test]
     async fn slash_usage_reports_observed_counters_or_their_absence() {
         use nexus_core::{RunId, SessionId, Usage, UsageFinality};
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
-        type_draft(&mut front, "/usage");
+        type_command(&mut front, "usage");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert!(
             transcript(&front).contains("no usage observed yet"),
@@ -4486,7 +4949,7 @@ mod cov_main_topup {
             EventPayload::UsageUpdated(Usage::new(Some(10), None, UsageFinality::Final)),
         );
         front.apply_events(vec![usage]);
-        type_draft(&mut front, "/usage");
+        type_command(&mut front, "usage");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert!(
             transcript(&front).contains("in:10 out:?"),
@@ -4498,14 +4961,14 @@ mod cov_main_topup {
     async fn slash_unknown_names_help() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
-        type_draft(&mut front, "/frobnicate");
+        type_command(&mut front, "frobnicate");
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert_eq!(front.request_counter, 0, "unknown routes locally too");
         assert!(
-            transcript(&front).contains("unknown command /frobnicate"),
+            transcript(&front).contains("unknown command :frobnicate"),
             "the word is echoed for correction"
         );
-        assert!(transcript(&front).contains("/help"));
+        assert!(transcript(&front).contains(":help"));
     }
 
     #[tokio::test]
@@ -5543,6 +6006,103 @@ mod cov_main_topup {
 
         draw(&mut terminal, &mut front).expect("the frame renders");
         assert!(front.state.is_finished());
+    }
+
+    #[tokio::test]
+    async fn command_suggestions_complete_but_wait_for_enter() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let (_run, mut front) = frontend_with(configured(2, &[], &[]));
+        front.focus = Focus::Viewport;
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(':'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('m'))).await);
+        assert!(
+            front
+                .state
+                .completions()
+                .iter()
+                .any(|item| item.insert == "model")
+        );
+        assert!(!front.state.overlay_open(), "typing only shows suggestions");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert_eq!(front.state.command_line(), Some("m"));
+        assert!(!front.state.overlay_open(), "first Enter only completes");
+        assert_eq!(front.focus, Focus::Viewport);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
+        assert!(front.state.overlay_open(), "second Enter executes :m");
+    }
+
+    #[tokio::test]
+    async fn escape_closes_suggestions_without_changing_focus_or_input() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.focus = Focus::Viewport;
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(':'))).await);
+        assert!(!front.state.completions().is_empty());
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
+        assert!(front.state.completions().is_empty());
+        assert!(front.state.colon_pending());
+        assert_eq!(front.focus, Focus::Viewport);
+    }
+
+    #[test]
+    fn file_suggestions_are_relative_bounded_and_do_not_read_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("nexus-tui-paths-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).expect("create fixture directory");
+        std::fs::write(root.join("src/main.rs"), "secret file contents")
+            .expect("create fixture file");
+        std::fs::create_dir_all(root.join("target/generated"))
+            .expect("create excluded generated directory");
+
+        let matches = find_project_paths(&root, "src/mai");
+        assert_eq!(matches, vec!["src/main.rs"]);
+        assert!(find_project_paths(&root, "target/").is_empty());
+        let mut state = AppState::new();
+        state.composer_type('@');
+        state.set_project_dir(root.to_string_lossy().into_owned());
+        let (start, end, query) = state.composer_at_token().expect("@ token recognized");
+        assert_eq!(query, "");
+        state.complete_composer_token(start, end, &matches[0]);
+        assert_eq!(state.composer(), "@src/main.rs");
+        assert!(!state.composer().contains("secret file contents"));
+
+        std::fs::remove_dir_all(root).expect("remove owned fixture tree");
+    }
+
+    #[tokio::test]
+    async fn vim_viewport_jumps_and_half_page_keys_are_scoped_to_viewport() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        for index in 0..40 {
+            front
+                .state
+                .record_submitted(&format!("history entry {index}"));
+        }
+        let mut terminal = fixed_terminal();
+        front.focus = Focus::Viewport;
+        draw(&mut terminal, &mut front).expect("render establishes viewport geometry");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('g'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('g'))).await);
+        assert!(front.state.scrollback() > 0, "gg jumps to the history top");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('G'))).await);
+        assert_eq!(front.state.scrollback(), 0, "G returns to the live tail");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('H'))).await);
+        let top = front.state.scrollback();
+        assert!(top > 0, "H jumps to the top");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('M'))).await);
+        assert!(front.state.scrollback() < top, "M jumps to the middle");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('L'))).await);
+        assert_eq!(front.state.scrollback(), 0, "L jumps to the bottom");
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('g'))).await);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('g'))).await);
+        assert!(!handle_key(&mut front, &runtime, ctrl('d')).await);
+        assert!(front.state.scrollback() > 0, "Ctrl+D scrolls half a page");
+        assert_eq!(front.request_counter, 0, "navigation never submits work");
     }
 }
 

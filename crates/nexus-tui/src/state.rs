@@ -817,8 +817,29 @@ impl ModelPicker {
 /// Single active overlay: at most one dialog captures the keyboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
-    /// Searchable configured-model list opened by bare `/model`.
+    /// Searchable configured-model list opened by bare `:model`.
     ModelPicker(ModelPicker),
+}
+
+/// A command or file completion row. `insert` is kept separate from its
+/// presentation so descriptions never leak into the composer or command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// Text inserted when the candidate is accepted.
+    pub insert: String,
+    /// Primary candidate label.
+    pub label: String,
+    /// Short context-sensitive explanation shown beside the label.
+    pub info: String,
+}
+
+/// Bounded inline completion candidates. File replacements target the
+/// `@path` token around the composer caret; command candidates replace the
+/// editable desktop command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionList {
+    items: Vec<CompletionItem>,
+    selected: usize,
 }
 
 /// The full frontend presentation model.
@@ -921,6 +942,10 @@ pub struct AppState {
     /// the overlay first and never falls through to composer, viewport,
     /// or approval shortcuts.
     overlay: Option<Overlay>,
+    /// Viewport command line; `Some("")` means `:` was pressed and is
+    /// waiting for command text. Commands execute only on Enter.
+    command_line: Option<String>,
+    completion: Option<CompletionList>,
 }
 
 impl Default for AppState {
@@ -976,6 +1001,8 @@ impl AppState {
             last_usage: None,
             model_choices: Vec::new(),
             overlay: None,
+            command_line: None,
+            completion: None,
         }
     }
 
@@ -1778,6 +1805,19 @@ impl AppState {
         }
     }
 
+    /// Jumps to the oldest, middle, or newest visible viewport position.
+    pub fn scroll_landmark(&mut self, landmark: ViewportLandmark) {
+        let (width, height) = (self.viewport.0.max(1), self.viewport.1.max(1));
+        let max = self.total_height(width).saturating_sub(height);
+        self.clear_text_selection();
+        self.scrollback = match landmark {
+            ViewportLandmark::Top => max,
+            ViewportLandmark::Middle => max / 2,
+            ViewportLandmark::Bottom => 0,
+        };
+        self.selected = None;
+    }
+
     /// Composer draft text.
     #[must_use]
     pub fn composer(&self) -> &str {
@@ -1896,6 +1936,7 @@ impl AppState {
     /// history on the next key.
     pub fn composer_take(&mut self) -> String {
         self.clear_text_selection();
+        self.clear_completions();
         self.abandon_recall();
         self.composer_caret = 0;
         self.touch_caret();
@@ -1913,6 +1954,8 @@ impl AppState {
     /// live configuration, so staleness can never invent a selection.
     pub fn open_model_picker(&mut self, choices: Vec<ModelChoice>) {
         self.model_choices = choices;
+        self.command_line = None;
+        self.clear_completions();
         self.overlay = Some(Overlay::ModelPicker(ModelPicker {
             filter: String::new(),
             selected: 0,
@@ -1922,6 +1965,175 @@ impl AppState {
     /// Closes any open dialog without applying it.
     pub fn dismiss_overlay(&mut self) {
         self.overlay = None;
+    }
+
+    /// Opens an editable viewport command line. It is closed only by
+    /// executing the entered command or explicitly dismissing it.
+    pub fn arm_colon(&mut self) {
+        self.command_line = Some(String::new());
+        self.completion = None;
+    }
+
+    /// Whether the viewport command line is open.
+    #[must_use]
+    pub fn colon_pending(&self) -> bool {
+        self.command_line.is_some()
+    }
+
+    /// Current command text without its leading colon.
+    #[must_use]
+    pub fn command_line(&self) -> Option<&str> {
+        self.command_line.as_deref()
+    }
+
+    /// Appends safe printable text to an open command line.
+    pub fn command_line_push(&mut self, char: char) {
+        if char.is_control() || is_bidi_format(char) {
+            return;
+        }
+        if let Some(line) = &mut self.command_line
+            && line.len() + char.len_utf8() <= MAX_PICKER_FILTER_BYTES
+        {
+            line.push(char);
+        }
+    }
+
+    /// Replaces the command text, usually after Tab completion.
+    pub fn set_command_line(&mut self, value: String) {
+        self.command_line = Some(value);
+    }
+
+    /// Deletes the final command-line character.
+    pub fn command_line_backspace(&mut self) {
+        if let Some(line) = &mut self.command_line {
+            line.pop();
+        }
+    }
+
+    /// Closes and returns the entered command text.
+    pub fn take_command_line(&mut self) -> Option<String> {
+        self.completion = None;
+        self.command_line.take()
+    }
+
+    /// Dismisses the command line without executing it.
+    pub fn clear_colon(&mut self) {
+        self.command_line = None;
+        self.completion = None;
+    }
+
+    /// Publishes a bounded candidate list and resets its selection.
+    pub fn set_completions(&mut self, items: Vec<String>) {
+        self.set_completion_items(
+            items
+                .into_iter()
+                .map(|item| CompletionItem {
+                    insert: item.clone(),
+                    label: item,
+                    info: String::new(),
+                })
+                .collect(),
+        );
+    }
+
+    /// Publishes completion rows with display descriptions.
+    pub fn set_completion_items(&mut self, items: Vec<CompletionItem>) {
+        self.completion = (!items.is_empty()).then_some(CompletionList {
+            items: items.into_iter().take(MAX_PICKER_VISIBLE_ROWS).collect(),
+            selected: 0,
+        });
+    }
+
+    /// Current completion candidates, if any.
+    #[must_use]
+    pub fn completions(&self) -> &[CompletionItem] {
+        self.completion
+            .as_ref()
+            .map_or(&[], |completion| completion.items.as_slice())
+    }
+
+    /// Moves the completion highlight, saturating at the list ends.
+    pub fn move_completion(&mut self, delta: isize) {
+        if let Some(completion) = &mut self.completion {
+            completion.selected = if delta < 0 {
+                completion.selected.saturating_sub(delta.unsigned_abs())
+            } else {
+                completion
+                    .selected
+                    .saturating_add(delta as usize)
+                    .min(completion.items.len().saturating_sub(1))
+            };
+        }
+    }
+
+    /// Returns the highlighted completion candidate.
+    #[must_use]
+    pub fn selected_completion(&self) -> Option<&CompletionItem> {
+        self.completion
+            .as_ref()
+            .and_then(|completion| completion.items.get(completion.selected))
+    }
+
+    /// Whether a candidate occupies the highlighted row.
+    #[must_use]
+    pub fn completion_is_selected(&self, index: usize) -> bool {
+        self.completion
+            .as_ref()
+            .is_some_and(|completion| completion.selected == index)
+    }
+
+    /// First candidate to render in the bounded completion viewport.
+    #[must_use]
+    pub fn completion_window_start(&self, visible: usize) -> usize {
+        self.completion.as_ref().map_or(0, |completion| {
+            completion
+                .selected
+                .saturating_add(1)
+                .saturating_sub(visible.max(1))
+        })
+    }
+
+    /// Hides the candidate list without changing the input.
+    pub fn clear_completions(&mut self) {
+        self.completion = None;
+    }
+
+    /// Current `@path` token around the composer caret as character offsets
+    /// and its query (without `@`).
+    #[must_use]
+    pub fn composer_at_token(&self) -> Option<(usize, usize, String)> {
+        let chars: Vec<char> = self.composer.chars().collect();
+        let caret = self.composer_caret.min(chars.len());
+        let start = chars[..caret]
+            .iter()
+            .rposition(|char| char.is_whitespace())
+            .map_or(0, |index| index + 1);
+        if chars.get(start) != Some(&'@') || caret < start + 1 {
+            return None;
+        }
+        let end = chars[caret..]
+            .iter()
+            .position(|char| char.is_whitespace())
+            .map_or(chars.len(), |offset| caret + offset);
+        let query: String = chars[start + 1..caret].iter().collect();
+        Some((start, end, query))
+    }
+
+    /// Replaces the `@path` token at character offsets and places the caret
+    /// after the inserted escaped relative reference.
+    pub fn complete_composer_token(&mut self, start: usize, end: usize, path: &str) {
+        let escaped = path.replace(' ', "\\ ");
+        let insert = format!("@{escaped}");
+        let mut chars: Vec<char> = self.composer.chars().collect();
+        let start = start.min(chars.len());
+        let end = end.min(chars.len()).max(start);
+        chars.splice(start..end, insert.chars());
+        let next = chars.into_iter().collect::<String>();
+        if next.len() <= MAX_COMPOSER_BYTES {
+            self.composer = next;
+            self.composer_caret = start + insert.chars().count();
+        }
+        self.clear_completions();
     }
 
     /// Current picker filter text (empty when no picker is open).
@@ -2503,6 +2715,17 @@ impl AppState {
     pub fn last_seq(&self) -> Option<u64> {
         self.last_seq
     }
+}
+
+/// Named positions in the conversation viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewportLandmark {
+    /// Oldest retained content.
+    Top,
+    /// Middle of the scrollable history.
+    Middle,
+    /// Live tail.
+    Bottom,
 }
 
 /// Event-driven redraw gate with a maximum rate: stream deltas call

@@ -357,10 +357,6 @@ fn a_pending_approval_cannot_starve_the_composer_or_the_footer() {
                 "{width}x{height} {focus:?}: card starved the footer: {screen:?}"
             );
             assert!(
-                screen.contains("[i] inspect"),
-                "{width}x{height} {focus:?}: footer lost the inspect hint: {screen:?}"
-            );
-            assert!(
                 rows[height as usize - 1].contains("v0.1.1-alpha"),
                 "{width}x{height} {focus:?}: footer must stay the last row: {rows:?}"
             );
@@ -629,10 +625,6 @@ fn a_clipped_card_drops_every_decision_and_keeps_the_gate_closed() {
         assert!(
             screen.contains("detail clipped"),
             "{width}x{height}: the clip must be explicit: {screen:?}"
-        );
-        assert!(
-            screen.contains("[i] inspect"),
-            "{width}x{height}: the clip must name the inspector: {screen:?}"
         );
         for forbidden in ["[a] allow once", "[d] deny", "[esc] park"] {
             assert!(

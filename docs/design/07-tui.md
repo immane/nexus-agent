@@ -22,6 +22,15 @@ Start with a single primary conversation view rather than permanent side panels.
 
 Keyboard operation must cover submission, multiline editing, focus, scrolling, folding, approval, and cancellation. Concrete bindings require terminal compatibility tests on Linux and macOS; do not blindly copy contradictory or version-dependent shortcuts from another product. Basic mouse support may complement keyboard operation without becoming a core dependency.
 
+The viewport currently uses Vim-inspired navigation: `j`/`k` scroll entries,
+`gg`/`G` jump to the history ends, `H`/`M`/`L` jump to top/middle/bottom,
+and `Ctrl+f`/`Ctrl+b` or `Ctrl+d`/`Ctrl+u` page or half-page. `i`/`o` return
+to the composer. `:` opens an editable desktop command line; commands execute
+only on Enter. Suggestion popups show a selected row and per-command info;
+Enter or Tab inserts the selected completion, and a subsequent Enter executes
+the command. Esc first closes the popup without moving focus. `@` path
+completion is display/insertion only and does not read or attach file content.
+
 ## Approvals
 
 Project-scoped reads/searches are automatic only when host policy permits them. Every model-directed file mutation and command execution requires confirmation under the default policy.

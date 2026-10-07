@@ -65,8 +65,8 @@ alone improves responsiveness.
   must prevent keys such as `a`, `s`, and `d` from falling through to the
   approval card.
 - `Esc` closes the topmost suggestion/dialog and never cancels a run. Closing
-  restores the draft and caret. Existing `Ctrl+C`/`Ctrl+D` meanings remain
-  context-gated and unchanged unless separately reviewed.
+  restores the draft and caret. The existing `Ctrl+C` cancel/quit escalation
+  is unchanged; quitting from the keyboard is `q`/`:q` in the viewport.
 - All interactions remain keyboard usable; mouse support is additive.
 - Preserve bounded state, stale-run rejection, terminal cleanup, and explicit
   error/empty/loading states.
@@ -167,16 +167,24 @@ The shared list widget should provide:
 
 Model picker behavior:
 
-- Open from the existing model-cycle action and `/model` with no argument.
+- Open from the existing model-cycle action and `:m`/`:model` in the desktop
+  command line.
 - Filter locally against configured model IDs, provider names, and display
   labels; mark the active selection and expose provider identity.
-- Confirm updates the same active model binding used by `/model <name>` and
+- Confirm updates the same active model binding used by `:model set <name>` and
   persists recency through the existing configuration owner. Cancel has no
   side effect.
 - A selection only affects future submissions. Do not switch the provider for
   an in-flight run.
-- Keep `/model <name>` as a direct exact configured-ID selection for scripts
+- Keep `:model set <name>` as a direct exact configured-ID selection for scripts
   and power users; report unknown IDs as today.
+- The viewport additionally offers vim-style keys: `i` focuses the composer,
+  `o` focuses it on a fresh line, and `:` opens an editable command line.
+  Commands execute only on Enter; `:m` opens the picker, `:model set <id>`
+  selects an exact configured model, `:s` lists sessions, and `:q` quits.
+  A bare `q` is not a quit key. Composer text beginning with `/` is ordinary
+  prompt input. The footer keeps the command line at left and version/status
+  at right.
 
 ### Acceptance
 
@@ -187,19 +195,21 @@ Model picker behavior:
   composer; save failure is surfaced without losing the in-memory selection.
 - While the picker is open, approval keys cannot reach the approval handler.
 
-## Stage 3 — `/` command suggestions
+## Stage 3 — `:` command suggestions
 
 - Derive suggestions from one command metadata registry containing canonical
   name, short description, and argument/help metadata. Use that registry for
-  `/help`, parser validation where practical, and interactive suggestions so
+  `:help`, parser validation where practical, and interactive suggestions so
   names cannot drift between three lists.
-- Show suggestions when the current composer token is a leading slash command;
+- Show suggestions when the viewport command line is active;
   filter as the user types and preserve all text after the caret.
-- Support navigation, `Tab` completion, `Enter` behavior, and `Esc` dismissal
+- Support navigation, `Enter`/`Tab` completion, and `Esc` dismissal
   without stealing normal multiline editing keys when no suggestion is active.
-- `Enter` with a highlighted command accepts/completes it first; it must not
-  both accept and submit in one keypress. A second `Enter` runs the completed
-  slash command through the existing local parser.
+- `Enter` or `Tab` completes the highlighted command; while a candidate is
+  selected, the first `Enter` only inserts it. A subsequent `Enter` executes
+  the completed command through the local parser and never submits a task.
+- Every candidate displays a short explanation; file candidates identify
+  directories versus literal reference-only files.
 - Offer subcommand/argument suggestions only where values are known locally
   (for example session labels and configured model IDs); do not guess unknown
   command semantics.
@@ -210,7 +220,8 @@ Model picker behavior:
   multiline drafts behave predictably.
 - Completion preserves suffix text and places the caret at the end of the
   inserted completion.
-- `Esc` dismisses suggestions without clearing or submitting the draft.
+- `Esc` dismisses only the suggestion list without clearing, submitting, or
+  changing focus; a second `Esc` may dismiss the command line itself.
 - Suggestion actions cannot fall through into approval, scroll, or submit
   handlers.
 
@@ -234,6 +245,12 @@ Model picker behavior:
   keeps the rest of the draft. It does not read or attach the file. The model
   may request `host_read` later, subject to existing policy, protected-path
   checks, and approval.
+
+Initial implementation uses a synchronous best-effort scan with a 12ms time
+budget, 1,000-entry cap, depth 5, and 10 results; it never follows symlinks
+and excludes common generated directories. A background cancellable scanner
+remains a follow-up if measurements show that this bounded scan can still
+interrupt interactive input on slow filesystems.
 
 ### Acceptance
 

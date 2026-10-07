@@ -1,10 +1,10 @@
-//! Slash commands typed into the composer.
+//! Desktop commands entered in the viewport command line.
 //!
-//! A draft starting with `/` never reaches the runtime: it is routed
-//! locally by [`SlashCommand::parse`]. Unknown commands are reported, never
-//! guessed, and command names match exactly (lowercase).
+//! Commands are parsed only after the user presses Enter. Composer input
+//! beginning with `/` is ordinary prompt text. Unknown commands are reported,
+//! never guessed, and command names match exactly (lowercase).
 
-/// Local composer command. Only [`SlashCommand::Quit`] leaves the loop;
+/// Local desktop command. Only [`SlashCommand::Quit`] leaves the loop;
 /// everything else answers inline and keeps the session alive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
@@ -22,7 +22,7 @@ pub enum SlashCommand {
     Unknown(String),
 }
 
-/// `/session` subcommand. Sessions are local conversations, each with its
+/// `:session` subcommand. Sessions are local conversations, each with its
 /// own runtime, event stream, and viewport history; switching never moves
 /// runs, approvals, or drafts between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum SessionArgs {
 }
 
 impl SessionArgs {
-    /// Parses the arguments after `/session`. A bare command shows the
+    /// Parses the arguments after `:session`. A bare command shows the
     /// active session; anything unrecognized explains usage instead of
     /// guessing a session.
     fn parse(args: &str) -> SessionArgs {
@@ -61,33 +61,51 @@ impl SessionArgs {
     /// Short usage listing, rendered as one transcript notice.
     #[must_use]
     pub fn usage_text() -> &'static str {
-        "/session — show the active session\n\
-         /session new — start a session and switch to it\n\
-         /session list — list sessions\n\
-         /session switch <n|sN|id> — switch sessions"
+        ":session — show the active session\n\
+         :session new — start a session and switch to it\n\
+         :session list — list sessions\n\
+         :session switch <n|sN|id> — switch sessions"
     }
 }
 
 impl SlashCommand {
-    /// Parses a composer draft. Returns `None` for ordinary input; a
-    /// leading `/` always routes locally, even for unknown words.
+    /// Parses one complete viewport command line. Returns `None` unless
+    /// the input begins with `:`. `:m` and `:model` open the picker;
+    /// `:model set <id>` selects an exact configured id.
     #[must_use]
     pub fn parse(input: &str) -> Option<SlashCommand> {
-        let rest = input.trim_start().strip_prefix('/')?;
+        let rest = input.trim_start().strip_prefix(':')?;
         let (word, args) = match rest.split_once(char::is_whitespace) {
             Some((word, args)) => (word, args.trim()),
             None => (rest, ""),
         };
         let command = match word {
             "help" => SlashCommand::Help,
-            "model" => SlashCommand::Model(if args.is_empty() {
+            "m" => SlashCommand::Model(if args.is_empty() {
                 None
             } else {
                 Some(args.to_owned())
             }),
+            "model" => {
+                let (subcommand, value) = args
+                    .split_once(char::is_whitespace)
+                    .map_or((args, ""), |(left, right)| (left, right.trim()));
+                match (subcommand, value) {
+                    ("", "") => SlashCommand::Model(None),
+                    ("set", id) if !id.is_empty() => SlashCommand::Model(Some(id.to_owned())),
+                    // Keep the concise exact-id form alongside the explicit
+                    // `set` form, but never guess when more tokens follow.
+                    (id, "") if !id.is_empty() => SlashCommand::Model(Some(id.to_owned())),
+                    _ => SlashCommand::Unknown(format!("model {args}")),
+                }
+            }
             "usage" => SlashCommand::Usage,
-            "session" => SlashCommand::Session(SessionArgs::parse(args)),
-            "quit" => SlashCommand::Quit,
+            "s" | "session" => SlashCommand::Session(if word == "s" && args.is_empty() {
+                SessionArgs::List
+            } else {
+                SessionArgs::parse(args)
+            }),
+            "q" | "quit" => SlashCommand::Quit,
             _ => SlashCommand::Unknown(word.to_owned()),
         };
         Some(command)
@@ -96,13 +114,13 @@ impl SlashCommand {
     /// Short help listing, rendered as one transcript notice.
     #[must_use]
     pub fn help_text() -> &'static str {
-        "/help — list commands\n\
-         /model [name] — pick or switch the active model\n\
-         /usage — show observed input/output tokens\n\
-         /session [new|list|switch] — manage conversation sessions\n\
-         /quit — leave the TUI\n\
-         keys: Tab mode (composer) / focus (elsewhere) · Enter submit · Up/Down recall input · Left/Right move caret · PgUp/PgDn page · click tool card expands/collapses · tool output previews last 10 lines · m model · ctrl+t variant · wheel scrolls · drag selects, release copies · Esc home (never cancels) · \
-         Ctrl+C clears the composer, then cancels a live run, then quits · Ctrl+D quits"
+        ":help — list commands\n\
+         :m — open the model picker\n\
+         :model set <id> — select an exact configured model\n\
+         :usage — show observed input/output tokens\n\
+         :session [new|list|switch] — manage conversation sessions\n\
+         :q — leave the TUI\n\
+         desktop: press : to enter a command, Tab to complete, Enter to execute · composer: @path inserts a project reference only · i/o edit · q does not quit · Esc home · Ctrl+C clears the composer, then cancels a live run, then quits"
     }
 }
 
@@ -112,59 +130,64 @@ mod tests {
 
     #[test]
     fn ordinary_input_never_routes() {
-        for input in ["", "hello", "  hello  ", "a/b", "x /help"] {
+        for input in ["", "hello", "  hello  ", "a/b", "x :help", "/help"] {
             assert_eq!(SlashCommand::parse(input), None, "{input:?}");
         }
     }
 
     #[test]
     fn every_command_parses_with_and_without_arguments() {
-        assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
-        assert_eq!(SlashCommand::parse("  /help  "), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse(":help"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse("  :help  "), Some(SlashCommand::Help));
         assert_eq!(
-            SlashCommand::parse("/model"),
+            SlashCommand::parse(":model"),
             Some(SlashCommand::Model(None))
         );
+        assert_eq!(SlashCommand::parse(":m"), Some(SlashCommand::Model(None)));
         assert_eq!(
-            SlashCommand::parse("/model demo-fast"),
-            Some(SlashCommand::Model(Some("demo-fast".to_owned())))
+            SlashCommand::parse(":model set deepseek"),
+            Some(SlashCommand::Model(Some("deepseek".to_owned())))
         );
         assert_eq!(
-            SlashCommand::parse("/model   spaced-name  "),
+            SlashCommand::parse(":model deepseek"),
+            Some(SlashCommand::Model(Some("deepseek".to_owned())))
+        );
+        assert_eq!(
+            SlashCommand::parse(":model set   spaced-name  "),
             Some(SlashCommand::Model(Some("spaced-name".to_owned())))
         );
-        assert_eq!(SlashCommand::parse("/usage"), Some(SlashCommand::Usage));
-        assert_eq!(SlashCommand::parse("/quit"), Some(SlashCommand::Quit));
+        assert_eq!(SlashCommand::parse(":usage"), Some(SlashCommand::Usage));
+        assert_eq!(SlashCommand::parse(":q"), Some(SlashCommand::Quit));
     }
 
     #[test]
     fn session_subcommands_parse_without_guessing() {
         use SessionArgs::*;
         assert_eq!(
-            SlashCommand::parse("/session"),
+            SlashCommand::parse(":session"),
             Some(SlashCommand::Session(Show))
         );
         assert_eq!(
-            SlashCommand::parse("/session new"),
+            SlashCommand::parse(":session new"),
             Some(SlashCommand::Session(New))
         );
         assert_eq!(
-            SlashCommand::parse("/session list"),
+            SlashCommand::parse(":session list"),
             Some(SlashCommand::Session(List))
         );
         assert_eq!(
-            SlashCommand::parse("/session switch 2"),
+            SlashCommand::parse(":session switch 2"),
             Some(SlashCommand::Session(Switch("2".to_owned())))
         );
         assert_eq!(
-            SlashCommand::parse("/session switch s2"),
+            SlashCommand::parse(":session switch s2"),
             Some(SlashCommand::Session(Switch("s2".to_owned())))
         );
         for malformed in [
-            "/session bogus",
-            "/session new extra",
-            "/session switch",
-            "/session help",
+            ":session bogus",
+            ":session new extra",
+            ":session switch",
+            ":session help",
         ] {
             assert_eq!(
                 SlashCommand::parse(malformed),
@@ -177,19 +200,19 @@ mod tests {
     #[test]
     fn unknown_words_are_reported_never_guessed() {
         assert_eq!(
-            SlashCommand::parse("/frobnicate"),
+            SlashCommand::parse(":frobnicate"),
             Some(SlashCommand::Unknown("frobnicate".to_owned()))
         );
         assert_eq!(
-            SlashCommand::parse("//double"),
-            Some(SlashCommand::Unknown("/double".to_owned()))
+            SlashCommand::parse("::double"),
+            Some(SlashCommand::Unknown(":double".to_owned()))
         );
         assert_eq!(
-            SlashCommand::parse("/"),
+            SlashCommand::parse(":"),
             Some(SlashCommand::Unknown(String::new()))
         );
         assert_eq!(
-            SlashCommand::parse("/MODEL"),
+            SlashCommand::parse(":MODEL"),
             Some(SlashCommand::Unknown("MODEL".to_owned()))
         );
     }
@@ -197,7 +220,7 @@ mod tests {
     #[test]
     fn help_text_names_every_command() {
         let help = SlashCommand::help_text();
-        for command in ["/help", "/model", "/usage", "/session", "/quit"] {
+        for command in [":help", ":model", ":usage", ":session", ":q"] {
             assert!(help.contains(command), "{help:?}");
         }
     }
