@@ -400,7 +400,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
     render_footer(state, regions.footer, buf, focus);
 }
 
-fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
+fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
     let run = state
         .active_run()
         .map(|run| run.as_str())
@@ -420,7 +420,6 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         } else {
             Span::raw(state.status())
         },
-        Span::raw(format!(" focus:{focus:?}").to_lowercase()),
     ];
     // The directory trails every existing segment, so frames that never
     // set it render byte-identically and narrow frames clip the path
@@ -896,32 +895,64 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         .title(Line::from(title));
     let inner = block.inner(area);
     block.render(area, buf);
-    // An empty focused composer shows a dimmed invitation instead of a
-    // bare caret; anything typed replaces it, and other focuses render
-    // the draft (or nothing) exactly as before.
+    // An empty focused composer shows a dimmed invitation, but the caret
+    // owns column zero either way: the hint never pushes it away.
+    // Anything typed replaces the hint, and other focuses render the
+    // draft (or nothing) exactly as before.
     let draft = state.composer().to_owned();
     let selected = state.composer_selection_range();
+    let show_caret = focus == Focus::Composer && state.caret_visible();
     let line = if draft.is_empty() && focus == Focus::Composer {
-        Line::from(vec![
-            Span::styled(
-                "Type a task or /help for commands",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-            Span::raw("▊"),
-        ])
+        // The hint never moves: the caret covers its first character
+        // instead of taking a cell of its own, so blinking cannot make
+        // the invitation jump back and forth.
+        let hint = "Type a task or /help for commands";
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        if show_caret {
+            let mut chars = hint.chars();
+            match chars.next() {
+                Some(first) => Line::from(vec![
+                    Span::styled(
+                        first.to_string(),
+                        Style::default()
+                            .add_modifier(Modifier::DIM)
+                            .add_modifier(Modifier::REVERSED),
+                    ),
+                    Span::styled(chars.collect::<String>(), dim),
+                ]),
+                None => Line::from(vec![Span::raw("▊")]),
+            }
+        } else {
+            Line::from(vec![Span::styled(hint, dim)])
+        }
     } else if let Some((start, len)) = selected {
         composer_selected_line(&draft, start, len, focus == Focus::Composer)
-    } else {
-        let mut text = draft;
-        if focus == Focus::Composer {
-            text.push('▊');
+    } else if show_caret {
+        // The caret covers the character it sits on (reversed video), so
+        // moving it never reflows the draft; past the last character a
+        // block glyph marks the insertion point instead.
+        let caret = state.composer_caret().min(draft.chars().count());
+        let before: String = draft.chars().take(caret).collect();
+        let mut rest = draft.chars().skip(caret);
+        let mut spans = vec![Span::raw(before)];
+        match rest.next() {
+            Some(char) => {
+                spans.push(Span::styled(
+                    char.to_string(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(Span::raw(rest.collect::<String>()));
+            }
+            None => spans.push(Span::raw("▊")),
         }
-        Line::from(text)
+        Line::from(spans)
+    } else {
+        Line::from(draft)
     };
     Paragraph::new(line).render(inner, buf);
 }
 
-fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
+fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
     let cancel_hint = if state.can_cancel() {
         "ctrl+c cancel"
     } else {
@@ -938,10 +969,10 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
         Span::raw(FOOTER_TAG),
         Span::styled(cancel_hint, Style::default().fg(Color::Yellow)),
         Span::styled(approval_hint, Style::default().fg(Color::Yellow)),
-        Span::raw(" tab · enter · ↑↓ select · ←→ fold · m model · approval i/a/d · ctrl+d quit "),
+        Span::raw(" tab · enter · ↑↓ select · m model · approval i/a/d · ctrl+d quit "),
         Span::raw(
             format!(
-                "focus:{focus:?} stale:{} seq:{} dropped:{}",
+                "stale:{} seq:{} dropped:{}",
                 state.stale_rejected, state.seq_rejected, state.dropped_entries
             )
             .to_lowercase(),
@@ -1008,7 +1039,7 @@ mod tests {
                 "no stale draft cells at {width}x{height}: {rows:?}"
             );
             assert!(
-                rows[height as usize - 1].contains("v0.1.0"),
+                rows[height as usize - 1].contains("v0.1.1-alpha"),
                 "footer pinned last at {width}x{height}: {rows:?}"
             );
         }
@@ -1340,7 +1371,7 @@ mod tests {
         let frame = screen(&terminal);
         assert!(frame.contains("nexus-tui"), "header present");
         assert!(frame.contains("composer (fixed)"), "fixed composer present");
-        assert!(frame.contains("v0.1.0"), "footer present");
+        assert!(frame.contains("v0.1.1-alpha"), "footer present");
         assert!(frame.contains("no run"), "accurate not-ready state");
     }
 
@@ -2243,7 +2274,7 @@ mod cov_render_private {
     }
 
     #[test]
-    fn header_reports_the_run_status_and_focus() {
+    fn header_reports_the_run_status() {
         let mut state = AppState::new();
         let area = Rect::new(0, 0, 80, 1);
         let header = rows_of(area, |buf| {
@@ -2251,22 +2282,19 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(header.contains("nexus-tui"), "{header:?}");
-        assert!(header.contains("v0.1.0"), "{header:?}");
+        assert!(header.contains("v0.1.1-alpha"), "{header:?}");
         assert!(header.contains("run:no run"), "{header:?}");
         assert!(header.contains("idle"), "{header:?}");
-        assert!(header.contains("focus:viewport"), "{header:?}");
+        assert!(!header.contains("focus:"), "{header:?}");
 
         assert!(state.apply_event(&started(0)));
-        for (focus, label) in [
-            (Focus::Composer, "focus:composer"),
-            (Focus::Viewport, "focus:viewport"),
-            (Focus::ApprovalCard, "focus:approvalcard"),
-        ] {
-            let header = rows_of(area, |buf| render_header(&state, area, buf, focus))[0].clone();
-            assert!(header.contains("run:run-1"), "{header:?}");
-            assert!(header.contains("running"), "{header:?}");
-            assert!(header.contains(label), "{header:?}");
-        }
+        let header = rows_of(area, |buf| {
+            render_header(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(header.contains("run:run-1"), "{header:?}");
+        assert!(header.contains("running"), "{header:?}");
+        assert!(!header.contains("focus:"), "{header:?}");
     }
 
     #[test]
@@ -2277,7 +2305,7 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.contains(" v0.1.0 "), "{footer:?}");
+        assert!(footer.contains(" v0.1.1-alpha "), "{footer:?}");
         assert!(footer.contains("idle"), "{footer:?}");
         assert!(
             !footer.contains("ctrl+c cancel"),
@@ -2335,6 +2363,93 @@ mod cov_render_private {
         assert!(text[1].contains("hello"), "{text:?}");
         assert!(!text[1].contains('▊'), "{text:?}");
         assert_ne!(blurred.get(0, 0).fg, Color::Green);
+    }
+
+    #[test]
+    fn composer_caret_covers_its_character_without_reflowing() {
+        let mut state = AppState::new();
+        for char in "ab".chars() {
+            state.composer_type(char);
+        }
+        state.caret_left();
+        let area = Rect::new(0, 0, 40, 3);
+        let mut focused = Buffer::empty(area);
+        render_composer(&state, area, &mut focused, Focus::Composer);
+        let text = text_rows(&focused);
+        assert!(text[1].contains("ab"), "{text:?}");
+        assert!(!text[1].contains('▊'), "{text:?}");
+        assert!(
+            focused.get(2, 1).modifier.contains(Modifier::REVERSED),
+            "the caret covers `b` in place: {text:?}"
+        );
+        assert!(
+            !focused.get(1, 1).modifier.contains(Modifier::REVERSED),
+            "only the caret cell reverses: {text:?}"
+        );
+    }
+
+    #[test]
+    fn empty_composer_pins_the_caret_over_the_hint() {
+        let state = AppState::new();
+        let area = Rect::new(0, 0, 40, 3);
+        let mut shown = Buffer::empty(area);
+        render_composer(&state, area, &mut shown, Focus::Composer);
+        let text = text_rows(&shown);
+        assert!(text[1].contains("Type a task"), "{text:?}");
+        assert!(!text[1].contains('▊'), "{text:?}");
+        assert!(
+            shown.get(1, 1).modifier.contains(Modifier::REVERSED),
+            "the caret covers the hint in place: {text:?}"
+        );
+        // The hidden phase renders the very same cells: blinking never
+        // shifts the invitation by a column.
+        use crate::state::CARET_BLINK_TICKS;
+        let mut blinking = AppState::new();
+        for _ in 0..CARET_BLINK_TICKS {
+            blinking.tick_caret();
+        }
+        assert!(!blinking.caret_visible());
+        let mut hidden = Buffer::empty(area);
+        render_composer(&blinking, area, &mut hidden, Focus::Composer);
+        let dark = text_rows(&hidden);
+        assert_eq!(dark[1], text[1], "both phases occupy the same cells");
+        assert!(
+            !hidden.get(1, 1).modifier.contains(Modifier::REVERSED),
+            "hidden means no caret cell: {dark:?}"
+        );
+    }
+
+    #[test]
+    fn composer_caret_blinks_off_and_back_on() {
+        use crate::state::CARET_BLINK_TICKS;
+        let mut state = AppState::new();
+        state.composer_type('a');
+        assert!(state.caret_visible(), "edits re-show the caret");
+        let area = Rect::new(0, 0, 40, 3);
+        for _ in 0..CARET_BLINK_TICKS {
+            state.tick_caret();
+        }
+        assert!(!state.caret_visible(), "one half-period hides the caret");
+        let mut hidden = Buffer::empty(area);
+        render_composer(&state, area, &mut hidden, Focus::Composer);
+        let text = text_rows(&hidden);
+        assert!(text[1].contains('a'), "{text:?}");
+        assert!(!text[1].contains('▊'), "{text:?}");
+        assert!(
+            !hidden.get(1, 1).modifier.contains(Modifier::REVERSED),
+            "no reversed cell while hidden: {text:?}"
+        );
+        for _ in 0..CARET_BLINK_TICKS {
+            state.tick_caret();
+        }
+        assert!(state.caret_visible(), "the next half-period shows it again");
+        // An edit during the hidden phase re-shows the caret at once.
+        for _ in 0..CARET_BLINK_TICKS {
+            state.tick_caret();
+        }
+        assert!(!state.caret_visible());
+        state.composer_type('b');
+        assert!(state.caret_visible(), "typing never lands in a blink gap");
     }
 
     #[test]
@@ -2574,7 +2689,7 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(!header.contains("sess:"), "{header:?}");
-        assert!(header.contains("focus:viewport"), "{header:?}");
+        assert!(!header.contains("focus:"), "{header:?}");
     }
 
     #[test]
@@ -2586,7 +2701,7 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(!header.contains("dir:"), "{header:?}");
-        assert!(header.contains("focus:viewport"), "{header:?}");
+        assert!(!header.contains("focus:"), "{header:?}");
     }
 
     #[test]
@@ -2615,10 +2730,10 @@ mod cov_render_private {
             render_header(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(header.contains("focus:viewport"), "{header:?}");
+        assert!(!header.contains("focus:"), "{header:?}");
         assert!(header.contains("dir:/Volumes/work/proj"), "{header:?}");
         assert!(
-            header.find("focus:viewport").expect("marker") < header.find("dir:").expect("dir"),
+            header.find("idle").expect("marker") < header.find("dir:").expect("dir"),
             "narrow frames clip the path before any status marker: {header:?}"
         );
     }
@@ -2755,7 +2870,7 @@ mod cov_render_private {
             .clone();
         assert!(marked.contains("copied 3 chars"), "{marked:?}");
         assert!(
-            marked.find("copied").expect("toast") > marked.find("focus:").expect("header"),
+            marked.find("copied").expect("toast") > marked.find("run:").expect("header"),
             "the toast sits right of the content: {marked:?}"
         );
 

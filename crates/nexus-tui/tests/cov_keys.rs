@@ -13,7 +13,7 @@
 //! - `Esc` parks focus and is the only key that can: it never cancels,
 //!   approves, denies, inspects, submits, or quits, under any modifier;
 //! - the composer accepts every ordinary character as text, including the
-//!   letters that decide, navigate, fold, or quit in another focus;
+//!   letters that decide, navigate, or quit in another focus;
 //! - intents are partitioned by focus, and each row sits under the focus that
 //!   owns its intent;
 //! - `Enter`, `Alt+Enter`, and `Ctrl+J` stay three distinct composer events,
@@ -168,20 +168,20 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::PageDown,
         doc: "Composer | PageDown | Page the viewport (focus stays)",
     },
-    // Composer | Left/Right | Fold/unfold the selected entry (focus stays)
+    // Composer | Left/Right | Move the draft caret (focus stays)
     Row {
         focus: Focus::Composer,
         code: KeyCode::Left,
         modifiers: NONE,
-        intent: Action::FoldToggle,
-        doc: "Composer | Left | Fold/unfold the selected entry (focus stays)",
+        intent: Action::CaretLeft,
+        doc: "Composer | Left | Move the draft caret (focus stays)",
     },
     Row {
         focus: Focus::Composer,
         code: KeyCode::Right,
         modifiers: NONE,
-        intent: Action::FoldToggle,
-        doc: "Composer | Right | Fold/unfold the selected entry (focus stays)",
+        intent: Action::CaretRight,
+        doc: "Composer | Right | Move the draft caret (focus stays)",
     },
     // Viewport | Up/k, Down/j | Move selection (scrolls)
     Row {
@@ -226,35 +226,6 @@ const PUBLISHED_ROWS: &[Row] = &[
         modifiers: NONE,
         intent: Action::PageDown,
         doc: "Viewport | PageDown | Scroll one page",
-    },
-    // Viewport | Left/h, Right/l | Fold/unfold the selected entry
-    Row {
-        focus: Focus::Viewport,
-        code: KeyCode::Left,
-        modifiers: NONE,
-        intent: Action::FoldToggle,
-        doc: "Viewport | Left | Fold/unfold the selected entry",
-    },
-    Row {
-        focus: Focus::Viewport,
-        code: KeyCode::Char('h'),
-        modifiers: NONE,
-        intent: Action::FoldToggle,
-        doc: "Viewport | h | Fold/unfold the selected entry",
-    },
-    Row {
-        focus: Focus::Viewport,
-        code: KeyCode::Right,
-        modifiers: NONE,
-        intent: Action::FoldToggle,
-        doc: "Viewport | Right | Fold/unfold the selected entry",
-    },
-    Row {
-        focus: Focus::Viewport,
-        code: KeyCode::Char('l'),
-        modifiers: NONE,
-        intent: Action::FoldToggle,
-        doc: "Viewport | l | Fold/unfold the selected entry",
     },
     // Viewport | m | Cycle the active model (admission order)
     Row {
@@ -439,6 +410,8 @@ const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
     ("CycleMode", Focus::Composer),
     ("Type", Focus::Composer),
     ("Backspace", Focus::Composer),
+    ("CaretLeft", Focus::Composer),
+    ("CaretRight", Focus::Composer),
     ("CycleModel", Focus::Viewport),
     ("ApproveOnce", Focus::ApprovalCard),
     ("Deny", Focus::ApprovalCard),
@@ -469,7 +442,6 @@ const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
         "PageDown",
         &[Focus::Composer, Focus::Viewport, Focus::ApprovalCard],
     ),
-    ("FoldToggle", &[Focus::Composer, Focus::Viewport]),
 ];
 
 /// Intents documented by a parameterized row rather than by a literal one.
@@ -480,9 +452,9 @@ const PARAMETERIZED_FAMILIES: &[&str] = &["Type"];
 
 /// Characters that stand in for the parameterized composer row: every one of
 /// them means something *elsewhere* in the keyset (the decision keys, the
-/// navigation and folding keys, the viewport quit key, and a shifted letter),
+/// navigation keys, the viewport quit key, and a shifted letter),
 /// so none of them may be special-cased as text.
-const COMPOSER_TYPE_SAMPLE: &[char] = &['a', 'd', 'i', 'k', 'j', 'h', 'l', 'q', 'A', ' '];
+const COMPOSER_TYPE_SAMPLE: &[char] = &['a', 'd', 'i', 'k', 'j', 'q', 'A', ' '];
 
 /// Named (non-character) key codes fed to the keyset by the producer census,
 /// in a fixed order: exactly the named keys the published table binds.
@@ -523,7 +495,6 @@ const SESSION: &[(Focus, KeyCode, KeyModifiers)] = &[
     (Focus::Composer, KeyCode::Tab, NONE),
     (Focus::Viewport, KeyCode::Down, NONE),
     (Focus::Viewport, KeyCode::PageDown, NONE),
-    (Focus::Viewport, KeyCode::Left, NONE),
     (Focus::Viewport, KeyCode::Esc, NONE),
     (Focus::Viewport, KeyCode::Tab, NONE),
     (Focus::ApprovalCard, KeyCode::Char('i'), NONE),
@@ -553,7 +524,8 @@ fn intent_family(intent: &Action) -> &'static str {
         Action::ScrollDown => "ScrollDown",
         Action::PageUp => "PageUp",
         Action::PageDown => "PageDown",
-        Action::FoldToggle => "FoldToggle",
+        Action::CaretLeft => "CaretLeft",
+        Action::CaretRight => "CaretRight",
         Action::CycleModel => "CycleModel",
         Action::CycleVariant => "CycleVariant",
         Action::ApproveOnce => "ApproveOnce",
@@ -578,7 +550,8 @@ fn all_intents() -> Vec<Action> {
         Action::ScrollDown,
         Action::PageUp,
         Action::PageDown,
-        Action::FoldToggle,
+        Action::CaretLeft,
+        Action::CaretRight,
         Action::CycleModel,
         Action::CycleVariant,
         Action::ApproveOnce,
@@ -708,12 +681,12 @@ fn every_published_row_maps_to_its_documented_intent() {
 
 #[test]
 fn published_table_has_no_duplicate_or_conflicting_rows() {
-    // 45 literal rows: 13 composer, 15 viewport, 11 approval, and the 6
+    // 41 literal rows: 13 composer, 11 viewport, 11 approval, and the 6
     // focus-expanded `Any` rows (`Ctrl+C` and `Ctrl+D` in each focus). The
-    // 46th published row is parameterized over printable characters.
+    // 42nd published row is parameterized over printable characters.
     assert_eq!(
         PUBLISHED_ROWS.len(),
-        45,
+        41,
         "the transcription lost or invented a published row"
     );
     // The oracle is only meaningful if it is a function: no `(focus, key,
@@ -815,9 +788,10 @@ fn intents_are_partitioned_by_focus() {
             vec![
                 "Backspace",
                 "Cancel",
+                "CaretLeft",
+                "CaretRight",
                 "CycleMode",
                 "CycleVariant",
-                "FoldToggle",
                 "Newline",
                 "PageDown",
                 "PageUp",
@@ -836,7 +810,6 @@ fn intents_are_partitioned_by_focus() {
                 "CycleModel",
                 "CycleVariant",
                 "FocusSwitch",
-                "FoldToggle",
                 "PageDown",
                 "PageUp",
                 "ParkFocus",
@@ -988,13 +961,13 @@ fn typed_text_is_produced_only_by_the_composer_and_preserves_the_character() {
             "{char:?} is ordinary text"
         );
     }
-    // The letters that decide, navigate, fold, or quit in another focus are
+    // The letters that decide, navigate, or quit in another focus are
     // plain draft text here: the composer row has no exceptions.
     for char in COMPOSER_TYPE_SAMPLE {
         assert_eq!(
             map_key(Focus::Composer, KeyEvent::new(KeyCode::Char(*char), NONE)),
             Some(Action::Type(*char)),
-            "{char:?} must type, never decide, navigate, fold, or quit"
+            "{char:?} must type, never decide, navigate, or quit"
         );
     }
     // Only the composer types: no other focus reaches the intent at all.
@@ -1090,10 +1063,10 @@ fn approval_rows_answer_only_under_the_approval_card_and_never_alias() {
         vec![row_label(Focus::ApprovalCard, KeyCode::Char('d'), NONE)],
         "only `d` denies"
     );
-    // The arrow, paging, and fold rows reach the composer without leaving
-    // typing focus, and decide nothing. Paging and folding stay out of the
-    // approval card's decision rows by construction (no such intent exists
-    // there for fold; paging scrolls the detail).
+    // The arrow and paging rows reach the composer without leaving
+    // typing focus, and decide nothing. They stay out of the
+    // approval card's decision rows by construction (paging scrolls the
+    // detail).
     for family in ["ScrollUp", "ScrollDown", "PageUp", "PageDown"] {
         assert_eq!(
             focuses_producing(family, &space),
@@ -1105,11 +1078,31 @@ fn approval_rows_answer_only_under_the_approval_card_and_never_alias() {
             "{family} navigates, pages, or scrolls detail and decides nothing"
         );
     }
+    // Keyboard folding is removed: arrows move the composer caret, while
+    // the viewport keeps no arrow or vim-letter fold binding, so expanding
+    // or collapsing a tool card is mouse-only.
     assert_eq!(
-        focuses_producing("FoldToggle", &space),
-        vec![String::from("Composer"), String::from("Viewport")],
-        "folding never reaches the approval card and decides nothing"
+        map_key(Focus::Composer, KeyEvent::new(KeyCode::Left, NONE)),
+        Some(Action::CaretLeft),
+        "composer Left moves the caret"
     );
+    assert_eq!(
+        map_key(Focus::Composer, KeyEvent::new(KeyCode::Right, NONE)),
+        Some(Action::CaretRight),
+        "composer Right moves the caret"
+    );
+    for (focus, code) in [
+        (Focus::Viewport, KeyCode::Left),
+        (Focus::Viewport, KeyCode::Right),
+        (Focus::Viewport, KeyCode::Char('h')),
+        (Focus::Viewport, KeyCode::Char('l')),
+    ] {
+        assert_eq!(
+            map_key(focus, KeyEvent::new(code, NONE)),
+            None,
+            "{focus:?} + {code:?} must stay unbound"
+        );
+    }
     assert_eq!(
         map_key(Focus::ApprovalCard, KeyEvent::new(KeyCode::Esc, NONE)),
         Some(Action::ParkFocus),
@@ -1162,7 +1155,7 @@ fn the_tab_row_hands_the_keyboard_on_and_parking_never_re_arms_the_card() {
 #[test]
 fn a_scripted_session_maps_row_for_row() {
     // The session in order: draft text, submit, newline, hand over to the
-    // viewport, navigate and fold, an `Esc` that returns home, hand
+    // viewport, navigate, an `Esc` that returns home, hand
     // over to the approval card, inspect, page, allow, park, and end.
     let observed_session: Vec<Option<String>> = SESSION
         .iter()
@@ -1178,7 +1171,6 @@ fn a_scripted_session_maps_row_for_row() {
             Some(String::from("CycleMode")),
             Some(String::from("ScrollDown")),
             Some(String::from("PageDown")),
-            Some(String::from("FoldToggle")),
             Some(String::from("ParkFocus")),
             Some(String::from("FocusSwitch")),
             Some(String::from("InspectApproval")),

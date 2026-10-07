@@ -58,6 +58,9 @@ pub const MAX_COMPOSER_BYTES: usize = nexus_core::commands::MAX_INPUT_BYTES;
 /// Maximum recalled composer inputs (M0-test choice). Older submissions
 /// are forgotten first; the bound keeps recall memory finite.
 pub const MAX_HISTORY_ENTRIES: usize = 128;
+/// Caret blink half-period in UI ticks (50ms each): visible for ten
+/// ticks, hidden for ten.
+pub const CARET_BLINK_TICKS: u64 = 10;
 /// Maximum redraw rate: event-driven redraws are coalesced to at most one
 /// frame per interval so a saturated stream cannot force full relayouts.
 pub const MAX_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
@@ -783,6 +786,13 @@ pub struct AppState {
     /// Presentation-only drops; accepted records are unaffected.
     pub dropped_entries: usize,
     composer: String,
+    /// Caret blink clock, advanced once per UI tick. The caret is visible
+    /// for [`CARET_BLINK_TICKS`] ticks, then hidden for the same span.
+    /// Counter-based (never wall-clock), so renders stay deterministic.
+    caret_ticks: u64,
+    /// Caret as a draft character offset (`0` is before the first char).
+    /// Always clamped to the draft by every edit path.
+    composer_caret: usize,
     /// Submitted inputs for composer recall, oldest first, bounded by
     /// [`MAX_HISTORY_ENTRIES`]. `Up` walks older, `Down` walks newer.
     composer_history: Vec<String>,
@@ -875,6 +885,8 @@ impl AppState {
             retained_bytes: 0,
             dropped_entries: 0,
             composer: String::new(),
+            caret_ticks: 0,
+            composer_caret: 0,
             composer_history: Vec::new(),
             history_cursor: None,
             history_stash: String::new(),
@@ -1403,6 +1415,8 @@ impl AppState {
         };
         self.history_cursor = Some(cursor);
         self.composer = self.composer_history[cursor].clone();
+        self.composer_caret = self.composer.chars().count();
+        self.touch_caret();
         true
     }
 
@@ -1421,6 +1435,8 @@ impl AppState {
             self.history_cursor = None;
             self.composer = std::mem::take(&mut self.history_stash);
         }
+        self.composer_caret = self.composer.chars().count();
+        self.touch_caret();
         true
     }
 
@@ -1713,7 +1729,7 @@ impl AppState {
         &self.composer
     }
 
-    /// Types one char, bounded by the command input limit. Control
+    /// Types one char at the caret, bounded by the command input limit. Control
     /// characters (including newline) and bidi formatting controls are
     /// rejected here as defense-in-depth for future paste paths; newline
     /// enters only through [`Self::composer_newline`], and the keyboard layer
@@ -1724,28 +1740,93 @@ impl AppState {
             return;
         }
         if self.composer.len() + char.len_utf8() <= MAX_COMPOSER_BYTES {
-            self.composer.push(char);
+            self.composer.insert(self.caret_byte(), char);
+            self.composer_caret += 1;
+            self.touch_caret();
             self.abandon_recall();
         }
     }
 
-    /// Starts a new composer line.
+    /// Starts a new composer line at the caret.
     pub fn composer_newline(&mut self) {
         self.clear_text_selection();
         if self.composer.len() < MAX_COMPOSER_BYTES {
-            self.composer.push('\n');
+            self.composer.insert(self.caret_byte(), '\n');
+            self.composer_caret += 1;
+            self.touch_caret();
             self.abandon_recall();
         }
     }
 
-    /// Deletes the last composer char. Returns false when already empty.
+    /// Deletes the composer char before the caret. Returns false when the
+    /// caret is already at the start of the draft.
     pub fn composer_backspace(&mut self) -> bool {
         self.clear_text_selection();
-        let removed = self.composer.pop().is_some();
-        if removed {
-            self.abandon_recall();
+        if self.composer_caret == 0 {
+            return false;
         }
-        removed
+        let byte = self.caret_byte();
+        let prev = self.composer[..byte]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.composer.drain(prev..byte);
+        self.composer_caret -= 1;
+        self.touch_caret();
+        self.abandon_recall();
+        true
+    }
+
+    /// Current caret as a draft character offset.
+    #[must_use]
+    pub fn composer_caret(&self) -> usize {
+        self.composer_caret
+    }
+
+    /// Moves the caret one char left, saturating at the draft start.
+    pub fn caret_left(&mut self) {
+        self.clear_text_selection();
+        self.composer_caret = self.composer_caret.saturating_sub(1);
+        self.touch_caret();
+    }
+
+    /// Moves the caret one char right, saturating at the draft end.
+    pub fn caret_right(&mut self) {
+        self.clear_text_selection();
+        self.composer_caret = (self.composer_caret + 1).min(self.composer.chars().count());
+        self.touch_caret();
+    }
+
+    /// Whether the caret renders this frame. Counter-based blink shared
+    /// with nothing else, so pausing the UI cannot desync it.
+    #[must_use]
+    pub fn caret_visible(&self) -> bool {
+        self.caret_ticks / CARET_BLINK_TICKS % 2 == 0
+    }
+
+    /// Advances the caret blink clock one UI tick. Returns true when the
+    /// visible phase flips and a redraw can show a different frame.
+    pub fn tick_caret(&mut self) -> bool {
+        let before = self.caret_visible();
+        self.caret_ticks = self.caret_ticks.saturating_add(1);
+        self.caret_visible() != before
+    }
+
+    /// Re-shows a hidden caret after an edit or a move, so typing never
+    /// lands in a blink-off gap.
+    fn touch_caret(&mut self) {
+        self.caret_ticks = 0;
+    }
+
+    /// Byte index of the caret: the boundary of the `composer_caret`-th
+    /// char, or the draft end when the caret is past the last char.
+    fn caret_byte(&self) -> usize {
+        self.composer
+            .char_indices()
+            .nth(self.composer_caret)
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.composer.len())
     }
 
     /// A manual edit leaves recall mode: the draft is live again and the
@@ -1761,6 +1842,8 @@ impl AppState {
     pub fn composer_take(&mut self) -> String {
         self.clear_text_selection();
         self.abandon_recall();
+        self.composer_caret = 0;
+        self.touch_caret();
         std::mem::take(&mut self.composer)
     }
 
@@ -2065,12 +2148,16 @@ impl AppState {
         }
     }
 
-    /// Starts a composer selection at one draft character offset.
+    /// Starts a composer selection at one draft character offset. A click
+    /// also parks the caret there, so typing after a click inserts where
+    /// the user pointed instead of where the caret happened to be.
     pub fn begin_composer_selection(&mut self, offset: usize) {
         self.text_selection = Some(TextSelection::Composer {
             anchor: offset,
             head: offset,
         });
+        self.composer_caret = offset.min(self.composer.chars().count());
+        self.touch_caret();
     }
 
     /// Extends the live composer selection. A no-op unless a composer
@@ -3402,6 +3489,55 @@ mod tests {
         assert_eq!(draft, "a\n");
         assert_eq!(state.composer(), "");
         assert!(!state.composer_backspace());
+    }
+
+    #[test]
+    fn composer_caret_edits_at_the_insertion_point() {
+        let mut state = AppState::new();
+        assert_eq!(state.composer_caret(), 0);
+        state.composer_type('a');
+        state.composer_type('b');
+        assert_eq!(state.composer_caret(), 2);
+        state.caret_left();
+        state.caret_left();
+        state.caret_left();
+        assert_eq!(
+            state.composer_caret(),
+            0,
+            "the caret saturates at the start"
+        );
+        assert!(!state.composer_backspace(), "nothing before the caret");
+        state.caret_right();
+        state.composer_type('X');
+        assert_eq!(state.composer(), "aXb");
+        assert_eq!(state.composer_caret(), 2);
+        assert!(state.composer_backspace());
+        assert_eq!(state.composer(), "ab");
+        assert_eq!(state.composer_caret(), 1);
+        state.caret_right();
+        state.caret_right();
+        assert_eq!(state.composer_caret(), 2, "the caret saturates at the end");
+        state.composer_newline();
+        state.caret_left();
+        state.composer_type('Y');
+        assert_eq!(state.composer(), "abY\n");
+        // Multibyte chars move the caret by one char, never into the
+        // middle of a code point.
+        let mut wide = AppState::new();
+        wide.composer_type('中');
+        wide.composer_type('x');
+        assert_eq!(wide.composer_caret(), 2);
+        wide.caret_left();
+        assert!(wide.composer_backspace());
+        assert_eq!(wide.composer(), "x");
+        assert_eq!(wide.composer_caret(), 0);
+        // Recall parks the caret at the end; taking the draft resets it.
+        wide.record_submitted("hello");
+        assert!(wide.recall_prev());
+        assert_eq!(wide.composer_caret(), 5);
+        wide.caret_left();
+        assert_eq!(wide.composer_take(), "hello");
+        assert_eq!(wide.composer_caret(), 0);
     }
 
     #[test]

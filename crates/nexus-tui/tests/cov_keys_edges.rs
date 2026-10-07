@@ -126,12 +126,12 @@ fn expected_special(focus: Focus, code: KeyCode) -> Option<Action> {
         (Focus::Composer, KeyCode::Down) => Some(Action::ScrollDown),
         (Focus::Composer, KeyCode::PageUp) => Some(Action::PageUp),
         (Focus::Composer, KeyCode::PageDown) => Some(Action::PageDown),
-        (Focus::Composer, KeyCode::Left | KeyCode::Right) => Some(Action::FoldToggle),
+        (Focus::Composer, KeyCode::Left) => Some(Action::CaretLeft),
+        (Focus::Composer, KeyCode::Right) => Some(Action::CaretRight),
         (Focus::Viewport, KeyCode::Up) => Some(Action::ScrollUp),
         (Focus::Viewport, KeyCode::Down) => Some(Action::ScrollDown),
         (Focus::Viewport, KeyCode::PageUp) => Some(Action::PageUp),
         (Focus::Viewport, KeyCode::PageDown) => Some(Action::PageDown),
-        (Focus::Viewport, KeyCode::Left | KeyCode::Right) => Some(Action::FoldToggle),
         (Focus::Viewport, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::Viewport, KeyCode::Esc) => Some(Action::ParkFocus),
         (Focus::ApprovalCard, KeyCode::Up) => Some(Action::ScrollUp),
@@ -151,7 +151,6 @@ fn expected_ascii_char(focus: Focus, char: char) -> Option<Action> {
         (Focus::Composer, _) => Some(Action::Type(char)),
         (Focus::Viewport, 'k') => Some(Action::ScrollUp),
         (Focus::Viewport, 'j') => Some(Action::ScrollDown),
-        (Focus::Viewport, 'h' | 'l') => Some(Action::FoldToggle),
         (Focus::Viewport, 'm') => Some(Action::CycleModel),
         (Focus::Viewport, 'q') => Some(Action::Quit),
         (Focus::ApprovalCard, 'a') => Some(Action::ApproveOnce),
@@ -242,7 +241,7 @@ fn focus_gaps_never_borrow_another_focus_binding() {
     );
     expect_none(Focus::ApprovalCard, key(KeyCode::Enter), "no approval row");
     // The composer recalls submitted inputs right in the draft, so recall
-    // is always visible; it also pages and folds without leaving typing
+    // is always visible; it also pages without leaving typing
     // focus, so the viewport-only shortcuts stay one `Esc` away but are
     // rarely needed.
     assert_eq!(
@@ -265,15 +264,30 @@ fn focus_gaps_never_borrow_another_focus_binding() {
         Some(Action::PageDown),
         "composer PgDn pages the viewport"
     );
+    // Left/Right move the composer caret; every other arrow is inert
+    // outside scrolling, and keyboard folding is removed, so arrows can
+    // never disturb the draft.
     assert_eq!(
         map_key(Focus::Composer, key(KeyCode::Left)),
-        Some(Action::FoldToggle),
-        "composer Left folds the selected entry"
+        Some(Action::CaretLeft),
+        "composer Left moves the caret"
     );
     assert_eq!(
         map_key(Focus::Composer, key(KeyCode::Right)),
-        Some(Action::FoldToggle),
-        "composer Right unfolds the selected entry"
+        Some(Action::CaretRight),
+        "composer Right moves the caret"
+    );
+    expect_none(Focus::Viewport, key(KeyCode::Left), "no viewport folding");
+    expect_none(Focus::Viewport, key(KeyCode::Right), "no viewport folding");
+    expect_none(
+        Focus::Viewport,
+        key(KeyCode::Char('h')),
+        "no viewport folding",
+    );
+    expect_none(
+        Focus::Viewport,
+        key(KeyCode::Char('l')),
+        "no viewport folding",
     );
     expect_none(
         Focus::ApprovalCard,

@@ -1860,6 +1860,8 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
         Action::Backspace => {
             front.state.composer_backspace();
         }
+        Action::CaretLeft => front.state.caret_left(),
+        Action::CaretRight => front.state.caret_right(),
         Action::FocusSwitch => {
             let pending = front.state.pending_approval().is_some();
             front.focus = next_focus(front.focus, pending);
@@ -1935,14 +1937,6 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
         Action::CycleVariant => {
             // Display-only: the title names the new variant at once.
             front.state.cycle_variant();
-        }
-        Action::FoldToggle => {
-            if front.state.selected().is_none() {
-                front.state.move_selection(-1);
-            }
-            if let Some(index) = front.state.selected() {
-                front.state.toggle_fold(index);
-            }
         }
         Action::ApproveOnce | Action::Deny => {
             let Some((run, notice)) = front.live_approval.clone() else {
@@ -2174,6 +2168,7 @@ async fn interactive_loop(
                 // without input the loop would otherwise hold it forever.
                 dirty |= sessions.active_mut().front.state.poll_toast_expired();
                 dirty |= sessions.active_mut().front.state.tick_tool_animation();
+                dirty |= sessions.active_mut().front.state.tick_caret();
                 // Drain queued session intents against the registry in
                 // recording order: creation moves the active slot, so later
                 // intents resolve after earlier ones.
@@ -4395,7 +4390,7 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
-    async fn composer_pages_and_folds_without_leaving_the_composer() {
+    async fn composer_pages_without_leaving_the_composer() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
         for index in 0..30 {
@@ -4414,12 +4409,21 @@ mod cov_main_topup {
             "composer PgDn returns to the tail"
         );
 
+        // Left/Right move the draft caret; folding is mouse-only, so
+        // arrow keys can never disturb the draft or the selection.
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
-        assert_eq!(front.focus, Focus::Composer, "folding keeps typing focus");
-        assert!(front.state.selected().is_some(), "Left selects and folds");
+        assert_eq!(front.state.composer_caret(), 0, "caret stays put on empty");
+        assert_eq!(front.focus, Focus::Composer, "arrows keep typing focus");
+        for char in ['a', 'b'] {
+            assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(char))).await);
+        }
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
+        assert_eq!(front.state.composer_caret(), 1);
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char('X'))).await);
+        assert_eq!(front.state.composer(), "aXb", "typing inserts at the caret");
         assert_eq!(
             front.request_counter, 0,
-            "paging and folding issue no command"
+            "paging and arrows issue no command"
         );
     }
 
@@ -4492,19 +4496,27 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
-    async fn folding_without_a_selection_selects_an_entry_first() {
+    async fn viewport_arrows_never_fold_or_select() {
+        // Keyboard folding is removed: Left/Right/h/l are inert everywhere,
+        // and only a mouse click expands or collapses a tool card.
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
-        let run = run_id("run-fold");
+        let run = run_id("run-arrows-inert");
         let mut front = Frontend::new(session());
         front.merger.adopt(&run);
         front.apply_events(vec![started(&run, 0), text(&run, 1, "hello")]);
         front.focus = Focus::Viewport;
         assert!(front.state.selected().is_none());
 
-        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
-        let selected = front.state.selected().expect("an entry is selected");
-        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Left)).await);
-        assert_eq!(front.state.selected(), Some(selected), "the fold toggles");
+        for key in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+        ] {
+            assert!(!handle_key(&mut front, &runtime, press(key)).await);
+        }
+        assert!(front.state.selected().is_none(), "arrows select nothing");
+        assert_eq!(front.request_counter, 0, "inert arrows issue no command");
         assert!(front.state.entry_count() > 0);
     }
 

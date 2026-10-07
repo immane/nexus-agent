@@ -45,7 +45,8 @@ Finished results keep the policy-redacted invocation visible alongside status an
 evidence. Compact tool results and streamed progress show the last **10 logical
 output lines** (wrapping may use more terminal rows), with a hidden-line count.
 Click a tool card (header or output) to expand/collapse its retained output;
-Left/Right remains the keyboard alternative. Dragging still selects text for
+keyboard folding is removed so arrow keys can never disturb the composer draft.
+Dragging still selects text for
 copying, even over headers. Click identity is independent of text selection, so
 runtime events clearing a highlight do not cancel an otherwise valid click. None
 of these inspection actions executes a tool or grants approval.

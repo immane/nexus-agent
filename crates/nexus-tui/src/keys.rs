@@ -21,10 +21,9 @@
 //! | Composer | `Backspace` | Delete last draft char |
 //! | Composer | `Up`/`Down` | Previous/next submitted input (shown in the composer) |
 //! | Composer | `PageUp`/`PageDown` | Page the viewport (focus stays) |
-//! | Composer | `Left`/`Right` | Fold/unfold the selected entry (focus stays) |
+//! | Composer | `Left`/`Right` | Move the draft caret (focus stays) |
 //! | Viewport | `Up`/`k`, `Down`/`j` | Move selection (scrolls) |
 //! | Viewport | `PageUp`/`PageDown` | Scroll one page |
-//! | Viewport | `Left`/`h`, `Right`/`l` | Fold/unfold the selected entry |
 //! | Viewport | `Esc` | Back to the composer (never cancels) |
 //! | Viewport | `m` | Cycle the active model (admission order) |
 //! | Viewport | `Tab` | Switch focus |
@@ -92,8 +91,10 @@ pub enum Action {
     PageUp,
     /// Scroll one viewport page down.
     PageDown,
-    /// Fold or unfold the selected entry.
-    FoldToggle,
+    /// Move the composer caret one char left.
+    CaretLeft,
+    /// Move the composer caret one char right.
+    CaretRight,
     /// Cycle the active configured model. Bound in the viewport only, so
     /// the composer keeps typing `m` as ordinary text.
     CycleModel,
@@ -165,16 +166,13 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
         (Focus::Composer, KeyCode::Down) => Some(Action::ScrollDown),
         (Focus::Composer, KeyCode::PageUp) => Some(Action::PageUp),
         (Focus::Composer, KeyCode::PageDown) => Some(Action::PageDown),
-        (Focus::Composer, KeyCode::Left | KeyCode::Right) => Some(Action::FoldToggle),
+        (Focus::Composer, KeyCode::Left) => Some(Action::CaretLeft),
+        (Focus::Composer, KeyCode::Right) => Some(Action::CaretRight),
         (Focus::Composer, KeyCode::Char(char)) if is_composable(char) => Some(Action::Type(char)),
         (Focus::Viewport, KeyCode::Up | KeyCode::Char('k')) => Some(Action::ScrollUp),
         (Focus::Viewport, KeyCode::Down | KeyCode::Char('j')) => Some(Action::ScrollDown),
         (Focus::Viewport, KeyCode::PageUp) => Some(Action::PageUp),
         (Focus::Viewport, KeyCode::PageDown) => Some(Action::PageDown),
-        (
-            Focus::Viewport,
-            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l'),
-        ) => Some(Action::FoldToggle),
         (Focus::Viewport, KeyCode::Char('m')) => Some(Action::CycleModel),
         (Focus::Viewport, KeyCode::Tab) => Some(Action::FocusSwitch),
         (Focus::Viewport, KeyCode::Char('q')) => Some(Action::Quit),
