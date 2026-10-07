@@ -12,7 +12,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent has an M0 **test-only implementation** with opt-in OpenAI-compatible live providers and root-jailed file reads/writes; storage remains ephemeral and plugins are not implemented. See [QUICKSTART.md](QUICKSTART.md) for live wiring and limitations. **M0 acceptance is not complete**. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and broader capabilities below describe the proposed architecture, not stable features.
+> Nexus Agent has an M0 **test-only implementation** (TUI reports `v0.1.1-alpha`) with opt-in OpenAI-compatible live providers and development-mode file tools plus sandboxed command execution; storage remains ephemeral and plugins are not implemented. Real tools default to development mode: operations inside the project root and temp directories are automatic, access to other paths needs approval (allow once, or grant that directory for the session), and `--strict-tools` restores project-jailed reads with per-call confirmation. See [QUICKSTART.md](QUICKSTART.md) for live wiring and limitations. **M0 acceptance is not complete**. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and broader capabilities below describe the proposed architecture, not stable features.
 
 ## Design Goals
 
@@ -119,7 +119,7 @@ Accepted in [Decision 01](docs/design/decisions/01-first-release-defaults.md); d
 
 | Area | Accepted default |
 | --- | --- |
-| Permissions | Scoped project reads/searches are automatic; file mutations and command execution require confirmation. |
+| Permissions | Development mode by default: project/temp operations are automatic, external file access needs approval (allow once or a session-only directory grant); `--strict-tools` keeps project-jailed reads with confirmation for mutations and exec. |
 | Frontend | Grok Build-style full-screen Rust TUI plus a headless entry point over the same runtime. |
 | Sessions | Save automatically outside the project; start new and restore history only on explicit request. |
 | Authentication | API configuration with external credential references; browser login deferred. |
@@ -133,7 +133,7 @@ Both frontends submit to the same runtime, so policy is identical wherever you i
 
 | Mode | Tool policy |
 | --- | --- |
-| `build` (default) | Full capability; file mutations and command execution still require explicit approval. |
+| `build` (default) | Full capability; in development mode project/temp operations are automatic while external paths need approval, and `--strict-tools` requires explicit approval for mutations and exec. |
 | `plan` | Read-only: confirmation-required tools are denied without prompting; automatic reads still run. |
 
 In the TUI, `Tab` in the composer cycles modes, and the composer border color and title name the active one. One-shot headless runs take `--mode plan|build|<custom>`. Further modes come from configuration:
@@ -149,7 +149,7 @@ Built-in ids cannot be redefined, and unknown mode ids or dangling defaults fail
 
 ### TUI presentation
 
-Assistant messages render a Markdown subset (headings, emphasis, code, lists, quotes, tables, footnotes, math) with breathing room between blocks, and CJK text wraps by cell width. Left-drag selects conversation or composer text and releasing copies it to the clipboard (OSC 52, which most terminals honor); the wheel scrolls, and `Esc` steps back without ever cancelling. `/help` lists the keys and slash commands.
+Assistant messages render a Markdown subset (headings, emphasis, code, lists, quotes, tables, footnotes, math) with breathing room between blocks, and CJK text wraps by cell width. Tool cards show the exact invocation with the last 10 output lines and expand on click; entry titles are role-colored. The composer has a blinking block caret that overlays text (`Left`/`Right` move it, `Up`/`Down` recall history), and mouse folding is click-only so arrows never disturb the draft. Left-drag selects conversation or composer text and releasing copies it to the clipboard (OSC 52, which most terminals honor); the wheel scrolls, and `Esc` steps back without ever cancelling. `/help` lists the keys and slash commands.
 
 ## Extensions
 
@@ -164,7 +164,7 @@ MCP over stdio is the preferred initial external-tool transport candidate, kept 
 
 API relay is separate from tool plugins: a relay is a provider implementation behind the provider port, not a model-invoked tool. Existing relay services come first; local relay execution remains an optional boundary and never mandatory startup work.
 
-The initial coding distribution provides scoped reads and approval-gated full-file writes. Search, patch application, and command execution remain pending. Workflow, context selection, storage, and frontend replacement retain explicit boundaries without allowing arbitrary mutation of runtime internals.
+The initial coding distribution provides scoped reads, listing, and search, full-file writes, exact-text patches, and sandboxed `argv` execution without a shell or network access (`sandbox-exec` on macOS, `bwrap` on Linux). In development mode project/temp operations are automatic and external paths are approval-gated; `--strict-tools` restores per-call confirmation for every mutation and execution. Workflow, context selection, storage, and frontend replacement retain explicit boundaries without allowing arbitrary mutation of runtime internals.
 
 **An extensible core does not make every enabled plugin free.** Optional integrations should initialize on demand; heavy dependencies should remain outside the minimal build. Native dynamic-library loading, WASM runtimes, and arbitrary lifecycle hooks are not initial-core goals.
 
@@ -193,7 +193,7 @@ The proposed runtime enforces permissions, resource scopes, deadlines, and outpu
 
 Initial external plugins are explicitly enabled **trusted code**. A subprocess is not a sandbox; isolation for untrusted plugins requires a separate implementation and platform-specific testing. No sandbox or containment guarantee exists today.
 
-The default permission policy and session behavior are accepted; automatic reads remain scoped, mutations/commands require exact-call confirmation, and restored history never replays operations or old grants.
+The default permission policy and session behavior are accepted; automatic access remains scoped to the project/temp boundary, external paths require exact-call confirmation (once, or a session-only directory grant that never persists), strict mode confirms every mutation and execution, and restored history never replays operations or old grants.
 
 See the [security design](docs/design/06-security.md) and [session recovery contract](docs/contracts/04-session-store.md).
 
@@ -203,10 +203,10 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Draft architecture, performance, security, and interface contracts.
 - [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
 - [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
-- [x] Build a testable core/runtime and minimal frontend (scripted fakes plus opt-in live providers and jailed file tools; last local verification: 2039 Rust tests passed / 0 failed with 9 intentionally-skipped redundancy layers, 253 Python harness tests passed with 1 platform skip; GitHub Actions runs the suite on Ubuntu and macOS).
+- [x] Build a testable core/runtime and minimal frontend (scripted fakes plus opt-in live providers and development-mode file tools with sandboxed exec; routine checks are `cargo fmt --check`, per-crate `cargo test`, and `cargo clippy -D warnings`, with the full suite in GitHub Actions on Ubuntu and macOS; see [Testing](docs/testing.md) for the default/optional split).
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
-- [ ] Complete coding tools and mainstream model adapters (opt-in OpenAI-compatible streaming and file reads/writes are implemented; search, shell execution, and other provider protocols remain pending).
+- [ ] Complete coding tools and mainstream model adapters (opt-in OpenAI-compatible streaming, file read/list/search/write/patch, and sandboxed execution are implemented; other provider protocols remain pending).
 - [ ] Add bounded external-plugin interoperability and session recovery.
 
 Windows and untrusted-plugin isolation are separate follow-up work. Build the M0 test-only binaries with `cargo build --workspace --release` (produces `nexus-headless` and `nexus-tui`); there is no installable release yet.
