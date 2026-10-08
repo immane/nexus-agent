@@ -7,6 +7,10 @@
 
 A Rust coding agent designed around very fast startup, a minimal core, and a native terminal interface. Broader capabilities belong in replaceable tools and plugins, not an ever-growing engine.
 
+<div align="center">
+<img src="docs/images/demo.gif" alt="Nexus Agent terminal demo" width="100%" />
+</div>
+
 [Documentation](docs/index.md) · [Contributing](CONTRIBUTING.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
