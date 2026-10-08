@@ -34,7 +34,7 @@ Escape
 Sleep 50ms
 
 # 6. Send a message
-Type "Please summarize this project for me."
+Type "Please summarize @README.md for me."
 Enter
 
 # 7. Wait for the Agent response
