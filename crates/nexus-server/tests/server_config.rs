@@ -86,21 +86,34 @@ fn round_trip(port: u16, raw: &str) -> (u16, Value) {
 }
 
 fn get(port: u16, path: &str) -> (u16, Value) {
-    round_trip(port, &format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n"))
+    round_trip(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n",
+            "a".repeat(64)
+        ),
+    )
 }
 
 fn post(port: u16, path: &str, body: &str) -> (u16, Value) {
     round_trip(
         port,
         &format!(
-            "POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\ncontent-length: {}\r\n\r\n{body}",
+            "a".repeat(64),
             body.len()
         ),
     )
 }
 
 fn delete(port: u16, path: &str) -> (u16, Value) {
-    round_trip(port, &format!("DELETE {path} HTTP/1.1\r\nhost: x\r\n\r\n"))
+    round_trip(
+        port,
+        &format!(
+            "DELETE {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n",
+            "a".repeat(64)
+        ),
+    )
 }
 
 /// Mints a session and returns its token.
@@ -142,7 +155,7 @@ fn drive_to_terminal(port: u16, session: &str, run: &str) {
         .expect("timeout sets");
     socket
         .write_all(
-            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: x\r\n\r\n")
+            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n", "a".repeat(64))
                 .as_bytes(),
         )
         .expect("SSE subscribes");
@@ -283,6 +296,9 @@ fn spawn_server(config: UserConfig, path: Option<PathBuf>) -> u16 {
         .expect("test executor builds");
     let mut server = nexus_server::Server::new(runtime.handle().clone());
     server.set_config(config, path);
+    server
+        .set_auth_token(&"a".repeat(64))
+        .expect("test token valid");
     let server = Arc::new(server);
     std::thread::spawn(move || {
         // The executor outlives the test: it is reclaimed at process exit,

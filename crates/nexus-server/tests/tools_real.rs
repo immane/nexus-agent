@@ -63,7 +63,8 @@ fn post(port: u16, path: &str, body: &str) -> (u16, Value) {
     round_trip(
         port,
         &format!(
-            "POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\ncontent-length: {}\r\n\r\n{body}",
+            "a".repeat(64),
             body.len()
         ),
     )
@@ -84,6 +85,9 @@ fn spawn_real_tools(root: &std::path::Path) -> u16 {
             root: root.to_owned(),
         })
         .expect("temp root binds");
+    server
+        .set_auth_token(&"a".repeat(64))
+        .expect("test token valid");
     let server = std::sync::Arc::new(server);
     std::thread::spawn(move || {
         std::mem::forget(runtime);
@@ -104,7 +108,7 @@ fn tool_outcomes(port: u16, session: &str, run: &str, wanted: usize) -> Vec<Valu
         .expect("timeout sets");
     stream
         .write_all(
-            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: x\r\n\r\n")
+            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n", "a".repeat(64))
                 .as_bytes(),
         )
         .expect("SSE subscribes");

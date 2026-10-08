@@ -143,8 +143,12 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
         {
             return Err(bad(400, "header name is malformed"));
         }
-        if name == "content-length" && headers.contains_key(&name) {
-            return Err(bad(400, "content length is malformed"));
+        if matches!(
+            name.as_str(),
+            "content-length" | "host" | "origin" | "authorization"
+        ) && headers.contains_key(&name)
+        {
+            return Err(bad(400, "request header is repeated"));
         }
         headers.insert(name, value.trim().to_owned());
     }
@@ -223,6 +227,8 @@ pub const fn reason(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         408 => "Request Timeout",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -240,14 +246,23 @@ pub const fn reason(status: u16) -> &'static str {
 /// Writes one framed response and flushes. The caller closes the stream
 /// afterwards unless it is handing the stream to the SSE loop.
 pub fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        response.status,
-        reason(response.status),
-        response.content_type,
-        response.body.len(),
-    )?;
+    if response.status == 401 {
+        write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            response.content_type,
+            response.body.len(),
+        )?;
+    } else {
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            response.status,
+            reason(response.status),
+            response.content_type,
+            response.body.len(),
+        )?;
+    }
     stream.write_all(&response.body)?;
     stream.flush()
 }

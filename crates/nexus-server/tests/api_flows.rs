@@ -57,7 +57,10 @@ fn round_trip(port: u16, raw: &str) -> (u16, Vec<u8>) {
 }
 
 fn get(port: u16, path: &str) -> (u16, Value) {
-    let (status, body) = round_trip(port, &format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n"));
+    let (status, body) = round_trip(
+        port,
+        &format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\r\n"),
+    );
     (status, serde_json::from_slice(&body).expect("JSON body"))
 }
 
@@ -65,7 +68,7 @@ fn post(port: u16, path: &str, body: &str) -> (u16, Value) {
     let (status, raw) = round_trip(
         port,
         &format!(
-            "POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-length: {}\r\n\r\n{body}",
             body.len()
         ),
     );
@@ -214,7 +217,7 @@ impl Stream {
             .expect("timeout sets");
         socket
             .write_all(
-                format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: x\r\n\r\n")
+                format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\r\n")
                     .as_bytes(),
             )
             .expect("SSE subscribes");
@@ -317,7 +320,7 @@ fn second_attach(port: u16, session: &str, run: &str) -> Vec<u8> {
         .expect("timeout sets");
     socket
         .write_all(
-            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: x\r\n\r\n")
+            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\r\n")
                 .as_bytes(),
         )
         .expect("SSE subscribes");
@@ -733,7 +736,10 @@ fn an_unknown_run_event_subscription_is_rejected_immediately() {
     let port = spawn_server();
     let session = create_session(port);
     let path = format!("/sessions/{session}/runs/no-such-run/events");
-    let (status, body) = round_trip(port, &format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n"));
+    let (status, body) = round_trip(
+        port,
+        &format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n\r\n"),
+    );
     assert_eq!(status, 404);
     let body: Value = serde_json::from_slice(&body).expect("static JSON error");
     assert_eq!(body["error"], "unknown run");

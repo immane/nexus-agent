@@ -42,14 +42,21 @@ fn post(port: u16, path: &str, body: &str) -> (u16, Value) {
     round_trip(
         port,
         &format!(
-            "POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\ncontent-length: {}\r\n\r\n{body}",
+            "a".repeat(64),
             body.len()
         ),
     )
 }
 
 fn get(port: u16, path: &str) -> (u16, Value) {
-    round_trip(port, &format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n"))
+    round_trip(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n",
+            "a".repeat(64)
+        ),
+    )
 }
 
 fn configured(endpoint: &str, credential: &str) -> nexus_config::UserConfig {
@@ -87,6 +94,9 @@ fn spawn_server(config: nexus_config::UserConfig) -> u16 {
         .expect("test executor builds");
     let mut server = nexus_server::Server::new(runtime.handle().clone());
     server.set_config(config, None);
+    server
+        .set_auth_token(&"a".repeat(64))
+        .expect("test token valid");
     let server = Arc::new(server);
     std::thread::spawn(move || {
         std::mem::forget(runtime);
@@ -110,7 +120,7 @@ fn events_until_terminal(port: u16, session: &str, run: &str) -> Vec<Value> {
         .expect("timeout sets");
     stream
         .write_all(
-            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: x\r\n\r\n")
+            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n", "a".repeat(64))
                 .as_bytes(),
         )
         .expect("SSE subscribes");

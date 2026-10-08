@@ -61,6 +61,19 @@ use nexus_tools::{
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+/// Validates the bearer-token syntax used by the server binary.
+///
+/// The token itself must be obtained through a secret-safe channel such as
+/// an environment variable, never command-line arguments or a URL.
+///
+/// # Errors
+/// Returns a static reason when the value is not exactly 64 hexadecimal
+/// characters.
+pub fn validate_auth_token(value: &str) -> Result<(), &'static str> {
+    AuthToken::parse(value).map(|_| ())
+}
+
+use crate::auth::{self, AuthToken};
 use crate::http::{self, Request, Response};
 use crate::json;
 
@@ -273,9 +286,8 @@ impl Session {
     }
 }
 
-/// Shared server state: the Tokio handle driving runtime ports, every live
-/// session, and the user configuration. Bound to loopback by the binary;
-/// there is no auth.
+/// Shared server state: runtime ports, live sessions, user configuration,
+/// and the HTTP caller credential.
 pub struct Server {
     handle: tokio::runtime::Handle,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -295,6 +307,7 @@ pub struct Server {
     /// Tool wiring for sessions created after the call. Startup-only: set
     /// before serving, alongside [`Server::set_config`].
     tools_mode: ToolsMode,
+    auth_token: Option<AuthToken>,
 }
 
 /// Session creation failure with its HTTP status and static diagnostic.
@@ -351,6 +364,7 @@ impl Server {
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
+            auth_token: None,
         }
     }
 
@@ -376,6 +390,13 @@ impl Server {
     pub fn set_config(&mut self, config: UserConfig, path: Option<PathBuf>) {
         *self.config.lock().expect("config lockable") = config;
         self.config_path = path;
+    }
+
+    /// Installs the HTTP bearer credential before serving. The configured
+    /// credential is required whenever real tools or a provider are enabled.
+    pub fn set_auth_token(&mut self, token: &str) -> Result<(), &'static str> {
+        self.auth_token = Some(AuthToken::parse(token)?);
+        Ok(())
     }
 
     /// Creates a session with a fresh demo-wired runtime and returns its
@@ -591,8 +612,43 @@ impl Server {
     /// terminal event).
     pub fn handle_connection(self: &Arc<Self>, mut stream: TcpStream) {
         let _ = stream.set_write_timeout(Some(http::WRITE_TIMEOUT));
+        let port = stream
+            .local_addr()
+            .map(|address| address.port())
+            .unwrap_or(0);
         let response = match http::read_request(&mut stream) {
-            Ok(request) => self.route(&request, &mut stream),
+            Ok(request) => {
+                let health = request.method == "GET" && request.route_path() == "/health";
+                let required = !health
+                    && (self.auth_token.is_some()
+                        || !matches!(self.tools_mode, ToolsMode::Fakes)
+                        || !self
+                            .config
+                            .lock()
+                            .expect("config lockable")
+                            .providers()
+                            .is_empty());
+                let token = if health {
+                    None
+                } else {
+                    self.auth_token.as_ref()
+                };
+                match auth::authorize(&request, port, token, required) {
+                    Ok(()) => self.route(&request, &mut stream),
+                    Err(auth::AccessError::Unauthorized) => Some(json_response(
+                        401,
+                        &json::error_body("bearer authentication required"),
+                    )),
+                    Err(auth::AccessError::Forbidden) => Some(json_response(
+                        403,
+                        &json::error_body("host or origin is not allowed"),
+                    )),
+                    Err(auth::AccessError::NotReady) => Some(json_response(
+                        503,
+                        &json::error_body("server authentication is not configured"),
+                    )),
+                }
+            }
             Err(error) => Some(json_response(
                 error.status,
                 &json::error_body(error.message),

@@ -144,6 +144,22 @@ SSE timeout installation, and a completed bound-model run with no SSE reader.
 
 ### M1.7 — Set the real-tool server trust contract
 
+**Implementation status: Verified.** D2 is resolved for this slice:
+the loopback server stays loopback-only; enabling real tools or configuring
+a live provider requires `--auth-token-env NAME` and a 32-byte bearer token
+encoded as 64 hexadecimal characters. Only the test-only fake demo may run
+without a token. The credential is server-wide and grants route access,
+including approval/denial; session IDs are not credentials. Host accepts only
+the bound-port `127.0.0.1` or `localhost`; optional Origin must be same-origin
+HTTP. No CORS or token-in-URL support is provided. This does not provide
+encryption or isolate mutually untrusted same-user processes. `auth_flows::real_tool_http_requires_bearer_and_rejects_untrusted_host_or_origin`
+verifies missing/invalid credentials, URL-token rejection, Host/Origin policy,
+and successful same-origin access; parser coverage verifies duplicate
+security/framing header rejection. Validation: `cargo fmt --all --check`,
+`cargo nextest run -p nexus-server --locked --offline` (149 passed), and
+`cargo clippy -p nexus-server --all-targets --locked --offline -- -D warnings`
+passed.
+
 **Findings:** P1.6. **Paths:** server entry/HTTP/route code and tests; security/setup documentation. **Dependencies:** explicit decision D2 below; M1.6 for integration.
 
 - Keep loopback binding. Decide a minimal local caller/approver authorization mechanism before product-facing real-tool use; session identifiers are correlation identities, not credentials.
@@ -292,7 +308,7 @@ These tasks are **deferred**, not prerequisites for current migration completion
 | Decision | Proposed minimum | Must be resolved before |
 | --- | --- | --- |
 | D1 — Selection/error compatibility | Server sessions remain bound; conflicting submit fields are rejected; omitted selection uses the binding. TUI accepted runs keep their actual model despite later UI changes. | M1.1/M1.5 behavior changes; specify default-model equivalence and attribution rules |
-| D2 — Real-tool server trust | Retain loopback exposure and establish minimal local caller/approver authorization; no OAuth/accounts or public listener. | M1.7; document token provisioning, browser access, demo exceptions, and startup compatibility |
+| D2 — Real-tool server trust | **Resolved for M1.7:** loopback-only; real tools or configured providers require `--auth-token-env`; fake demo may be unauthenticated; same-origin HTTP only; one server-wide bearer credential grants submit/approval/control; no OAuth/accounts or public listener. | M1.7 implemented and verified; see task evidence above |
 | D3 — File operation guarantees | A concrete supported platform access boundary plus separately specified update consistency; no universal capability framework. | M2.3; choose symlink/hardlink/permissions/identity semantics and residual concurrency limits |
 | D4 — API retirement | Remove/narrow a public legacy contract only after caller inventory and compatibility review; migrate meaningful tests. | M4.3 public API removal |
 | D5 — Effective budgets | Finite explicit event/byte/cleanup/server bounds; distinguish configurable limits from hard ceilings and keep terminal reserve. | M1.3/M1.4/M1.6; record chosen values and evidence, no silent widening |

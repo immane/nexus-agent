@@ -143,18 +143,20 @@ cat > /tmp/nexus-config.json <<'EOF'
   "recent": []
 }
 EOF
-cargo run -p nexus-server --locked --offline -- --port 8471 --config /tmp/nexus-config.json
+export NEXUS_SERVER_TOKEN=$(openssl rand -hex 32)
+cargo run -p nexus-server --locked --offline -- --port 8471 --config /tmp/nexus-config.json --auth-token-env NEXUS_SERVER_TOKEN
 ```
 
 In another terminal (session bound to the configured provider; tools
 stay scripted fakes unless `--tools real` is also passed):
 
 ```sh
-SID=$(curl -s -X POST localhost:8471/sessions -d '{"provider":"ollama","model":"local"}' \
+AUTH="Authorization: Bearer $NEXUS_SERVER_TOKEN"
+SID=$(curl -s -H "$AUTH" -X POST localhost:8471/sessions -d '{"provider":"ollama","model":"local"}' \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['session'])")
-RID=$(curl -s -X POST localhost:8471/sessions/$SID/runs -d '{"input":"say hi in five words"}' \
+RID=$(curl -s -H "$AUTH" -X POST localhost:8471/sessions/$SID/runs -d '{"input":"say hi in five words"}' \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['run'])")
-curl -sN localhost:8471/sessions/$SID/runs/$RID/events
+curl -sN -H "$AUTH" localhost:8471/sessions/$SID/runs/$RID/events
 ```
 
 Expect the model's text, then a terminal `completed`. If the model
@@ -171,8 +173,8 @@ files are refused.
 Sanity checks that need no model at all:
 
 ```sh
-curl -s -X POST localhost:8471/sessions -d '{"provider":"ghost"}'       # 400 unknown
-curl -s -X POST localhost:8471/sessions/$SID/runs -d '{"input":"x"}'    # fake demo path still works
+curl -s -H "$AUTH" -X POST localhost:8471/sessions -d '{"provider":"ghost"}'       # 400 unknown
+curl -s -H "$AUTH" -X POST localhost:8471/sessions/$SID/runs -d '{"input":"x"}'    # fake demo path still works
 ```
 
 Unset `OLLAMA_API_KEY` and submit with `"provider":"ollama"` to see the

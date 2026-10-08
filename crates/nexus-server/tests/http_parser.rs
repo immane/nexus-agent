@@ -233,6 +233,17 @@ fn duplicate_header_names_keep_the_last_value() {
     assert_eq!(request.header("x-trace"), Some("second"));
 }
 
+#[test]
+fn duplicate_security_and_framing_headers_are_rejected() {
+    for header in ["host", "origin", "authorization", "content-length"] {
+        let raw = format!("GET /x HTTP/1.1\r\n{header}: first\r\n{header}: second\r\n\r\n");
+        assert!(
+            !reject(&raw, 400).is_empty(),
+            "duplicate {header} must not be accepted"
+        );
+    }
+}
+
 // --- Request line -----------------------------------------------------------
 
 #[test]

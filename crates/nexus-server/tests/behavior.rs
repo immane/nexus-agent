@@ -1,6 +1,7 @@
 //! Behavioral integration tests share one executable to avoid repeated linking.
 
 mod api_flows;
+mod auth_flows;
 mod http_parser;
 mod json_encoding;
 mod provider_sessions;

@@ -5,8 +5,10 @@
 //! live stream. It is never real configuration: the demo wiring uses
 //! scripted [`nexus_fakes`] doubles (no provider credentials, no network
 //! egress beyond loopback, no stored sessions), and the server binds
-//! `127.0.0.1` only. There is no authentication: any local process can
-//! submit, approve, and cancel. Do not expose this server to a network.
+//! `127.0.0.1` only. Real tools and configured providers require a bearer
+//! credential; only the test-only fake demo may run unauthenticated. The
+//! credential holder can submit, approve, and cancel. Do not expose this
+//! server to a network.
 //! The binary caps concurrent connection threads at 64; sessions are capped
 //! at 128 and excess creation is rejected (`503`) rather than evicting
 //! runtime state. Requests have a 60-second total read deadline and writes
@@ -107,6 +109,7 @@
 
 #![forbid(unsafe_code)]
 
+mod auth;
 pub mod http;
 pub mod json;
 pub mod server;
