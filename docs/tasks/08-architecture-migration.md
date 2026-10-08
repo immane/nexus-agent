@@ -76,6 +76,8 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.4 — Own exec cleanup on every exit path
 
+**Implementation status: In progress.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If a descendant keeps a pipe open beyond cleanup, the exec worker retains ownership rather than returning; runtime timeout/cancellation quarantines that worker. The original process group is signalled, but escaped descendants that close inherited pipes cannot be proven terminated by this mechanism. Linux-specific sandbox execution and injected wait/read/probe failures remain unverified.
+
 **Findings:** P1.4. **Paths:** `crates/nexus-tools/src/exec.rs`, tool exec tests. **Dependencies:** none; validate together with M1.3 when both are integrated.
 
 - Introduce only a private exec resource guard or equivalent local ownership. Cover child spawn, wait failure, pipe-reader failure, deadline, cancellation, and normal completion.

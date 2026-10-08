@@ -88,6 +88,36 @@ fn argv_runs_inside_the_configured_sandbox_root() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn descendant_holding_output_pipe_does_not_extend_cleanup_unboundedly() {
+    let root = TempRoot::new();
+    let executor = SandboxedExecutor::with_root(&root.0).expect("valid root binds");
+    assert!(executor.sandbox_available());
+    let started = std::time::Instant::now();
+    let result = executor.execute(
+        &call(
+            r#"{"argv":["/bin/sh","-c","(/usr/bin/touch spawned; /bin/sleep 5) & while [ ! -e spawned ]; do /bin/sleep 0.01; done; exit 0"]}"#,
+        ),
+        &context(),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cleanup exceeded its bound"
+    );
+    assert_eq!(
+        result.status(),
+        ExecutionStatus::Succeeded,
+        "{}",
+        result.content()
+    );
+    assert!(
+        root.0.join("spawned").exists(),
+        "descendant handshake completed"
+    );
+    assert_eq!(result.effect(), nexus_core::EffectState::Unknown);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn mac_sandbox_allows_project_writes_but_denies_other_project_reads_and_writes() {
     let root = TempRoot::new();
     let outside = TempRoot::new();
