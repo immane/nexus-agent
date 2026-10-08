@@ -345,6 +345,38 @@ fn a_bound_session_completes_and_records_its_bound_model() {
     let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
 }
 
+/// Usage accounting is runtime-owned and does not require a client to attach
+/// to or drain the run's SSE terminal event.
+#[test]
+fn a_completed_bound_run_records_usage_without_an_sse_subscriber() {
+    let (base, mock) = serve_mock();
+    let probe = resolvable_probe();
+    let path = temp_config("usage-without-sse");
+    let port = spawn_server(configured_at(probe, &base), Some(path.clone()));
+    let session = create_bound_session(port, r#"{"provider":"acme","model":"fast"}"#);
+    let _run = submit(port, &session, r#"{"input":"no stream"}"#);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, summary) = get(port, "/config");
+        assert_eq!(status, 200);
+        if summary["recent"] == serde_json::json!(["fast"]) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "completion watcher records usage"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        mock.hits.load(Ordering::SeqCst) >= 1,
+        "the provider was invoked"
+    );
+    assert_eq!(read_back(&path).recent(), ["fast"]);
+    let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
+}
+
 /// A submit selection that names anything other than the session binding is
 /// refused before the runtime is touched: no run is minted, the adapter is
 /// never invoked, and history is unchanged. The session stays usable for its

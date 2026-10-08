@@ -22,6 +22,7 @@ const DEFAULT_PORT: u16 = 8471;
 /// Maximum simultaneously serviced sockets; excess connections are closed
 /// immediately instead of creating another unbounded thread.
 const MAX_CONNECTIONS: usize = 64;
+const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn usage() -> ! {
     eprintln!(
@@ -189,6 +190,16 @@ fn main() {
         );
     }
     let server = Arc::new(server);
+    let cleanup_server = Arc::downgrade(&server);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(SESSION_CLEANUP_INTERVAL);
+            let Some(server) = cleanup_server.upgrade() else {
+                break;
+            };
+            server.cleanup_idle_sessions();
+        }
+    });
     let connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -199,10 +210,17 @@ fn main() {
                 }
                 let server = Arc::clone(&server);
                 let connections = Arc::clone(&connections);
-                thread::spawn(move || {
-                    let _connection = ConnectionGuard(connections);
-                    server.handle_connection(stream);
-                });
+                let worker_connections = Arc::clone(&connections);
+                if let Err(error) = thread::Builder::new()
+                    .name("nexus-http-connection".to_owned())
+                    .spawn(move || {
+                        let _connection = ConnectionGuard(worker_connections);
+                        server.handle_connection(stream);
+                    })
+                {
+                    connections.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!("nexus-server: connection worker could not start ({error})");
+                }
             }
             Err(error) => eprintln!("nexus-server: accept failed ({error})"),
         }

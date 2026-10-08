@@ -11,8 +11,8 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::Duration;
 
 use nexus_server::http::{
-    IO_TIMEOUT, MAX_BODY_BYTES, MAX_HEAD_BYTES, Request, Response, read_request, reason,
-    write_response, write_sse_headers,
+    IO_TIMEOUT, MAX_BODY_BYTES, MAX_HEAD_BYTES, Request, Response, WRITE_TIMEOUT, read_request,
+    reason, write_response, write_sse_headers,
 };
 
 /// Socket timeouts for the test peer. Every case here either completes or
@@ -557,6 +557,17 @@ fn write_sse_headers_leaves_the_stream_to_the_caller() {
         Some(&b"id: 1\ndata: {\"kind\":\"run-started\"}\n\n"[..]),
         "frames follow the head verbatim"
     );
+}
+
+#[test]
+fn sse_installs_a_finite_socket_write_timeout() {
+    let mut pair = TcpPair::new();
+    write_sse_headers(&mut pair.server).expect("SSE head writes");
+    assert_eq!(
+        pair.server.write_timeout().expect("timeout is readable"),
+        Some(WRITE_TIMEOUT)
+    );
+    assert_eq!(WRITE_TIMEOUT, Duration::from_secs(30));
 }
 
 // --- Constants and reason phrases -------------------------------------------

@@ -43,9 +43,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
@@ -66,9 +66,27 @@ use crate::json;
 
 /// Idle SSE window: a `: ping` comment keeps the stream alive.
 const SSE_IDLE: Duration = Duration::from_secs(15);
+/// Session-owned history/grants are retained for this idle window before
+/// admission pressure may reclaim a provably inactive session.
+const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
+/// Cross-run events retained while one SSE subscriber is filtering the shared
+/// session channels. One extra overflow event is retained as a reserve before
+/// the stream is closed, so pressure never silently discards a received event.
+const MAX_PENDING_EVENTS: usize = 4_096;
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
+/// At most one deferred terminal per accepted run. Run admission stops at this
+/// count, preserving terminal records instead of overflowing the reserve.
+const MAX_DEFERRED_TERMINALS: usize = 128;
 /// Hard cap: session runtimes own grants, history, and event receivers and
 /// are rejected rather than evicted while their execution state is unknown.
 pub const MAX_SESSIONS: usize = 128;
+/// Bound retained usage identities independently from client stream behavior.
+/// At capacity, bound-model runs are refused until clients consume terminal
+/// events and release associations.
+pub const MAX_USAGE_ASSOCIATIONS: usize = 128;
+/// Completion observers are bounded independently from connection threads.
+const MAX_COMPLETION_WATCHERS: usize = MAX_USAGE_ASSOCIATIONS;
 /// Default execution profile for web-submitted tasks.
 const WEB_PROFILE: &str = "web-test";
 
@@ -161,7 +179,90 @@ pub struct Session {
     /// the one being served. `try_recv` consumes, so a foreign event met
     /// while draining cannot be left in the channel; it is stashed here
     /// for its own waiter instead of being dropped.
-    pending: Mutex<Vec<nexus_core::RunEvent>>,
+    pending: Mutex<PendingEvents>,
+    deferred_terminals: Mutex<Vec<nexus_core::RunEvent>>,
+    last_activity: Mutex<Instant>,
+    last_run: Mutex<Option<RunId>>,
+}
+
+#[derive(Default)]
+struct PendingEvents {
+    events: Vec<nexus_core::RunEvent>,
+    bytes: usize,
+    overflow: Option<(nexus_core::RunEvent, usize)>,
+}
+
+impl PendingEvents {
+    fn can_receive_more(&self) -> bool {
+        self.events.len() < MAX_PENDING_EVENTS
+            && self.bytes < MAX_PENDING_BYTES
+            && self.overflow.is_none()
+    }
+
+    /// Stores one event within the ordinary budget, or the single reserve
+    /// slot. `false` means the reserve was consumed and the caller must stop
+    /// receiving until a reconnect drains retained events.
+    fn push(&mut self, event: nexus_core::RunEvent) -> bool {
+        let bytes = pending_event_bytes(&event);
+        if bytes > MAX_PENDING_OVERFLOW_BYTES {
+            // Current core event constructors and runtime output budgets keep
+            // every encoded event below this ceiling. Treat a contract breach
+            // as a transport failure; never let one malformed event bypass
+            // the retained-byte bound.
+            eprintln!("nexus-server: runtime event exceeded the SSE event budget");
+            return false;
+        }
+        if self.events.len() < MAX_PENDING_EVENTS
+            && self.bytes.saturating_add(bytes) <= MAX_PENDING_BYTES
+        {
+            self.bytes += bytes;
+            self.events.push(event);
+            true
+        } else if self.overflow.is_none() && bytes <= MAX_PENDING_OVERFLOW_BYTES {
+            self.overflow = Some((event, bytes));
+            false
+        } else {
+            false
+        }
+    }
+
+    fn pop_run(&mut self, run: &RunId) -> Option<nexus_core::RunEvent> {
+        let event_pos = self
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.run() == run)
+            .min_by_key(|(_, event)| event.seq())
+            .map(|(index, _)| index);
+        let overflow_matches = self
+            .overflow
+            .as_ref()
+            .is_some_and(|(event, _)| event.run() == run);
+        if let Some(index) = event_pos {
+            let pending_seq = self.events[index].seq();
+            if overflow_matches
+                && self
+                    .overflow
+                    .as_ref()
+                    .is_some_and(|(event, _)| event.seq() < pending_seq)
+            {
+                return self.overflow.take().map(|(event, _)| event);
+            }
+            let pending = self.events.remove(index);
+            self.bytes = self.bytes.saturating_sub(pending_event_bytes(&pending));
+            Some(pending)
+        } else if overflow_matches {
+            let (event, _) = self.overflow.take().expect("matched overflow exists");
+            Some(event)
+        } else {
+            None
+        }
+    }
+}
+
+fn pending_event_bytes(event: &nexus_core::RunEvent) -> usize {
+    serde_json::to_vec(&json::event_json(event))
+        .map_or(usize::MAX, |bytes| bytes.len().saturating_add(16))
 }
 
 impl Session {
@@ -187,9 +288,10 @@ pub struct Server {
     /// memory: a server without a configured path never writes a file.
     config_path: Option<PathBuf>,
     /// Accepted run id to the model id it was submitted with. Entries are
-    /// consumed by that run's SSE terminal event, so the map holds at most
-    /// the runs that were accepted but never streamed to a terminal.
+    /// consumed by the completion watcher, a terminal SSE event, a subsequent
+    /// run, or safe idle reclamation; admission caps retained entries.
     run_models: Mutex<HashMap<String, String>>,
+    completion_watchers: Arc<AtomicUsize>,
     /// Tool wiring for sessions created after the call. Startup-only: set
     /// before serving, alongside [`Server::set_config`].
     tools_mode: ToolsMode,
@@ -247,6 +349,7 @@ impl Server {
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             run_models: Mutex::new(HashMap::new()),
+            completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
         }
     }
@@ -296,6 +399,7 @@ impl Server {
         // creators cannot pass the cap together. The lock is not held over
         // runtime execution or network I/O.
         let mut sessions = self.sessions.lock().expect("sessions lockable");
+        self.remove_idle_sessions(&mut sessions, Instant::now());
         if sessions.len() >= MAX_SESSIONS {
             return Err(SessionError::new(503, "session capacity is full"));
         }
@@ -378,7 +482,10 @@ impl Server {
             control: Mutex::new(streams.control),
             streaming: Mutex::new(false),
             next_request: AtomicU64::new(1),
-            pending: Mutex::new(Vec::new()),
+            pending: Mutex::new(PendingEvents::default()),
+            deferred_terminals: Mutex::new(Vec::new()),
+            last_activity: Mutex::new(Instant::now()),
+            last_run: Mutex::new(None),
         });
         sessions.insert(token.clone(), entry);
         Ok(token)
@@ -423,17 +530,66 @@ impl Server {
 
     /// Looks up a session by token.
     fn session(&self, token: &str) -> Option<Arc<Session>> {
-        self.sessions
+        let session = self
+            .sessions
             .lock()
             .expect("sessions lockable")
             .get(token)
-            .cloned()
+            .cloned()?;
+        *session.last_activity.lock().expect("activity lockable") = Instant::now();
+        Some(session)
+    }
+
+    /// Reclaims only idle sessions whose runtime proves the most recent run
+    /// finalized (or which never ran), and which have no external owners or
+    /// active SSE subscriber. Active/quarantined runtime state is retained.
+    /// Called under the session-map lock during maintenance or admission.
+    fn remove_idle_sessions(&self, sessions: &mut HashMap<String, Arc<Session>>, now: Instant) {
+        sessions.retain(|_, session| {
+            if Arc::strong_count(session) != 1
+                || *session.streaming.lock().expect("stream flag lockable")
+                || now.saturating_duration_since(
+                    *session.last_activity.lock().expect("activity lockable"),
+                ) < SESSION_IDLE
+            {
+                return true;
+            }
+            let last_run = session.last_run.lock().expect("last run lockable").clone();
+            let Some(run) = last_run else {
+                return false;
+            };
+            let request = GetSnapshotCommand {
+                request: session.request_id(),
+                run: run.clone(),
+            };
+            let runtime = session.runtime.lock().expect("runtime lockable");
+            let (reply, snapshot) = self.handle.block_on(runtime.get_snapshot(request));
+            match (reply.reply(), snapshot) {
+                (CommandReply::Accepted, Some(snapshot)) => {
+                    if snapshot.lifecycle() == nexus_core::RunLifecycle::Active {
+                        return true;
+                    }
+                    self.record_model_use(run.as_str());
+                    false
+                }
+                // Unknown state is not evidence that workers and grants are
+                // safe to release; retain conservatively.
+                _ => true,
+            }
+        });
+    }
+
+    /// Performs bounded idle-session maintenance. The binary calls this from
+    /// one housekeeping thread; embedders may call it on their own schedule.
+    pub fn cleanup_idle_sessions(&self) {
+        let mut sessions = self.sessions.lock().expect("sessions lockable");
+        self.remove_idle_sessions(&mut sessions, Instant::now());
     }
 
     /// Serves one connection to completion, then returns for the caller to
     /// close the stream (except SSE, which closes its own stream at the
     /// terminal event).
-    pub fn handle_connection(&self, mut stream: TcpStream) {
+    pub fn handle_connection(self: &Arc<Self>, mut stream: TcpStream) {
         let _ = stream.set_write_timeout(Some(http::WRITE_TIMEOUT));
         let response = match http::read_request(&mut stream) {
             Ok(request) => self.route(&request, &mut stream),
@@ -449,7 +605,7 @@ impl Server {
 
     /// Routes a parsed request. Returns `None` when the SSE loop took over
     /// the stream (headers already written); anything else is framed here.
-    fn route(&self, request: &Request, stream: &mut TcpStream) -> Option<Response> {
+    fn route(self: &Arc<Self>, request: &Request, stream: &mut TcpStream) -> Option<Response> {
         let parsed: Value = if request.body.is_empty() {
             Value::Null
         } else {
@@ -614,7 +770,7 @@ impl Server {
     /// never occupies the session's single run slot, mints a run, or records
     /// a model that did not run. An accepted run with a bound model is
     /// remembered for terminal-time recording.
-    fn submit_run(&self, session: &Arc<Session>, body: &Value) -> Option<Response> {
+    fn submit_run(self: &Arc<Self>, session: &Arc<Session>, body: &Value) -> Option<Response> {
         let model =
             match resolve_selection(session.provider.as_deref(), session.model.as_deref(), body) {
                 Ok(model) => model,
@@ -636,7 +792,59 @@ impl Server {
                 ));
             }
         };
+        // Keep the global lock order runtime -> usage map. A run can finish
+        // before this request thread resumes from `submit`; holding the map
+        // lock ensures its SSE consumer cannot remove a not-yet-registered
+        // identity. The same lock enforces a finite association budget.
         let runtime = session.runtime.lock().expect("runtime lockable");
+        if session
+            .deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable")
+            .len()
+            >= MAX_DEFERRED_TERMINALS
+        {
+            return Some(json_response(
+                409,
+                &json::error_body("session event backlog is full"),
+            ));
+        }
+        if !session
+            .pending
+            .lock()
+            .expect("pending lockable")
+            .can_receive_more()
+        {
+            return Some(json_response(
+                409,
+                &json::error_body("session event backlog is full"),
+            ));
+        }
+        // Before a newer accepted run can replace Runtime's single retained
+        // `last` snapshot, settle the previous run's usage association if it
+        // has finalized. This is independent of whether the client consumed
+        // that run's SSE terminal record.
+        if let Some(previous) = session.last_run.lock().expect("last run lockable").clone() {
+            let snapshot = self
+                .handle
+                .block_on(runtime.get_snapshot(GetSnapshotCommand {
+                    request: session.request_id(),
+                    run: previous.clone(),
+                }));
+            if let (response, Some(snapshot)) = snapshot
+                && response.reply() == CommandReply::Accepted
+                && snapshot.lifecycle() != nexus_core::RunLifecycle::Active
+            {
+                self.record_model_use(previous.as_str());
+            }
+        }
+        let mut run_models = self.run_models.lock().expect("run model map lockable");
+        if model.is_some() && run_models.len() >= MAX_USAGE_ASSOCIATIONS {
+            return Some(json_response(
+                503,
+                &json::error_body("usage association capacity is full"),
+            ));
+        }
         let reply = self.handle.block_on(runtime.submit(command));
         let status = match reply.reply() {
             CommandReply::Accepted => 201,
@@ -648,10 +856,20 @@ impl Server {
         if reply.reply() == CommandReply::Accepted
             && let (Some(run), Some(model)) = (reply.run(), model.as_deref())
         {
-            self.run_models
-                .lock()
-                .expect("run model map lockable")
-                .insert(run.as_str().to_owned(), model.to_owned());
+            run_models.insert(run.as_str().to_owned(), model.to_owned());
+        }
+        if reply.reply() == CommandReply::Accepted
+            && let Some(run) = reply.run()
+        {
+            *session.last_run.lock().expect("last run lockable") = Some(run.clone());
+            if model.is_some() {
+                Self::watch_run_completion(
+                    Arc::downgrade(self),
+                    Arc::clone(session),
+                    run.clone(),
+                    self.handle.clone(),
+                );
+            }
         }
         let body = match reply.run() {
             Some(run) => {
@@ -660,6 +878,62 @@ impl Server {
             None => serde_json::json!({ "reply": crate::json::reply_name(reply.reply()) }),
         };
         Some(json_response(status, &body_json(body)))
+    }
+
+    /// Watches a bound-model run independently of its SSE client. The
+    /// association is installed before this watcher starts; a later submit
+    /// settles the previous finalized run before Runtime replaces its `last`
+    /// snapshot, so polling cannot miss a completed run between snapshots.
+    fn watch_run_completion(
+        server: Weak<Self>,
+        session: Arc<Session>,
+        run: RunId,
+        handle: tokio::runtime::Handle,
+    ) {
+        let Some(server_arc) = server.upgrade() else {
+            return;
+        };
+        let watchers = Arc::clone(&server_arc.completion_watchers);
+        drop(server_arc);
+        if !try_acquire_watcher(&watchers) {
+            return;
+        }
+        let watcher_count = Arc::clone(&watchers);
+        let watcher = std::thread::Builder::new()
+            .name("nexus-usage-watch".to_owned())
+            .spawn(move || {
+                let _watcher = WatcherGuard(watcher_count);
+                loop {
+                    let Some(server) = server.upgrade() else {
+                        return;
+                    };
+                    let command = GetSnapshotCommand {
+                        request: session.request_id(),
+                        run: run.clone(),
+                    };
+                    let snapshot = {
+                        let runtime = session.runtime.lock().expect("runtime lockable");
+                        handle.block_on(runtime.get_snapshot(command))
+                    };
+                    match snapshot {
+                        (response, Some(snapshot))
+                            if response.reply() == CommandReply::Accepted
+                                && snapshot.lifecycle() != nexus_core::RunLifecycle::Active =>
+                        {
+                            server.record_model_use(run.as_str());
+                            return;
+                        }
+                        (response, _) if response.reply() != CommandReply::Accepted => return,
+                        _ => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+            });
+        if watcher.is_err() {
+            watchers.fetch_sub(1, Ordering::AcqRel);
+            // The bounded association remains available for SSE or the idle
+            // maintenance path to settle; never report fabricated success.
+            eprintln!("nexus-server: usage completion watcher could not start");
+        }
     }
 
     /// Returns the bounded snapshot for a known run of this session.
@@ -787,6 +1061,19 @@ impl Server {
             Ok(run) => run,
             Err(_) => return Some(json_response(400, &json::error_body("run id is invalid"))),
         };
+        // Refuse unknown/evicted run ids before claiming the subscriber or
+        // touching shared event receivers. Only active and most-recent runs
+        // remain observable in Runtime's existing snapshot contract.
+        let request = GetSnapshotCommand {
+            request: session.request_id(),
+            run: run.clone(),
+        };
+        let runtime = session.runtime.lock().expect("runtime lockable");
+        let (reply, _) = self.handle.block_on(runtime.get_snapshot(request));
+        if reply.reply() != CommandReply::Accepted && !Self::has_retained_terminal(session, &run) {
+            return Some(json_response(404, &json::error_body("unknown run")));
+        }
+        drop(runtime);
         {
             let mut streaming = session.streaming.lock().expect("stream flag lockable");
             if *streaming {
@@ -804,9 +1091,27 @@ impl Server {
         let mut data = session.data.lock().expect("data channel lockable");
         let mut control = session.control.lock().expect("control channel lockable");
         loop {
-            let event = match Self::take_pending(session, &run) {
+            let pending_event = Self::take_pending(session, &run);
+            let deferred_event = if pending_event.is_none() {
+                Self::take_deferred_terminal(session, &run, &data, &control)
+            } else {
+                None
+            };
+            let is_deferred_terminal = deferred_event.is_some();
+            let event = match pending_event.or(deferred_event) {
                 Some(event) => event,
                 None => {
+                    let pending = session.pending.lock().expect("pending lockable");
+                    if !pending.can_receive_more()
+                        || pending
+                            .overflow
+                            .as_ref()
+                            .is_some_and(|(event, _)| event.run() != &run)
+                    {
+                        Self::write_backpressure_comment(stream);
+                        break;
+                    }
+                    drop(pending);
                     let next = self.handle.block_on(async {
                         tokio::time::timeout(SSE_IDLE, async {
                             tokio::select! {
@@ -832,11 +1137,15 @@ impl Server {
             if event.run() != &run {
                 // Another run's event: stash it for its own waiter
                 // instead of dropping it.
-                session
+                let can_continue = session
                     .pending
                     .lock()
                     .expect("pending lockable")
                     .push(event);
+                if !can_continue {
+                    Self::write_backpressure_comment(stream);
+                    break;
+                }
                 continue;
             }
             let terminal = event.is_terminal();
@@ -852,10 +1161,23 @@ impl Server {
                 // independent channels): forward everything already
                 // committed first, terminal last, so a select! ordering can
                 // never strand a predecessor event.
-                if Self::drain_predecessors(stream, &mut data, &mut control, &run, &session.pending)
-                    .is_err()
-                {
-                    break;
+                if !is_deferred_terminal {
+                    match Self::drain_predecessors(
+                        stream,
+                        &mut data,
+                        &mut control,
+                        &run,
+                        &event,
+                        &session.pending,
+                        &session.deferred_terminals,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            Self::write_backpressure_comment(stream);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             let frame = format!(
@@ -885,11 +1207,17 @@ impl Server {
         data: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
         control: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
         run: &RunId,
-        pending: &Mutex<Vec<nexus_core::RunEvent>>,
-    ) -> std::io::Result<()> {
+        terminal: &nexus_core::RunEvent,
+        pending: &Mutex<PendingEvents>,
+        deferred_terminals: &Mutex<Vec<nexus_core::RunEvent>>,
+    ) -> std::io::Result<bool> {
         loop {
             let mut progressed = false;
             for channel in [&mut *data, &mut *control] {
+                if !pending.lock().expect("pending lockable").can_receive_more() {
+                    Self::defer_terminal(deferred_terminals, terminal);
+                    return Ok(false);
+                }
                 while let Ok(queued) = channel.try_recv() {
                     progressed = true;
                     if queued.run() != run {
@@ -897,7 +1225,11 @@ impl Server {
                         // cannot stay queued: stash it for its own waiter
                         // and stop draining this channel, leaving the
                         // events behind it untouched.
-                        pending.lock().expect("pending lockable").push(queued);
+                        let can_continue = pending.lock().expect("pending lockable").push(queued);
+                        if !can_continue {
+                            Self::defer_terminal(deferred_terminals, terminal);
+                            return Ok(false);
+                        }
                         break;
                     }
                     let frame = format!(
@@ -910,9 +1242,15 @@ impl Server {
                 }
             }
             if !progressed {
-                return Ok(());
+                return Ok(true);
             }
         }
+    }
+
+    fn write_backpressure_comment(stream: &mut TcpStream) {
+        let _ =
+            stream.write_all(b": bounded event backlog; reconnect after draining pending runs\n\n");
+        let _ = stream.flush();
     }
 
     /// Pops the earliest stashed event owned by `run`, if any. Stashed
@@ -921,15 +1259,64 @@ impl Server {
     /// waiter exactly once.
     fn take_pending(session: &Session, run: &RunId) -> Option<nexus_core::RunEvent> {
         let mut pending = session.pending.lock().expect("pending lockable");
-        let pos = pending.iter().position(|event| event.run() == run)?;
-        Some(pending.remove(pos))
+        pending.pop_run(run)
+    }
+
+    fn take_deferred_terminal(
+        session: &Session,
+        run: &RunId,
+        data: &tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
+        control: &tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
+    ) -> Option<nexus_core::RunEvent> {
+        if !data.is_empty() || !control.is_empty() {
+            return None;
+        }
+        let mut deferred = session
+            .deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable");
+        let index = deferred.iter().position(|event| event.run() == run)?;
+        Some(deferred.remove(index))
+    }
+
+    fn has_retained_terminal(session: &Session, run: &RunId) -> bool {
+        session
+            .deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable")
+            .iter()
+            .any(|event| event.run() == run)
+            || {
+                let pending = session.pending.lock().expect("pending lockable");
+                pending
+                    .events
+                    .iter()
+                    .any(|event| event.run() == run && event.is_terminal())
+                    || pending
+                        .overflow
+                        .as_ref()
+                        .is_some_and(|(event, _)| event.run() == run && event.is_terminal())
+            }
+    }
+
+    fn defer_terminal(
+        deferred_terminals: &Mutex<Vec<nexus_core::RunEvent>>,
+        terminal: &nexus_core::RunEvent,
+    ) {
+        let mut deferred = deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable");
+        if deferred.iter().all(|event| event.run() != terminal.run()) {
+            debug_assert!(deferred.len() < MAX_DEFERRED_TERMINALS);
+            deferred.push(terminal.clone());
+        }
     }
     /// the document. A run submitted without a model has no entry and is
     /// skipped without touching the configuration.
     ///
-    /// The map entry is consumed on every call, terminal or not, so a
-    /// client that abandons the stream cannot leave a stale attribution
-    /// behind for a later run. Recording is applied to the in-memory
+    /// The map entry is consumed on the first successful attribution, so a
+    /// watcher/SSE race cannot double-count and an abandoned stream does not
+    /// retain usage forever. Recording is applied to the in-memory
     /// document first, so a failed save leaves usage visible in `GET
     /// /config` and is reported on stderr rather than discarded; the run
     /// itself has already finished and its outcome is never retracted.
@@ -950,6 +1337,28 @@ impl Server {
         if let Err(error) = self.persist(&config) {
             eprintln!("nexus-server: configuration could not be saved ({error})");
         }
+    }
+}
+
+fn try_acquire_watcher(watchers: &AtomicUsize) -> bool {
+    let mut count = watchers.load(Ordering::Acquire);
+    loop {
+        if count >= MAX_COMPLETION_WATCHERS {
+            return false;
+        }
+        match watchers.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return true,
+            Err(observed) => count = observed,
+        }
+    }
+}
+
+struct WatcherGuard(Arc<AtomicUsize>);
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1510,6 +1919,153 @@ mod tests {
                 .recent()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn idle_session_cleanup_waits_for_expiry_and_external_owners() {
+        let (server, _runtime) = server_with_gated_config();
+        let token = server.create_session().expect("demo session creates");
+        let mut sessions = server.sessions.lock().expect("sessions lockable");
+        let entry = sessions.get(&token).expect("session is registered").clone();
+        let old = Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+        *entry.last_activity.lock().expect("activity lockable") = old;
+
+        server.remove_idle_sessions(&mut sessions, Instant::now());
+        assert!(
+            sessions.contains_key(&token),
+            "live Arc owner prevents removal"
+        );
+
+        drop(entry);
+        server.remove_idle_sessions(&mut sessions, Instant::now());
+        assert!(
+            !sessions.contains_key(&token),
+            "expired idle session is reclaimed"
+        );
+    }
+
+    #[test]
+    fn session_admission_rejects_excess_without_evicting_existing_sessions() {
+        let (server, _runtime) = server_with_gated_config();
+        let mut admitted = Vec::with_capacity(MAX_SESSIONS);
+        for _ in 0..MAX_SESSIONS {
+            admitted.push(server.create_session().expect("session is under the cap"));
+        }
+        let error = server
+            .create_session_with(None, None)
+            .expect_err("session admission is bounded");
+        assert_eq!(error.status(), 503);
+        assert_eq!(
+            server.sessions.lock().expect("sessions lockable").len(),
+            MAX_SESSIONS,
+            "rejection does not evict an existing session"
+        );
+    }
+
+    #[test]
+    fn idle_cleanup_retains_a_runtime_with_active_work() {
+        let (server, _runtime) = server_with_gated_config();
+        let token = server.create_session().expect("demo session creates");
+        let session = server.session(&token).expect("session is registered");
+        let command = SubmitCommand::new(
+            session.request_id(),
+            session.session.clone(),
+            "active cleanup fixture",
+            WEB_PROFILE,
+        )
+        .expect("valid fixture command");
+        let runtime = session.runtime.lock().expect("runtime lockable");
+        let accepted = server.handle.block_on(runtime.submit(command));
+        assert_eq!(accepted.reply(), CommandReply::Accepted);
+        let run = accepted.run().expect("accepted run has identity").clone();
+        drop(runtime);
+        *session.last_run.lock().expect("last run lockable") = Some(run.clone());
+        *session.last_activity.lock().expect("activity lockable") =
+            Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+
+        let mut sessions = server.sessions.lock().expect("sessions lockable");
+        server.remove_idle_sessions(&mut sessions, Instant::now());
+        assert!(
+            sessions.contains_key(&token),
+            "active runtime is never evicted"
+        );
+
+        let cancel = nexus_core::CancelCommand {
+            request: session.request_id(),
+            run,
+        };
+        let runtime = session.runtime.lock().expect("runtime lockable");
+        let _ = server.handle.block_on(runtime.cancel(cancel));
+    }
+
+    #[test]
+    fn pending_events_respect_the_count_budget_and_use_one_overflow_reserve() {
+        let run = RunId::new("pending-cap").expect("valid run");
+        let session = SessionId::new("pending-session").expect("valid session");
+        let request = RequestId::new("pending-request").expect("valid request");
+        let mut pending = PendingEvents::default();
+        for seq in 0..MAX_PENDING_EVENTS as u64 {
+            let event = nexus_core::RunEvent::new(
+                session.clone(),
+                run.clone(),
+                seq,
+                nexus_core::EventPayload::RunStarted {
+                    request: request.clone(),
+                },
+            );
+            assert!(pending.push(event), "ordinary event {seq} fits");
+        }
+        let reserve = nexus_core::RunEvent::new(
+            session,
+            run,
+            MAX_PENDING_EVENTS as u64,
+            nexus_core::EventPayload::RunStarted { request },
+        );
+        assert!(
+            !pending.push(reserve),
+            "reserve signals stream backpressure"
+        );
+        assert_eq!(pending.events.len(), MAX_PENDING_EVENTS);
+        assert!(pending.overflow.is_some(), "received event is retained");
+        assert!(
+            pending
+                .overflow
+                .as_ref()
+                .is_some_and(|(_, bytes)| *bytes <= MAX_PENDING_OVERFLOW_BYTES),
+            "reserve event fits the declared byte ceiling"
+        );
+        assert!(
+            !pending.can_receive_more(),
+            "no more channel reads are permitted"
+        );
+    }
+
+    #[test]
+    fn pending_event_bytes_respect_the_byte_budget_and_retain_the_overflow() {
+        let run = RunId::new("pending-bytes").expect("valid run");
+        let session = SessionId::new("pending-byte-session").expect("valid session");
+        let turn = TurnId::new("pending-byte-turn").expect("valid turn");
+        let text = "x".repeat(nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES);
+        let mut pending = PendingEvents::default();
+        let mut overflowed = false;
+        for seq in 0..MAX_PENDING_EVENTS as u64 {
+            let payload = nexus_core::AssistantText::new(turn.clone(), "item", text.clone())
+                .expect("maximum permitted fragment builds");
+            let event = nexus_core::RunEvent::new(
+                session.clone(),
+                run.clone(),
+                seq,
+                nexus_core::EventPayload::AssistantTextDelta(payload),
+            );
+            if !pending.push(event) {
+                overflowed = true;
+                break;
+            }
+        }
+        assert!(overflowed, "byte cap activates before the event-count cap");
+        assert!(pending.bytes <= MAX_PENDING_BYTES);
+        assert!(pending.overflow.is_some(), "overflow event remains owned");
+        assert!(!pending.can_receive_more());
     }
 
     /// The favourites handlers answer with the resulting list, so a client

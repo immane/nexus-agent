@@ -104,17 +104,34 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.6 — Bound server connections, sessions, and SSE lifecycle
 
-**Implementation status: In progress.** The binary now admits at most 64
+**Implementation status: Verified.** The binary admits at most 64
 connection threads and rejects additional sockets by closing them; the server
 admits at most 128 sessions and rejects excess creation with `503` rather than
-evicting session-owned runtime state. HTTP request reads have a 60-second
-wall-clock deadline (30-second maximum per read), and socket writes have a
+evicting session-owned runtime state, so at most 128 runtime runs can be active
+(one per session). HTTP request reads have a 60-second wall-clock deadline
+(30-second maximum per read), and socket writes have a
 30-second timeout. SSE subscriber ownership is released through an RAII guard
-on normal return, disconnect, and unwinding. Pending-event and usage
-association maps still lack independently enforced budgets, and no safe idle
-session cleanup/completion observer exists yet; those requirements remain
-open rather than being approximated by eviction or client-driven terminal
-delivery.
+on normal return, disconnect, and unwinding. Usage associations are capped at
+128, and registration is serialized with terminal attribution to close the
+completion-before-registration race; bound-model submissions are refused with
+`503` at capacity. SSE rejects unknown/evicted run ids before taking receiver
+ownership. Cross-run pending retention is capped at 4,096 events and 1 MiB per
+session, plus one overflow event reserve capped at 2 MiB; once saturated, the
+SSE stream closes with a backpressure comment and submissions are refused with
+`409` until retained events are drained. Deferred terminal records are capped
+at 128 per session and stop new run admission at the cap. Completion watchers
+are capped at 128 per server; if the watcher cap is full, the bounded
+association is reconciled on the next run or safe idle sweep. One minute
+housekeeping performs a 30-minute idle sweep; it reclaims only sessions with
+no in-flight request or subscriber and a finalized (or never-started) runtime.
+A bounded-per-session completion watcher observes finalized runs; usage is also settled before a
+newer run replaces its snapshot and during safe idle reclamation. It therefore
+does not require a client to consume the terminal SSE frame. Unknown or active
+runtime state is retained conservatively.
+
+Regression coverage includes connection/session saturation, retained-event
+count/byte ceilings, unknown-run subscriptions, expired/active session cleanup,
+SSE timeout installation, and a completed bound-model run with no SSE reader.
 
 **Findings:** P1.6. **Paths:** server `main.rs`, `http.rs`, `server.rs`, server tests. **Dependencies:** M1.2 for closed-stream integration; M1.1 for selection identity.
 

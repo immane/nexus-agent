@@ -12,8 +12,17 @@
 //! runtime state. Requests have a 60-second total read deadline and writes
 //! have a 30-second timeout. These are resource bounds, not caller
 //! authentication or product security guarantees. Session removal and
-//! independent bounds for pending cross-run events/usage attribution remain
-//! unresolved.
+//! independent pending cross-run event bounds remain unresolved. Usage
+//! attribution is capped at 128 outstanding runs; new bound-model runs receive
+//! `503` until terminal events release entries. SSE subscriptions for unknown
+//! or no-longer-retained runs receive `404` before attaching.
+//! The binary sweeps sessions idle for 30 minutes once per minute, but only
+//! when no request/subscriber owns them and the runtime is confirmed finalized
+//! or has never started. Completed usage is settled before a subsequent run
+//! replaces the retained snapshot and during safe session reclamation.
+//! Cross-run SSE retention is bounded to 4,096 events / 1 MiB plus one
+//! 2 MiB overflow reserve per session; saturated streams close with a
+//! backpressure comment and run admission returns `409` until drained.
 //!
 //! # Protocol (v1, unstable, test-only)
 //!
