@@ -17,3 +17,6 @@ lcov.info/
 
 # macOS metadata.
 .DS_Store
+
+# Local Obsidian vault metadata and workspace state.
+/.obsidian/
