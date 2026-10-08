@@ -20,26 +20,6 @@ The recommended approach is to keep the existing crate graph and ports, fix conc
 
 This is a static review, not an exhaustive audit, a reproduced exploit, or a security certification. In particular, no Linux sandbox or live TLS behavior was exercised here.
 
-## M1.3 follow-up findings
-
-**Status:** Open; recorded 2026-10-08 after reviewing the uncommitted M1.3 migration changes. These findings are not fixed by the changes in this review pass.
-
-### M1.3-F1 — Usage replay can duplicate or regress published updates
-
-**Severity:** P2. **Path:** `crates/nexus-runtime/src/runtime.rs`, usage publication in `ingest_model_batch` and `publish_usage`.
-
-Usage updates are compared only with the most recently published value. If an incremental provider publishes provisional usage and the authoritative batch repeats those events, the UI can observe the same usage sequence twice. If the sink published final usage before the batch is ingested, replayed provisional values can temporarily move the displayed usage backwards.
-
-**Follow-up:** Track/validate the streamed usage prefix against the authoritative batch and skip already-published updates while still publishing authoritative final counters. Cover a prefix below the throttle limit and a sink that publishes final usage.
-
-### M1.3-F2 — Receiver closure can race finalization and reinsert a drained event
-
-**Severity:** P2. **Path:** `crates/nexus-runtime/src/runtime.rs`, `finish_run` and `flush_control`.
-
-The flusher removes an event from the outbox before awaiting channel capacity. If the receiver closes and `finish_run` clears the outbox before the flusher's `reserve()` returns an error, the flusher can push its in-flight event back after finalization. The retained counters then remain nonzero and future submissions may stay `Busy` permanently despite there being no consumer capable of draining the event.
-
-**Follow-up:** Define ownership for an in-flight event across finalization and closure; ensure a finalized run cannot have its event reinserted and retained counters are reconciled. Add a deterministic regression test for pop → receiver close → finalize → failed reserve.
-
 ## Findings and severity
 
 Severity levels:
