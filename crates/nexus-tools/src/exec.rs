@@ -3,6 +3,7 @@
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,8 @@ const OUTPUT_LIMIT: usize = 65_536;
 const CLEANUP_GRACE: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_QUANTUM: usize = 64 * 1024;
+const MAX_PROBE_OWNERS: usize = 4;
+static PROBE_OWNERS: AtomicUsize = AtomicUsize::new(0);
 const EXEC_SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}},"required":["argv"],"additionalProperties":false}"#;
 
 /// Sandboxed executor used by the real-tools composition roots.
@@ -105,6 +108,11 @@ impl SandboxedExecutor {
     // unsandboxed execution if isolation fails.
     fn probe(&mut self) {
         if self.sandbox_available() {
+            let Some(probe_slot) = ProbeSlot::acquire() else {
+                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
+                return;
+            };
+            let mut probe_slot = Some(probe_slot);
             let mut probe = self.command(&["/usr/bin/true"], None);
             #[cfg(unix)]
             {
@@ -122,14 +130,22 @@ impl SandboxedExecutor {
                     let deadline = Instant::now() + PROBE_TIMEOUT;
                     loop {
                         match child.try_wait() {
-                            Ok(Some(status)) if status.success() => break,
+                            Ok(Some(status)) if status.success() => {
+                                drop(probe_slot.take());
+                                break;
+                            }
                             Ok(Some(_)) => {
+                                drop(probe_slot.take());
                                 self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
                                 break;
                             }
                             Err(_) => {
                                 terminate_process_group(&mut child);
-                                thread::spawn(move || retain_probe_child_until_reaped(child));
+                                let slot = probe_slot.take().expect("probe slot is owned");
+                                thread::spawn(move || {
+                                    let _slot = slot;
+                                    retain_probe_child_until_reaped(child);
+                                });
                                 self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
                                 break;
                             }
@@ -139,7 +155,13 @@ impl SandboxedExecutor {
                             Ok(None) => {
                                 terminate_process_group(&mut child);
                                 if wait_bounded(&mut child, CLEANUP_GRACE).is_none() {
-                                    thread::spawn(move || retain_probe_child_until_reaped(child));
+                                    let slot = probe_slot.take().expect("probe slot is owned");
+                                    thread::spawn(move || {
+                                        let _slot = slot;
+                                        retain_probe_child_until_reaped(child);
+                                    });
+                                } else {
+                                    drop(probe_slot.take());
                                 }
                                 self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
                                 break;
@@ -147,7 +169,10 @@ impl SandboxedExecutor {
                         }
                     }
                 }
-                Err(_) => self.backend = Backend::Unavailable(SandboxFailure::LaunchFailed),
+                Err(_) => {
+                    drop(probe_slot.take());
+                    self.backend = Backend::Unavailable(SandboxFailure::LaunchFailed);
+                }
             }
         }
     }
@@ -243,8 +268,7 @@ impl SandboxedExecutor {
         let stdout_nonblocking = set_nonblocking(&stdout).is_ok();
         let stderr_nonblocking = set_nonblocking(&stderr).is_ok();
         if !stdout_nonblocking || !stderr_nonblocking {
-            terminate_process_group(&mut child);
-            retain_child_until_reaped(&mut child, &mut stdout, &mut stderr);
+            abort_unreadable_pipes(&mut child, stdout, stderr);
             return Err(Failure::Output);
         }
         let mut out = CapturedOutput::new(OUTPUT_LIMIT);
@@ -293,8 +317,16 @@ impl SandboxedExecutor {
                 // pipe open. Keep this tool worker alive (and quarantinable) until
                 // the inherited descriptors close; do not abandon pipe ownership.
                 while !out.eof || !err.eof {
-                    let _ = drain_pipe(&mut stdout, &mut out);
-                    let _ = drain_pipe(&mut stderr, &mut err);
+                    if drain_pipe(&mut stdout, &mut out).is_err()
+                        || drain_pipe(&mut stderr, &mut err).is_err()
+                    {
+                        // A read error is not EOF and does not prove that a
+                        // descendant released the pipe. Retain ownership
+                        // through the common cleanup path until both pipes
+                        // close; the runtime may quarantine this worker.
+                        retain_child_until_reaped(&mut child, &mut stdout, &mut stderr);
+                        return Err(Failure::Output);
+                    }
                     if !out.eof || !err.eof {
                         thread::sleep(Duration::from_millis(10));
                     }
@@ -500,7 +532,9 @@ fn drain_pipe(reader: &mut impl Read, output: &mut CapturedOutput) -> IoResult<(
                 output.truncated |= retain < count;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Let the owner re-check cancellation/deadlines instead of
+            // retrying indefinitely inside one drain quantum.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
             Err(error) => return Err(error),
         }
     }
@@ -531,11 +565,39 @@ fn retain_child_until_reaped(
         let mut err = CapturedOutput::new(0);
         let _ = drain_pipe(stdout, &mut out);
         let _ = drain_pipe(stderr, &mut err);
-        match child.try_wait() {
-            Ok(Some(_)) if out.eof && err.eof => return,
-            _ => thread::sleep(Duration::from_millis(10)),
+        if cleanup_complete(
+            child.try_wait().is_ok_and(|status| status.is_some()),
+            out.eof,
+            err.eof,
+        ) {
+            return;
         }
+        thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn retain_process_until_reaped(child: &mut std::process::Child) {
+    loop {
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn abort_unreadable_pipes(child: &mut std::process::Child, stdout: impl Read, stderr: impl Read) {
+    terminate_process_group(child);
+    // Never read a descriptor whose nonblocking setup failed: it may block
+    // forever while a descendant owns its write end. Closing our read ends
+    // makes writers observe a closed pipe; keep direct-child ownership until
+    // it is reaped so the runtime can quarantine this worker if necessary.
+    drop(stdout);
+    drop(stderr);
+    retain_process_until_reaped(child);
+}
+
+fn cleanup_complete(child_exited: bool, stdout_eof: bool, stderr_eof: bool) -> bool {
+    child_exited && stdout_eof && stderr_eof
 }
 
 fn retain_probe_child_until_reaped(mut child: std::process::Child) {
@@ -544,6 +606,25 @@ fn retain_probe_child_until_reaped(mut child: std::process::Child) {
             Ok(Some(_)) => return,
             _ => thread::sleep(Duration::from_millis(10)),
         }
+    }
+}
+
+struct ProbeSlot;
+
+impl ProbeSlot {
+    fn acquire() -> Option<Self> {
+        PROBE_OWNERS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_PROBE_OWNERS).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        PROBE_OWNERS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -728,8 +809,9 @@ impl ToolPort for SandboxedExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapturedOutput, drain_pipe};
+    use super::{CapturedOutput, abort_unreadable_pipes, cleanup_complete, drain_pipe};
     use std::io::{self, Cursor, Read};
+    use std::process::{Command, Stdio};
 
     #[test]
     fn output_limit_caps_retention_but_drain_continues_to_eof() {
@@ -762,5 +844,39 @@ mod tests {
         assert_eq!(output.bytes, b"xxxx");
         assert!(output.truncated);
         assert!(!output.eof);
+    }
+
+    #[test]
+    fn cleanup_requires_child_exit_and_eof_on_both_pipes() {
+        assert!(!cleanup_complete(true, false, true));
+        assert!(!cleanup_complete(true, true, false));
+        assert!(!cleanup_complete(false, true, true));
+        assert!(cleanup_complete(true, true, true));
+    }
+
+    #[test]
+    fn unreadable_pipe_cleanup_closes_reads_without_blocking_drain() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("yes")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("test child starts");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        abort_unreadable_pipes(&mut child, stdout, stderr);
+        assert!(
+            child
+                .try_wait()
+                .expect("child status is readable")
+                .is_some()
+        );
     }
 }

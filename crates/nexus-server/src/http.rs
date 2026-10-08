@@ -168,17 +168,7 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        set_read_deadline(reader.get_ref(), deadline)?;
-        reader.read_exact(&mut body).map_err(|error| {
-            if matches!(
-                error.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-            ) {
-                bad(408, "request timed out")
-            } else {
-                bad(400, "request body is truncated")
-            }
-        })?;
+        read_exact_before(&mut reader, &mut body, deadline)?;
     }
     Ok(Request {
         method: method.to_owned(),
@@ -186,6 +176,30 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
         headers,
         body,
     })
+}
+
+fn read_exact_before(
+    reader: &mut BufReader<&mut TcpStream>,
+    mut body: &mut [u8],
+    deadline: Instant,
+) -> Result<(), HttpError> {
+    while !body.is_empty() {
+        set_read_deadline(reader.get_ref(), deadline)?;
+        match reader.read(body) {
+            Ok(0) => return Err(bad(400, "request body is truncated")),
+            Ok(read) => body = &mut body[read..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(bad(408, "request timed out"));
+            }
+            Err(_) => return Err(bad(400, "request body is truncated")),
+        }
+    }
+    Ok(())
 }
 
 fn set_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<(), HttpError> {
@@ -276,4 +290,37 @@ pub fn write_sse_headers(stream: &mut TcpStream) -> io::Result<()> {
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
     )?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn slow_body_progress_cannot_extend_the_absolute_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
+        let mut client = TcpStream::connect(listener.local_addr().expect("address available"))
+            .expect("client connects");
+        let (mut server, _) = listener.accept().expect("connection accepted");
+        let writer = thread::spawn(move || {
+            for _ in 0..8 {
+                thread::sleep(Duration::from_millis(40));
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+        let mut reader = BufReader::new(&mut server);
+        let mut body = [0; 8];
+        let error = read_exact_before(
+            &mut reader,
+            &mut body,
+            Instant::now() + Duration::from_millis(120),
+        )
+        .expect_err("slow trickle exceeds the absolute deadline");
+        assert_eq!(error.status, 408);
+        writer.join().expect("writer exits");
+    }
 }

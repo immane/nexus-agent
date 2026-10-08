@@ -403,6 +403,57 @@ async fn usage_updates_are_throttled_but_final_counters_remain_authoritative() {
 }
 
 #[tokio::test]
+async fn streamed_usage_prefix_is_not_replayed_from_the_authoritative_batch() {
+    let streamed: Vec<_> = (1..=3)
+        .map(|count| ProviderEvent::Usage(provisional(Some(count), Some(count + 1))))
+        .collect();
+    let authoritative = final_usage(Some(9), Some(8));
+    let mut batch = streamed.clone();
+    batch.push(stop_turn(authoritative));
+    let provider = Arc::new(StreamingProvider::new(streamed.clone(), batch));
+
+    let (_, control, finished) = run_turn(provider, "usage-prefix", 0).await;
+
+    let published = usage_updates(&control);
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert_eq!(published.len(), 4, "three estimates and one final only");
+    assert_eq!(
+        published[..3],
+        streamed
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(published.last(), Some(&authoritative));
+}
+
+#[tokio::test]
+async fn failed_batch_does_not_replay_streamed_provisional_usage() {
+    let first = provisional(Some(2), Some(1));
+    let second = provisional(Some(2), Some(3));
+    let provider = Arc::new(StreamingProvider::new(
+        vec![ProviderEvent::Usage(first), ProviderEvent::Usage(second)],
+        vec![
+            ProviderEvent::Usage(first),
+            ProviderEvent::Usage(second),
+            failed(ErrorCategory::Timeout, "provider timed out"),
+        ],
+    ));
+
+    let (_, control, finished) = run_turn(provider, "failed-usage-prefix", 0).await;
+
+    assert_eq!(finished.outcome(), RunOutcome::Failed);
+    assert_eq!(usage_updates(&control), vec![first, second]);
+    assert!(matches!(
+        control.last().map(RunEvent::payload),
+        Some(EventPayload::RunFinished(done)) if done.error().is_some_and(|error| error.category() == ErrorCategory::Timeout)
+    ));
+}
+
+#[tokio::test]
 async fn batch_text_keeps_interleaving_and_splits_large_fragments() {
     let large = "x".repeat(MAX_TEXT_FRAGMENT_BYTES + 17);
     let provider = Arc::new(StreamingProvider::new(

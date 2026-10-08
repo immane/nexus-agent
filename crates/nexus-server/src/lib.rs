@@ -75,11 +75,11 @@
 //! - `GET /config` -> `200` with the redacted summary: providers, models,
 //!   favourites, and recents. Credential *references* (variable names) are
 //!   included because the document cannot hold a value.
-//! - `POST /sessions/{sid}/runs` accepts optional `"provider"` and
-//!   `"model"`. An unknown identity, or a pair that disagrees about
-//!   ownership, is `400`. A selected provider whose credential does not
-//!   resolve is `503`; the diagnostic names only the provider id.
-//!   An accepted run records its model and, at its SSE terminal event,
+//! - Provider/model selection is fixed at `POST /sessions` session creation.
+//!   Submit may omit those fields or repeat the exact binding; conflicting
+//!   values and live selections on a demo session are `400`. A selected
+//!   provider whose credential does not resolve is `503` during creation.
+//!   An accepted run records its bound model and, at terminal completion,
 //!   marks that model recently used and saves the file. A failed save is
 //!   logged and never changes the run's outcome.
 //! - `POST /config/favourites` with `{"id": "<model id>"}` -> `200` with

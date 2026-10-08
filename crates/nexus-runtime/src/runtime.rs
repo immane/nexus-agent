@@ -46,7 +46,9 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::policy::Policy;
-use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY, EventStreams};
+use crate::transport::EventStreams;
+#[cfg(test)]
+use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY};
 
 /// Single-run lifecycle states (design 02-execution baseline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +184,8 @@ struct StreamedPrefix {
     identity_bytes: usize,
     event_count: usize,
     usage_updates: usize,
+    usage_prefix: Vec<Usage>,
+    usage_replayed: Vec<Usage>,
     exceeded: bool,
 }
 
@@ -429,8 +433,8 @@ impl Runtime {
                 "provider declares no usable context budget",
             ));
         }
-        let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
-        let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+        let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
+        let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
             limits: config.limits,
             effective_output_budget,
@@ -833,6 +837,14 @@ impl Runtime {
         )
     }
 
+    /// Reports whether the runtime has active or unconfirmed worker
+    /// ownership. A finalized snapshot alone is insufficient for safe
+    /// session reclamation because timed-out workers may remain quarantined.
+    pub async fn has_unconfirmed_work(&self) -> bool {
+        let state = self.shared.state.lock().await;
+        state.active.is_some() || !state.quarantine.is_empty()
+    }
+
     fn stale_or_finalized(
         &self,
         state: &State,
@@ -995,6 +1007,13 @@ impl Runtime {
         let mut handle = tokio::task::spawn_blocking(move || {
             if incremental {
                 let sink = |event: ProviderEvent| {
+                    if !matches!(
+                        &event,
+                        ProviderEvent::TextDelta { .. } | ProviderEvent::ToolCallDelta { .. }
+                    ) && !matches!(&event, ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional)
+                    {
+                        return;
+                    }
                     let bytes = provisional_event_bytes(&event);
                     let previous = producer_bytes.fetch_add(bytes, Ordering::SeqCst);
                     if previous.saturating_add(bytes) > PROVISIONAL_STREAM_BYTE_CAPACITY {
@@ -1191,6 +1210,9 @@ impl Runtime {
                 );
             }
             ProviderEvent::Usage(usage) => {
+                if usage.finality() == UsageFinality::Provisional {
+                    prefix.usage_prefix.push(usage);
+                }
                 publish_usage(
                     &self.shared,
                     active,
@@ -1282,6 +1304,37 @@ impl Runtime {
             _ => None,
         };
         let successful_turn = terminal.as_ref().is_some_and(Result::is_ok);
+        let mut streamed_index = 0;
+        let mut usage_prefix_matches = true;
+        let mut unmatched_usage = prefix.usage_prefix.clone();
+        for usage in events.iter().filter_map(|event| match event {
+            ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional => {
+                Some(*usage)
+            }
+            _ => None,
+        }) {
+            if successful_turn {
+                if streamed_index < prefix.usage_prefix.len()
+                    && prefix.usage_prefix[streamed_index] != usage
+                {
+                    usage_prefix_matches = false;
+                    break;
+                }
+                if streamed_index < prefix.usage_prefix.len() {
+                    prefix.usage_replayed.push(usage);
+                    streamed_index += 1;
+                }
+            } else if let Some(index) = unmatched_usage.iter().position(|item| *item == usage) {
+                unmatched_usage.remove(index);
+                prefix.usage_replayed.push(usage);
+            }
+        }
+        if successful_turn && !usage_prefix_matches {
+            return Err(Terminal::failed(runtime_error(
+                ErrorCategory::Protocol,
+                "authoritative provider usage does not match its streamed prefix",
+            )));
+        }
         if successful_turn {
             for (item_key, streamed) in &prefix.text {
                 if !text_items.iter().any(|(key, _)| key == item_key) && !streamed.is_empty() {
@@ -1357,6 +1410,13 @@ impl Runtime {
                 }
                 ProviderEvent::ToolCallReady(candidate) => candidates.push(candidate.clone()),
                 ProviderEvent::Usage(usage) => {
+                    if usage.finality() == UsageFinality::Provisional
+                        && let Some(index) =
+                            prefix.usage_replayed.iter().position(|item| item == usage)
+                    {
+                        prefix.usage_replayed.remove(index);
+                        continue;
+                    }
                     publish_usage(
                         &self.shared,
                         active,
@@ -2562,7 +2622,12 @@ fn record_identity(prefix: &mut StreamedPrefix, bytes: usize) -> bool {
 fn provisional_event_bytes(event: &ProviderEvent) -> usize {
     match event {
         ProviderEvent::TextDelta { item_key, text } => item_key.len().saturating_add(text.len()),
-        ProviderEvent::ToolCallDelta { item_key, .. } => item_key.len(),
+        ProviderEvent::ToolCallDelta {
+            item_key,
+            assembled_bytes,
+        } => item_key
+            .len()
+            .saturating_add(std::mem::size_of_val(assembled_bytes)),
         ProviderEvent::ToolCallReady(candidate) => candidate
             .item_key()
             .len()
@@ -2571,7 +2636,10 @@ fn provisional_event_bytes(event: &ProviderEvent) -> usize {
             .saturating_add(candidate.arguments_json().len()),
         ProviderEvent::ReasoningDelta { text } => text.len(),
         ProviderEvent::Failed(error) => error.message().len(),
-        ProviderEvent::Usage(_) | ProviderEvent::TurnFinished(_) => 0,
+        ProviderEvent::Usage(_) => std::mem::size_of::<Usage>(),
+        ProviderEvent::TurnFinished(finished) => finished
+            .continuation()
+            .map_or(0, |continuation| continuation.bytes().len()),
     }
 }
 
@@ -2802,6 +2870,10 @@ fn deliver_control(shared: &Arc<Shared>, event: RunEvent) -> ControlOutcome {
         return ControlOutcome::Exhausted;
     }
     let mut outbox = shared.outbox.lock().expect("control outbox readable");
+    if shared.control_closed.load(Ordering::SeqCst) || shared.control_tx.is_closed() {
+        shared.control_closed.store(true, Ordering::SeqCst);
+        return ControlOutcome::Closed;
+    }
     // Count includes the flusher's in-flight event until it enters the
     // channel. New events must not bypass either queued or in-flight work.
     if shared.outbox_events.load(Ordering::SeqCst) == 0 {
@@ -2905,12 +2977,25 @@ async fn flush_control(shared: Arc<Shared>) {
                 }
             }
             Err(_) => {
-                shared
-                    .outbox
-                    .lock()
-                    .expect("control outbox readable")
-                    .push_front(event);
                 shared.control_closed.store(true, Ordering::SeqCst);
+                {
+                    let mut outbox = shared.outbox.lock().expect("control outbox readable");
+                    let queued_bytes = outbox.iter().map(control_event_bytes).sum::<usize>();
+                    let queued_events = outbox.len();
+                    outbox.clear();
+                    shared.outbox_bytes.fetch_sub(
+                        queued_bytes.saturating_add(control_event_bytes(&event)),
+                        Ordering::SeqCst,
+                    );
+                    shared
+                        .outbox_events
+                        .fetch_sub(queued_events.saturating_add(1), Ordering::SeqCst);
+                }
+                let mut state = shared.state.lock().await;
+                if let Some(last) = state.last.as_mut() {
+                    last.terminal_delivered = false;
+                    last.truncated = true;
+                }
                 break;
             }
         }
@@ -4844,6 +4929,7 @@ mod tests {
         rt.block_on(async {
             let submit = runtime.submit(submit_cmd("blocked-tool-cancel")).await;
             assert_eq!(submit.reply(), CommandReply::Accepted);
+            assert!(runtime.has_unconfirmed_work().await);
             let run = submit.run().cloned().expect("run issued");
             let mut prelude = collect_until_tool_started(&mut data, &mut control).await;
             assert!(
@@ -4879,6 +4965,10 @@ mod tests {
             // Quarantine holds ownership: no new run until termination.
             let blocked = runtime.submit(submit_cmd("blocked")).await;
             assert_eq!(blocked.reply(), CommandReply::Busy);
+            assert!(
+                runtime.has_unconfirmed_work().await,
+                "logical finalization does not clear worker quarantine"
+            );
 
             release.send(()).expect("release the blocked worker");
             let accepted = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4892,6 +4982,10 @@ mod tests {
             })
             .await
             .expect("quarantine clears after termination");
+            assert!(
+                runtime.has_unconfirmed_work().await,
+                "the newly admitted run is active"
+            );
             assert_eq!(accepted.reply(), CommandReply::Accepted);
             let _ = collect_until_finished(&mut data, &mut control).await;
             assert_eq!(tool.executions.load(Ordering::SeqCst), 1);
@@ -5083,6 +5177,24 @@ mod cov_runtime_private {
             false,
         ));
         assert!(!control_outbox_fits(CONTROL_OUTBOX_EVENT_LIMIT, 0, 1, true,));
+    }
+
+    #[test]
+    fn configured_event_capacities_are_the_effective_channel_bounds() {
+        let mut limits = Limits::m0_test();
+        limits.event_data_capacity = 3;
+        limits.event_control_capacity = 2;
+        let (runtime, _) = Runtime::new(
+            RuntimeConfig {
+                limits,
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        assert_eq!(runtime.shared.data_tx.capacity(), 3);
+        assert_eq!(runtime.shared.control_tx.capacity(), 2);
     }
 
     #[test]
@@ -6509,7 +6621,7 @@ mod cov_runtime_topup_private {
     }
 
     #[test]
-    fn a_vanished_control_consumer_retains_the_committed_outbox_event() {
+    fn a_vanished_control_consumer_retires_the_undeliverable_event() {
         let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
         let run = run_id("outbox");
         let rt = test_rt();
@@ -6533,10 +6645,14 @@ mod cov_runtime_topup_private {
                 .lock()
                 .expect("the control outbox is readable")
                 .push_back(buffered.clone());
+            bed.shared.outbox_events.store(1, Ordering::SeqCst);
+            bed.shared
+                .outbox_bytes
+                .store(control_event_bytes(&buffered), Ordering::SeqCst);
 
             // The only consumer disappears while an event is committed to the
-            // outbox. The flusher must retain that undeliverable event and
-            // classify the channel as closed rather than as saturation.
+            // outbox. The flusher retires undeliverable ownership and classifies
+            // the channel as closed rather than as saturation.
             drop(bed.control);
             tokio::time::timeout(FLUSH_WAIT, flush_control(bed.shared.clone()))
                 .await
@@ -6551,18 +6667,14 @@ mod cov_runtime_topup_private {
                 .outbox
                 .lock()
                 .expect("the control outbox is readable");
-            assert_eq!(
-                outbox.len(),
-                1,
-                "the undeliverable event is retained, never dropped"
-            );
-            assert_eq!(
-                outbox.front().map(RunEvent::seq),
-                Some(buffered.seq()),
-                "the retained event is the committed one, in order"
+            assert!(
+                outbox.is_empty(),
+                "permanently undeliverable events are retired"
             );
             assert!(!bed.shared.flushing.load(Ordering::SeqCst));
             drop(outbox);
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 0);
+            assert_eq!(bed.shared.outbox_bytes.load(Ordering::SeqCst), 0);
             ensure_flusher(&bed.shared);
             assert!(
                 !bed.shared.flushing.load(Ordering::SeqCst),
@@ -6722,7 +6834,7 @@ mod cov_runtime_topup_private {
     }
 
     #[test]
-    fn closed_control_transport_retains_events_without_rescheduling() {
+    fn closed_control_transport_discards_undeliverable_events_without_rescheduling() {
         let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
         let run = run_id("outbox-respawn");
         let rt = test_rt();
@@ -6741,6 +6853,11 @@ mod cov_runtime_topup_private {
                 outbox.push_back(first.clone());
                 outbox.push_back(second.clone());
             }
+            bed.shared.outbox_events.store(2, Ordering::SeqCst);
+            bed.shared.outbox_bytes.store(
+                control_event_bytes(&first) + control_event_bytes(&second),
+                Ordering::SeqCst,
+            );
             drop(bed.control);
             ensure_flusher(&bed.shared);
 
@@ -6759,14 +6876,13 @@ mod cov_runtime_topup_private {
                 .outbox
                 .lock()
                 .expect("the control outbox is readable");
-            assert_eq!(
-                outbox.len(),
-                2,
-                "neither retained event is dropped after transport closure"
+            assert!(
+                outbox.is_empty(),
+                "undeliverable events are retired on permanent closure"
             );
-            assert_eq!(outbox.front().map(RunEvent::seq), Some(first.seq()));
-            assert_eq!(outbox.back().map(RunEvent::seq), Some(second.seq()));
             drop(outbox);
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 0);
+            assert_eq!(bed.shared.outbox_bytes.load(Ordering::SeqCst), 0);
             ensure_flusher(&bed.shared);
             assert!(
                 !bed.shared.flushing.load(Ordering::SeqCst),
@@ -6802,6 +6918,77 @@ mod cov_runtime_topup_private {
                 "finalization clears undeliverable events after recording their status"
             );
             assert!(!bed.shared.flushing.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn closing_during_finalization_retires_in_flight_and_queued_control_events() {
+        let mut limits = Limits::m0_test();
+        limits.event_control_capacity = 1;
+        let bed = make_bed(limits, true, Vec::new(), None, None);
+        let run = run_id("close-during-finalization");
+        let rt = test_rt();
+        rt.block_on(async {
+            install(&bed, active_for(&run)).await;
+            let filler = RunEvent::new(session_id(), run.clone(), 0, usage_payload());
+            bed.shared
+                .control_tx
+                .try_reserve()
+                .expect("single channel slot accepts filler")
+                .send(filler);
+
+            let inflight = RunEvent::new(session_id(), run.clone(), 1, usage_payload());
+            bed.shared
+                .outbox
+                .lock()
+                .expect("outbox is readable")
+                .push_back(inflight.clone());
+            bed.shared.outbox_events.store(1, Ordering::SeqCst);
+            bed.shared
+                .outbox_bytes
+                .store(control_event_bytes(&inflight), Ordering::SeqCst);
+
+            let flusher = tokio::spawn(flush_control(bed.shared.clone()));
+            tokio::time::timeout(FLUSH_WAIT, async {
+                while !bed
+                    .shared
+                    .outbox
+                    .lock()
+                    .expect("outbox is readable")
+                    .is_empty()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("flusher took ownership of the in-flight event");
+
+            bed.runtime
+                .finish_run(&run, RunOutcome::Completed, None)
+                .await;
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 2);
+            drop(bed.control);
+            tokio::time::timeout(FLUSH_WAIT, flusher)
+                .await
+                .expect("flusher observes closure")
+                .expect("flusher task completes");
+
+            assert!(
+                bed.shared
+                    .outbox
+                    .lock()
+                    .expect("outbox readable")
+                    .is_empty()
+            );
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 0);
+            assert_eq!(bed.shared.outbox_bytes.load(Ordering::SeqCst), 0);
+            let state = bed.shared.state.lock().await;
+            let finished = state.last.as_ref().expect("logical terminal is retained");
+            assert!(!finished.terminal_delivered);
+            assert!(
+                finished.truncated,
+                "undeliverable control data is observable"
+            );
         });
     }
 

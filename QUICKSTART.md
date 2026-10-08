@@ -123,6 +123,7 @@ executable; certificate and hostname verification remain enabled.
 ```sh
 ollama pull llama3.1
 export OLLAMA_API_KEY=dummy   # local Ollama ignores it; the credential gate still requires it set
+export NEXUS_SERVER_TOKEN="$(openssl rand -hex 32)"
 cat > /tmp/nexus-config.json <<'EOF'
 {
   "revision": 1,
@@ -143,20 +144,32 @@ cat > /tmp/nexus-config.json <<'EOF'
   "recent": []
 }
 EOF
-export NEXUS_SERVER_TOKEN=$(openssl rand -hex 32)
 cargo run -p nexus-server --locked --offline -- --port 8471 --config /tmp/nexus-config.json --auth-token-env NEXUS_SERVER_TOKEN
 ```
 
-In another terminal (session bound to the configured provider; tools
-stay scripted fakes unless `--tools real` is also passed):
+In the server terminal, keep the generated token available through your
+secret manager or another secret-safe channel. In the client terminal, read
+it without echoing or putting it in shell history (then export it):
 
 ```sh
-AUTH="Authorization: Bearer $NEXUS_SERVER_TOKEN"
-SID=$(curl -s -H "$AUTH" -X POST localhost:8471/sessions -d '{"provider":"ollama","model":"local"}' \
+read -s NEXUS_SERVER_TOKEN
+export NEXUS_SERVER_TOKEN
+```
+
+Session tools stay scripted fakes unless `--tools real` is also passed. This
+creates a private, temporary curl config so the expanded credential is not
+present in curl's command-line arguments. The trap removes the file on exit:
+
+```sh
+umask 077
+AUTH_CONFIG=$(mktemp)
+trap 'rm -f "$AUTH_CONFIG"; unset NEXUS_SERVER_TOKEN' EXIT
+printf 'header = "Authorization: Bearer %s"\n' "$NEXUS_SERVER_TOKEN" > "$AUTH_CONFIG"
+SID=$(curl -s --config "$AUTH_CONFIG" -X POST localhost:8471/sessions -d '{"provider":"ollama","model":"local"}' \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['session'])")
-RID=$(curl -s -H "$AUTH" -X POST localhost:8471/sessions/$SID/runs -d '{"input":"say hi in five words"}' \
+RID=$(curl -s --config "$AUTH_CONFIG" -X POST localhost:8471/sessions/$SID/runs -d '{"input":"say hi in five words"}' \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['run'])")
-curl -sN -H "$AUTH" localhost:8471/sessions/$SID/runs/$RID/events
+curl -sN --config "$AUTH_CONFIG" localhost:8471/sessions/$SID/runs/$RID/events
 ```
 
 Expect the model's text, then a terminal `completed`. If the model
@@ -170,15 +183,15 @@ for that session only. Real file tools additionally need
 automatic, other paths need approval, and paths to protected credential
 files are refused.
 
-Sanity checks that need no model at all:
+API sanity check that does not invoke a model:
 
 ```sh
-curl -s -H "$AUTH" -X POST localhost:8471/sessions -d '{"provider":"ghost"}'       # 400 unknown
-curl -s -H "$AUTH" -X POST localhost:8471/sessions/$SID/runs -d '{"input":"x"}'    # fake demo path still works
+curl -s --config "$AUTH_CONFIG" -X POST localhost:8471/sessions -d '{"provider":"ghost"}'       # 400 unknown
 ```
 
-Unset `OLLAMA_API_KEY` and submit with `"provider":"ollama"` to see the
-`503` credential gate: no socket ever opens without a referenced secret.
+To test the `503` credential gate, stop the server, unset `OLLAMA_API_KEY` in
+its environment, restart it with the same config, and try to create the Ollama
+session again. Session creation fails before any provider network request.
 
 ## Use a hosted model (e.g. DeepSeek)
 

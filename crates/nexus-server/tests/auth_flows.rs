@@ -85,6 +85,19 @@ fn real_tool_http_requires_bearer_and_rejects_untrusted_host_or_origin() {
     let (status, _) = round_trip(port, &request(Some("Bearer wrong"), &host, None));
     assert_eq!(status, 401, "invalid credentials are refused");
 
+    for (method, path) in [
+        ("POST", "/sessions/sess-web-1/runs/run-x/approve"),
+        ("POST", "/sessions/sess-web-1/runs/run-x/deny"),
+        ("POST", "/sessions/sess-web-1/runs/run-x/cancel"),
+        ("GET", "/sessions/sess-web-1/snapshot?run=run-x"),
+    ] {
+        let (status, _) = round_trip(
+            port,
+            &format!("{method} {path} HTTP/1.1\r\nhost: {host}\r\n\r\n"),
+        );
+        assert_eq!(status, 401, "unauthorized control route {method} {path}");
+    }
+
     let (status, _) = round_trip(
         port,
         &request(Some(&format!("Bearer {TOKEN}")), "evil.example", None),

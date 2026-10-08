@@ -584,6 +584,9 @@ impl Server {
                 run: run.clone(),
             };
             let runtime = session.runtime.lock().expect("runtime lockable");
+            if self.handle.block_on(runtime.has_unconfirmed_work()) {
+                return true;
+            }
             let (reply, snapshot) = self.handle.block_on(runtime.get_snapshot(request));
             match (reply.reply(), snapshot) {
                 (CommandReply::Accepted, Some(snapshot)) => {
@@ -1126,7 +1129,7 @@ impl Server {
         };
         let runtime = session.runtime.lock().expect("runtime lockable");
         let (reply, _) = self.handle.block_on(runtime.get_snapshot(request));
-        if reply.reply() != CommandReply::Accepted && !Self::has_retained_terminal(session, &run) {
+        if reply.reply() != CommandReply::Accepted && !Self::has_retained_event(session, &run) {
             return Some(json_response(404, &json::error_body("unknown run")));
         }
         drop(runtime);
@@ -1335,7 +1338,7 @@ impl Server {
         Some(deferred.remove(index))
     }
 
-    fn has_retained_terminal(session: &Session, run: &RunId) -> bool {
+    fn has_retained_event(session: &Session, run: &RunId) -> bool {
         session
             .deferred_terminals
             .lock()
@@ -1344,14 +1347,11 @@ impl Server {
             .any(|event| event.run() == run)
             || {
                 let pending = session.pending.lock().expect("pending lockable");
-                pending
-                    .events
-                    .iter()
-                    .any(|event| event.run() == run && event.is_terminal())
+                pending.events.iter().any(|event| event.run() == run)
                     || pending
                         .overflow
                         .as_ref()
-                        .is_some_and(|(event, _)| event.run() == run && event.is_terminal())
+                        .is_some_and(|(event, _)| event.run() == run)
             }
     }
 
@@ -2038,6 +2038,7 @@ mod tests {
         *session.last_run.lock().expect("last run lockable") = Some(run.clone());
         *session.last_activity.lock().expect("activity lockable") =
             Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+        drop(session);
 
         let mut sessions = server.sessions.lock().expect("sessions lockable");
         server.remove_idle_sessions(&mut sessions, Instant::now());
@@ -2045,6 +2046,7 @@ mod tests {
             sessions.contains_key(&token),
             "active runtime is never evicted"
         );
+        let session = sessions.get(&token).expect("retained session").clone();
 
         let cancel = nexus_core::CancelCommand {
             request: session.request_id(),

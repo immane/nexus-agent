@@ -62,6 +62,8 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.3 — Bound the provisional streaming and control pipeline
 
+**Follow-up status:** The current worktree wires configured event channel capacities, accounts for provisional payloads, validates/skips replayed usage, and retires undeliverable control outbox ownership after permanent channel closure. Regression tests cover usage-prefix replay, configured capacities, and close-during-finalization. Linux/provider-live validation is not claimed.
+
 **Findings:** P1.2, P2.5, P2.6. **Paths:** runtime `runtime.rs`, `protocol.rs`, `transport.rs`; OpenAI `provider.rs`; core provider/limit contracts only if necessary; associated tests. **Dependencies:** M1.2.
 
 - Inventory every queue, retained identity set, usage update, and aggregate batch. Establish explicit event-count and byte ceilings, including the TLS pump, provisional stream, and control outbox.
@@ -90,7 +92,7 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.5 — Record TUI usage against the accepted run's model
 
-**Implementation status: Verified.** TUI submission now snapshots the live provider selection before runtime dispatch; the provider consumes that snapshot for its first call for the run. Accepted run IDs retain their selected model for terminal usage recording, independent of subsequent picker changes. Busy/rejected submissions clear the pending snapshot and do not create usage attribution. TUI configuration save failures remain transcript notices and do not alter run outcomes.
+**Implementation status: Verified with race fix.** TUI submission snapshots the live provider selection before runtime dispatch; a second submission cannot replace or clear an already-pending accepted run's snapshot. Accepted run IDs retain their selected model for terminal usage recording, independent of subsequent picker changes. Busy/rejected submissions clear only a snapshot they own and do not create usage attribution. TUI configuration save failures remain transcript notices and do not alter run outcomes.
 
 **Findings:** P2.4. **Paths:** `crates/nexus-tui/src/main.rs`, TUI tests. **Dependencies:** none.
 
