@@ -11,6 +11,7 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use nexus_config::{UserConfig, load, resolve_path};
@@ -18,6 +19,9 @@ use nexus_server::{Server, ToolsMode};
 
 /// Default loopback port.
 const DEFAULT_PORT: u16 = 8471;
+/// Maximum simultaneously serviced sockets; excess connections are closed
+/// immediately instead of creating another unbounded thread.
+const MAX_CONNECTIONS: usize = 64;
 
 fn usage() -> ! {
     eprintln!(
@@ -185,14 +189,49 @@ fn main() {
         );
     }
     let server = Arc::new(server);
+    let connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                if !try_acquire_connection(&connections) {
+                    drop(stream);
+                    continue;
+                }
                 let server = Arc::clone(&server);
-                thread::spawn(move || server.handle_connection(stream));
+                let connections = Arc::clone(&connections);
+                thread::spawn(move || {
+                    let _connection = ConnectionGuard(connections);
+                    server.handle_connection(stream);
+                });
             }
             Err(error) => eprintln!("nexus-server: accept failed ({error})"),
         }
+    }
+}
+
+fn try_acquire_connection(connections: &AtomicUsize) -> bool {
+    let mut current = connections.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONNECTIONS {
+            return false;
+        }
+        match connections.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -210,6 +249,19 @@ mod cov_main_args {
     //! leaves no listening socket behind.
 
     use super::{CliAction, DEFAULT_PORT, parse_args};
+
+    #[test]
+    fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {
+        let active = std::sync::atomic::AtomicUsize::new(super::MAX_CONNECTIONS - 1);
+        assert!(super::try_acquire_connection(&active));
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Acquire),
+            super::MAX_CONNECTIONS
+        );
+        assert!(!super::try_acquire_connection(&active));
+        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(super::try_acquire_connection(&active));
+    }
 
     /// Builds the full argv vector a process would receive. `parse_args`
     /// skips element 0 as the program path, so every case must supply that

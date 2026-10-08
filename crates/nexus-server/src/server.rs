@@ -66,6 +66,9 @@ use crate::json;
 
 /// Idle SSE window: a `: ping` comment keeps the stream alive.
 const SSE_IDLE: Duration = Duration::from_secs(15);
+/// Hard cap: session runtimes own grants, history, and event receivers and
+/// are rejected rather than evicted while their execution state is unknown.
+pub const MAX_SESSIONS: usize = 128;
 /// Default execution profile for web-submitted tasks.
 const WEB_PROFILE: &str = "web-test";
 
@@ -289,6 +292,13 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, SessionError> {
+        // Hold admission ownership through construction so concurrent
+        // creators cannot pass the cap together. The lock is not held over
+        // runtime execution or network I/O.
+        let mut sessions = self.sessions.lock().expect("sessions lockable");
+        if sessions.len() >= MAX_SESSIONS {
+            return Err(SessionError::new(503, "session capacity is full"));
+        }
         if provider.is_none() && model.is_some() {
             return Err(SessionError::new(400, "selected model needs a provider"));
         }
@@ -370,10 +380,7 @@ impl Server {
             next_request: AtomicU64::new(1),
             pending: Mutex::new(Vec::new()),
         });
-        self.sessions
-            .lock()
-            .expect("sessions lockable")
-            .insert(token.clone(), entry);
+        sessions.insert(token.clone(), entry);
         Ok(token)
     }
 
@@ -427,6 +434,7 @@ impl Server {
     /// close the stream (except SSE, which closes its own stream at the
     /// terminal event).
     pub fn handle_connection(&self, mut stream: TcpStream) {
+        let _ = stream.set_write_timeout(Some(http::WRITE_TIMEOUT));
         let response = match http::read_request(&mut stream) {
             Ok(request) => self.route(&request, &mut stream),
             Err(error) => Some(json_response(
@@ -789,8 +797,8 @@ impl Server {
             }
             *streaming = true;
         }
+        let _subscriber = SubscriberGuard(&session.streaming);
         if http::write_sse_headers(stream).is_err() {
-            *session.streaming.lock().expect("stream flag lockable") = false;
             return None;
         }
         let mut data = session.data.lock().expect("data channel lockable");
@@ -862,7 +870,6 @@ impl Server {
                 break;
             }
         }
-        *session.streaming.lock().expect("stream flag lockable") = false;
         None
     }
 
@@ -943,6 +950,16 @@ impl Server {
         if let Err(error) = self.persist(&config) {
             eprintln!("nexus-server: configuration could not be saved ({error})");
         }
+    }
+}
+
+/// Releases the session's exclusive SSE attachment on every return and
+/// unwind path, including socket write failures.
+struct SubscriberGuard<'a>(&'a Mutex<bool>);
+
+impl Drop for SubscriberGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().expect("stream flag lockable") = false;
     }
 }
 

@@ -104,6 +104,18 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.6 — Bound server connections, sessions, and SSE lifecycle
 
+**Implementation status: In progress.** The binary now admits at most 64
+connection threads and rejects additional sockets by closing them; the server
+admits at most 128 sessions and rejects excess creation with `503` rather than
+evicting session-owned runtime state. HTTP request reads have a 60-second
+wall-clock deadline (30-second maximum per read), and socket writes have a
+30-second timeout. SSE subscriber ownership is released through an RAII guard
+on normal return, disconnect, and unwinding. Pending-event and usage
+association maps still lack independently enforced budgets, and no safe idle
+session cleanup/completion observer exists yet; those requirements remain
+open rather than being approximated by eviction or client-driven terminal
+delivery.
+
 **Findings:** P1.6. **Paths:** server `main.rs`, `http.rs`, `server.rs`, server tests. **Dependencies:** M1.2 for closed-stream integration; M1.1 for selection identity.
 
 - Choose explicit finite limits for connections, sessions, active runs, pending events, and unconsumed usage associations. Reject excess admission rather than silently dropping an active session.

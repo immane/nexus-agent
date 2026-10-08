@@ -7,6 +7,13 @@
 //! egress beyond loopback, no stored sessions), and the server binds
 //! `127.0.0.1` only. There is no authentication: any local process can
 //! submit, approve, and cancel. Do not expose this server to a network.
+//! The binary caps concurrent connection threads at 64; sessions are capped
+//! at 128 and excess creation is rejected (`503`) rather than evicting
+//! runtime state. Requests have a 60-second total read deadline and writes
+//! have a 30-second timeout. These are resource bounds, not caller
+//! authentication or product security guarantees. Session removal and
+//! independent bounds for pending cross-run events/usage attribution remain
+//! unresolved.
 //!
 //! # Protocol (v1, unstable, test-only)
 //!

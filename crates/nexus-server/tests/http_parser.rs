@@ -569,10 +569,8 @@ fn the_io_timeout_is_installed_on_the_connection() {
         .expect("request writes");
     pair.parse_on_server()
         .unwrap_or_else(|error| panic!("valid request was rejected: {error:?}"));
-    assert_eq!(
-        pair.server.read_timeout().expect("timeout is readable"),
-        Some(IO_TIMEOUT)
-    );
+    let timeout = pair.server.read_timeout().expect("timeout is readable");
+    assert!(timeout.is_some_and(|remaining| remaining <= IO_TIMEOUT));
 }
 
 #[test]
@@ -587,6 +585,7 @@ fn reason_phrases_cover_the_emitted_statuses() {
         (200, "OK"),
         (201, "Created"),
         (400, "Bad Request"),
+        (408, "Request Timeout"),
         (404, "Not Found"),
         (405, "Method Not Allowed"),
         (409, "Conflict"),
