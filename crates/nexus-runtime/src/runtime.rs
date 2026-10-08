@@ -2485,6 +2485,12 @@ fn deliver_control(shared: &Arc<Shared>, event: RunEvent) -> ControlOutcome {
 }
 
 fn ensure_flusher(shared: &Arc<Shared>) {
+    // A disconnected receiver is a permanent transport failure. Retained
+    // events remain available for honest run state/finalization, but retrying
+    // them cannot make progress and would create a busy reschedule loop.
+    if shared.control_closed.load(Ordering::SeqCst) {
+        return;
+    }
     if shared.flushing.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -2525,11 +2531,12 @@ async fn flush_control(shared: Arc<Shared>) {
         }
     }
     shared.flushing.store(false, Ordering::SeqCst);
-    if !shared
-        .outbox
-        .lock()
-        .expect("control outbox readable")
-        .is_empty()
+    if !shared.control_closed.load(Ordering::SeqCst)
+        && !shared
+            .outbox
+            .lock()
+            .expect("control outbox readable")
+            .is_empty()
     {
         ensure_flusher(&shared);
     }
@@ -5927,7 +5934,7 @@ mod cov_runtime_topup_private {
                 bed.shared.control_closed.load(Ordering::SeqCst),
                 "a vanished consumer is classified as closed, never as saturation"
             );
-            let mut outbox = bed
+            let outbox = bed
                 .shared
                 .outbox
                 .lock()
@@ -5942,10 +5949,13 @@ mod cov_runtime_topup_private {
                 Some(buffered.seq()),
                 "the retained event is the committed one, in order"
             );
-            // Production clears the outbox once a closed consumer is classified
-            // (see `finish_run`); doing the same here ends the flusher's respawn
-            // instead of letting the test leave a spinning successor behind.
-            outbox.clear();
+            assert!(!bed.shared.flushing.load(Ordering::SeqCst));
+            drop(outbox);
+            ensure_flusher(&bed.shared);
+            assert!(
+                !bed.shared.flushing.load(Ordering::SeqCst),
+                "closed transport is terminal and cannot schedule another pass"
+            );
         });
     }
 
@@ -6100,13 +6110,14 @@ mod cov_runtime_topup_private {
     }
 
     #[test]
-    fn the_retained_outbox_events_survive_every_flusher_pass() {
+    fn closed_control_transport_retains_events_without_rescheduling() {
         let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
         let run = run_id("outbox-respawn");
         let rt = test_rt();
         rt.block_on(async {
             // Two committed events and no consumer. The flusher must retain
-            // both, in order, and respawn itself rather than losing either one.
+            // both in order. A disconnected receiver is terminal, so it must
+            // not respawn itself while those events remain undeliverable.
             let first = RunEvent::new(session_id(), run.clone(), 0, usage_payload());
             let second = RunEvent::new(session_id(), run.clone(), 1, started_payload());
             {
@@ -6125,20 +6136,13 @@ mod cov_runtime_topup_private {
                 while !bed.shared.control_closed.load(Ordering::SeqCst) {
                     tokio::task::yield_now().await;
                 }
-                // A respawned flusher reaches the same verdict on its own.
-                while !bed.shared.flushing.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
             })
             .await
-            .expect("the flusher classifies the vanished consumer and respawns");
-            // Let the respawned pass run once more against the retained outbox.
-            for _ in 0..4 {
-                tokio::task::yield_now().await;
-            }
+            .expect("the flusher classifies the vanished consumer and stops");
 
             assert!(bed.shared.control_closed.load(Ordering::SeqCst));
-            let mut outbox = bed
+            assert!(!bed.shared.flushing.load(Ordering::SeqCst));
+            let outbox = bed
                 .shared
                 .outbox
                 .lock()
@@ -6146,14 +6150,46 @@ mod cov_runtime_topup_private {
             assert_eq!(
                 outbox.len(),
                 2,
-                "neither retained event is dropped, however many passes run"
+                "neither retained event is dropped after transport closure"
             );
             assert_eq!(outbox.front().map(RunEvent::seq), Some(first.seq()));
             assert_eq!(outbox.back().map(RunEvent::seq), Some(second.seq()));
-            // Production clears the outbox once a closed consumer is classified
-            // (see `finish_run`); clearing here ends the respawn loop the way a
-            // finalizing run does, instead of leaving a spinning successor.
-            outbox.clear();
+            drop(outbox);
+            ensure_flusher(&bed.shared);
+            assert!(
+                !bed.shared.flushing.load(Ordering::SeqCst),
+                "a retained outbox does not restart a flusher after closure"
+            );
+        });
+    }
+
+    #[test]
+    fn finalization_does_not_claim_a_terminal_delivered_to_a_closed_channel() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("terminal-undelivered");
+        let rt = test_rt();
+        rt.block_on(async {
+            install(&bed, active_for(&run)).await;
+            drop(bed.control);
+
+            bed.runtime
+                .finish_run(&run, RunOutcome::Completed, None)
+                .await;
+
+            let state = bed.shared.state.lock().await;
+            let last = state.last.as_ref().expect("finalized run is retained");
+            assert!(!last.terminal_delivered);
+            assert!(last.truncated, "closed control delivery remains observable");
+            drop(state);
+            assert!(
+                bed.shared
+                    .outbox
+                    .lock()
+                    .expect("control outbox readable")
+                    .is_empty(),
+                "finalization clears undeliverable events after recording their status"
+            );
+            assert!(!bed.shared.flushing.load(Ordering::SeqCst));
         });
     }
 
