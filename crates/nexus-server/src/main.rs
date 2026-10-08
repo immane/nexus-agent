@@ -1,7 +1,7 @@
 //! `nexus-server` binary: loopback HTTP frontend for the agent runtime.
 //!
-//! TEST-ONLY demo. Binds `127.0.0.1` only: any local process can submit,
-//! approve, and cancel. There is no authentication. Sessions created
+//! Binds `127.0.0.1` only. Real tools/providers require bearer authentication;
+//! only the fake demo may run unauthenticated. Sessions created
 //! without a provider selection serve scripted fakes; sessions bound to
 //! a configured provider use the real OpenAI-compatible adapter.
 //! Do not expose this server to a network.
@@ -11,6 +11,7 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use nexus_config::{UserConfig, load, resolve_path};
@@ -18,13 +19,20 @@ use nexus_server::{Server, ToolsMode};
 
 /// Default loopback port.
 const DEFAULT_PORT: u16 = 8471;
+/// Maximum simultaneously serviced sockets; excess connections are closed
+/// immediately instead of creating another unbounded thread.
+const MAX_CONNECTIONS: usize = 64;
+const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--auth-token-env NAME] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
+    eprintln!(
+        "  --auth-token-env reads a 64-hex-character bearer token from the named environment variable."
+    );
     eprintln!(
         "  --tools real executes filesystem tools and sandboxed host_exec with --tools-root as the project (default: working directory);"
     );
@@ -45,6 +53,7 @@ enum CliAction {
         tools_real: bool,
         tools_root: Option<String>,
         strict_tools: bool,
+        auth_token_env: Option<String>,
     },
     /// Print usage and exit 2.
     Usage,
@@ -56,11 +65,16 @@ fn parse_args(argv: &[String]) -> CliAction {
     let mut tools_real = false;
     let mut tools_root: Option<String> = None;
     let mut strict_tools = false;
+    let mut auth_token_env = None;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return CliAction::Usage,
             "--strict-tools" => strict_tools = true,
+            "--auth-token-env" => match args.next() {
+                Some(value) if !value.is_empty() => auth_token_env = Some(value.clone()),
+                _ => return CliAction::Usage,
+            },
             "--port" => match args.next().and_then(|value| value.parse().ok()) {
                 Some(value) => port = value,
                 None => return CliAction::Usage,
@@ -90,6 +104,7 @@ fn parse_args(argv: &[String]) -> CliAction {
         tools_real,
         tools_root,
         strict_tools,
+        auth_token_env,
     }
 }
 
@@ -123,17 +138,47 @@ fn load_user_config(explicit: Option<&str>) -> (UserConfig, Option<PathBuf>) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let (port, explicit_config, tools_real, tools_root, strict_tools) = match parse_args(&argv) {
-        CliAction::Run {
-            port,
-            config,
-            tools_real,
-            tools_root,
-            strict_tools,
-        } => (port, config, tools_real, tools_root, strict_tools),
-        CliAction::Usage => usage(),
-    };
+    let (port, explicit_config, tools_real, tools_root, strict_tools, auth_token_env) =
+        match parse_args(&argv) {
+            CliAction::Run {
+                port,
+                config,
+                tools_real,
+                tools_root,
+                strict_tools,
+                auth_token_env,
+            } => (
+                port,
+                config,
+                tools_real,
+                tools_root,
+                strict_tools,
+                auth_token_env,
+            ),
+            CliAction::Usage => usage(),
+        };
     let (config, path) = load_user_config(explicit_config.as_deref());
+    let needs_auth = tools_real || !config.providers().is_empty();
+    let token = match auth_token_env.as_deref() {
+        Some(name) => match std::env::var(name) {
+            Ok(value) => match nexus_server::server::validate_auth_token(&value) {
+                Ok(()) => Some(value),
+                Err(error) => {
+                    eprintln!("nexus-server: invalid bearer credential ({error})");
+                    std::process::exit(1);
+                }
+            },
+            Err(_) => {
+                eprintln!("nexus-server: authentication environment variable is unavailable");
+                std::process::exit(1);
+            }
+        },
+        None if needs_auth => {
+            eprintln!("nexus-server: real tools/providers require --auth-token-env");
+            std::process::exit(1);
+        }
+        None => None,
+    };
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
         eprintln!("nexus-server: cannot bind 127.0.0.1:{port} ({error})");
         std::process::exit(1);
@@ -146,6 +191,12 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
+    if let Some(token) = token.as_deref()
+        && let Err(error) = server.set_auth_token(token)
+    {
+        eprintln!("nexus-server: invalid bearer credential ({error})");
+        std::process::exit(1);
+    }
     // The banner describes the default wiring, not every session: tools
     // follow the startup mode, while each session's provider is chosen at
     // creation (unbound sessions serve the demo script, bound sessions use
@@ -177,22 +228,79 @@ fn main() {
             std::process::exit(1);
         }
         eprintln!(
-            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (real tools at {root}, strict={strict_tools}, {providers}, no auth; never expose)"
+            "nexus-server loopback API on 127.0.0.1:{port} (real tools at {root}, strict={strict_tools}, {providers}, authenticated; never expose)"
         );
     } else {
         eprintln!(
-            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (scripted fakes by default, {providers}, no auth; never expose)"
+            "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (scripted fakes by default, {providers}, {}; never expose)",
+            if token.is_some() {
+                "authenticated"
+            } else {
+                "test-only unauthenticated demo"
+            }
         );
     }
     let server = Arc::new(server);
+    let cleanup_server = Arc::downgrade(&server);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(SESSION_CLEANUP_INTERVAL);
+            let Some(server) = cleanup_server.upgrade() else {
+                break;
+            };
+            server.cleanup_idle_sessions();
+        }
+    });
+    let connections = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                if !try_acquire_connection(&connections) {
+                    drop(stream);
+                    continue;
+                }
                 let server = Arc::clone(&server);
-                thread::spawn(move || server.handle_connection(stream));
+                let connections = Arc::clone(&connections);
+                let worker_connections = Arc::clone(&connections);
+                if let Err(error) = thread::Builder::new()
+                    .name("nexus-http-connection".to_owned())
+                    .spawn(move || {
+                        let _connection = ConnectionGuard(worker_connections);
+                        server.handle_connection(stream);
+                    })
+                {
+                    connections.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!("nexus-server: connection worker could not start ({error})");
+                }
             }
             Err(error) => eprintln!("nexus-server: accept failed ({error})"),
         }
+    }
+}
+
+fn try_acquire_connection(connections: &AtomicUsize) -> bool {
+    let mut current = connections.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONNECTIONS {
+            return false;
+        }
+        match connections.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -210,6 +318,19 @@ mod cov_main_args {
     //! leaves no listening socket behind.
 
     use super::{CliAction, DEFAULT_PORT, parse_args};
+
+    #[test]
+    fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {
+        let active = std::sync::atomic::AtomicUsize::new(super::MAX_CONNECTIONS - 1);
+        assert!(super::try_acquire_connection(&active));
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Acquire),
+            super::MAX_CONNECTIONS
+        );
+        assert!(!super::try_acquire_connection(&active));
+        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(super::try_acquire_connection(&active));
+    }
 
     /// Builds the full argv vector a process would receive. `parse_args`
     /// skips element 0 as the program path, so every case must supply that
@@ -229,7 +350,7 @@ mod cov_main_args {
                 config,
                 tools_real,
                 tools_root,
-                strict_tools: _,
+                ..
             } => (port, config, tools_real, tools_root),
             CliAction::Usage => panic!("expected a run action for {args:?}"),
         }
@@ -290,6 +411,19 @@ mod cov_main_args {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn auth_token_source_is_an_environment_variable_name_only() {
+        assert!(matches!(
+            parse_args(&argv(&["--auth-token-env", "NEXUS_SERVER_TOKEN"])),
+            CliAction::Run {
+                auth_token_env: Some(name),
+                ..
+            } if name == "NEXUS_SERVER_TOKEN"
+        ));
+        usage(&["--auth-token-env"]);
+        usage(&["--auth-token-env", ""]);
     }
 
     /// `--port N` is the only way to move the listener off the default, so a

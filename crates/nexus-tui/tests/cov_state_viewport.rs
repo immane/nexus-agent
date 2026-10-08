@@ -840,6 +840,28 @@ fn composer_accepts_text_and_deletes_one_char_at_a_time() {
 }
 
 #[test]
+fn composer_caret_byte_offset_tracks_utf8_edits_and_movement() {
+    let mut state = AppState::new();
+    for char in "aé漢b".chars() {
+        state.composer_type(char);
+    }
+
+    state.caret_left();
+    state.caret_left();
+    state.composer_type('🙂');
+    assert_eq!(state.composer(), "aé🙂漢b");
+    assert!(state.composer_backspace());
+    assert_eq!(state.composer(), "aé漢b");
+
+    state.caret_left();
+    state.composer_newline();
+    assert_eq!(state.composer(), "a\né漢b");
+    state.caret_right();
+    state.composer_type('!');
+    assert_eq!(state.composer(), "a\né!漢b");
+}
+
+#[test]
 fn composer_never_exceeds_the_input_limit() {
     let mut state = AppState::new();
     for _ in 0..MAX_COMPOSER_BYTES {

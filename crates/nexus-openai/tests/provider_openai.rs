@@ -620,6 +620,26 @@ fn sse_tool_fragments_assemble_per_index_before_admission() {
 }
 
 #[test]
+fn sse_identity_budget_counts_all_new_indices_in_one_record() {
+    let calls: Vec<_> = (0..17)
+        .map(|index| {
+            serde_json::json!({
+                "index": index,
+                "id": format!("call-{index}"),
+                "function": {"name": "host_read", "arguments": "{}"}
+            })
+        })
+        .collect();
+    let record = serde_json::json!({
+        "choices": [{"delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}]
+    });
+    let body = format!("data: {record}\n\ndata: [DONE]\n");
+    let (base, _) = serve_raw(&sse_head(body.len()), &body);
+    let error = failed(provider(&base).stream(&base_request(), &live_context()));
+    assert_eq!(error.0, ErrorCategory::ResourceLimit);
+}
+
+#[test]
 fn sse_without_termination_is_a_truncation_not_a_stop() {
     let body =
         "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";

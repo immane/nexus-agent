@@ -14,7 +14,7 @@
 //!   terminates; a quarantined worker blocks the next dispatch and a new run
 //!   instead of racing an earlier operation;
 //! - control delivery never silently drops a required event: a full channel
-//!   buffers into a bounded outbox that keeps ownership until drained, and a
+//!   buffers into a count/byte-bounded outbox with terminal reserve, and a
 //!   closed consumer is classified separately from saturation;
 //! - per-run sequence numbers commit only on a successful enqueue (or a
 //!   committed outbox entry), so delivered sequences stay contiguous;
@@ -25,20 +25,20 @@
 //!   result, item-key, and provider-reference round-trips.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
-use nexus_core::commands::EventSequence;
+use nexus_core::commands::{EventSequence, MAX_TEXT_FRAGMENT_BYTES};
 use nexus_core::{
     AgentError, ApprovalBinding, ApprovalId, ApprovalNotice, ApproveCommand, AssistantText,
     CallCandidate, CallId, CancelCommand, CancellationToken, Command, CommandReply,
     CommandResponse, ContinuationData, DenyCommand, EffectState, ErrorCategory, EventPayload,
-    Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, Limits, ModelContextItem,
+    Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits, ModelContextItem,
     ModelRequest, OutcomeSummary, PersistenceState, ProviderContext, ProviderEvent, ProviderPort,
     RequestId, RetryGuidance, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome, SessionId,
     Snapshot, SubmitCommand, ToolCall, ToolContext, ToolFinishedInfo, ToolId, ToolOutcome,
-    ToolPort, ToolSpec, ToolStartedInfo, TurnId, Usage,
+    ToolPort, ToolSpec, ToolStartedInfo, TurnId, Usage, UsageFinality,
 };
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
@@ -46,7 +46,9 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::policy::Policy;
-use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY, EventStreams};
+use crate::transport::EventStreams;
+#[cfg(test)]
+use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY};
 
 /// Single-run lifecycle states (design 02-execution baseline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +105,11 @@ struct Shared {
     data_tx: mpsc::Sender<RunEvent>,
     control_tx: mpsc::Sender<RunEvent>,
     /// Committed control events that could not enter the bounded channel.
-    /// Bounded by construction: a run can only generate a finite number of
-    /// control events, and a new run is rejected while this is non-empty.
+    /// Explicit event and byte ceilings bound retained transport state.
     outbox: StdMutex<VecDeque<RunEvent>>,
+    outbox_events: AtomicUsize,
+    outbox_bytes: AtomicUsize,
+    control_exhausted: AtomicBool,
     flushing: AtomicBool,
     control_closed: AtomicBool,
     incarnation: u64,
@@ -171,11 +175,29 @@ struct CurrentCall {
 /// publish each prefix exactly once instead of replaying it.
 #[derive(Default)]
 struct StreamedPrefix {
-    /// Text item keys with at least one live-published fragment.
-    text_keys: HashSet<String>,
+    /// Text already published per item, used to validate and append the
+    /// authoritative batch suffix without replaying or hiding mismatches.
+    text: HashMap<String, String>,
     /// Preview item keys already announced as `ToolCallPreview`.
     preview_keys: HashSet<String>,
+    retained_bytes: usize,
+    identity_bytes: usize,
+    event_count: usize,
+    usage_updates: usize,
+    usage_prefix: Vec<Usage>,
+    usage_replayed: Vec<Usage>,
+    exceeded: bool,
 }
+
+/// Provisional bridge has independent queue, payload, text-output, and event
+/// ceilings; none of these substitutes for the authoritative batch budget.
+const PROVISIONAL_STREAM_CAPACITY: usize = 64;
+const PROVISIONAL_STREAM_BYTE_CAPACITY: usize = 1_048_576;
+const PROVISIONAL_EVENT_LIMIT: usize = crate::protocol::MAX_BATCH_EVENTS;
+const PROVISIONAL_USAGE_UPDATE_LIMIT: usize = 16;
+const CONTROL_OUTBOX_EVENT_LIMIT: usize = 256;
+const CONTROL_OUTBOX_BYTE_LIMIT: usize = 1_048_576;
+const CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES: usize = 65_536;
 
 struct ActiveRun {
     phase: RunState,
@@ -218,6 +240,7 @@ struct ActiveRun {
     /// (frontends reject duplicate sequences).
     sequence_exhausted: bool,
     last_usage: Option<Usage>,
+    published_usage: Option<Usage>,
     force_terminal: Option<RunOutcome>,
     terminal: Option<RunOutcome>,
     terminal_error: Option<AgentError>,
@@ -295,6 +318,7 @@ enum ControlOutcome {
     Sent,
     Buffered,
     Closed,
+    Exhausted,
 }
 
 /// Process-unique runtime incarnation. Recreated runtimes (tests, restarts)
@@ -409,8 +433,8 @@ impl Runtime {
                 "provider declares no usable context budget",
             ));
         }
-        let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
-        let (control_tx, control_rx) = mpsc::channel(CONTROL_CAPACITY);
+        let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
+        let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
             limits: config.limits,
             effective_output_budget,
@@ -431,6 +455,9 @@ impl Runtime {
             data_tx,
             control_tx,
             outbox: StdMutex::new(VecDeque::new()),
+            outbox_events: AtomicUsize::new(0),
+            outbox_bytes: AtomicUsize::new(0),
+            control_exhausted: AtomicBool::new(false),
             flushing: AtomicBool::new(false),
             control_closed: AtomicBool::new(false),
             incarnation: next_incarnation(),
@@ -513,16 +540,13 @@ impl Runtime {
                 Some(quarantined.run.clone()),
             );
         }
-        if !self
-            .shared
-            .outbox
-            .lock()
-            .expect("control outbox readable")
-            .is_empty()
-        {
+        if self.shared.outbox_events.load(Ordering::SeqCst) != 0 {
             let run = state.last.as_ref().map(|last| last.run.clone());
             return CommandResponse::new(command.request.clone(), CommandReply::Busy, run);
         }
+        // Exhaustion belongs to the previous run. Its outbox is empty here,
+        // so the next accepted run starts with a fresh control budget.
+        self.shared.control_exhausted.store(false, Ordering::SeqCst);
         let mut conversation = Vec::new();
         let mut count = 1;
         let mut bytes = user_item.payload_bytes();
@@ -581,6 +605,7 @@ impl Runtime {
             data_dropped: false,
             sequence_exhausted: false,
             last_usage: None,
+            published_usage: None,
             force_terminal: None,
             terminal: None,
             terminal_error: None,
@@ -812,6 +837,14 @@ impl Runtime {
         )
     }
 
+    /// Reports whether the runtime has active or unconfirmed worker
+    /// ownership. A finalized snapshot alone is insufficient for safe
+    /// session reclamation because timed-out workers may remain quarantined.
+    pub async fn has_unconfirmed_work(&self) -> bool {
+        let state = self.shared.state.lock().await;
+        state.active.is_some() || !state.quarantine.is_empty()
+    }
+
     fn stale_or_finalized(
         &self,
         state: &State,
@@ -881,6 +914,9 @@ impl Runtime {
         let Some(active) = state.active.as_ref() else {
             return Err(Terminal::cancelled());
         };
+        if active.terminal.is_some() {
+            return Ok(RunState::Finished);
+        }
         if &active.run != run || active.cancelled || active.token.is_cancelled() {
             return Err(Terminal::cancelled());
         }
@@ -904,6 +940,9 @@ impl Runtime {
             let Some(active) = state.active.as_mut() else {
                 return Err(Terminal::cancelled());
             };
+            if active.terminal.is_some() {
+                return Ok(RunState::Finished);
+            }
             if &active.run != run || active.cancelled || active.token.is_cancelled() {
                 return Err(Terminal::cancelled());
             }
@@ -958,11 +997,37 @@ impl Runtime {
         };
         let provider = self.shared.provider.clone();
         let incremental = provider.supports_incremental_streaming();
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<ProviderEvent>();
+        let (stream_tx, mut stream_rx) =
+            mpsc::channel::<ProviderEvent>(PROVISIONAL_STREAM_CAPACITY);
+        let stream_overflow = Arc::new(AtomicBool::new(false));
+        let producer_overflow = stream_overflow.clone();
+        let producer_token = token.clone();
+        let stream_bytes = Arc::new(AtomicUsize::new(0));
+        let producer_bytes = stream_bytes.clone();
         let mut handle = tokio::task::spawn_blocking(move || {
             if incremental {
                 let sink = |event: ProviderEvent| {
-                    let _ = stream_tx.send(event);
+                    if !matches!(
+                        &event,
+                        ProviderEvent::TextDelta { .. } | ProviderEvent::ToolCallDelta { .. }
+                    ) && !matches!(&event, ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional)
+                    {
+                        return;
+                    }
+                    let bytes = provisional_event_bytes(&event);
+                    let previous = producer_bytes.fetch_add(bytes, Ordering::SeqCst);
+                    if previous.saturating_add(bytes) > PROVISIONAL_STREAM_BYTE_CAPACITY {
+                        producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                        producer_overflow.store(true, Ordering::SeqCst);
+                        producer_token.cancel();
+                        return;
+                    }
+                    if let Err(error) = stream_tx.try_send(event) {
+                        producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                        drop(error);
+                        producer_overflow.store(true, Ordering::SeqCst);
+                        producer_token.cancel();
+                    }
                 };
                 provider.stream_with_sink(&request, &context, &sink)
             } else {
@@ -980,8 +1045,9 @@ impl Runtime {
                 biased;
                 joined = &mut handle => break Some(joined),
                 streamed = stream_rx.recv() => {
-                    if let Some(event) = streamed {
-                        self.publish_provisional(run, &turn, event, &mut prefix)
+                        if let Some(event) = streamed {
+                            stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
+                            self.publish_provisional(run, &turn, event, &mut prefix)
                             .await;
                     }
                 }
@@ -999,9 +1065,18 @@ impl Runtime {
                 // The join may win the race while provisional events are
                 // still buffered: drain them first so every streamed prefix
                 // publishes before the authoritative batch ingests.
-                self.drain_stream(run, &turn, &mut stream_rx, &mut prefix)
+                self.drain_stream(run, &turn, &mut stream_rx, &stream_bytes, &mut prefix)
                     .await;
-                self.ingest_model_batch(run, &turn, events, &prefix).await
+                if stream_overflow.load(Ordering::SeqCst) {
+                    return Err(Terminal::limit(
+                        "provisional provider stream exceeded its bound",
+                    ));
+                }
+                if prefix.exceeded {
+                    return Err(Terminal::limit("provisional output budget exhausted"));
+                }
+                self.ingest_model_batch(run, &turn, events, &mut prefix)
+                    .await
             }
             Some(Err(join)) => {
                 let message = if join.is_panic() {
@@ -1012,6 +1087,31 @@ impl Runtime {
                 Err(Terminal::failed_internal(message))
             }
             None => {
+                if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                    self.quarantine_provider(run, handle).await;
+                    return Err(Terminal::limit(if prefix.exceeded {
+                        "provisional output budget exhausted"
+                    } else {
+                        "provisional provider stream exceeded its bound"
+                    }));
+                }
+                let forced = {
+                    let state = self.shared.state.lock().await;
+                    state
+                        .active
+                        .as_ref()
+                        .filter(|active| &active.run == run)
+                        .and_then(|active| {
+                            active.terminal.map(|outcome| Terminal {
+                                outcome,
+                                error: active.terminal_error.clone(),
+                            })
+                        })
+                };
+                if let Some(forced) = forced {
+                    self.quarantine_provider(run, handle).await;
+                    return Err(forced);
+                }
                 let cancelled = cancelled_first || token.is_cancelled() || {
                     let state = self.shared.state.lock().await;
                     state
@@ -1058,18 +1158,49 @@ impl Runtime {
         if &active.run != run || active.cancelled || active.token.is_cancelled() {
             return;
         }
+        if prefix.event_count >= PROVISIONAL_EVENT_LIMIT {
+            prefix.exceeded = true;
+            active.token.cancel();
+            return;
+        }
+        prefix.event_count += 1;
+        if let ProviderEvent::TextDelta { item_key, .. }
+        | ProviderEvent::ToolCallDelta { item_key, .. } = &event
+            && let Err(error) = ItemKey::new(item_key.as_str())
+        {
+            active.data_dropped = true;
+            active.force_terminal = Some(RunOutcome::Failed);
+            active.terminal = Some(RunOutcome::Failed);
+            active.terminal_error = Some(error);
+            active.token.cancel();
+            active.wake.notify_one();
+            return;
+        }
         match event {
             ProviderEvent::TextDelta { item_key, text } => {
-                prefix.text_keys.insert(item_key.clone());
-                match AssistantText::new(turn.clone(), item_key, text) {
-                    Ok(fragment) => {
-                        buffer_text(&self.shared, active, run, fragment);
-                        flush_text(&self.shared, active);
-                    }
-                    Err(_) => active.data_dropped = true,
+                if !record_provisional(prefix, text.len(), self.shared.effective_output_budget)
+                    || !record_identity(prefix, item_key.len())
+                {
+                    active.data_dropped = true;
+                    prefix.exceeded = true;
+                    active.token.cancel();
+                    return;
                 }
+                prefix
+                    .text
+                    .entry(item_key.clone())
+                    .or_default()
+                    .push_str(&text);
+                buffer_text_fragments(&self.shared, active, run, turn, &item_key, &text);
+                flush_text(&self.shared, active);
             }
             ProviderEvent::ToolCallDelta { item_key, .. } => {
+                if !record_identity(prefix, item_key.len()) {
+                    active.data_dropped = true;
+                    prefix.exceeded = true;
+                    active.token.cancel();
+                    return;
+                }
                 prefix.preview_keys.insert(item_key.clone());
                 emit_data(
                     &self.shared,
@@ -1079,10 +1210,17 @@ impl Runtime {
                 );
             }
             ProviderEvent::Usage(usage) => {
-                if active.last_usage != Some(usage) {
-                    emit_control(&self.shared, active, run, EventPayload::UsageUpdated(usage));
-                    active.last_usage = Some(usage);
+                if usage.finality() == UsageFinality::Provisional {
+                    prefix.usage_prefix.push(usage);
                 }
+                publish_usage(
+                    &self.shared,
+                    active,
+                    run,
+                    usage,
+                    &mut prefix.usage_updates,
+                    true,
+                );
             }
             ProviderEvent::ToolCallReady(_)
             | ProviderEvent::TurnFinished(_)
@@ -1100,10 +1238,12 @@ impl Runtime {
         &self,
         run: &RunId,
         turn: &TurnId,
-        stream_rx: &mut mpsc::UnboundedReceiver<ProviderEvent>,
+        stream_rx: &mut mpsc::Receiver<ProviderEvent>,
+        stream_bytes: &AtomicUsize,
         prefix: &mut StreamedPrefix,
     ) {
         while let Ok(event) = stream_rx.try_recv() {
+            stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
             self.publish_provisional(run, turn, event, prefix).await;
         }
     }
@@ -1113,7 +1253,7 @@ impl Runtime {
         run: &RunId,
         turn: &TurnId,
         events: Vec<ProviderEvent>,
-        prefix: &StreamedPrefix,
+        prefix: &mut StreamedPrefix,
     ) -> Result<RunState, Terminal> {
         // Full-turn atomic validation: duplicate references, partial/final
         // disagreement, and finish-reason conflicts fail before any
@@ -1141,35 +1281,119 @@ impl Runtime {
         let Some(active) = state.active.as_mut() else {
             return Err(Terminal::cancelled());
         };
+        if active.terminal.is_some() {
+            return Ok(RunState::Finished);
+        }
         if &active.run != run || active.cancelled || active.token.is_cancelled() {
             return Err(Terminal::cancelled());
         }
         let mut candidates = Vec::new();
-        let mut terminal: Option<Result<nexus_core::TurnFinished, AgentError>> = None;
         let mut text_items: Vec<(String, String)> = Vec::new();
+        for event in &events {
+            if let ProviderEvent::TextDelta { item_key, text } = event {
+                if let Some(entry) = text_items.iter_mut().find(|(key, _)| key == item_key) {
+                    entry.1.push_str(text);
+                } else {
+                    text_items.push((item_key.clone(), text.clone()));
+                }
+            }
+        }
+        let terminal = match events.last() {
+            Some(ProviderEvent::TurnFinished(finished)) => Some(Ok(finished.clone())),
+            Some(ProviderEvent::Failed(error)) => Some(Err(error.clone())),
+            _ => None,
+        };
+        let successful_turn = terminal.as_ref().is_some_and(Result::is_ok);
+        let mut streamed_index = 0;
+        let mut usage_prefix_matches = true;
+        let mut unmatched_usage = prefix.usage_prefix.clone();
+        for usage in events.iter().filter_map(|event| match event {
+            ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional => {
+                Some(*usage)
+            }
+            _ => None,
+        }) {
+            if successful_turn {
+                if streamed_index < prefix.usage_prefix.len()
+                    && prefix.usage_prefix[streamed_index] != usage
+                {
+                    usage_prefix_matches = false;
+                    break;
+                }
+                if streamed_index < prefix.usage_prefix.len() {
+                    prefix.usage_replayed.push(usage);
+                    streamed_index += 1;
+                }
+            } else if let Some(index) = unmatched_usage.iter().position(|item| *item == usage) {
+                unmatched_usage.remove(index);
+                prefix.usage_replayed.push(usage);
+            }
+        }
+        if successful_turn && !usage_prefix_matches {
+            return Err(Terminal::failed(runtime_error(
+                ErrorCategory::Protocol,
+                "authoritative provider usage does not match its streamed prefix",
+            )));
+        }
+        if successful_turn {
+            for (item_key, streamed) in &prefix.text {
+                if !text_items.iter().any(|(key, _)| key == item_key) && !streamed.is_empty() {
+                    return Err(Terminal::failed(runtime_error(
+                        ErrorCategory::Protocol,
+                        "authoritative provider batch omitted streamed text",
+                    )));
+                }
+            }
+            for (item_key, authoritative) in &text_items {
+                if !authoritative.starts_with(prefix.text.get(item_key).map_or("", String::as_str))
+                {
+                    return Err(Terminal::failed(runtime_error(
+                        ErrorCategory::Protocol,
+                        "authoritative provider text does not match its streamed prefix",
+                    )));
+                }
+            }
+        }
+        let mut remaining_prefix: HashMap<String, usize> = prefix
+            .text
+            .iter()
+            .map(|(key, text)| (key.clone(), text.len()))
+            .collect();
         // Thinking trace for this turn, echoed back on later turns when
         // present. Accumulated silently: reasoning is never presented and
         // never previewed, only recorded into the turn's assistant items.
         let mut reasoning = String::new();
         for event in &events {
+            if active.terminal.is_some() {
+                break;
+            }
             match event {
                 ProviderEvent::ReasoningDelta { text } => {
                     reasoning.push_str(text);
                 }
                 ProviderEvent::TextDelta { item_key, text } => {
-                    if let Some(entry) = text_items.iter_mut().find(|(key, _)| key == item_key) {
-                        entry.1.push_str(text);
-                    } else {
-                        text_items.push((item_key.clone(), text.clone()));
-                    }
-                    if !prefix.text_keys.contains(item_key) {
-                        // Keys published live while the turn streamed stay
-                        // published: records still accumulate above,
-                        // presentation does not replay.
-                        match AssistantText::new(turn.clone(), item_key.clone(), text.clone()) {
-                            Ok(fragment) => buffer_text(&self.shared, active, run, fragment),
-                            Err(_) => active.data_dropped = true,
+                    let skip = if successful_turn {
+                        let remaining = remaining_prefix.entry(item_key.clone()).or_default();
+                        let mut skip = (*remaining).min(text.len());
+                        while !text.is_char_boundary(skip) {
+                            skip -= 1;
                         }
+                        *remaining -= skip;
+                        skip
+                    } else if prefix.text.contains_key(item_key) {
+                        text.len()
+                    } else {
+                        0
+                    };
+                    if skip < text.len() {
+                        buffer_text_fragments(
+                            &self.shared,
+                            active,
+                            run,
+                            turn,
+                            item_key,
+                            &text[skip..],
+                        );
                     }
                 }
                 ProviderEvent::ToolCallDelta { item_key, .. } => {
@@ -1186,34 +1410,41 @@ impl Runtime {
                 }
                 ProviderEvent::ToolCallReady(candidate) => candidates.push(candidate.clone()),
                 ProviderEvent::Usage(usage) => {
-                    if active.last_usage != Some(*usage) {
-                        emit_control(
-                            &self.shared,
-                            active,
-                            run,
-                            EventPayload::UsageUpdated(*usage),
-                        );
-                        active.last_usage = Some(*usage);
+                    if usage.finality() == UsageFinality::Provisional
+                        && let Some(index) =
+                            prefix.usage_replayed.iter().position(|item| item == usage)
+                    {
+                        prefix.usage_replayed.remove(index);
+                        continue;
                     }
+                    publish_usage(
+                        &self.shared,
+                        active,
+                        run,
+                        *usage,
+                        &mut prefix.usage_updates,
+                        usage.finality() == UsageFinality::Provisional,
+                    );
                 }
                 ProviderEvent::TurnFinished(finished) => {
                     // Per-counter final merge: terminal `Some` wins, terminal
                     // `None` retains the last final `Some`, and a missing
                     // counter stays unknown instead of being downgraded.
                     let merged = merge_final_usage(active.last_usage, finished.usage());
-                    if active.last_usage != Some(merged) {
-                        emit_control(
-                            &self.shared,
-                            active,
-                            run,
-                            EventPayload::UsageUpdated(merged),
-                        );
-                        active.last_usage = Some(merged);
-                    }
-                    terminal = Some(Ok(finished.clone()));
+                    publish_usage(
+                        &self.shared,
+                        active,
+                        run,
+                        merged,
+                        &mut prefix.usage_updates,
+                        false,
+                    );
                 }
-                ProviderEvent::Failed(error) => terminal = Some(Err(error.clone())),
+                ProviderEvent::Failed(_) => {}
             }
+        }
+        if active.terminal.is_some() {
+            return Ok(RunState::Finished);
         }
         flush_text(&self.shared, active);
         let Some(terminal) = terminal else {
@@ -1325,6 +1556,9 @@ impl Runtime {
                     trace.take(),
                 )?);
                 record_denied(&self.shared, active, &run, call, outcome);
+                if active.terminal.is_some() {
+                    break;
+                }
                 continue;
             };
             let tool_id = registered.spec.id().clone();
@@ -1344,9 +1578,15 @@ impl Runtime {
                         trace.take(),
                     )?);
                     record_denied(&self.shared, active, &run, call, outcome);
+                    if active.terminal.is_some() {
+                        break;
+                    }
                     continue;
                 }
             };
+            if active.terminal.is_some() {
+                break;
+            }
             let queued = QueuedCall {
                 call: ToolCall::new(
                     active.run.clone(),
@@ -1388,6 +1628,9 @@ impl Runtime {
         let Some(active) = state.active.as_mut() else {
             return Err(Terminal::cancelled());
         };
+        if active.terminal.is_some() {
+            return Ok(RunState::Finished);
+        }
         if &active.run != run || active.cancelled || active.token.is_cancelled() {
             return Err(Terminal::cancelled());
         }
@@ -1531,20 +1774,19 @@ impl Runtime {
             provider_ref: queued.provider_ref,
             binding: Some(binding),
         });
-        if emit_control(
+        let delivery = emit_control(
             &self.shared,
             active,
             run,
             EventPayload::ApprovalRequired(notice),
-        ) == ControlOutcome::Closed
-        {
-            active.force_terminal.get_or_insert(RunOutcome::Cancelled);
-        }
+        );
+        apply_required_control_outcome(active, delivery);
         Ok(RunState::AwaitingApproval)
     }
 
     async fn on_awaiting(&self, run: &RunId) -> Result<RunState, Terminal> {
         enum Wake {
+            Forced,
             Cancelled,
             Deadline,
             Expired,
@@ -1561,7 +1803,10 @@ impl Runtime {
                 if &active.run != run {
                     return Err(Terminal::cancelled());
                 }
-                if active.cancelled || active.token.is_cancelled() {
+                if active.terminal.is_some() {
+                    Wake::Forced
+                } else if active.delivery_closed || active.cancelled || active.token.is_cancelled()
+                {
                     Wake::Cancelled
                 } else if StdInstant::now() >= active.deadline {
                     Wake::Deadline
@@ -1595,6 +1840,7 @@ impl Runtime {
                 }
             };
             match wake {
+                Wake::Forced => return Ok(RunState::Finished),
                 Wake::NoCurrent => return Ok(RunState::ValidatingTools),
                 Wake::Wait(wait_for) => {
                     let wake = {
@@ -1621,12 +1867,17 @@ impl Runtime {
                     if let Some(active) = state.active.as_mut()
                         && &active.run == run
                     {
+                        let disconnected = active.delivery_closed;
                         abandon_pending(active);
                         let call = current_call_id(active);
                         if let Some(call) = call {
                             active.outcome_slot = Some((
                                 call,
-                                cancelled_outcome("run cancelled while awaiting approval"),
+                                if disconnected {
+                                    denied_outcome("approval consumer disconnected")
+                                } else {
+                                    cancelled_outcome("run cancelled while awaiting approval")
+                                },
                             ));
                         }
                         active.force_terminal = Some(RunOutcome::Cancelled);
@@ -1799,7 +2050,7 @@ impl Runtime {
             )
             .map_err(|_| Terminal::failed_internal("tool context is invalid"))?
             .with_control(active.token.clone(), tool_deadline);
-            if emit_control(
+            let delivery = emit_control(
                 &self.shared,
                 active,
                 run,
@@ -1808,9 +2059,10 @@ impl Runtime {
                     tool: call.tool().clone(),
                     args_preview: self.shared.policy.approval_preview(&call).ok(),
                 }),
-            ) == ControlOutcome::Closed
-            {
-                active.force_terminal.get_or_insert(RunOutcome::Cancelled);
+            );
+            apply_required_control_outcome(active, delivery);
+            if active.terminal.is_some() {
+                return Ok(RunState::Finished);
             }
             let tool = registered.port.clone();
             let wake = active.wake.clone();
@@ -1867,11 +2119,13 @@ impl Runtime {
                     timeout_outcome("tool deadline exceeded; termination unconfirmed")
                 };
                 active.outcome_slot = Some((call_id.clone(), outcome));
-                active.force_terminal = Some(if cancelled {
-                    RunOutcome::Cancelled
-                } else {
-                    RunOutcome::LimitReached
-                });
+                if active.terminal.is_none() {
+                    active.force_terminal = Some(if cancelled {
+                        RunOutcome::Cancelled
+                    } else {
+                        RunOutcome::LimitReached
+                    });
+                }
                 drop(state);
                 // Ownership is retained: the worker stays quarantined until
                 // it actually terminates, and no next call or new run can
@@ -1911,15 +2165,13 @@ impl Runtime {
             .map_err(Terminal::failed)?;
             active.conversation.push(item);
         }
-        if emit_control(
+        let delivery = emit_control(
             &self.shared,
             active,
             run,
             EventPayload::ToolFinished(ToolFinishedInfo { call, outcome }),
-        ) == ControlOutcome::Closed
-        {
-            active.force_terminal.get_or_insert(RunOutcome::Cancelled);
-        }
+        );
+        apply_required_control_outcome(active, delivery);
         if let Some(outcome) = active.force_terminal.take() {
             active.terminal = Some(outcome);
             return Ok(RunState::Finished);
@@ -1971,8 +2223,10 @@ impl Runtime {
         if &active.run != run {
             return Err(Terminal::cancelled());
         }
-        if emit_control(&self.shared, active, run, payload) == ControlOutcome::Closed {
-            active.delivery_closed = true;
+        let delivery = emit_control(&self.shared, active, run, payload);
+        apply_control_outcome(active, delivery);
+        if delivery == ControlOutcome::Exhausted {
+            return Err(Terminal::limit("control event budget exhausted"));
         }
         Ok(())
     }
@@ -2042,12 +2296,18 @@ impl Runtime {
         let terminal_delivered = delivery == ControlOutcome::Sent;
         let delivery_closed =
             delivery == ControlOutcome::Closed || self.shared.control_closed.load(Ordering::SeqCst);
+        let delivery_truncated = delivery_closed || delivery == ControlOutcome::Exhausted;
         if delivery_closed {
+            let mut outbox = self.shared.outbox.lock().expect("control outbox readable");
+            let discarded_bytes = outbox.iter().map(control_event_bytes).sum::<usize>();
+            let discarded_events = outbox.len();
+            outbox.clear();
             self.shared
-                .outbox
-                .lock()
-                .expect("control outbox readable")
-                .clear();
+                .outbox_bytes
+                .fetch_sub(discarded_bytes, Ordering::SeqCst);
+            self.shared
+                .outbox_events
+                .fetch_sub(discarded_events, Ordering::SeqCst);
         }
         active.finished_sent = true;
         active.phase = RunState::Finished;
@@ -2085,7 +2345,7 @@ impl Runtime {
             outcome,
             last_seq: active.last_seq,
             outcomes: active.outcomes.clone(),
-            truncated: active.data_dropped || delivery_closed,
+            truncated: active.data_dropped || delivery_truncated,
             terminal_delivered,
         });
     }
@@ -2251,15 +2511,13 @@ fn record_denied(
         effect: outcome.effect(),
         evidence: outcome.evidence(),
     });
-    if emit_control(
+    let delivery = emit_control(
         shared,
         active,
         run,
         EventPayload::ToolFinished(ToolFinishedInfo { call, outcome }),
-    ) == ControlOutcome::Closed
-    {
-        active.force_terminal.get_or_insert(RunOutcome::Cancelled);
-    }
+    );
+    apply_required_control_outcome(active, delivery);
 }
 
 fn bound_outcome(shared: &Arc<Shared>, outcome: ToolOutcome) -> ToolOutcome {
@@ -2343,6 +2601,100 @@ fn failed_outcome(message: &'static str) -> ToolOutcome {
 
 fn run_event(active: &ActiveRun, seq: EventSequence, payload: EventPayload) -> RunEvent {
     RunEvent::new(active.session.clone(), active.run.clone(), seq, payload)
+}
+
+fn record_provisional(prefix: &mut StreamedPrefix, bytes: usize, byte_limit: usize) -> bool {
+    if prefix.retained_bytes.saturating_add(bytes) > byte_limit {
+        return false;
+    }
+    prefix.retained_bytes += bytes;
+    true
+}
+
+fn record_identity(prefix: &mut StreamedPrefix, bytes: usize) -> bool {
+    if prefix.identity_bytes.saturating_add(bytes) > PROVISIONAL_STREAM_BYTE_CAPACITY {
+        return false;
+    }
+    prefix.identity_bytes += bytes;
+    true
+}
+
+fn provisional_event_bytes(event: &ProviderEvent) -> usize {
+    match event {
+        ProviderEvent::TextDelta { item_key, text } => item_key.len().saturating_add(text.len()),
+        ProviderEvent::ToolCallDelta {
+            item_key,
+            assembled_bytes,
+        } => item_key
+            .len()
+            .saturating_add(std::mem::size_of_val(assembled_bytes)),
+        ProviderEvent::ToolCallReady(candidate) => candidate
+            .item_key()
+            .len()
+            .saturating_add(candidate.provider_ref().len())
+            .saturating_add(candidate.tool_name().len())
+            .saturating_add(candidate.arguments_json().len()),
+        ProviderEvent::ReasoningDelta { text } => text.len(),
+        ProviderEvent::Failed(error) => error.message().len(),
+        ProviderEvent::Usage(_) => std::mem::size_of::<Usage>(),
+        ProviderEvent::TurnFinished(finished) => finished
+            .continuation()
+            .map_or(0, |continuation| continuation.bytes().len()),
+    }
+}
+
+fn control_event_bytes(event: &RunEvent) -> usize {
+    let payload_bytes = match event.payload() {
+        EventPayload::RunStarted { request } => request.as_str().len(),
+        EventPayload::AssistantTextDelta(text) => {
+            text.turn.as_str().len() + text.item_key.len() + text.text.len()
+        }
+        EventPayload::ToolCallPreview { item_key } => item_key.len(),
+        EventPayload::ApprovalRequired(notice) => {
+            notice.approval.as_str().len()
+                + notice.call.as_str().len()
+                + notice.summary.len()
+                + notice.scope_summary.len()
+                + notice.args_preview.as_ref().map_or(0, String::len)
+                + notice.session_directory.as_ref().map_or(0, String::len)
+        }
+        EventPayload::ToolStarted(info) => {
+            info.call.as_str().len()
+                + info.tool.name().len()
+                + info.args_preview.as_ref().map_or(0, String::len)
+        }
+        EventPayload::ToolOutput(progress) => progress.call.as_str().len() + progress.preview.len(),
+        EventPayload::ToolFinished(info) => info.call.as_str().len() + info.outcome.content().len(),
+        EventPayload::UsageUpdated(_) => 16,
+        EventPayload::RunFinished(finished) => {
+            finished.error().map_or(0, |error| error.message().len())
+                + finished
+                    .persistence_error()
+                    .map_or(0, |error| error.message().len())
+        }
+    };
+    // Include a fixed allowance for the event/envelope and owned collection
+    // bookkeeping; variable text is counted at its actual UTF-8 byte length.
+    payload_bytes.saturating_add(128)
+}
+
+fn control_outbox_fits(
+    event_count: usize,
+    retained_bytes: usize,
+    next_bytes: usize,
+    terminal: bool,
+) -> bool {
+    let event_limit = if terminal {
+        CONTROL_OUTBOX_EVENT_LIMIT
+    } else {
+        CONTROL_OUTBOX_EVENT_LIMIT.saturating_sub(1)
+    };
+    let byte_limit = if terminal {
+        CONTROL_OUTBOX_BYTE_LIMIT
+    } else {
+        CONTROL_OUTBOX_BYTE_LIMIT.saturating_sub(CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES)
+    };
+    event_count < event_limit && retained_bytes.saturating_add(next_bytes) <= byte_limit
 }
 
 fn commit_sequence(active: &mut ActiveRun, seq: EventSequence) {
@@ -2429,6 +2781,31 @@ fn buffer_text(shared: &Arc<Shared>, active: &mut ActiveRun, run: &RunId, fragme
     active.pending_text = Some(fragment);
 }
 
+fn buffer_text_fragments(
+    shared: &Arc<Shared>,
+    active: &mut ActiveRun,
+    run: &RunId,
+    turn: &TurnId,
+    item_key: &str,
+    text: &str,
+) {
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + MAX_TEXT_FRAGMENT_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        match AssistantText::new(turn.clone(), item_key, &text[start..end]) {
+            Ok(fragment) => buffer_text(shared, active, run, fragment),
+            Err(_) => {
+                active.data_dropped = true;
+                return;
+            }
+        }
+        start = end;
+    }
+}
+
 /// Publishes one control event with a contiguous per-run sequence committed
 /// only after a successful enqueue or a committed outbox entry. A full
 /// channel buffers into the bounded outbox (retained ownership until
@@ -2453,38 +2830,122 @@ fn emit_control(
     let seq = active.next_seq;
     let event = run_event(active, seq, payload);
     let outcome = deliver_control(shared, event);
-    if outcome != ControlOutcome::Closed {
+    if matches!(outcome, ControlOutcome::Sent | ControlOutcome::Buffered) {
         commit_sequence(active, seq);
     }
     outcome
 }
 
-fn deliver_control(shared: &Arc<Shared>, event: RunEvent) -> ControlOutcome {
-    if shared.control_closed.load(Ordering::SeqCst) {
-        return ControlOutcome::Closed;
+fn publish_usage(
+    shared: &Arc<Shared>,
+    active: &mut ActiveRun,
+    run: &RunId,
+    usage: Usage,
+    update_count: &mut usize,
+    throttle: bool,
+) {
+    active.last_usage = Some(usage);
+    if active.published_usage == Some(usage)
+        || (throttle && *update_count >= PROVISIONAL_USAGE_UPDATE_LIMIT)
+    {
+        return;
     }
-    match shared.control_tx.try_reserve() {
-        Ok(permit) => {
-            permit.send(event);
-            ControlOutcome::Sent
-        }
-        Err(TrySendError::Full(_)) => {
-            shared
-                .outbox
-                .lock()
-                .expect("control outbox readable")
-                .push_back(event);
-            ensure_flusher(shared);
-            ControlOutcome::Buffered
-        }
-        Err(TrySendError::Closed(_)) => {
-            shared.control_closed.store(true, Ordering::SeqCst);
-            ControlOutcome::Closed
+    let outcome = emit_control(shared, active, run, EventPayload::UsageUpdated(usage));
+    apply_control_outcome(active, outcome);
+    if matches!(outcome, ControlOutcome::Sent | ControlOutcome::Buffered) {
+        active.published_usage = Some(usage);
+        if throttle {
+            *update_count += 1;
         }
     }
 }
 
+fn deliver_control(shared: &Arc<Shared>, event: RunEvent) -> ControlOutcome {
+    if shared.control_closed.load(Ordering::SeqCst) || shared.control_tx.is_closed() {
+        shared.control_closed.store(true, Ordering::SeqCst);
+        return ControlOutcome::Closed;
+    }
+    let terminal = event.is_terminal();
+    if !terminal && shared.control_exhausted.load(Ordering::SeqCst) {
+        return ControlOutcome::Exhausted;
+    }
+    let mut outbox = shared.outbox.lock().expect("control outbox readable");
+    if shared.control_closed.load(Ordering::SeqCst) || shared.control_tx.is_closed() {
+        shared.control_closed.store(true, Ordering::SeqCst);
+        return ControlOutcome::Closed;
+    }
+    // Count includes the flusher's in-flight event until it enters the
+    // channel. New events must not bypass either queued or in-flight work.
+    if shared.outbox_events.load(Ordering::SeqCst) == 0 {
+        match shared.control_tx.try_reserve() {
+            Ok(permit) => {
+                permit.send(event);
+                return ControlOutcome::Sent;
+            }
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Closed(_)) => {
+                shared.control_closed.store(true, Ordering::SeqCst);
+                return ControlOutcome::Closed;
+            }
+        }
+    }
+    let bytes = control_event_bytes(&event);
+    let retained = shared.outbox_bytes.load(Ordering::SeqCst);
+    let retained_events = shared.outbox_events.load(Ordering::SeqCst);
+    if !control_outbox_fits(retained_events, retained, bytes, terminal) {
+        if terminal {
+            return ControlOutcome::Exhausted;
+        }
+        shared.control_exhausted.store(true, Ordering::SeqCst);
+        return ControlOutcome::Exhausted;
+    }
+    shared.outbox_bytes.fetch_add(bytes, Ordering::SeqCst);
+    shared.outbox_events.fetch_add(1, Ordering::SeqCst);
+    outbox.push_back(event);
+    drop(outbox);
+    ensure_flusher(shared);
+    ControlOutcome::Buffered
+}
+
+fn apply_control_outcome(active: &mut ActiveRun, outcome: ControlOutcome) {
+    match outcome {
+        ControlOutcome::Sent | ControlOutcome::Buffered => return,
+        ControlOutcome::Closed => {
+            active.delivery_closed = true;
+            return;
+        }
+        ControlOutcome::Exhausted => {
+            active.data_dropped = true;
+            active
+                .force_terminal
+                .get_or_insert(RunOutcome::LimitReached);
+            active.terminal.get_or_insert(RunOutcome::LimitReached);
+            active.terminal_error.get_or_insert_with(|| {
+                runtime_error(
+                    ErrorCategory::ResourceLimit,
+                    "control event budget exhausted",
+                )
+            });
+        }
+    }
+    active.token.cancel();
+    active.wake.notify_one();
+}
+
+fn apply_required_control_outcome(active: &mut ActiveRun, outcome: ControlOutcome) {
+    apply_control_outcome(active, outcome);
+    if outcome == ControlOutcome::Closed {
+        active.force_terminal.get_or_insert(RunOutcome::Cancelled);
+    }
+}
+
 fn ensure_flusher(shared: &Arc<Shared>) {
+    // A disconnected receiver is a permanent transport failure. Retained
+    // events remain available for honest run state/finalization, but retrying
+    // them cannot make progress and would create a busy reschedule loop.
+    if shared.control_closed.load(Ordering::SeqCst) {
+        return;
+    }
     if shared.flushing.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -2494,18 +2955,20 @@ fn ensure_flusher(shared: &Arc<Shared>) {
 
 async fn flush_control(shared: Arc<Shared>) {
     loop {
-        let next = shared
-            .outbox
-            .lock()
-            .expect("control outbox readable")
-            .pop_front();
+        let next = {
+            let mut outbox = shared.outbox.lock().expect("control outbox readable");
+            outbox.pop_front()
+        };
         let Some(event) = next else {
             break;
         };
         match shared.control_tx.reserve().await {
             Ok(permit) => {
                 let terminal = event.is_terminal();
+                let event_bytes = control_event_bytes(&event);
                 permit.send(event);
+                shared.outbox_bytes.fetch_sub(event_bytes, Ordering::SeqCst);
+                shared.outbox_events.fetch_sub(1, Ordering::SeqCst);
                 if terminal {
                     let mut state = shared.state.lock().await;
                     if let Some(last) = state.last.as_mut() {
@@ -2514,22 +2977,36 @@ async fn flush_control(shared: Arc<Shared>) {
                 }
             }
             Err(_) => {
-                shared
-                    .outbox
-                    .lock()
-                    .expect("control outbox readable")
-                    .push_front(event);
                 shared.control_closed.store(true, Ordering::SeqCst);
+                {
+                    let mut outbox = shared.outbox.lock().expect("control outbox readable");
+                    let queued_bytes = outbox.iter().map(control_event_bytes).sum::<usize>();
+                    let queued_events = outbox.len();
+                    outbox.clear();
+                    shared.outbox_bytes.fetch_sub(
+                        queued_bytes.saturating_add(control_event_bytes(&event)),
+                        Ordering::SeqCst,
+                    );
+                    shared
+                        .outbox_events
+                        .fetch_sub(queued_events.saturating_add(1), Ordering::SeqCst);
+                }
+                let mut state = shared.state.lock().await;
+                if let Some(last) = state.last.as_mut() {
+                    last.terminal_delivered = false;
+                    last.truncated = true;
+                }
                 break;
             }
         }
     }
     shared.flushing.store(false, Ordering::SeqCst);
-    if !shared
-        .outbox
-        .lock()
-        .expect("control outbox readable")
-        .is_empty()
+    if !shared.control_closed.load(Ordering::SeqCst)
+        && !shared
+            .outbox
+            .lock()
+            .expect("control outbox readable")
+            .is_empty()
     {
         ensure_flusher(&shared);
     }
@@ -4194,6 +4671,179 @@ mod tests {
     }
 
     #[test]
+    fn control_outbox_exhaustion_still_reserves_and_delivers_terminal() {
+        let provider = Arc::new(FakeProvider::new(vec![FakeProvider::stop_turn(
+            "recovered",
+        )]));
+        let (runtime, mut streams) = Runtime::new(quick_config(), provider.clone(), Vec::new());
+        let rt = test_rt();
+        rt.block_on(async {
+            let session = SessionId::new("sess-outbox-limit").expect("valid");
+            let run = RunId::new("run-outbox-limit").expect("valid");
+            let usage = Usage::new(Some(1), Some(1), UsageFinality::Provisional);
+            for seq in 0..CONTROL_CAPACITY as u64 {
+                let event = RunEvent::new(
+                    session.clone(),
+                    run.clone(),
+                    seq,
+                    EventPayload::UsageUpdated(usage),
+                );
+                assert_eq!(
+                    deliver_control(&runtime.shared, event),
+                    ControlOutcome::Sent
+                );
+            }
+            for seq in
+                CONTROL_CAPACITY as u64..(CONTROL_CAPACITY + CONTROL_OUTBOX_EVENT_LIMIT - 1) as u64
+            {
+                let event = RunEvent::new(
+                    session.clone(),
+                    run.clone(),
+                    seq,
+                    EventPayload::UsageUpdated(usage),
+                );
+                assert_eq!(
+                    deliver_control(&runtime.shared, event),
+                    ControlOutcome::Buffered
+                );
+            }
+            let terminal_seq = (CONTROL_CAPACITY + CONTROL_OUTBOX_EVENT_LIMIT - 1) as u64;
+            let excess = RunEvent::new(
+                session.clone(),
+                run.clone(),
+                terminal_seq,
+                EventPayload::UsageUpdated(usage),
+            );
+            assert_eq!(
+                deliver_control(&runtime.shared, excess),
+                ControlOutcome::Exhausted
+            );
+            assert!(runtime.shared.control_exhausted.load(Ordering::SeqCst));
+            assert!(!runtime.shared.control_closed.load(Ordering::SeqCst));
+
+            let terminal =
+                RunFinished::new(RunOutcome::LimitReached, PersistenceState::Ephemeral, None)
+                    .expect("terminal builds");
+            let event = RunEvent::new(
+                session,
+                run,
+                terminal_seq,
+                EventPayload::RunFinished(terminal),
+            );
+            assert_eq!(
+                deliver_control(&runtime.shared, event),
+                ControlOutcome::Buffered
+            );
+            assert_eq!(
+                runtime.shared.outbox_events.load(Ordering::SeqCst),
+                CONTROL_OUTBOX_EVENT_LIMIT
+            );
+
+            let mut received = Vec::new();
+            let total = CONTROL_CAPACITY + CONTROL_OUTBOX_EVENT_LIMIT;
+            while received.len() < total {
+                received.push(
+                    tokio::time::timeout(Duration::from_secs(5), streams.control.recv())
+                        .await
+                        .expect("outbox event arrives")
+                        .expect("control remains open on capacity exhaustion"),
+                );
+            }
+            assert_eq!(received.len(), total);
+            assert!(received.last().is_some_and(RunEvent::is_terminal));
+            assert!(
+                received
+                    .windows(2)
+                    .all(|pair| pair[0].seq() + 1 == pair[1].seq())
+            );
+
+            let accepted = runtime.submit(submit_cmd("after-outbox-exhaustion")).await;
+            assert_eq!(accepted.reply(), CommandReply::Accepted);
+            assert!(!runtime.shared.control_exhausted.load(Ordering::SeqCst));
+            let (_, next_finished) =
+                collect_until_finished(&mut streams.data, &mut streams.control).await;
+            assert_eq!(next_finished.outcome(), RunOutcome::Completed);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn control_terminal_never_bypasses_queued_or_in_flight_events() {
+        let rt = test_rt();
+        rt.block_on(async {
+            for in_flight in [false, true] {
+                let provider = Arc::new(FakeProvider::new(vec![]));
+                let (runtime, mut streams) = Runtime::new(quick_config(), provider, Vec::new());
+                let session = SessionId::new("sess-control-order").expect("valid");
+                let run = RunId::new("run-control-order").expect("valid");
+                for seq in 0..=CONTROL_CAPACITY as u64 {
+                    let event = RunEvent::new(
+                        session.clone(),
+                        run.clone(),
+                        seq,
+                        EventPayload::UsageUpdated(Usage::new(
+                            Some(seq),
+                            None,
+                            UsageFinality::Provisional,
+                        )),
+                    );
+                    assert_eq!(
+                        deliver_control(&runtime.shared, event),
+                        if seq < CONTROL_CAPACITY as u64 {
+                            ControlOutcome::Sent
+                        } else {
+                            ControlOutcome::Buffered
+                        }
+                    );
+                }
+                if in_flight {
+                    tokio::task::yield_now().await;
+                    assert!(runtime.shared.outbox.lock().expect("readable").is_empty());
+                    assert_eq!(runtime.shared.outbox_events.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        runtime
+                            .submit(submit_cmd("in-flight-control"))
+                            .await
+                            .reply(),
+                        CommandReply::Busy
+                    );
+                }
+                let mut received = Vec::new();
+                for _ in 0..CONTROL_CAPACITY {
+                    received.push(streams.control.try_recv().expect("channel event"));
+                }
+                let terminal =
+                    RunFinished::new(RunOutcome::Completed, PersistenceState::Ephemeral, None)
+                        .expect("valid terminal");
+                let event = RunEvent::new(
+                    session,
+                    run,
+                    CONTROL_CAPACITY as u64 + 1,
+                    EventPayload::RunFinished(terminal),
+                );
+                assert_eq!(
+                    deliver_control(&runtime.shared, event),
+                    ControlOutcome::Buffered
+                );
+                for _ in 0..2 {
+                    received.push(
+                        tokio::time::timeout(Duration::from_secs(5), streams.control.recv())
+                            .await
+                            .expect("event arrives")
+                            .expect("control open"),
+                    );
+                }
+                assert!(
+                    received
+                        .windows(2)
+                        .all(|pair| pair[0].seq() + 1 == pair[1].seq())
+                );
+                assert!(received.last().expect("terminal").is_terminal());
+            }
+        });
+    }
+
+    #[test]
     fn provider_panic_is_supervised_with_a_failed_terminal() {
         let provider = Arc::new(PanicProvider);
         let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![Arc::new(FakeTool::succeeding(
@@ -4279,6 +4929,7 @@ mod tests {
         rt.block_on(async {
             let submit = runtime.submit(submit_cmd("blocked-tool-cancel")).await;
             assert_eq!(submit.reply(), CommandReply::Accepted);
+            assert!(runtime.has_unconfirmed_work().await);
             let run = submit.run().cloned().expect("run issued");
             let mut prelude = collect_until_tool_started(&mut data, &mut control).await;
             assert!(
@@ -4314,6 +4965,10 @@ mod tests {
             // Quarantine holds ownership: no new run until termination.
             let blocked = runtime.submit(submit_cmd("blocked")).await;
             assert_eq!(blocked.reply(), CommandReply::Busy);
+            assert!(
+                runtime.has_unconfirmed_work().await,
+                "logical finalization does not clear worker quarantine"
+            );
 
             release.send(()).expect("release the blocked worker");
             let accepted = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4327,6 +4982,10 @@ mod tests {
             })
             .await
             .expect("quarantine clears after termination");
+            assert!(
+                runtime.has_unconfirmed_work().await,
+                "the newly admitted run is active"
+            );
             assert_eq!(accepted.reply(), CommandReply::Accepted);
             let _ = collect_until_finished(&mut data, &mut control).await;
             assert_eq!(tool.executions.load(Ordering::SeqCst), 1);
@@ -4481,6 +5140,76 @@ mod cov_runtime_private {
     use nexus_core::ProviderCapabilities;
     use nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES;
 
+    #[test]
+    fn provisional_retention_enforces_event_and_byte_ceilings() {
+        let mut prefix = StreamedPrefix::default();
+        for _ in 0..PROVISIONAL_EVENT_LIMIT {
+            prefix.event_count += 1;
+        }
+        assert!(prefix.event_count >= PROVISIONAL_EVENT_LIMIT);
+        assert_eq!(prefix.event_count, PROVISIONAL_EVENT_LIMIT);
+
+        let mut bytes = StreamedPrefix::default();
+        assert!(record_provisional(&mut bytes, 4, 4));
+        assert!(!record_provisional(&mut bytes, 1, 4));
+        assert_eq!(bytes.retained_bytes, 4);
+
+        let mut identities = StreamedPrefix::default();
+        assert!(record_identity(
+            &mut identities,
+            PROVISIONAL_STREAM_BYTE_CAPACITY
+        ));
+        assert!(!record_identity(&mut identities, 1));
+    }
+
+    #[test]
+    fn control_outbox_bounds_reserve_one_terminal_slot_and_bytes() {
+        assert!(control_outbox_fits(
+            CONTROL_OUTBOX_EVENT_LIMIT - 1,
+            CONTROL_OUTBOX_BYTE_LIMIT - CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES,
+            CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES,
+            true,
+        ));
+        assert!(!control_outbox_fits(
+            CONTROL_OUTBOX_EVENT_LIMIT - 1,
+            CONTROL_OUTBOX_BYTE_LIMIT - CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES,
+            1,
+            false,
+        ));
+        assert!(!control_outbox_fits(CONTROL_OUTBOX_EVENT_LIMIT, 0, 1, true,));
+    }
+
+    #[test]
+    fn configured_event_capacities_are_the_effective_channel_bounds() {
+        let mut limits = Limits::m0_test();
+        limits.event_data_capacity = 3;
+        limits.event_control_capacity = 2;
+        let (runtime, _) = Runtime::new(
+            RuntimeConfig {
+                limits,
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        assert_eq!(runtime.shared.data_tx.capacity(), 3);
+        assert_eq!(runtime.shared.control_tx.capacity(), 2);
+    }
+
+    #[test]
+    fn control_budget_exhaustion_marks_active_snapshot_truncated() {
+        let run = RunId::new("run-control-limit").expect("valid run id");
+        let mut active = active_for(&run);
+        apply_control_outcome(&mut active, ControlOutcome::Exhausted);
+        assert_eq!(active.force_terminal, Some(RunOutcome::LimitReached));
+        assert!(
+            snapshot_of_active(&active)
+                .expect("active snapshot builds")
+                .is_content_truncated()
+        );
+    }
+
     /// Minimal provider only used to build a real `Shared` with its bounded
     /// channels; the covered helpers never invoke it.
     struct NoopProvider;
@@ -4554,6 +5283,7 @@ mod cov_runtime_private {
             data_dropped: false,
             sequence_exhausted: false,
             last_usage: None,
+            published_usage: None,
             force_terminal: None,
             terminal: None,
             terminal_error: None,
@@ -5392,6 +6122,7 @@ mod cov_runtime_topup_private {
             data_dropped: false,
             sequence_exhausted: false,
             last_usage: None,
+            published_usage: None,
             force_terminal: None,
             terminal: None,
             terminal_error: None,
@@ -5461,7 +6192,7 @@ mod cov_runtime_topup_private {
                         &run,
                         &turn_id("absent"),
                         stop_turn("ignored"),
-                        &StreamedPrefix::default(),
+                        &mut StreamedPrefix::default(),
                     )
                     .await,
             );
@@ -5501,7 +6232,7 @@ mod cov_runtime_topup_private {
                         &stale,
                         &turn_id("stale"),
                         stop_turn("ignored"),
-                        &StreamedPrefix::default(),
+                        &mut StreamedPrefix::default(),
                     )
                     .await,
             );
@@ -5890,7 +6621,7 @@ mod cov_runtime_topup_private {
     }
 
     #[test]
-    fn a_vanished_control_consumer_retains_the_committed_outbox_event() {
+    fn a_vanished_control_consumer_retires_the_undeliverable_event() {
         let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
         let run = run_id("outbox");
         let rt = test_rt();
@@ -5914,10 +6645,14 @@ mod cov_runtime_topup_private {
                 .lock()
                 .expect("the control outbox is readable")
                 .push_back(buffered.clone());
+            bed.shared.outbox_events.store(1, Ordering::SeqCst);
+            bed.shared
+                .outbox_bytes
+                .store(control_event_bytes(&buffered), Ordering::SeqCst);
 
             // The only consumer disappears while an event is committed to the
-            // outbox. The flusher must retain that undeliverable event and
-            // classify the channel as closed rather than as saturation.
+            // outbox. The flusher retires undeliverable ownership and classifies
+            // the channel as closed rather than as saturation.
             drop(bed.control);
             tokio::time::timeout(FLUSH_WAIT, flush_control(bed.shared.clone()))
                 .await
@@ -5927,25 +6662,24 @@ mod cov_runtime_topup_private {
                 bed.shared.control_closed.load(Ordering::SeqCst),
                 "a vanished consumer is classified as closed, never as saturation"
             );
-            let mut outbox = bed
+            let outbox = bed
                 .shared
                 .outbox
                 .lock()
                 .expect("the control outbox is readable");
-            assert_eq!(
-                outbox.len(),
-                1,
-                "the undeliverable event is retained, never dropped"
+            assert!(
+                outbox.is_empty(),
+                "permanently undeliverable events are retired"
             );
-            assert_eq!(
-                outbox.front().map(RunEvent::seq),
-                Some(buffered.seq()),
-                "the retained event is the committed one, in order"
+            assert!(!bed.shared.flushing.load(Ordering::SeqCst));
+            drop(outbox);
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 0);
+            assert_eq!(bed.shared.outbox_bytes.load(Ordering::SeqCst), 0);
+            ensure_flusher(&bed.shared);
+            assert!(
+                !bed.shared.flushing.load(Ordering::SeqCst),
+                "closed transport is terminal and cannot schedule another pass"
             );
-            // Production clears the outbox once a closed consumer is classified
-            // (see `finish_run`); doing the same here ends the flusher's respawn
-            // instead of letting the test leave a spinning successor behind.
-            outbox.clear();
         });
     }
 
@@ -6100,13 +6834,14 @@ mod cov_runtime_topup_private {
     }
 
     #[test]
-    fn the_retained_outbox_events_survive_every_flusher_pass() {
+    fn closed_control_transport_discards_undeliverable_events_without_rescheduling() {
         let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
         let run = run_id("outbox-respawn");
         let rt = test_rt();
         rt.block_on(async {
             // Two committed events and no consumer. The flusher must retain
-            // both, in order, and respawn itself rather than losing either one.
+            // both in order. A disconnected receiver is terminal, so it must
+            // not respawn itself while those events remain undeliverable.
             let first = RunEvent::new(session_id(), run.clone(), 0, usage_payload());
             let second = RunEvent::new(session_id(), run.clone(), 1, started_payload());
             {
@@ -6118,6 +6853,11 @@ mod cov_runtime_topup_private {
                 outbox.push_back(first.clone());
                 outbox.push_back(second.clone());
             }
+            bed.shared.outbox_events.store(2, Ordering::SeqCst);
+            bed.shared.outbox_bytes.store(
+                control_event_bytes(&first) + control_event_bytes(&second),
+                Ordering::SeqCst,
+            );
             drop(bed.control);
             ensure_flusher(&bed.shared);
 
@@ -6125,35 +6865,130 @@ mod cov_runtime_topup_private {
                 while !bed.shared.control_closed.load(Ordering::SeqCst) {
                     tokio::task::yield_now().await;
                 }
-                // A respawned flusher reaches the same verdict on its own.
-                while !bed.shared.flushing.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
             })
             .await
-            .expect("the flusher classifies the vanished consumer and respawns");
-            // Let the respawned pass run once more against the retained outbox.
-            for _ in 0..4 {
-                tokio::task::yield_now().await;
-            }
+            .expect("the flusher classifies the vanished consumer and stops");
 
             assert!(bed.shared.control_closed.load(Ordering::SeqCst));
-            let mut outbox = bed
+            assert!(!bed.shared.flushing.load(Ordering::SeqCst));
+            let outbox = bed
                 .shared
                 .outbox
                 .lock()
                 .expect("the control outbox is readable");
-            assert_eq!(
-                outbox.len(),
-                2,
-                "neither retained event is dropped, however many passes run"
+            assert!(
+                outbox.is_empty(),
+                "undeliverable events are retired on permanent closure"
             );
-            assert_eq!(outbox.front().map(RunEvent::seq), Some(first.seq()));
-            assert_eq!(outbox.back().map(RunEvent::seq), Some(second.seq()));
-            // Production clears the outbox once a closed consumer is classified
-            // (see `finish_run`); clearing here ends the respawn loop the way a
-            // finalizing run does, instead of leaving a spinning successor.
-            outbox.clear();
+            drop(outbox);
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 0);
+            assert_eq!(bed.shared.outbox_bytes.load(Ordering::SeqCst), 0);
+            ensure_flusher(&bed.shared);
+            assert!(
+                !bed.shared.flushing.load(Ordering::SeqCst),
+                "a retained outbox does not restart a flusher after closure"
+            );
+        });
+    }
+
+    #[test]
+    fn finalization_does_not_claim_a_terminal_delivered_to_a_closed_channel() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("terminal-undelivered");
+        let rt = test_rt();
+        rt.block_on(async {
+            install(&bed, active_for(&run)).await;
+            drop(bed.control);
+
+            bed.runtime
+                .finish_run(&run, RunOutcome::Completed, None)
+                .await;
+
+            let state = bed.shared.state.lock().await;
+            let last = state.last.as_ref().expect("finalized run is retained");
+            assert!(!last.terminal_delivered);
+            assert!(last.truncated, "closed control delivery remains observable");
+            drop(state);
+            assert!(
+                bed.shared
+                    .outbox
+                    .lock()
+                    .expect("control outbox readable")
+                    .is_empty(),
+                "finalization clears undeliverable events after recording their status"
+            );
+            assert!(!bed.shared.flushing.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn closing_during_finalization_retires_in_flight_and_queued_control_events() {
+        let mut limits = Limits::m0_test();
+        limits.event_control_capacity = 1;
+        let bed = make_bed(limits, true, Vec::new(), None, None);
+        let run = run_id("close-during-finalization");
+        let rt = test_rt();
+        rt.block_on(async {
+            install(&bed, active_for(&run)).await;
+            let filler = RunEvent::new(session_id(), run.clone(), 0, usage_payload());
+            bed.shared
+                .control_tx
+                .try_reserve()
+                .expect("single channel slot accepts filler")
+                .send(filler);
+
+            let inflight = RunEvent::new(session_id(), run.clone(), 1, usage_payload());
+            bed.shared
+                .outbox
+                .lock()
+                .expect("outbox is readable")
+                .push_back(inflight.clone());
+            bed.shared.outbox_events.store(1, Ordering::SeqCst);
+            bed.shared
+                .outbox_bytes
+                .store(control_event_bytes(&inflight), Ordering::SeqCst);
+
+            let flusher = tokio::spawn(flush_control(bed.shared.clone()));
+            tokio::time::timeout(FLUSH_WAIT, async {
+                while !bed
+                    .shared
+                    .outbox
+                    .lock()
+                    .expect("outbox is readable")
+                    .is_empty()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("flusher took ownership of the in-flight event");
+
+            bed.runtime
+                .finish_run(&run, RunOutcome::Completed, None)
+                .await;
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 2);
+            drop(bed.control);
+            tokio::time::timeout(FLUSH_WAIT, flusher)
+                .await
+                .expect("flusher observes closure")
+                .expect("flusher task completes");
+
+            assert!(
+                bed.shared
+                    .outbox
+                    .lock()
+                    .expect("outbox readable")
+                    .is_empty()
+            );
+            assert_eq!(bed.shared.outbox_events.load(Ordering::SeqCst), 0);
+            assert_eq!(bed.shared.outbox_bytes.load(Ordering::SeqCst), 0);
+            let state = bed.shared.state.lock().await;
+            let finished = state.last.as_ref().expect("logical terminal is retained");
+            assert!(!finished.terminal_delivered);
+            assert!(
+                finished.truncated,
+                "undeliverable control data is observable"
+            );
         });
     }
 

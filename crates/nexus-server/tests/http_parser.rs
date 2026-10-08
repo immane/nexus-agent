@@ -11,8 +11,8 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::Duration;
 
 use nexus_server::http::{
-    IO_TIMEOUT, MAX_BODY_BYTES, MAX_HEAD_BYTES, Request, Response, read_request, reason,
-    write_response, write_sse_headers,
+    IO_TIMEOUT, MAX_BODY_BYTES, MAX_HEAD_BYTES, Request, Response, WRITE_TIMEOUT, read_request,
+    reason, write_response, write_sse_headers,
 };
 
 /// Socket timeouts for the test peer. Every case here either completes or
@@ -231,6 +231,17 @@ fn a_lookup_name_is_not_folded_to_lower_case() {
 fn duplicate_header_names_keep_the_last_value() {
     let request = accept("GET /x HTTP/1.1\r\nx-trace: first\r\nx-trace: second\r\n\r\n");
     assert_eq!(request.header("x-trace"), Some("second"));
+}
+
+#[test]
+fn duplicate_security_and_framing_headers_are_rejected() {
+    for header in ["host", "origin", "authorization", "content-length"] {
+        let raw = format!("GET /x HTTP/1.1\r\n{header}: first\r\n{header}: second\r\n\r\n");
+        assert!(
+            !reject(&raw, 400).is_empty(),
+            "duplicate {header} must not be accepted"
+        );
+    }
 }
 
 // --- Request line -----------------------------------------------------------
@@ -559,6 +570,17 @@ fn write_sse_headers_leaves_the_stream_to_the_caller() {
     );
 }
 
+#[test]
+fn sse_installs_a_finite_socket_write_timeout() {
+    let mut pair = TcpPair::new();
+    write_sse_headers(&mut pair.server).expect("SSE head writes");
+    assert_eq!(
+        pair.server.write_timeout().expect("timeout is readable"),
+        Some(WRITE_TIMEOUT)
+    );
+    assert_eq!(WRITE_TIMEOUT, Duration::from_secs(30));
+}
+
 // --- Constants and reason phrases -------------------------------------------
 
 #[test]
@@ -569,10 +591,8 @@ fn the_io_timeout_is_installed_on_the_connection() {
         .expect("request writes");
     pair.parse_on_server()
         .unwrap_or_else(|error| panic!("valid request was rejected: {error:?}"));
-    assert_eq!(
-        pair.server.read_timeout().expect("timeout is readable"),
-        Some(IO_TIMEOUT)
-    );
+    let timeout = pair.server.read_timeout().expect("timeout is readable");
+    assert!(timeout.is_some_and(|remaining| remaining <= IO_TIMEOUT));
 }
 
 #[test]
@@ -587,6 +607,7 @@ fn reason_phrases_cover_the_emitted_statuses() {
         (200, "OK"),
         (201, "Created"),
         (400, "Bad Request"),
+        (408, "Request Timeout"),
         (404, "Not Found"),
         (405, "Method Not Allowed"),
         (409, "Conflict"),

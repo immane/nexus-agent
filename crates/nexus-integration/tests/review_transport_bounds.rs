@@ -3,9 +3,8 @@
 //! Review regressions: bounded event transport under saturation and drops.
 //!
 //! Findings under test:
-//! - when the control channel saturates, the required terminal event must
-//!   still be delivered once the consumer resumes draining; silently
-//!   dropping `RunFinished` violates the required-delivery contract;
+//! - provisional usage publication is bounded, while the required terminal
+//!   and final usage still arrive after the consumer resumes draining;
 //! - data-channel drops must not leave holes in the delivered sequence
 //!   numbers: published events stay contiguous even when presentation
 //!   traffic is truncated, and the truncation stays visible in snapshots.
@@ -28,12 +27,12 @@ fn stop_terminal() -> ProviderEvent {
     ))
 }
 
-/// Fills the control channel beyond its locked capacity without a consumer,
-/// then resumes draining. Every required control event, including the
-/// terminal, must arrive once the consumer resumes; none may be silently
-/// dropped, and exactly one terminal closes the run.
+/// Sends more provisional updates than the runtime's bounded publication
+/// budget without a consumer, then resumes draining. The bounded prefix,
+/// final usage, and terminal must arrive, and exactly one terminal closes
+/// the run.
 #[test]
-fn saturated_control_channel_still_delivers_every_event_after_resume() {
+fn provisional_usage_burst_is_bounded_and_terminal_survives_resume() {
     let rt = common::test_rt();
     rt.block_on(async {
         let mut turn = Vec::with_capacity(201);
@@ -55,9 +54,7 @@ fn saturated_control_channel_still_delivers_every_event_after_resume() {
         assert_eq!(response.reply(), CommandReply::Accepted);
         let run = response.run().cloned().expect("run issued");
 
-        // Deliberately do not drain: the control channel fills while the run
-        // publishes usage. The runtime must not treat a full control channel
-        // as permission to drop the terminal.
+        // Deliberately do not drain while usage publication is bounded.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Consumer resumes. The terminal is required and must arrive.
@@ -82,16 +79,15 @@ fn saturated_control_channel_still_delivers_every_event_after_resume() {
             }
         })
         .await
-        .expect("required terminal event was silently dropped when the control channel saturated");
+        .expect("required terminal event was not delivered");
 
         assert_eq!(
             finished.outcome(),
             RunOutcome::Completed,
-            "saturation delays delivery; it does not corrupt the run outcome"
+            "bounded usage publication does not corrupt the run outcome"
         );
-        // Exact composition: one RunStarted, the 200 distinct provisional
-        // updates, the terminal's final usage record (unknown counters, not
-        // fabricated zeros), and one RunFinished. Nothing silently dropped.
+        // Exact composition: RunStarted, the bounded provisional updates,
+        // final usage (unknown counters, not fabricated zeros), and RunFinished.
         let usages: Vec<Usage> = control
             .iter()
             .filter_map(|event| match event.payload() {
@@ -101,8 +97,8 @@ fn saturated_control_channel_still_delivers_every_event_after_resume() {
             .collect();
         assert_eq!(
             usages.len(),
-            201,
-            "200 provisional updates plus the terminal final usage record"
+            17,
+            "16 bounded provisional updates plus terminal final usage"
         );
         let provisional: Vec<u64> = usages
             .iter()
@@ -111,8 +107,8 @@ fn saturated_control_channel_still_delivers_every_event_after_resume() {
             .collect();
         assert_eq!(
             provisional,
-            (1..=200).collect::<Vec<u64>>(),
-            "every provisional counter is delivered exactly once, in order"
+            (1..=16).collect::<Vec<u64>>(),
+            "the bounded provisional prefix is delivered in order"
         );
         let terminal_usage = usages.last().expect("usage events observed");
         assert_eq!(
@@ -130,8 +126,8 @@ fn saturated_control_channel_still_delivers_every_event_after_resume() {
         );
         assert_eq!(
             control.len(),
-            203,
-            "one RunStarted, 201 usage records, one RunFinished: {}",
+            19,
+            "one RunStarted, 17 usage records, one RunFinished: {}",
             control.len()
         );
         assert_eq!(

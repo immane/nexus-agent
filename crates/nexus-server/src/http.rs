@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum request head (request line plus headers) in bytes.
 pub const MAX_HEAD_BYTES: usize = 16_384;
@@ -16,6 +16,11 @@ pub const MAX_HEAD_BYTES: usize = 16_384;
 pub const MAX_BODY_BYTES: usize = 65_536;
 /// Per-read timeout so a stalled peer cannot park a connection thread.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum wall-clock time to receive one complete request, including slow
+/// clients that make progress just before each per-read timeout.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound response writes, including SSE frames to clients that stop reading.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Parsed request: method, path (with query), lowercased headers, raw body.
 pub struct Request {
@@ -75,16 +80,25 @@ fn bad(status: u16, message: &'static str) -> HttpError {
 /// the response the caller closes the stream (except SSE, which owns its
 /// stream for the event loop instead).
 pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .map_err(|_| bad(500, "connection setup failed"))?;
     let mut reader = BufReader::new(stream);
     let mut head: Vec<u8> = Vec::new();
     loop {
+        set_read_deadline(reader.get_ref(), deadline)?;
         let mut byte = [0u8; 1];
-        reader
-            .read_exact(&mut byte)
-            .map_err(|_| bad(400, "request could not be read"))?;
+        reader.read_exact(&mut byte).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) {
+                bad(408, "request timed out")
+            } else {
+                bad(400, "request could not be read")
+            }
+        })?;
         head.push(byte[0]);
         if head.len() > MAX_HEAD_BYTES {
             return Err(bad(431, "request head is too large"));
@@ -129,8 +143,12 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
         {
             return Err(bad(400, "header name is malformed"));
         }
-        if name == "content-length" && headers.contains_key(&name) {
-            return Err(bad(400, "content length is malformed"));
+        if matches!(
+            name.as_str(),
+            "content-length" | "host" | "origin" | "authorization"
+        ) && headers.contains_key(&name)
+        {
+            return Err(bad(400, "request header is repeated"));
         }
         headers.insert(name, value.trim().to_owned());
     }
@@ -150,9 +168,7 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        reader
-            .read_exact(&mut body)
-            .map_err(|_| bad(400, "request body is truncated"))?;
+        read_exact_before(&mut reader, &mut body, deadline)?;
     }
     Ok(Request {
         method: method.to_owned(),
@@ -160,6 +176,40 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, HttpError> {
         headers,
         body,
     })
+}
+
+fn read_exact_before(
+    reader: &mut BufReader<&mut TcpStream>,
+    mut body: &mut [u8],
+    deadline: Instant,
+) -> Result<(), HttpError> {
+    while !body.is_empty() {
+        set_read_deadline(reader.get_ref(), deadline)?;
+        match reader.read(body) {
+            Ok(0) => return Err(bad(400, "request body is truncated")),
+            Ok(read) => body = &mut body[read..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(bad(408, "request timed out"));
+            }
+            Err(_) => return Err(bad(400, "request body is truncated")),
+        }
+    }
+    Ok(())
+}
+
+fn set_read_deadline(stream: &TcpStream, deadline: Instant) -> Result<(), HttpError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(bad(408, "request timed out"));
+    }
+    stream
+        .set_read_timeout(Some(remaining.min(IO_TIMEOUT)))
+        .map_err(|_| bad(500, "connection setup failed"))
 }
 
 /// Outgoing response with explicit framing.
@@ -191,6 +241,9 @@ pub const fn reason(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        408 => "Request Timeout",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -207,14 +260,23 @@ pub const fn reason(status: u16) -> &'static str {
 /// Writes one framed response and flushes. The caller closes the stream
 /// afterwards unless it is handing the stream to the SSE loop.
 pub fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        response.status,
-        reason(response.status),
-        response.content_type,
-        response.body.len(),
-    )?;
+    if response.status == 401 {
+        write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            response.content_type,
+            response.body.len(),
+        )?;
+    } else {
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            response.status,
+            reason(response.status),
+            response.content_type,
+            response.body.len(),
+        )?;
+    }
     stream.write_all(&response.body)?;
     stream.flush()
 }
@@ -222,9 +284,43 @@ pub fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result
 /// Writes SSE stream headers; the caller then owns the stream and writes
 /// `data:` frames until the terminal event.
 pub fn write_sse_headers(stream: &mut TcpStream) -> io::Result<()> {
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     write!(
         stream,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
     )?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn slow_body_progress_cannot_extend_the_absolute_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener binds");
+        let mut client = TcpStream::connect(listener.local_addr().expect("address available"))
+            .expect("client connects");
+        let (mut server, _) = listener.accept().expect("connection accepted");
+        let writer = thread::spawn(move || {
+            for _ in 0..8 {
+                thread::sleep(Duration::from_millis(40));
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+        let mut reader = BufReader::new(&mut server);
+        let mut body = [0; 8];
+        let error = read_exact_before(
+            &mut reader,
+            &mut body,
+            Instant::now() + Duration::from_millis(120),
+        )
+        .expect_err("slow trickle exceeds the absolute deadline");
+        assert_eq!(error.status, 408);
+        writer.join().expect("writer exits");
+    }
 }

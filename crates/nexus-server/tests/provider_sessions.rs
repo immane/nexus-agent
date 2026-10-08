@@ -6,12 +6,14 @@
 //! reaches the terminal outcome. Fake sessions keep the demo script.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::Value;
+
+use crate::support::serve_mock;
 
 fn address(port: u16) -> String {
     format!("127.0.0.1:{port}")
@@ -40,80 +42,21 @@ fn post(port: u16, path: &str, body: &str) -> (u16, Value) {
     round_trip(
         port,
         &format!(
-            "POST {path} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\ncontent-length: {}\r\n\r\n{body}",
+            "a".repeat(64),
             body.len()
         ),
     )
 }
 
 fn get(port: u16, path: &str) -> (u16, Value) {
-    round_trip(port, &format!("GET {path} HTTP/1.1\r\nhost: x\r\n\r\n"))
-}
-
-/// Loopback mock speaking just enough Chat Completions: one stop turn
-/// with fixed text, recording hits and the raw request.
-struct Mock {
-    hits: Arc<AtomicUsize>,
-    request: Arc<Mutex<Vec<u8>>>,
-}
-
-fn serve_mock() -> (String, Mock) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback binds");
-    let port = listener.local_addr().expect("port known").port();
-    let mock = Mock {
-        hits: Arc::new(AtomicUsize::new(0)),
-        request: Arc::new(Mutex::new(Vec::new())),
-    };
-    let captured = Mock {
-        hits: Arc::clone(&mock.hits),
-        request: Arc::clone(&mock.request),
-    };
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let mut stream = stream;
-            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while !head.ends_with(b"\r\n\r\n") {
-                match stream.read_exact(&mut byte) {
-                    Ok(()) => head.push(byte[0]),
-                    Err(_) => break,
-                }
-                if head.len() > 65_536 {
-                    break;
-                }
-            }
-            let length: usize = String::from_utf8_lossy(&head)
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("content-length:")
-                        .or_else(|| line.strip_prefix("Content-Length:"))
-                })
-                .filter_map(|value| value.trim().parse().ok())
-                .next()
-                .unwrap_or(0);
-            let mut rest = vec![0u8; length.min(1_048_576)];
-            let _ = stream.read_exact(&mut rest);
-            captured
-                .request
-                .lock()
-                .expect("request log writable")
-                .extend_from_slice(&head);
-            captured
-                .request
-                .lock()
-                .expect("request log writable")
-                .extend_from_slice(&rest);
-            captured.hits.fetch_add(1, Ordering::SeqCst);
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"mock says hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#;
-            let response = format!(
-                "HTTP/1.1 200 Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    (format!("http://127.0.0.1:{port}/v1"), mock)
+    round_trip(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n",
+            "a".repeat(64)
+        ),
+    )
 }
 
 fn configured(endpoint: &str, credential: &str) -> nexus_config::UserConfig {
@@ -151,6 +94,9 @@ fn spawn_server(config: nexus_config::UserConfig) -> u16 {
         .expect("test executor builds");
     let mut server = nexus_server::Server::new(runtime.handle().clone());
     server.set_config(config, None);
+    server
+        .set_auth_token(&"a".repeat(64))
+        .expect("test token valid");
     let server = Arc::new(server);
     std::thread::spawn(move || {
         std::mem::forget(runtime);
@@ -174,7 +120,7 @@ fn events_until_terminal(port: u16, session: &str, run: &str) -> Vec<Value> {
         .expect("timeout sets");
     stream
         .write_all(
-            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: x\r\n\r\n")
+            format!("GET /sessions/{session}/runs/{run}/events HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n", "a".repeat(64))
                 .as_bytes(),
         )
         .expect("SSE subscribes");

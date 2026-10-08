@@ -10,19 +10,28 @@
 //!
 //! [`Server::set_config`] installs one [`UserConfig`] plus the file it is
 //! persisted to. A server built by [`Server::new`] alone holds
-//! [`UserConfig::default_config`] with no path: submit selection then
-//! resolves nothing, favourites are refused, and recent-model recording
-//! stays in memory, so the existing demo wiring is unchanged.
+//! [`UserConfig::default_config`] with no path: sessions can only be
+//! unbound (live selections fail as unknown identities), favourites are
+//! refused, and recent-model recording stays in memory, so the existing
+//! demo wiring is unchanged.
 //!
-//! `submit` accepts an optional `"provider"` and `"model"`. Both must name
-//! configured identities (`400` otherwise) and, when they disagree about
-//! which provider owns the model, the pair is rejected. The selected
-//! provider's credential must resolve from the process environment at
-//! submit time (`503` otherwise). The diagnostic names only the provider
-//! id, which is a bounded lock identifier: no environment value can reach
-//! it. An accepted run with a selected model is remembered in a
-//! run-to-model map, and the SSE terminal event for that run records the
-//! use in the configuration and saves it.
+//! A session's provider and model are fixed when it is created
+//! (`POST /sessions` with an optional `"provider"`/`"model"`). Both must
+//! name configured identities (`400` otherwise), the pair must agree about
+//! which provider owns the model, and the provider's credential must
+//! resolve from the process environment (`503` otherwise). The diagnostic
+//! names only the provider id, which is a bounded lock identifier: no
+//! environment value can reach it. A session created without a selection is
+//! unbound and serves the scripted demo wiring.
+//!
+//! `submit` may repeat the session's own `"provider"`/`"model"` or omit
+//! both. An omitted field uses the session binding, and any other value is
+//! refused (`400`) before the runtime is touched, so a request can never
+//! invoke one model while recording another. A demo session refuses any
+//! live selection rather than recording a model that never ran. An accepted
+//! run is remembered in a run-to-model map keyed by the session's bound
+//! model, and the SSE terminal event records the use in the configuration
+//! and saves it.
 //!
 //! Persistence is best effort by design: a failed save is logged to stderr
 //! and the run, its stream, and the in-memory record all continue. Usage
@@ -34,9 +43,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
@@ -52,11 +61,45 @@ use nexus_tools::{
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+/// Validates the bearer-token syntax used by the server binary.
+///
+/// The token itself must be obtained through a secret-safe channel such as
+/// an environment variable, never command-line arguments or a URL.
+///
+/// # Errors
+/// Returns a static reason when the value is not exactly 64 hexadecimal
+/// characters.
+pub fn validate_auth_token(value: &str) -> Result<(), &'static str> {
+    AuthToken::parse(value).map(|_| ())
+}
+
+use crate::auth::{self, AuthToken};
 use crate::http::{self, Request, Response};
 use crate::json;
 
 /// Idle SSE window: a `: ping` comment keeps the stream alive.
 const SSE_IDLE: Duration = Duration::from_secs(15);
+/// Session-owned history/grants are retained for this idle window before
+/// admission pressure may reclaim a provably inactive session.
+const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
+/// Cross-run events retained while one SSE subscriber is filtering the shared
+/// session channels. One extra overflow event is retained as a reserve before
+/// the stream is closed, so pressure never silently discards a received event.
+const MAX_PENDING_EVENTS: usize = 4_096;
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
+/// At most one deferred terminal per accepted run. Run admission stops at this
+/// count, preserving terminal records instead of overflowing the reserve.
+const MAX_DEFERRED_TERMINALS: usize = 128;
+/// Hard cap: session runtimes own grants, history, and event receivers and
+/// are rejected rather than evicted while their execution state is unknown.
+pub const MAX_SESSIONS: usize = 128;
+/// Bound retained usage identities independently from client stream behavior.
+/// At capacity, bound-model runs are refused until clients consume terminal
+/// events and release associations.
+pub const MAX_USAGE_ASSOCIATIONS: usize = 128;
+/// Completion observers are bounded independently from connection threads.
+const MAX_COMPLETION_WATCHERS: usize = MAX_USAGE_ASSOCIATIONS;
 /// Default execution profile for web-submitted tasks.
 const WEB_PROFILE: &str = "web-test";
 
@@ -134,6 +177,12 @@ impl ProviderPort for PerRunProvider {
 /// One web session: an owned runtime plus its unconsumed event receivers.
 pub struct Session {
     session: SessionId,
+    /// Configured provider id this session was bound to at creation, or
+    /// `None` for the demo wiring. Fixed for the session's lifetime.
+    provider: Option<String>,
+    /// Configured model id bound at creation. `None` means the provider
+    /// default (or the demo wiring).
+    model: Option<String>,
     runtime: Mutex<Runtime>,
     data: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
     control: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
@@ -143,7 +192,90 @@ pub struct Session {
     /// the one being served. `try_recv` consumes, so a foreign event met
     /// while draining cannot be left in the channel; it is stashed here
     /// for its own waiter instead of being dropped.
-    pending: Mutex<Vec<nexus_core::RunEvent>>,
+    pending: Mutex<PendingEvents>,
+    deferred_terminals: Mutex<Vec<nexus_core::RunEvent>>,
+    last_activity: Mutex<Instant>,
+    last_run: Mutex<Option<RunId>>,
+}
+
+#[derive(Default)]
+struct PendingEvents {
+    events: Vec<nexus_core::RunEvent>,
+    bytes: usize,
+    overflow: Option<(nexus_core::RunEvent, usize)>,
+}
+
+impl PendingEvents {
+    fn can_receive_more(&self) -> bool {
+        self.events.len() < MAX_PENDING_EVENTS
+            && self.bytes < MAX_PENDING_BYTES
+            && self.overflow.is_none()
+    }
+
+    /// Stores one event within the ordinary budget, or the single reserve
+    /// slot. `false` means the reserve was consumed and the caller must stop
+    /// receiving until a reconnect drains retained events.
+    fn push(&mut self, event: nexus_core::RunEvent) -> bool {
+        let bytes = pending_event_bytes(&event);
+        if bytes > MAX_PENDING_OVERFLOW_BYTES {
+            // Current core event constructors and runtime output budgets keep
+            // every encoded event below this ceiling. Treat a contract breach
+            // as a transport failure; never let one malformed event bypass
+            // the retained-byte bound.
+            eprintln!("nexus-server: runtime event exceeded the SSE event budget");
+            return false;
+        }
+        if self.events.len() < MAX_PENDING_EVENTS
+            && self.bytes.saturating_add(bytes) <= MAX_PENDING_BYTES
+        {
+            self.bytes += bytes;
+            self.events.push(event);
+            true
+        } else if self.overflow.is_none() && bytes <= MAX_PENDING_OVERFLOW_BYTES {
+            self.overflow = Some((event, bytes));
+            false
+        } else {
+            false
+        }
+    }
+
+    fn pop_run(&mut self, run: &RunId) -> Option<nexus_core::RunEvent> {
+        let event_pos = self
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.run() == run)
+            .min_by_key(|(_, event)| event.seq())
+            .map(|(index, _)| index);
+        let overflow_matches = self
+            .overflow
+            .as_ref()
+            .is_some_and(|(event, _)| event.run() == run);
+        if let Some(index) = event_pos {
+            let pending_seq = self.events[index].seq();
+            if overflow_matches
+                && self
+                    .overflow
+                    .as_ref()
+                    .is_some_and(|(event, _)| event.seq() < pending_seq)
+            {
+                return self.overflow.take().map(|(event, _)| event);
+            }
+            let pending = self.events.remove(index);
+            self.bytes = self.bytes.saturating_sub(pending_event_bytes(&pending));
+            Some(pending)
+        } else if overflow_matches {
+            let (event, _) = self.overflow.take().expect("matched overflow exists");
+            Some(event)
+        } else {
+            None
+        }
+    }
+}
+
+fn pending_event_bytes(event: &nexus_core::RunEvent) -> usize {
+    serde_json::to_vec(&json::event_json(event))
+        .map_or(usize::MAX, |bytes| bytes.len().saturating_add(16))
 }
 
 impl Session {
@@ -154,9 +286,8 @@ impl Session {
     }
 }
 
-/// Shared server state: the Tokio handle driving runtime ports, every live
-/// session, and the user configuration. Bound to loopback by the binary;
-/// there is no auth.
+/// Shared server state: runtime ports, live sessions, user configuration,
+/// and the HTTP caller credential.
 pub struct Server {
     handle: tokio::runtime::Handle,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -169,12 +300,14 @@ pub struct Server {
     /// memory: a server without a configured path never writes a file.
     config_path: Option<PathBuf>,
     /// Accepted run id to the model id it was submitted with. Entries are
-    /// consumed by that run's SSE terminal event, so the map holds at most
-    /// the runs that were accepted but never streamed to a terminal.
+    /// consumed by the completion watcher, a terminal SSE event, a subsequent
+    /// run, or safe idle reclamation; admission caps retained entries.
     run_models: Mutex<HashMap<String, String>>,
+    completion_watchers: Arc<AtomicUsize>,
     /// Tool wiring for sessions created after the call. Startup-only: set
     /// before serving, alongside [`Server::set_config`].
     tools_mode: ToolsMode,
+    auth_token: Option<AuthToken>,
 }
 
 /// Session creation failure with its HTTP status and static diagnostic.
@@ -229,7 +362,9 @@ impl Server {
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             run_models: Mutex::new(HashMap::new()),
+            completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
+            auth_token: None,
         }
     }
 
@@ -257,6 +392,13 @@ impl Server {
         self.config_path = path;
     }
 
+    /// Installs the HTTP bearer credential before serving. The configured
+    /// credential is required whenever real tools or a provider are enabled.
+    pub fn set_auth_token(&mut self, token: &str) -> Result<(), &'static str> {
+        self.auth_token = Some(AuthToken::parse(token)?);
+        Ok(())
+    }
+
     /// Creates a session with a fresh demo-wired runtime and returns its
     /// token. Wiring failures are startup-class errors, never hung runs.
     pub fn create_session(&self) -> Result<String, nexus_core::AgentError> {
@@ -274,9 +416,21 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, SessionError> {
+        // Hold admission ownership through construction so concurrent
+        // creators cannot pass the cap together. The lock is not held over
+        // runtime execution or network I/O.
+        let mut sessions = self.sessions.lock().expect("sessions lockable");
+        self.remove_idle_sessions(&mut sessions, Instant::now());
+        if sessions.len() >= MAX_SESSIONS {
+            return Err(SessionError::new(503, "session capacity is full"));
+        }
         if provider.is_none() && model.is_some() {
             return Err(SessionError::new(400, "selected model needs a provider"));
         }
+        // The validated identities are retained so a later submit can be
+        // checked against what this session actually dispatches to.
+        let bound_provider = provider.map(str::to_owned);
+        let bound_model = model.map(str::to_owned);
         let provider = match provider {
             None => None,
             Some(id) => Some(self.select_provider(id, model)?),
@@ -342,17 +496,19 @@ impl Server {
             .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
         let entry = Arc::new(Session {
             session,
+            provider: bound_provider,
+            model: bound_model,
             runtime: Mutex::new(runtime),
             data: Mutex::new(streams.data),
             control: Mutex::new(streams.control),
             streaming: Mutex::new(false),
             next_request: AtomicU64::new(1),
-            pending: Mutex::new(Vec::new()),
+            pending: Mutex::new(PendingEvents::default()),
+            deferred_terminals: Mutex::new(Vec::new()),
+            last_activity: Mutex::new(Instant::now()),
+            last_run: Mutex::new(None),
         });
-        self.sessions
-            .lock()
-            .expect("sessions lockable")
-            .insert(token.clone(), entry);
+        sessions.insert(token.clone(), entry);
         Ok(token)
     }
 
@@ -387,7 +543,7 @@ impl Server {
         };
         let (profile, vendor) = profile;
         let vendor = vendor.unwrap_or(profile.default_model.clone());
-        nexus_config::resolve_credential(&profile.credential)
+        resolve_credential(&profile.credential)
             .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
             .map_err(|_| SessionError::new(400, "selected provider is invalid"))
@@ -395,19 +551,107 @@ impl Server {
 
     /// Looks up a session by token.
     fn session(&self, token: &str) -> Option<Arc<Session>> {
-        self.sessions
+        let session = self
+            .sessions
             .lock()
             .expect("sessions lockable")
             .get(token)
-            .cloned()
+            .cloned()?;
+        *session.last_activity.lock().expect("activity lockable") = Instant::now();
+        Some(session)
+    }
+
+    /// Reclaims only idle sessions whose runtime proves the most recent run
+    /// finalized (or which never ran), and which have no external owners or
+    /// active SSE subscriber. Active/quarantined runtime state is retained.
+    /// Called under the session-map lock during maintenance or admission.
+    fn remove_idle_sessions(&self, sessions: &mut HashMap<String, Arc<Session>>, now: Instant) {
+        sessions.retain(|_, session| {
+            if Arc::strong_count(session) != 1
+                || *session.streaming.lock().expect("stream flag lockable")
+                || now.saturating_duration_since(
+                    *session.last_activity.lock().expect("activity lockable"),
+                ) < SESSION_IDLE
+            {
+                return true;
+            }
+            let last_run = session.last_run.lock().expect("last run lockable").clone();
+            let Some(run) = last_run else {
+                return false;
+            };
+            let request = GetSnapshotCommand {
+                request: session.request_id(),
+                run: run.clone(),
+            };
+            let runtime = session.runtime.lock().expect("runtime lockable");
+            if self.handle.block_on(runtime.has_unconfirmed_work()) {
+                return true;
+            }
+            let (reply, snapshot) = self.handle.block_on(runtime.get_snapshot(request));
+            match (reply.reply(), snapshot) {
+                (CommandReply::Accepted, Some(snapshot)) => {
+                    if snapshot.lifecycle() == nexus_core::RunLifecycle::Active {
+                        return true;
+                    }
+                    self.record_model_use(run.as_str());
+                    false
+                }
+                // Unknown state is not evidence that workers and grants are
+                // safe to release; retain conservatively.
+                _ => true,
+            }
+        });
+    }
+
+    /// Performs bounded idle-session maintenance. The binary calls this from
+    /// one housekeeping thread; embedders may call it on their own schedule.
+    pub fn cleanup_idle_sessions(&self) {
+        let mut sessions = self.sessions.lock().expect("sessions lockable");
+        self.remove_idle_sessions(&mut sessions, Instant::now());
     }
 
     /// Serves one connection to completion, then returns for the caller to
     /// close the stream (except SSE, which closes its own stream at the
     /// terminal event).
-    pub fn handle_connection(&self, mut stream: TcpStream) {
+    pub fn handle_connection(self: &Arc<Self>, mut stream: TcpStream) {
+        let _ = stream.set_write_timeout(Some(http::WRITE_TIMEOUT));
+        let port = stream
+            .local_addr()
+            .map(|address| address.port())
+            .unwrap_or(0);
         let response = match http::read_request(&mut stream) {
-            Ok(request) => self.route(&request, &mut stream),
+            Ok(request) => {
+                let health = request.method == "GET" && request.route_path() == "/health";
+                let required = !health
+                    && (self.auth_token.is_some()
+                        || !matches!(self.tools_mode, ToolsMode::Fakes)
+                        || !self
+                            .config
+                            .lock()
+                            .expect("config lockable")
+                            .providers()
+                            .is_empty());
+                let token = if health {
+                    None
+                } else {
+                    self.auth_token.as_ref()
+                };
+                match auth::authorize(&request, port, token, required) {
+                    Ok(()) => self.route(&request, &mut stream),
+                    Err(auth::AccessError::Unauthorized) => Some(json_response(
+                        401,
+                        &json::error_body("bearer authentication required"),
+                    )),
+                    Err(auth::AccessError::Forbidden) => Some(json_response(
+                        403,
+                        &json::error_body("host or origin is not allowed"),
+                    )),
+                    Err(auth::AccessError::NotReady) => Some(json_response(
+                        503,
+                        &json::error_body("server authentication is not configured"),
+                    )),
+                }
+            }
             Err(error) => Some(json_response(
                 error.status,
                 &json::error_body(error.message),
@@ -420,7 +664,7 @@ impl Server {
 
     /// Routes a parsed request. Returns `None` when the SSE loop took over
     /// the stream (headers already written); anything else is framed here.
-    fn route(&self, request: &Request, stream: &mut TcpStream) -> Option<Response> {
+    fn route(self: &Arc<Self>, request: &Request, stream: &mut TcpStream) -> Option<Response> {
         let parsed: Value = if request.body.is_empty() {
             Value::Null
         } else {
@@ -579,16 +823,18 @@ impl Server {
     /// Accepts a task for the session. Only `Accepted` mints a run; every
     /// other reply keeps the slot untouched.
     ///
-    /// An optional `provider`/`model` pair selects the integration. Both
-    /// are validated against the configured document before the run is
-    /// submitted, so an invalid or unavailable selection never occupies the
-    /// session's single run slot and never mints a run. An accepted run
-    /// with a selected model is remembered for terminal-time recording.
-    fn submit_run(&self, session: &Arc<Session>, body: &Value) -> Option<Response> {
-        let model = match self.select_model(body) {
-            Ok(model) => model,
-            Err(response) => return Some(response),
-        };
+    /// The request may repeat the session's bound `provider`/`model` or omit
+    /// them. An omitted field uses the binding and any other value is
+    /// refused before the runtime is touched, so a conflicting selection
+    /// never occupies the session's single run slot, mints a run, or records
+    /// a model that did not run. An accepted run with a bound model is
+    /// remembered for terminal-time recording.
+    fn submit_run(self: &Arc<Self>, session: &Arc<Session>, body: &Value) -> Option<Response> {
+        let model =
+            match resolve_selection(session.provider.as_deref(), session.model.as_deref(), body) {
+                Ok(model) => model,
+                Err(response) => return Some(response),
+            };
         let input = body_str(body, "input").unwrap_or("");
         let profile = body_str(body, "profile").unwrap_or(WEB_PROFILE);
         let command = match SubmitCommand::new(
@@ -605,7 +851,59 @@ impl Server {
                 ));
             }
         };
+        // Keep the global lock order runtime -> usage map. A run can finish
+        // before this request thread resumes from `submit`; holding the map
+        // lock ensures its SSE consumer cannot remove a not-yet-registered
+        // identity. The same lock enforces a finite association budget.
         let runtime = session.runtime.lock().expect("runtime lockable");
+        if session
+            .deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable")
+            .len()
+            >= MAX_DEFERRED_TERMINALS
+        {
+            return Some(json_response(
+                409,
+                &json::error_body("session event backlog is full"),
+            ));
+        }
+        if !session
+            .pending
+            .lock()
+            .expect("pending lockable")
+            .can_receive_more()
+        {
+            return Some(json_response(
+                409,
+                &json::error_body("session event backlog is full"),
+            ));
+        }
+        // Before a newer accepted run can replace Runtime's single retained
+        // `last` snapshot, settle the previous run's usage association if it
+        // has finalized. This is independent of whether the client consumed
+        // that run's SSE terminal record.
+        if let Some(previous) = session.last_run.lock().expect("last run lockable").clone() {
+            let snapshot = self
+                .handle
+                .block_on(runtime.get_snapshot(GetSnapshotCommand {
+                    request: session.request_id(),
+                    run: previous.clone(),
+                }));
+            if let (response, Some(snapshot)) = snapshot
+                && response.reply() == CommandReply::Accepted
+                && snapshot.lifecycle() != nexus_core::RunLifecycle::Active
+            {
+                self.record_model_use(previous.as_str());
+            }
+        }
+        let mut run_models = self.run_models.lock().expect("run model map lockable");
+        if model.is_some() && run_models.len() >= MAX_USAGE_ASSOCIATIONS {
+            return Some(json_response(
+                503,
+                &json::error_body("usage association capacity is full"),
+            ));
+        }
         let reply = self.handle.block_on(runtime.submit(command));
         let status = match reply.reply() {
             CommandReply::Accepted => 201,
@@ -617,10 +915,20 @@ impl Server {
         if reply.reply() == CommandReply::Accepted
             && let (Some(run), Some(model)) = (reply.run(), model.as_deref())
         {
-            self.run_models
-                .lock()
-                .expect("run model map lockable")
-                .insert(run.as_str().to_owned(), model.to_owned());
+            run_models.insert(run.as_str().to_owned(), model.to_owned());
+        }
+        if reply.reply() == CommandReply::Accepted
+            && let Some(run) = reply.run()
+        {
+            *session.last_run.lock().expect("last run lockable") = Some(run.clone());
+            if model.is_some() {
+                Self::watch_run_completion(
+                    Arc::downgrade(self),
+                    Arc::clone(session),
+                    run.clone(),
+                    self.handle.clone(),
+                );
+            }
         }
         let body = match reply.run() {
             Some(run) => {
@@ -631,104 +939,60 @@ impl Server {
         Some(json_response(status, &body_json(body)))
     }
 
-    /// Resolves the optional `provider`/`model` submit selection to the
-    /// model id whose use will be recorded at the run's terminal event.
-    ///
-    /// `Ok(None)` means no selection was requested: the run proceeds on the
-    /// demo wiring and records no usage. An unknown `provider` or `model`
-    /// is invalid input (`400`). When both name configured identities but
-    /// disagree about ownership, the pair is rejected rather than silently
-    /// preferring one field.
-    ///
-    /// A selection whose provider credential cannot be resolved is a
-    /// readiness failure (`503`), not bad input: the request is well-formed
-    /// and retryable once the environment is set. The body names only the
-    /// provider id, which the configuration charset bounds to lock
-    /// identifier text, so no credential value can reach the diagnostic.
-    fn select_model(&self, body: &Value) -> Result<Option<String>, Response> {
-        let provider_field = optional_text(body, "provider")?;
-        let model_field = optional_text(body, "model")?;
-        if provider_field.is_none() && model_field.is_none() {
-            return Ok(None);
-        }
-        // The document is locked once and released before any credential
-        // resolution: the environment lookup must never run while the
-        // configuration lock is held, so a slow or blocking resolution
-        // cannot stall every other config request.
-        let (provider_id, credential) = {
-            let config = self.config.lock().expect("config lockable");
-            let provider_id = match (provider_field, model_field) {
-                (Some(provider), Some(model)) => {
-                    let Some(entry) = config.model(model) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected model is unknown"),
-                        ));
-                    };
-                    let Some(profile) = config.provider(provider) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected provider is unknown"),
-                        ));
-                    };
-                    if entry.provider != profile.id {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected model does not belong to that provider"),
-                        ));
-                    }
-                    profile.id.clone()
-                }
-                (Some(provider), None) => {
-                    let Some(profile) = config.provider(provider) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected provider is unknown"),
-                        ));
-                    };
-                    profile.id.clone()
-                }
-                (None, Some(model)) => {
-                    let Some(entry) = config.model(model) else {
-                        return Err(json_response(
-                            400,
-                            &json::error_body("selected model is unknown"),
-                        ));
-                    };
-                    // A model entry always names an existing provider:
-                    // admission rejects the reference otherwise.
-                    config
-                        .provider(&entry.provider)
-                        .expect("model names a configured provider")
-                        .id
-                        .clone()
-                }
-                (None, None) => unreachable!("both-absent is handled above"),
-            };
-            let credential = config
-                .provider(&provider_id)
-                .expect("provider was resolved above")
-                .credential
-                .clone();
-            (provider_id, credential)
+    /// Watches a bound-model run independently of its SSE client. The
+    /// association is installed before this watcher starts; a later submit
+    /// settles the previous finalized run before Runtime replaces its `last`
+    /// snapshot, so polling cannot miss a completed run between snapshots.
+    fn watch_run_completion(
+        server: Weak<Self>,
+        session: Arc<Session>,
+        run: RunId,
+        handle: tokio::runtime::Handle,
+    ) {
+        let Some(server_arc) = server.upgrade() else {
+            return;
         };
-        if resolve_credential(&credential).is_err() {
-            return Err(self.credential_unavailable(&provider_id));
+        let watchers = Arc::clone(&server_arc.completion_watchers);
+        drop(server_arc);
+        if !try_acquire_watcher(&watchers) {
+            return;
         }
-        Ok(model_field.map(str::to_owned))
-    }
-
-    /// Builds the credential-readiness refusal for one provider. The id
-    /// comes from the validated document, so it is bounded lock-identifier
-    /// text; the resolved value never appears here.
-    fn credential_unavailable(&self, provider: &str) -> Response {
-        json_response(
-            503,
-            &body_json(serde_json::json!({
-                "error": format!("provider credential is unavailable: {provider}"),
-                "retry": "set the referenced environment variable and retry",
-            })),
-        )
+        let watcher_count = Arc::clone(&watchers);
+        let watcher = std::thread::Builder::new()
+            .name("nexus-usage-watch".to_owned())
+            .spawn(move || {
+                let _watcher = WatcherGuard(watcher_count);
+                loop {
+                    let Some(server) = server.upgrade() else {
+                        return;
+                    };
+                    let command = GetSnapshotCommand {
+                        request: session.request_id(),
+                        run: run.clone(),
+                    };
+                    let snapshot = {
+                        let runtime = session.runtime.lock().expect("runtime lockable");
+                        handle.block_on(runtime.get_snapshot(command))
+                    };
+                    match snapshot {
+                        (response, Some(snapshot))
+                            if response.reply() == CommandReply::Accepted
+                                && snapshot.lifecycle() != nexus_core::RunLifecycle::Active =>
+                        {
+                            server.record_model_use(run.as_str());
+                            return;
+                        }
+                        (response, _) if response.reply() != CommandReply::Accepted => return,
+                        _ => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+            });
+        if watcher.is_err() {
+            watchers.fetch_sub(1, Ordering::AcqRel);
+            // The bounded association remains available for SSE or the idle
+            // maintenance path to settle; never report fabricated success.
+            eprintln!("nexus-server: usage completion watcher could not start");
+        }
     }
 
     /// Returns the bounded snapshot for a known run of this session.
@@ -856,6 +1120,19 @@ impl Server {
             Ok(run) => run,
             Err(_) => return Some(json_response(400, &json::error_body("run id is invalid"))),
         };
+        // Refuse unknown/evicted run ids before claiming the subscriber or
+        // touching shared event receivers. Only active and most-recent runs
+        // remain observable in Runtime's existing snapshot contract.
+        let request = GetSnapshotCommand {
+            request: session.request_id(),
+            run: run.clone(),
+        };
+        let runtime = session.runtime.lock().expect("runtime lockable");
+        let (reply, _) = self.handle.block_on(runtime.get_snapshot(request));
+        if reply.reply() != CommandReply::Accepted && !Self::has_retained_event(session, &run) {
+            return Some(json_response(404, &json::error_body("unknown run")));
+        }
+        drop(runtime);
         {
             let mut streaming = session.streaming.lock().expect("stream flag lockable");
             if *streaming {
@@ -866,16 +1143,34 @@ impl Server {
             }
             *streaming = true;
         }
+        let _subscriber = SubscriberGuard(&session.streaming);
         if http::write_sse_headers(stream).is_err() {
-            *session.streaming.lock().expect("stream flag lockable") = false;
             return None;
         }
         let mut data = session.data.lock().expect("data channel lockable");
         let mut control = session.control.lock().expect("control channel lockable");
         loop {
-            let event = match Self::take_pending(session, &run) {
+            let pending_event = Self::take_pending(session, &run);
+            let deferred_event = if pending_event.is_none() {
+                Self::take_deferred_terminal(session, &run, &data, &control)
+            } else {
+                None
+            };
+            let is_deferred_terminal = deferred_event.is_some();
+            let event = match pending_event.or(deferred_event) {
                 Some(event) => event,
                 None => {
+                    let pending = session.pending.lock().expect("pending lockable");
+                    if !pending.can_receive_more()
+                        || pending
+                            .overflow
+                            .as_ref()
+                            .is_some_and(|(event, _)| event.run() != &run)
+                    {
+                        Self::write_backpressure_comment(stream);
+                        break;
+                    }
+                    drop(pending);
                     let next = self.handle.block_on(async {
                         tokio::time::timeout(SSE_IDLE, async {
                             tokio::select! {
@@ -901,11 +1196,15 @@ impl Server {
             if event.run() != &run {
                 // Another run's event: stash it for its own waiter
                 // instead of dropping it.
-                session
+                let can_continue = session
                     .pending
                     .lock()
                     .expect("pending lockable")
                     .push(event);
+                if !can_continue {
+                    Self::write_backpressure_comment(stream);
+                    break;
+                }
                 continue;
             }
             let terminal = event.is_terminal();
@@ -921,10 +1220,23 @@ impl Server {
                 // independent channels): forward everything already
                 // committed first, terminal last, so a select! ordering can
                 // never strand a predecessor event.
-                if Self::drain_predecessors(stream, &mut data, &mut control, &run, &session.pending)
-                    .is_err()
-                {
-                    break;
+                if !is_deferred_terminal {
+                    match Self::drain_predecessors(
+                        stream,
+                        &mut data,
+                        &mut control,
+                        &run,
+                        &event,
+                        &session.pending,
+                        &session.deferred_terminals,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            Self::write_backpressure_comment(stream);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             let frame = format!(
@@ -939,7 +1251,6 @@ impl Server {
                 break;
             }
         }
-        *session.streaming.lock().expect("stream flag lockable") = false;
         None
     }
 
@@ -955,11 +1266,17 @@ impl Server {
         data: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
         control: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
         run: &RunId,
-        pending: &Mutex<Vec<nexus_core::RunEvent>>,
-    ) -> std::io::Result<()> {
+        terminal: &nexus_core::RunEvent,
+        pending: &Mutex<PendingEvents>,
+        deferred_terminals: &Mutex<Vec<nexus_core::RunEvent>>,
+    ) -> std::io::Result<bool> {
         loop {
             let mut progressed = false;
             for channel in [&mut *data, &mut *control] {
+                if !pending.lock().expect("pending lockable").can_receive_more() {
+                    Self::defer_terminal(deferred_terminals, terminal);
+                    return Ok(false);
+                }
                 while let Ok(queued) = channel.try_recv() {
                     progressed = true;
                     if queued.run() != run {
@@ -967,7 +1284,11 @@ impl Server {
                         // cannot stay queued: stash it for its own waiter
                         // and stop draining this channel, leaving the
                         // events behind it untouched.
-                        pending.lock().expect("pending lockable").push(queued);
+                        let can_continue = pending.lock().expect("pending lockable").push(queued);
+                        if !can_continue {
+                            Self::defer_terminal(deferred_terminals, terminal);
+                            return Ok(false);
+                        }
                         break;
                     }
                     let frame = format!(
@@ -980,9 +1301,15 @@ impl Server {
                 }
             }
             if !progressed {
-                return Ok(());
+                return Ok(true);
             }
         }
+    }
+
+    fn write_backpressure_comment(stream: &mut TcpStream) {
+        let _ =
+            stream.write_all(b": bounded event backlog; reconnect after draining pending runs\n\n");
+        let _ = stream.flush();
     }
 
     /// Pops the earliest stashed event owned by `run`, if any. Stashed
@@ -991,15 +1318,61 @@ impl Server {
     /// waiter exactly once.
     fn take_pending(session: &Session, run: &RunId) -> Option<nexus_core::RunEvent> {
         let mut pending = session.pending.lock().expect("pending lockable");
-        let pos = pending.iter().position(|event| event.run() == run)?;
-        Some(pending.remove(pos))
+        pending.pop_run(run)
+    }
+
+    fn take_deferred_terminal(
+        session: &Session,
+        run: &RunId,
+        data: &tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
+        control: &tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
+    ) -> Option<nexus_core::RunEvent> {
+        if !data.is_empty() || !control.is_empty() {
+            return None;
+        }
+        let mut deferred = session
+            .deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable");
+        let index = deferred.iter().position(|event| event.run() == run)?;
+        Some(deferred.remove(index))
+    }
+
+    fn has_retained_event(session: &Session, run: &RunId) -> bool {
+        session
+            .deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable")
+            .iter()
+            .any(|event| event.run() == run)
+            || {
+                let pending = session.pending.lock().expect("pending lockable");
+                pending.events.iter().any(|event| event.run() == run)
+                    || pending
+                        .overflow
+                        .as_ref()
+                        .is_some_and(|(event, _)| event.run() == run)
+            }
+    }
+
+    fn defer_terminal(
+        deferred_terminals: &Mutex<Vec<nexus_core::RunEvent>>,
+        terminal: &nexus_core::RunEvent,
+    ) {
+        let mut deferred = deferred_terminals
+            .lock()
+            .expect("deferred terminal lockable");
+        if deferred.iter().all(|event| event.run() != terminal.run()) {
+            debug_assert!(deferred.len() < MAX_DEFERRED_TERMINALS);
+            deferred.push(terminal.clone());
+        }
     }
     /// the document. A run submitted without a model has no entry and is
     /// skipped without touching the configuration.
     ///
-    /// The map entry is consumed on every call, terminal or not, so a
-    /// client that abandons the stream cannot leave a stale attribution
-    /// behind for a later run. Recording is applied to the in-memory
+    /// The map entry is consumed on the first successful attribution, so a
+    /// watcher/SSE race cannot double-count and an abandoned stream does not
+    /// retain usage forever. Recording is applied to the in-memory
     /// document first, so a failed save leaves usage visible in `GET
     /// /config` and is reported on stderr rather than discarded; the run
     /// itself has already finished and its outcome is never retracted.
@@ -1020,6 +1393,38 @@ impl Server {
         if let Err(error) = self.persist(&config) {
             eprintln!("nexus-server: configuration could not be saved ({error})");
         }
+    }
+}
+
+fn try_acquire_watcher(watchers: &AtomicUsize) -> bool {
+    let mut count = watchers.load(Ordering::Acquire);
+    loop {
+        if count >= MAX_COMPLETION_WATCHERS {
+            return false;
+        }
+        match watchers.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return true,
+            Err(observed) => count = observed,
+        }
+    }
+}
+
+struct WatcherGuard(Arc<AtomicUsize>);
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Releases the session's exclusive SSE attachment on every return and
+/// unwind path, including socket write failures.
+struct SubscriberGuard<'a>(&'a Mutex<bool>);
+
+impl Drop for SubscriberGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().expect("stream flag lockable") = false;
     }
 }
 
@@ -1126,6 +1531,50 @@ fn optional_text<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, Resp
             &json::error_body("selection field is not text"),
         )),
     }
+}
+
+/// Resolves a submit request's optional `provider`/`model` fields against
+/// the selection a session was bound to at creation.
+///
+/// An omitted field uses the binding, so the return value is the bound model
+/// id whose use the terminal event records (or `None` when the session is
+/// unbound or bound to a provider default). Any field that names something
+/// other than the binding is refused (`400`): the session's adapter is fixed
+/// at creation, so accepting a different value could only misattribute the
+/// run. A demo session therefore refuses every live selection rather than
+/// recording a model that never executed.
+fn resolve_selection(
+    bound_provider: Option<&str>,
+    bound_model: Option<&str>,
+    body: &Value,
+) -> Result<Option<String>, Response> {
+    let provider_field = optional_text(body, "provider")?;
+    let model_field = optional_text(body, "model")?;
+    let Some(bound_provider) = bound_provider else {
+        return if provider_field.is_none() && model_field.is_none() {
+            Ok(None)
+        } else {
+            Err(selection_mismatch())
+        };
+    };
+    if provider_field.is_some_and(|requested| requested != bound_provider) {
+        return Err(selection_mismatch());
+    }
+    match model_field {
+        None => Ok(bound_model.map(str::to_owned)),
+        Some(requested) if bound_model == Some(requested) => Ok(bound_model.map(str::to_owned)),
+        Some(_) => Err(selection_mismatch()),
+    }
+}
+
+/// The refusal for a submit selection that contradicts the session binding.
+/// Static: no caller text is echoed, and the message names neither the
+/// requested nor the bound identity.
+fn selection_mismatch() -> Response {
+    json_response(
+        400,
+        &json::error_body("submit selection conflicts with the session binding"),
+    )
 }
 
 /// Builds a runtime reply body with its HTTP status.
@@ -1354,72 +1803,65 @@ mod tests {
         }
     }
 
-    /// A submit without selection fields is not a selection request at all:
-    /// the demo wiring serves it and nothing is recorded against it. This is
-    /// the path every pre-configuration client uses.
+    /// An unbound session records nothing, while a bound session records its
+    /// own model even when the request omits the selection fields.
     #[test]
-    fn submit_without_selection_records_nothing() {
-        let (server, _runtime) = server_with_gated_config();
+    fn omitted_selection_uses_the_session_binding() {
         // `Response` has no `Debug`, so the outcome is matched rather than
         // unwrapped through `expect`.
-        match server.select_model(&submit_body(None, None)) {
-            Ok(model) => assert_eq!(model, None, "no selection names no model"),
+        match resolve_selection(None, None, &submit_body(None, None)) {
+            Ok(model) => assert_eq!(model, None, "the demo wiring names no model"),
             Err(response) => panic!("no selection is never refused: {}", response.status),
+        }
+        match resolve_selection(Some("gated"), Some("gated-fast"), &submit_body(None, None)) {
+            Ok(model) => assert_eq!(model.as_deref(), Some("gated-fast")),
+            Err(response) => panic!("omitted fields use the binding: {}", response.status),
         }
     }
 
-    /// Every unresolvable selection is refused as a readiness failure, not
-    /// as invalid input, and the diagnostic names only the provider id.
+    /// A session whose selected provider credential cannot resolve fails at
+    /// creation as a readiness failure, so no run can be minted against it.
     #[test]
-    fn unresolvable_selections_are_refused_as_not_ready() {
+    fn a_session_with_an_unresolvable_credential_is_not_ready() {
         let (server, _runtime) = server_with_gated_config();
-        for body in [
-            submit_body(None, Some("gated-fast")),
-            submit_body(Some("gated"), Some("gated-fast")),
-            submit_body(Some("gated"), None),
-        ] {
-            let response = server
-                .select_model(&body)
-                .expect_err("an unresolvable credential cannot be selected");
-            assert_eq!(response.status, 503, "{body}");
-            let reported = serde_json::from_slice::<Value>(&response.body).expect("JSON body");
-            let message = reported["error"].as_str().expect("diagnostic");
-            assert!(message.contains("gated"), "names the provider: {message}");
+        for (provider, model) in [(Some("gated"), Some("gated-fast")), (Some("gated"), None)] {
+            let error = server
+                .create_session_with(provider, model)
+                .expect_err("an unresolvable credential cannot be bound");
+            assert_eq!(error.status(), 503, "{provider:?}/{model:?}");
             assert!(
-                !message.contains("NEXUS_SERVER_UNIT_ABSENT_7C1E"),
-                "carries no credential detail: {message}"
+                !error.message().contains("NEXUS_SERVER_UNIT_ABSENT_7C1E"),
+                "carries no credential detail: {}",
+                error.message()
             );
         }
     }
 
-    /// Unknown identities and an inconsistent pair are invalid input, which
-    /// is a different status and a different remedy from not-ready: the
+    /// Unknown identities and an inconsistent pair are invalid input at
+    /// creation, which is a different status and remedy from not-ready: the
     /// request itself must change, not the environment.
     #[test]
-    fn unknown_or_inconsistent_selections_are_invalid_input() {
+    fn unknown_or_inconsistent_creation_selections_are_invalid_input() {
         let (server, _runtime) = server_with_gated_config();
-        for body in [
-            submit_body(Some("absent"), None),
-            submit_body(None, Some("absent")),
-            submit_body(Some("absent"), Some("gated-fast")),
-            submit_body(Some("gated"), Some("absent")),
-            // A present-but-non-string field is malformed input, not an
-            // absent selection.
-            serde_json::json!({ "input": "t", "model": 12 }),
-            serde_json::json!({ "input": "t", "provider": ["gated"] }),
+        for (provider, model) in [
+            (Some("absent"), None),
+            (Some("gated"), Some("absent")),
+            (Some("absent"), Some("gated-fast")),
+            (None, Some("gated-fast")),
         ] {
-            let response = server
-                .select_model(&body)
-                .expect_err("an unknown identity cannot be selected");
-            assert_eq!(response.status, 400, "{body}");
+            let error = server
+                .create_session_with(provider, model)
+                .expect_err("an unknown identity cannot be bound");
+            assert_eq!(error.status(), 400, "{provider:?}/{model:?}");
         }
     }
 
-    /// A model that belongs to a different provider is refused rather than
-    /// resolved through whichever field happened to be read first: a
-    /// selection that silently contradicts itself is not a selection.
+    /// A model that belongs to a different provider is refused at creation
+    /// rather than resolved through whichever field happened to be read
+    /// first: a selection that silently contradicts itself is not a
+    /// selection.
     #[test]
-    fn a_model_from_another_provider_is_refused() {
+    fn a_model_from_another_provider_is_refused_at_creation() {
         let mut config = gated_config();
         config
             .add_provider(
@@ -1445,10 +1887,42 @@ mod tests {
         let mut server = Server::new(runtime.handle().clone());
         server.set_config(config, None);
 
-        let response = server
-            .select_model(&submit_body(Some("gated"), Some("second-fast")))
+        let error = server
+            .create_session_with(Some("gated"), Some("second-fast"))
             .expect_err("the pair contradicts itself");
-        assert_eq!(response.status, 400);
+        assert_eq!(error.status(), 400);
+    }
+
+    /// A submit selection that contradicts the session binding is refused,
+    /// including any live selection on a demo session. A malformed
+    /// (non-string) field is refused rather than read as absent.
+    #[test]
+    fn a_submit_selection_that_conflicts_with_the_binding_is_refused() {
+        for body in [
+            submit_body(Some("other"), None),
+            submit_body(Some("gated"), Some("other")),
+            submit_body(None, Some("other")),
+        ] {
+            let response = resolve_selection(Some("gated"), Some("gated-fast"), &body)
+                .expect_err("a conflicting selection cannot run");
+            assert_eq!(response.status, 400, "{body}");
+        }
+        for body in [
+            submit_body(Some("gated"), None),
+            submit_body(None, Some("gated-fast")),
+        ] {
+            let response = resolve_selection(None, None, &body)
+                .expect_err("the demo wiring has no live model to record");
+            assert_eq!(response.status, 400, "{body}");
+        }
+        for body in [
+            serde_json::json!({ "input": "t", "model": 12 }),
+            serde_json::json!({ "input": "t", "provider": ["gated"] }),
+        ] {
+            let response = resolve_selection(Some("gated"), Some("gated-fast"), &body)
+                .expect_err("a non-string selection field is malformed");
+            assert_eq!(response.status, 400, "{body}");
+        }
     }
 
     /// Recording is idempotent per run because the map entry is consumed on
@@ -1501,6 +1975,155 @@ mod tests {
                 .recent()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn idle_session_cleanup_waits_for_expiry_and_external_owners() {
+        let (server, _runtime) = server_with_gated_config();
+        let token = server.create_session().expect("demo session creates");
+        let mut sessions = server.sessions.lock().expect("sessions lockable");
+        let entry = sessions.get(&token).expect("session is registered").clone();
+        let old = Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+        *entry.last_activity.lock().expect("activity lockable") = old;
+
+        server.remove_idle_sessions(&mut sessions, Instant::now());
+        assert!(
+            sessions.contains_key(&token),
+            "live Arc owner prevents removal"
+        );
+
+        drop(entry);
+        server.remove_idle_sessions(&mut sessions, Instant::now());
+        assert!(
+            !sessions.contains_key(&token),
+            "expired idle session is reclaimed"
+        );
+    }
+
+    #[test]
+    fn session_admission_rejects_excess_without_evicting_existing_sessions() {
+        let (server, _runtime) = server_with_gated_config();
+        let mut admitted = Vec::with_capacity(MAX_SESSIONS);
+        for _ in 0..MAX_SESSIONS {
+            admitted.push(server.create_session().expect("session is under the cap"));
+        }
+        let error = server
+            .create_session_with(None, None)
+            .expect_err("session admission is bounded");
+        assert_eq!(error.status(), 503);
+        assert_eq!(
+            server.sessions.lock().expect("sessions lockable").len(),
+            MAX_SESSIONS,
+            "rejection does not evict an existing session"
+        );
+    }
+
+    #[test]
+    fn idle_cleanup_retains_a_runtime_with_active_work() {
+        let (server, _runtime) = server_with_gated_config();
+        let token = server.create_session().expect("demo session creates");
+        let session = server.session(&token).expect("session is registered");
+        let command = SubmitCommand::new(
+            session.request_id(),
+            session.session.clone(),
+            "active cleanup fixture",
+            WEB_PROFILE,
+        )
+        .expect("valid fixture command");
+        let runtime = session.runtime.lock().expect("runtime lockable");
+        let accepted = server.handle.block_on(runtime.submit(command));
+        assert_eq!(accepted.reply(), CommandReply::Accepted);
+        let run = accepted.run().expect("accepted run has identity").clone();
+        drop(runtime);
+        *session.last_run.lock().expect("last run lockable") = Some(run.clone());
+        *session.last_activity.lock().expect("activity lockable") =
+            Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+        drop(session);
+
+        let mut sessions = server.sessions.lock().expect("sessions lockable");
+        server.remove_idle_sessions(&mut sessions, Instant::now());
+        assert!(
+            sessions.contains_key(&token),
+            "active runtime is never evicted"
+        );
+        let session = sessions.get(&token).expect("retained session").clone();
+
+        let cancel = nexus_core::CancelCommand {
+            request: session.request_id(),
+            run,
+        };
+        let runtime = session.runtime.lock().expect("runtime lockable");
+        let _ = server.handle.block_on(runtime.cancel(cancel));
+    }
+
+    #[test]
+    fn pending_events_respect_the_count_budget_and_use_one_overflow_reserve() {
+        let run = RunId::new("pending-cap").expect("valid run");
+        let session = SessionId::new("pending-session").expect("valid session");
+        let request = RequestId::new("pending-request").expect("valid request");
+        let mut pending = PendingEvents::default();
+        for seq in 0..MAX_PENDING_EVENTS as u64 {
+            let event = nexus_core::RunEvent::new(
+                session.clone(),
+                run.clone(),
+                seq,
+                nexus_core::EventPayload::RunStarted {
+                    request: request.clone(),
+                },
+            );
+            assert!(pending.push(event), "ordinary event {seq} fits");
+        }
+        let reserve = nexus_core::RunEvent::new(
+            session,
+            run,
+            MAX_PENDING_EVENTS as u64,
+            nexus_core::EventPayload::RunStarted { request },
+        );
+        assert!(
+            !pending.push(reserve),
+            "reserve signals stream backpressure"
+        );
+        assert_eq!(pending.events.len(), MAX_PENDING_EVENTS);
+        assert!(pending.overflow.is_some(), "received event is retained");
+        assert!(
+            pending
+                .overflow
+                .as_ref()
+                .is_some_and(|(_, bytes)| *bytes <= MAX_PENDING_OVERFLOW_BYTES),
+            "reserve event fits the declared byte ceiling"
+        );
+        assert!(
+            !pending.can_receive_more(),
+            "no more channel reads are permitted"
+        );
+    }
+
+    #[test]
+    fn pending_event_bytes_respect_the_byte_budget_and_retain_the_overflow() {
+        let run = RunId::new("pending-bytes").expect("valid run");
+        let session = SessionId::new("pending-byte-session").expect("valid session");
+        let turn = TurnId::new("pending-byte-turn").expect("valid turn");
+        let text = "x".repeat(nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES);
+        let mut pending = PendingEvents::default();
+        let mut overflowed = false;
+        for seq in 0..MAX_PENDING_EVENTS as u64 {
+            let payload = nexus_core::AssistantText::new(turn.clone(), "item", text.clone())
+                .expect("maximum permitted fragment builds");
+            let event = nexus_core::RunEvent::new(
+                session.clone(),
+                run.clone(),
+                seq,
+                nexus_core::EventPayload::AssistantTextDelta(payload),
+            );
+            if !pending.push(event) {
+                overflowed = true;
+                break;
+            }
+        }
+        assert!(overflowed, "byte cap activates before the event-count cap");
+        assert!(pending.bytes <= MAX_PENDING_BYTES);
+        assert!(pending.overflow.is_some(), "overflow event remains owned");
+        assert!(!pending.can_receive_more());
     }
 
     /// The favourites handlers answer with the resulting list, so a client

@@ -3,8 +3,9 @@
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nexus_core::{
     EffectState, ErrorCategory, Evidence, ExecutionStatus, M0_REVISION, RetryGuidance, ToolCall,
@@ -13,6 +14,11 @@ use nexus_core::{
 
 pub const HOST_EXEC_TOOL: &str = "host_exec";
 const OUTPUT_LIMIT: usize = 65_536;
+const CLEANUP_GRACE: Duration = Duration::from_millis(250);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const DRAIN_QUANTUM: usize = 64 * 1024;
+const MAX_PROBE_OWNERS: usize = 4;
+static PROBE_OWNERS: AtomicUsize = AtomicUsize::new(0);
 const EXEC_SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}},"required":["argv"],"additionalProperties":false}"#;
 
 /// Sandboxed executor used by the real-tools composition roots.
@@ -102,17 +108,71 @@ impl SandboxedExecutor {
     // unsandboxed execution if isolation fails.
     fn probe(&mut self) {
         if self.sandbox_available() {
+            let Some(probe_slot) = ProbeSlot::acquire() else {
+                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
+                return;
+            };
+            let mut probe_slot = Some(probe_slot);
             let mut probe = self.command(&["/usr/bin/true"], None);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                probe.process_group(0);
+            }
             self.configure_environment(&mut probe);
             match probe
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
+                .spawn()
             {
-                Ok(status) if status.success() => {}
-                Ok(_) => self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed),
-                Err(_) => self.backend = Backend::Unavailable(SandboxFailure::LaunchFailed),
+                Ok(mut child) => {
+                    let deadline = Instant::now() + PROBE_TIMEOUT;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) if status.success() => {
+                                drop(probe_slot.take());
+                                break;
+                            }
+                            Ok(Some(_)) => {
+                                drop(probe_slot.take());
+                                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
+                                break;
+                            }
+                            Err(_) => {
+                                terminate_process_group(&mut child);
+                                let slot = probe_slot.take().expect("probe slot is owned");
+                                thread::spawn(move || {
+                                    let _slot = slot;
+                                    retain_probe_child_until_reaped(child);
+                                });
+                                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
+                                break;
+                            }
+                            Ok(None) if Instant::now() < deadline => {
+                                thread::sleep(Duration::from_millis(10))
+                            }
+                            Ok(None) => {
+                                terminate_process_group(&mut child);
+                                if wait_bounded(&mut child, CLEANUP_GRACE).is_none() {
+                                    let slot = probe_slot.take().expect("probe slot is owned");
+                                    thread::spawn(move || {
+                                        let _slot = slot;
+                                        retain_probe_child_until_reaped(child);
+                                    });
+                                } else {
+                                    drop(probe_slot.take());
+                                }
+                                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    drop(probe_slot.take());
+                    self.backend = Backend::Unavailable(SandboxFailure::LaunchFailed);
+                }
             }
         }
     }
@@ -203,44 +263,118 @@ impl SandboxedExecutor {
             }
         })?;
         let mut child = command.spawn().map_err(|_| Failure::Spawn)?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let out_reader = thread::spawn(move || read_bounded(stdout, OUTPUT_LIMIT));
-        let err_reader = thread::spawn(move || read_bounded(stderr, OUTPUT_LIMIT));
-        let status = loop {
-            if context.check_active().is_err() {
-                let cancelled = context.is_cancelled();
-                terminate_process_group(&mut child);
-                let _ = child.wait();
-                let _ = out_reader.join();
-                let _ = err_reader.join();
-                return Err(if cancelled {
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stdout_nonblocking = set_nonblocking(&stdout).is_ok();
+        let stderr_nonblocking = set_nonblocking(&stderr).is_ok();
+        if !stdout_nonblocking || !stderr_nonblocking {
+            abort_unreadable_pipes(&mut child, stdout, stderr);
+            return Err(Failure::Output);
+        }
+        let mut out = CapturedOutput::new(OUTPUT_LIMIT);
+        let mut err = CapturedOutput::new(OUTPUT_LIMIT);
+        let mut status = None;
+        let mut cleanup_deadline = None;
+        let mut interruption = None;
+        loop {
+            if interruption.is_none() && context.check_active().is_err() {
+                interruption = Some(if context.is_cancelled() {
                     Failure::Cancelled
                 } else {
                     Failure::TimedOut
                 });
+                terminate_process_group(&mut child);
             }
-            if let Some(status) = child.try_wait().map_err(|_| Failure::Wait)? {
-                break status;
+            if status.is_none() {
+                status = match child.try_wait() {
+                    Ok(status) => status,
+                    Err(_) => {
+                        terminate_process_group(&mut child);
+                        retain_child_until_reaped(&mut child, &mut stdout, &mut stderr);
+                        return Err(Failure::Wait);
+                    }
+                };
+                if status.is_some() {
+                    // Stop remaining members of the original group as soon as the
+                    // direct leader exits; pipe closure alone cannot establish that
+                    // a descendant has stopped executing.
+                    terminate_process_group(&mut child);
+                    cleanup_deadline = Some(Instant::now() + CLEANUP_GRACE);
+                }
             }
-            thread::sleep(Duration::from_millis(20));
-        };
-        let (out, out_cut) = out_reader
-            .join()
-            .map_err(|_| Failure::Output)?
-            .map_err(|_| Failure::Output)?;
-        let (err, err_cut) = err_reader
-            .join()
-            .map_err(|_| Failure::Output)?
-            .map_err(|_| Failure::Output)?;
-        let mut text = String::from_utf8_lossy(&out).into_owned();
-        if !err.is_empty() {
+            if drain_pipe(&mut stdout, &mut out).is_err()
+                || drain_pipe(&mut stderr, &mut err).is_err()
+            {
+                terminate_process_group(&mut child);
+                retain_child_until_reaped(&mut child, &mut stdout, &mut stderr);
+                return Err(Failure::Output);
+            }
+            if status.is_some() && out.eof && err.eof {
+                break;
+            }
+            if cleanup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                // A descendant may have escaped the process group while keeping a
+                // pipe open. Keep this tool worker alive (and quarantinable) until
+                // the inherited descriptors close; do not abandon pipe ownership.
+                while !out.eof || !err.eof {
+                    if drain_pipe(&mut stdout, &mut out).is_err()
+                        || drain_pipe(&mut stderr, &mut err).is_err()
+                    {
+                        // A read error is not EOF and does not prove that a
+                        // descendant released the pipe. Retain ownership
+                        // through the common cleanup path until both pipes
+                        // close; the runtime may quarantine this worker.
+                        retain_child_until_reaped(&mut child, &mut stdout, &mut stderr);
+                        return Err(Failure::Output);
+                    }
+                    if !out.eof || !err.eof {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                break;
+            }
+            let timeout = rustix::event::Timespec {
+                tv_sec: 0,
+                tv_nsec: 10_000_000,
+            };
+            let mut fds = Vec::with_capacity(2);
+            if !out.eof {
+                fds.push(rustix::event::PollFd::new(
+                    &stdout,
+                    rustix::event::PollFlags::IN,
+                ));
+            }
+            if !err.eof {
+                fds.push(rustix::event::PollFd::new(
+                    &stderr,
+                    rustix::event::PollFlags::IN,
+                ));
+            }
+            if fds.is_empty() {
+                thread::sleep(Duration::from_millis(10));
+            } else if let Err(error) = rustix::event::poll(&mut fds, Some(&timeout))
+                && error != rustix::io::Errno::INTR
+            {
+                terminate_process_group(&mut child);
+                retain_child_until_reaped(&mut child, &mut stdout, &mut stderr);
+                return Err(Failure::Output);
+            }
+        }
+        let status = status.ok_or(Failure::Wait)?;
+        if let Some(interruption) = interruption {
+            return Err(interruption);
+        }
+        if !out.eof || !err.eof {
+            return Err(Failure::Output);
+        }
+        let mut text = String::from_utf8_lossy(&out.bytes).into_owned();
+        if !err.bytes.is_empty() {
             if !text.is_empty() {
                 text.push('\n');
             }
-            text.push_str(&String::from_utf8_lossy(&err));
+            text.push_str(&String::from_utf8_lossy(&err.bytes));
         }
-        let mut truncated = out_cut || err_cut;
+        let mut truncated = out.truncated || err.truncated || !out.eof || !err.eof;
         if text.len() > context.output_budget_bytes() {
             let mut end = context.output_budget_bytes();
             while !text.is_char_boundary(end) {
@@ -351,12 +485,147 @@ fn configure_environment(command: &mut Command, root: &Path) {
         .env("HOME", "/nonexistent");
 }
 
-fn read_bounded(reader: impl Read, limit: usize) -> IoResult<(Vec<u8>, bool)> {
-    let mut bytes = Vec::with_capacity(limit.min(8192));
-    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    let cut = bytes.len() > limit;
-    bytes.truncate(limit);
-    Ok((bytes, cut))
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+    truncated: bool,
+    eof: bool,
+}
+
+impl CapturedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8192)),
+            limit,
+            truncated: false,
+            eof: false,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_nonblocking(file: &impl std::os::fd::AsFd) -> rustix::io::Result<()> {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let flags = fcntl_getfl(file)?;
+    fcntl_setfl(file, flags | OFlags::NONBLOCK)
+}
+
+#[cfg(not(unix))]
+fn set_nonblocking(_: &impl std::os::fd::AsFd) -> IoResult<()> {
+    Ok(())
+}
+
+fn drain_pipe(reader: &mut impl Read, output: &mut CapturedOutput) -> IoResult<()> {
+    let mut buffer = [0_u8; 8192];
+    let mut drained = 0;
+    while drained < DRAIN_QUANTUM {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                output.eof = true;
+                return Ok(());
+            }
+            Ok(count) => {
+                drained += count;
+                let remaining = output.limit.saturating_sub(output.bytes.len());
+                let retain = remaining.min(count);
+                output.bytes.extend_from_slice(&buffer[..retain]);
+                output.truncated |= retain < count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            // Let the owner re-check cancellation/deadlines instead of
+            // retrying indefinitely inside one drain quantum.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_bounded(
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => return None,
+        }
+    }
+}
+
+fn retain_child_until_reaped(
+    child: &mut std::process::Child,
+    stdout: &mut impl Read,
+    stderr: &mut impl Read,
+) {
+    loop {
+        let mut out = CapturedOutput::new(0);
+        let mut err = CapturedOutput::new(0);
+        let _ = drain_pipe(stdout, &mut out);
+        let _ = drain_pipe(stderr, &mut err);
+        if cleanup_complete(
+            child.try_wait().is_ok_and(|status| status.is_some()),
+            out.eof,
+            err.eof,
+        ) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn retain_process_until_reaped(child: &mut std::process::Child) {
+    loop {
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn abort_unreadable_pipes(child: &mut std::process::Child, stdout: impl Read, stderr: impl Read) {
+    terminate_process_group(child);
+    // Never read a descriptor whose nonblocking setup failed: it may block
+    // forever while a descendant owns its write end. Closing our read ends
+    // makes writers observe a closed pipe; keep direct-child ownership until
+    // it is reaped so the runtime can quarantine this worker if necessary.
+    drop(stdout);
+    drop(stderr);
+    retain_process_until_reaped(child);
+}
+
+fn cleanup_complete(child_exited: bool, stdout_eof: bool, stderr_eof: bool) -> bool {
+    child_exited && stdout_eof && stderr_eof
+}
+
+fn retain_probe_child_until_reaped(mut child: std::process::Child) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+struct ProbeSlot;
+
+impl ProbeSlot {
+    fn acquire() -> Option<Self> {
+        PROBE_OWNERS
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_PROBE_OWNERS).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        PROBE_OWNERS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -403,13 +672,8 @@ fn sbpl_quote(value: &str) -> String {
 
 #[cfg(unix)]
 fn terminate_process_group(child: &mut std::process::Child) {
-    let group = format!("-{}", child.id());
-    let killer = if cfg!(target_os = "macos") {
-        "/bin/kill"
-    } else {
-        "/usr/bin/kill"
-    };
-    let _ = Command::new(killer).args(["-KILL", "--", &group]).status();
+    let group = rustix::process::Pid::from_child(child);
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     let _ = child.kill();
 }
 
@@ -540,5 +804,79 @@ impl ToolPort for SandboxedExecutor {
                 )
                 .expect("static outcome")
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CapturedOutput, abort_unreadable_pipes, cleanup_complete, drain_pipe};
+    use std::io::{self, Cursor, Read};
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn output_limit_caps_retention_but_drain_continues_to_eof() {
+        let input = Cursor::new(b"abcdefghij".to_vec());
+        let mut output = CapturedOutput::new(4);
+        let mut input = input;
+        drain_pipe(&mut input, &mut output).unwrap();
+        assert_eq!(output.bytes, b"abcd");
+        assert!(output.truncated);
+        assert!(output.eof);
+        assert_eq!(input.position(), 10);
+    }
+
+    struct EndlessReader(usize);
+
+    impl Read for EndlessReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.0 += 1;
+            buffer.fill(b'x');
+            Ok(buffer.len())
+        }
+    }
+
+    #[test]
+    fn busy_pipe_drain_yields_after_its_fairness_quantum() {
+        let mut reader = EndlessReader(0);
+        let mut output = CapturedOutput::new(4);
+        drain_pipe(&mut reader, &mut output).unwrap();
+        assert_eq!(reader.0, 8);
+        assert_eq!(output.bytes, b"xxxx");
+        assert!(output.truncated);
+        assert!(!output.eof);
+    }
+
+    #[test]
+    fn cleanup_requires_child_exit_and_eof_on_both_pipes() {
+        assert!(!cleanup_complete(true, false, true));
+        assert!(!cleanup_complete(true, true, false));
+        assert!(!cleanup_complete(false, true, true));
+        assert!(cleanup_complete(true, true, true));
+    }
+
+    #[test]
+    fn unreadable_pipe_cleanup_closes_reads_without_blocking_drain() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("yes")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("test child starts");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        abort_unreadable_pipes(&mut child, stdout, stderr);
+        assert!(
+            child
+                .try_wait()
+                .expect("child status is readable")
+                .is_some()
+        );
     }
 }

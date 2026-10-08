@@ -33,7 +33,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,9 +45,9 @@ use nexus_config::{
     AgentMode, UserConfig, load as load_config, resolve_path, resolve_with, save as save_config,
 };
 use nexus_core::{
-    AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload, Limits,
-    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
-    RetryGuidance, RunEvent, RunId, SessionId,
+    AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload,
+    GetSnapshotCommand, Limits, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
+    ProviderPort, RequestId, RetryGuidance, RunEvent, RunId, SessionId,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
@@ -306,6 +306,10 @@ struct LiveSelection {
     /// through this flag; an unconfigured selection without it fails
     /// instead of silently demoing.
     demo: bool,
+    /// Selection captured immediately before submit and consumed by the
+    /// provider when this accepted run first invokes it.
+    pending_run: Option<Box<LiveSelection>>,
+    pending_run_id: Option<RunId>,
 }
 
 /// Shared handle between a slot's [`Frontend`] and its provider.
@@ -532,6 +536,8 @@ impl PerRunProvider {
             config: UserConfig::default_config(),
             active_model: None,
             demo: true,
+            pending_run: None,
+            pending_run_id: None,
         })))
     }
 
@@ -586,11 +592,7 @@ impl PerRunProvider {
         let mut current = self.current.lock().expect("demo provider lockable");
         if current.run.as_ref() != Some(request.run()) {
             current.run = Some(request.run().clone());
-            let selection = self
-                .binding
-                .lock()
-                .expect("live selection lockable")
-                .clone();
+            let selection = take_selection_for_run(&self.binding, request.run());
             current.provider = match resolve_live_adapter(&selection, env_credential) {
                 LiveResolve::Demo => ActiveProvider::Fake(FakeProvider::demo_two_turn()),
                 LiveResolve::Live(adapter) => ActiveProvider::Live(adapter),
@@ -613,6 +615,24 @@ impl PerRunProvider {
             }
         }
     }
+}
+
+fn take_selection_for_run(binding: &LiveHandle, run: &RunId) -> LiveSelection {
+    let mut binding = binding.lock().expect("live selection lockable");
+    if binding
+        .pending_run_id
+        .as_ref()
+        .is_some_and(|pending| pending != run)
+    {
+        binding.pending_run = None;
+        binding.pending_run_id = None;
+    }
+    let selection = binding
+        .pending_run
+        .take()
+        .map_or_else(|| binding.clone(), |snapshot| *snapshot);
+    binding.pending_run_id = None;
+    selection
 }
 
 /// Production composition over the startup configuration: the provider
@@ -683,6 +703,8 @@ fn runtime_with_tools(
         config: session_config.config.clone(),
         active_model: session_config.active_model.clone(),
         demo: session_config.demo,
+        pending_run: None,
+        pending_run_id: None,
     }));
     let provider = Arc::new(PerRunProvider::live(Arc::clone(&binding)));
     let (runtime, streams) = Runtime::try_new(config, provider, tools).map_err(io::Error::other)?;
@@ -973,6 +995,9 @@ struct Frontend {
     demo: bool,
     /// Currently selected model id, or `None` when none is configured.
     active_model: Option<String>,
+    /// Actual model identity captured for each accepted run. Terminal usage
+    /// is attributed from this map, never from the mutable picker selection.
+    run_models: HashMap<RunId, String>,
     /// Shared provider selection for this slot's runtime. `None` in unit
     /// tests (which use the demo-only wiring); production slots set it
     /// right after [`Frontend::with_config`] and refresh it on every
@@ -1005,6 +1030,7 @@ impl Frontend {
             config: UserConfig::default_config(),
             config_path: None,
             active_model: None,
+            run_models: HashMap::new(),
             demo: false,
             live: None,
             pending_session_cmds: Vec::new(),
@@ -1020,6 +1046,7 @@ impl Frontend {
             config: config.config,
             config_path: config.path,
             active_model: config.active_model,
+            run_models: HashMap::new(),
             demo: config.demo,
             ..Self::new(session)
         };
@@ -1040,11 +1067,87 @@ impl Frontend {
     /// without a production handle (unit tests).
     fn sync_live_binding(&mut self) {
         if let Some(binding) = &self.live {
-            *binding.lock().expect("live selection lockable") = LiveSelection {
+            let mut binding = binding.lock().expect("live selection lockable");
+            let pending_run = binding.pending_run.take();
+            let pending_run_id = binding.pending_run_id.take();
+            *binding = LiveSelection {
                 config: self.config.clone(),
                 active_model: self.active_model.clone(),
                 demo: self.demo,
+                pending_run,
+                pending_run_id,
             };
+        }
+    }
+
+    /// Freezes the current provider/model choice before dispatch. The
+    /// provider consumes this snapshot on its first call for the run.
+    fn prepare_run_selection(&mut self) -> bool {
+        if let Some(binding) = &self.live {
+            let mut binding = binding.lock().expect("live selection lockable");
+            // A pending snapshot belongs to a previously accepted run whose
+            // provider has not made its first call yet. A Busy submission
+            // must never replace that run's execution identity.
+            if binding.pending_run.is_some() {
+                return false;
+            }
+            let mut snapshot = binding.clone();
+            snapshot.pending_run = None;
+            snapshot.pending_run_id = None;
+            binding.pending_run = Some(Box::new(snapshot));
+            binding.pending_run_id = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_unaccepted_selection(&mut self, owns_pending: bool) {
+        if owns_pending && let Some(binding) = &self.live {
+            let mut binding = binding.lock().expect("live selection lockable");
+            binding.pending_run = None;
+            binding.pending_run_id = None;
+        }
+    }
+
+    fn bind_pending_selection(&mut self, run: &RunId) {
+        if let Some(binding) = &self.live {
+            let mut binding = binding.lock().expect("live selection lockable");
+            if binding.pending_run.is_some() {
+                binding.pending_run_id = Some(run.clone());
+            }
+        }
+    }
+
+    fn clear_unconsumed_selection(&mut self, run: &RunId) {
+        if let Some(binding) = &self.live {
+            let mut binding = binding.lock().expect("live selection lockable");
+            if binding.pending_run_id.as_ref() == Some(run) {
+                binding.pending_run = None;
+                binding.pending_run_id = None;
+            }
+        }
+    }
+
+    async fn clear_finalized_pending_selection(&mut self, runtime: &Runtime) {
+        let run = self.live.as_ref().and_then(|binding| {
+            binding
+                .lock()
+                .expect("live selection lockable")
+                .pending_run_id
+                .clone()
+        });
+        let Some(run) = run else {
+            return;
+        };
+        let command = GetSnapshotCommand {
+            request: self.next_request(),
+            run: run.clone(),
+        };
+        let (_, snapshot) = runtime.get_snapshot(command).await;
+        if snapshot.is_some_and(|snapshot| snapshot.lifecycle() != nexus_core::RunLifecycle::Active)
+        {
+            self.clear_unconsumed_selection(&run);
         }
     }
 
@@ -1297,8 +1400,8 @@ impl Frontend {
     /// convenience, so a document that cannot be read back or written must
     /// never take down a session that already produced its output. The
     /// in-memory document keeps the recorded use either way.
-    fn record_active_model_use(&mut self) {
-        let Some(id) = self.active_model.clone() else {
+    fn record_model_use(&mut self, run: &RunId) {
+        let Some(id) = self.run_models.remove(run) else {
             return;
         };
         if self.config.model(&id).is_none() {
@@ -1363,7 +1466,11 @@ impl Frontend {
                 self.state.clear_colon();
                 // The run completed, so this model is genuinely "used":
                 // record it before the notice history moves on.
-                self.record_active_model_use();
+                self.record_model_use(event.run());
+                // A run can be cancelled or fail before its provider's first
+                // call consumes the selection snapshot. Do not let that
+                // abandoned identity leak into the next accepted run.
+                self.clear_unconsumed_selection(event.run());
                 return true;
             }
         }
@@ -2062,13 +2169,27 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
 /// Applies a submit reply to the frontend. Only `Accepted` adopts the run
 /// identity and records the draft; `Busy`/rejections keep the draft and
 /// report the reply. Returns true when the draft was accepted.
-fn settle_submit(front: &mut Frontend, draft: &str, reply: &CommandResponse) -> bool {
+fn settle_submit(
+    front: &mut Frontend,
+    draft: &str,
+    reply: &CommandResponse,
+    owns_pending_selection: bool,
+) -> bool {
     if !front.adopt_accepted(reply) {
+        front.clear_unaccepted_selection(owns_pending_selection);
         front.state.notice(&format!(
             "submit not accepted ({:?}); draft preserved",
             reply.reply()
         ));
         return false;
+    }
+    if owns_pending_selection && let Some(run) = reply.run() {
+        front.bind_pending_selection(run);
+    }
+    if let Some(run) = reply.run()
+        && let Some(model) = front.active_model.clone()
+    {
+        front.run_models.insert(run.clone(), model);
     }
     front.state.record_submitted(draft);
     true
@@ -2362,8 +2483,10 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             ) {
                 Ok(command) => {
                     let draft = front.state.composer().to_owned();
+                    front.clear_finalized_pending_selection(runtime).await;
+                    let owns_pending_selection = front.prepare_run_selection();
                     let response = runtime.handle(command).await.0;
-                    if settle_submit(front, &draft, &response) {
+                    if settle_submit(front, &draft, &response, owns_pending_selection) {
                         let stashed = front.state.composer_take();
                         debug_assert_eq!(stashed, draft);
                     }
@@ -2620,8 +2743,9 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
             false,
         )
         .map_err(io::Error::other)?;
+        let owns_pending_selection = slot.front.prepare_run_selection();
         let reply = slot.runtime.handle(submit).await.0;
-        if settle_submit(&mut slot.front, DEMO_INPUT, &reply) {
+        if settle_submit(&mut slot.front, DEMO_INPUT, &reply, owns_pending_selection) {
             slot.front.state.notice("canned M0 submission accepted");
         }
     }
@@ -2874,8 +2998,9 @@ async fn headless(
         false,
     )
     .map_err(io::Error::other)?;
+    let owns_pending_selection = front.prepare_run_selection();
     let reply = runtime.handle(submit).await.0;
-    settle_submit(&mut front, DEMO_INPUT, &reply);
+    settle_submit(&mut front, DEMO_INPUT, &reply, owns_pending_selection);
 
     let timed_out = tokio::time::timeout(HEADLESS_TIMEOUT, async {
         let mut event_since_tick = false;
@@ -2964,7 +3089,7 @@ async fn apply_headless(runtime: &Runtime, front: &mut Frontend, events: Vec<Run
             front.state_rejected += 1;
         }
         if terminal {
-            front.record_active_model_use();
+            front.record_model_use(event.run());
             return true;
         }
     }
@@ -3278,7 +3403,7 @@ mod tests {
             CommandReply::Busy,
             Some(run_id("run-1")),
         );
-        assert!(!settle_submit(&mut front, "hi", &busy));
+        assert!(!settle_submit(&mut front, "hi", &busy, false));
         assert_eq!(front.state.composer(), "hi", "Busy preserves the draft");
         assert!(front.merger.active_run().is_none(), "Busy adopts nothing");
         assert!(
@@ -3295,7 +3420,7 @@ mod tests {
             CommandReply::Accepted,
             Some(run_id("run-2")),
         );
-        assert!(settle_submit(&mut front, "hi", &accepted));
+        assert!(settle_submit(&mut front, "hi", &accepted, false));
         assert_eq!(front.merger.active_run(), Some(&run_id("run-2")));
         assert!(
             front
@@ -3320,7 +3445,7 @@ mod tests {
         )
         .expect("valid submit builds");
         let reply = runtime.handle(submit).await.0;
-        assert!(settle_submit(&mut front, DEMO_INPUT, &reply));
+        assert!(settle_submit(&mut front, DEMO_INPUT, &reply, false));
 
         let mut interval = interval();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -3360,7 +3485,7 @@ mod tests {
         )
         .expect("valid submit builds");
         let reply = runtime.handle(submit).await.0;
-        assert!(settle_submit(&mut front, DEMO_INPUT, &reply));
+        assert!(settle_submit(&mut front, DEMO_INPUT, &reply, false));
         let unresolved = reconcile_after_stop(&runtime, &mut streams, &mut front, "quit").await;
         assert!(
             !unresolved,
@@ -3759,7 +3884,7 @@ mod cov_main_private {
         .expect("valid submit builds");
         let reply = runtime.handle(command).await.0;
         assert_eq!(reply.reply(), CommandReply::Accepted);
-        assert!(settle_submit(&mut front, "hi", &reply));
+        assert!(settle_submit(&mut front, "hi", &reply, false));
         assert_eq!(front.merger.active_run(), reply.run());
         assert_eq!(user_line_count(&front), 1, "the accepted draft is recorded");
 
@@ -3770,7 +3895,7 @@ mod cov_main_private {
         // adopts nothing, so no event can be attributed to it.
         front.state.composer_type('?');
         let orphan = CommandResponse::new(front.next_request(), CommandReply::Accepted, None);
-        assert!(settle_submit(&mut front, "?", &orphan));
+        assert!(settle_submit(&mut front, "?", &orphan, false));
         assert_eq!(
             front.merger.active_run(),
             reply.run(),
@@ -3790,7 +3915,7 @@ mod cov_main_private {
 
         let busy =
             CommandResponse::new(front.next_request(), CommandReply::Busy, Some(live.clone()));
-        assert!(!settle_submit(&mut front, &draft, &busy));
+        assert!(!settle_submit(&mut front, &draft, &busy, false));
         assert_eq!(front.state.composer(), "hi", "Busy preserves the draft");
         assert!(
             front.merger.active_run().is_none(),
@@ -3811,7 +3936,7 @@ mod cov_main_private {
             CommandReply::Rejected,
             Some(live.clone()),
         );
-        assert!(!settle_submit(&mut front, &draft, &rejected));
+        assert!(!settle_submit(&mut front, &draft, &rejected, false));
         assert_eq!(front.state.composer(), "hi", "a refusal preserves it too");
         assert!(front.merger.active_run().is_none());
         assert_eq!(user_line_count(&front), 0);
@@ -3831,7 +3956,7 @@ mod cov_main_private {
             CommandReply::Accepted,
             Some(live.clone()),
         );
-        assert!(settle_submit(&mut front, &retried, &accepted));
+        assert!(settle_submit(&mut front, &retried, &accepted, false));
         assert_eq!(front.merger.active_run(), Some(&live));
         assert_eq!(user_line_count(&front), 1, "recorded exactly once");
         assert_eq!(front.state.composer(), "h", "the draft is untouched");
@@ -4044,7 +4169,7 @@ mod cov_main_private {
         )
         .expect("valid submit builds");
         let reply = runtime.handle(submit).await.0;
-        assert!(settle_submit(&mut front, DEMO_INPUT, &reply));
+        assert!(settle_submit(&mut front, DEMO_INPUT, &reply, false));
         assert!(front.merger.active_run().is_some());
 
         // The user quits before any event has been merged.
@@ -4659,29 +4784,116 @@ mod cov_main_topup {
     }
 
     #[test]
-    fn terminal_outcome_records_the_active_model_and_saves_the_document() {
+    fn terminal_outcome_records_the_model_bound_to_the_run_and_saves_the_document() {
         let directory = temp_config_dir("terminal-save");
         let path = directory.join("config.json");
         let mut config = configured(3, &[], &[]);
         config.path = Some(path.clone());
         let (run, mut front) = frontend_with(config);
+        front.run_models.insert(run.clone(), "m1".to_owned());
         front.active_model = Some("m2".to_owned());
 
         assert!(front.apply_events(vec![started(&run, 0), finished(&run, 1)]));
         assert_eq!(
             front.config.recent().first().map(String::as_str),
-            Some("m2"),
-            "the completed run's model leads the recents"
+            Some("m1"),
+            "later picker changes do not alter run attribution"
         );
         let persisted = load_config(&path)
             .expect("the document is readable")
             .expect("it exists");
         assert_eq!(
             persisted.recent().first().map(String::as_str),
-            Some("m2"),
+            Some("m1"),
             "the usage was written back to the file the session loaded"
         );
         std::fs::remove_dir_all(&directory).expect("temporary directory removed");
+    }
+
+    #[test]
+    fn prepared_provider_selection_survives_picker_changes_before_first_call() {
+        let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
+        let binding = Arc::new(Mutex::new(LiveSelection {
+            config: front.config.clone(),
+            active_model: Some("m0".to_owned()),
+            demo: false,
+            pending_run: None,
+            pending_run_id: None,
+        }));
+        front.attach_live(binding.clone(), None);
+
+        front.prepare_run_selection();
+        front.select_model("m1");
+        assert!(
+            !front.prepare_run_selection(),
+            "a second submit cannot replace the pending run identity"
+        );
+        front.clear_unaccepted_selection(false);
+
+        let mut binding = binding.lock().expect("selection lockable");
+        let captured = binding.pending_run.take().expect("submit snapshot");
+        assert_eq!(captured.active_model.as_deref(), Some("m0"));
+        assert_eq!(binding.active_model.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn terminal_before_first_provider_call_clears_only_its_run_snapshot() {
+        let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
+        let binding = Arc::new(Mutex::new(LiveSelection {
+            config: front.config.clone(),
+            active_model: Some("m0".to_owned()),
+            demo: false,
+            pending_run: None,
+            pending_run_id: None,
+        }));
+        front.attach_live(binding.clone(), None);
+
+        assert!(front.prepare_run_selection());
+        let first = run_id("cancelled-before-provider");
+        let accepted = CommandResponse::new(
+            front.next_request(),
+            CommandReply::Accepted,
+            Some(first.clone()),
+        );
+        assert!(settle_submit(&mut front, "first", &accepted, true));
+        assert!(
+            binding
+                .lock()
+                .expect("selection lockable")
+                .pending_run_id
+                .as_ref()
+                == Some(&first)
+        );
+
+        assert!(front.apply_events(vec![finished(&first, 0)]));
+        let binding = binding.lock().expect("selection lockable");
+        assert!(binding.pending_run.is_none());
+        assert!(binding.pending_run_id.is_none());
+    }
+
+    #[test]
+    fn provider_discards_snapshot_owned_by_a_different_run() {
+        let mut selection = LiveSelection {
+            config: configured(2, &[], &[]).config,
+            active_model: Some("m1".to_owned()),
+            demo: false,
+            pending_run: None,
+            pending_run_id: None,
+        };
+        let mut stale = selection.clone();
+        stale.active_model = Some("m0".to_owned());
+        selection.pending_run = Some(Box::new(stale));
+        let first = run_id("first-run");
+        let next = run_id("next-run");
+        selection.pending_run_id = Some(first);
+        let binding = Arc::new(Mutex::new(selection));
+
+        let captured = take_selection_for_run(&binding, &next);
+
+        assert_eq!(captured.active_model.as_deref(), Some("m1"));
+        let binding = binding.lock().expect("selection lockable");
+        assert!(binding.pending_run.is_none());
+        assert!(binding.pending_run_id.is_none());
     }
 
     #[test]
@@ -4695,6 +4907,7 @@ mod cov_main_topup {
         );
         let (run, mut front) = frontend_with(config);
         front.active_model = Some("m1".to_owned());
+        front.run_models.insert(run.clone(), "m1".to_owned());
 
         assert!(
             front.apply_events(vec![started(&run, 0), finished(&run, 1)]),
@@ -6010,7 +6223,7 @@ mod cov_main_topup {
                 CommandReply::Accepted,
                 "each demo task is accepted, even after a previous run"
             );
-            assert!(settle_submit(&mut front, task, &reply));
+            assert!(settle_submit(&mut front, task, &reply, false));
             drain_until_settled(&mut front, &mut streams, &mut interval).await;
             let (run, notice) = front
                 .live_approval
@@ -6287,6 +6500,8 @@ mod cov_live_wiring {
             config,
             active_model: active_model.map(str::to_owned),
             demo: true,
+            pending_run: None,
+            pending_run_id: None,
         }
     }
 
@@ -6296,6 +6511,8 @@ mod cov_live_wiring {
             config: UserConfig::default_config(),
             active_model: None,
             demo: false,
+            pending_run: None,
+            pending_run_id: None,
         };
         let resolved = resolve_live_adapter(&selection, |_| Some("secret".to_owned()));
         assert!(
@@ -6319,6 +6536,8 @@ mod cov_live_wiring {
             config: UserConfig::default_config(),
             active_model: None,
             demo: true,
+            pending_run: None,
+            pending_run_id: None,
         };
         assert!(
             matches!(
@@ -6488,6 +6707,8 @@ mod cov_live_wiring {
             config,
             active_model: Some("m0".to_owned()),
             demo: true,
+            pending_run: None,
+            pending_run_id: None,
         };
         assert!(
             matches!(

@@ -62,6 +62,8 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.3 — Bound the provisional streaming and control pipeline
 
+**Follow-up status:** The current worktree wires configured event channel capacities, accounts for provisional payloads, validates/skips replayed usage, and retires undeliverable control outbox ownership after permanent channel closure. Regression tests cover usage-prefix replay, configured capacities, and close-during-finalization. Linux/provider-live validation is not claimed.
+
 **Findings:** P1.2, P2.5, P2.6. **Paths:** runtime `runtime.rs`, `protocol.rs`, `transport.rs`; OpenAI `provider.rs`; core provider/limit contracts only if necessary; associated tests. **Dependencies:** M1.2.
 
 - Inventory every queue, retained identity set, usage update, and aggregate batch. Establish explicit event-count and byte ceilings, including the TLS pump, provisional stream, and control outbox.
@@ -76,6 +78,8 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.4 — Own exec cleanup on every exit path
 
+**Implementation status: In progress.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If a descendant keeps a pipe open beyond cleanup, the exec worker retains ownership rather than returning; runtime timeout/cancellation quarantines that worker. The original process group is signalled, but escaped descendants that close inherited pipes cannot be proven terminated by this mechanism. Linux-specific sandbox execution and injected wait/read/probe failures remain unverified.
+
 **Findings:** P1.4. **Paths:** `crates/nexus-tools/src/exec.rs`, tool exec tests. **Dependencies:** none; validate together with M1.3 when both are integrated.
 
 - Introduce only a private exec resource guard or equivalent local ownership. Cover child spawn, wait failure, pipe-reader failure, deadline, cancellation, and normal completion.
@@ -88,6 +92,8 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.5 — Record TUI usage against the accepted run's model
 
+**Implementation status: Verified with race fix.** TUI submission snapshots the live provider selection before runtime dispatch; a second submission cannot replace or clear an already-pending accepted run's snapshot. Accepted run IDs retain their selected model for terminal usage recording, independent of subsequent picker changes. Busy/rejected submissions clear only a snapshot they own and do not create usage attribution. TUI configuration save failures remain transcript notices and do not alter run outcomes.
+
 **Findings:** P2.4. **Paths:** `crates/nexus-tui/src/main.rs`, TUI tests. **Dependencies:** none.
 
 - Capture the actual selection consistently with run acceptance and the per-run provider binding, not merely the display label when the terminal event arrives.
@@ -96,7 +102,38 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 **Acceptance/tests:** accept A, select B before the first provider invocation and during streaming, complete A, then submit B. Verify actual invocations and recent attribution. Rejected/busy submits create no attribution; terminal duplicates do not record twice; failed config saves remain visible without changing the run outcome.
 
+**Validation evidence:** `cargo fmt --all --check`; `cargo nextest run -p nexus-tui --locked --offline` (497 passed, 11 skipped); `cargo clippy -p nexus-tui --all-targets --locked --offline -- -D warnings` (passed). Regression coverage verifies the pre-provider selection snapshot and run-bound model attribution after the picker changes; no live-provider call was made.
+
 ### M1.6 — Bound server connections, sessions, and SSE lifecycle
+
+**Implementation status: Verified.** The binary admits at most 64
+connection threads and rejects additional sockets by closing them; the server
+admits at most 128 sessions and rejects excess creation with `503` rather than
+evicting session-owned runtime state, so at most 128 runtime runs can be active
+(one per session). HTTP request reads have a 60-second wall-clock deadline
+(30-second maximum per read), and socket writes have a
+30-second timeout. SSE subscriber ownership is released through an RAII guard
+on normal return, disconnect, and unwinding. Usage associations are capped at
+128, and registration is serialized with terminal attribution to close the
+completion-before-registration race; bound-model submissions are refused with
+`503` at capacity. SSE rejects unknown/evicted run ids before taking receiver
+ownership. Cross-run pending retention is capped at 4,096 events and 1 MiB per
+session, plus one overflow event reserve capped at 2 MiB; once saturated, the
+SSE stream closes with a backpressure comment and submissions are refused with
+`409` until retained events are drained. Deferred terminal records are capped
+at 128 per session and stop new run admission at the cap. Completion watchers
+are capped at 128 per server; if the watcher cap is full, the bounded
+association is reconciled on the next run or safe idle sweep. One minute
+housekeeping performs a 30-minute idle sweep; it reclaims only sessions with
+no in-flight request or subscriber and a finalized (or never-started) runtime.
+A bounded-per-session completion watcher observes finalized runs; usage is also settled before a
+newer run replaces its snapshot and during safe idle reclamation. It therefore
+does not require a client to consume the terminal SSE frame. Unknown or active
+runtime state is retained conservatively.
+
+Regression coverage includes connection/session saturation, retained-event
+count/byte ceilings, unknown-run subscriptions, expired/active session cleanup,
+SSE timeout installation, and a completed bound-model run with no SSE reader.
 
 **Findings:** P1.6. **Paths:** server `main.rs`, `http.rs`, `server.rs`, server tests. **Dependencies:** M1.2 for closed-stream integration; M1.1 for selection identity.
 
@@ -108,6 +145,22 @@ Task dependencies are listed below. Stage gates are the default integration orde
 **Acceptance/tests:** saturation and slow clients, client stops reading, invalid/unknown-run subscription, reconnect/closure, idle expiry, session cleanup while work remains active, and a run never streamed to completion. Verify limits and absence of orphaned subscribers or unbounded retained maps.
 
 ### M1.7 — Set the real-tool server trust contract
+
+**Implementation status: Verified.** D2 is resolved for this slice:
+the loopback server stays loopback-only; enabling real tools or configuring
+a live provider requires `--auth-token-env NAME` and a 32-byte bearer token
+encoded as 64 hexadecimal characters. Only the test-only fake demo may run
+without a token. The credential is server-wide and grants route access,
+including approval/denial; session IDs are not credentials. Host accepts only
+the bound-port `127.0.0.1` or `localhost`; optional Origin must be same-origin
+HTTP. No CORS or token-in-URL support is provided. This does not provide
+encryption or isolate mutually untrusted same-user processes. `auth_flows::real_tool_http_requires_bearer_and_rejects_untrusted_host_or_origin`
+verifies missing/invalid credentials, URL-token rejection, Host/Origin policy,
+and successful same-origin access; parser coverage verifies duplicate
+security/framing header rejection. Validation: `cargo fmt --all --check`,
+`cargo nextest run -p nexus-server --locked --offline` (149 passed), and
+`cargo clippy -p nexus-server --all-targets --locked --offline -- -D warnings`
+passed.
 
 **Findings:** P1.6. **Paths:** server entry/HTTP/route code and tests; security/setup documentation. **Dependencies:** explicit decision D2 below; M1.6 for integration.
 
@@ -257,7 +310,7 @@ These tasks are **deferred**, not prerequisites for current migration completion
 | Decision | Proposed minimum | Must be resolved before |
 | --- | --- | --- |
 | D1 — Selection/error compatibility | Server sessions remain bound; conflicting submit fields are rejected; omitted selection uses the binding. TUI accepted runs keep their actual model despite later UI changes. | M1.1/M1.5 behavior changes; specify default-model equivalence and attribution rules |
-| D2 — Real-tool server trust | Retain loopback exposure and establish minimal local caller/approver authorization; no OAuth/accounts or public listener. | M1.7; document token provisioning, browser access, demo exceptions, and startup compatibility |
+| D2 — Real-tool server trust | **Resolved for M1.7:** loopback-only; real tools or configured providers require `--auth-token-env`; fake demo may be unauthenticated; same-origin HTTP only; one server-wide bearer credential grants submit/approval/control; no OAuth/accounts or public listener. | M1.7 implemented and verified; see task evidence above |
 | D3 — File operation guarantees | A concrete supported platform access boundary plus separately specified update consistency; no universal capability framework. | M2.3; choose symlink/hardlink/permissions/identity semantics and residual concurrency limits |
 | D4 — API retirement | Remove/narrow a public legacy contract only after caller inventory and compatibility review; migrate meaningful tests. | M4.3 public API removal |
 | D5 — Effective budgets | Finite explicit event/byte/cleanup/server bounds; distinguish configurable limits from hard ceilings and keep terminal reserve. | M1.3/M1.4/M1.6; record chosen values and evidence, no silent widening |

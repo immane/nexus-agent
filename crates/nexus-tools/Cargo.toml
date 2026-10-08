@@ -17,3 +17,4 @@ nexus-core = { path = "../nexus-core" }
 # JSON for reading the admitted `{"path": ...}` arguments. No schema
 # framework is added here; schemas are validated at registration.
 serde_json = "1"
+rustix = { version = "1.1.5", features = ["event", "fs", "process"] }

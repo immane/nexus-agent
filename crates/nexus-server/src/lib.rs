@@ -5,8 +5,26 @@
 //! live stream. It is never real configuration: the demo wiring uses
 //! scripted [`nexus_fakes`] doubles (no provider credentials, no network
 //! egress beyond loopback, no stored sessions), and the server binds
-//! `127.0.0.1` only. There is no authentication: any local process can
-//! submit, approve, and cancel. Do not expose this server to a network.
+//! `127.0.0.1` only. Real tools and configured providers require a bearer
+//! credential; only the test-only fake demo may run unauthenticated. The
+//! credential holder can submit, approve, and cancel. Do not expose this
+//! server to a network.
+//! The binary caps concurrent connection threads at 64; sessions are capped
+//! at 128 and excess creation is rejected (`503`) rather than evicting
+//! runtime state. Requests have a 60-second total read deadline and writes
+//! have a 30-second timeout. These are resource bounds, not caller
+//! authentication or product security guarantees. Session removal and
+//! independent pending cross-run event bounds remain unresolved. Usage
+//! attribution is capped at 128 outstanding runs; new bound-model runs receive
+//! `503` until terminal events release entries. SSE subscriptions for unknown
+//! or no-longer-retained runs receive `404` before attaching.
+//! The binary sweeps sessions idle for 30 minutes once per minute, but only
+//! when no request/subscriber owns them and the runtime is confirmed finalized
+//! or has never started. Completed usage is settled before a subsequent run
+//! replaces the retained snapshot and during safe session reclamation.
+//! Cross-run SSE retention is bounded to 4,096 events / 1 MiB plus one
+//! 2 MiB overflow reserve per session; saturated streams close with a
+//! backpressure comment and run admission returns `409` until drained.
 //!
 //! # Protocol (v1, unstable, test-only)
 //!
@@ -57,11 +75,11 @@
 //! - `GET /config` -> `200` with the redacted summary: providers, models,
 //!   favourites, and recents. Credential *references* (variable names) are
 //!   included because the document cannot hold a value.
-//! - `POST /sessions/{sid}/runs` accepts optional `"provider"` and
-//!   `"model"`. An unknown identity, or a pair that disagrees about
-//!   ownership, is `400`. A selected provider whose credential does not
-//!   resolve is `503`; the diagnostic names only the provider id.
-//!   An accepted run records its model and, at its SSE terminal event,
+//! - Provider/model selection is fixed at `POST /sessions` session creation.
+//!   Submit may omit those fields or repeat the exact binding; conflicting
+//!   values and live selections on a demo session are `400`. A selected
+//!   provider whose credential does not resolve is `503` during creation.
+//!   An accepted run records its bound model and, at terminal completion,
 //!   marks that model recently used and saves the file. A failed save is
 //!   logged and never changes the run's outcome.
 //! - `POST /config/favourites` with `{"id": "<model id>"}` -> `200` with
@@ -91,6 +109,7 @@
 
 #![forbid(unsafe_code)]
 
+mod auth;
 pub mod http;
 pub mod json;
 pub mod server;

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Hardened transport-drop coverage: sequence integrity under data drops,
-//! required control delivery after a saturated control channel resumes, and
-//! truncation reporting — against the real runtime and the real fakes.
+//! Hardened transport coverage: sequence integrity under data drops, bounded
+//! usage publication, and truncation reporting — against the real runtime and
+//! the real fakes.
 //!
 //! Every test keeps both event receivers alive for the whole run and drains
 //! nothing until the runtime reports the run finalized through a snapshot.
@@ -13,18 +13,18 @@
 //! failure backstops only; assertions are on recorded invariants (sequence
 //! accounting, payload kinds, terminal outcomes), never on wall-clock timing.
 //!
-//! Existing coverage in `review_transport_bounds.rs` asserts that a saturated
-//! control channel still delivers its terminal and that a data flood keeps
-//! delivered sequences gap-free. The gaps hardened here are:
+//! Runtime unit tests cover saturated control-outbox delivery; these
+//! integration tests cover real provider/fake behavior. The gaps hardened
+//! here are:
 //! - a dropped presentation event must consume NO sequence number, proven by
 //!   exact accounting (dropped count, contiguous terminal sequence) instead
 //!   of the weaker "sequences look contiguous" bound;
 //! - control records published *after* the data channel started dropping must
 //!   still commit gap-free sequence numbers, which is the only place a hole
 //!   could hide behind a silent drop;
-//! - control-channel backpressure alone must NOT be reported as content
-//!   truncation, while a full data channel must be;
-//! - saturation must never violate channel discipline (required payloads on
+//! - a full data channel must be reported as content truncation;
+//! - bounded usage publication must never violate channel discipline
+//!   (required payloads on
 //!   control, presentation on data) as observed by the consumer;
 //! - undelivered required events must be provably retained, not dropped: the
 //!   runtime answers `Busy` for a new run while its control outbox still owns
@@ -39,15 +39,15 @@ use nexus_core::{
     RunLifecycle, RunOutcome, Snapshot, TurnFinished, Usage, UsageFinality,
 };
 use nexus_fakes::stop_turn;
-use nexus_runtime::{CONTROL_CAPACITY, DATA_CAPACITY};
+use nexus_runtime::DATA_CAPACITY;
 
 /// Presentation fragments in the data flood: above the locked 1,024-event data
 /// bound, so the channel provably saturates while no consumer is attached.
 const FRAGMENTS: usize = 1_200;
-/// Provisional usage records in the control flood: far above the locked
-/// 128-event control bound, so required control traffic provably buffers.
+/// Provisional usage records in the usage burst, above the runtime's bounded
+/// publication limit.
 const USAGE_RECORDS: u64 = 600;
-/// Interleaved fragment/usage pairs for the saturation-plus-tool run.
+/// Interleaved fragment/usage pairs for the data-drop-plus-tool run.
 const PAIRS: usize = 1_200;
 /// Presentation fragments in the control-saturation run: a handful, kept far
 /// below the data bound so data saturation is provably NOT part of that run.
@@ -153,24 +153,6 @@ async fn await_finalized(bed: &common::Bed, run: &RunId, tag: &str) -> Snapshot 
     })
     .await
     .expect("run finalizes while the consumer holds both event channels")
-}
-
-/// Asserts the runtime still OWNS undelivered required events rather than
-/// having dropped them: a new run is refused `Busy` and the refusal names the
-/// finished run, which is the control-outbox retention branch, not an
-/// active-run or quarantine refusal.
-async fn assert_required_events_retained(bed: &common::Bed, run: &RunId, tag: &str) {
-    let response = bed.runtime.submit(common::submit_cmd(tag)).await;
-    assert_eq!(
-        response.reply(),
-        CommandReply::Busy,
-        "undelivered required control events are retained, so no new run starts"
-    );
-    assert_eq!(
-        response.run(),
-        Some(run),
-        "the Busy names the run whose control events are still buffered"
-    );
 }
 
 /// A presentation flood of 1,200 fragments overflows the 1,024-event data
@@ -315,18 +297,15 @@ fn data_drops_consume_no_sequence_numbers() {
     });
 }
 
-/// A 600-record control flood exceeds the 128-event control bound by a wide
-/// margin while presentation traffic stays far below the data bound.
+/// A 600-record provisional-usage burst exercises the runtime's publication
+/// bound while presentation traffic stays far below the data bound.
 ///
 /// Control backpressure must not lose a single required record: every
-/// provisional counter arrives exactly once and in order, the merged final
-/// usage record and the terminal follow, exactly one terminal closes the run,
-/// and the resumed delivery is gap-free (the outbox commits its sequences in
-/// publication order). Control backpressure alone is NOT content truncation —
-/// only a full data channel is — so the snapshot stays untruncated here. Once
-/// the buffered events are drained the runtime accepts a new run.
+/// bounded provisional prefix arrives in order, the merged final usage record
+/// and terminal follow, and the resumed delivery is gap-free. The runtime
+/// control-outbox saturation contract is covered directly by runtime tests.
 #[test]
-fn saturated_control_delivers_every_record_after_resume() {
+fn provisional_usage_burst_is_bounded_and_terminal_survives_resume() {
     let rt = common::test_rt();
     rt.block_on(async {
         let mut turn = Vec::with_capacity(USAGE_RECORDS as usize + FEW_TEXTS + 1);
@@ -353,8 +332,6 @@ fn saturated_control_delivers_every_record_after_resume() {
             !snapshot.is_content_truncated(),
             "control backpressure is not presentation truncation: nothing was dropped from data"
         );
-        assert_required_events_retained(&bed, &run, "ctl-sat-probe").await;
-
         let (data, control, finished) =
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         assert_eq!(finished.outcome(), RunOutcome::Completed);
@@ -362,15 +339,10 @@ fn saturated_control_delivers_every_record_after_resume() {
         common::assert_single_terminal(&data, &control);
         assert_channel_discipline(&data, &control);
 
-        assert!(
-            control.len() > CONTROL_CAPACITY,
-            "the delivered control traffic genuinely exceeded its bound: {}",
-            control.len()
-        );
         assert_eq!(
             control.len(),
-            USAGE_RECORDS as usize + 3,
-            "RunStarted, every usage record, the merged final usage, and the terminal: none silently dropped"
+            19,
+            "RunStarted, 16 bounded usage updates, final usage, and terminal"
         );
         assert_eq!(
             common::count_payload(&data, &control, |payload| matches!(
@@ -380,8 +352,8 @@ fn saturated_control_delivers_every_record_after_resume() {
             1
         );
 
-        // Exact composition: every provisional counter exactly once, in order,
-        // followed by the terminal's final record.
+        // The bounded provisional prefix arrives in order, followed by the
+        // terminal's final record.
         let usages: Vec<Usage> = control
             .iter()
             .filter_map(|event| match event.payload() {
@@ -396,8 +368,8 @@ fn saturated_control_delivers_every_record_after_resume() {
             .collect();
         assert_eq!(
             provisional_records,
-            (1..=USAGE_RECORDS).collect::<Vec<u64>>(),
-            "no required control record is dropped or reordered by saturation"
+            (1..=16).collect::<Vec<u64>>(),
+            "the bounded usage prefix remains ordered"
         );
         let final_usage = usages.last().expect("usage records");
         assert_eq!(
@@ -419,7 +391,10 @@ fn saturated_control_delivers_every_record_after_resume() {
         );
 
         let terminal = control.last().expect("control events");
-        assert!(terminal.is_terminal(), "the terminal is the last control event");
+        assert!(
+            terminal.is_terminal(),
+            "the terminal is the last control event"
+        );
         assert_eq!(
             terminal.seq() as usize,
             data.len() + control.len() - 1,
@@ -431,17 +406,12 @@ fn saturated_control_delivers_every_record_after_resume() {
             "the snapshot names the terminal sequence"
         );
 
-        // Drained required events release the runtime: the next run is
-        // accepted and completes normally, proving saturation left no stuck
-        // state behind.
-        let next = bed
-            .runtime
-            .submit(common::submit_cmd("ctl-sat-next"))
-            .await;
+        // Once the finalized run has been drained, a new run is accepted.
+        let next = bed.runtime.submit(common::submit_cmd("ctl-sat-next")).await;
         assert_eq!(
             next.reply(),
             CommandReply::Accepted,
-            "a drained control outbox frees the single-run slot"
+            "draining the finalized run frees the single-run slot"
         );
         let next_run = next.run().cloned().expect("probe run issued");
         let (next_data, next_control, next_finished) =
@@ -449,7 +419,7 @@ fn saturated_control_delivers_every_record_after_resume() {
         assert_eq!(
             next_finished.outcome(),
             RunOutcome::Completed,
-            "the runtime serves a normal run after a saturation episode"
+            "the runtime serves a normal run after the usage burst"
         );
         assert_ne!(next_run, run, "the probe run has its own identity");
         common::assert_contiguous(&next_data, &next_control);
@@ -461,17 +431,15 @@ fn saturated_control_delivers_every_record_after_resume() {
     });
 }
 
-/// Both channels saturate at once while a real tool call executes, and the
-/// consumer's receivers stay alive for the whole run.
+/// The data channel saturates while a real tool call executes and provisional
+/// usage publication remains bounded.
 ///
 /// Saturation must not corrupt required delivery: the tool outcome pair is
 /// complete, control records keep committing gap-free sequence numbers after
 /// the data channel started dropping, and the terminal is delivered exactly
-/// once, last, with the snapshot naming its sequence. While the consumer lives
-/// the runtime still OWNS the undelivered events (a new run is `Busy`), which
-/// is the difference between a buffered droppable channel and a lost terminal.
+/// once, last, with the snapshot naming its sequence.
 #[test]
-fn terminal_survives_dual_saturation_while_the_consumer_lives() {
+fn terminal_survives_data_saturation_while_usage_stays_bounded() {
     let rt = common::test_rt();
     rt.block_on(async {
         let mut turn = Vec::with_capacity(PAIRS * 2 + 2);
@@ -504,8 +472,6 @@ fn terminal_survives_dual_saturation_while_the_consumer_lives() {
             snapshot.is_content_truncated(),
             "the full data channel is reported as content truncation"
         );
-        assert_required_events_retained(&bed, &run, "dual-sat-probe").await;
-
         let (data, control, finished) =
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         assert_eq!(finished.outcome(), RunOutcome::Completed);
@@ -526,17 +492,12 @@ fn terminal_survives_dual_saturation_while_the_consumer_lives() {
             "only presentation traffic was delivered"
         );
 
-        // Control: one required record per usage pair, the merged final usage
-        // record, the tool outcome pair, and the terminal.
-        assert!(
-            control.len() > CONTROL_CAPACITY,
-            "the delivered control traffic genuinely exceeded its bound: {}",
-            control.len()
-        );
+        // Control: RunStarted, at most 16 provisional usage updates, final
+        // usage, the tool outcome pair, and the terminal.
         assert_eq!(
             control.len(),
-            PAIRS + 5,
-            "every required control record survived dual saturation"
+            21,
+            "usage updates are bounded while tool outcomes and terminal survive"
         );
         let provisional_records: Vec<u64> = control
             .iter()
@@ -549,8 +510,8 @@ fn terminal_survives_dual_saturation_while_the_consumer_lives() {
             .collect();
         assert_eq!(
             provisional_records,
-            (1..=PAIRS as u64).collect::<Vec<u64>>(),
-            "no required control record is dropped or reordered"
+            (1..=16).collect::<Vec<u64>>(),
+            "the bounded provisional usage prefix stays ordered"
         );
 
         // The tool really executed while both channels were saturated, and its
@@ -602,28 +563,23 @@ fn terminal_survives_dual_saturation_while_the_consumer_lives() {
             "the snapshot names the terminal sequence"
         );
 
-        // Control records published after the last delivered fragment prove
-        // the drop window consumed no sequence numbers at all.
+        // Records published after the last delivered fragment prove the data
+        // drop window consumed no sequence numbers.
         let max_data_seq = data
             .iter()
             .map(nexus_core::RunEvent::seq)
             .max()
             .expect("presentation events");
-        // The tail beyond the delivered presentation block: one required
-        // record per pair whose fragment was dropped, the record sharing the
-        // last committed fragment's pair, and the four records published
-        // after the flood ended (the merged final usage record, the tool
-        // outcome pair, and the terminal). This is exactly where a hole would
-        // open if a drop had consumed a sequence number.
-        let dropped_pairs = PAIRS - DATA_CAPACITY;
+        // This is exactly where a hole would open if a dropped fragment had
+        // consumed a sequence number.
         let after_drop: Vec<&nexus_core::RunEvent> = control
             .iter()
             .filter(|event| event.seq() > max_data_seq)
             .collect();
         assert_eq!(
             after_drop.len(),
-            dropped_pairs + 5,
-            "every dropped fragment is followed by its own required record"
+            4,
+            "final usage, tool outcome pair, and terminal follow the data-drop window"
         );
         assert_eq!(
             after_drop[0].seq(),
