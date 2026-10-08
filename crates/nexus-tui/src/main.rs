@@ -33,7 +33,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -306,6 +306,9 @@ struct LiveSelection {
     /// through this flag; an unconfigured selection without it fails
     /// instead of silently demoing.
     demo: bool,
+    /// Selection captured immediately before submit and consumed by the
+    /// provider when this accepted run first invokes it.
+    pending_run: Option<Box<LiveSelection>>,
 }
 
 /// Shared handle between a slot's [`Frontend`] and its provider.
@@ -532,6 +535,7 @@ impl PerRunProvider {
             config: UserConfig::default_config(),
             active_model: None,
             demo: true,
+            pending_run: None,
         })))
     }
 
@@ -586,11 +590,13 @@ impl PerRunProvider {
         let mut current = self.current.lock().expect("demo provider lockable");
         if current.run.as_ref() != Some(request.run()) {
             current.run = Some(request.run().clone());
-            let selection = self
-                .binding
-                .lock()
-                .expect("live selection lockable")
-                .clone();
+            let selection = {
+                let mut binding = self.binding.lock().expect("live selection lockable");
+                binding
+                    .pending_run
+                    .take()
+                    .map_or_else(|| binding.clone(), |s| *s)
+            };
             current.provider = match resolve_live_adapter(&selection, env_credential) {
                 LiveResolve::Demo => ActiveProvider::Fake(FakeProvider::demo_two_turn()),
                 LiveResolve::Live(adapter) => ActiveProvider::Live(adapter),
@@ -683,6 +689,7 @@ fn runtime_with_tools(
         config: session_config.config.clone(),
         active_model: session_config.active_model.clone(),
         demo: session_config.demo,
+        pending_run: None,
     }));
     let provider = Arc::new(PerRunProvider::live(Arc::clone(&binding)));
     let (runtime, streams) = Runtime::try_new(config, provider, tools).map_err(io::Error::other)?;
@@ -973,6 +980,9 @@ struct Frontend {
     demo: bool,
     /// Currently selected model id, or `None` when none is configured.
     active_model: Option<String>,
+    /// Actual model identity captured for each accepted run. Terminal usage
+    /// is attributed from this map, never from the mutable picker selection.
+    run_models: HashMap<RunId, String>,
     /// Shared provider selection for this slot's runtime. `None` in unit
     /// tests (which use the demo-only wiring); production slots set it
     /// right after [`Frontend::with_config`] and refresh it on every
@@ -1005,6 +1015,7 @@ impl Frontend {
             config: UserConfig::default_config(),
             config_path: None,
             active_model: None,
+            run_models: HashMap::new(),
             demo: false,
             live: None,
             pending_session_cmds: Vec::new(),
@@ -1020,6 +1031,7 @@ impl Frontend {
             config: config.config,
             config_path: config.path,
             active_model: config.active_model,
+            run_models: HashMap::new(),
             demo: config.demo,
             ..Self::new(session)
         };
@@ -1040,11 +1052,31 @@ impl Frontend {
     /// without a production handle (unit tests).
     fn sync_live_binding(&mut self) {
         if let Some(binding) = &self.live {
-            *binding.lock().expect("live selection lockable") = LiveSelection {
+            let mut binding = binding.lock().expect("live selection lockable");
+            let pending_run = binding.pending_run.take();
+            *binding = LiveSelection {
                 config: self.config.clone(),
                 active_model: self.active_model.clone(),
                 demo: self.demo,
+                pending_run,
             };
+        }
+    }
+
+    /// Freezes the current provider/model choice before dispatch. The
+    /// provider consumes this snapshot on its first call for the run.
+    fn prepare_run_selection(&mut self) {
+        if let Some(binding) = &self.live {
+            let mut binding = binding.lock().expect("live selection lockable");
+            let mut snapshot = binding.clone();
+            snapshot.pending_run = None;
+            binding.pending_run = Some(Box::new(snapshot));
+        }
+    }
+
+    fn clear_unaccepted_selection(&mut self) {
+        if let Some(binding) = &self.live {
+            binding.lock().expect("live selection lockable").pending_run = None;
         }
     }
 
@@ -1297,8 +1329,8 @@ impl Frontend {
     /// convenience, so a document that cannot be read back or written must
     /// never take down a session that already produced its output. The
     /// in-memory document keeps the recorded use either way.
-    fn record_active_model_use(&mut self) {
-        let Some(id) = self.active_model.clone() else {
+    fn record_model_use(&mut self, run: &RunId) {
+        let Some(id) = self.run_models.remove(run) else {
             return;
         };
         if self.config.model(&id).is_none() {
@@ -1363,7 +1395,7 @@ impl Frontend {
                 self.state.clear_colon();
                 // The run completed, so this model is genuinely "used":
                 // record it before the notice history moves on.
-                self.record_active_model_use();
+                self.record_model_use(event.run());
                 return true;
             }
         }
@@ -2064,11 +2096,17 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
 /// report the reply. Returns true when the draft was accepted.
 fn settle_submit(front: &mut Frontend, draft: &str, reply: &CommandResponse) -> bool {
     if !front.adopt_accepted(reply) {
+        front.clear_unaccepted_selection();
         front.state.notice(&format!(
             "submit not accepted ({:?}); draft preserved",
             reply.reply()
         ));
         return false;
+    }
+    if let Some(run) = reply.run()
+        && let Some(model) = front.active_model.clone()
+    {
+        front.run_models.insert(run.clone(), model);
     }
     front.state.record_submitted(draft);
     true
@@ -2362,6 +2400,7 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             ) {
                 Ok(command) => {
                     let draft = front.state.composer().to_owned();
+                    front.prepare_run_selection();
                     let response = runtime.handle(command).await.0;
                     if settle_submit(front, &draft, &response) {
                         let stashed = front.state.composer_take();
@@ -2620,6 +2659,7 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
             false,
         )
         .map_err(io::Error::other)?;
+        slot.front.prepare_run_selection();
         let reply = slot.runtime.handle(submit).await.0;
         if settle_submit(&mut slot.front, DEMO_INPUT, &reply) {
             slot.front.state.notice("canned M0 submission accepted");
@@ -2874,6 +2914,7 @@ async fn headless(
         false,
     )
     .map_err(io::Error::other)?;
+    front.prepare_run_selection();
     let reply = runtime.handle(submit).await.0;
     settle_submit(&mut front, DEMO_INPUT, &reply);
 
@@ -2964,7 +3005,7 @@ async fn apply_headless(runtime: &Runtime, front: &mut Frontend, events: Vec<Run
             front.state_rejected += 1;
         }
         if terminal {
-            front.record_active_model_use();
+            front.record_model_use(event.run());
             return true;
         }
     }
@@ -4659,29 +4700,50 @@ mod cov_main_topup {
     }
 
     #[test]
-    fn terminal_outcome_records_the_active_model_and_saves_the_document() {
+    fn terminal_outcome_records_the_model_bound_to_the_run_and_saves_the_document() {
         let directory = temp_config_dir("terminal-save");
         let path = directory.join("config.json");
         let mut config = configured(3, &[], &[]);
         config.path = Some(path.clone());
         let (run, mut front) = frontend_with(config);
+        front.run_models.insert(run.clone(), "m1".to_owned());
         front.active_model = Some("m2".to_owned());
 
         assert!(front.apply_events(vec![started(&run, 0), finished(&run, 1)]));
         assert_eq!(
             front.config.recent().first().map(String::as_str),
-            Some("m2"),
-            "the completed run's model leads the recents"
+            Some("m1"),
+            "later picker changes do not alter run attribution"
         );
         let persisted = load_config(&path)
             .expect("the document is readable")
             .expect("it exists");
         assert_eq!(
             persisted.recent().first().map(String::as_str),
-            Some("m2"),
+            Some("m1"),
             "the usage was written back to the file the session loaded"
         );
         std::fs::remove_dir_all(&directory).expect("temporary directory removed");
+    }
+
+    #[test]
+    fn prepared_provider_selection_survives_picker_changes_before_first_call() {
+        let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
+        let binding = Arc::new(Mutex::new(LiveSelection {
+            config: front.config.clone(),
+            active_model: Some("m0".to_owned()),
+            demo: false,
+            pending_run: None,
+        }));
+        front.attach_live(binding.clone(), None);
+
+        front.prepare_run_selection();
+        front.select_model("m1");
+
+        let mut binding = binding.lock().expect("selection lockable");
+        let captured = binding.pending_run.take().expect("submit snapshot");
+        assert_eq!(captured.active_model.as_deref(), Some("m0"));
+        assert_eq!(binding.active_model.as_deref(), Some("m1"));
     }
 
     #[test]
@@ -4695,6 +4757,7 @@ mod cov_main_topup {
         );
         let (run, mut front) = frontend_with(config);
         front.active_model = Some("m1".to_owned());
+        front.run_models.insert(run.clone(), "m1".to_owned());
 
         assert!(
             front.apply_events(vec![started(&run, 0), finished(&run, 1)]),
@@ -6287,6 +6350,7 @@ mod cov_live_wiring {
             config,
             active_model: active_model.map(str::to_owned),
             demo: true,
+            pending_run: None,
         }
     }
 
@@ -6296,6 +6360,7 @@ mod cov_live_wiring {
             config: UserConfig::default_config(),
             active_model: None,
             demo: false,
+            pending_run: None,
         };
         let resolved = resolve_live_adapter(&selection, |_| Some("secret".to_owned()));
         assert!(
@@ -6319,6 +6384,7 @@ mod cov_live_wiring {
             config: UserConfig::default_config(),
             active_model: None,
             demo: true,
+            pending_run: None,
         };
         assert!(
             matches!(
@@ -6488,6 +6554,7 @@ mod cov_live_wiring {
             config,
             active_model: Some("m0".to_owned()),
             demo: true,
+            pending_run: None,
         };
         assert!(
             matches!(

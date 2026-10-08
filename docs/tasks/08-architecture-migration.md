@@ -90,6 +90,8 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.5 — Record TUI usage against the accepted run's model
 
+**Implementation status: Verified.** TUI submission now snapshots the live provider selection before runtime dispatch; the provider consumes that snapshot for its first call for the run. Accepted run IDs retain their selected model for terminal usage recording, independent of subsequent picker changes. Busy/rejected submissions clear the pending snapshot and do not create usage attribution. TUI configuration save failures remain transcript notices and do not alter run outcomes.
+
 **Findings:** P2.4. **Paths:** `crates/nexus-tui/src/main.rs`, TUI tests. **Dependencies:** none.
 
 - Capture the actual selection consistently with run acceptance and the per-run provider binding, not merely the display label when the terminal event arrives.
@@ -97,6 +99,8 @@ Task dependencies are listed below. Stage gates are the default integration orde
 - Preserve next-run selection changes and associate terminal use recording with the accepted identity. Do not introduce a full execution snapshot.
 
 **Acceptance/tests:** accept A, select B before the first provider invocation and during streaming, complete A, then submit B. Verify actual invocations and recent attribution. Rejected/busy submits create no attribution; terminal duplicates do not record twice; failed config saves remain visible without changing the run outcome.
+
+**Validation evidence:** `cargo fmt --all --check`; `cargo nextest run -p nexus-tui --locked --offline` (497 passed, 11 skipped); `cargo clippy -p nexus-tui --all-targets --locked --offline -- -D warnings` (passed). Regression coverage verifies the pre-provider selection snapshot and run-bound model attribution after the picker changes; no live-provider call was made.
 
 ### M1.6 — Bound server connections, sessions, and SSE lifecycle
 
