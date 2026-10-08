@@ -1,7 +1,7 @@
 //! OpenAI-compatible chat completions adapter over blocking std sockets,
 //! with streaming SSE parsing and an `openssl s_client` TLS bridge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Stdio};
@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{CredentialRef, ProviderProfile};
 use nexus_core::{
-    AgentError, CallCandidate, CorrelationData, ErrorCategory, FinishReason, ModelContextItem,
-    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort,
-    RetryGuidance, TurnFinished, Usage, UsageFinality,
+    AgentError, CallCandidate, CorrelationData, ErrorCategory, FinishReason, Limits,
+    ModelContextItem, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
+    ProviderPort, RetryGuidance, TurnFinished, Usage, UsageFinality,
 };
 use serde_json::{Value, json};
 
@@ -32,6 +32,14 @@ const MAX_HEAD_BYTES: usize = 16_384;
 /// Read poll quantum: cancellation and deadlines are re-checked between
 /// quanta so a stalled peer cannot park the worker past its bound.
 const READ_QUANTUM: Duration = Duration::from_secs(1);
+/// The TLS stdout pump retains at most this many fixed-size chunks while the
+/// parser is behind (128 KiB total). A closed consumer releases a blocked send.
+const TLS_PUMP_CHUNKS: usize = 16;
+const TLS_PUMP_CHUNK_BYTES: usize = 8_192;
+/// Bound distinct provider tool identities before creating accumulator state.
+const MAX_SSE_TOOL_IDENTITIES: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize;
+/// Bound tiny SSE records independently of the response byte ceiling.
+const MAX_SSE_RECORDS: usize = 4_096;
 
 fn provider_error(category: ErrorCategory, message: &'static str) -> ProviderEvent {
     ProviderEvent::Failed(
@@ -420,11 +428,11 @@ fn spawn_tls(host: &str, port: u16, head: &[u8], body: &[u8]) -> Result<TlsSourc
             "provider response failed",
         ));
     };
-    let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+    let (sender, receiver) = mpsc::sync_channel::<Result<Vec<u8>, std::io::Error>>(TLS_PUMP_CHUNKS);
     std::thread::spawn(move || {
         let mut reader = stdout;
         loop {
-            let mut chunk = [0u8; 8192];
+            let mut chunk = [0u8; TLS_PUMP_CHUNK_BYTES];
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(read) => {
@@ -877,6 +885,7 @@ struct SseLive {
     acc: SseAccum,
     last_usage: (Option<u64>, Option<u64>),
     raw_bytes: usize,
+    records: usize,
 }
 
 impl SseLive {
@@ -887,6 +896,7 @@ impl SseLive {
             acc: SseAccum::default(),
             last_usage: (None, None),
             raw_bytes: 0,
+            records: 0,
         }
     }
 
@@ -932,6 +942,40 @@ impl SseLive {
             }
             if payload.is_empty() {
                 continue;
+            }
+            self.records = self.records.saturating_add(1);
+            if self.records > MAX_SSE_RECORDS {
+                return Err(vec![provider_error(
+                    ErrorCategory::ResourceLimit,
+                    "provider response has too many stream records",
+                )]);
+            }
+            if let Ok(chunk) = serde_json::from_str::<Value>(payload)
+                && let Some(calls) = chunk
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("delta"))
+                    .and_then(|delta| delta.get("tool_calls"))
+                    .and_then(Value::as_array)
+            {
+                let mut new_indices = HashSet::new();
+                for call in calls {
+                    let Some(index) = call.get("index").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    if !self.acc.fragments.contains_key(&index) {
+                        new_indices.insert(index);
+                    }
+                    if self.acc.fragments.len().saturating_add(new_indices.len())
+                        > MAX_SSE_TOOL_IDENTITIES
+                    {
+                        return Err(vec![provider_error(
+                            ErrorCategory::ResourceLimit,
+                            "provider response has too many tool identities",
+                        )]);
+                    }
+                }
             }
             let applied = apply_sse_data(&mut self.acc, payload)?;
             if !applied.content.is_empty() {

@@ -24,6 +24,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES;
 use nexus_core::{
     AgentError, AssistantText, CallCandidate, CommandReply, ErrorCategory, EventPayload,
     FinishReason, Limits, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
@@ -329,4 +330,150 @@ async fn providers_without_the_opt_in_keep_legacy_coalescing() {
         vec!["hello world"],
         "adjacent same-item fragments still coalesce without the opt-in"
     );
+}
+
+#[tokio::test]
+async fn provisional_output_exhaustion_is_a_limit_not_cancellation() {
+    let provider = Arc::new(StreamingProvider::new(
+        vec![text("item-0", "a"), text("item-0", "b")],
+        vec![text("item-0", "ab"), stop_turn(final_usage(None, None))],
+    ));
+    let mut runtime_config = config();
+    runtime_config.limits.max_tool_output_bytes = 1;
+    let (runtime, mut streams) = Runtime::new(runtime_config, provider, Vec::new());
+    assert_eq!(
+        runtime.submit(submit_cmd("stream-budget")).await.reply(),
+        CommandReply::Accepted
+    );
+    let finished = tokio::time::timeout(WAIT, async {
+        loop {
+            if let EventPayload::RunFinished(finished) = streams
+                .control
+                .recv()
+                .await
+                .expect("control remains open")
+                .payload()
+            {
+                break finished.clone();
+            }
+        }
+    })
+    .await
+    .expect("run finishes within the wait bound");
+    assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+    assert_eq!(
+        finished.error().map(AgentError::category),
+        Some(ErrorCategory::ResourceLimit)
+    );
+}
+
+#[tokio::test]
+async fn authoritative_text_must_extend_the_published_prefix() {
+    let provider = Arc::new(StreamingProvider::new(
+        vec![text("item-0", "partial")],
+        vec![
+            text("item-0", "different"),
+            stop_turn(final_usage(None, None)),
+        ],
+    ));
+    let (data, _, finished) = run_turn(provider, "prefix-mismatch", 1).await;
+    assert_eq!(data_texts(&data), vec!["partial"]);
+    assert_eq!(finished.outcome(), RunOutcome::Failed);
+    assert_eq!(
+        finished.error().map(AgentError::category),
+        Some(ErrorCategory::Protocol)
+    );
+}
+
+#[tokio::test]
+async fn usage_updates_are_throttled_but_final_counters_remain_authoritative() {
+    let updates: Vec<_> = (0..20)
+        .map(|count| ProviderEvent::Usage(provisional(Some(count), None)))
+        .collect();
+    let mut batch = updates.clone();
+    let final_usage = final_usage(Some(99), Some(7));
+    batch.push(ProviderEvent::Usage(final_usage));
+    batch.push(stop_turn(final_usage));
+    let provider = Arc::new(StreamingProvider::new(updates, batch));
+    let (_, control, finished) = run_turn(provider, "usage-throttle", 0).await;
+    let published = usage_updates(&control);
+    assert_eq!(published.len(), 17);
+    assert_eq!(published.last(), Some(&final_usage));
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+}
+
+#[tokio::test]
+async fn batch_text_keeps_interleaving_and_splits_large_fragments() {
+    let large = "x".repeat(MAX_TEXT_FRAGMENT_BYTES + 17);
+    let provider = Arc::new(StreamingProvider::new(
+        Vec::new(),
+        vec![
+            text("item-a", "a1"),
+            text("item-b", "b1"),
+            text("item-a", "a2"),
+            text("item-c", &large),
+            stop_turn(final_usage(None, None)),
+        ],
+    ));
+    let (data, _, finished) = run_turn(provider, "batch-order", 5).await;
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert_eq!(
+        data_texts(&data),
+        vec![
+            "a1",
+            "b1",
+            "a2",
+            &large[..MAX_TEXT_FRAGMENT_BYTES],
+            &large[MAX_TEXT_FRAGMENT_BYTES..]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn provisional_text_splits_fragments_larger_than_the_core_limit() {
+    let large = "x".repeat(MAX_TEXT_FRAGMENT_BYTES + 17);
+    let provider = Arc::new(StreamingProvider::new(
+        vec![text("item-large", &large)],
+        vec![
+            text("item-large", &large),
+            stop_turn(final_usage(None, None)),
+        ],
+    ));
+    let (data, _, finished) = run_turn(provider, "large-provisional", 1).await;
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert_eq!(
+        data_texts(&data),
+        vec![
+            &large[..MAX_TEXT_FRAGMENT_BYTES],
+            &large[MAX_TEXT_FRAGMENT_BYTES..]
+        ]
+    );
+}
+
+#[tokio::test]
+async fn invalid_provisional_item_keys_never_publish_text_or_preview() {
+    for item_key in ["x".repeat(129), String::new()] {
+        for event in [
+            text(&item_key, "hidden"),
+            ProviderEvent::ToolCallDelta {
+                item_key: item_key.clone(),
+                assembled_bytes: 1,
+            },
+        ] {
+            let provider = Arc::new(StreamingProvider::new(
+                vec![event],
+                vec![stop_turn(final_usage(None, None))],
+            ));
+            let (data, _, finished) = run_turn(provider, "invalid-provisional-key", 0).await;
+            assert!(
+                data.is_empty(),
+                "invalid identities must not reach presentation"
+            );
+            assert_eq!(finished.outcome(), RunOutcome::Failed);
+            assert_eq!(
+                finished.error().map(AgentError::category),
+                Some(ErrorCategory::InvalidInput)
+            );
+        }
+    }
 }
