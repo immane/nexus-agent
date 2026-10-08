@@ -72,7 +72,7 @@ use std::time::{Duration, Instant};
 use nexus_core::commands::EventSequence;
 use nexus_core::{
     CancelCommand, CommandReply, CorrelationData, EventPayload, Limits, RequestId, RunEvent,
-    RunFinished, RunId, RunOutcome, SessionId, SubmitCommand,
+    RunFinished, RunId, RunOutcome, SessionId, SubmitCommand, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool, candidate, stop_turn, tool_turn};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
@@ -576,11 +576,12 @@ fn watchdog_budget(remaining: Duration) -> Duration {
 
 /// Builds the M0-test tool set; [`Runtime::try_new`] validates every
 /// registration (revision, duplicate names, schema) before a run can start.
-fn m0_tools() -> Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> {
+/// Each category is assigned here by the host composition boundary.
+fn m0_tools() -> Vec<ToolRegistration> {
     vec![
-        Arc::new(FakeTool::read_only()),
-        Arc::new(FakeTool::mutation()),
-        Arc::new(FakeTool::command()),
+        ToolRegistration::read(Arc::new(FakeTool::read_only())),
+        ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
+        ToolRegistration::process(Arc::new(FakeTool::command())),
     ]
 }
 
@@ -589,7 +590,7 @@ fn m0_tools() -> Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> {
 fn build_runtime(
     limits: Limits,
     provider: Arc<dyn nexus_core::ProviderPort + Send + Sync>,
-    tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>>,
+    tools: Vec<ToolRegistration>,
 ) -> Result<(Runtime, EventStreams), HeadlessError> {
     Runtime::try_new(
         RuntimeConfig {
@@ -1100,9 +1101,9 @@ mod tests {
 
     #[test]
     fn runtime_registration_failure_is_a_normal_operation_error() {
-        let duplicate: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = vec![
-            Arc::new(FakeTool::read_only()),
-            Arc::new(FakeTool::read_only()),
+        let duplicate = vec![
+            ToolRegistration::read(Arc::new(FakeTool::read_only())),
+            ToolRegistration::read(Arc::new(FakeTool::read_only())),
         ];
         let error = build_runtime(
             Limits::m0_test(),

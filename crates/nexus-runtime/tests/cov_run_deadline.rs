@@ -34,7 +34,7 @@ use nexus_core::{
     Limits, ModelRequest, OutcomeSummary, PersistenceState, ProviderCapabilities, ProviderContext,
     ProviderEvent, ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId,
     RunLifecycle, RunOutcome, SessionId, SubmitCommand, ToolCall, ToolContext, ToolId, ToolOutcome,
-    ToolPort, ToolSpec, TurnFinished, Usage, UsageFinality,
+    ToolPort, ToolRegistration, ToolSpec, TurnFinished, Usage, UsageFinality,
 };
 use nexus_runtime::{Policy, Runtime, RuntimeConfig};
 use tokio::sync::mpsc;
@@ -471,7 +471,7 @@ fn provider_deadline_after_entry_is_limit_reached_without_dispatch() {
         release_rx,
     ));
     let read_tool = Arc::new(ScriptedTool::succeeding("host_read"));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![read_tool.clone()];
+    let tools = vec![ToolRegistration::read(read_tool.clone())];
     let (runtime, mut streams) = Runtime::new(
         RuntimeConfig {
             limits,
@@ -545,7 +545,7 @@ fn run_deadline_during_approval_wait_denies_without_dispatch_or_deadlock() {
         r#"{"path":"src"}"#,
     )])]));
     let write_tool = Arc::new(ScriptedTool::succeeding("host_write"));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![write_tool.clone()];
+    let tools = vec![ToolRegistration::mutation(write_tool.clone())];
     let (runtime, mut streams) = Runtime::new(
         RuntimeConfig {
             limits,
@@ -651,7 +651,7 @@ fn tool_deadline_watchdog_keeps_unknown_effects_without_rollback_claims() {
         stop_turn("after"),
     ]));
     let tool = Arc::new(GatedTool::new(entered_tx, release_rx));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+    let tools = vec![ToolRegistration::read(tool.clone())];
     let (runtime, mut streams) = Runtime::new(
         RuntimeConfig {
             limits,

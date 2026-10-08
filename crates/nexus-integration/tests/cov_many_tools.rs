@@ -29,21 +29,22 @@ use std::time::Duration;
 use nexus_core::{
     ApproveCommand, CallId, CommandReply, EffectState, ErrorCategory, EventPayload,
     ExecutionStatus, MAX_TOOL_DEFINITIONS, ModelRequest, ProviderCapabilities, ProviderContext,
-    ProviderEvent, ProviderPort, RequestId, RunOutcome, ToolPort,
+    ProviderEvent, ProviderPort, RequestId, RunOutcome, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool, stop_turn, tool_turn};
 use nexus_runtime::{EventStreams, Runtime, RuntimeConfig};
 
 /// Named registration doubles: the shared fake exposes arbitrary tool names
 /// through its delayed constructor, and a zero delay keeps a filler tool from
-/// ever sleeping if it is ever dispatched.
-fn named_tools(count: usize) -> Vec<Arc<dyn ToolPort + Send + Sync>> {
+/// ever sleeping if it is ever dispatched. Fixtures are conservatively
+/// unclassified; the host composition assigns categories for real tools.
+fn named_tools(count: usize) -> Vec<ToolRegistration> {
     (0..count)
         .map(|index| {
-            Arc::new(FakeTool::delayed(
+            ToolRegistration::new(Arc::new(FakeTool::delayed(
                 &format!("filler_{index}"),
                 Duration::ZERO,
-            )) as Arc<dyn ToolPort + Send + Sync>
+            )))
         })
         .collect()
 }
@@ -376,7 +377,7 @@ fn tool_count_boundary_registers_and_reaches_every_provider_request() {
         // Anchor the boundary set with the real read double so the accepted
         // registration is proven usable, not merely constructible.
         let read_tool = Arc::new(FakeTool::read_only());
-        tools.push(read_tool.clone());
+        tools.push(ToolRegistration::read(read_tool.clone()));
         assert_eq!(
             tools.len(),
             MAX_TOOL_DEFINITIONS,
@@ -430,7 +431,7 @@ fn tool_count_boundary_registers_and_reaches_every_provider_request() {
 
         // One tool past the bound is refused instead of silently truncated.
         let mut over = named_tools(MAX_TOOL_DEFINITIONS);
-        over.push(read_tool);
+        over.push(ToolRegistration::read(read_tool));
         let error = Runtime::try_new(
             common::quick_config(),
             Arc::new(FakeProvider::new(vec![])),
@@ -456,8 +457,8 @@ fn text_only_provider_is_refused_with_tools_and_accepted_without() {
             "the double really withdraws the tool-call capability"
         );
         let tools = vec![
-            Arc::new(FakeTool::read_only()) as Arc<dyn ToolPort + Send + Sync>,
-            Arc::new(FakeTool::mutation()) as Arc<dyn ToolPort + Send + Sync>,
+            ToolRegistration::read(Arc::new(FakeTool::read_only())),
+            ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
         ];
         let error = Runtime::try_new(common::quick_config(), provider.clone(), tools)
             .err()

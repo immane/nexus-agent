@@ -35,7 +35,7 @@ use nexus_core::{
     CallId, CommandReply, EffectState, ErrorCategory, EventPayload, Evidence, ExecutionStatus,
     GetSnapshotCommand, Limits, M0_REVISION, ProviderEvent, RequestId, RetryGuidance, RunEvent,
     RunFinished, RunLifecycle, RunOutcome, ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort,
-    ToolSpec,
+    ToolRegistration, ToolSpec,
 };
 use nexus_fakes::{FakeProvider, stop_turn, tool_turn};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
@@ -202,7 +202,7 @@ struct FixedBed {
 fn fixed_output_bed(script: Vec<Vec<ProviderEvent>>, limits: Limits, content: &str) -> FixedBed {
     let provider = Arc::new(FakeProvider::new(script));
     let tool = Arc::new(FixedOutputTool::new(content));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+    let tools = vec![ToolRegistration::read(tool.clone())];
     let (runtime, streams): (Runtime, EventStreams) =
         Runtime::new(config_with(limits), provider.clone(), tools);
     FixedBed {

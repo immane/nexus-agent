@@ -27,15 +27,15 @@ use std::time::Duration;
 use gates::{GatedProvider, candidate, next_entry, review_bed, stop_turn, tool_turn};
 use nexus_core::{
     CancelCommand, CommandReply, ErrorCategory, Limits, ModelContextItem, RequestId, RunOutcome,
-    ToolPort,
+    ToolRegistration,
 };
 use nexus_fakes::FakeTool;
 use nexus_runtime::{Policy, RuntimeConfig};
 
-fn tools() -> Vec<Arc<dyn ToolPort + Send + Sync>> {
+fn tools() -> Vec<ToolRegistration> {
     vec![
-        Arc::new(FakeTool::read_only()),
-        Arc::new(FakeTool::mutation()),
+        ToolRegistration::read(Arc::new(FakeTool::read_only())),
+        ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
     ]
 }
 

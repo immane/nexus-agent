@@ -178,6 +178,22 @@ All tasks above are resolved or have explicit evidence that the finding no longe
 
 ### M2.1 — Make tool access classification host-owned
 
+**Implementation status: Verified.** Classification is supplied by the host
+through `ToolRegistration`, defaults to `Unknown`, and is not carried by
+`ToolSpec` or returned by `ToolPort::describe`. Built-in host composition
+assigns read/mutation/process categories explicitly. Read-only admission uses
+the registered category rather than tool-name branches; automatic read access
+still requires the host allowlist and validated resource authorization.
+Regression tests cover self-described read claims versus host registration,
+name/category disagreement, unknown tools, read-only denial, and no-handler
+denial. Validation: `cargo fmt --all --check`; `cargo nextest run
+-p nexus-runtime --locked --offline` (246 passed); affected-package nextest
+and clippy checks reported passing during implementation; independent
+`cargo clippy -p nexus-core -p nexus-runtime -p nexus-tools -p nexus-fakes
+-p nexus-headless -p nexus-server -p nexus-tui -p nexus-openai
+-p nexus-integration --all-targets --locked --offline -- -D warnings` passed.
+The optional ignored/all-features suite was not run.
+
 **Findings:** P2.1. **Paths:** runtime policy/registration, core tool contracts only where needed, concrete tool/fake registration and tests. **Dependencies:** M1; keep existing automatic behavior covered by tests.
 
 - Introduce a minimal host-registration access category for current built-ins, including conservative unknown handling. Do not trust model-visible descriptions or arbitrary plugin declarations.
@@ -187,6 +203,22 @@ All tasks above are resolved or have explicit evidence that the finding no longe
 **Acceptance/tests:** tool classification is independent of display/name conventions; unknown tools cannot self-authorize; custom read/mutation fixtures exercise strict/development/read-only/no-handler paths; registration alone never grants scope. Automatic access still requires a valid resource authorization.
 
 ### M2.2 — Centralize file and exec scope agreement
+
+**Implementation status: Verified.** Shared construction and exact matching
+for canonical file, exec-directory, and exec-workspace scope forms now live in
+`nexus-permissions`; runtime policy and the development file/exec adapters use
+those helpers while preserving the existing serialized strings and opaque,
+bounded `ApprovedScope`. A custom process registration without the concrete
+built-in exec resource remains approval-gated. Validation: `cargo fmt --all
+--check`; `cargo test -p nexus-permissions --locked --offline` (4 passed);
+`cargo test -p nexus-runtime --lib --locked --offline` (140 passed);
+`cargo test -p nexus-runtime --test cov_approval_dispatch --locked --offline
+-- --test-threads=1` (13 passed); `cargo test -p nexus-tools --test behavior
+--locked --offline -- --test-threads=1` (41 passed); and clippy for
+`nexus-permissions`, `nexus-runtime`, and `nexus-tools` passed with warnings
+denied. A combined nextest invocation timed out after compilation without
+reporting results; the affected test suites were run sequentially via Cargo's
+test harness instead. No Linux filesystem or sandbox claim is made here.
 
 **Findings:** P2.2. **Paths:** permissions, runtime policy, tool development/exec modules, approval tests. **Dependencies:** M2.1.
 
@@ -198,6 +230,13 @@ All tasks above are resolved or have explicit evidence that the finding no longe
 
 ### M2.3 — Bind file access and define update consistency
 
+**Implementation status: Blocked.** D3's main baseline has been approved:
+descriptor-bound access, staged same-directory replacement, no-clobber new
+files, multi-hardlink mutation refusal, execution-time object binding, and the
+stated best-effort concurrency limits. Exact compatibility decisions for new
+file mode, ownership/ACL/xattr/platform metadata handling, and crash-durability
+claims remain unapproved; no file-access implementation has started.
+
 **Findings:** P1.5. **Paths:** permissions, `crates/nexus-tools/src/fs.rs`, `development.rs`, filesystem tests; platform/security docs. **Dependencies:** M2.2 and accepted D3.
 
 - Inventory read/list/search/write/patch check/use gaps. Choose narrow platform file-access code or a mature capability dependency for supported Linux/macOS guarantees; do not add repeated canonicalization as a claimed race fix.
@@ -208,6 +247,12 @@ All tasks above are resolved or have explicit evidence that the finding no longe
 **Acceptance/tests:** deterministically synchronized path/parent swaps, protected targets, special files, existing/new files, interruption/write failure, concurrent patch changes, permission preservation, and symlink/hardlink semantics. An unimplemented platform guarantee remains a declared blocker for that guarantee, not a success claim.
 
 ### M2.4 — Verify sandbox capability on both supported platforms
+
+**Implementation status: Blocked.** The current macOS tools suite passed,
+including sandbox write/network and exec cleanup coverage. Linux sandbox
+execution with the required backend remains unverified under M1.4; no Linux
+isolation evidence is claimed. This task remains blocked until the M1.4 Linux
+prerequisite is available, and must be repeated after M2.3 as planned.
 
 **Findings:** P1 validation gap. **Paths:** `crates/nexus-tools/tests/exec_sandbox.rs`, `tests/behavior.rs`, CI workflow if authorized, platform documentation. **Dependencies:** M1.4; repeat relevant tests after M2.3.
 

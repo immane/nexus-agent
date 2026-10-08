@@ -15,8 +15,8 @@
 
 use nexus_core::approval::MAX_SCOPE_BYTES;
 use nexus_core::{
-    AgentError, CallId, ErrorCategory, M0_REVISION, NormalizedArgs, RetryGuidance, RunId, ToolCall,
-    ToolId, TurnId,
+    AgentError, CallId, ErrorCategory, M0_REVISION, NormalizedArgs, RetryGuidance, RunId,
+    ToolAccess, ToolCall, ToolId, TurnId,
 };
 use nexus_runtime::Policy;
 use nexus_validation::{MAX_ARGS_DEPTH, MAX_ARGS_NODES};
@@ -63,7 +63,10 @@ fn authorize_auto_approves_only_canonical_project_reads_and_searches() {
     policy.validate().expect("the M0 policy validates");
     for tool in ["host_read", "host_list", "host_search"] {
         assert!(
-            !policy.requires_approval(&ToolId::new(tool, M0_REVISION).expect("valid")),
+            !policy.requires_approval(
+                ToolAccess::Read,
+                &ToolId::new(tool, M0_REVISION).expect("valid")
+            ),
             "{tool} is automatic"
         );
     }
@@ -117,24 +120,41 @@ fn authorize_auto_approves_only_canonical_project_reads_and_searches() {
 fn authorize_refuses_mutations_and_commands_that_require_approval() {
     let policy = Policy::m0_test();
     let cases = [
-        ("host_write", r#"{"path":"dst/file.txt","content":"hi"}"#),
+        (
+            "host_write",
+            ToolAccess::Mutation,
+            r#"{"path":"dst/file.txt","content":"hi"}"#,
+        ),
         (
             "host_patch",
+            ToolAccess::Mutation,
             r#"{"path":"src/lib.rs","old_text":"old","new_text":"new"}"#,
         ),
-        ("host_exec", r#"{"argv":["git","status"]}"#),
-        ("host_exec", r#"{"command":"cargo test"}"#),
-        ("host_delete", r#"{"path":"dst/file.txt"}"#),
-        ("host_edit", r#"{"path":"src/lib.rs"}"#),
-        ("hostread", r#"{"path":"src"}"#),
-        ("host-search", r#"{"path":"src"}"#),
-        ("HOST_READ", r#"{"path":"src"}"#),
-        ("Host_Search", r#"{"path":"src"}"#),
+        (
+            "host_exec",
+            ToolAccess::Process,
+            r#"{"argv":["git","status"]}"#,
+        ),
+        (
+            "host_exec",
+            ToolAccess::Process,
+            r#"{"command":"cargo test"}"#,
+        ),
+        (
+            "host_delete",
+            ToolAccess::Unknown,
+            r#"{"path":"dst/file.txt"}"#,
+        ),
+        ("host_edit", ToolAccess::Unknown, r#"{"path":"src/lib.rs"}"#),
+        ("hostread", ToolAccess::Unknown, r#"{"path":"src"}"#),
+        ("host-search", ToolAccess::Unknown, r#"{"path":"src"}"#),
+        ("HOST_READ", ToolAccess::Unknown, r#"{"path":"src"}"#),
+        ("Host_Search", ToolAccess::Unknown, r#"{"path":"src"}"#),
     ];
-    for (tool, args) in cases {
+    for (tool, access, args) in cases {
         let scoped = call(tool, M0_REVISION, args);
         assert!(
-            policy.requires_approval(scoped.tool()),
+            policy.requires_approval(access, scoped.tool()),
             "{tool} requires approval"
         );
         assert_denied(
@@ -254,15 +274,16 @@ fn validate_rejects_wrong_revisions_and_forbidden_automatic_sets() {
 
 #[test]
 fn forbidden_automatic_sets_fail_closed_inside_authorize() {
-    for (tool, args) in [
-        ("host_write", r#"{"path":"dst"}"#),
-        ("host_exec", r#"{"argv":"run"}"#),
+    for (tool, access, args) in [
+        ("host_write", ToolAccess::Mutation, r#"{"path":"dst"}"#),
+        ("host_exec", ToolAccess::Process, r#"{"argv":"run"}"#),
     ] {
         let policy = Policy::new(vec![tool.to_owned()], M0_REVISION);
         let scoped = call(tool, M0_REVISION, args);
-        // The compatibility classification view stays name-based...
-        assert!(!policy.requires_approval(scoped.tool()));
-        // ...but the authorization boundary validates the policy first and
+        // A mutation or process registration always requires approval, even
+        // when an invalid custom set names it...
+        assert!(policy.requires_approval(access, scoped.tool()));
+        // ...and the authorization boundary validates the policy first and
         // refuses, so a forbidden set can never widen automatic execution.
         assert_invalid(
             policy.authorize(&scoped),
@@ -286,16 +307,16 @@ fn an_empty_automatic_set_requires_approval_for_every_tool() {
     let closed = Policy::try_new(Vec::new(), M0_REVISION).expect("conservative policy builds");
     assert_eq!(closed.revision(), M0_REVISION);
     closed.validate().expect("the empty set is valid");
-    for tool in [
-        "host_read",
-        "host_list",
-        "host_search",
-        "host_write",
-        "host_patch",
-        "host_exec",
+    for (tool, access) in [
+        ("host_read", ToolAccess::Read),
+        ("host_list", ToolAccess::Read),
+        ("host_search", ToolAccess::Read),
+        ("host_write", ToolAccess::Mutation),
+        ("host_patch", ToolAccess::Mutation),
+        ("host_exec", ToolAccess::Process),
     ] {
         let scoped = call(tool, M0_REVISION, r#"{"path":"src"}"#);
-        assert!(closed.requires_approval(scoped.tool()), "{tool}");
+        assert!(closed.requires_approval(access, scoped.tool()), "{tool}");
         assert_denied(
             closed.authorize(&scoped),
             "tool is not authorized for automatic execution",

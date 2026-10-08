@@ -25,7 +25,7 @@ use std::sync::Arc;
 use nexus_core::{
     AgentError, CallCandidate, ErrorCategory, FinishReason, ModelRequest, ProviderCapabilities,
     ProviderContext, ProviderEvent, ProviderPort, RetryGuidance, RunEvent, ToolCall, ToolContext,
-    ToolId, ToolOutcome, ToolPort, ToolSpec, TurnFinished, Usage, UsageFinality,
+    ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec, TurnFinished, Usage, UsageFinality,
 };
 use nexus_runtime::{EventStreams, Runtime, RuntimeConfig};
 
@@ -40,11 +40,11 @@ pub struct ReviewBed {
     pub control: tokio::sync::mpsc::Receiver<RunEvent>,
 }
 
-/// Builds a review bed from a provider and tool set.
+/// Builds a review bed from a provider and host-registered tool set.
 pub fn review_bed(
     config: RuntimeConfig,
     provider: Arc<dyn ProviderPort + Send + Sync>,
-    tools: Vec<Arc<dyn ToolPort + Send + Sync>>,
+    tools: Vec<ToolRegistration>,
 ) -> ReviewBed {
     let (runtime, streams): (Runtime, EventStreams) = Runtime::new(config, provider, tools);
     ReviewBed {

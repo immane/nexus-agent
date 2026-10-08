@@ -35,8 +35,8 @@ use nexus_core::{
     ExecutionStatus, FinishReason, Limits, M0_REVISION, ModelContextItem, ModelRequest,
     PersistenceState, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort,
     RequestId, RetryGuidance, RunEvent, RunFinished, RunOutcome, SessionId, SubmitCommand,
-    ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolSpec, TurnFinished, Usage,
-    UsageFinality,
+    ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec, TurnFinished,
+    Usage, UsageFinality,
 };
 use nexus_runtime::{Policy, Runtime, RuntimeConfig};
 use tokio::sync::mpsc;
@@ -273,7 +273,7 @@ fn bed(
 ) -> Bed {
     let provider = Arc::new(ScriptedProvider::new(script, provider_max));
     let tool = Arc::new(tool);
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+    let tools = vec![ToolRegistration::read(tool.clone())];
     let (runtime, streams) = Runtime::try_new(
         RuntimeConfig {
             limits,
@@ -832,7 +832,7 @@ fn per_tool_timeout_maps_to_limit_reached_with_an_unknown_effect_outcome() {
         )])],
         None,
     ));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+    let tools = vec![ToolRegistration::read(tool.clone())];
     let (runtime, streams) = Runtime::try_new(
         RuntimeConfig {
             limits,
@@ -891,7 +891,9 @@ fn per_tool_timeout_maps_to_limit_reached_with_an_unknown_effect_outcome() {
 #[test]
 fn zero_provider_output_cap_is_rejected_at_wiring() {
     let provider = Arc::new(ScriptedProvider::new(vec![], Some(0)));
-    let tool: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![Arc::new(BudgetTool::new("host_read"))];
+    let tools = vec![ToolRegistration::read(Arc::new(BudgetTool::new(
+        "host_read",
+    )))];
     let error = match Runtime::try_new(
         RuntimeConfig {
             limits: Limits::m0_test(),
@@ -899,7 +901,7 @@ fn zero_provider_output_cap_is_rejected_at_wiring() {
             has_approval_handler: false,
         },
         provider,
-        tool,
+        tools,
     ) {
         Ok(_) => panic!("a zero effective output budget must be rejected"),
         Err(error) => error,

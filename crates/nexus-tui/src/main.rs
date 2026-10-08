@@ -47,7 +47,7 @@ use nexus_config::{
 use nexus_core::{
     AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload,
     GetSnapshotCommand, Limits, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
-    ProviderPort, RequestId, RetryGuidance, RunEvent, RunId, SessionId,
+    ProviderPort, RequestId, RetryGuidance, RunEvent, RunId, SessionId, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
@@ -103,9 +103,9 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
         has_approval_handler: true,
     };
     let provider = Arc::new(PerRunProvider::new());
-    let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = vec![
-        Arc::new(FakeTool::read_only()),
-        Arc::new(FakeTool::mutation()),
+    let tools = vec![
+        ToolRegistration::read(Arc::new(FakeTool::read_only())),
+        ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
     ];
     Runtime::try_new(config, provider, tools).map_err(io::Error::other)
 }
@@ -658,10 +658,10 @@ fn build_live_runtime(
         },
         has_approval_handler: true,
     };
-    let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = match &session_config.tools_root {
+    let tools = match &session_config.tools_root {
         None => vec![
-            Arc::new(FakeTool::read_only()),
-            Arc::new(FakeTool::mutation()),
+            ToolRegistration::read(Arc::new(FakeTool::read_only())),
+            ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
         ],
         Some(root) => {
             let canonical = std::fs::canonicalize(root).map_err(|_| {
@@ -676,18 +676,30 @@ fn build_live_runtime(
             if !session_config.strict_tools {
                 let mut tools =
                     nexus_tools::development_file_tools(&canonical).map_err(io::Error::other)?;
-                tools.push(Arc::new(
+                tools.push(ToolRegistration::process(Arc::new(
                     SandboxedExecutor::development(&canonical).map_err(io::Error::other)?,
-                ));
+                )));
                 return runtime_with_tools(session_config, config, tools);
             }
             vec![
-                Arc::new(ScopedReader::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedLister::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedSearcher::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedWriter::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedPatcher::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(SandboxedExecutor::with_root(&canonical).map_err(io::Error::other)?),
+                ToolRegistration::read(Arc::new(
+                    ScopedReader::with_root(&canonical).map_err(io::Error::other)?,
+                )),
+                ToolRegistration::read(Arc::new(
+                    ScopedLister::with_root(&canonical).map_err(io::Error::other)?,
+                )),
+                ToolRegistration::read(Arc::new(
+                    ScopedSearcher::with_root(&canonical).map_err(io::Error::other)?,
+                )),
+                ToolRegistration::mutation(Arc::new(
+                    ScopedWriter::with_root(&canonical).map_err(io::Error::other)?,
+                )),
+                ToolRegistration::mutation(Arc::new(
+                    ScopedPatcher::with_root(&canonical).map_err(io::Error::other)?,
+                )),
+                ToolRegistration::process(Arc::new(
+                    SandboxedExecutor::with_root(&canonical).map_err(io::Error::other)?,
+                )),
             ]
         }
     };
@@ -697,7 +709,7 @@ fn build_live_runtime(
 fn runtime_with_tools(
     session_config: &SessionConfig,
     config: RuntimeConfig,
-    tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>>,
+    tools: Vec<ToolRegistration>,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let binding = Arc::new(Mutex::new(LiveSelection {
         config: session_config.config.clone(),

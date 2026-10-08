@@ -51,7 +51,7 @@ use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
     ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, ModelRequest,
     ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunId,
-    SessionId, SubmitCommand,
+    SessionId, SubmitCommand, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
@@ -451,45 +451,45 @@ impl Server {
             Some(adapter) => Arc::new(adapter),
             None => Arc::new(PerRunProvider::new()),
         };
-        let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = match &self.tools_mode {
+        let tools = match &self.tools_mode {
             ToolsMode::Fakes => vec![
-                Arc::new(FakeTool::read_only()),
-                Arc::new(FakeTool::mutation()),
+                ToolRegistration::read(Arc::new(FakeTool::read_only())),
+                ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
             ],
             ToolsMode::Development { root } => {
                 let mut tools = nexus_tools::development_file_tools(root)
                     .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?;
-                tools
-                    .push(Arc::new(SandboxedExecutor::development(root).map_err(
-                        |_| SessionError::new(500, "tool wiring is invalid"),
-                    )?));
+                tools.push(ToolRegistration::process(Arc::new(
+                    SandboxedExecutor::development(root)
+                        .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?,
+                )));
                 tools
             }
             ToolsMode::RealFiles { root } => vec![
-                Arc::new(
+                ToolRegistration::read(Arc::new(
                     ScopedReader::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
-                ),
-                Arc::new(
+                )),
+                ToolRegistration::read(Arc::new(
                     ScopedLister::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
-                ),
-                Arc::new(
+                )),
+                ToolRegistration::read(Arc::new(
                     ScopedSearcher::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
-                ),
-                Arc::new(
+                )),
+                ToolRegistration::mutation(Arc::new(
                     ScopedWriter::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
-                ),
-                Arc::new(
+                )),
+                ToolRegistration::mutation(Arc::new(
                     ScopedPatcher::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
-                ),
-                Arc::new(
+                )),
+                ToolRegistration::process(Arc::new(
                     SandboxedExecutor::with_root(root)
                         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
-                ),
+                )),
             ],
         };
         let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)

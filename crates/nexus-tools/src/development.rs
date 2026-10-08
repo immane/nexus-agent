@@ -7,14 +7,12 @@ use std::sync::Arc;
 
 use crate::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};
 use nexus_core::{
-    AgentError, EffectState, Evidence, ExecutionStatus, NormalizedArgs, ToolCall, ToolContext,
-    ToolOutcome, ToolPort, ToolSpec,
+    AgentError, EffectState, Evidence, ExecutionStatus, NormalizedArgs, ToolAccess, ToolCall,
+    ToolContext, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
 };
 use nexus_permissions::DirectoryPolicy;
 
-pub fn development_file_tools(
-    root: &Path,
-) -> Result<Vec<Arc<dyn ToolPort + Send + Sync>>, AgentError> {
+pub fn development_file_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
     let policy = DirectoryPolicy::new(root).map_err(|_| {
         AgentError::new(
             nexus_core::ErrorCategory::InvalidInput,
@@ -23,19 +21,37 @@ pub fn development_file_tools(
         )
         .expect("static permission error")
     })?;
-    let ports: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![
-        Arc::new(ScopedReader::with_root(root)?),
-        Arc::new(ScopedLister::with_root(root)?),
-        Arc::new(ScopedSearcher::with_root(root)?),
-        Arc::new(ScopedWriter::with_root(root)?),
-        Arc::new(ScopedPatcher::with_root(root)?),
+    // Trusted host composition: each category is assigned from the concrete
+    // adapter constructed here, never read back from `describe()`.
+    let ports: Vec<(ToolAccess, Arc<dyn ToolPort + Send + Sync>)> = vec![
+        (ToolAccess::Read, Arc::new(ScopedReader::with_root(root)?)),
+        (ToolAccess::Read, Arc::new(ScopedLister::with_root(root)?)),
+        (ToolAccess::Read, Arc::new(ScopedSearcher::with_root(root)?)),
+        (
+            ToolAccess::Mutation,
+            Arc::new(ScopedWriter::with_root(root)?),
+        ),
+        (
+            ToolAccess::Mutation,
+            Arc::new(ScopedPatcher::with_root(root)?),
+        ),
     ];
-    ports.into_iter().map(|port| {
-        let original = port.describe();
-        let description = format!("{}. Development mode: project/temp paths are automatic; external paths need runtime approval. Protected credential paths are unavailable.", original.description().replace("inside the tool root", "at a runtime-authorized path").replace(". Requires approval.", "").trim_end_matches('.'));
-        let spec = ToolSpec::new(original.id().clone(), description, original.input_schema_json())?;
-        Ok(Arc::new(DevelopmentFile { policy: policy.clone(), spec }) as Arc<dyn ToolPort + Send + Sync>)
-    }).collect()
+    ports
+        .into_iter()
+        .map(|(access, port)| {
+            let original = port.describe();
+            let description = format!("{}. Development mode: project/temp paths are automatic; external paths need runtime approval. Protected credential paths are unavailable.", original.description().replace("inside the tool root", "at a runtime-authorized path").replace(". Requires approval.", "").trim_end_matches('.'));
+            let spec =
+                ToolSpec::new(original.id().clone(), description, original.input_schema_json())?;
+            Ok(ToolRegistration::classified(
+                Arc::new(DevelopmentFile {
+                    policy: policy.clone(),
+                    spec,
+                }) as Arc<dyn ToolPort + Send + Sync>,
+                access,
+            ))
+        })
+        .collect()
 }
 
 struct DevelopmentFile {
@@ -80,7 +96,7 @@ impl ToolPort for DevelopmentFile {
                         .ok_or(())?,
                 )
                 .map_err(|_| ())?;
-            if context.scope().as_str() != format!("path:{}", target.to_string_lossy()) {
+            if !nexus_permissions::file_scope_matches(context.scope().as_str(), &target) {
                 return Err(());
             }
             let root = if target.is_dir() {
@@ -167,8 +183,9 @@ mod tests {
             .unwrap();
             tools
                 .iter()
-                .find(|port| port.describe().id().name() == tool)
+                .find(|registration| registration.port().describe().id().name() == tool)
                 .unwrap()
+                .port()
                 .execute(&call, &context)
         };
         let plain = policy.resolve("plain.txt").unwrap();

@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use nexus_core::{
     ApprovalId, CallCandidate, CallId, EventPayload, FinishReason, Limits, ProviderEvent,
-    RequestId, RunEvent, RunFinished, SessionId, SubmitCommand, ToolPort, TurnFinished, Usage,
-    UsageFinality,
+    RequestId, RunEvent, RunFinished, SessionId, SubmitCommand, ToolRegistration, TurnFinished,
+    Usage, UsageFinality,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
@@ -94,7 +94,10 @@ pub fn make_bed_with_tools(
     let provider = Arc::new(FakeProvider::new(script));
     let read_tool = Arc::new(read);
     let write_tool = Arc::new(write);
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![read_tool.clone(), write_tool.clone()];
+    let tools = vec![
+        ToolRegistration::read(read_tool.clone()),
+        ToolRegistration::mutation(write_tool.clone()),
+    ];
     let (runtime, streams): (Runtime, EventStreams) = Runtime::new(config, provider.clone(), tools);
     Bed {
         runtime,

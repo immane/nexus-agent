@@ -35,8 +35,8 @@ use nexus_core::{
     EventPayload, Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, Limits,
     ModelRequest, OutcomeSummary, ProviderCapabilities, ProviderContext, ProviderEvent,
     ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome,
-    SessionId, SubmitCommand, ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolSpec,
-    TurnFinished, Usage, UsageFinality,
+    SessionId, SubmitCommand, ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort,
+    ToolRegistration, ToolSpec, TurnFinished, Usage, UsageFinality,
 };
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 
@@ -370,7 +370,7 @@ struct Bed {
 fn bed(
     config: RuntimeConfig,
     provider: Arc<dyn ProviderPort + Send + Sync>,
-    tools: Vec<Arc<dyn ToolPort + Send + Sync>>,
+    tools: Vec<ToolRegistration>,
 ) -> Bed {
     let (runtime, streams): (Runtime, EventStreams) = Runtime::new(config, provider, tools);
     Bed {
@@ -652,7 +652,7 @@ fn cancelled_blocked_tool_records_cancelled_unknown_uncertain_and_quarantines() 
         tool_turn(vec![candidate("host_read", r#"{"path":"src"}"#)]),
         stop_turn("done"),
     ]));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+    let tools = vec![ToolRegistration::read(tool.clone())];
     let mut bed = bed(runtime_config(Limits::m0_test()), provider, tools);
     let rt = test_rt();
     rt.block_on(async {
@@ -779,7 +779,7 @@ fn per_tool_timeout_records_unknown_without_rollback_and_refines_late_evidence()
     ]));
     let mut limits = Limits::m0_test();
     limits.per_tool_timeout = Duration::from_millis(50);
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+    let tools = vec![ToolRegistration::read(tool.clone())];
     let mut bed = bed(runtime_config(limits), provider.clone(), tools);
     let rt = test_rt();
     rt.block_on(async {
