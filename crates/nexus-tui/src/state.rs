@@ -866,6 +866,8 @@ pub struct AppState {
     /// Caret as a draft character offset (`0` is before the first char).
     /// Always clamped to the draft by every edit path.
     composer_caret: usize,
+    /// UTF-8 byte offset corresponding to `composer_caret`.
+    composer_caret_byte: usize,
     /// Submitted inputs for composer recall, oldest first, bounded by
     /// [`MAX_HISTORY_ENTRIES`]. `Up` walks older, `Down` walks newer.
     composer_history: Vec<String>,
@@ -973,6 +975,7 @@ impl AppState {
             composer: String::new(),
             caret_ticks: 0,
             composer_caret: 0,
+            composer_caret_byte: 0,
             composer_history: Vec::new(),
             history_cursor: None,
             history_stash: String::new(),
@@ -1506,6 +1509,7 @@ impl AppState {
         self.history_cursor = Some(cursor);
         self.composer = self.composer_history[cursor].clone();
         self.composer_caret = self.composer.chars().count();
+        self.composer_caret_byte = self.composer.len();
         self.touch_caret();
         true
     }
@@ -1526,6 +1530,7 @@ impl AppState {
             self.composer = std::mem::take(&mut self.history_stash);
         }
         self.composer_caret = self.composer.chars().count();
+        self.composer_caret_byte = self.composer.len();
         self.touch_caret();
         true
     }
@@ -1843,8 +1848,9 @@ impl AppState {
             return;
         }
         if self.composer.len() + char.len_utf8() <= MAX_COMPOSER_BYTES {
-            self.composer.insert(self.caret_byte(), char);
+            self.composer.insert(self.composer_caret_byte, char);
             self.composer_caret += 1;
+            self.composer_caret_byte += char.len_utf8();
             self.touch_caret();
             self.abandon_recall();
         }
@@ -1854,8 +1860,9 @@ impl AppState {
     pub fn composer_newline(&mut self) {
         self.clear_text_selection();
         if self.composer.len() < MAX_COMPOSER_BYTES {
-            self.composer.insert(self.caret_byte(), '\n');
+            self.composer.insert(self.composer_caret_byte, '\n');
             self.composer_caret += 1;
+            self.composer_caret_byte += 1;
             self.touch_caret();
             self.abandon_recall();
         }
@@ -1868,7 +1875,7 @@ impl AppState {
         if self.composer_caret == 0 {
             return false;
         }
-        let byte = self.caret_byte();
+        let byte = self.composer_caret_byte;
         let prev = self.composer[..byte]
             .char_indices()
             .last()
@@ -1876,6 +1883,7 @@ impl AppState {
             .unwrap_or(0);
         self.composer.drain(prev..byte);
         self.composer_caret -= 1;
+        self.composer_caret_byte = prev;
         self.touch_caret();
         self.abandon_recall();
         true
@@ -1890,14 +1898,24 @@ impl AppState {
     /// Moves the caret one char left, saturating at the draft start.
     pub fn caret_left(&mut self) {
         self.clear_text_selection();
-        self.composer_caret = self.composer_caret.saturating_sub(1);
+        if self.composer_caret > 0 {
+            let previous_char_len = self.composer[..self.composer_caret_byte]
+                .chars()
+                .next_back()
+                .map_or(0, char::len_utf8);
+            self.composer_caret -= 1;
+            self.composer_caret_byte -= previous_char_len;
+        }
         self.touch_caret();
     }
 
     /// Moves the caret one char right, saturating at the draft end.
     pub fn caret_right(&mut self) {
         self.clear_text_selection();
-        self.composer_caret = (self.composer_caret + 1).min(self.composer.chars().count());
+        if let Some(next_char) = self.composer[self.composer_caret_byte..].chars().next() {
+            self.composer_caret += 1;
+            self.composer_caret_byte += next_char.len_utf8();
+        }
         self.touch_caret();
     }
 
@@ -1922,16 +1940,6 @@ impl AppState {
         self.caret_ticks = 0;
     }
 
-    /// Byte index of the caret: the boundary of the `composer_caret`-th
-    /// char, or the draft end when the caret is past the last char.
-    fn caret_byte(&self) -> usize {
-        self.composer
-            .char_indices()
-            .nth(self.composer_caret)
-            .map(|(offset, _)| offset)
-            .unwrap_or(self.composer.len())
-    }
-
     /// A manual edit leaves recall mode: the draft is live again and the
     /// stash is dropped, so the next `Up` restarts from the newest entry.
     fn abandon_recall(&mut self) {
@@ -1947,6 +1955,7 @@ impl AppState {
         self.clear_completions();
         self.abandon_recall();
         self.composer_caret = 0;
+        self.composer_caret_byte = 0;
         self.touch_caret();
         std::mem::take(&mut self.composer)
     }
@@ -2173,6 +2182,10 @@ impl AppState {
         if next.len() <= MAX_COMPOSER_BYTES {
             self.composer = next;
             self.composer_caret = start + insert.chars().count();
+            self.composer_caret_byte = self.composer[..]
+                .char_indices()
+                .nth(self.composer_caret)
+                .map_or(self.composer.len(), |(offset, _)| offset);
         }
         self.clear_completions();
     }
@@ -2575,6 +2588,11 @@ impl AppState {
             head: offset,
         });
         self.composer_caret = offset.min(self.composer.chars().count());
+        self.composer_caret_byte = self
+            .composer
+            .char_indices()
+            .nth(self.composer_caret)
+            .map_or(self.composer.len(), |(byte, _)| byte);
         self.touch_caret();
     }
 
