@@ -9,6 +9,15 @@
 //! beyond the scoped read/list/search tools) is rejected by [`Policy::validate`]
 //! before it can authorize or scope anything.
 //!
+//! Admission classification uses the host-registration [`ToolAccess`] carried
+//! by the registered tool, never the tool's name alone. In strict mode a
+//! mutation, process, or unclassified tool always requires confirmation; in
+//! development mode the recognized concrete target still governs project/temp
+//! automation. A read-only run denies every non-read category even when a
+//! development grant would otherwise allow it. Classification never grants
+//! scope; automatic execution still requires a validated resource
+//! authorization.
+//!
 //! Argument text is parsed with the strict workspace validator
 //! ([`nexus_validation::parse_object`]), so duplicate keys and depth, node,
 //! or byte budget exhaustion are rejected even though [`nexus_core::NormalizedArgs`]
@@ -32,12 +41,17 @@
 use nexus_core::approval::MAX_SCOPE_BYTES;
 use nexus_core::commands::MAX_SUMMARY_BYTES;
 use nexus_core::{
-    AgentError, ApprovedScope, ErrorCategory, Limits, M0_REVISION, RetryGuidance, ToolCall, ToolId,
+    AgentError, ApprovedScope, ErrorCategory, Limits, M0_REVISION, RetryGuidance, ToolAccess,
+    ToolCall, ToolId,
 };
 use nexus_validation::parse_object;
 use nexus_validation::serde_json::{self, Map, Value};
 
-/// The only tool names the M0 policy may auto-approve.
+/// The only tool names the M0 policy may automatically authorize. This is the
+/// host-owned automatic-authorization allowlist, separate from the
+/// registration access category: a [`ToolAccess::Read`] tool is still refused
+/// automatic execution unless it is one of these exact built-ins and its
+/// arguments resolve to a valid resource scope.
 const AUTO_READ_TOOLS: &[&str] = &["host_read", "host_list", "host_search"];
 
 /// Placeholder replacing a redacted JSON value.
@@ -135,13 +149,21 @@ impl Policy {
     }
 
     /// Per-call decision; a tool name alone cannot decide external access.
+    ///
+    /// `access` is the host registration category carried by the registered
+    /// tool. In strict mode a non-read category always requires approval. In
+    /// development mode the recognized concrete path target still governs
+    /// project/temp automation, while an unclassified or non-process tool
+    /// without a recognized target requires approval. Read-only runs deny
+    /// every non-read category separately at admission.
     pub fn call_requires_approval(
         &self,
         call: &ToolCall,
         directories: &[std::path::PathBuf],
+        access: ToolAccess,
     ) -> Result<bool, AgentError> {
         let Some(policy) = &self.development else {
-            return Ok(self.requires_approval(call.tool()));
+            return Ok(self.requires_approval(access, call.tool()));
         };
         let target = self.development_target(call)?;
         if let Some(path) = target {
@@ -150,7 +172,10 @@ impl Policy {
                     .iter()
                     .any(|directory| path.starts_with(directory)))
         } else {
-            Ok(call.tool().name() != "host_exec")
+            // Only the concrete sandboxed built-in exec is automatic without
+            // an external target. A host category alone does not authorize a
+            // custom process tool or establish its resource boundary.
+            Ok(access != ToolAccess::Process || call.tool().name() != "host_exec")
         }
     }
 
@@ -158,11 +183,12 @@ impl Policy {
         &self,
         call: &ToolCall,
         directories: &[std::path::PathBuf],
+        access: ToolAccess,
     ) -> Result<ApprovedScope, AgentError> {
         if !self.is_development() {
             return self.authorize(call);
         }
-        if self.call_requires_approval(call, directories)? {
+        if self.call_requires_approval(call, directories, access)? {
             return Err(policy_error(
                 ErrorCategory::PermissionDenied,
                 "external directory needs approval",
@@ -258,14 +284,18 @@ impl Policy {
         Ok(())
     }
 
-    /// Returns true when the tool requires an approval grant before dispatch.
+    /// Returns true when the registered tool requires an approval grant before
+    /// dispatch, from its host-registration `access` category.
     ///
-    /// This is the admission-time classification only; it is not the
-    /// authorization boundary. Automatic calls must still pass
-    /// [`Self::authorize`] immediately before dispatch.
+    /// Every non-read category (mutation, process, or unknown) always requires
+    /// approval. A [`ToolAccess::Read`] tool requires approval unless the host
+    /// allowlist names it; even then, [`Self::authorize`] still refuses
+    /// automatic execution unless the arguments resolve to a valid resource
+    /// scope. This is the admission-time classification only; it is not the
+    /// authorization boundary.
     #[must_use]
-    pub fn requires_approval(&self, tool: &ToolId) -> bool {
-        !self.auto_tools.iter().any(|name| name == tool.name())
+    pub fn requires_approval(&self, access: ToolAccess, tool: &ToolId) -> bool {
+        access != ToolAccess::Read || !self.auto_tools.iter().any(|name| name == tool.name())
     }
 
     /// Returns the policy revision bound into approval grants.
@@ -299,7 +329,7 @@ impl Policy {
             ));
         }
         let name = call.tool().name();
-        if self.requires_approval(call.tool()) || !is_auto_read_tool(name) {
+        if self.requires_approval(ToolAccess::Read, call.tool()) || !is_auto_read_tool(name) {
             return Err(policy_error(
                 ErrorCategory::PermissionDenied,
                 "tool is not authorized for automatic execution",
@@ -359,16 +389,18 @@ impl Policy {
         self.validate()?;
         if self.is_development() {
             return match self.development_target(call)? {
-                Some(path) => bounded_scope(&format!(
-                    "{}:{}",
-                    if call.tool().name() == "host_exec" {
-                        "exec-directory"
+                Some(path) => {
+                    let scope = if call.tool().name() == "host_exec" {
+                        nexus_permissions::exec_directory_scope(&path)
                     } else {
-                        "path"
-                    },
-                    path.to_string_lossy()
-                )),
-                None if call.tool().name() == "host_exec" => bounded_scope("exec:workspace"),
+                        nexus_permissions::file_scope(&path)
+                    }
+                    .map_err(|message| policy_error(ErrorCategory::PermissionDenied, message))?;
+                    bounded_scope(&scope)
+                }
+                None if call.tool().name() == "host_exec" => {
+                    bounded_scope(nexus_permissions::exec_workspace_scope())
+                }
                 None => bounded_scope(&format!("tool:{}", call.tool().name())),
             };
         }
@@ -381,7 +413,10 @@ impl Policy {
                 ));
             };
             let path = normalize_project_path(raw_path)?;
-            return bounded_scope(&format!("path:{path}"));
+            return bounded_scope(
+                &nexus_permissions::file_scope(std::path::Path::new(&path))
+                    .map_err(|message| policy_error(ErrorCategory::PermissionDenied, message))?,
+            );
         }
         if let Some(command) = command_argument(&args)? {
             let escaped = escape_controls(&command);
@@ -657,11 +692,84 @@ mod tests {
         let search = ToolId::new("host_search", M0_REVISION).expect("valid");
         let write = ToolId::new("host_write", M0_REVISION).expect("valid");
         let exec = ToolId::new("host_exec", M0_REVISION).expect("valid");
-        assert!(!policy.requires_approval(&read));
-        assert!(!policy.requires_approval(&search));
-        assert!(policy.requires_approval(&write));
-        assert!(policy.requires_approval(&exec));
+        assert!(!policy.requires_approval(ToolAccess::Read, &read));
+        assert!(!policy.requires_approval(ToolAccess::Read, &search));
+        assert!(policy.requires_approval(ToolAccess::Mutation, &write));
+        assert!(policy.requires_approval(ToolAccess::Process, &exec));
         assert_eq!(policy.revision(), M0_REVISION);
+    }
+
+    #[test]
+    fn access_classification_overrides_name_conventions() {
+        let policy = Policy::m0_test();
+        let read_named = ToolId::new("host_read", M0_REVISION).expect("valid");
+        // The same allowlisted read name is refused automatic treatment under
+        // any non-read registration category.
+        assert!(!policy.requires_approval(ToolAccess::Read, &read_named));
+        assert!(policy.requires_approval(ToolAccess::Mutation, &read_named));
+        assert!(policy.requires_approval(ToolAccess::Process, &read_named));
+        assert!(policy.requires_approval(ToolAccess::Unknown, &read_named));
+
+        // A non-standard name requires approval under every category, because
+        // classification alone never grants automatic execution.
+        let custom = ToolId::new("custom_tool", M0_REVISION).expect("valid");
+        for access in [
+            ToolAccess::Read,
+            ToolAccess::Mutation,
+            ToolAccess::Process,
+            ToolAccess::Unknown,
+        ] {
+            assert!(policy.requires_approval(access, &custom), "{access:?}");
+        }
+    }
+
+    #[test]
+    fn development_classification_keeps_project_mutations_automatic() {
+        let policy = Policy::development(&std::env::temp_dir()).expect("development policy builds");
+        let write = call(
+            "host_write",
+            M0_REVISION,
+            r#"{"path":"nexus-access-write"}"#,
+        );
+        // A recognized concrete project/temp path stays automatic for a
+        // mutation in development; read-only denial is enforced separately.
+        assert!(
+            !policy
+                .call_requires_approval(&write, &[], ToolAccess::Mutation)
+                .expect("a project path resolves")
+        );
+
+        // An unrecognized tool without a concrete target is conservative.
+        let custom = call(
+            "custom_tool",
+            M0_REVISION,
+            r#"{"path":"nexus-access-write"}"#,
+        );
+        assert!(
+            policy
+                .call_requires_approval(&custom, &[], ToolAccess::Unknown)
+                .expect("no target resolves")
+        );
+        assert!(
+            policy
+                .call_requires_approval(&custom, &[], ToolAccess::Read)
+                .expect("no target resolves")
+        );
+
+        // A process registration without a declared write directory stays
+        // automatic in development (sandboxed exec).
+        let exec = call("host_exec", M0_REVISION, r#"{"argv":["true"]}"#);
+        assert!(
+            !policy
+                .call_requires_approval(&exec, &[], ToolAccess::Process)
+                .expect("no write directory resolves")
+        );
+        let custom_process = call("custom_process", M0_REVISION, r#"{"argv":["true"]}"#);
+        assert!(
+            policy
+                .call_requires_approval(&custom_process, &[], ToolAccess::Process)
+                .expect("custom process has no recognized resource")
+        );
     }
 
     #[test]
@@ -820,8 +928,9 @@ mod tests {
         let read = call("host_read", M0_REVISION, r#"{"path":"src"}"#);
 
         let custom_write = Policy::new(vec!["host_write".to_owned()], M0_REVISION);
-        // Compatibility view stays name-based; authorize is the boundary.
-        assert!(!custom_write.requires_approval(write.tool()));
+        // A mutation registration always requires approval, even when a custom
+        // (invalid) allowlist names its tool; authorize is still the boundary.
+        assert!(custom_write.requires_approval(ToolAccess::Mutation, write.tool()));
         assert!(custom_write.authorize(&write).is_err());
 
         let custom_exec = Policy::new(vec!["host_exec".to_owned()], M0_REVISION);

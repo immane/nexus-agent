@@ -49,7 +49,7 @@ pub use store::{
     STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, ToolIntentRecord,
     ToolOutcomeRecord,
 };
-pub use tool::{ToolContext, ToolPort, ToolSpec};
+pub use tool::{ToolAccess, ToolContext, ToolPort, ToolRegistration, ToolSpec};
 
 #[cfg(test)]
 mod cov_lib_private {
@@ -104,7 +104,7 @@ mod cov_lib_private {
         alias_all!(store::{
             SessionCheckpoint, SessionMetadata, ToolIntentRecord, ToolOutcomeRecord,
         });
-        alias_all!(tool::{ToolContext, ToolSpec});
+        alias_all!(tool::{ToolAccess, ToolContext, ToolRegistration, ToolSpec});
     }
 
     #[test]

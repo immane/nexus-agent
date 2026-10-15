@@ -24,7 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gates::{GatedProvider, GatedTool, candidate, next_entry, review_bed, stop_turn, tool_turn};
-use nexus_core::{CommandReply, EventPayload, ExecutionStatus, Limits, RunOutcome, ToolPort};
+use nexus_core::{
+    CommandReply, EventPayload, ExecutionStatus, Limits, RunOutcome, ToolRegistration,
+};
 use nexus_runtime::{Policy, RuntimeConfig};
 
 fn config_with(limits: Limits) -> RuntimeConfig {
@@ -53,7 +55,7 @@ fn timed_out_worker_still_live_blocks_conflicting_next_dispatch() {
             ],
             false,
         );
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+        let tools = vec![ToolRegistration::read(tool.clone())];
         let mut bed = review_bed(config_with(limits), Arc::new(provider), tools);
         let response = bed
             .runtime
@@ -310,7 +312,7 @@ fn effective_output_budget_bounds_recorded_tool_outcome() {
             ],
             false,
         );
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+        let tools = vec![ToolRegistration::read(tool.clone())];
         let mut bed = review_bed(config_with(limits), Arc::new(provider), tools);
         let response = bed
             .runtime

@@ -5,6 +5,45 @@
 
 use std::path::{Path, PathBuf};
 
+/// Builds the existing opaque file scope from an already-resolved host path.
+/// The caller remains responsible for bounded approval-carrier validation.
+pub fn file_scope(path: &Path) -> Result<String, &'static str> {
+    resource_scope("path", path)
+}
+
+/// Builds the existing opaque exec write-directory scope from an
+/// already-resolved host directory.
+pub fn exec_directory_scope(path: &Path) -> Result<String, &'static str> {
+    resource_scope("exec-directory", path)
+}
+
+/// The exec scope used when a development command has no external write
+/// directory.
+pub fn exec_workspace_scope() -> &'static str {
+    "exec:workspace"
+}
+
+/// Checks the concrete exec workspace scope.
+pub fn exec_workspace_scope_matches(scope: &str) -> bool {
+    scope == exec_workspace_scope()
+}
+
+/// Checks a host path against a scope built by [`file_scope`].
+pub fn file_scope_matches(scope: &str, path: &Path) -> bool {
+    file_scope(path).is_ok_and(|expected| scope == expected)
+}
+
+/// Checks a host directory against a scope built by
+/// [`exec_directory_scope`].
+pub fn exec_directory_scope_matches(scope: &str, path: &Path) -> bool {
+    exec_directory_scope(path).is_ok_and(|expected| scope == expected)
+}
+
+fn resource_scope(kind: &str, path: &Path) -> Result<String, &'static str> {
+    let path = path.to_str().ok_or("resource path must be UTF-8")?;
+    Ok(format!("{kind}:{path}"))
+}
+
 /// Immutable host-configured development boundary. Session grants belong to
 /// the runtime, not this object or a process-global permission store.
 #[derive(Debug, Clone)]
@@ -164,6 +203,35 @@ impl DirectoryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_and_exec_scopes_share_exact_construction_and_matching() {
+        let path = Path::new("/tmp/project/ü file");
+        let file = file_scope(path).unwrap();
+        let exec = exec_directory_scope(path).unwrap();
+
+        assert_eq!(file, "path:/tmp/project/ü file");
+        assert_eq!(exec, "exec-directory:/tmp/project/ü file");
+        assert_eq!(exec_workspace_scope(), "exec:workspace");
+        assert!(exec_workspace_scope_matches("exec:workspace"));
+        assert!(!exec_workspace_scope_matches("exec:other"));
+        assert!(file_scope_matches(&file, path));
+        assert!(!file_scope_matches(&exec, path));
+        assert!(exec_directory_scope_matches(&exec, path));
+        assert!(!exec_directory_scope_matches(&file, path));
+        assert!(!file_scope_matches("path:/tmp/project/ü file/..", path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scopes_refuse_non_utf8_paths_instead_of_lossy_reconstruction() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/non-utf8-\xff"));
+        assert!(file_scope(path).is_err());
+        assert!(exec_directory_scope(path).is_err());
+        assert!(!file_scope_matches("path:/tmp/non-utf8-�", path));
+    }
 
     #[cfg(unix)]
     #[test]

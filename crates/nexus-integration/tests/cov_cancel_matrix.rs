@@ -45,7 +45,7 @@ use gates::{GatedTool, review_bed};
 use nexus_core::{
     ApproveCommand, CallId, CancelCommand, CommandReply, CommandResponse, EffectState,
     EventPayload, Evidence, ExecutionStatus, GetSnapshotCommand, OutcomeSummary, ProviderEvent,
-    RequestId, RunEvent, RunId, RunLifecycle, RunOutcome, Snapshot, ToolOutcome, ToolPort,
+    RequestId, RunEvent, RunId, RunLifecycle, RunOutcome, Snapshot, ToolOutcome, ToolRegistration,
 };
 use nexus_fakes::{FakeGate, FakeProvider, FakeTool, stop_turn, tool_turn};
 use nexus_runtime::Runtime;
@@ -87,7 +87,10 @@ fn gated_provider_bed(script: Vec<Vec<ProviderEvent>>) -> (common::Bed, FakeGate
     let gate = provider.gate().expect("gated provider exposes its gate");
     let read_tool = Arc::new(FakeTool::read_only());
     let write_tool = Arc::new(FakeTool::mutation());
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![read_tool.clone(), write_tool.clone()];
+    let tools = vec![
+        ToolRegistration::read(read_tool.clone()),
+        ToolRegistration::mutation(write_tool.clone()),
+    ];
     let (runtime, streams) = Runtime::new(common::auto_config(), provider.clone(), tools);
     (
         common::Bed {
@@ -114,7 +117,7 @@ fn gated_mutation_bed(
 ) {
     let (tool, entries) = GatedTool::new("host_write", "write ok", true, true);
     let tool = Arc::new(tool);
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+    let tools = vec![ToolRegistration::mutation(tool.clone())];
     let provider = Arc::new(FakeProvider::new(provider_script));
     (
         review_bed(common::quick_config(), provider, tools),

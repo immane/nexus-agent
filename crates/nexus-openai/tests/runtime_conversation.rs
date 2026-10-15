@@ -174,9 +174,13 @@ fn translate_then_overwrite_followup_uses_history_and_real_approved_writes() {
     test_rt().block_on(async {
         let provider = OpenAiProvider::new(&mock.endpoint,
             CredentialRef::env_var("PATH").unwrap(), "thinking-model").unwrap();
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![
-            Arc::new(nexus_tools::ScopedReader::with_root(&root.0).unwrap()),
-            Arc::new(nexus_tools::ScopedWriter::with_root(&root.0).unwrap()),
+        let tools = vec![
+            ToolRegistration::read(Arc::new(
+                nexus_tools::ScopedReader::with_root(&root.0).unwrap(),
+            )),
+            ToolRegistration::mutation(Arc::new(
+                nexus_tools::ScopedWriter::with_root(&root.0).unwrap(),
+            )),
         ];
         let (runtime, mut streams) = Runtime::try_new(RuntimeConfig {
             limits: Limits::m0_test(), policy: Policy::m0_test(), has_approval_handler: true,
@@ -273,13 +277,18 @@ fn runtime(
     )
     .unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = ["host_read", "host_write"]
+    let tools = ["host_read", "host_write"]
         .into_iter()
         .map(|name| {
-            Arc::new(LocalTool {
+            let port = Arc::new(LocalTool {
                 name,
                 seen: seen.clone(),
-            }) as Arc<dyn ToolPort + Send + Sync>
+            });
+            match name {
+                "host_read" => ToolRegistration::read(port),
+                "host_write" => ToolRegistration::mutation(port),
+                _ => ToolRegistration::new(port),
+            }
         })
         .collect();
     let (runtime, streams) = Runtime::try_new(

@@ -1,13 +1,15 @@
 //! Root-jailed file tools (`host_read` and `host_write` at the M0 revision).
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use nexus_core::{
     AgentError, EffectState, ErrorCategory, Evidence, ExecutionStatus, Limits, M0_REVISION,
     RetryGuidance, ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolSpec,
 };
+
+use crate::fs_access::BoundRoot;
 
 /// Tool name. Matches the policy auto-read set, so scoped reads stay
 /// automatic under the same authorization as the fake reader.
@@ -35,6 +37,7 @@ fn tool_error(category: ErrorCategory, message: &'static str) -> AgentError {
 /// directory via [`ScopedReader::with_current_dir`].
 pub struct ScopedReader {
     root: PathBuf,
+    access: BoundRoot,
     spec: ToolSpec,
 }
 
@@ -56,7 +59,9 @@ impl ScopedReader {
             READ_SCHEMA,
         )
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
-        Ok(Self { root, spec })
+        let access = BoundRoot::open(&root)
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
+        Ok(Self { root, access, spec })
     }
 
     /// Binds the jail to the process working directory.
@@ -117,18 +122,10 @@ impl ScopedReader {
                 "tool call was cancelled",
             ));
         }
-        let file = File::open(path)
+        let file = self
+            .access
+            .open_file(path)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be read"))?;
-        if !file
-            .metadata()
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-        {
-            return Err(tool_error(
-                ErrorCategory::ToolFailure,
-                "file cannot be read",
-            ));
-        }
         // One byte past the global cap is enough: anything longer is cut
         // with the truncation flag below, so memory stays bounded.
         let mut limited = file.take(Limits::M0_TEST_TOOL_OUTPUT_BYTES as u64 + 1);
@@ -264,6 +261,7 @@ const LIST_ENTRY_LIMIT: usize = 10_000;
 /// Root-jailed directory listing tool. Lists direct children only.
 pub struct ScopedLister {
     root: PathBuf,
+    access: BoundRoot,
     spec: ToolSpec,
     protected: Option<nexus_permissions::DirectoryPolicy>,
 }
@@ -272,6 +270,8 @@ impl ScopedLister {
     /// Bind the tool to an existing directory root.
     pub fn with_root(root: &Path) -> Result<Self, AgentError> {
         let root = canonical_root(root)?;
+        let access = BoundRoot::open(&root)
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
         let spec = ToolSpec::new(
             ToolId::new(HOST_LIST_TOOL, M0_REVISION).expect("static tool identity builds"),
             "List direct children of a directory inside the tool root",
@@ -280,6 +280,7 @@ impl ScopedLister {
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
         Ok(Self {
             root,
+            access,
             spec,
             protected: None,
         })
@@ -308,11 +309,20 @@ impl ScopedLister {
             ));
         }
         let mut entries = Vec::new();
-        let mut iterator = std::fs::read_dir(path)
+        let directory = self
+            .access
+            .open_directory(&path)
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
+        let mut iterator = rustix::fs::Dir::read_from(&directory)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
         while entries.len() < LIST_ENTRY_LIMIT {
-            match iterator.next() {
-                Some(Ok(entry)) => entries.push(entry),
+            match iterator.read() {
+                Some(Ok(entry)) => {
+                    if entry.file_name().to_bytes() != b"." && entry.file_name().to_bytes() != b".."
+                    {
+                        entries.push(entry);
+                    }
+                }
                 Some(Err(_)) => {
                     return Err(tool_error(
                         ErrorCategory::ToolFailure,
@@ -322,8 +332,8 @@ impl ScopedLister {
                 None => break,
             }
         }
-        let mut truncated = entries.len() == LIST_ENTRY_LIMIT && iterator.next().is_some();
-        entries.sort_by_key(|entry| entry.file_name());
+        let mut truncated = entries.len() == LIST_ENTRY_LIMIT && iterator.read().is_some();
+        entries.sort_by_key(|entry| entry.file_name().to_owned());
         let mut output = String::new();
         for entry in entries {
             if context.is_cancelled() {
@@ -332,17 +342,21 @@ impl ScopedLister {
                     "tool call was cancelled",
                 ));
             }
+            let raw_name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+            let entry_path = path.join(raw_name);
+            let name = entry_path
+                .file_name()
+                .expect("joined directory entry has a name")
+                .to_string_lossy();
             if self.protected.as_ref().is_some_and(|policy| {
-                policy.is_protected(&entry.path())
-                    || entry
-                        .path()
+                policy.is_protected(&entry_path)
+                    || entry_path
                         .canonicalize()
                         .is_ok_and(|path| policy.is_protected(&path))
             }) {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let suffix = if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            let suffix = if entry.file_type() == rustix::fs::FileType::Directory {
                 "/"
             } else {
                 ""
@@ -368,6 +382,7 @@ impl ScopedLister {
 /// Root-jailed recursive UTF-8 text search. Results contain relative path, line number and matching line.
 pub struct ScopedSearcher {
     root: PathBuf,
+    access: BoundRoot,
     spec: ToolSpec,
     protected: Option<nexus_permissions::DirectoryPolicy>,
 }
@@ -376,6 +391,8 @@ impl ScopedSearcher {
     /// Bind the tool to an existing directory root.
     pub fn with_root(root: &Path) -> Result<Self, AgentError> {
         let root = canonical_root(root)?;
+        let access = BoundRoot::open(&root)
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
         let spec = ToolSpec::new(
             ToolId::new(HOST_SEARCH_TOOL, M0_REVISION).expect("static tool identity builds"),
             "Search UTF-8 text files beneath a directory inside the tool root",
@@ -384,6 +401,7 @@ impl ScopedSearcher {
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
         Ok(Self {
             root,
+            access,
             spec,
             protected: None,
         })
@@ -422,7 +440,10 @@ impl ScopedSearcher {
                     "tool call was cancelled",
                 ));
             }
-            let entries = std::fs::read_dir(&dir).map_err(|_| {
+            let directory = self.access.open_directory(&dir).map_err(|_| {
+                tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
+            })?;
+            let entries = rustix::fs::Dir::read_from(&directory).map_err(|_| {
                 tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
             })?;
             for entry in entries {
@@ -435,7 +456,11 @@ impl ScopedSearcher {
                 let entry = entry.map_err(|_| {
                     tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
                 })?;
-                let path = entry.path();
+                if entry.file_name().to_bytes() == b"." || entry.file_name().to_bytes() == b".." {
+                    continue;
+                }
+                let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+                let path = dir.join(name);
                 if self
                     .protected
                     .as_ref()
@@ -443,33 +468,28 @@ impl ScopedSearcher {
                 {
                     continue;
                 }
-                let canonical = std::fs::canonicalize(&path).map_err(|_| {
-                    tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
-                })?;
-                if !canonical.starts_with(&self.root) {
+                let metadata = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !metadata.is_file() {
                     continue;
                 }
                 if self
                     .protected
                     .as_ref()
-                    .is_some_and(|policy| policy.is_protected(&canonical))
+                    .is_some_and(|policy| policy.is_protected(&path))
                 {
                     continue;
                 }
-                let kind = entry.file_type().map_err(|_| {
-                    tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
-                })?;
-                if kind.is_symlink() {
-                    continue;
-                }
-                if kind.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if !kind.is_file() {
-                    continue;
-                }
-                let Ok(file) = File::open(&path) else {
+                let Ok(file) = self.access.open_file(&path) else {
                     continue;
                 };
                 let mut limited = file.take(SEARCH_FILE_BYTES + 1);
@@ -634,6 +654,7 @@ const PATCH_FILE_BYTES: u64 = 8 * 1_048_576;
 /// Requires exactly one occurrence of `old_text`; it never creates files.
 pub struct ScopedPatcher {
     root: PathBuf,
+    access: BoundRoot,
     spec: ToolSpec,
 }
 
@@ -641,13 +662,15 @@ impl ScopedPatcher {
     /// Bind the tool to an existing directory root.
     pub fn with_root(root: &Path) -> Result<Self, AgentError> {
         let root = canonical_root(root)?;
+        let access = BoundRoot::open(&root)
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
         let spec = ToolSpec::new(
             ToolId::new(HOST_PATCH_TOOL, M0_REVISION).expect("static tool identity builds"),
             "Replace one unique exact text occurrence in an existing UTF-8 file inside the tool root. Requires approval.",
             PATCH_SCHEMA,
         )
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
-        Ok(Self { root, spec })
+        Ok(Self { root, access, spec })
     }
 
     /// Bind to the process working directory.
@@ -682,9 +705,13 @@ impl ScopedPatcher {
                 "file cannot be patched",
             ));
         }
-        let file = File::open(&target)
+        let source = self
+            .access
+            .open_file(&target)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
-        let mut limited = file.take(PATCH_FILE_BYTES + 1);
+        let stamp = crate::fs_access::FileStamp::read(&source)
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        let mut limited = (&source).take(PATCH_FILE_BYTES + 1);
         let mut bytes = Vec::new();
         let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
@@ -748,13 +775,32 @@ impl ScopedPatcher {
                 "file cannot be patched",
             ));
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&target)
+        let parent = canonical
+            .parent()
+            .ok_or_else(|| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        let parent_fd = self
+            .access
+            .open_directory(parent)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
-        file.write_all(replacement.as_bytes())
-            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        let name = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
+        crate::fs_access::replace_existing(
+            &parent_fd,
+            name,
+            &source,
+            stamp,
+            replacement.as_bytes(),
+            || context.is_cancelled(),
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                tool_error(ErrorCategory::Cancelled, "tool call was cancelled")
+            } else {
+                tool_error(ErrorCategory::ToolFailure, "file cannot be patched")
+            }
+        })?;
         Ok(replacement.len())
     }
 }
@@ -836,6 +882,7 @@ pub const WRITE_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":
 /// jail escapes are refused before any write.
 pub struct ScopedWriter {
     root: PathBuf,
+    access: BoundRoot,
     spec: ToolSpec,
 }
 
@@ -851,13 +898,15 @@ impl ScopedWriter {
                 "tool root is invalid",
             ));
         }
+        let access = BoundRoot::open(&root)
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
         let spec = ToolSpec::new(
             ToolId::new(HOST_WRITE_TOOL, M0_REVISION).expect("static tool identity builds"),
             "Write a file inside the tool root, creating it when missing and replacing its whole content otherwise. Parent directories must already exist. Takes exactly {\"path\": \"notes/todo.txt\", \"content\": \"...\"}.",
             WRITE_SCHEMA,
         )
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
-        Ok(Self { root, spec })
+        Ok(Self { root, access, spec })
     }
 
     /// Returns the canonical jail root.
@@ -893,33 +942,66 @@ impl ScopedWriter {
         } else {
             self.root.join(path)
         };
-        let name = joined
+        let candidate_name = joined
             .file_name()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty() && !name.contains('\0'))
             .ok_or_else(|| tool_error(ErrorCategory::InvalidInput, "tool path is invalid"))?
             .to_owned();
-        let parent = joined
-            .parent()
-            .ok_or_else(|| tool_error(ErrorCategory::InvalidInput, "tool path is invalid"))?;
-        let canonical = std::fs::canonicalize(parent)
-            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
-        if !canonical.starts_with(&self.root) {
-            return Err(tool_error(
-                ErrorCategory::PermissionDenied,
-                "path escapes the tool root",
-            ));
-        }
-        Ok((canonical, name, content.to_owned()))
+        let candidate = joined;
+        let resolved_target =
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(_) => Some(std::fs::canonicalize(&candidate).map_err(|_| {
+                    tool_error(ErrorCategory::ToolFailure, "file cannot be written")
+                })?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => {
+                    return Err(tool_error(
+                        ErrorCategory::ToolFailure,
+                        "file cannot be written",
+                    ));
+                }
+            };
+        let (parent, name) = if let Some(target) = resolved_target {
+            if !target.starts_with(&self.root) {
+                return Err(tool_error(
+                    ErrorCategory::PermissionDenied,
+                    "path escapes the tool root",
+                ));
+            }
+            if !target.is_file() {
+                return Err(tool_error(
+                    ErrorCategory::ToolFailure,
+                    "file cannot be written",
+                ));
+            }
+            (
+                target.parent().ok_or_else(invalid)?.to_path_buf(),
+                target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(invalid)?
+                    .to_owned(),
+            )
+        } else {
+            let parent = candidate
+                .parent()
+                .ok_or_else(|| tool_error(ErrorCategory::InvalidInput, "tool path is invalid"))?;
+            let canonical = std::fs::canonicalize(parent)
+                .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
+            if !canonical.starts_with(&self.root) {
+                return Err(tool_error(
+                    ErrorCategory::PermissionDenied,
+                    "path escapes the tool root",
+                ));
+            }
+            (canonical, candidate_name)
+        };
+        Ok((parent, name, content.to_owned()))
     }
 
-    /// Writes the content, observing cancellation before touching the
-    /// filesystem. New files are created with `create_new` so a raced
-    /// symlink cannot redirect the create; overwrites re-validate the
-    /// resolved target stays inside the jail and refuses directories.
-    /// Same documented residual as the reader: a path swapped between the
-    /// final check and the open could escape, so `openat2` remains the
-    /// hard-guarantee upgrade path.
+    /// Stages content beside its destination and publishes it with a
+    /// descriptor-relative rename after revalidating the source object.
     fn write_scoped(
         &self,
         parent: &Path,
@@ -933,38 +1015,50 @@ impl ScopedWriter {
                 "tool call was cancelled",
             ));
         }
+        let parent_fd = self
+            .access
+            .open_directory(parent)
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
         let target = parent.join(name);
-        let exists = std::fs::symlink_metadata(&target).is_ok();
-        if exists {
-            let canonical = std::fs::canonicalize(&target)
-                .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
-            if !canonical.starts_with(&self.root) {
-                return Err(tool_error(
-                    ErrorCategory::PermissionDenied,
-                    "path escapes the tool root",
-                ));
+        match self.access.open_file(&target) {
+            Ok(source) => {
+                let stamp = crate::fs_access::FileStamp::read(&source).map_err(|_| {
+                    tool_error(ErrorCategory::ToolFailure, "file cannot be written")
+                })?;
+                crate::fs_access::replace_existing(
+                    &parent_fd,
+                    name,
+                    &source,
+                    stamp,
+                    content.as_bytes(),
+                    || context.is_cancelled(),
+                )
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        tool_error(ErrorCategory::Cancelled, "tool call was cancelled")
+                    } else {
+                        tool_error(ErrorCategory::ToolFailure, "file cannot be written")
+                    }
+                })?;
             }
-            if !canonical.is_file() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::fs_access::create_new(&parent_fd, name, content.as_bytes(), || {
+                    context.is_cancelled()
+                })
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        tool_error(ErrorCategory::Cancelled, "tool call was cancelled")
+                    } else {
+                        tool_error(ErrorCategory::ToolFailure, "file cannot be written")
+                    }
+                })?;
+            }
+            Err(_) => {
                 return Err(tool_error(
                     ErrorCategory::ToolFailure,
                     "file cannot be written",
                 ));
             }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(&target)
-                .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
-            file.write_all(content.as_bytes())
-                .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
-        } else {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)
-                .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
-            file.write_all(content.as_bytes())
-                .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be written"))?;
         }
         Ok(content.len())
     }

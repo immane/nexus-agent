@@ -13,7 +13,7 @@ use std::sync::Arc;
 use nexus_core::{
     AgentError, ErrorCategory, Limits, M0_REVISION, ModelRequest, ProviderCapabilities,
     ProviderContext, ProviderEvent, ProviderPort, RetryGuidance, ToolCall, ToolContext, ToolId,
-    ToolOutcome, ToolPort, ToolSpec,
+    ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
 };
 use nexus_runtime::{Policy, Runtime, RuntimeConfig};
 
@@ -67,11 +67,11 @@ impl ToolPort for StubTool {
     }
 }
 
-fn tool_from_spec(spec: ToolSpec) -> Arc<dyn ToolPort + Send + Sync> {
-    Arc::new(StubTool { spec })
+fn tool_from_spec(spec: ToolSpec) -> ToolRegistration {
+    ToolRegistration::read(Arc::new(StubTool { spec }))
 }
 
-fn tool(name: &str, revision: u32, schema: &str) -> Arc<dyn ToolPort + Send + Sync> {
+fn tool(name: &str, revision: u32, schema: &str) -> ToolRegistration {
     tool_from_spec(spec(name, revision, schema))
 }
 

@@ -30,7 +30,8 @@ use nexus_core::{
     EffectState, EventPayload, Evidence, ExecutionStatus, FinishReason, Limits, ModelRequest,
     PersistenceState, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort,
     RequestId, RunEvent, RunFinished, RunId, RunOutcome, SessionId, SubmitCommand, ToolCall,
-    ToolContext, ToolId, ToolOutcome, ToolPort, ToolSpec, TurnFinished, Usage, UsageFinality,
+    ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec, TurnFinished, Usage,
+    UsageFinality,
 };
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 use tokio::sync::mpsc;
@@ -160,7 +161,10 @@ struct Bed {
 fn build_bed(provider: Arc<ScriptedProvider>, config: RuntimeConfig) -> Bed {
     let read = Arc::new(ScriptedTool::succeeding("host_read"));
     let write = Arc::new(ScriptedTool::succeeding("host_write"));
-    let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![read.clone(), write.clone()];
+    let tools = vec![
+        ToolRegistration::read(read.clone()),
+        ToolRegistration::mutation(write.clone()),
+    ];
     let (runtime, streams): (Runtime, EventStreams) = Runtime::new(config, provider.clone(), tools);
     Bed {
         runtime,

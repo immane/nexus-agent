@@ -234,12 +234,17 @@ impl SandboxedExecutor {
                 .resolve(value.as_str().ok_or(Failure::Invalid)?)
                 .map_err(|_| Failure::Permission)?;
             if !path.is_dir()
-                || context.scope().as_str() != format!("exec-directory:{}", path.to_string_lossy())
+                || !nexus_permissions::exec_directory_scope_matches(context.scope().as_str(), &path)
             {
                 return Err(Failure::Permission);
             }
             Some(path)
         } else {
+            if self.development.is_some()
+                && !nexus_permissions::exec_workspace_scope_matches(context.scope().as_str())
+            {
+                return Err(Failure::Permission);
+            }
             None
         };
         let mut command = self.command(&strings, write_dir.as_deref());

@@ -25,7 +25,7 @@ use nexus_core::approval::MAX_SCOPE_BYTES;
 use nexus_core::commands::MAX_SUMMARY_BYTES;
 use nexus_core::{
     AgentError, CallId, ErrorCategory, Limits, M0_REVISION, NormalizedArgs, RetryGuidance, RunId,
-    ToolCall, ToolId, TurnId,
+    ToolAccess, ToolCall, ToolId, TurnId,
 };
 use nexus_runtime::Policy;
 use nexus_validation::{MAX_ARGS_DEPTH, MAX_ARGS_NODES};
@@ -163,8 +163,11 @@ fn approval_scope_resolves_path_command_and_tool_fallback_exactly() {
     assert_eq!(resolved_scope(&policy, &newer), "tool:host_write");
 
     // Commands always require confirmation; a resolved label is not a grant.
-    assert!(policy.requires_approval(exec.tool()));
-    assert!(!policy.requires_approval(&ToolId::new("host_read", M0_REVISION).expect("valid")));
+    assert!(policy.requires_approval(ToolAccess::Process, exec.tool()));
+    assert!(!policy.requires_approval(
+        ToolAccess::Read,
+        &ToolId::new("host_read", M0_REVISION).expect("valid")
+    ));
 }
 
 #[test]

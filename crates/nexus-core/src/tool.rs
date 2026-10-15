@@ -5,6 +5,7 @@
 //! tool must never mutate the conversation, schedule runs, or grant itself
 //! capabilities. The trait is synchronous and data-only.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::approval::ApprovedScope;
@@ -20,6 +21,30 @@ pub const MAX_TOOL_DESCRIPTION_LEN: usize = 1024;
 /// Maximum input-schema text in bytes (M0-TEST choice; the lock sets no
 /// table value for schema size).
 pub const MAX_SCHEMA_BYTES: usize = 65_536;
+
+/// Host-owned registration classification of a tool's external access.
+///
+/// This is a registration descriptor, not a permission grant. A [`Self::Read`]
+/// classification never authorizes execution by itself: the runtime still
+/// requires a host-owned automatic tool set and a validated resource scope
+/// before dispatch. The classification is supplied by the host at
+/// registration ([`ToolRegistration`]), never by the tool's own
+/// [`ToolSpec`], description, or arguments.
+///
+/// [`Self::Unknown`] is the default for an unclassified registration and is
+/// conservative: it requires confirmation and is denied in a read-only run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolAccess {
+    /// Reads, listings, and searches that do not mutate state.
+    Read,
+    /// Writes or patches that mutate filesystem state.
+    Mutation,
+    /// Process or command execution.
+    Process,
+    /// No host classification; conservatively treated like a mutation.
+    #[default]
+    Unknown,
+}
 
 /// Immutable registered descriptor for the current implementation revision.
 /// Schemas are object-root JSON; unsupported validation features fail
@@ -73,6 +98,71 @@ impl ToolSpec {
     #[must_use]
     pub fn input_schema_json(&self) -> &str {
         &self.input_schema_json
+    }
+}
+
+/// Host registration entry: one tool port paired with the access category the
+/// composition boundary assigned it.
+///
+/// The category lives here, outside [`ToolPort`]/[`ToolSpec`], so a tool's own
+/// `describe()` output, description text, or arguments can never select its
+/// own trust. Registration is still not permission to execute: the runtime
+/// applies approval policy and resource authorization separately.
+pub struct ToolRegistration {
+    port: Arc<dyn ToolPort + Send + Sync>,
+    access: ToolAccess,
+}
+
+impl ToolRegistration {
+    /// Registers `port` with the conservative default: unclassified.
+    #[must_use]
+    pub fn new(port: Arc<dyn ToolPort + Send + Sync>) -> Self {
+        Self {
+            port,
+            access: ToolAccess::Unknown,
+        }
+    }
+
+    /// Registers `port` with an explicit host classification.
+    #[must_use]
+    pub fn classified(port: Arc<dyn ToolPort + Send + Sync>, access: ToolAccess) -> Self {
+        Self { port, access }
+    }
+
+    /// Registers a read-only tool.
+    #[must_use]
+    pub fn read(port: Arc<dyn ToolPort + Send + Sync>) -> Self {
+        Self::classified(port, ToolAccess::Read)
+    }
+
+    /// Registers a state-mutating tool.
+    #[must_use]
+    pub fn mutation(port: Arc<dyn ToolPort + Send + Sync>) -> Self {
+        Self::classified(port, ToolAccess::Mutation)
+    }
+
+    /// Registers a process-executing tool.
+    #[must_use]
+    pub fn process(port: Arc<dyn ToolPort + Send + Sync>) -> Self {
+        Self::classified(port, ToolAccess::Process)
+    }
+
+    /// Returns the host-assigned access classification.
+    #[must_use]
+    pub fn access(&self) -> ToolAccess {
+        self.access
+    }
+
+    /// Borrows the registered tool port.
+    #[must_use]
+    pub fn port(&self) -> &Arc<dyn ToolPort + Send + Sync> {
+        &self.port
+    }
+
+    /// Consumes the registration into its port and access classification.
+    #[must_use]
+    pub fn into_parts(self) -> (Arc<dyn ToolPort + Send + Sync>, ToolAccess) {
+        (self.port, self.access)
     }
 }
 

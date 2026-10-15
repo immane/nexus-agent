@@ -47,14 +47,11 @@ use nexus_config::{
 use nexus_core::{
     AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload,
     GetSnapshotCommand, Limits, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
-    ProviderPort, RequestId, RetryGuidance, RunEvent, RunId, SessionId,
+    ProviderPort, RequestId, RetryGuidance, RunEvent, RunId, SessionId, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
-use nexus_tools::{
-    SandboxedExecutor, ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter,
-};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
     Action, AppState, CompletionItem, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate,
@@ -103,16 +100,16 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
         has_approval_handler: true,
     };
     let provider = Arc::new(PerRunProvider::new());
-    let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = vec![
-        Arc::new(FakeTool::read_only()),
-        Arc::new(FakeTool::mutation()),
+    let tools = vec![
+        ToolRegistration::read(Arc::new(FakeTool::read_only())),
+        ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
     ];
     Runtime::try_new(config, provider, tools).map_err(io::Error::other)
 }
 
 /// User configuration resolved once at startup, plus the path it was read
-/// from (so a later write goes back to the same document) and the model the
-/// session boots with.
+/// from (so every session writes back to the same document) and the model the
+/// session boots with. The document itself has one shared owner across slots.
 ///
 /// The TUI takes no `--config` flag: the document's location is
 /// [`nexus_config`]'s documented precedence (CLI path, then `NEXUS_CONFIG`,
@@ -121,12 +118,11 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 /// duplicate that precedence with no consumer here, and would risk writing
 /// model usage back to a file the user did not mean to write.
 ///
-/// Cloned once per session slot: every conversation shares the same startup
-/// document and boot model, while each keeps its own runtime and history.
+/// The shared document is process-owned; each slot keeps its own runtime,
+/// active model, and history.
 #[derive(Debug, Clone)]
 struct SessionConfig {
-    config: UserConfig,
-    path: Option<std::path::PathBuf>,
+    user_config: SharedUserConfig,
     active_model: Option<String>,
     /// Project root for real file reads/writes: `--tools-root`, else the working
     /// directory. `None` (tests only) keeps every tool scripted. Cloned
@@ -137,6 +133,26 @@ struct SessionConfig {
     /// Scripted demo explicitly requested with `--demo`. Without it the
     /// runtime never serves fakes, however unconfigured the selection is.
     demo: bool,
+}
+
+#[derive(Debug)]
+struct UserConfigDocument {
+    config: UserConfig,
+    path: Option<std::path::PathBuf>,
+}
+
+type SharedUserConfig = Arc<Mutex<UserConfigDocument>>;
+
+fn shared_user_config(config: UserConfig, path: Option<std::path::PathBuf>) -> SharedUserConfig {
+    Arc::new(Mutex::new(UserConfigDocument { config, path }))
+}
+
+fn user_config_snapshot(shared: &SharedUserConfig) -> UserConfig {
+    shared
+        .lock()
+        .expect("user configuration lockable")
+        .config
+        .clone()
 }
 
 /// Loads the user configuration for both the interactive and the headless
@@ -186,8 +202,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
     };
     let active_model = boot_model(&config);
     Ok(SessionConfig {
-        config,
-        path,
+        user_config: shared_user_config(config, path),
         active_model,
         tools_root: None,
         strict_tools: false,
@@ -325,6 +340,48 @@ enum LiveResolve {
     Failed(ErrorCategory, &'static str),
 }
 
+/// Capability contract shared by the adapters currently supported by this
+/// TUI. Keep it explicit rather than deriving production claims from the demo
+/// provider; the test suite pins it against each concrete current adapter.
+fn tui_provider_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        text: true,
+        streaming: true,
+        tool_calls: true,
+        structured_output: false,
+        usage_reporting: true,
+        max_context_items: None,
+        max_output_bytes: None,
+    }
+}
+
+fn adapter_satisfies_tui_requirements(capabilities: &ProviderCapabilities) -> bool {
+    let limits = tui_runtime_limits();
+    capabilities.text
+        && capabilities.streaming
+        && capabilities.tool_calls
+        && capabilities.max_context_items.is_none_or(|maximum| {
+            maximum as usize
+                >= limits
+                    .retained_context_items
+                    .min(nexus_core::provider::MAX_CONVERSATION_ITEMS)
+        })
+        && capabilities.max_output_bytes.is_none_or(|maximum| {
+            maximum as usize
+                >= limits
+                    .max_tool_output_bytes
+                    .min(Limits::M0_TEST_TOOL_OUTPUT_BYTES)
+        })
+}
+
+fn admit_adapter<A>(adapter: A, capabilities: &ProviderCapabilities) -> Result<A, ErrorCategory> {
+    if adapter_satisfies_tui_requirements(capabilities) {
+        Ok(adapter)
+    } else {
+        Err(ErrorCategory::UnsupportedCapability)
+    }
+}
+
 /// Resolves the active model to a live adapter through an injected
 /// credential lookup, so the missing/empty contract is testable without
 /// touching the process environment. Values never enter the diagnostic.
@@ -354,7 +411,16 @@ fn resolve_live_adapter(
         );
     }
     match OpenAiProvider::from_profile(profile, &entry.name) {
-        Ok(adapter) => LiveResolve::Live(adapter),
+        Ok(adapter) => {
+            let capabilities = adapter.capabilities();
+            match admit_adapter(adapter, &capabilities) {
+                Ok(adapter) => LiveResolve::Live(adapter),
+                Err(category) => LiveResolve::Failed(
+                    category,
+                    "provider capabilities do not satisfy TUI runtime requirements",
+                ),
+            }
+        }
         Err(_) => LiveResolve::Failed(ErrorCategory::InvalidInput, "selected provider is invalid"),
     }
 }
@@ -444,10 +510,13 @@ impl SessionRegistry {
     /// the registry untouched and reports the error instead.
     fn create(&mut self) -> io::Result<usize> {
         let number = self.slots.len() + 1;
-        let (runtime, streams, live) = build_live_runtime(&self.template)?;
+        let mut session_config = self.template.clone();
+        session_config.active_model =
+            boot_model(&user_config_snapshot(&session_config.user_config));
+        let (runtime, streams, live) = build_live_runtime(&session_config)?;
         let session =
             SessionId::new(format!("{DEMO_SESSION}-{number}")).map_err(io::Error::other)?;
-        let mut front = Frontend::with_config(session, self.template.clone());
+        let mut front = Frontend::with_config(session, session_config);
         let label = format!("s{number}");
         front.state.set_session_label(&label);
         front.state.notice(&format!("session {label} started"));
@@ -543,11 +612,8 @@ impl PerRunProvider {
 
     /// Production wiring over the slot's shared selection.
     fn live(binding: LiveHandle) -> Self {
-        // Fake and real adapters advertise identical capabilities, so one
-        // static claim covers both resolutions.
-        let capabilities = FakeProvider::demo_two_turn().capabilities();
         Self {
-            capabilities,
+            capabilities: tui_provider_capabilities(),
             binding,
             current: Mutex::new(PerRunState {
                 run: None,
@@ -658,10 +724,10 @@ fn build_live_runtime(
         },
         has_approval_handler: true,
     };
-    let tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>> = match &session_config.tools_root {
+    let tools = match &session_config.tools_root {
         None => vec![
-            Arc::new(FakeTool::read_only()),
-            Arc::new(FakeTool::mutation()),
+            ToolRegistration::read(Arc::new(FakeTool::read_only())),
+            ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
         ],
         Some(root) => {
             let canonical = std::fs::canonicalize(root).map_err(|_| {
@@ -674,21 +740,10 @@ fn build_live_runtime(
                 ));
             }
             if !session_config.strict_tools {
-                let mut tools =
-                    nexus_tools::development_file_tools(&canonical).map_err(io::Error::other)?;
-                tools.push(Arc::new(
-                    SandboxedExecutor::development(&canonical).map_err(io::Error::other)?,
-                ));
+                let tools = nexus_tools::development_tools(&canonical).map_err(io::Error::other)?;
                 return runtime_with_tools(session_config, config, tools);
             }
-            vec![
-                Arc::new(ScopedReader::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedLister::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedSearcher::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedWriter::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(ScopedPatcher::with_root(&canonical).map_err(io::Error::other)?),
-                Arc::new(SandboxedExecutor::with_root(&canonical).map_err(io::Error::other)?),
-            ]
+            nexus_tools::strict_tools(&canonical).map_err(io::Error::other)?
         }
     };
     runtime_with_tools(session_config, config, tools)
@@ -697,10 +752,10 @@ fn build_live_runtime(
 fn runtime_with_tools(
     session_config: &SessionConfig,
     config: RuntimeConfig,
-    tools: Vec<Arc<dyn nexus_core::ToolPort + Send + Sync>>,
+    tools: Vec<ToolRegistration>,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let binding = Arc::new(Mutex::new(LiveSelection {
-        config: session_config.config.clone(),
+        config: user_config_snapshot(&session_config.user_config),
         active_model: session_config.active_model.clone(),
         demo: session_config.demo,
         pending_run: None,
@@ -983,12 +1038,9 @@ struct Frontend {
     rejected_reported: bool,
     state_rejected: u64,
     state_rejected_reported: bool,
-    /// Typed user configuration: model admission order, favourites, and
-    /// recents. Read once at startup, written back when a run completes.
-    config: UserConfig,
-    /// Where [`Self::config`] came from. `None` means the platform exposes no
-    /// config location, in which case usage is never written back.
-    config_path: Option<std::path::PathBuf>,
+    /// The single process-owned user document. Reads take short snapshots;
+    /// terminal usage updates and persistence are serialized through this owner.
+    user_config: SharedUserConfig,
     /// Scripted demo explicitly requested with `--demo`, from
     /// [`SessionConfig`]. Mirrored into the shared selection so runs
     /// resolve fakes only through this flag.
@@ -1027,8 +1079,7 @@ impl Frontend {
             rejected_reported: false,
             state_rejected: 0,
             state_rejected_reported: false,
-            config: UserConfig::default_config(),
-            config_path: None,
+            user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             run_models: HashMap::new(),
             demo: false,
@@ -1043,8 +1094,7 @@ impl Frontend {
     /// the interactive and headless paths share one load and one document.
     fn with_config(session: SessionId, config: SessionConfig) -> Self {
         let mut front = Self {
-            config: config.config,
-            config_path: config.path,
+            user_config: config.user_config,
             active_model: config.active_model,
             run_models: HashMap::new(),
             demo: config.demo,
@@ -1054,24 +1104,30 @@ impl Frontend {
         // Composer modes: built-ins first, then configuration customs, with
         // the configured default (or `build`) selected.
         let mut modes = vec![AgentMode::plan(), AgentMode::build()];
-        modes.extend(front.config.modes().iter().cloned());
-        front.state.set_modes(modes, front.config.default_mode());
+        let user_config = front.config_snapshot();
+        modes.extend(user_config.modes().iter().cloned());
+        front.state.set_modes(modes, user_config.default_mode());
         if let Some(dir) = session_project_dir() {
             front.state.set_project_dir(dir);
         }
         front
     }
 
+    fn config_snapshot(&self) -> UserConfig {
+        user_config_snapshot(&self.user_config)
+    }
+
     /// Mirrors the current document and selection into the runtime's shared
     /// selection, so the next run resolves what the header shows. No-op
     /// without a production handle (unit tests).
     fn sync_live_binding(&mut self) {
+        let config = self.config_snapshot();
         if let Some(binding) = &self.live {
             let mut binding = binding.lock().expect("live selection lockable");
             let pending_run = binding.pending_run.take();
             let pending_run_id = binding.pending_run_id.take();
             *binding = LiveSelection {
-                config: self.config.clone(),
+                config,
                 active_model: self.active_model.clone(),
                 demo: self.demo,
                 pending_run,
@@ -1186,8 +1242,8 @@ impl Frontend {
     /// fact and changes nothing: cycling an empty list must not clear or
     /// invent a selection.
     fn cycle_model(&mut self) {
-        let ids: Vec<&str> = self
-            .config
+        let config = self.config_snapshot();
+        let ids: Vec<&str> = config
             .models()
             .iter()
             .map(|entry| entry.id.as_str())
@@ -1215,14 +1271,14 @@ impl Frontend {
     /// display and live binding. Unknown ids report the available list and
     /// change nothing: a failed switch never invents or clears a selection.
     fn select_model(&mut self, name: &str) {
-        if self.config.model(name).is_some() {
+        let config = self.config_snapshot();
+        if config.model(name).is_some() {
             self.active_model = Some(name.to_owned());
             self.sync_model_display();
             self.sync_live_binding();
             self.state.notice(&format!("model: {name}"));
         } else {
-            let mut ids: Vec<&str> = self
-                .config
+            let mut ids: Vec<&str> = config
                 .models()
                 .iter()
                 .map(|entry| entry.id.as_str())
@@ -1240,8 +1296,8 @@ impl Frontend {
     /// Opens the searchable model picker over the configured models, or
     /// reports that nothing is configured. Shared by bare `:model` and `:m`.
     fn open_model_picker(&mut self) {
-        let choices: Vec<ModelChoice> = self
-            .config
+        let config = self.config_snapshot();
+        let choices: Vec<ModelChoice> = config
             .models()
             .iter()
             .map(|entry| ModelChoice {
@@ -1285,7 +1341,7 @@ impl Frontend {
             ));
             if let Some(prefix) = input.strip_prefix("model set ") {
                 candidates.extend(
-                    self.config
+                    self.config_snapshot()
                         .models()
                         .iter()
                         .map(|model| {
@@ -1379,8 +1435,9 @@ impl Frontend {
     /// resolves) into presentation state. Unknown ids clear the display
     /// instead of showing a stale name.
     fn sync_model_display(&mut self) {
+        let config = self.config_snapshot();
         let display = self.active_model.as_deref().and_then(|id| {
-            self.config
+            config
                 .model(id)
                 .map(|entry| (id.to_owned(), entry.provider.clone()))
         });
@@ -1404,20 +1461,25 @@ impl Frontend {
         let Some(id) = self.run_models.remove(run) else {
             return;
         };
-        if self.config.model(&id).is_none() {
-            return;
-        }
-        // `record_use` only fails for an unknown id, which the membership
-        // check above already excluded; treat a failure as a write failure
-        // rather than asserting on library internals.
-        if self.config.record_use(&id).is_err() {
-            self.state.notice("config save failed");
-            return;
-        }
-        let Some(path) = self.config_path.clone() else {
-            return;
+        let save_failed = {
+            let mut document = self
+                .user_config
+                .lock()
+                .expect("user configuration lockable");
+            if document.config.model(&id).is_none() {
+                return;
+            }
+            // Keep mutation and writeback serialized so concurrent terminal
+            // outcomes cannot persist stale snapshots over one another.
+            if document.config.record_use(&id).is_err() {
+                true
+            } else if let Some(path) = &document.path {
+                save_config(&document.config, path).is_err()
+            } else {
+                false
+            }
         };
-        if save_config(&self.config, &path).is_err() {
+        if save_failed {
             self.state.notice("config save failed");
         }
     }
@@ -4464,8 +4526,7 @@ mod cov_main_topup {
     /// exercise the loop rather than persistence.
     fn defaults_config() -> SessionConfig {
         SessionConfig {
-            config: UserConfig::default_config(),
-            path: None,
+            user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
             demo: false,
@@ -4506,8 +4567,7 @@ mod cov_main_topup {
         }
         let active_model = boot_model(&config);
         SessionConfig {
-            config,
-            path: None,
+            user_config: shared_user_config(config, None),
             active_model,
             tools_root: None,
             demo: false,
@@ -4689,20 +4749,68 @@ mod cov_main_topup {
     fn boot_model_prefers_recent_then_favourites_then_admission_order() {
         assert_eq!(boot_model(&UserConfig::default_config()), None);
         assert_eq!(
-            boot_model(&configured(3, &[], &[]).config).as_deref(),
+            boot_model(&user_config_snapshot(&configured(3, &[], &[]).user_config)).as_deref(),
             Some("m0"),
             "with nothing ranked, the first configured model boots"
         );
         assert_eq!(
-            boot_model(&configured(3, &[], &["m2"]).config).as_deref(),
+            boot_model(&user_config_snapshot(
+                &configured(3, &[], &["m2"]).user_config
+            ))
+            .as_deref(),
             Some("m2"),
             "a favourite beats admission order"
         );
         assert_eq!(
-            boot_model(&configured(3, &["m1"], &["m2"]).config).as_deref(),
+            boot_model(&user_config_snapshot(
+                &configured(3, &["m1"], &["m2"]).user_config
+            ))
+            .as_deref(),
             Some("m1"),
             "recent beats favourites"
         );
+    }
+
+    #[test]
+    fn runtime_capability_claim_is_explicit_and_current_adapters_match_it() {
+        let declared = tui_provider_capabilities();
+        assert_eq!(FakeProvider::demo_two_turn().capabilities(), declared);
+        let config = user_config_snapshot(&configured(1, &[], &[]).user_config);
+        let profile = config
+            .provider("demo-provider")
+            .expect("test provider exists");
+        let openai = OpenAiProvider::from_profile(profile, "demo-model")
+            .expect("current adapter config builds without network");
+        assert_eq!(openai.capabilities(), declared);
+        assert!(adapter_satisfies_tui_requirements(&openai.capabilities()));
+    }
+
+    #[test]
+    fn limited_adapter_capabilities_are_refused_at_live_binding() {
+        let mut limited = tui_provider_capabilities();
+        limited.tool_calls = false;
+        assert_eq!(
+            admit_adapter((), &limited),
+            Err(ErrorCategory::UnsupportedCapability)
+        );
+
+        limited = tui_provider_capabilities();
+        limited.max_context_items = Some(1);
+        assert_eq!(
+            admit_adapter((), &limited),
+            Err(ErrorCategory::UnsupportedCapability)
+        );
+
+        limited = tui_provider_capabilities();
+        limited.max_output_bytes = Some(1);
+        assert_eq!(
+            admit_adapter((), &limited),
+            Err(ErrorCategory::UnsupportedCapability)
+        );
+
+        let admitted = admit_adapter("bound", &tui_provider_capabilities())
+            .expect("the current adapter contract is admitted");
+        assert_eq!(admitted, "bound");
     }
 
     #[test]
@@ -4787,15 +4895,15 @@ mod cov_main_topup {
     fn terminal_outcome_records_the_model_bound_to_the_run_and_saves_the_document() {
         let directory = temp_config_dir("terminal-save");
         let path = directory.join("config.json");
-        let mut config = configured(3, &[], &[]);
-        config.path = Some(path.clone());
+        let config = configured(3, &[], &[]);
+        config.user_config.lock().expect("config lockable").path = Some(path.clone());
         let (run, mut front) = frontend_with(config);
         front.run_models.insert(run.clone(), "m1".to_owned());
         front.active_model = Some("m2".to_owned());
 
         assert!(front.apply_events(vec![started(&run, 0), finished(&run, 1)]));
         assert_eq!(
-            front.config.recent().first().map(String::as_str),
+            front.config_snapshot().recent().first().map(String::as_str),
             Some("m1"),
             "later picker changes do not alter run attribution"
         );
@@ -4811,10 +4919,56 @@ mod cov_main_topup {
     }
 
     #[test]
+    fn sessions_serialize_recent_updates_through_the_shared_config_owner() {
+        let directory = temp_config_dir("shared-recent");
+        let path = directory.join("config.json");
+        let config = configured(3, &[], &[]);
+        config.user_config.lock().expect("config lockable").path = Some(path.clone());
+        let (first_run, mut first) = frontend_with(config.clone());
+        let (second_run, mut second) = frontend_with(config);
+        first.run_models.insert(first_run.clone(), "m1".to_owned());
+        second
+            .run_models
+            .insert(second_run.clone(), "m2".to_owned());
+
+        // Complete the second slot first, then the first. Each write must
+        // include the update already recorded by the other slot.
+        assert!(second.apply_events(vec![started(&second_run, 0), finished(&second_run, 1)]));
+        assert!(first.apply_events(vec![started(&first_run, 0), finished(&first_run, 1)]));
+
+        let expected = vec!["m1".to_owned(), "m2".to_owned()];
+        assert_eq!(first.config_snapshot().recent(), expected);
+        let persisted = load_config(&path)
+            .expect("shared config reloads")
+            .expect("shared config was saved");
+        assert_eq!(persisted.recent(), expected);
+        std::fs::remove_dir_all(&directory).expect("temporary directory removed");
+    }
+
+    #[test]
+    fn new_sessions_boot_from_the_latest_shared_recent_model() {
+        let template = configured(3, &[], &[]);
+        let mut sessions = SessionRegistry::new(slot("s1", "sess-shared-1", &template), template);
+        let run = run_id("shared-config-run");
+        let first = sessions.active_mut();
+        first.front.merger.adopt(&run);
+        first.front.run_models.insert(run.clone(), "m2".to_owned());
+        assert!(
+            first
+                .front
+                .apply_events(vec![started(&run, 0), finished(&run, 1)])
+        );
+        assert_eq!(first.front.active_model.as_deref(), Some("m0"));
+
+        sessions.create().expect("new session builds");
+        assert_eq!(sessions.active().front.active_model.as_deref(), Some("m2"));
+    }
+
+    #[test]
     fn prepared_provider_selection_survives_picker_changes_before_first_call() {
         let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
         let binding = Arc::new(Mutex::new(LiveSelection {
-            config: front.config.clone(),
+            config: front.config_snapshot(),
             active_model: Some("m0".to_owned()),
             demo: false,
             pending_run: None,
@@ -4840,7 +4994,7 @@ mod cov_main_topup {
     fn terminal_before_first_provider_call_clears_only_its_run_snapshot() {
         let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
         let binding = Arc::new(Mutex::new(LiveSelection {
-            config: front.config.clone(),
+            config: front.config_snapshot(),
             active_model: Some("m0".to_owned()),
             demo: false,
             pending_run: None,
@@ -4874,7 +5028,7 @@ mod cov_main_topup {
     #[test]
     fn provider_discards_snapshot_owned_by_a_different_run() {
         let mut selection = LiveSelection {
-            config: configured(2, &[], &[]).config,
+            config: user_config_snapshot(&configured(2, &[], &[]).user_config),
             active_model: Some("m1".to_owned()),
             demo: false,
             pending_run: None,
@@ -4898,9 +5052,9 @@ mod cov_main_topup {
 
     #[test]
     fn an_unwritable_config_path_is_a_notice_and_never_a_crash() {
-        let mut config = configured(2, &[], &[]);
+        let config = configured(2, &[], &[]);
         // A path whose parent does not exist: `save` cannot create it.
-        config.path = Some(
+        config.user_config.lock().expect("config lockable").path = Some(
             std::env::temp_dir()
                 .join("nexus-tui-missing-parent")
                 .join("config.json"),
@@ -4931,7 +5085,9 @@ mod cov_main_topup {
             session_config_at(Some(directory.join("config.json"))).expect("a missing file is fine");
         assert_eq!(loaded.active_model, None);
         assert!(
-            loaded.config.models().is_empty(),
+            user_config_snapshot(&loaded.user_config)
+                .models()
+                .is_empty(),
             "defaults carry no models"
         );
         std::fs::remove_dir_all(&directory).expect("temporary directory removed");
@@ -6739,8 +6895,7 @@ mod cov_live_wiring {
     fn live_roots_must_exist_as_directories() {
         let missing = std::path::PathBuf::from("/nonexistent-nexus-tui-jail");
         let session = SessionConfig {
-            config: UserConfig::default_config(),
-            path: None,
+            user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: Some(missing),
             demo: false,
@@ -6764,8 +6919,7 @@ mod cov_live_wiring {
     #[test]
     fn demo_wiring_builds_without_a_jail() {
         let session = SessionConfig {
-            config: UserConfig::default_config(),
-            path: None,
+            user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
             demo: false,

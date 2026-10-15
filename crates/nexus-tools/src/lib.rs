@@ -5,19 +5,21 @@
 //! [`ScopedSearcher`] (`host_search`), [`ScopedWriter`] (`host_write`), and
 //! [`ScopedPatcher`] (`host_patch`), and [`SandboxedExecutor`] (`host_exec`,
 //! OS-sandboxed argv), all at the M0 revision. Strict adapters use one jail;
-//! [`development_file_tools`] accepts exact canonical runtime scopes for
-//! external paths too. Runtime policy decides approvals, not the adapters.
+//! [`strict_tools`] and [`development_tools`] provide the shared host
+//! compositions used by frontends. [`development_file_tools`] accepts exact
+//! canonical runtime scopes for external paths too. Runtime policy decides
+//! approvals, not the adapters.
 //! `host_exec` runs only behind an available mandatory
 //! platform sandbox and never falls back to an unsandboxed process.
 //!
 //! # Jail model
 //!
-//! - The root is canonicalized once at construction (symlinks in the root
-//!   itself are resolved there, not per call).
-//! - Every call joins the root with the admitted relative-or-inside path,
-//!   canonicalizes the result (following symlinks), and requires the root
-//!   prefix. A path that escapes is refused with `Denied`/`NotStarted`
-//!   before any read, never executed.
+//! - The root is canonicalized and bound to a directory descriptor at
+//!   construction (symlinks in the root itself are resolved there).
+//! - Calls resolve policy paths first, then walk the resulting relative path
+//!   from the bound descriptor without following changed symlink components.
+//!   Swapped components fail closed rather than redirecting access outside
+//!   the root.
 //! - Only regular files are read. Missing files, directories, special
 //!   files, and non-UTF-8 content fail with `Failed`/`Unknown`/`Uncertain`
 //!   and a static diagnostic that never echoes the path.
@@ -27,11 +29,11 @@
 //!
 //! # Residual risks (documented, not hidden)
 //!
-//! Canonicalize-then-read has a TOCTOU window: a path swapped between the
-//! prefix check and the open could escape. Readers that need hard
-//! guarantees must use OS-scoped opens (`openat2` on Linux) instead.
-//! Reads never write, so the worst case is bounded disclosure, never
-//! modification.
+//! Descriptor-relative access binds each opened object, but external writers
+//! can still race the final compare-and-rename window. Updates are staged in
+//! the destination directory and are atomically visible on rename; no
+//! crash-durability guarantee is made. Replacements preserve supported
+//! metadata and fail closed when required metadata cannot be retained.
 //!
 //! # Dependency justification
 //!
@@ -44,7 +46,8 @@
 
 mod development;
 mod exec;
-pub use development::development_file_tools;
+mod fs_access;
+pub use development::{development_file_tools, development_tools, strict_tools};
 pub mod fs;
 
 pub use exec::SandboxedExecutor;

@@ -43,11 +43,15 @@ fn call(args: &str) -> ToolCall {
 }
 
 fn context() -> ToolContext {
+    context_with_scope("command:/usr/bin/printf sandbox-ok")
+}
+
+fn context_with_scope(scope: &str) -> ToolContext {
     ToolContext::new(
         4096,
         Duration::ZERO,
         false,
-        ApprovedScope::new("command:/usr/bin/printf sandbox-ok").unwrap(),
+        ApprovedScope::new(scope).unwrap(),
     )
     .unwrap()
 }
@@ -194,7 +198,7 @@ fn development_python_runs_with_stdlib_temp_files_and_protected_credentials() {
         let script = "import pathlib,tempfile,ssl,json,socket; pathlib.Path('ok.txt').write_text('ok'); f=tempfile.TemporaryFile(); f.write(b'ok'); f.close();\ntry: pathlib.Path('.env').read_text(); raise AssertionError('credential readable')\nexcept PermissionError: pass\ntry: s=socket.socket(); s.connect(('127.0.0.1',9)); raise AssertionError('network permitted')\nexcept PermissionError: pass\nprint('python-ok')";
         let result = executor.execute(
             &call(&serde_json::json!({"argv":[python,"-c",script]}).to_string()),
-            &context(),
+            &context_with_scope("exec:workspace"),
         );
         assert_eq!(
             result.status(),
@@ -223,7 +227,8 @@ fn development_external_writes_require_a_bound_declared_directory() {
     let file = outside.join(format!("nexus-sandbox-write-{}", std::process::id()));
     assert!(!file.exists());
     let args = serde_json::json!({"argv":["/usr/bin/touch",file]});
-    let refused = executor.execute(&call(&args.to_string()), &context());
+    let workspace_context = context_with_scope("exec:workspace");
+    let refused = executor.execute(&call(&args.to_string()), &workspace_context);
     assert_eq!(
         refused.status(),
         ExecutionStatus::Failed,
@@ -232,7 +237,7 @@ fn development_external_writes_require_a_bound_declared_directory() {
     );
     assert!(!file.exists());
     let args = serde_json::json!({"argv":["/usr/bin/touch",file], "write_dir":outside});
-    let refused = executor.execute(&call(&args.to_string()), &context());
+    let refused = executor.execute(&call(&args.to_string()), &workspace_context);
     assert_eq!(refused.status(), ExecutionStatus::Denied);
     let context = ToolContext::new(
         4096,

@@ -37,8 +37,9 @@ use nexus_core::{
     Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits, ModelContextItem,
     ModelRequest, OutcomeSummary, PersistenceState, ProviderContext, ProviderEvent, ProviderPort,
     RequestId, RetryGuidance, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome, SessionId,
-    Snapshot, SubmitCommand, ToolCall, ToolContext, ToolFinishedInfo, ToolId, ToolOutcome,
-    ToolPort, ToolSpec, ToolStartedInfo, TurnId, Usage, UsageFinality,
+    Snapshot, SubmitCommand, ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId,
+    ToolOutcome, ToolPort, ToolRegistration, ToolSpec, ToolStartedInfo, TurnId, Usage,
+    UsageFinality,
 };
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
@@ -120,6 +121,7 @@ struct RegisteredTool {
     spec: ToolSpec,
     schema: CompiledSchema,
     port: Arc<dyn ToolPort + Send + Sync>,
+    access: ToolAccess,
 }
 
 struct State {
@@ -160,6 +162,7 @@ struct QueuedCall {
     item_key: String,
     provider_ref: String,
     needs_approval: bool,
+    access: ToolAccess,
 }
 
 struct CurrentCall {
@@ -343,13 +346,14 @@ fn runtime_error(category: ErrorCategory, message: &'static str) -> AgentError {
 
 impl Runtime {
     /// Fallible production constructor: validates limits, provider
-    /// capabilities, and every tool registration (one `describe()` call per
+    /// capabilities, and every host registration (one `describe()` call per
     /// tool, exact M0 revision, no duplicate names, closed-schema compile)
-    /// before any run can start.
+    /// before any run can start. The access classification is taken from the
+    /// host [`ToolRegistration`], never from the tool's own descriptor.
     pub fn try_new(
         config: RuntimeConfig,
         provider: Arc<dyn ProviderPort + Send + Sync>,
-        tools: Vec<Arc<dyn ToolPort + Send + Sync>>,
+        tools: Vec<ToolRegistration>,
     ) -> Result<(Self, EventStreams), AgentError> {
         config.limits.validate()?;
         let capabilities = provider.capabilities();
@@ -373,7 +377,8 @@ impl Runtime {
         }
         let mut registry: HashMap<String, RegisteredTool> = HashMap::new();
         let mut order: Vec<String> = Vec::with_capacity(tools.len());
-        for tool in tools {
+        for registration in tools {
+            let (tool, access) = registration.into_parts();
             let spec = tool.describe();
             let id = spec.id().clone();
             if id.revision() != nexus_core::M0_REVISION {
@@ -396,6 +401,7 @@ impl Runtime {
                     spec,
                     schema,
                     port: tool,
+                    access,
                 },
             );
         }
@@ -478,7 +484,7 @@ impl Runtime {
     pub fn new(
         config: RuntimeConfig,
         provider: Arc<dyn ProviderPort + Send + Sync>,
-        tools: Vec<Arc<dyn ToolPort + Send + Sync>>,
+        tools: Vec<ToolRegistration>,
     ) -> (Self, EventStreams) {
         Self::try_new(config, provider, tools)
             .expect("test-only runtime wiring must be valid; use Runtime::try_new in production")
@@ -1004,6 +1010,7 @@ impl Runtime {
         let producer_token = token.clone();
         let stream_bytes = Arc::new(AtomicUsize::new(0));
         let producer_bytes = stream_bytes.clone();
+        let worker_context = context.clone();
         let mut handle = tokio::task::spawn_blocking(move || {
             if incremental {
                 let sink = |event: ProviderEvent| {
@@ -1029,9 +1036,9 @@ impl Runtime {
                         producer_token.cancel();
                     }
                 };
-                provider.stream_with_sink(&request, &context, &sink)
+                provider.stream_with_sink(&request, &worker_context, &sink)
             } else {
-                provider.stream(&request, &context)
+                provider.stream(&request, &worker_context)
             }
         });
         let mut prefix = StreamedPrefix::default();
@@ -1062,6 +1069,19 @@ impl Runtime {
         };
         match joined {
             Some(Ok(events)) => {
+                // The join can become ready after the deadline while the
+                // deadline branch is also ready. Because the join branch is
+                // biased, do not accept the provider batch without checking
+                // the invocation's live control state again.
+                if let Err(error) = context.check_active() {
+                    return Err(match error.category() {
+                        ErrorCategory::Cancelled => Terminal::cancelled_with(error),
+                        ErrorCategory::Timeout => {
+                            Terminal::limit("run duration exhausted while awaiting provider")
+                        }
+                        _ => Terminal::failed(error),
+                    });
+                }
                 // The join may win the race while provisional events are
                 // still buffered: drain them first so every streamed prefix
                 // publishes before the authoritative batch ingests.
@@ -1587,6 +1607,7 @@ impl Runtime {
             if active.terminal.is_some() {
                 break;
             }
+            let tool_access = registered.access;
             let queued = QueuedCall {
                 call: ToolCall::new(
                     active.run.clone(),
@@ -1597,7 +1618,8 @@ impl Runtime {
                 ),
                 item_key: candidate.item_key().to_owned(),
                 provider_ref: candidate.provider_ref().to_owned(),
-                needs_approval: self.shared.policy.requires_approval(&tool_id),
+                needs_approval: self.shared.policy.requires_approval(tool_access, &tool_id),
+                access: tool_access,
             };
             let item = ModelContextItem::assistant_call_with_reasoning(
                 candidate.item_key(),
@@ -1640,6 +1662,21 @@ impl Runtime {
         let Some(mut queued) = active.queue.pop_front() else {
             return Ok(RunState::Preparing);
         };
+        if self.shared.policy.validate().is_err() {
+            // An invalid policy can neither authorize an automatic call nor
+            // mint a scoped approval. Fail closed with the same recorded
+            // denial the automatic path would produce, without dispatching.
+            let call = queued.call.call().clone();
+            active.outcome_slot =
+                Some((call, denied_outcome("policy no longer authorizes dispatch")));
+            active.current = Some(CurrentCall {
+                call: queued.call,
+                item_key: queued.item_key,
+                provider_ref: queued.provider_ref,
+                binding: None,
+            });
+            return Ok(RunState::RecordingResult);
+        }
         if self.shared.policy.is_development() {
             queued.needs_approval = self
                 .shared
@@ -1652,16 +1689,11 @@ impl Runtime {
                         .expect("session permissions lock")
                         .get(&active.session)
                         .map_or(&[], Vec::as_slice),
+                    queued.access,
                 )
                 .unwrap_or(true);
         }
-        if active.read_only
-            && (queued.needs_approval
-                || matches!(
-                    queued.call.tool().name(),
-                    "host_write" | "host_patch" | "host_exec"
-                ))
-        {
+        if active.read_only && (queued.needs_approval || queued.access != ToolAccess::Read) {
             // Read-only runs never prompt and never execute: the denial is
             // recorded exactly like the no-handler denial below, so no
             // approval card is minted and no grant can exist to approve.
@@ -2019,6 +2051,7 @@ impl Runtime {
                         .expect("session permissions lock")
                         .get(&active.session)
                         .map_or(&[], Vec::as_slice),
+                    registered.access,
                 ) {
                     Ok(scope) => scope,
                     Err(_) => {
@@ -3431,8 +3464,10 @@ mod tests {
         let provider = Arc::new(FakeProvider::with_delay(script, slow_provider));
         let read_tool = Arc::new(FakeTool::succeeding("host_read", nexus_core::M0_REVISION));
         let write_tool = Arc::new(FakeTool::succeeding("host_write", nexus_core::M0_REVISION));
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> =
-            vec![read_tool.clone(), write_tool.clone()];
+        let tools = vec![
+            ToolRegistration::read(read_tool.clone()),
+            ToolRegistration::mutation(write_tool.clone()),
+        ];
         let (runtime, streams) = Runtime::new(config, provider.clone(), tools);
         Bed {
             runtime,
@@ -3646,17 +3681,24 @@ mod tests {
     #[test]
     fn try_new_rejects_duplicate_names_and_wrong_revision() {
         let provider = Arc::new(FakeProvider::new(vec![]));
-        let duplicate: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![
-            Arc::new(FakeTool::succeeding("host_read", nexus_core::M0_REVISION)),
-            Arc::new(FakeTool::succeeding("host_read", nexus_core::M0_REVISION)),
+        let duplicate = vec![
+            ToolRegistration::read(Arc::new(FakeTool::succeeding(
+                "host_read",
+                nexus_core::M0_REVISION,
+            ))),
+            ToolRegistration::read(Arc::new(FakeTool::succeeding(
+                "host_read",
+                nexus_core::M0_REVISION,
+            ))),
         ];
         assert!(
             Runtime::try_new(quick_config(), provider.clone(), duplicate).is_err(),
             "duplicate registrations fail explicitly"
         );
-        let wrong_revision: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![Arc::new(
-            FakeTool::succeeding("host_read", nexus_core::M0_REVISION + 1),
-        )];
+        let wrong_revision = vec![ToolRegistration::read(Arc::new(FakeTool::succeeding(
+            "host_read",
+            nexus_core::M0_REVISION + 1,
+        )))];
         assert!(
             Runtime::try_new(quick_config(), provider, wrong_revision).is_err(),
             "non-M0 revisions fail exact equality"
@@ -4293,7 +4335,7 @@ mod tests {
             FakeProvider::tool_turn(vec![candidate("host_read", r#"{"path":"src"}"#)]),
             FakeProvider::stop_turn("done"),
         ]));
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![slow_tool.clone()];
+        let tools = vec![ToolRegistration::read(slow_tool.clone())];
         let (runtime, streams) = Runtime::new(
             RuntimeConfig {
                 limits: Limits::m0_test(),
@@ -4531,7 +4573,7 @@ mod tests {
         ])]));
         let mut limits = Limits::m0_test();
         limits.per_tool_timeout = Duration::from_millis(50);
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![slow.clone()];
+        let tools = vec![ToolRegistration::read(slow.clone())];
         let (runtime, streams) = Runtime::new(
             RuntimeConfig {
                 limits,
@@ -4606,7 +4648,7 @@ mod tests {
     #[test]
     fn control_saturation_buffers_terminal_until_the_consumer_resumes() {
         let provider = Arc::new(FakeProvider::new(vec![]));
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = Vec::new();
+        let tools = Vec::new();
         let (runtime, mut streams) = Runtime::new(quick_config(), provider, tools);
         let rt = test_rt();
         rt.block_on(async {
@@ -4846,10 +4888,10 @@ mod tests {
     #[test]
     fn provider_panic_is_supervised_with_a_failed_terminal() {
         let provider = Arc::new(PanicProvider);
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![Arc::new(FakeTool::succeeding(
+        let tools = vec![ToolRegistration::read(Arc::new(FakeTool::succeeding(
             "host_read",
             nexus_core::M0_REVISION,
-        ))];
+        )))];
         let (runtime, streams) = Runtime::new(quick_config(), provider, tools);
         let mut data = streams.data;
         let mut control = streams.control;
@@ -4869,8 +4911,9 @@ mod tests {
             FakeProvider::tool_turn(vec![candidate("host_read", r#"{"path":"src"}"#)]),
             FakeProvider::stop_turn("done"),
         ]));
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> =
-            vec![Arc::new(PanicTool::new("host_read"))];
+        let tools = vec![ToolRegistration::read(Arc::new(PanicTool::new(
+            "host_read",
+        )))];
         let (runtime, streams) = Runtime::new(quick_config(), provider, tools);
         let mut data = streams.data;
         let mut control = streams.control;
@@ -4921,7 +4964,7 @@ mod tests {
             FakeProvider::tool_turn(vec![candidate("host_read", r#"{"path":"src"}"#)]),
             FakeProvider::stop_turn("done"),
         ]));
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![tool.clone()];
+        let tools = vec![ToolRegistration::read(tool.clone())];
         let (runtime, streams) = Runtime::new(quick_config(), provider, tools);
         let mut data = streams.data;
         let mut control = streams.control;
@@ -4996,7 +5039,7 @@ mod tests {
     fn cancelled_blocked_provider_finalizes_promptly_and_quarantines_until_termination() {
         let (provider, entered, release) = BlockingProvider::new();
         let provider = Arc::new(provider);
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = Vec::new();
+        let tools = Vec::new();
         let (runtime, streams) = Runtime::new(quick_config(), provider.clone(), tools);
         let mut data = streams.data;
         let mut control = streams.control;
@@ -5961,7 +6004,10 @@ mod cov_runtime_topup_private {
         // is created deterministically.
         let read = Arc::new(ScriptedTool::new("host_read", read_gate));
         let write = Arc::new(ScriptedTool::new("host_write", None));
-        let tools: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![read.clone(), write.clone()];
+        let tools = vec![
+            ToolRegistration::read(read.clone()),
+            ToolRegistration::mutation(write.clone()),
+        ];
         let (runtime, streams) = Runtime::try_new(
             RuntimeConfig {
                 limits,
@@ -6461,6 +6507,7 @@ mod cov_runtime_topup_private {
                 item_key: "item-0".to_owned(),
                 provider_ref: "prov-ref-0".to_owned(),
                 needs_approval: true,
+                access: ToolAccess::Mutation,
             });
             active.pending.insert(
                 approval.clone(),

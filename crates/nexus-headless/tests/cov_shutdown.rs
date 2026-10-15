@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_core::commands::MAX_INPUT_BYTES;
-use nexus_core::{ErrorCategory, Limits, ProviderPort, RunOutcome, ToolPort};
+use nexus_core::{ErrorCategory, Limits, ProviderPort, RunOutcome, ToolRegistration};
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_headless::{
     EXIT_STDOUT_CLOSED, HeadlessError, RECONCILE_TIMEOUT, SHUTDOWN_TIMEOUT, USAGE, WATCHDOG_SLACK,
@@ -91,11 +91,11 @@ fn scripted_provider() -> Arc<dyn ProviderPort + Send + Sync> {
 
 /// The tool set the M0 composition registers: three distinct names at the M0
 /// revision, so registration cannot fail on duplicates.
-fn headless_composition_tools() -> Vec<Arc<dyn ToolPort + Send + Sync>> {
+fn headless_composition_tools() -> Vec<ToolRegistration> {
     vec![
-        Arc::new(FakeTool::read_only()),
-        Arc::new(FakeTool::mutation()),
-        Arc::new(FakeTool::command()),
+        ToolRegistration::read(Arc::new(FakeTool::read_only())),
+        ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
+        ToolRegistration::process(Arc::new(FakeTool::command())),
     ]
 }
 
@@ -299,9 +299,9 @@ fn runtime_registration_failure_is_a_normal_operation_error() {
         "the headless composition registers three distinct tools cleanly"
     );
 
-    let duplicate: Vec<Arc<dyn ToolPort + Send + Sync>> = vec![
-        Arc::new(FakeTool::read_only()),
-        Arc::new(FakeTool::read_only()),
+    let duplicate = vec![
+        ToolRegistration::read(Arc::new(FakeTool::read_only())),
+        ToolRegistration::read(Arc::new(FakeTool::read_only())),
     ];
     let registration = Runtime::try_new(headless_runtime_config(), scripted_provider(), duplicate)
         .err()
