@@ -135,6 +135,43 @@ fn create_and_overwrite_replace_the_whole_content() {
 
 #[cfg(unix)]
 #[test]
+fn replacement_preserves_mode_bits() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = TempRoot::new();
+    let path = root.0.join("mode.txt");
+    std::fs::write(&path, b"before").expect("fixture writes");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+        .expect("mode fixture sets");
+    let outcome = writer_for(&root).execute(
+        &call(r#"{"path":"mode.txt","content":"after"}"#),
+        &context(4096, false),
+    );
+    assert_eq!(outcome.status(), ExecutionStatus::Succeeded);
+    let metadata = std::fs::metadata(&path).expect("replacement metadata");
+    assert_eq!(metadata.mode() & 0o7777, 0o640);
+    assert_eq!(std::fs::read(path).expect("replacement content"), b"after");
+}
+
+#[cfg(unix)]
+#[test]
+fn multiply_linked_files_are_refused_without_mutating_either_name() {
+    let root = TempRoot::new();
+    let first = root.0.join("first.txt");
+    let second = root.0.join("second.txt");
+    std::fs::write(&first, b"shared").expect("fixture writes");
+    std::fs::hard_link(&first, &second).expect("hard link builds");
+    let outcome = writer_for(&root).execute(
+        &call(r#"{"path":"first.txt","content":"replacement"}"#),
+        &context(4096, false),
+    );
+    assert_eq!(outcome.status(), ExecutionStatus::Failed);
+    assert_eq!(root.read("first.txt").expect("first survives"), b"shared");
+    assert_eq!(root.read("second.txt").expect("second survives"), b"shared");
+}
+
+#[cfg(unix)]
+#[test]
 fn symlinks_outside_the_root_are_denied_and_targets_unchanged() {
     let root = TempRoot::new();
     let outside = TempRoot::new();
@@ -151,6 +188,21 @@ fn symlinks_outside_the_root_are_denied_and_targets_unchanged() {
         outside.read("original").expect("original survives"),
         b"unchanged"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn in_root_symlinks_keep_the_existing_follow_target_behavior() {
+    let root = TempRoot::new();
+    std::fs::write(root.0.join("target.txt"), b"before").expect("fixture writes");
+    std::os::unix::fs::symlink("target.txt", root.0.join("link.txt")).expect("in-root link builds");
+    let outcome = writer_for(&root).execute(
+        &call(r#"{"path":"link.txt","content":"after"}"#),
+        &context(4096, false),
+    );
+    assert_eq!(outcome.status(), ExecutionStatus::Succeeded);
+    assert!(root.0.join("link.txt").is_symlink());
+    assert_eq!(root.read("target.txt").expect("target replaced"), b"after");
 }
 
 #[cfg(unix)]

@@ -230,12 +230,22 @@ test harness instead. No Linux filesystem or sandbox claim is made here.
 
 ### M2.3 — Bind file access and define update consistency
 
-**Implementation status: Blocked.** D3's main baseline has been approved:
-descriptor-bound access, staged same-directory replacement, no-clobber new
-files, multi-hardlink mutation refusal, execution-time object binding, and the
-stated best-effort concurrency limits. Exact compatibility decisions for new
-file mode, ownership/ACL/xattr/platform metadata handling, and crash-durability
-claims remain unapproved; no file-access implementation has started.
+**Implementation status: In progress.** D3's main baseline and compatibility
+defaults have been approved: descriptor-bound access, staged same-directory
+replacement, no-clobber new files, multi-hardlink mutation refusal,
+execution-time object binding, and best-effort external-writer detection. New
+files use the existing `0666 & umask` creation behavior. Replacements preserve
+ordinary mode bits and supported metadata; when metadata cannot be preserved,
+replacement fails closed. Same-directory rename guarantees atomic visibility
+only; crash durability is not promised. The initial Unix descriptor walk and
+writer/patch integration are implemented. Regressions cover parent-symlink
+swaps, concurrent source changes during staging, no-clobber creation,
+multi-hardlink refusal, in-root/out-of-root symlink behavior, and mode
+preservation. The serialized macOS tools behavior suite passes. Linux runtime
+behavior and platform-metadata preservation cannot currently be verified
+because no Linux test environment is available; defer those checks until a
+Linux environment (for example, a future Docker setup) is available. No
+cross-platform guarantee is inferred from macOS results.
 
 **Findings:** P1.5. **Paths:** permissions, `crates/nexus-tools/src/fs.rs`, `development.rs`, filesystem tests; platform/security docs. **Dependencies:** M2.2 and accepted D3.
 
@@ -248,11 +258,17 @@ claims remain unapproved; no file-access implementation has started.
 
 ### M2.4 — Verify sandbox capability on both supported platforms
 
-**Implementation status: Blocked.** The current macOS tools suite passed,
-including sandbox write/network and exec cleanup coverage. Linux sandbox
+**Implementation status: macOS verified; Linux blocked.** On macOS 26.3.1
+(Darwin 25.3.0, arm64), `/usr/bin/sandbox-exec` is present and the serialized
+tools behavior suite passed all 44 tests, including all six exec sandbox tests:
+`cargo test -p nexus-tools --locked --offline --test behavior --
+--test-threads=1`. An earlier parallel test run hit backend-availability
+assertions; use the serialized invocation for this evidence. Linux sandbox
 execution with the required backend remains unverified under M1.4; no Linux
-isolation evidence is claimed. This task remains blocked until the M1.4 Linux
-prerequisite is available, and must be repeated after M2.3 as planned.
+isolation evidence is claimed. Linux validation is deferred until a suitable
+Linux environment (for example, a future Docker setup) is available. M2.4
+remains blocked until that prerequisite is available and must be repeated after
+M2.3 as planned.
 
 **Findings:** P1 validation gap. **Paths:** `crates/nexus-tools/tests/exec_sandbox.rs`, `tests/behavior.rs`, CI workflow if authorized, platform documentation. **Dependencies:** M1.4; repeat relevant tests after M2.3.
 
@@ -270,6 +286,14 @@ Strict/development/read-only and exact approval invariants hold after policy cha
 
 ### M3.1 — Give TUI user configuration one owner
 
+**Implementation status: Verified.** The loaded `UserConfig` document and its
+writeback path now live in one `Arc<Mutex<_>>` process owner shared by all TUI
+slots. Per-slot model selection and run identity remain local. Recent-model
+updates mutate and save under the same lock, preventing one slot from writing
+a stale document over another; newly created sessions derive their boot model
+from the current shared recents/favourites. Save failures remain notices and
+keep the in-memory update.
+
 **Findings:** P2.3. **Paths:** TUI session/frontend state in `main.rs`, config APIs only where necessary, TUI/config tests. **Dependencies:** M1.5.
 
 - Own mutable user config once in the TUI process; slots retain local selected model/mode and presentation state. New sessions use the current shared config rather than a stale startup copy.
@@ -278,7 +302,21 @@ Strict/development/read-only and exact approval invariants hold after policy cha
 
 **Acceptance/tests:** two sessions finish in either order and retain both updates; creating/switching sessions does not overwrite unrelated config; failed saves preserve in-memory changes; per-run attribution and next-run selection remain consistent.
 
+**Validation evidence:** `cargo test -p nexus-tui --locked --offline` (504
+passed, 11 ignored); `cargo clippy -p nexus-tui --all-targets --locked
+--offline -- -D warnings` (passed). Added regressions cover serialized
+writeback from two slots and a new session booting from the latest shared
+recent model. No live provider call was made.
+
 ### M3.2 — Share concrete wiring functions, not an application layer
+
+**Implementation status: Verified.** `nexus-tools` now owns shared strict and
+development real-tool set construction. TUI and server still own runtime
+policy, config, and concrete provider assembly; fake/headless wiring remains
+entrypoint-specific. Provider selection resolution also remains frontend
+specific: server sessions bind an explicit provider with an optional model
+override, while TUI runs resolve the slot's selected model and credential at
+run time; a common helper would obscure rather than remove those contracts.
 
 **Findings:** P2.8 composition duplication; review target-boundary recommendations. **Paths:** tools constructors, config selection helpers, TUI/server entrypoints and tests. **Dependencies:** M1.1, M2.1–M2.2; M3.1 for TUI integration.
 
@@ -288,7 +326,24 @@ Strict/development/read-only and exact approval invariants hold after policy cha
 
 **Acceptance/tests:** equivalent supported configurations yield matching tool identities and permission behavior through both composition roots; custom modes and unknown references fail explicitly; fake/headless limitations remain documented. The runtime does not gain dependencies on concrete adapters or frontends.
 
+**Validation evidence:** `cargo test -p nexus-tools --locked --offline --
+--test-threads=1` (53 passed); `cargo test -p nexus-tui --locked --offline`
+(504 passed, 11 ignored); `cargo test -p nexus-server --locked --offline`
+(151 passed). No live provider or external endpoint was used. The default
+parallel `nexus-tools` invocation had two sandbox probe availability failures;
+the serialized run passed, consistent with the recorded macOS probe-cap
+concurrency sensitivity in M2.4.
+
 ### M3.3 — Use truthful provider identity/capabilities for current runs
+
+**Implementation status: Verified for current TUI adapters.** The TUI now
+declares its wrapper capability contract explicitly instead of copying it
+from `FakeProvider`. A live `OpenAiProvider` is checked at per-run resolution
+against text, streaming, tool-call, and effective context/output budget
+requirements before it can be bound. Current fake and OpenAI adapter
+capabilities are pinned equal by a no-network test; deliberately limited
+capability fixtures are rejected. Selection snapshots and model attribution
+remain run-bound as established in M1.5.
 
 **Findings:** P2.9 (existing dynamic capability claim), P2.4. **Paths:** TUI provider binding, runtime registration only if needed, provider tests. **Dependencies:** M1.5, M3.2.
 
@@ -298,7 +353,19 @@ Strict/development/read-only and exact approval invariants hold after policy cha
 
 **Acceptance/tests:** a limited-capability adapter fixture cannot bypass admission through the wrapper; model changes affect only future runs; demo identity is explicit; existing conversation/history remains valid.
 
+**Validation evidence:** `cargo test -p nexus-tui --locked --offline` (504
+passed, 11 ignored); `cargo clippy -p nexus-tui --all-targets --locked
+--offline -- -D warnings` (passed). The capability equality and limited-adapter
+admission tests make no network requests.
+
 ### M3 gate
+
+**Implementation status: Verified.** All three slices have targeted regression
+coverage. TUI and server now call the same strict/development tool constructors;
+they retain their own provider/configuration, runtime policy, and failure
+contracts. Fake-only headless behavior remains explicit. Linux sandbox and
+filesystem validation deferred under M2 are not inferred from macOS results
+and remain a separate platform blocker, not an M3 claim.
 
 TUI config has one mutable owner and accepted runs have one actual selection. Shared functions reduce existing duplication without introducing an application service/crate. Equivalent supported configuration is exercised across frontends; intentional differences (including fake-only headless behavior) remain explicit.
 

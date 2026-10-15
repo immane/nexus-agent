@@ -5,12 +5,37 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};
+use crate::{
+    SandboxedExecutor, ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter,
+};
 use nexus_core::{
     AgentError, EffectState, Evidence, ExecutionStatus, NormalizedArgs, ToolAccess, ToolCall,
     ToolContext, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
 };
 use nexus_permissions::DirectoryPolicy;
+
+/// Constructs the real-file strict tool set shared by the TUI and server.
+/// Runtime policy and provider composition remain owned by each entrypoint.
+pub fn strict_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
+    Ok(vec![
+        ToolRegistration::read(Arc::new(ScopedReader::with_root(root)?)),
+        ToolRegistration::read(Arc::new(ScopedLister::with_root(root)?)),
+        ToolRegistration::read(Arc::new(ScopedSearcher::with_root(root)?)),
+        ToolRegistration::mutation(Arc::new(ScopedWriter::with_root(root)?)),
+        ToolRegistration::mutation(Arc::new(ScopedPatcher::with_root(root)?)),
+        ToolRegistration::process(Arc::new(SandboxedExecutor::with_root(root)?)),
+    ])
+}
+
+/// Constructs development file and exec tools shared by the TUI and server.
+/// Runtime permission policy is still configured by the caller.
+pub fn development_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
+    let mut tools = development_file_tools(root)?;
+    tools.push(ToolRegistration::process(Arc::new(
+        SandboxedExecutor::development(root)?,
+    )));
+    Ok(tools)
+}
 
 pub fn development_file_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
     let policy = DirectoryPolicy::new(root).map_err(|_| {
@@ -147,7 +172,7 @@ impl ToolPort for DevelopmentFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_core::{ApprovedScope, CallId, M0_REVISION, RunId, ToolId, TurnId};
+    use nexus_core::{ApprovedScope, CallId, M0_REVISION, RunId, ToolAccess, ToolId, TurnId};
     use std::time::Duration;
 
     #[test]
@@ -243,5 +268,38 @@ mod tests {
             written.content()
         );
         assert_eq!(std::fs::read_to_string(new).unwrap(), "written");
+    }
+
+    #[test]
+    fn shared_tool_sets_keep_expected_identities_and_host_access_classes() {
+        let root =
+            std::env::temp_dir().join(format!("nexus-shared-tool-sets-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        let strict = strict_tools(&root).unwrap();
+        let development = development_tools(&root).unwrap();
+        let identities = |tools: &[ToolRegistration]| {
+            tools
+                .iter()
+                .map(|tool| (tool.port().describe().id().name().to_owned(), tool.access()))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            ("host_read".to_owned(), ToolAccess::Read),
+            ("host_list".to_owned(), ToolAccess::Read),
+            ("host_search".to_owned(), ToolAccess::Read),
+            ("host_write".to_owned(), ToolAccess::Mutation),
+            ("host_patch".to_owned(), ToolAccess::Mutation),
+            ("host_exec".to_owned(), ToolAccess::Process),
+        ];
+        assert_eq!(identities(&strict), expected);
+        assert_eq!(identities(&development), expected);
     }
 }

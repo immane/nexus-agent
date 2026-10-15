@@ -56,6 +56,10 @@ Configuration changes MUST NOT silently alter an active call's arguments or capa
 
 A frontend or plugin cannot change host policy by emitting content. Loading an old session does not restore old grants automatically.
 
+### Current user-config save behavior
+
+The current TUI owns one mutable user-config document per process and serializes its recent-model updates and saves through that owner. Saves use atomic replacement, but this is not a cross-process merge or lock: if multiple processes update the same file, the last successful rename wins and an earlier process's changes may be lost. This policy does not promise reconciliation with edits made by another process while the TUI is running.
+
 ## Compatibility and Privacy
 
 Version stored configuration independently from provider and external-plugin protocols. Explain migrations and reject unsupported required formats instead of inferring them.
