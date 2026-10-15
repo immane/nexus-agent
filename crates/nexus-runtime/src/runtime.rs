@@ -1010,6 +1010,7 @@ impl Runtime {
         let producer_token = token.clone();
         let stream_bytes = Arc::new(AtomicUsize::new(0));
         let producer_bytes = stream_bytes.clone();
+        let worker_context = context.clone();
         let mut handle = tokio::task::spawn_blocking(move || {
             if incremental {
                 let sink = |event: ProviderEvent| {
@@ -1035,9 +1036,9 @@ impl Runtime {
                         producer_token.cancel();
                     }
                 };
-                provider.stream_with_sink(&request, &context, &sink)
+                provider.stream_with_sink(&request, &worker_context, &sink)
             } else {
-                provider.stream(&request, &context)
+                provider.stream(&request, &worker_context)
             }
         });
         let mut prefix = StreamedPrefix::default();
@@ -1068,6 +1069,19 @@ impl Runtime {
         };
         match joined {
             Some(Ok(events)) => {
+                // The join can become ready after the deadline while the
+                // deadline branch is also ready. Because the join branch is
+                // biased, do not accept the provider batch without checking
+                // the invocation's live control state again.
+                if let Err(error) = context.check_active() {
+                    return Err(match error.category() {
+                        ErrorCategory::Cancelled => Terminal::cancelled_with(error),
+                        ErrorCategory::Timeout => {
+                            Terminal::limit("run duration exhausted while awaiting provider")
+                        }
+                        _ => Terminal::failed(error),
+                    });
+                }
                 // The join may win the race while provisional events are
                 // still buffered: drain them first so every streamed prefix
                 // publishes before the authoritative batch ingests.
