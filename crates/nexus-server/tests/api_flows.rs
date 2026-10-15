@@ -205,6 +205,7 @@ fn find_frame_end(buffer: &[u8]) -> Option<usize> {
 struct Stream {
     socket: TcpStream,
     buffer: Vec<u8>,
+    events_read: usize,
 }
 
 impl Stream {
@@ -224,6 +225,7 @@ impl Stream {
         Self {
             socket,
             buffer: Vec::new(),
+            events_read: 0,
         }
     }
 
@@ -235,6 +237,7 @@ impl Stream {
     fn next(&mut self) -> Value {
         for attempt in 0..STREAM_LIMIT {
             if let Some(event) = self.take_event() {
+                self.events_read += 1;
                 return event;
             }
             let mut chunk = [0u8; 4096];
@@ -265,9 +268,25 @@ impl Stream {
     /// Drives the stream to the terminal event, invoking `on_event` for each
     /// event as it arrives. Returns every observed event, terminal included.
     fn drive_to_terminal(&mut self, mut on_event: impl FnMut(&Value)) -> Vec<Value> {
-        let mut events = Vec::new();
+        let mut events: Vec<Value> = Vec::new();
         loop {
+            let first_on_subscription = self.events_read == 0;
             let event = self.next();
+            if first_on_subscription {
+                assert_eq!(
+                    event["seq"].as_u64(),
+                    Some(0),
+                    "a fresh SSE subscription preserves the run's first event"
+                );
+            }
+            if let Some(previous) = events.last() {
+                let previous_seq = previous["seq"].as_u64().expect("previous SSE sequence");
+                let current_seq = event["seq"].as_u64().expect("current SSE sequence");
+                assert!(
+                    current_seq > previous_seq,
+                    "SSE sequence IDs are strictly increasing: {previous_seq} then {current_seq}"
+                );
+            }
             let terminal = event["terminal"] == true;
             on_event(&event);
             events.push(event);
@@ -627,6 +646,17 @@ fn a_decision_after_the_terminal_is_an_already_finalized_conflict() {
     assert_eq!(
         summary["effect"], "KnownApplied",
         "a late decision is inert"
+    );
+
+    let resumed = second_attach(port, &session, &run);
+    let resumed = String::from_utf8_lossy(&resumed);
+    assert!(
+        resumed.starts_with("HTTP/1.1 200 "),
+        "a settled stream can reconnect: {resumed}"
+    );
+    assert!(
+        !resumed.contains("data: "),
+        "reconnect does not replay already-written events"
     );
 }
 

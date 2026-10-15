@@ -54,6 +54,7 @@ use nexus_core::{
     SessionId, SubmitCommand, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
+use nexus_runtime::transport::{OrderedEventConsumer, is_control_payload};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 use nexus_tools::ScopedReader;
 use serde_json::Value;
@@ -86,9 +87,10 @@ const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_EVENTS: usize = 4_096;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_OVERFLOW_BYTES: usize = 2 * 1024 * 1024;
-/// At most one deferred terminal per accepted run. Run admission stops at this
-/// count, preserving terminal records instead of overflowing the reserve.
-const MAX_DEFERRED_TERMINALS: usize = 128;
+const SSE_ORDERED_EVENT_BUFFER_CAPACITY: usize = 256;
+/// One suspended stream plus one stream draining foreign-run backlog. New
+/// streams cannot evict either owner's unacknowledged events.
+const MAX_RETAINED_STREAMS: usize = 2;
 /// Hard cap: session runtimes own grants, history, and event receivers and
 /// are rejected rather than evicted while their execution state is unknown.
 pub const MAX_SESSIONS: usize = 128;
@@ -191,9 +193,97 @@ pub struct Session {
     /// while draining cannot be left in the channel; it is stashed here
     /// for its own waiter instead of being dropped.
     pending: Mutex<PendingEvents>,
-    deferred_terminals: Mutex<Vec<nexus_core::RunEvent>>,
+    /// Unacknowledged SSE events survive socket failure in their original
+    /// bounded owner, independently of the foreign-run pending store.
+    delivery: Mutex<Vec<SseDelivery>>,
     last_activity: Mutex<Instant>,
     last_run: Mutex<Option<RunId>>,
+}
+
+struct SseDelivery {
+    ordering: OrderedEventConsumer,
+    bytes: usize,
+    retry: Option<nexus_core::RunEvent>,
+    terminal: Option<nexus_core::RunEvent>,
+}
+
+impl SseDelivery {
+    fn new(run: &RunId) -> Self {
+        let mut ordering = OrderedEventConsumer::new(SSE_ORDERED_EVENT_BUFFER_CAPACITY);
+        ordering.adopt(run);
+        Self {
+            ordering,
+            bytes: 0,
+            retry: None,
+            terminal: None,
+        }
+    }
+
+    fn pressured(&self) -> bool {
+        self.bytes >= MAX_PENDING_BYTES
+            || self.ordering.pending_len() >= SSE_ORDERED_EVENT_BUFFER_CAPACITY
+    }
+
+    fn missing_control(&self) -> Option<bool> {
+        if !self.pressured() && self.retry.is_none() {
+            return None;
+        }
+        // Both runtime channels are FIFO. Once read-ahead is full, the
+        // earliest retained event's predecessor must be on the other side.
+        self.ordering
+            .first_pending()
+            .map(|event| !is_control_payload(event.payload()))
+    }
+
+    fn retain(&mut self, event: nexus_core::RunEvent) {
+        let bytes = pending_event_bytes(&event);
+        let before = self.ordering.pending_len();
+        match self.ordering.enqueue(event) {
+            Ok(()) => {
+                if self.ordering.pending_len() > before {
+                    self.bytes = self.bytes.saturating_add(bytes);
+                }
+            }
+            Err(event) => {
+                // No further read-ahead is permitted until the missing FIFO
+                // predecessor frees space. This is one owned reserve, not a
+                // best-effort transfer into the cross-run pending store.
+                self.retry = Some(*event);
+            }
+        }
+    }
+
+    fn write_ready(&mut self, stream: &mut impl Write) -> std::io::Result<()> {
+        loop {
+            if self.retry.as_ref().is_some_and(|event| {
+                !self.pressured() || event.seq() == self.ordering.expected_sequence()
+            }) && let Some(event) = self.retry.take()
+            {
+                self.retain(event);
+            }
+            if self
+                .terminal
+                .as_ref()
+                .is_some_and(|event| event.seq() == self.ordering.expected_sequence())
+                && let Some(event) = self.terminal.take()
+            {
+                self.retain(event);
+            }
+            let Some(event) = self.ordering.peek_ready() else {
+                break;
+            };
+            let frame = format!(
+                "id: {}\ndata: {}\n\n",
+                event.seq(),
+                crate::json::event_json(event)
+            );
+            stream.write_all(frame.as_bytes())?;
+            stream.flush()?;
+            self.bytes = self.bytes.saturating_sub(pending_event_bytes(event));
+            self.ordering.pop_ready();
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -471,7 +561,7 @@ impl Server {
             streaming: Mutex::new(false),
             next_request: AtomicU64::new(1),
             pending: Mutex::new(PendingEvents::default()),
-            deferred_terminals: Mutex::new(Vec::new()),
+            delivery: Mutex::new(Vec::new()),
             last_activity: Mutex::new(Instant::now()),
             last_run: Mutex::new(None),
         });
@@ -823,18 +913,6 @@ impl Server {
         // lock ensures its SSE consumer cannot remove a not-yet-registered
         // identity. The same lock enforces a finite association budget.
         let runtime = session.runtime.lock().expect("runtime lockable");
-        if session
-            .deferred_terminals
-            .lock()
-            .expect("deferred terminal lockable")
-            .len()
-            >= MAX_DEFERRED_TERMINALS
-        {
-            return Some(json_response(
-                409,
-                &json::error_body("session event backlog is full"),
-            ));
-        }
         if !session
             .pending
             .lock()
@@ -1111,20 +1189,55 @@ impl Server {
             *streaming = true;
         }
         let _subscriber = SubscriberGuard(&session.streaming);
+        let mut delivery = session.delivery.lock().expect("delivery lockable");
+        let index = match delivery
+            .iter()
+            .position(|state| state.ordering.active_run() == Some(&run))
+        {
+            Some(index) => index,
+            None => {
+                if delivery.len() == MAX_RETAINED_STREAMS {
+                    if let Some(index) = delivery
+                        .iter()
+                        .position(|state| state.ordering.is_finalized())
+                    {
+                        delivery.remove(index);
+                    } else {
+                        return Some(json_response(
+                            409,
+                            &json::error_body("resume retained event streams first"),
+                        ));
+                    }
+                }
+                delivery.push(SseDelivery::new(&run));
+                delivery.len() - 1
+            }
+        };
+        let delivery = &mut delivery[index];
         if http::write_sse_headers(stream).is_err() {
             return None;
         }
         let mut data = session.data.lock().expect("data channel lockable");
         let mut control = session.control.lock().expect("control channel lockable");
         loop {
-            let pending_event = Self::take_pending(session, &run);
-            let deferred_event = if pending_event.is_none() {
-                Self::take_deferred_terminal(session, &run, &data, &control)
-            } else {
-                None
+            if delivery.write_ready(stream).is_err() || delivery.ordering.is_finalized() {
+                break;
+            }
+            let pending_event = {
+                let mut pending = session.pending.lock().expect("pending lockable");
+                let expected = delivery.ordering.expected_sequence();
+                let has_predecessor = pending
+                    .events
+                    .iter()
+                    .chain(pending.overflow.iter().map(|(event, _)| event))
+                    .any(|event| event.run() == &run && event.seq() <= expected);
+                if !delivery.pressured() || has_predecessor {
+                    pending.pop_run(&run)
+                } else {
+                    None
+                }
             };
-            let is_deferred_terminal = deferred_event.is_some();
-            let event = match pending_event.or(deferred_event) {
+            let event = match pending_event {
                 Some(event) => event,
                 None => {
                     let pending = session.pending.lock().expect("pending lockable");
@@ -1138,11 +1251,12 @@ impl Server {
                         break;
                     }
                     drop(pending);
+                    let missing_control = delivery.missing_control();
                     let next = self.handle.block_on(async {
                         tokio::time::timeout(SSE_IDLE, async {
                             tokio::select! {
-                                event = data.recv() => event.map(StreamSide::Data),
-                                event = control.recv() => event.map(StreamSide::Control),
+                                event = data.recv(), if missing_control != Some(true) => event.map(StreamSide::Data),
+                                event = control.recv(), if missing_control != Some(false) => event.map(StreamSide::Control),
                             }
                         })
                         .await
@@ -1182,95 +1296,12 @@ impl Server {
             // the run looks finished but its usage is not yet durable.
             if terminal {
                 self.record_model_use(run.as_str());
-                // The terminal may win the channel race while presentation
-                // traffic is still queued behind it (data and control are
-                // independent channels): forward everything already
-                // committed first, terminal last, so a select! ordering can
-                // never strand a predecessor event.
-                if !is_deferred_terminal {
-                    match Self::drain_predecessors(
-                        stream,
-                        &mut data,
-                        &mut control,
-                        &run,
-                        &event,
-                        &session.pending,
-                        &session.deferred_terminals,
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            Self::write_backpressure_comment(stream);
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-            let frame = format!(
-                "id: {}\ndata: {}\n\n",
-                event.seq(),
-                crate::json::event_json(&event)
-            );
-            if stream.write_all(frame.as_bytes()).is_err() || stream.flush().is_err() {
-                break;
-            }
-            if terminal {
-                break;
+                delivery.terminal = Some(event);
+            } else {
+                delivery.retain(event);
             }
         }
         None
-    }
-
-    /// Forwards events already queued on either channel for this run. Called
-    /// with the terminal in hand but before publishing it, so predecessors
-    /// stranded by a channel race still precede it on the wire. Only the
-    /// caller knows which event is authoritative; everything drained here is
-    /// forwarded, including a duplicate terminal if one ever appears (the
-    /// runtime publishes exactly one, so its presence would itself be the
-    /// finding, never something to hide).
-    fn drain_predecessors(
-        stream: &mut TcpStream,
-        data: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
-        control: &mut tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
-        run: &RunId,
-        terminal: &nexus_core::RunEvent,
-        pending: &Mutex<PendingEvents>,
-        deferred_terminals: &Mutex<Vec<nexus_core::RunEvent>>,
-    ) -> std::io::Result<bool> {
-        loop {
-            let mut progressed = false;
-            for channel in [&mut *data, &mut *control] {
-                if !pending.lock().expect("pending lockable").can_receive_more() {
-                    Self::defer_terminal(deferred_terminals, terminal);
-                    return Ok(false);
-                }
-                while let Ok(queued) = channel.try_recv() {
-                    progressed = true;
-                    if queued.run() != run {
-                        // `try_recv` already consumed this event, so it
-                        // cannot stay queued: stash it for its own waiter
-                        // and stop draining this channel, leaving the
-                        // events behind it untouched.
-                        let can_continue = pending.lock().expect("pending lockable").push(queued);
-                        if !can_continue {
-                            Self::defer_terminal(deferred_terminals, terminal);
-                            return Ok(false);
-                        }
-                        break;
-                    }
-                    let frame = format!(
-                        "id: {}\ndata: {}\n\n",
-                        queued.seq(),
-                        crate::json::event_json(&queued)
-                    );
-                    stream.write_all(frame.as_bytes())?;
-                    stream.flush()?;
-                }
-            }
-            if !progressed {
-                return Ok(true);
-            }
-        }
     }
 
     fn write_backpressure_comment(stream: &mut TcpStream) {
@@ -1279,61 +1310,21 @@ impl Server {
         let _ = stream.flush();
     }
 
-    /// Pops the earliest stashed event owned by `run`, if any. Stashed
-    /// events come from foreign-run encounters in the receive and drain
-    /// paths; serving them here keeps every event deliverable to its own
-    /// waiter exactly once.
-    fn take_pending(session: &Session, run: &RunId) -> Option<nexus_core::RunEvent> {
-        let mut pending = session.pending.lock().expect("pending lockable");
-        pending.pop_run(run)
-    }
-
-    fn take_deferred_terminal(
-        session: &Session,
-        run: &RunId,
-        data: &tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
-        control: &tokio::sync::mpsc::Receiver<nexus_core::RunEvent>,
-    ) -> Option<nexus_core::RunEvent> {
-        if !data.is_empty() || !control.is_empty() {
-            return None;
-        }
-        let mut deferred = session
-            .deferred_terminals
-            .lock()
-            .expect("deferred terminal lockable");
-        let index = deferred.iter().position(|event| event.run() == run)?;
-        Some(deferred.remove(index))
-    }
-
     fn has_retained_event(session: &Session, run: &RunId) -> bool {
-        session
-            .deferred_terminals
-            .lock()
-            .expect("deferred terminal lockable")
-            .iter()
-            .any(|event| event.run() == run)
-            || {
-                let pending = session.pending.lock().expect("pending lockable");
-                pending.events.iter().any(|event| event.run() == run)
-                    || pending
-                        .overflow
-                        .as_ref()
-                        .is_some_and(|(event, _)| event.run() == run)
-            }
-    }
-
-    fn defer_terminal(
-        deferred_terminals: &Mutex<Vec<nexus_core::RunEvent>>,
-        terminal: &nexus_core::RunEvent,
-    ) {
-        let mut deferred = deferred_terminals
-            .lock()
-            .expect("deferred terminal lockable");
-        if deferred.iter().all(|event| event.run() != terminal.run()) {
-            debug_assert!(deferred.len() < MAX_DEFERRED_TERMINALS);
-            deferred.push(terminal.clone());
+        session.delivery.try_lock().ok().is_some_and(|delivery| {
+            delivery
+                .iter()
+                .any(|state| state.ordering.active_run() == Some(run))
+        }) || {
+            let pending = session.pending.lock().expect("pending lockable");
+            pending.events.iter().any(|event| event.run() == run)
+                || pending
+                    .overflow
+                    .as_ref()
+                    .is_some_and(|(event, _)| event.run() == run)
         }
     }
+
     /// the document. A run submitted without a model has no entry and is
     /// skipped without touching the configuration.
     ///
@@ -1570,6 +1561,247 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    fn delivery_event(seq: u64, terminal: bool, text: &str) -> nexus_core::RunEvent {
+        let payload = if terminal {
+            nexus_core::EventPayload::RunFinished(
+                nexus_core::RunFinished::new(
+                    nexus_core::RunOutcome::Completed,
+                    nexus_core::PersistenceState::Ephemeral,
+                    None,
+                )
+                .expect("valid terminal"),
+            )
+        } else {
+            nexus_core::EventPayload::AssistantTextDelta(
+                nexus_core::AssistantText::new(
+                    TurnId::new("delivery-turn").expect("valid"),
+                    "item",
+                    text,
+                )
+                .expect("valid text"),
+            )
+        };
+        nexus_core::RunEvent::new(
+            SessionId::new("delivery-session").expect("valid"),
+            RunId::new("delivery-run").expect("valid"),
+            seq,
+            payload,
+        )
+    }
+
+    struct FailingWriter {
+        remaining: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let written = bytes.len().min(self.remaining);
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn written_sequences(bytes: &[u8]) -> Vec<u64> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter_map(|line| line.strip_prefix("id: "))
+            .map(|seq| seq.parse().expect("sequence"))
+            .collect()
+    }
+
+    #[test]
+    fn delivery_keeps_failed_event_buffered_successors_and_terminal_for_reconnect() {
+        let first = delivery_event(0, false, "first");
+        let run = first.run().clone();
+        let mut delivery = SseDelivery::new(&run);
+        delivery.retain(first);
+        let mut first_wire = Vec::new();
+        delivery.write_ready(&mut first_wire).expect("first write");
+        for seq in 1..=3 {
+            delivery.retain(delivery_event(seq, false, "queued"));
+        }
+        delivery.terminal = Some(delivery_event(4, true, ""));
+        let first_queued = delivery.ordering.peek_ready().expect("queued event");
+        let first_queued_bytes = pending_event_bytes(first_queued);
+        let frame_len = format!(
+            "id: {}\ndata: {}\n\n",
+            first_queued.seq(),
+            crate::json::event_json(first_queued)
+        )
+        .len();
+        let bytes = delivery.bytes;
+        let mut broken = FailingWriter {
+            remaining: frame_len + 7,
+            fail_flush: false,
+        };
+        assert!(delivery.write_ready(&mut broken).is_err());
+        assert_eq!(delivery.ordering.expected_sequence(), 2);
+        assert_eq!(delivery.ordering.pending_len(), 2);
+        assert_eq!(delivery.bytes, bytes - first_queued_bytes);
+        assert!(delivery.terminal.is_some());
+
+        let mut resumed = Vec::new();
+        delivery.write_ready(&mut resumed).expect("reconnect");
+        assert_eq!(written_sequences(&resumed), [2, 3, 4]);
+        assert!(delivery.ordering.is_finalized());
+        assert_eq!(delivery.bytes, 0);
+        assert!(delivery.terminal.is_none());
+        let mut again = Vec::new();
+        delivery
+            .write_ready(&mut again)
+            .expect("already acknowledged");
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn delivery_does_not_acknowledge_a_failed_flush_or_terminal_write() {
+        for fail_flush in [false, true] {
+            let terminal = delivery_event(0, true, "");
+            let mut delivery = SseDelivery::new(terminal.run());
+            delivery.terminal = Some(terminal);
+            let mut broken = FailingWriter {
+                remaining: if fail_flush { usize::MAX } else { 0 },
+                fail_flush,
+            };
+            assert!(delivery.write_ready(&mut broken).is_err());
+            assert!(!delivery.ordering.is_finalized());
+            assert_eq!(
+                delivery
+                    .ordering
+                    .peek_ready()
+                    .expect("terminal retained")
+                    .seq(),
+                0
+            );
+            let mut resumed = Vec::new();
+            delivery.write_ready(&mut resumed).expect("retry terminal");
+            assert_eq!(written_sequences(&resumed), [0]);
+            assert!(delivery.ordering.is_finalized());
+        }
+    }
+
+    #[test]
+    fn delivery_pressure_waits_for_the_other_fifo_instead_of_skipping() {
+        let first = delivery_event(1, false, "queued");
+        let mut delivery = SseDelivery::new(first.run());
+        for seq in 1..=SSE_ORDERED_EVENT_BUFFER_CAPACITY as u64 {
+            delivery.retain(delivery_event(seq, false, "queued"));
+        }
+        assert!(delivery.pressured());
+        assert_eq!(delivery.missing_control(), Some(true));
+        // RunStarted is on control; it still fits the predecessor reserve.
+        let mut predecessor = delivery_event(0, false, "first");
+        predecessor = nexus_core::RunEvent::new(
+            predecessor.session().clone(),
+            predecessor.run().clone(),
+            0,
+            nexus_core::EventPayload::RunStarted {
+                request: RequestId::new("delivery-request").expect("valid"),
+            },
+        );
+        delivery.retain(predecessor);
+        let mut wire = Vec::new();
+        delivery.write_ready(&mut wire).expect("filled predecessor");
+        assert_eq!(
+            written_sequences(&wire),
+            (0..=SSE_ORDERED_EVENT_BUFFER_CAPACITY as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(delivery.ordering.gaps(), 0);
+        assert!(!delivery.pressured());
+    }
+
+    #[test]
+    fn delivery_byte_pressure_is_bounded_and_survives_a_broken_writer() {
+        let text = "x".repeat(nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES);
+        let first = delivery_event(1, false, &text);
+        let event_bytes = pending_event_bytes(&first);
+        let mut delivery = SseDelivery::new(first.run());
+        let mut seq = 1;
+        while !delivery.pressured() {
+            delivery.retain(delivery_event(seq, false, &text));
+            seq += 1;
+        }
+        assert!(delivery.bytes < MAX_PENDING_BYTES + event_bytes);
+        assert!(delivery.ordering.pending_len() < SSE_ORDERED_EVENT_BUFFER_CAPACITY);
+        assert_eq!(delivery.missing_control(), Some(true));
+        delivery.retain(delivery_event(0, false, "predecessor"));
+        let mut broken = FailingWriter {
+            remaining: 0,
+            fail_flush: false,
+        };
+        assert!(delivery.write_ready(&mut broken).is_err());
+        let mut wire = Vec::new();
+        delivery
+            .write_ready(&mut wire)
+            .expect("resumes without pending-store transfer");
+        assert_eq!(written_sequences(&wire), (0..seq).collect::<Vec<_>>());
+        assert_eq!(delivery.bytes, 0);
+    }
+
+    #[test]
+    fn stream_admission_never_evicts_suspended_delivery_states() {
+        let (server, _executor) = server_with_gated_config();
+        let token = server.create_session().expect("session");
+        let session = server.session(&token).expect("registered session");
+        let runtime = session.runtime.lock().expect("runtime");
+        let reply = server.handle.block_on(
+            runtime.submit(
+                SubmitCommand::new(
+                    session.request_id(),
+                    session.session.clone(),
+                    "third stream",
+                    WEB_PROFILE,
+                )
+                .expect("valid submit"),
+            ),
+        );
+        let run = reply.run().expect("accepted run").clone();
+        drop(runtime);
+        {
+            let mut delivery = session.delivery.lock().expect("delivery");
+            for id in ["suspended-first", "suspended-second"] {
+                delivery.push(SseDelivery::new(&RunId::new(id).expect("valid")));
+            }
+        }
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let _client = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (mut socket, _) = listener.accept().expect("accept");
+        let response = server
+            .stream_events(&session, run.as_str(), &mut socket)
+            .expect("admission refusal");
+        assert_eq!(response.status, 409);
+        let delivery = session.delivery.lock().expect("delivery");
+        assert_eq!(delivery.len(), MAX_RETAINED_STREAMS);
+        assert_eq!(
+            delivery[0].ordering.active_run().expect("run").as_str(),
+            "suspended-first"
+        );
+        assert_eq!(
+            delivery[1].ordering.active_run().expect("run").as_str(),
+            "suspended-second"
+        );
+        drop(delivery);
+        let runtime = session.runtime.lock().expect("runtime");
+        server
+            .handle
+            .block_on(runtime.cancel(nexus_core::CancelCommand {
+                request: session.request_id(),
+                run,
+            }));
+    }
 
     /// Live demo context: a 60s elapsed reading, never cancelled, no
     /// credential, so the served script is never short-circuited.

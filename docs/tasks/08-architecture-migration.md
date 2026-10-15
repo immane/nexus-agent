@@ -373,6 +373,27 @@ TUI config has one mutable owner and accepted runs have one actual selection. Sh
 
 ### M4.1 — Unify ordered event consumption where it is actually shared
 
+**Implementation status: Verified.** `nexus-runtime::transport::OrderedEventConsumer`
+now owns the common bounded merge, run/sequence rejection, gap accounting, and
+terminal cutoff. Saturation returns the unaccepted event without skipping a
+sequence. The TUI explicitly retains its counted, best-effort presentation gap
+policy and drains both queued channels before a terminal gap flush. Headless applies ordered events
+before its existing bounded retention and flushes only after terminal plus the
+already-queued data drain; a closed control channel without a terminal remains
+an error, not a fabricated result; reorder saturation refuses an incomplete
+report. Server SSE retains its own unacknowledged ordered events and terminal
+in the session, separately from the foreign-run pending store. It writes and
+acknowledges one event at a time, resuming after the last successful write and
+flush; a new subscription starts at sequence zero. A failed/partial write is
+retried on the replacement socket, not treated as client acknowledgment.
+Read-ahead stops at 256 events or the 1 MiB encoded-byte budget and waits on
+the other FIFO channel for the missing predecessor. Finite event reserves
+cover an in-progress predecessor, retry, and terminal. At most two stream
+states (a suspended run and a backlog-draining run) are retained per session;
+admitting a third returns 409 rather than evicting unacknowledged events.
+Channel closure without a terminal remains an incomplete
+stream. Formatting, retention, and reconnection stay frontend-owned.
+
 **Findings:** P2.7. **Paths:** runtime `transport.rs`, TUI merger, headless consumer, server SSE and related tests. **Dependencies:** M1.2–M1.3, M1.6; frontend contracts stable after M3.
 
 - Define one bounded ordering helper for run/sequence rejection, cross-channel merge, gaps, terminal handling, and closure. Prefer the existing transport module; introduce no event framework or mandatory background service.
@@ -380,6 +401,17 @@ TUI config has one mutable owner and accepted runs have one actual selection. Sh
 - Do not change public wire revision or event naming merely for internal consistency.
 
 **Acceptance/tests:** reordered channels, duplicates, stale/post-terminal events, missing sequences, saturation, closure, and reconnect policies. Server output sequence is monotonic; TUI output is not duplicated; headless encoding/exit codes remain compatible. Cross-frontend tests exercise the same lifecycle fixtures.
+
+**Validation evidence:** `cargo nextest run -p nexus-runtime -p nexus-tui
+-p nexus-headless -p nexus-server --locked --offline` (1031 passed, 11 skipped).
+Shared transport regressions cover reordering, duplicate/stale and
+post-terminal rejection, ownership-preserving saturation, predecessor reserve,
+gap flush, and reconnect start. SSE regressions cover partial write/flush
+failure, queued successors and terminal retry, event/byte backpressure, and
+bounded stream admission without eviction. TUI presentation gaps and explicit
+headless saturation refusal are tested separately. Formatting and all-target
+Clippy with `-D warnings` passed for these four packages. No wire revision or
+event names changed; no live provider endpoint was used.
 
 ### M4.2 — Simplify development file-tool reuse
 
