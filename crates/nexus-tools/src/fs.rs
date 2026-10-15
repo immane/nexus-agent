@@ -32,6 +32,15 @@ fn tool_error(category: ErrorCategory, message: &'static str) -> AgentError {
         .expect("static safe tool message builds")
 }
 
+fn active_error(context: &ToolContext) -> AgentError {
+    let (category, message) = if context.is_cancelled() {
+        (ErrorCategory::Cancelled, "tool call was cancelled")
+    } else {
+        (ErrorCategory::Timeout, "tool deadline exceeded")
+    };
+    tool_error(category, message)
+}
+
 /// Read-only file executor jailed to one canonical root. Constructed with
 /// [`ScopedReader::with_root`]; the root defaults to the process working
 /// directory via [`ScopedReader::with_current_dir`].
@@ -116,12 +125,7 @@ impl ScopedReader {
         path: &Path,
         context: &ToolContext,
     ) -> Result<(String, bool), AgentError> {
-        if context.is_cancelled() {
-            return Err(tool_error(
-                ErrorCategory::Cancelled,
-                "tool call was cancelled",
-            ));
-        }
+        context.check_active()?;
         let file = self
             .access
             .open_file(path)
@@ -132,12 +136,7 @@ impl ScopedReader {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
-            if context.is_cancelled() {
-                return Err(tool_error(
-                    ErrorCategory::Cancelled,
-                    "tool call was cancelled",
-                ));
-            }
+            context.check_active()?;
             match limited.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(read) => bytes.extend_from_slice(&chunk[..read]),
@@ -169,6 +168,43 @@ impl ScopedReader {
             }
         };
         Ok((text, truncated))
+    }
+
+    pub(crate) fn execute_resolved(&self, path: &Path, context: &ToolContext) -> ToolOutcome {
+        if context.check_active().is_err() {
+            return Self::failed(tool_error(
+                if context.is_cancelled() {
+                    ErrorCategory::Cancelled
+                } else {
+                    ErrorCategory::Timeout
+                },
+                "filesystem call is no longer active",
+            ));
+        }
+        let (text, truncated) = match self.read_scoped(path, context) {
+            Ok(result) => result,
+            Err(error) => return Self::failed(error),
+        };
+        match ToolOutcome::from_bounded_content(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownNotApplied,
+            Evidence::HostObserved,
+            text,
+            truncated,
+        ) {
+            Ok(outcome) => outcome
+                .enforce_budget(context.output_budget_bytes())
+                .unwrap_or_else(|_| {
+                    Self::failed(tool_error(
+                        ErrorCategory::Internal,
+                        "tool output could not be bounded",
+                    ))
+                }),
+            Err(_) => Self::failed(tool_error(
+                ErrorCategory::Internal,
+                "tool output could not be bounded",
+            )),
+        }
     }
 
     /// Maps an internal failure to an honest outcome: unknown effects,
@@ -225,29 +261,7 @@ impl ToolPort for ScopedReader {
             }
             Err(error) => return Self::failed(error),
         };
-        let (text, truncated) = match self.read_scoped(&path, context) {
-            Ok(text) => text,
-            Err(error) => return Self::failed(error),
-        };
-        match ToolOutcome::from_bounded_content(
-            ExecutionStatus::Succeeded,
-            EffectState::KnownNotApplied,
-            Evidence::HostObserved,
-            text,
-            truncated,
-        ) {
-            Ok(outcome) => match outcome.enforce_budget(context.output_budget_bytes()) {
-                Ok(bounded) => bounded,
-                Err(_) => Self::failed(tool_error(
-                    ErrorCategory::Internal,
-                    "tool output could not be bounded",
-                )),
-            },
-            Err(_) => Self::failed(tool_error(
-                ErrorCategory::Internal,
-                "tool output could not be bounded",
-            )),
-        }
+        self.execute_resolved(&path, context)
     }
 }
 
@@ -302,6 +316,14 @@ impl ScopedLister {
         context: &ToolContext,
     ) -> Result<(String, bool), AgentError> {
         let path = resolve_existing(&self.root, call.args().as_str())?;
+        self.execute_directory(&path, context)
+    }
+
+    fn execute_directory(
+        &self,
+        path: &Path,
+        context: &ToolContext,
+    ) -> Result<(String, bool), AgentError> {
         if !path.is_dir() {
             return Err(tool_error(
                 ErrorCategory::ToolFailure,
@@ -311,7 +333,7 @@ impl ScopedLister {
         let mut entries = Vec::new();
         let directory = self
             .access
-            .open_directory(&path)
+            .open_directory(path)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
         let mut iterator = rustix::fs::Dir::read_from(&directory)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
@@ -336,12 +358,7 @@ impl ScopedLister {
         entries.sort_by_key(|entry| entry.file_name().to_owned());
         let mut output = String::new();
         for entry in entries {
-            if context.is_cancelled() {
-                return Err(tool_error(
-                    ErrorCategory::Cancelled,
-                    "tool call was cancelled",
-                ));
-            }
+            context.check_active()?;
             let raw_name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
             let entry_path = path.join(raw_name);
             let name = entry_path
@@ -376,6 +393,25 @@ impl ScopedLister {
             output.push('\n');
         }
         Ok((output, truncated))
+    }
+
+    pub(crate) fn execute_resolved(&self, path: &Path, context: &ToolContext) -> ToolOutcome {
+        if context.check_active().is_err() {
+            return ScopedReader::failed(tool_error(
+                if context.is_cancelled() {
+                    ErrorCategory::Cancelled
+                } else {
+                    ErrorCategory::Timeout
+                },
+                "filesystem call is no longer active",
+            ));
+        }
+        match self.execute_directory(path, context) {
+            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                ScopedReader::denied()
+            }
+            result => read_result(result, context, "directory cannot be listed"),
+        }
     }
 }
 
@@ -424,22 +460,26 @@ impl ScopedSearcher {
     ) -> Result<(String, bool), AgentError> {
         let (directory, query) = parse_path_query(call.args().as_str())?;
         let base = resolve_path(&self.root, &directory)?;
+        self.execute_search(&base, &query, context)
+    }
+
+    fn execute_search(
+        &self,
+        base: &Path,
+        query: &str,
+        context: &ToolContext,
+    ) -> Result<(String, bool), AgentError> {
         if !base.is_dir() || query.is_empty() {
             return Err(tool_error(
                 ErrorCategory::InvalidInput,
                 "tool input is invalid",
             ));
         }
-        let mut stack = vec![base.clone()];
+        let mut stack = vec![base.to_path_buf()];
         let mut output = String::new();
         let mut truncated = false;
         while let Some(dir) = stack.pop() {
-            if context.is_cancelled() {
-                return Err(tool_error(
-                    ErrorCategory::Cancelled,
-                    "tool call was cancelled",
-                ));
-            }
+            context.check_active()?;
             let directory = self.access.open_directory(&dir).map_err(|_| {
                 tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
             })?;
@@ -447,12 +487,7 @@ impl ScopedSearcher {
                 tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
             })?;
             for entry in entries {
-                if context.is_cancelled() {
-                    return Err(tool_error(
-                        ErrorCategory::Cancelled,
-                        "tool call was cancelled",
-                    ));
-                }
+                context.check_active()?;
                 let entry = entry.map_err(|_| {
                     tool_error(ErrorCategory::ToolFailure, "search cannot be completed")
                 })?;
@@ -505,8 +540,8 @@ impl ScopedSearcher {
                     continue;
                 };
                 for (index, line) in text.lines().enumerate() {
-                    if line.contains(&query) {
-                        let relative = path.strip_prefix(&base).unwrap_or(&path).to_string_lossy();
+                    if line.contains(query) {
+                        let relative = path.strip_prefix(base).unwrap_or(&path).to_string_lossy();
                         let record = format!("{relative}:{}:{line}\n", index + 1);
                         if output.len().saturating_add(record.len()) > context.output_budget_bytes()
                         {
@@ -519,6 +554,30 @@ impl ScopedSearcher {
             }
         }
         Ok((output, truncated))
+    }
+
+    pub(crate) fn execute_resolved(
+        &self,
+        base: &Path,
+        query: &str,
+        context: &ToolContext,
+    ) -> ToolOutcome {
+        if context.check_active().is_err() {
+            return ScopedReader::failed(tool_error(
+                if context.is_cancelled() {
+                    ErrorCategory::Cancelled
+                } else {
+                    ErrorCategory::Timeout
+                },
+                "filesystem call is no longer active",
+            ));
+        }
+        match self.execute_search(base, query, context) {
+            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                ScopedReader::denied()
+            }
+            result => read_result(result, context, "search cannot be completed"),
+        }
     }
 }
 
@@ -699,6 +758,22 @@ impl ScopedPatcher {
             ));
         }
         let target = resolve_path(&self.root, path)?;
+        self.apply_resolved(&target, old_text, new_text, context)
+    }
+
+    fn apply_resolved(
+        &self,
+        target: &Path,
+        old_text: &str,
+        new_text: &str,
+        context: &ToolContext,
+    ) -> Result<usize, AgentError> {
+        if old_text.is_empty() {
+            return Err(tool_error(
+                ErrorCategory::InvalidInput,
+                "tool arguments are invalid",
+            ));
+        }
         if !target.is_file() {
             return Err(tool_error(
                 ErrorCategory::ToolFailure,
@@ -707,7 +782,7 @@ impl ScopedPatcher {
         }
         let source = self
             .access
-            .open_file(&target)
+            .open_file(target)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
         let stamp = crate::fs_access::FileStamp::read(&source)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
@@ -715,12 +790,7 @@ impl ScopedPatcher {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
-            if context.is_cancelled() {
-                return Err(tool_error(
-                    ErrorCategory::Cancelled,
-                    "tool call was cancelled",
-                ));
-            }
+            context.check_active()?;
             let read = limited
                 .read(&mut chunk)
                 .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
@@ -750,18 +820,13 @@ impl ScopedPatcher {
                 "patch did not match exactly once",
             ));
         }
-        if context.is_cancelled() {
-            return Err(tool_error(
-                ErrorCategory::Cancelled,
-                "tool call was cancelled",
-            ));
-        }
+        context.check_active()?;
         let mut replacement = String::with_capacity(text.len() - old_text.len() + new_text.len());
         replacement.push_str(&text[..index]);
         replacement.push_str(new_text);
         replacement.push_str(&text[index + old_text.len()..]);
 
-        let canonical = std::fs::canonicalize(&target)
+        let canonical = std::fs::canonicalize(target)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be patched"))?;
         if !canonical.starts_with(&self.root) {
             return Err(tool_error(
@@ -792,16 +857,80 @@ impl ScopedPatcher {
             &source,
             stamp,
             replacement.as_bytes(),
-            || context.is_cancelled(),
+            || context.check_active().is_err(),
         )
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::Interrupted {
-                tool_error(ErrorCategory::Cancelled, "tool call was cancelled")
+                active_error(context)
             } else {
                 tool_error(ErrorCategory::ToolFailure, "file cannot be patched")
             }
         })?;
         Ok(replacement.len())
+    }
+
+    pub(crate) fn execute_development(
+        &self,
+        target: &Path,
+        old_text: &str,
+        new_text: &str,
+        context: &ToolContext,
+    ) -> ToolOutcome {
+        if context.check_active().is_err() {
+            return ScopedWriter::failed(tool_error(
+                if context.is_cancelled() {
+                    ErrorCategory::Cancelled
+                } else {
+                    ErrorCategory::Timeout
+                },
+                "filesystem call is no longer active",
+            ));
+        }
+        match self.apply_resolved(target, old_text, new_text, context) {
+            Ok(bytes) => ToolOutcome::from_bounded_content(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                format!("patched file ({bytes} bytes after patch)"),
+                false,
+            )
+            .and_then(|outcome| outcome.enforce_budget(context.output_budget_bytes()))
+            .unwrap_or_else(|_| {
+                ToolOutcome::new(
+                    ExecutionStatus::Failed,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "patch result could not be bounded",
+                    false,
+                )
+                .expect("static failure builds")
+            }),
+            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                ScopedWriter::denied()
+            }
+            Err(error)
+                if error.category() == ErrorCategory::InvalidInput
+                    && error.message() == "patch did not match exactly once" =>
+            {
+                ToolOutcome::new(
+                    ExecutionStatus::Failed,
+                    EffectState::KnownNotApplied,
+                    Evidence::HostObserved,
+                    "patch did not match exactly once",
+                    false,
+                )
+                .expect("static patch refusal builds")
+            }
+            Err(error) if error.category() == ErrorCategory::ResourceLimit => ToolOutcome::new(
+                ExecutionStatus::Failed,
+                EffectState::KnownNotApplied,
+                Evidence::HostObserved,
+                "file exceeds patch limit",
+                false,
+            )
+            .expect("static patch limit builds"),
+            Err(error) => ScopedWriter::failed(error),
+        }
     }
 }
 
@@ -1009,12 +1138,7 @@ impl ScopedWriter {
         content: &str,
         context: &ToolContext,
     ) -> Result<usize, AgentError> {
-        if context.is_cancelled() {
-            return Err(tool_error(
-                ErrorCategory::Cancelled,
-                "tool call was cancelled",
-            ));
-        }
+        context.check_active()?;
         let parent_fd = self
             .access
             .open_directory(parent)
@@ -1031,11 +1155,11 @@ impl ScopedWriter {
                     &source,
                     stamp,
                     content.as_bytes(),
-                    || context.is_cancelled(),
+                    || context.check_active().is_err(),
                 )
                 .map_err(|error| {
                     if error.kind() == std::io::ErrorKind::Interrupted {
-                        tool_error(ErrorCategory::Cancelled, "tool call was cancelled")
+                        active_error(context)
                     } else {
                         tool_error(ErrorCategory::ToolFailure, "file cannot be written")
                     }
@@ -1043,11 +1167,11 @@ impl ScopedWriter {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 crate::fs_access::create_new(&parent_fd, name, content.as_bytes(), || {
-                    context.is_cancelled()
+                    context.check_active().is_err()
                 })
                 .map_err(|error| {
                     if error.kind() == std::io::ErrorKind::Interrupted {
-                        tool_error(ErrorCategory::Cancelled, "tool call was cancelled")
+                        active_error(context)
                     } else {
                         tool_error(ErrorCategory::ToolFailure, "file cannot be written")
                     }
@@ -1061,6 +1185,63 @@ impl ScopedWriter {
             }
         }
         Ok(content.len())
+    }
+
+    pub(crate) fn execute_development(
+        &self,
+        target: &Path,
+        content: &str,
+        context: &ToolContext,
+    ) -> ToolOutcome {
+        if context.check_active().is_err() {
+            return Self::failed(tool_error(
+                if context.is_cancelled() {
+                    ErrorCategory::Cancelled
+                } else {
+                    ErrorCategory::Timeout
+                },
+                "filesystem call is no longer active",
+            ));
+        }
+        let parent = match target.parent() {
+            Some(parent) => parent,
+            None => {
+                return Self::failed(tool_error(
+                    ErrorCategory::InvalidInput,
+                    "tool path is invalid",
+                ));
+            }
+        };
+        let name = match target.file_name().and_then(|name| name.to_str()) {
+            Some(name) if !name.is_empty() => name,
+            _ => {
+                return Self::failed(tool_error(
+                    ErrorCategory::InvalidInput,
+                    "tool path is invalid",
+                ));
+            }
+        };
+        let written = match self.write_scoped(parent, name, content, context) {
+            Ok(written) => written,
+            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                return Self::denied();
+            }
+            Err(error) => return Self::failed(error),
+        };
+        ToolOutcome::from_bounded_content(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownApplied,
+            Evidence::HostObserved,
+            format!("wrote {written} bytes"),
+            false,
+        )
+        .and_then(|outcome| outcome.enforce_budget(context.output_budget_bytes()))
+        .unwrap_or_else(|_| {
+            Self::failed(tool_error(
+                ErrorCategory::Internal,
+                "tool output could not be bounded",
+            ))
+        })
     }
 
     /// Maps an internal failure to an honest outcome: unknown effects,

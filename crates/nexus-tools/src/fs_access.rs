@@ -504,6 +504,37 @@ mod tests {
     }
 
     #[test]
+    fn deadline_expiring_after_new_file_staging_prevents_publish() {
+        let root = TempRoot::new();
+        let bound = BoundRoot::open(&root.0).expect("root binds");
+        let result = create_new(&bound.directory, "new.txt", b"staged content", || {
+            // The callback runs after the temporary file has been written and
+            // immediately before publication. Simulate a deadline expiring
+            // during staging, without relying on wall-clock timing.
+            assert!(
+                std::fs::read_dir(&root.0)
+                    .expect("directory reads")
+                    .next()
+                    .is_some(),
+                "staging has completed before the activity check"
+            );
+            true
+        });
+        assert_eq!(
+            result
+                .expect_err("expired operation must not publish")
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!root.0.join("new.txt").exists());
+        assert_eq!(
+            std::fs::read_dir(&root.0).expect("directory reads").count(),
+            0,
+            "the staged temporary is cleaned up"
+        );
+    }
+
+    #[test]
     fn new_file_publish_never_clobbers_a_racing_creator() {
         let root = TempRoot::new();
         let bound = BoundRoot::open(&root.0).expect("root binds");
@@ -580,6 +611,42 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(&root.0).expect("directory reads").count(),
             1
+        );
+    }
+
+    #[test]
+    fn deadline_expiring_after_replacement_staging_preserves_original() {
+        let root = TempRoot::new();
+        let bound = BoundRoot::open(&root.0).expect("root binds");
+        let path = bound.path.join("file.txt");
+        std::fs::write(&path, b"before").expect("fixture writes");
+        let source = bound.open_file(&path).expect("source opens");
+        let stamp = FileStamp::read(&source).expect("source stamps");
+        let result = replace_existing(
+            &bound.directory,
+            "file.txt",
+            &source,
+            stamp,
+            b"replacement",
+            || {
+                assert!(
+                    std::fs::read_dir(&root.0).expect("directory reads").count() > 1,
+                    "replacement staging exists before the activity check"
+                );
+                true
+            },
+        );
+        assert_eq!(
+            result
+                .expect_err("expired operation must not publish")
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(std::fs::read(&path).expect("original remains"), b"before");
+        assert_eq!(
+            std::fs::read_dir(&root.0).expect("directory reads").count(),
+            1,
+            "the staged temporary is cleaned up"
         );
     }
 }

@@ -612,8 +612,9 @@ impl ProviderContext {
 }
 
 /// Normalized provider events for one invocation. Candidate progress never
-/// authorizes execution; exactly one terminal [`crate::InvocationOutcome`] ends a
-/// fully consumed invocation.
+/// authorizes execution; exactly one terminal `TurnFinished` or `Failed` event
+/// ends a fully consumed invocation. `InvocationOutcome` remains a separate
+/// compatibility summary and is not used as this event-stream contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderEvent {
     /// Ordered text fragment for a stable turn-local item key.
