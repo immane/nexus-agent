@@ -1,10 +1,11 @@
-//! `nexus-openai`: OpenAI-compatible chat provider adapter.
+//! `nexus-openai`: first-party HTTP provider protocol adapters.
 //!
 //! This crate owns the first REAL [`nexus_core::ProviderPort`]
-//! implementation: it turns a [`nexus_core::ModelRequest`] into one Chat
-//! Completions call and maps the reply back to provider events. The dialect
-//! covers OpenAI-compatible endpoints (vendor API, `vLLM`, `Ollama`, and
-//! other `/chat/completions` servers), not any vendor-specific extensions.
+//! implementation: it turns a [`nexus_core::ModelRequest`] into a configured
+//! Chat Completions, OpenAI Responses, or Anthropic Messages exchange and maps
+//! the reply back to normalized provider events. Protocol selection is
+//! explicit in the provider profile and remains separate from direct/relay
+//! routing.
 //!
 //! # Transport honesty
 //!
@@ -15,12 +16,11 @@
 //!   fails `Protocol` before any secret is used). Certificate verification
 //!   is enforced (`verify_return_error` against the host name or IP); a
 //!   verification failure is a `Protocol` error, never a silent downgrade.
-//! - Requests send `stream: true` and parse the SSE wire (`data:` chunks
-//!   plus `data: [DONE]`), including `Transfer-Encoding: chunked` framing.
-//!   A plain single-JSON reply is still accepted for servers that ignore the
-//!   flag. Either way the adapter returns one validated batch: text is
-//!   aggregated to a single `item-0` delta and streamed tool-argument
-//!   fragments are assembled per index before any candidate is built.
+//! - Requests send `stream: true` and parse each protocol's SSE terminal
+//!   contract (Chat Completions `[DONE]`, Responses completion events, and
+//!   Messages `message_stop`), including chunked framing. Plain JSON replies
+//!   are also accepted. Text deltas are provisional; tool candidates are
+//!   withheld until the authoritative terminal payload validates.
 //! - Cancellation is observed before connecting, after connecting, and
 //!   between read quanta; a cancelled call ends `Cancelled`, never
 //!   half-ingested.
@@ -28,10 +28,10 @@
 //!   instead of allocating unboundedly. Malformed replies fail `Protocol`,
 //!   transport failures fail `Protocol`, timeouts fail `Timeout`, and a
 //!   missing credential fails `Authentication` before any socket opens.
-//! - Unknown usage counters stay unknown, never zero. A claimed
-//!   `tool_calls` finish without any parsed call is a provider-contract
-//!   violation and fails `Protocol` instead of fabricating dispatchable
-//!   work.
+//! - Unknown usage counters stay unknown, never zero. Invalid or incomplete
+//!   tool proposals fail protocol validation rather than fabricating
+//!   dispatchable work. Thinking traces that cannot be faithfully replayed
+//!   by the selected protocol are rejected explicitly.
 //!
 //! # Item identities
 //!

@@ -1,14 +1,14 @@
 //! OpenAI-compatible chat completions adapter over blocking std sockets,
 //! with streaming SSE parsing and an `openssl s_client` TLS bridge.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use nexus_config::{CredentialRef, ProviderProfile};
+use nexus_config::{CredentialRef, ProtocolKind, ProviderProfile};
 use nexus_core::{
     AgentError, CallCandidate, CorrelationData, ErrorCategory, FinishReason, Limits,
     ModelContextItem, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
@@ -86,10 +86,9 @@ fn status_error(status: u16) -> ProviderEvent {
     )
 }
 
-/// OpenAI-compatible chat provider over HTTP, plus `https` through the
-/// system `openssl s_client` TLS bridge. Constructed from a configured
-/// profile plus the vendor model string; see
-/// [`OpenAiProvider::from_profile`].
+/// Configured HTTP protocol provider, plus `https` through the system
+/// `openssl s_client` TLS bridge. The profile selects Chat Completions,
+/// Responses, or Anthropic Messages; see [`OpenAiProvider::from_profile`].
 pub struct OpenAiProvider {
     host: String,
     port: u16,
@@ -97,6 +96,7 @@ pub struct OpenAiProvider {
     credential: CredentialRef,
     model: String,
     use_tls: bool,
+    protocol: ProtocolKind,
 }
 
 impl OpenAiProvider {
@@ -113,6 +113,16 @@ impl OpenAiProvider {
         endpoint: &str,
         credential: CredentialRef,
         model: impl Into<String>,
+    ) -> Result<Self, AgentError> {
+        Self::new_for_protocol(endpoint, credential, model, ProtocolKind::ChatCompletions)
+    }
+
+    /// Builds a provider for a configured wire protocol.
+    pub fn new_for_protocol(
+        endpoint: &str,
+        credential: CredentialRef,
+        model: impl Into<String>,
+        protocol: ProtocolKind,
     ) -> Result<Self, AgentError> {
         let model = model.into();
         if model.is_empty() || model.len() > MAX_MODEL_LEN {
@@ -223,20 +233,27 @@ impl OpenAiProvider {
             credential,
             model,
             use_tls,
+            protocol,
         })
     }
 
-    /// Builds an adapter from a configured provider profile plus the
-    /// vendor model string to send (a selected [`ModelEntry`] name or the
-    /// profile default). Both adapter kinds speak the same HTTP dialect;
-    /// the distinction governs credential scoping, not bytes.
+    /// Builds an adapter from a configured provider profile plus the vendor
+    /// model string to send (a selected [`ModelEntry`] name or the profile
+    /// default). The protocol determines endpoint, authentication headers,
+    /// request/response mapping, and stream termination rules; direct/relay
+    /// remains an independent routing selection.
     ///
     /// [`ModelEntry`]: nexus_config::ModelEntry
     pub fn from_profile(profile: &ProviderProfile, model: &str) -> Result<Self, AgentError> {
         let endpoint = profile.endpoint.as_deref().ok_or_else(|| {
             provider_error_inner(ErrorCategory::InvalidInput, "provider endpoint is missing")
         })?;
-        Self::new(endpoint, profile.credential.clone(), model)
+        Self::new_for_protocol(
+            endpoint,
+            profile.credential.clone(),
+            model,
+            profile.protocol,
+        )
     }
 
     /// Returns the vendor model string sent on the wire.
@@ -255,7 +272,16 @@ impl OpenAiProvider {
     /// SSE wire is parsed incrementally for cancellation responsiveness and
     /// aggregated into one validated batch (see [`ProviderPort::stream`]).
     fn request_body(&self, request: &ModelRequest) -> Result<Value, ProviderEvent> {
+        if request.continuation().is_some() {
+            return Err(provider_error(
+                ErrorCategory::UnsupportedCapability,
+                "provider does not accept opaque continuation state",
+            ));
+        }
         validate_conversation(request.conversation())?;
+        if self.protocol != ProtocolKind::ChatCompletions {
+            return protocol_request_body(self.protocol, &self.model, request);
+        }
         let messages: Vec<Value> = conversation_messages(request.conversation());
         let mut tools: Vec<Value> = Vec::new();
         for spec in request.tool_definitions() {
@@ -324,10 +350,28 @@ impl OpenAiProvider {
                 )];
             }
         };
-        let path = format!("{}/chat/completions", self.base_path);
+        if token.bytes().any(|byte| byte.is_ascii_control()) {
+            return vec![provider_error(
+                ErrorCategory::Authentication,
+                "provider credential contains invalid header control characters",
+            )];
+        }
+        let path = format!(
+            "{}{}",
+            self.base_path,
+            protocol_path(self.protocol, &self.base_path)
+        );
         let address = join_host_port(&self.host, self.port);
+        let auth = match self.protocol {
+            ProtocolKind::AnthropicMessages => {
+                format!("x-api-key: {token}\r\nanthropic-version: 2023-06-01\r\n")
+            }
+            ProtocolKind::ChatCompletions | ProtocolKind::OpenAiResponses => {
+                format!("authorization: Bearer {token}\r\n")
+            }
+        };
         let head = format!(
-            "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\naccept: text/event-stream, application/json\r\ncontent-length: {}\r\nauthorization: Bearer {token}\r\nconnection: close\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\naccept: text/event-stream, application/json\r\ncontent-length: {}\r\n{auth}connection: close\r\n\r\n",
             address,
             body.len(),
         );
@@ -335,7 +379,7 @@ impl OpenAiProvider {
             match spawn_tls(&self.host, self.port, head.as_bytes(), body) {
                 Ok(tls) => {
                     let mut source = tls;
-                    stream_response(&mut source, deadline, context, sink)
+                    stream_response(&mut source, deadline, context, sink, self.protocol)
                 }
                 Err(failure) => vec![failure],
             }
@@ -358,10 +402,198 @@ impl OpenAiProvider {
                     let mut source = TcpSource {
                         stream: &mut stream,
                     };
-                    stream_response(&mut source, deadline, context, sink)
+                    stream_response(&mut source, deadline, context, sink, self.protocol)
                 }
                 Err(failure) => vec![failure],
             }
+        }
+    }
+}
+
+fn protocol_path(protocol: ProtocolKind, base_path: &str) -> &'static str {
+    match protocol {
+        ProtocolKind::ChatCompletions => "/chat/completions",
+        ProtocolKind::OpenAiResponses if base_path.ends_with("/v1") => "/responses",
+        ProtocolKind::OpenAiResponses => "/v1/responses",
+        ProtocolKind::AnthropicMessages if base_path.ends_with("/v1") => "/messages",
+        ProtocolKind::AnthropicMessages => "/v1/messages",
+    }
+}
+
+fn protocol_request_body(
+    protocol: ProtocolKind,
+    model: &str,
+    request: &ModelRequest,
+) -> Result<Value, ProviderEvent> {
+    let tool_defs = request
+        .tool_definitions()
+        .iter()
+        .map(|spec| {
+            let schema: Value = serde_json::from_str(spec.input_schema_json()).map_err(|_| {
+                provider_error(
+                    ErrorCategory::InvalidInput,
+                    "provider tool schema is invalid",
+                )
+            })?;
+            Ok((spec, schema))
+        })
+        .collect::<Result<Vec<_>, ProviderEvent>>()?;
+    let max_tokens = request.output_budget_bytes().div_ceil(4).max(1);
+    match protocol {
+        ProtocolKind::ChatCompletions => unreachable!("handled by the chat request encoder"),
+        ProtocolKind::OpenAiResponses => {
+            let mut input = Vec::new();
+            for item in request.conversation() {
+                if item.reasoning().is_some() {
+                    return Err(provider_error(
+                        ErrorCategory::UnsupportedCapability,
+                        "Responses protocol cannot replay this reasoning context",
+                    ));
+                }
+                match item {
+                    ModelContextItem::UserText(text) => {
+                        input.push(json!({"role":"user","content":text.as_str()}));
+                    }
+                    ModelContextItem::AssistantText { text, .. } => {
+                        input.push(json!({"role":"assistant","content":text.as_str()}));
+                    }
+                    ModelContextItem::AssistantCall {
+                        provider_ref, call, ..
+                    } => input.push(json!({
+                        "type":"function_call",
+                        "call_id":provider_ref.as_str(),
+                        "name":call.tool().name(),
+                        "arguments":call.args().as_str(),
+                    })),
+                    ModelContextItem::AssistantDeniedCall { candidate, .. } => {
+                        input.push(json!({
+                            "type":"function_call",
+                            "call_id":candidate.provider_ref(),
+                            "name":candidate.tool_name(),
+                            "arguments":candidate.arguments_json(),
+                        }));
+                    }
+                    ModelContextItem::ToolResult {
+                        provider_ref,
+                        outcome,
+                        ..
+                    } => input.push(json!({
+                        "type":"function_call_output",
+                        "call_id":provider_ref.as_str(),
+                        "output":outcome.content(),
+                    })),
+                    ModelContextItem::AssistantReasoning { .. } => {
+                        return Err(provider_error(
+                            ErrorCategory::UnsupportedCapability,
+                            "Responses protocol cannot replay this reasoning context",
+                        ));
+                    }
+                }
+            }
+            let tools: Vec<Value> = tool_defs
+                .into_iter()
+                .map(|(spec, schema)| {
+                    json!({
+                        "type":"function",
+                        "name":spec.id().name(),
+                        "description":spec.description(),
+                        "parameters":schema,
+                    })
+                })
+                .collect();
+            let mut body = json!({
+                "model":model,
+                "input":input,
+                "stream":true,
+                "max_output_tokens":max_tokens,
+            });
+            if !tools.is_empty() {
+                body["tools"] = Value::Array(tools);
+            }
+            Ok(body)
+        }
+        ProtocolKind::AnthropicMessages => {
+            let mut messages: Vec<Value> = Vec::new();
+            for item in request.conversation() {
+                if item.reasoning().is_some() {
+                    return Err(provider_error(
+                        ErrorCategory::UnsupportedCapability,
+                        "Messages protocol cannot replay this reasoning context",
+                    ));
+                }
+                let next = match item {
+                    ModelContextItem::UserText(text) => {
+                        json!({"role":"user","content":[{"type":"text","text":text.as_str()}]})
+                    }
+                    ModelContextItem::AssistantText { text, .. } => {
+                        json!({"role":"assistant","content":[{"type":"text","text":text.as_str()}]})
+                    }
+                    ModelContextItem::AssistantCall {
+                        provider_ref, call, ..
+                    } => {
+                        let input: Value =
+                            serde_json::from_str(call.args().as_str()).map_err(|_| {
+                                provider_error(
+                                    ErrorCategory::InvalidInput,
+                                    "provider tool arguments are invalid",
+                                )
+                            })?;
+                        json!({"role":"assistant","content":[{"type":"tool_use","id":provider_ref.as_str(),"name":call.tool().name(),"input":input}]})
+                    }
+                    ModelContextItem::AssistantDeniedCall { candidate, .. } => {
+                        let input: Value = serde_json::from_str(candidate.arguments_json())
+                            .map_err(|_| {
+                                provider_error(
+                                    ErrorCategory::InvalidInput,
+                                    "provider tool arguments are invalid",
+                                )
+                            })?;
+                        json!({"role":"assistant","content":[{"type":"tool_use","id":candidate.provider_ref(),"name":candidate.tool_name(),"input":input}]})
+                    }
+                    ModelContextItem::ToolResult {
+                        provider_ref,
+                        outcome,
+                        ..
+                    } => {
+                        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":provider_ref.as_str(),"content":outcome.content()}]})
+                    }
+                    ModelContextItem::AssistantReasoning { .. } => {
+                        return Err(provider_error(
+                            ErrorCategory::UnsupportedCapability,
+                            "Messages protocol cannot replay this reasoning context",
+                        ));
+                    }
+                };
+                if let Some(last) = messages.last_mut()
+                    && last["role"] == next["role"]
+                    && let (Some(old), Some(add)) =
+                        (last["content"].as_array_mut(), next["content"].as_array())
+                {
+                    old.extend(add.iter().cloned());
+                } else {
+                    messages.push(next);
+                }
+            }
+            let tools: Vec<Value> = tool_defs
+                .into_iter()
+                .map(|(spec, schema)| {
+                    json!({
+                        "name":spec.id().name(),
+                        "description":spec.description(),
+                        "input_schema":schema,
+                    })
+                })
+                .collect();
+            let mut body = json!({
+                "model":model,
+                "messages":messages,
+                "max_tokens":max_tokens,
+                "stream":true,
+            });
+            if !tools.is_empty() {
+                body["tools"] = Value::Array(tools);
+            }
+            Ok(body)
         }
     }
 }
@@ -588,6 +820,7 @@ fn stream_response(
     deadline: Option<Instant>,
     context: &ProviderContext,
     sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    protocol: ProtocolKind,
 ) -> Vec<ProviderEvent> {
     let mut head_buf = Vec::new();
     let body_start = loop {
@@ -647,9 +880,35 @@ fn stream_response(
                 }
             }
         }
-        return events_for(status, &head, &decode_body(&head, &body));
+        return events_for_protocol(status, &head, &decode_body(&head, &body), protocol);
     }
     let chunked = head.to_ascii_lowercase().contains("chunked");
+    if protocol != ProtocolKind::ChatCompletions {
+        let mut live = ProtocolSseLive::new(chunked, protocol);
+        if !body_start.is_empty() {
+            match live.feed(&body_start, sink) {
+                Ok(Some(batch)) => return batch,
+                Ok(None) => {}
+                Err(failure) => return failure,
+            }
+        }
+        loop {
+            match source.next_chunk(quantum_for(deadline), deadline, context) {
+                Err(failure) => return vec![failure],
+                Ok(None) => {
+                    return vec![provider_error(
+                        ErrorCategory::Protocol,
+                        "provider stream ended without termination",
+                    )];
+                }
+                Ok(Some(bytes)) => match live.feed(&bytes, sink) {
+                    Ok(Some(batch)) => return batch,
+                    Ok(None) => {}
+                    Err(failure) => return failure,
+                },
+            }
+        }
+    }
     let mut live = SseLive::new(chunked);
     if !body_start.is_empty() {
         match live.feed(&body_start, sink) {
@@ -869,6 +1128,385 @@ fn finalize_sse(acc: &SseAccum) -> Vec<ProviderEvent> {
             events
         }
         Err(failure) => failure,
+    }
+}
+
+#[derive(Default)]
+struct ProtocolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Bounded event accumulator for the Responses and Messages SSE dialects.
+/// Terminal events are authoritative; only text deltas reach the provisional
+/// sink before the completed batch validates.
+struct ProtocolSseLive {
+    protocol: ProtocolKind,
+    dechunker: Option<Dechunker>,
+    buf: Vec<u8>,
+    raw_bytes: usize,
+    records: usize,
+    calls: BTreeMap<u64, ProtocolCall>,
+    blocks: BTreeMap<u64, Value>,
+    open_blocks: BTreeSet<u64>,
+    response_text: String,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    stop_reason: Option<String>,
+}
+
+impl ProtocolSseLive {
+    fn new(chunked: bool, protocol: ProtocolKind) -> Self {
+        Self {
+            protocol,
+            dechunker: chunked.then(Dechunker::new),
+            buf: Vec::new(),
+            raw_bytes: 0,
+            records: 0,
+            calls: BTreeMap::new(),
+            blocks: BTreeMap::new(),
+            open_blocks: BTreeSet::new(),
+            response_text: String::new(),
+            input_tokens: None,
+            output_tokens: None,
+            stop_reason: None,
+        }
+    }
+
+    fn feed(
+        &mut self,
+        bytes: &[u8],
+        sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    ) -> Result<Option<Vec<ProviderEvent>>, Vec<ProviderEvent>> {
+        let too_large = || {
+            vec![provider_error(
+                ErrorCategory::ResourceLimit,
+                "provider response is too large",
+            )]
+        };
+        self.raw_bytes = self.raw_bytes.saturating_add(bytes.len());
+        if self.raw_bytes > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        if let Some(dechunker) = self.dechunker.as_mut() {
+            let mut clean = Vec::new();
+            dechunker.feed(bytes, &mut clean).map_err(|()| {
+                vec![provider_error(
+                    ErrorCategory::Protocol,
+                    "provider response failed",
+                )]
+            })?;
+            self.buf.extend_from_slice(&clean);
+        } else {
+            self.buf.extend_from_slice(bytes);
+        }
+        if self.buf.len() > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        while let Some(line) = take_line(&mut self.buf) {
+            let line = String::from_utf8_lossy(&line);
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            self.records = self.records.saturating_add(1);
+            if self.records > MAX_SSE_RECORDS {
+                return Err(vec![provider_error(
+                    ErrorCategory::ResourceLimit,
+                    "provider response has too many stream records",
+                )]);
+            }
+            let event: Value = serde_json::from_str(payload).map_err(|_| {
+                vec![provider_error(
+                    ErrorCategory::Protocol,
+                    "provider reply is not valid JSON",
+                )]
+            })?;
+            match self.protocol {
+                ProtocolKind::OpenAiResponses => {
+                    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+                    match kind {
+                        "response.output_text.delta" => {
+                            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                                self.response_text.push_str(delta);
+                                sink(ProviderEvent::TextDelta {
+                                    item_key: "item-0".to_owned(),
+                                    text: delta.to_owned(),
+                                });
+                            }
+                        }
+                        "response.output_item.added" => {
+                            let index = event.get("output_index").and_then(Value::as_u64);
+                            let item = event.get("item");
+                            if item.is_some_and(|item| {
+                                item.get("type").and_then(Value::as_str) == Some("reasoning")
+                            }) {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::UnsupportedCapability,
+                                    "Responses reasoning items cannot be replayed faithfully",
+                                )]);
+                            }
+                            if let (Some(index), Some(item)) = (index, item)
+                                && item.get("type").and_then(Value::as_str) == Some("function_call")
+                            {
+                                let call = self.calls.entry(index).or_default();
+                                call.id = item
+                                    .get("call_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned();
+                                call.name = item
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned();
+                                call.arguments = item
+                                    .get("arguments")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned();
+                                if self.calls.len() > MAX_SSE_TOOL_IDENTITIES {
+                                    return Err(vec![provider_error(
+                                        ErrorCategory::ResourceLimit,
+                                        "provider response has too many tool identities",
+                                    )]);
+                                }
+                            }
+                        }
+                        "response.function_call_arguments.delta" => {
+                            let index = event.get("output_index").and_then(Value::as_u64);
+                            if let Some(index) = index {
+                                let call = self.calls.entry(index).or_default();
+                                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                                    call.arguments.push_str(delta);
+                                }
+                                if self.calls.len() > MAX_SSE_TOOL_IDENTITIES {
+                                    return Err(vec![provider_error(
+                                        ErrorCategory::ResourceLimit,
+                                        "provider response has too many tool identities",
+                                    )]);
+                                }
+                            }
+                        }
+                        kind if kind.contains("reasoning") => {
+                            return Err(vec![provider_error(
+                                ErrorCategory::UnsupportedCapability,
+                                "Responses reasoning items cannot be replayed faithfully",
+                            )]);
+                        }
+                        "response.completed" | "response.incomplete" => {
+                            let response = event.get("response").unwrap_or(&event);
+                            return Ok(Some(events_for_responses(response)));
+                        }
+                        "response.failed" | "error" => {
+                            return Ok(Some(vec![provider_error(
+                                ErrorCategory::Protocol,
+                                "provider response failed",
+                            )]));
+                        }
+                        _ => {}
+                    }
+                }
+                ProtocolKind::AnthropicMessages => {
+                    let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+                    match kind {
+                        "message_start" => {
+                            self.input_tokens = event
+                                .pointer("/message/usage/input_tokens")
+                                .and_then(Value::as_u64);
+                        }
+                        "content_block_start" => {
+                            let (Some(index), Some(block)) = (
+                                event.get("index").and_then(Value::as_u64),
+                                event.get("content_block").filter(|block| block.is_object()),
+                            ) else {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider content block start is invalid",
+                                )]);
+                            };
+                            if self.blocks.contains_key(&index) {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider content block index is repeated",
+                                )]);
+                            }
+                            let block = block.clone();
+                            if matches!(
+                                block.get("type").and_then(Value::as_str),
+                                Some("thinking" | "redacted_thinking")
+                            ) {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::UnsupportedCapability,
+                                    "Messages thinking blocks cannot be replayed faithfully",
+                                )]);
+                            }
+                            self.open_blocks.insert(index);
+                            if block.get("type").and_then(Value::as_str) == Some("text") {
+                                self.blocks.insert(index, json!({"type":"text","text":""}));
+                            } else if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                            {
+                                let call = self.calls.entry(index).or_default();
+                                call.id = block
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned();
+                                call.name = block
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_owned();
+                                self.blocks.insert(index, block);
+                            } else {
+                                self.blocks.insert(index, block);
+                            }
+                        }
+                        "content_block_delta" => {
+                            let (Some(index), Some(delta)) = (
+                                event.get("index").and_then(Value::as_u64),
+                                event.get("delta").filter(|delta| delta.is_object()),
+                            ) else {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider content block delta is invalid",
+                                )]);
+                            };
+                            if !self.open_blocks.contains(&index) {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider content block delta has no open block",
+                                )]);
+                            }
+                            let invalid_delta = || {
+                                vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider content block delta does not match its block or has invalid fields",
+                                )]
+                            };
+                            let block = self.blocks.get_mut(&index).ok_or_else(invalid_delta)?;
+                            match (
+                                block.get("type").and_then(Value::as_str),
+                                delta.get("type").and_then(Value::as_str),
+                            ) {
+                                (Some("text"), Some("text_delta")) => {
+                                    let text = delta
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .ok_or_else(invalid_delta)?;
+                                    let existing =
+                                        block.get("text").and_then(Value::as_str).unwrap_or("");
+                                    block["text"] = Value::String(format!("{existing}{text}"));
+                                    self.response_text.push_str(text);
+                                    sink(ProviderEvent::TextDelta {
+                                        item_key: "item-0".to_owned(),
+                                        text: text.to_owned(),
+                                    });
+                                }
+                                (Some("tool_use"), Some("input_json_delta")) => {
+                                    let text = delta
+                                        .get("partial_json")
+                                        .and_then(Value::as_str)
+                                        .ok_or_else(invalid_delta)?;
+                                    self.calls
+                                        .get_mut(&index)
+                                        .ok_or_else(invalid_delta)?
+                                        .arguments
+                                        .push_str(text);
+                                }
+                                _ => return Err(invalid_delta()),
+                            }
+                        }
+                        "content_block_stop" => {
+                            let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider content block stop is invalid",
+                                )]);
+                            };
+                            if !self.open_blocks.remove(&index) {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider content block stop has no open block",
+                                )]);
+                            }
+                        }
+                        "message_delta" => {
+                            self.stop_reason = event
+                                .pointer("/delta/stop_reason")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            self.output_tokens = event
+                                .pointer("/usage/output_tokens")
+                                .and_then(Value::as_u64);
+                        }
+                        "message_stop" => {
+                            if !self.open_blocks.is_empty() {
+                                return Err(vec![provider_error(
+                                    ErrorCategory::Protocol,
+                                    "provider message ended with open content blocks",
+                                )]);
+                            }
+                            return Ok(Some(self.finish_anthropic()));
+                        }
+                        "error" => {
+                            return Ok(Some(vec![provider_error(
+                                ErrorCategory::Protocol,
+                                "provider response failed",
+                            )]));
+                        }
+                        _ => {}
+                    }
+                    if self.calls.len() > MAX_SSE_TOOL_IDENTITIES {
+                        return Err(vec![provider_error(
+                            ErrorCategory::ResourceLimit,
+                            "provider response has too many tool identities",
+                        )]);
+                    }
+                }
+                ProtocolKind::ChatCompletions => unreachable!(),
+            }
+            if self.response_text.len() > MAX_RESPONSE_BYTES
+                || self
+                    .calls
+                    .values()
+                    .map(|call| call.arguments.len())
+                    .sum::<usize>()
+                    > MAX_RESPONSE_BYTES
+            {
+                return Err(too_large());
+            }
+        }
+        Ok(None)
+    }
+
+    fn finish_anthropic(&self) -> Vec<ProviderEvent> {
+        let mut content = Vec::new();
+        for (index, mut block) in self.blocks.clone() {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use")
+                && let Some(call) = self.calls.get(&index)
+                && !call.arguments.is_empty()
+            {
+                let Ok(input) = serde_json::from_str::<Value>(&call.arguments) else {
+                    return vec![provider_error(
+                        ErrorCategory::Protocol,
+                        "provider tool arguments are invalid",
+                    )];
+                };
+                block["input"] = input;
+            }
+            content.push(block);
+        }
+        events_for_anthropic(&json!({
+            "type":"message",
+            "content":content,
+            "stop_reason":self.stop_reason,
+            "usage":{"input_tokens":self.input_tokens,"output_tokens":self.output_tokens},
+        }))
     }
 }
 
@@ -1436,6 +2074,273 @@ fn events_for(status: u16, head: &str, body: &[u8]) -> Vec<ProviderEvent> {
     events_for_json(body)
 }
 
+fn events_for_protocol(
+    status: u16,
+    head: &str,
+    body: &[u8],
+    protocol: ProtocolKind,
+) -> Vec<ProviderEvent> {
+    if protocol == ProtocolKind::ChatCompletions {
+        return events_for(status, head, body);
+    }
+    if !(200..300).contains(&status) {
+        return vec![status_error(status)];
+    }
+    if is_sse(head, body) {
+        return vec![provider_error(
+            ErrorCategory::Protocol,
+            "provider stream parser is not available for this protocol response",
+        )];
+    }
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => {
+            return vec![provider_error(
+                ErrorCategory::Protocol,
+                "provider reply is not valid JSON",
+            )];
+        }
+    };
+    match protocol {
+        ProtocolKind::OpenAiResponses => events_for_responses(&value),
+        ProtocolKind::AnthropicMessages => events_for_anthropic(&value),
+        ProtocolKind::ChatCompletions => unreachable!(),
+    }
+}
+
+fn events_for_responses(reply: &Value) -> Vec<ProviderEvent> {
+    if reply.get("status").and_then(Value::as_str) == Some("failed") {
+        return vec![provider_error(
+            ErrorCategory::Protocol,
+            "provider response failed",
+        )];
+    }
+    let mut events = Vec::new();
+    let mut call_count = 0usize;
+    let mut refusal = false;
+    let Some(output) = reply.get("output").and_then(Value::as_array) else {
+        return vec![provider_error(
+            ErrorCategory::Protocol,
+            "provider reply has no output",
+        )];
+    };
+    let status = reply.get("status").and_then(Value::as_str);
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                return vec![provider_error(
+                    ErrorCategory::UnsupportedCapability,
+                    "Responses reasoning items cannot be replayed faithfully",
+                )];
+            }
+            Some("message") => {
+                if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    for part in parts {
+                        if part.get("type").and_then(Value::as_str) == Some("reasoning") {
+                            return vec![provider_error(
+                                ErrorCategory::UnsupportedCapability,
+                                "Responses reasoning items cannot be replayed faithfully",
+                            )];
+                        }
+                        refusal |= part.get("type").and_then(Value::as_str) == Some("refusal");
+                        if let Some(text) = part.get("text").and_then(Value::as_str)
+                            && !text.is_empty()
+                        {
+                            events.push(ProviderEvent::TextDelta {
+                                item_key: "item-0".to_owned(),
+                                text: text.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                // An incomplete response may contain a partial tool proposal.
+                // Never expose it as dispatchable work.
+                if status != Some("completed") {
+                    continue;
+                }
+                if call_count >= MAX_SSE_TOOL_IDENTITIES {
+                    return vec![provider_error(
+                        ErrorCategory::ResourceLimit,
+                        "provider response has too many tool identities",
+                    )];
+                }
+                let Some(id) = item.get("call_id").and_then(Value::as_str) else {
+                    return vec![provider_error(
+                        ErrorCategory::Protocol,
+                        "provider call identity is invalid",
+                    )];
+                };
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    return vec![provider_error(
+                        ErrorCategory::Protocol,
+                        "provider call identity is invalid",
+                    )];
+                };
+                let Some(arguments) = item.get("arguments").and_then(Value::as_str) else {
+                    return vec![provider_error(
+                        ErrorCategory::Protocol,
+                        "provider call arguments are invalid",
+                    )];
+                };
+                let candidate = match CallCandidate::new(
+                    format!("item-{}", call_count + 1),
+                    id,
+                    name,
+                    arguments,
+                ) {
+                    Ok(candidate) => candidate,
+                    Err(_) => {
+                        return vec![provider_error(
+                            ErrorCategory::Protocol,
+                            "provider call identity is invalid",
+                        )];
+                    }
+                };
+                call_count += 1;
+                events.push(ProviderEvent::ToolCallReady(candidate));
+            }
+            _ => {}
+        }
+    }
+    let (input, output) = reply
+        .get("usage")
+        .map(|usage| {
+            (
+                usage.get("input_tokens").and_then(Value::as_u64),
+                usage.get("output_tokens").and_then(Value::as_u64),
+            )
+        })
+        .unwrap_or((None, None));
+    let reason = if status == Some("incomplete") {
+        if reply
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens")
+        {
+            FinishReason::OutputLimit
+        } else {
+            FinishReason::Incomplete
+        }
+    } else if status != Some("completed") {
+        FinishReason::Incomplete
+    } else if call_count > 0 {
+        FinishReason::ToolCalls
+    } else if refusal {
+        FinishReason::Refusal
+    } else {
+        FinishReason::Stop
+    };
+    events.push(ProviderEvent::TurnFinished(TurnFinished::new(
+        reason,
+        Usage::new(input, output, UsageFinality::Final),
+        None,
+    )));
+    events
+}
+
+fn events_for_anthropic(reply: &Value) -> Vec<ProviderEvent> {
+    if reply.get("type").and_then(Value::as_str) != Some("message") {
+        return vec![provider_error(
+            ErrorCategory::Protocol,
+            "provider reply has no message",
+        )];
+    }
+    let mut events = Vec::new();
+    let mut call_count = 0usize;
+    if let Some(content) = reply.get("content").and_then(Value::as_array) {
+        for block in content {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        events.push(ProviderEvent::TextDelta {
+                            item_key: "item-0".to_owned(),
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+                Some("thinking") | Some("redacted_thinking") => {
+                    return vec![provider_error(
+                        ErrorCategory::UnsupportedCapability,
+                        "Messages thinking blocks cannot be replayed faithfully",
+                    )];
+                }
+                Some("tool_use") => {
+                    if call_count >= MAX_SSE_TOOL_IDENTITIES {
+                        return vec![provider_error(
+                            ErrorCategory::ResourceLimit,
+                            "provider response has too many tool identities",
+                        )];
+                    }
+                    let (Some(id), Some(name), Some(input)) = (
+                        block.get("id").and_then(Value::as_str),
+                        block.get("name").and_then(Value::as_str),
+                        block.get("input"),
+                    ) else {
+                        return vec![provider_error(
+                            ErrorCategory::Protocol,
+                            "provider call is invalid",
+                        )];
+                    };
+                    let arguments = input.to_string();
+                    let candidate = match CallCandidate::new(
+                        format!("item-{}", call_count + 1),
+                        id,
+                        name,
+                        arguments,
+                    ) {
+                        Ok(candidate) => candidate,
+                        Err(_) => {
+                            return vec![provider_error(
+                                ErrorCategory::Protocol,
+                                "provider call identity is invalid",
+                            )];
+                        }
+                    };
+                    call_count += 1;
+                    events.push(ProviderEvent::ToolCallReady(candidate));
+                }
+                _ => {}
+            }
+        }
+    }
+    let usage = reply.get("usage");
+    let input = usage
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let output = usage
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64);
+    let reason = match reply.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn") | Some("stop_sequence") => FinishReason::Stop,
+        Some("tool_use") if call_count > 0 => FinishReason::ToolCalls,
+        Some("tool_use") => {
+            return vec![provider_error(
+                ErrorCategory::Protocol,
+                "provider claimed tool use without items",
+            )];
+        }
+        Some("max_tokens") => FinishReason::OutputLimit,
+        Some("refusal") => FinishReason::Refusal,
+        Some(_) => FinishReason::Incomplete,
+        None => {
+            return vec![provider_error(
+                ErrorCategory::Protocol,
+                "provider reply is incomplete",
+            )];
+        }
+    };
+    events.push(ProviderEvent::TurnFinished(TurnFinished::new(
+        reason,
+        Usage::new(input, output, UsageFinality::Final),
+        None,
+    )));
+    events
+}
+
 /// True when the reply looks like an SSE stream: either the head declares
 /// `text/event-stream` or the trimmed body opens with a `data:` line.
 fn is_sse(head: &str, body: &[u8]) -> bool {
@@ -1674,6 +2579,18 @@ impl ProviderPort for OpenAiProvider {
 
     fn supports_incremental_streaming(&self) -> bool {
         true
+    }
+
+    fn adapter_identity(&self) -> &str {
+        match self.protocol {
+            ProtocolKind::ChatCompletions => "openai-chat-completions-v1",
+            ProtocolKind::OpenAiResponses => "openai-responses-v1",
+            ProtocolKind::AnthropicMessages => "anthropic-messages-v1",
+        }
+    }
+
+    fn continuation_scope(&self, profile: &str) -> String {
+        profile.to_owned()
     }
 
     fn stream_with_sink(

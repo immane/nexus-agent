@@ -10,8 +10,9 @@ use serde_json::{Map, Value};
 
 use crate::store::{ConfigError, invalid};
 
-/// Configuration format revision. Only this revision loads or saves.
-pub const CONFIG_REVISION: u64 = 1;
+/// Canonical configuration revision. Revision 1 loads through an explicit
+/// migration and every save writes this revision.
+pub const CONFIG_REVISION: u64 = 2;
 /// Maximum providers in one document.
 pub const MAX_PROVIDERS: usize = 16;
 /// Maximum model entries in one document.
@@ -119,6 +120,40 @@ impl AdapterKind {
     }
 }
 
+/// Wire protocol family. Kept separate from [`AdapterKind`], which selects
+/// direct versus relay routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolKind {
+    /// OpenAI Chat Completions-compatible protocol.
+    ChatCompletions,
+    /// OpenAI Responses protocol.
+    OpenAiResponses,
+    /// Anthropic Messages protocol.
+    AnthropicMessages,
+}
+
+impl ProtocolKind {
+    /// Parses the closed protocol vocabulary.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        match text {
+            "chat_completions" => Ok(Self::ChatCompletions),
+            "openai_responses" => Ok(Self::OpenAiResponses),
+            "anthropic_messages" => Ok(Self::AnthropicMessages),
+            _ => Err(invalid("provider protocol is invalid")),
+        }
+    }
+
+    /// Returns the canonical wire name.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::OpenAiResponses => "openai_responses",
+            Self::AnthropicMessages => "anthropic_messages",
+        }
+    }
+}
+
 /// Credential reference. The only variant names an environment variable;
 /// values are resolved at use time and never stored, logged, or echoed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +203,8 @@ pub struct ProviderProfile {
     pub display_name: String,
     /// Direct or relay adapter.
     pub adapter: AdapterKind,
+    /// Protocol spoken by the endpoint.
+    pub protocol: ProtocolKind,
     /// Optional `http(s)` endpoint without embedded credentials.
     pub endpoint: Option<String>,
     /// Secret reference (never a value).
@@ -186,10 +223,32 @@ impl ProviderProfile {
         credential: CredentialRef,
         default_model: impl Into<String>,
     ) -> Result<Self, ConfigError> {
+        Self::new_with_protocol(
+            id,
+            display_name,
+            adapter,
+            ProtocolKind::ChatCompletions,
+            endpoint,
+            credential,
+            default_model,
+        )
+    }
+
+    /// Builds a validated profile with an explicit protocol family.
+    pub fn new_with_protocol(
+        id: impl Into<String>,
+        display_name: impl Into<String>,
+        adapter: AdapterKind,
+        protocol: ProtocolKind,
+        endpoint: Option<String>,
+        credential: CredentialRef,
+        default_model: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
         let profile = Self {
             id: id.into(),
             display_name: display_name.into(),
             adapter,
+            protocol,
             endpoint,
             credential,
             default_model: default_model.into(),
@@ -623,12 +682,12 @@ impl UserConfig {
             .get("revision")
             .and_then(Value::as_u64)
             .ok_or(invalid("configuration revision is invalid"))?;
-        if revision != CONFIG_REVISION {
+        if revision != 1 && revision != CONFIG_REVISION {
             return Err(ConfigError::unsupported());
         }
         let mut config = Self::default_config();
         for provider in object_array(document, "providers")? {
-            config.add_provider(parse_provider(provider)?)?;
+            config.add_provider(parse_provider(provider, revision)?)?;
         }
         for model in object_array(document, "models")? {
             config.add_model(parse_model(model)?)?;
@@ -682,6 +741,10 @@ fn provider_json(profile: &ProviderProfile) -> Value {
     object.insert(
         "adapter".to_owned(),
         Value::String(profile.adapter.name().to_owned()),
+    );
+    object.insert(
+        "protocol".to_owned(),
+        Value::String(profile.protocol.name().to_owned()),
     );
     object.insert(
         "endpoint".to_owned(),
@@ -790,13 +853,17 @@ fn require_str<'a>(
 }
 
 /// Parses one provider object with known fields only.
-fn parse_provider(object: &Map<String, Value>) -> Result<ProviderProfile, ConfigError> {
+fn parse_provider(
+    object: &Map<String, Value>,
+    revision: u64,
+) -> Result<ProviderProfile, ConfigError> {
     reject_unknown(
         object,
         &[
             "id",
             "display_name",
             "adapter",
+            "protocol",
             "endpoint",
             "credential",
             "default_model",
@@ -817,10 +884,19 @@ fn parse_provider(object: &Map<String, Value>) -> Result<ProviderProfile, Config
                 .to_owned(),
         ),
     };
-    ProviderProfile::new(
+    let protocol = if revision == 1 {
+        if object.contains_key("protocol") {
+            return Err(invalid("configuration field is unknown"));
+        }
+        ProtocolKind::ChatCompletions
+    } else {
+        ProtocolKind::parse(require_str(object, "protocol")?)?
+    };
+    ProviderProfile::new_with_protocol(
         require_str(object, "id")?.to_owned(),
         require_str(object, "display_name")?.to_owned(),
         AdapterKind::parse(require_str(object, "adapter")?)?,
+        protocol,
         endpoint,
         CredentialRef::env_var(var.to_owned())?,
         require_str(object, "default_model")?.to_owned(),

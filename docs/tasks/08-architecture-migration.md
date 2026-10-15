@@ -499,13 +499,17 @@ Linux evidence. The full optional/all-features ignored suite was not run.
 
 ## M5 — Extension contracts only on concrete demand
 
-These tasks are **deferred**, not prerequisites for current migration completion.
+M5.1 was implemented when concrete second protocols were requested. Its coverage
+is limited to the configured OpenAI Responses and Anthropic Messages dialects
+and offline fixtures; this is not live compatibility evidence for every service
+or model. M5.2 and M5.3 remain **deferred** and are not prerequisites for current
+migration completion.
 
-| Task | Trigger and finding | Required work and gate |
-| --- | --- | --- |
-| M5.1 — Second provider protocol | A requested second concrete protocol; remaining P2.9 | Distinguish protocol family from direct/relay routing. Declare actual capabilities and continuation compatibility; add transcript/tool-call/error tests. Change config revisions only with a documented migration. No registry/framework by default. |
-| M5.2 — External tool transport | A requested concrete plugin/transport | Define host trust, credentials, resource/approval scope, bounded process/transport lifecycle, cancellation, and failure outcomes. All dispatch stays under runtime policy. A subprocess is not a sandbox; no compliance or untrusted-code containment claim without tests. |
-| M5.3 — HTTP/TLS replacement evaluation | A concrete maintenance/correctness need in current transport | Compare a mature implementation against hand-written HTTP/chunked/SSE/OpenSSL code using dependency size, build/startup cost, cancellation, verified TLS, bounded buffering, and protocol regressions. Keep this separate from permission refactoring; select a dependency only with justification. |
+| Task | Status | Trigger and finding | Required work and gate |
+| --- | --- | --- | --- |
+| M5.1 — Second provider protocol | Implemented; offline fixtures only | A requested second concrete protocol; remaining P2.9 | Distinguish protocol family from direct/relay routing. Declare actual capabilities and continuation compatibility; add transcript/tool-call/error tests. Change config revisions only with a documented migration. No registry/framework by default. |
+| M5.2 — External tool transport | Deferred — not implemented | A requested concrete plugin/transport | Define host trust, credentials, resource/approval scope, bounded process/transport lifecycle, cancellation, and failure outcomes. All dispatch stays under runtime policy. A subprocess is not a sandbox; no compliance or untrusted-code containment claim without tests. |
+| M5.3 — HTTP/TLS replacement evaluation | Deferred — not implemented | A concrete maintenance/correctness need in current transport | Compare a mature implementation against hand-written HTTP/chunked/SSE/OpenSSL code using dependency size, build/startup cost, cancellation, verified TLS, bounded buffering, and protocol regressions. Keep this separate from permission refactoring; select a dependency only with justification. |
 
 ## Decisions required before behavior-changing implementation
 

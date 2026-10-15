@@ -20,12 +20,13 @@
 //!
 //! ```json
 //! {
-//!   "revision": 1,
+//!   "revision": 2,
 //!   "providers": [
 //!     {
 //!       "id": "anthropic-main",
 //!       "display_name": "Anthropic (direct)",
 //!       "adapter": "direct",
+//!       "protocol": "anthropic_messages",
 //!       "endpoint": "https://api.anthropic.com",
 //!       "credential": {"env": "ANTHROPIC_API_KEY"},
 //!       "default_model": "claude-sonnet"
@@ -39,8 +40,9 @@
 //! }
 //! ```
 //!
-//! Unknown fields, duplicate keys, a wrong `revision`, oversize documents,
-//! and dangling references are all explicit errors, never silent repairs.
+//! Revision 1 documents migrate to `chat_completions`; unknown fields,
+//! duplicate keys, unsupported revisions, oversize documents, and dangling
+//! references are explicit errors, never silent repairs.
 //! A missing file is NOT an error: [`load`] returns `None` and the caller
 //! falls back to [`UserConfig::default_config`].
 //!
@@ -58,8 +60,8 @@ pub mod model;
 pub mod store;
 
 pub use model::{
-    AdapterKind, AgentMode, CredentialRef, MODE_BUILD, MODE_PLAN, ModelEntry, ProviderProfile,
-    UserConfig,
+    AdapterKind, AgentMode, CredentialRef, MODE_BUILD, MODE_PLAN, ModelEntry, ProtocolKind,
+    ProviderProfile, UserConfig,
 };
 pub use store::{
     CONFIG_ENV_VAR, CONFIG_FILE_NAME, ConfigError, ConfigErrorKind, default_path,

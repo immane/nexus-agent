@@ -567,9 +567,10 @@ fn the_config_summary_is_redacted_and_complete() {
 
     let (status, body) = get(port, "/config");
     assert_eq!(status, 200);
-    assert_eq!(body["revision"], 1);
+    assert_eq!(body["revision"], nexus_config::model::CONFIG_REVISION);
     assert_eq!(body["providers"][0]["id"], "acme");
     assert_eq!(body["providers"][0]["adapter"], "direct");
+    assert_eq!(body["providers"][0]["protocol"], "chat_completions");
     assert_eq!(body["providers"][0]["endpoint"], "https://api.example.com");
     assert_eq!(
         body["providers"][0]["credential"]["env"], probe,

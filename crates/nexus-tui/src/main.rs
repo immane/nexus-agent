@@ -4740,6 +4740,17 @@ mod cov_main_topup {
             .expect("current adapter config builds without network");
         assert_eq!(openai.capabilities(), declared);
         assert!(adapter_satisfies_tui_requirements(&openai.capabilities()));
+        for protocol in [
+            nexus_config::ProtocolKind::OpenAiResponses,
+            nexus_config::ProtocolKind::AnthropicMessages,
+        ] {
+            let mut profile = profile.clone();
+            profile.protocol = protocol;
+            let adapter = OpenAiProvider::from_profile(&profile, "demo-model")
+                .expect("configured protocol adapter builds without network");
+            assert_eq!(adapter.capabilities(), declared);
+            assert!(adapter_satisfies_tui_requirements(&adapter.capabilities()));
+        }
     }
 
     #[test]
