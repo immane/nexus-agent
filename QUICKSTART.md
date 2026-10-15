@@ -3,8 +3,9 @@
 ## Status snapshot
 
 - See `git status` and `git log` for the current worktree and revision.
-- Implementation stage: **M0 test-only with opt-in live integrations**:
-  an incremental OpenAI-compatible chat adapter (`nexus-openai`, HTTP or
+- Implementation stage: **0.2.0-alpha**, built on the M0 runtime:
+  Chat Completions, OpenAI Responses, and Anthropic Messages adapters
+  (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
   tools (`host_read`/`host_list`/`host_search`/`host_write`/`host_patch`) plus
   sandboxed `argv` execution (`host_exec`: no shell, no network,
@@ -14,36 +15,55 @@
   approval, and `--strict-tools` restores project-jailed reads with per-call
   confirmation. No plugins, no durable history.
   **M0 acceptance is NOT complete** (see `docs/tasks/04-m0-gates.md`).
-- Verification is routine, not a frozen count: `cargo fmt --check`,
-  per-crate `cargo test` (default vs. optional split in `docs/testing.md`),
-  and `cargo clippy --workspace --all-targets -- -D warnings` are clean on
-  a healthy tree; GitHub Actions runs the full suite on Ubuntu and macOS.
-  Coverage is measured on demand (see below); re-measure after toolchain
-  moves, as the two `llvm-cov` versions must agree.
+- The [migration record](docs/tasks/08-architecture-migration.md) documents
+  implemented M4 consolidation slices and passing default-feature macOS
+  workspace tests. Linux filesystem/metadata and sandbox-isolation validation
+  remain blocked; escaped-descendant cleanup is still limited. Continued
+  macOS-only development is not cross-platform security acceptance.
+- Responses and Messages are covered by offline fixtures, not universal live
+  compatibility evidence. The TUI and server can use configured live providers;
+  headless remains scripted. See [Testing](docs/testing.md) for routine checks
+  and the optional suite. CI's Ubuntu/macOS jobs do not replace the outstanding
+  platform-specific security evidence.
 
 ## Prerequisites
 
-- Rust stable (pinned via `rust-toolchain.toml`; needs `rustfmt` + `clippy` components)
+- Rust stable (`rust-toolchain.toml` selects the floating `stable` channel,
+  not an exact version; includes `rustfmt` + `clippy`)
+- `cargo-nextest` for the normal test workflow; `cargo test` is a fallback
 - Python 3 (stdlib only) for `tools/perf`
+- System `openssl` on `PATH` for HTTPS providers; OS sandbox support for
+  `host_exec` (`sandbox-exec` on macOS, `bwrap` on Linux; no unsandboxed fallback)
 - Xcode Command Line Tools on macOS if you want coverage (`llvm-cov`/`llvm-profdata`)
-- No network needed: all checks run with `--locked --offline`
+- `--locked --offline` checks need the toolchain and locked dependencies
+  already installed/cached. Initial setup may need network access. Cargo's
+  `--offline` does **not** prevent runtime model API requests or billing.
 
-## 60-second start
+## Start from source
 
 ```sh
-cargo test --workspace --locked --offline --no-fail-fast
-python3 -m unittest discover -s tools/perf -p 'test_*.py'
+cargo run -p nexus-headless --locked --offline -- "hello"
+# Interactive terminal; configure a provider/model below before submitting:
+cargo run -p nexus-tui --locked --offline
 ```
 
 ## Everyday commands
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked --offline -- -D warnings
-cargo test -p <crate> --locked --offline          # one crate, e.g. nexus-runtime
-cargo test -p <crate> --test <target> --locked --offline   # one test file
+cargo fmt --all --check
+cargo nextest run -p nexus-runtime --locked --offline
+cargo clippy -p nexus-runtime --all-targets --locked --offline -- -D warnings
+# Fallback without nextest:
+cargo test -p nexus-runtime --locked --offline
+# Tools/TUI/server modules are registered in a shared behavior target:
+cargo test -p nexus-tools --test behavior fs_patch --locked --offline
+python3 -m unittest discover -s tools/perf -p 'test_*.py'
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline
 ```
+
+Select affected packages and run Cargo commands sequentially against the shared
+target directory. Routine checks use default features and skip ignored tests;
+the full optional suite is documented in [Testing](docs/testing.md).
 
 ## Layout
 
@@ -51,11 +71,11 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline
 |---|---|
 | `crates/nexus-core` | Domain types, errors, limits, ports. Dependency-free |
 | `crates/nexus-validation` | Closed M0 JSON/schema validator for tool arguments |
-| `crates/nexus-config` | Typed user config (providers, models, favourites, recents) + file persistence |
+| `crates/nexus-config` | Revision-2 provider/protocol/model/mode config, favourites/recents, revision-1 migration, file persistence |
 | `crates/nexus-fakes` | Scripted deterministic provider/tool/store doubles (test-only) |
 | `crates/nexus-tools` | Real file tools and sandboxed `host_exec`: `host_read`/`host_list`/`host_search`/`host_write`/`host_patch` plus mandatory-OS-sandbox `argv` execution; development adapters accept exact canonical runtime scopes |
 | `crates/nexus-permissions` | Shared canonical project/temp/protected-path rules for runtime policy and real adapters; session grants stay runtime-owned and non-persistent |
-| `crates/nexus-openai` | Streaming OpenAI-compatible chat adapter over HTTP/HTTPS |
+| `crates/nexus-openai` | Streaming Chat Completions, Responses, and Messages adapters over HTTP/HTTPS |
 | `crates/nexus-runtime` | Single-active-run loop: policy, cancellation, quarantine, ordered events |
 | `crates/nexus-server` | Loopback HTTP frontend: sessions, SSE streams, config-gated selection |
 | `crates/nexus-tui` | TUI with configured live providers or scripted demo wiring |
@@ -64,25 +84,46 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked --offline
 | `tools/perf` | stdlib-only startup/readiness measurement harnesses + their tests |
 | `docs/` | Design, contracts, task gates; start at `docs/index.md` |
 
-## Run the demos
+## Scripted runs and demo fallback
 
 ```sh
 cargo run -p nexus-headless --locked --offline -- "hello"
-cargo run -p nexus-tui --locked --offline
+cargo run -p nexus-tui --locked --offline -- --demo
 ```
 
-The headless binary uses fakes (no side effects). The plain TUI run uses
-real development tools rooted at the working directory: project/temp
-operations apply for real, so treat it as live, not a sandbox. The TUI
-uses fakes for the provider only when no configured model is selected; a
-configured model can send paid requests. Neither has durable session
-storage.
+Headless uses scripted provider/tools, has no approval handler, and emits
+percent-encoded `key=value` records, not JSON. A leading `--mode plan` selects
+read-only mode; the default is `build`.
+
+The TUI uses real development tools rooted at the working directory, even with
+`--demo`: project/temp operations apply for real. Demo fallback is available
+only when no configured model is selected; `--demo` does not override a live
+model or guarantee a side-effect-free run. Without `--demo`, an unconfigured
+submission fails explicitly instead of returning a fake reply. Neither
+frontend has durable conversation storage.
 
 ## Use a configured model in the TUI
 
 Configure a provider and model in the user configuration, with credentials
 referenced by environment-variable name, not embedded in JSON. Export that
 variable **before starting the TUI in the same shell**. No server is needed.
+
+Configuration lookup uses `NEXUS_CONFIG` when nonempty, otherwise
+`$XDG_CONFIG_HOME/nexus-agent/config.json`, falling back to
+`$HOME/.config/nexus-agent/config.json` (also on macOS). The server additionally
+accepts `--config PATH`, which takes precedence. The TUI has no `--config` flag:
+
+```sh
+export NEXUS_CONFIG=/path/to/config.json
+```
+
+Use the complete revision-2 example below. Revision 2 requires a provider
+`protocol`: `chat_completions`, `openai_responses`, or `anthropic_messages`.
+`adapter` (`direct` or `relay`) describes routing, not the protocol or an
+implemented plugin system. Revision-1 files without `protocol` remain readable
+as Chat Completions; saving writes revision 2. Missing config starts empty;
+invalid config fails startup explicitly. Config saves do not create missing
+parent directories, so create the chosen directory first.
 
 ```sh
 cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project
@@ -98,24 +139,36 @@ broadly except protected credential paths, writes only the project/temp
 roots or a declared approved directory, and has no network access.
 `--strict-tools` restores the strict policy: project-jailed reads with
 per-call confirmation for writes and exec. `--demo` only affects provider
-wiring and transcript fallback, not tool mode. Canonical path checks cannot
-close the check/open race against concurrent host path changes, so treat
-colliding writers as out of scope.
+wiring and transcript fallback, not tool mode. File tools now bind access to
+descriptors and stage same-directory replacements: new-file creation is
+no-clobber, multi-hardlink mutations are refused, and supported metadata must
+be preserved or replacement fails closed. Atomic visibility is not crash
+durability; external-writer conflict detection is best-effort, not a universal
+race guarantee. These filesystem changes have macOS evidence only; Linux
+validation remains blocked. See the [migration record](docs/tasks/08-architecture-migration.md).
 
 Changing the environment in another shell does not change a running TUI's
 credentials; restart it after changing credentials.
 
 Completed exchanges are retained in memory for follow-up tasks within the
-same session. `/session new` starts isolated context. Retention is bounded
+same session. `:session new` starts isolated context; `:session list` and
+`:session switch <target>` manage up to 16 in-memory sessions. Retention is bounded
 by context-item limits and 1 MiB per runtime; oldest complete exchanges are
 evicted when necessary, never individual tool-call/result pairs. Failed,
 cancelled, and limited runs are not retained—even if a tool already changed
 a file. Cancellation is not rollback; reread affected files before relying
 on their state. Restarting loses this history; disk restore is not implemented.
 
+Use `:model` (or `:model set <id>`) to select a configured model. Startup prefers
+the first recent, then favourite, then configured model. `Tab` in the composer
+cycles `build`, read-only `plan`, and custom modes; `default_mode` initializes
+the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
+`:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
+command.
+
 ## Test a real LLM (local Ollama, end to end)
 
-The deterministic proof lives in `cargo test -p nexus-openai` (loopback
+The deterministic tests live in `cargo test -p nexus-openai --locked --offline` (loopback
 mock, no external API). To run a live model, use an OpenAI-compatible
 endpoint such as Ollama. HTTPS endpoints require the system `openssl`
 executable; certificate and hostname verification remain enabled.
@@ -124,14 +177,16 @@ executable; certificate and hostname verification remain enabled.
 ollama pull llama3.1
 export OLLAMA_API_KEY=dummy   # local Ollama ignores it; the credential gate still requires it set
 export NEXUS_SERVER_TOKEN="$(openssl rand -hex 32)"
-cat > /tmp/nexus-config.json <<'EOF'
+export NEXUS_CONFIG="$(mktemp)"
+cat > "$NEXUS_CONFIG" <<'EOF'
 {
-  "revision": 1,
+  "revision": 2,
   "providers": [
     {
       "id": "ollama",
       "display_name": "Ollama (local)",
       "adapter": "direct",
+      "protocol": "chat_completions",
       "endpoint": "http://localhost:11434/v1",
       "credential": {"env": "OLLAMA_API_KEY"},
       "default_model": "llama3.1"
@@ -144,8 +199,17 @@ cat > /tmp/nexus-config.json <<'EOF'
   "recent": []
 }
 EOF
-cargo run -p nexus-server --locked --offline -- --port 8471 --config /tmp/nexus-config.json --auth-token-env NEXUS_SERVER_TOKEN
+# TUI alternative: run this instead of the server in the same shell:
+# cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project
+cargo run -p nexus-server --locked --offline -- --port 8471 --config "$NEXUS_CONFIG" --auth-token-env NEXUS_SERVER_TOKEN
 ```
+
+The temporary config is selected for this shell's runs; remove it after use,
+or copy it into your chosen persistent config location. Live calls require
+Ollama running locally. The server listens only on `127.0.0.1`; configured
+providers or real tools require the 64-hex-character bearer token. This token
+grants server-wide route access, including approvals; session IDs are not
+credentials. Only the fake-only server demo may run without authentication.
 
 In the server terminal, keep the generated token available through your
 secret manager or another secret-safe channel. In the client terminal, read
@@ -172,8 +236,8 @@ RID=$(curl -s --config "$AUTH_CONFIG" -X POST localhost:8471/sessions/$SID/runs 
 curl -sN --config "$AUTH_CONFIG" localhost:8471/sessions/$SID/runs/$RID/events
 ```
 
-Expect the model's text, then a terminal `completed`. If the model
-calls a tool, an `approval-required` event appears: approve it with its
+Expect the model's text, then a terminal `completed`. If a tool call requires
+confirmation, an `approval-required` event appears: approve it with its
 exact ids (`POST .../approve {"approval":"...","call":"..."}`) and the
 run continues. External-path approvals additionally accept
 `"scope":"session-directory"`, which grants the runtime-published directory
@@ -182,6 +246,11 @@ for that session only. Real file tools additionally need
 `--strict-tools` for the strict policy): project/temp operations are
 automatic, other paths need approval, and paths to protected credential
 files are refused.
+
+Session provider/model selection is fixed at creation. The `model` field is a
+configured model ID (`local` here), not arbitrary vendor text. Run submissions
+may omit selection or repeat the binding; conflicting selections fail `400`.
+The server does not expose the TUI/headless agent-mode selector.
 
 API sanity check that does not invoke a model:
 
@@ -193,36 +262,46 @@ To test the `503` credential gate, stop the server, unset `OLLAMA_API_KEY` in
 its environment, restart it with the same config, and try to create the Ollama
 session again. Session creation fails before any provider network request.
 
-## Use a hosted model (e.g. DeepSeek)
+## Use a hosted model
 
 Same configuration shape with an `https` endpoint; export the referenced
 variable **before starting** (TUI or server) in the same shell. The value
-is referenced by name only, never embedded in JSON.
+is referenced by name only, never embedded in JSON. Replace the endpoint and
+model placeholders with values supported by your service:
 
 ```json
 {
-  "revision": 1,
+  "revision": 2,
   "providers": [
     {
-      "id": "deepseek",
-      "display_name": "DeepSeek",
+      "id": "hosted",
+      "display_name": "Hosted provider",
       "adapter": "direct",
-      "endpoint": "https://api.deepseek.com",
-      "credential": {"env": "DEEPSEEK_API_KEY"},
-      "default_model": "deepseek-flash"
+      "protocol": "chat_completions",
+      "endpoint": "https://YOUR_PROVIDER_HOST/v1",
+      "credential": {"env": "HOSTED_API_KEY"},
+      "default_model": "YOUR_MODEL_NAME"
     }
   ],
   "models": [
-    {"id": "flash", "provider": "deepseek", "name": "deepseek-flash"}
+    {"id": "hosted-model", "provider": "hosted", "name": "YOUR_MODEL_NAME"}
   ],
-  "favourites": ["flash"],
+  "favourites": ["hosted-model"],
   "recent": []
 }
 ```
 
-Then select the `flash` model in the TUI and submit; requests are billable.
-Thinking traces are echoed back automatically, and follow-up tasks in the
-same session reuse the retained context described above.
+Set `HOSTED_API_KEY` securely in the launching shell, then use
+`:model set hosted-model` in the TUI; requests are billable. Follow-up tasks
+reuse bounded context. Thinking/continuation data is protocol-specific;
+unsupported replay is rejected, not silently rewritten.
+
+For Responses or Messages, use `openai_responses` or `anthropic_messages` and
+the corresponding service base URL/model. Chat Completions appends
+`/chat/completions`; Responses and Messages append `/responses` or `/messages`
+when the base ends in `/v1`, otherwise `/v1/responses` or `/v1/messages`.
+Do not supply the complete request URL as the base. These adapters have offline
+fixtures; verify the particular service/model before relying on compatibility.
 
 ## Perf harnesses
 
@@ -235,18 +314,22 @@ Cold-cache runs need an explicit user-supplied `--purge-cmd`; without one they a
 
 ## Coverage (optional)
 
-```sh
-rm -f /tmp/nexus-cov/*.profraw
-LLVM_PROFILE_FILE='/tmp/nexus-cov/%p.profraw' RUSTFLAGS='-C instrument-coverage' \
-  cargo test --workspace --locked --offline --no-fail-fast
-xcrun llvm-profdata merge -sparse /tmp/nexus-cov/*.profraw -o /tmp/nexus-cov/merged.profdata
-# then: xcrun llvm-cov report --instr-profile /tmp/nexus-cov/merged.profdata \
-#   $(for f in target/debug/deps/*; do ...) --ignore-filename-regex='/\.cargo/|/rustc/|registry/src'
-```
+Coverage is measured on demand, not a published fixed percentage. Compile and
+test with `RUSTFLAGS='-C instrument-coverage'`, directing `LLVM_PROFILE_FILE`
+to a fresh private directory with a `%p.profraw` filename. Merge profiles with
+`llvm-profdata`, then report against the corresponding instrumented test
+executables with `llvm-cov`. Both LLVM tools must match the Rust compiler's
+LLVM version; macOS `xcrun` tools are usable only when they match. Do not mix
+profiles or executable artifacts from different builds. This is separate from
+the routine default-feature test workflow.
 
 ## What NOT to expect
 
 - Provider transport covers HTTP and HTTPS (HTTPS via the system `openssl`
-  bridge) with streaming SSE; plugins and durable history do not exist (ephemeral store only).
+  bridge) with protocol-specific streaming SSE; Gemini, external plugins,
+  and durable history are not implemented (ephemeral store only).
 - Recorded performance numbers are historical characterization, not acceptance evidence; PTY/idle/streaming baselines are still pending.
-- GitHub Actions runs the check suite on Ubuntu and macOS; exact toolchain pinning is still open.
+- No Linux security-readiness or complete descendant-cleanup claim: the
+  migration record's platform blockers and cleanup limitations still apply.
+- CI has Ubuntu/macOS checks; exact toolchain pinning is still open. Coverage
+  tools must match the Rust compiler's LLVM version; Xcode tools may not match.

@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Design](https://img.shields.io/badge/Stage-Design-orange.svg)](docs/index.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.0--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent designed around very fast startup, a minimal core, and a native terminal interface. Broader capabilities belong in replaceable tools and plugins, not an ever-growing engine.
 
@@ -11,12 +11,12 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 <img src="docs/images/demo.gif" alt="Nexus Agent terminal demo" width="100%" />
 </div>
 
-[Documentation](docs/index.md) · [Contributing](CONTRIBUTING.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
+[Quickstart](QUICKSTART.md) · [Documentation](docs/index.md) · [Contributing](CONTRIBUTING.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent has an M0 **test-only implementation**; the TUI displays its version from Cargo package metadata. It has opt-in OpenAI-compatible live providers and development-mode file tools plus sandboxed command execution; storage remains ephemeral and plugins are not implemented. Real tools default to development mode: operations inside the project root and temp directories are automatic, access to other paths needs approval (allow once, or grant that directory for the session), and `--strict-tools` restores project-jailed reads with per-call confirmation. See [QUICKSTART.md](QUICKSTART.md) for live wiring and limitations. **M0 acceptance is not complete**. Recorded macOS and Linux (container) runs are historical spawn-to-exit characterization, not first-interactive startup evidence; their RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch baselines are still pending. The diagrams and broader capabilities below describe the proposed architecture, not stable features.
+> Nexus Agent is **0.2.0-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
 
 ## Screenshots
 
@@ -51,9 +51,9 @@ Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 The startup target includes local configuration and interface initialization, but not model responses or optional plugin readiness. It is a goal for documented reference environments, **not a measured result or a guarantee on arbitrary hardware**. See the [performance design](docs/design/05-performance.md).
 
-### Current executable sizes
+### Historical executable sizes
 
-Measured from the optimized, unstripped Cargo release binaries built on **macOS arm64** for this checkout (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`):
+Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.0-alpha**:
 
 | Executable | File size |
 | --- | ---: |
@@ -65,11 +65,11 @@ These are platform- and build-profile-specific file sizes, not compressed downlo
 
 ## Architecture
 
-The proposed host runs in one process. Its core, runtime, frontends, and adapters are in-process components; external plugins run separately. Built-in tools do not pay an IPC cost.
+The host's core, runtime, frontend, and adapters are in-process components; built-in tools do not pay an IPC cost. The diagram includes planned durable storage and external plugins, which are not implemented. Provider TLS and sandboxed commands can launch helper processes.
 
 ```mermaid
 flowchart TB
-    Frontend["Rust TUI / headless frontend"]
+    Frontend["Rust TUI / headless / HTTP frontend"]
     Core["Domain core<br/>Types, transitions, contracts"]
     Runtime["Agent runtime<br/>Policy, lifecycle, cancellation"]
     Provider["Provider adapters<br/>Direct APIs and relay plugins"]
@@ -100,7 +100,7 @@ See [component boundaries](docs/design/01-components.md) for dependency directio
 
 ### Agent Execution
 
-The following sequence illustrates an approved, persistent run. Denial, refusal, errors, cancellation, and uncertain effects have explicit outcomes in the contracts.
+The following sequence illustrates the proposed persistent run, not today's ephemeral storage. Denial, refusal, errors, cancellation, and uncertain effects have explicit outcomes in the contracts.
 
 ```mermaid
 sequenceDiagram
@@ -146,7 +146,7 @@ sequenceDiagram
     Runtime-->>UI: RunFinished
 ```
 
-Partial tool arguments are previews, never executable instructions. The proposed baseline has one active run and sequential tool dispatch. Cancellation is not rollback, and uncertain side effects must not be blindly replayed.
+Partial tool arguments are previews, never executable instructions. Each runtime has one active run and sequential tool dispatch; separate TUI/server sessions own separate runtimes. Cancellation is not rollback, and uncertain side effects must not be blindly replayed.
 
 ## First-Release Defaults
 
@@ -156,20 +156,27 @@ Accepted in [Decision 01](docs/design/decisions/01-first-release-defaults.md); d
 | --- | --- |
 | Permissions | Development mode by default: project/temp operations are automatic, external file access needs approval (allow once or a session-only directory grant); `--strict-tools` keeps project-jailed reads with confirmation for mutations and exec. |
 | Frontend | Grok Build-style full-screen Rust TUI plus a headless entry point over the same runtime. |
-| Sessions | Save automatically outside the project; start new and restore history only on explicit request. |
+| Sessions | Target: save automatically outside the project; restore history only on explicit request. Current history is memory-only. |
 | Authentication | API configuration with external credential references; browser login deferred. |
 | API relay | Relay is a provider plugin; support existing services first and keep local execution optional. |
 
 ## Using the Frontends
 
-Both frontends submit to the same runtime, so policy is identical wherever you invoke it. The read-only mode is enforced at tool dispatch, not by convention.
+All frontends use the same runtime policy boundary, but their wiring differs: the TUI supports live providers and real tools; the server supports live providers with fake tools by default; headless uses scripted fakes only. Read-only mode in the TUI/headless is enforced at tool dispatch, not by convention.
+
+```sh
+cargo run -p nexus-headless --locked --offline -- "hello"
+cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project
+```
+
+Configure a model before submitting in the TUI; an unconfigured launch does not silently return fake replies. `--demo` permits demo fallback but does not disable real tools or override a selected live model. Cargo's `--offline` does not disable runtime API requests. See the [Quickstart](QUICKSTART.md).
 
 ### Agent modes
 
 | Mode | Tool policy |
 | --- | --- |
 | `build` (default) | Full capability; in development mode project/temp operations are automatic while external paths need approval, and `--strict-tools` requires explicit approval for mutations and exec. |
-| `plan` | Read-only: confirmation-required tools are denied without prompting; automatic reads still run. |
+| `plan` | Read-only: mutations, processes, and unclassified tools are denied without prompting; permitted reads still run. |
 
 In the TUI, `Tab` in the composer cycles modes, and the composer border color and title name the active one. One-shot headless runs take `--mode plan|build|<custom>`. Further modes come from configuration:
 
@@ -180,7 +187,7 @@ In the TUI, `Tab` in the composer cycles modes, and the composer border color an
 }
 ```
 
-Built-in ids cannot be redefined, and unknown mode ids or dangling defaults fail explicitly instead of falling back silently.
+This fragment extends a complete user configuration. Built-in ids cannot be redefined, and unknown mode ids or dangling defaults fail explicitly instead of falling back silently. `default_mode` initializes the TUI; headless defaults to `build` unless `--mode` is supplied.
 
 ### TUI presentation
 
@@ -188,9 +195,11 @@ Assistant messages render a Markdown subset (headings, emphasis, code, lists, qu
 
 Type `:` in the viewport to open the desktop command line. `:help` opens a scrollable reference dialog with commands, key bindings, application version, platform, active model, and session. Commands execute only after Enter; use `:q` to exit. The viewport supports Vim-style navigation (`j`/`k`, `gg`/`G`, `H`/`M`/`L`, `Ctrl+f`/`b`, `Ctrl+d`/`u`). In the composer, `@` offers project-relative path suggestions; accepting one inserts a literal reference and does not read or attach the file contents.
 
+Use `:model` to select a configured model, and `:session new`, `:session list`, or `:session switch <target>` to manage up to 16 in-memory sessions. Restarting loses conversations and session grants; saving configuration is not durable session storage.
+
 ## Extensions
 
-Built-in and external tools share one semantic contract, but do not share the same transport cost.
+The extension design gives built-in and external tools one semantic contract, but different transport costs. Only built-in tools are implemented today.
 
 | Path | Integration | Tradeoff |
 | --- | --- | --- |
@@ -207,18 +216,18 @@ The initial coding distribution provides scoped reads, listing, and search, full
 
 Read the [plugin design](docs/design/04-tool-plugins.md) and [tool contract](docs/contracts/02-tool.md).
 
-## Planned Model Coverage
+## Model Coverage
 
 Coverage is organized by protocol family rather than by a growing list of vendor SDKs.
 
-| Protocol family | Intended integration |
+| Protocol family | Current status |
 | --- | --- |
-| OpenAI Chat Completions-compatible | Implemented with streaming over HTTP/HTTPS (local endpoints and hosted services). |
-| OpenAI Responses | Responses streaming, function calls, and continuation state. |
-| Anthropic Messages | Content blocks, streaming, and tool use/results. |
-| Gemini native APIs | Native content/function representations and continuation requirements. |
+| OpenAI Chat Completions-compatible | Implemented: `chat_completions`, streaming text and tool calls over HTTP/HTTPS. |
+| OpenAI Responses | Implemented: `openai_responses`, streaming, function calls, and continuation mapping. |
+| Anthropic Messages | Implemented: `anthropic_messages`, content blocks, streaming, and tool use/results. |
+| Gemini native APIs | Planned; not implemented. |
 
-The remaining rows are **coverage targets, not verified integrations**. Each adapter must declare capabilities, preserve tool-call identity and required continuation data, and validate its compatibility. A configurable base URL alone does not establish support.
+Protocol selection is explicit in revision-2 provider configuration and separate from `direct`/`relay` routing. Revision-1 files remain readable as Chat Completions profiles; saves write revision 2. HTTPS uses the system `openssl` TLS bridge with certificate/hostname verification. Responses and Messages coverage is backed by offline fixtures, **not universal live service/model compatibility**. Unsupported continuation/thinking context fails explicitly; a configurable base URL alone does not establish support.
 
 First-release authentication uses API profiles with external credential references. Existing relay services integrate as provider plugins; local relay execution is optional and on demand.
 
@@ -226,9 +235,11 @@ See [model integration](docs/design/03-model-integration.md), [API relay](docs/d
 
 ## Safety and Trust
 
-The proposed runtime enforces permissions, resource scopes, deadlines, and output limits for every execution path. Plugin descriptions and model output are data, not permission grants.
+The runtime enforces permissions, resource scopes, deadlines, and output limits. Tool access categories come from host registration, not model-visible descriptions. Model output is data, not a permission grant.
 
-Initial external plugins are explicitly enabled **trusted code**. A subprocess is not a sandbox; isolation for untrusted plugins requires a separate implementation and platform-specific testing. No sandbox or containment guarantee exists today.
+Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Built-in `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
+
+The server binds to loopback only. Configured providers or real tools require `--auth-token-env NAME` with a 64-hex-character bearer token. That server-wide token also authorizes approval/control routes; session IDs are not credentials. Loopback HTTP is not encrypted and does not isolate mutually untrusted same-user processes.
 
 The default permission policy and session behavior are accepted; automatic access remains scoped to the project/temp boundary, external paths require exact-call confirmation (once, or a session-only directory grant that never persists), strict mode confirms every mutation and execution, and restored history never replays operations or old grants.
 
@@ -240,13 +251,16 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Draft architecture, performance, security, and interface contracts.
 - [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
 - [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
-- [x] Build a testable core/runtime and minimal frontend (scripted fakes plus opt-in live providers and development-mode file tools with sandboxed exec; routine checks are `cargo fmt --check`, per-crate `cargo test`, and `cargo clippy -D warnings`, with the full suite in GitHub Actions on Ubuntu and macOS; see [Testing](docs/testing.md) for the default/optional split).
+- [x] Implement the shared runtime, live TUI, loopback HTTP/SSE server, scripted headless runner, file read/list/search/write/patch, and sandboxed exec.
+- [x] Implement Chat Completions, OpenAI Responses, and Anthropic Messages adapters with explicit protocol configuration and offline regression fixtures.
+- [x] Implement M4 consolidation slices: shared ordered-event consumption, tool composition, and current provider capability handling. The default-feature workspace suite has recorded passing macOS evidence; see [migration status](docs/tasks/08-architecture-migration.md) and [Testing](docs/testing.md).
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
-- [ ] Complete coding tools and mainstream model adapters (opt-in OpenAI-compatible streaming, file read/list/search/write/patch, and sandboxed execution are implemented; other provider protocols remain pending).
+- [ ] Close migration gates: Linux file race/metadata and sandbox-isolation validation remain blocked; escaped-descendant cleanup remains unresolved. Temporary macOS-only development scope is not cross-platform acceptance.
+- [ ] Verify live compatibility for individual services/models and extend protocol coverage as needed; Gemini is not implemented.
 - [ ] Add bounded external-plugin interoperability and session recovery.
 
-Windows and untrusted-plugin isolation are separate follow-up work. Build the M0 test-only binaries with `cargo build --workspace --release` (produces `nexus-headless` and `nexus-tui`); there is no installable release yet.
+Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The alpha version is not a stable-release or production-readiness claim.
 
 ## Documentation and Contributions
 
@@ -261,6 +275,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull-request guida
 | [TUI and headless frontends](docs/design/07-tui.md) | Grok Build-style layout, approvals, history, and script entry point. |
 | [API relay](docs/design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries. |
 | [Implementation readiness](docs/design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review. |
+| [Architecture migration](docs/tasks/08-architecture-migration.md) | Implemented consolidation slices, protocol extension evidence, and platform blockers. |
 | [Overview](docs/design/00-overview.md) | First-release boundaries and non-goals. |
 | [Common contract](docs/contracts/00-common.md) | Identifiers, outcomes, errors, limits, and compatibility. |
 | [Commands and events](docs/contracts/03-command-events.md) | Frontend/runtime interaction and backpressure. |
