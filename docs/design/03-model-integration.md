@@ -1,6 +1,6 @@
 # Model Integration
 
-Status: Draft design. All protocol families below are coverage targets, not implemented or verified integrations.
+Status: Draft design. The first-party client currently implements Chat Completions-compatible, OpenAI Responses, and Anthropic Messages dialects with offline fixtures. This is not a claim of live compatibility with every service or model in those protocol families. Gemini remains a coverage target only.
 
 ## Protocols Before Vendor SDKs
 
@@ -48,6 +48,12 @@ Preserve original tool-call references and all protocol-required continuation da
 The core may retain bounded, adapter-scoped continuation data without interpreting it. Adapters must preserve its semantics and reject incompatible reuse. Context compaction and provider switching require an explicit policy; they must not silently manufacture a valid history after dropping required state.
 
 Opaque data is neither a permission grant nor user-facing output. Apply privacy and retention rules before storing or forwarding it.
+
+The current three adapters reconstruct turns from the normalized transcript and
+do not emit or consume opaque provider continuation state. Requests carrying
+opaque continuation data fail explicitly; protocol switching is distinguished
+by stable adapter identity. Reasoning traces that these protocols cannot
+faithfully replay are also rejected rather than silently dropped.
 
 ## Testing and Coverage Claims
 

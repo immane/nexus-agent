@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{AdapterKind, CredentialRef, ProviderProfile};
 use nexus_core::{
-    CallId, CancellationToken, EffectState, ErrorCategory, Evidence, ExecutionStatus, FinishReason,
-    M0_REVISION, ModelContextItem, ModelRequest, NormalizedArgs, ProviderContext, ProviderEvent,
-    ProviderPort, RunId, ToolCall, ToolId, ToolOutcome, ToolSpec, TurnFinished, TurnId, Usage,
-    UsageFinality,
+    CallId, CancellationToken, ContinuationData, EffectState, ErrorCategory, Evidence,
+    ExecutionStatus, FinishReason, M0_REVISION, ModelContextItem, ModelRequest, NormalizedArgs,
+    ProviderContext, ProviderEvent, ProviderPort, RunId, ToolCall, ToolId, ToolOutcome, ToolSpec,
+    TurnFinished, TurnId, Usage, UsageFinality,
 };
 use nexus_openai::OpenAiProvider;
+use serde_json::Value;
 
 /// Observed mock interaction: connection count plus the raw request bytes.
 struct Served {
@@ -259,6 +260,604 @@ fn construction_rejects_bad_endpoints_models_and_profiles() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn configured_responses_and_messages_protocols_use_their_wire_contracts() {
+    for (protocol, path, expected_text, response) in [
+        (
+            nexus_config::ProtocolKind::OpenAiResponses,
+            "/v1/responses",
+            "Responses hello",
+            r#"{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"Responses hello"}]}],"usage":{"input_tokens":2,"output_tokens":3}}"#,
+        ),
+        (
+            nexus_config::ProtocolKind::AnthropicMessages,
+            "/v1/messages",
+            "Messages hello",
+            r#"{"type":"message","content":[{"type":"text","text":"Messages hello"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":5}}"#,
+        ),
+    ] {
+        let (base, served) = serve(200, response, Duration::ZERO);
+        let profile = nexus_config::ProviderProfile::new_with_protocol(
+            "fixture-provider",
+            "Fixture provider",
+            nexus_config::AdapterKind::Direct,
+            protocol,
+            Some(base),
+            present_credential(),
+            "fixture-model",
+        )
+        .expect("protocol profile builds");
+        let adapter = OpenAiProvider::from_profile(&profile, "fixture-model")
+            .expect("profile selects its protocol adapter");
+        assert_eq!(adapter.continuation_scope("profile-a"), "profile-a");
+        let expected_identity = match protocol {
+            nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+            nexus_config::ProtocolKind::OpenAiResponses => "openai-responses-v1",
+            nexus_config::ProtocolKind::AnthropicMessages => "anthropic-messages-v1",
+        };
+        assert_eq!(adapter.adapter_identity(), expected_identity);
+        let request = base_request()
+            .with_conversation(vec![
+                ModelContextItem::user_text("fixture prompt").expect("user text builds"),
+            ])
+            .expect("conversation attaches")
+            .with_tool_definitions(vec![
+                ToolSpec::new(
+                    ToolId::new("host_read", M0_REVISION).expect("tool id builds"),
+                    "Read a file",
+                    r#"{"type":"object"}"#,
+                )
+                .expect("tool spec builds"),
+            ])
+            .expect("tool definitions attach");
+        let events = adapter.stream(&request, &live_context());
+        assert!(matches!(
+            events.first(),
+            Some(ProviderEvent::TextDelta { text, .. }) if text == expected_text
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::TurnFinished(_))
+        ));
+        let request = String::from_utf8_lossy(&served.request.lock().expect("request captured"))
+            .to_ascii_lowercase();
+        assert!(request.contains(path), "request uses the selected endpoint");
+        match protocol {
+            nexus_config::ProtocolKind::OpenAiResponses => {
+                assert!(request.contains("authorization: bearer "));
+                assert!(request.contains("\"type\":\"function\""));
+                assert!(
+                    request
+                        .contains("\"input\":[{\"content\":\"fixture prompt\",\"role\":\"user\"}]")
+                );
+            }
+            nexus_config::ProtocolKind::AnthropicMessages => {
+                assert!(request.contains("x-api-key:"));
+                assert!(request.contains("anthropic-version: 2023-06-01"));
+                assert!(request.contains("\"messages\":[{\"content\":[{\"text\":\"fixture prompt\",\"type\":\"text\"}],\"role\":\"user\"}]"));
+                assert!(request.contains("\"input_schema\""));
+            }
+            nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn all_protocols_reject_unconsumed_opaque_continuation_state() {
+    for protocol in [
+        nexus_config::ProtocolKind::ChatCompletions,
+        nexus_config::ProtocolKind::OpenAiResponses,
+        nexus_config::ProtocolKind::AnthropicMessages,
+    ] {
+        let adapter = OpenAiProvider::new_for_protocol(
+            "http://127.0.0.1:1",
+            present_credential(),
+            "model",
+            protocol,
+        )
+        .expect("adapter builds without connecting");
+        let continuation = ContinuationData::new(
+            adapter.adapter_identity(),
+            "profile",
+            b"opaque provider state".to_vec(),
+        )
+        .expect("continuation is bounded");
+        let request = ModelRequest::new(
+            RunId::new("run-continuation").expect("run id is valid"),
+            TurnId::new("turn-continuation").expect("turn id is valid"),
+            "profile",
+            Vec::new(),
+            Some(continuation),
+            1024,
+        )
+        .expect("request with continuation builds");
+        let events = adapter.stream(&request, &live_context());
+        assert!(matches!(
+            events.first(),
+            Some(ProviderEvent::Failed(error))
+                if error.category() == ErrorCategory::UnsupportedCapability
+        ));
+    }
+}
+
+#[test]
+fn responses_and_messages_reject_reasoning_they_cannot_replay_faithfully() {
+    for protocol in [
+        nexus_config::ProtocolKind::OpenAiResponses,
+        nexus_config::ProtocolKind::AnthropicMessages,
+    ] {
+        let adapter = OpenAiProvider::new_for_protocol(
+            "http://127.0.0.1:1",
+            present_credential(),
+            "model",
+            protocol,
+        )
+        .expect("protocol adapter builds without connecting");
+        let request = base_request()
+            .with_conversation(vec![
+                ModelContextItem::assistant_reasoning("private reasoning".to_owned())
+                    .expect("reasoning fits the context bound"),
+            ])
+            .expect("reasoning transcript attaches");
+        assert!(matches!(
+            adapter.stream(&request, &live_context()).first(),
+            Some(ProviderEvent::Failed(error))
+                if error.category() == ErrorCategory::UnsupportedCapability
+        ));
+    }
+}
+
+#[test]
+fn responses_and_messages_sse_normalize_text_tool_calls_and_termination() {
+    let responses_body = concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]},{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"host_read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n"
+    );
+    let (base, _) = serve_raw(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+        responses_body,
+    );
+    let responses = OpenAiProvider::new_for_protocol(
+        &base,
+        present_credential(),
+        "model",
+        nexus_config::ProtocolKind::OpenAiResponses,
+    )
+    .expect("Responses adapter builds");
+    let provisional = Mutex::new(Vec::new());
+    let events = responses.stream_with_sink(&base_request(), &live_context(), &|event| {
+        provisional.lock().expect("sink list writable").push(event)
+    });
+    assert!(
+        matches!(provisional.lock().expect("sink list readable").first(), Some(ProviderEvent::TextDelta { text, .. }) if text == "hello")
+    );
+    assert!(
+        matches!(events.get(1), Some(ProviderEvent::ToolCallReady(candidate)) if candidate.provider_ref() == "call-1")
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ProviderEvent::TurnFinished(_))
+    ));
+
+    let anthropic_body = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":4}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu-1\",\"name\":\"host_read\",\"input\":{}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"b\\\"}\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    );
+    let (base, _) = serve_raw(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+        anthropic_body,
+    );
+    let messages = OpenAiProvider::new_for_protocol(
+        &base,
+        present_credential(),
+        "model",
+        nexus_config::ProtocolKind::AnthropicMessages,
+    )
+    .expect("Messages adapter builds");
+    let events = messages.stream(&base_request(), &live_context());
+    assert!(
+        matches!(events.first(), Some(ProviderEvent::ToolCallReady(candidate)) if candidate.provider_ref() == "toolu-1" && candidate.arguments_json() == "{\"path\":\"b\"}")
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ProviderEvent::TurnFinished(_))
+    ));
+}
+
+#[test]
+fn responses_incomplete_tool_proposals_are_never_dispatchable() {
+    for (status, body) in [
+        (
+            "JSON",
+            r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","call_id":"partial-call","name":"host_read","arguments":"{\"path\":\"x\"}"}]}"#,
+        ),
+        (
+            "SSE",
+            r#"data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","call_id":"partial-call","name":"host_read","arguments":"{\"path\":\"x\"}"}]}}"#,
+        ),
+    ] {
+        let (base, _) = if status == "JSON" {
+            serve(200, body, Duration::ZERO)
+        } else {
+            serve_raw(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                &format!("{body}\n\n"),
+            )
+        };
+        let adapter = OpenAiProvider::new_for_protocol(
+            &base,
+            present_credential(),
+            "model",
+            nexus_config::ProtocolKind::OpenAiResponses,
+        )
+        .expect("Responses adapter builds");
+        let events = adapter.stream(&base_request(), &live_context());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolCallReady(_))),
+            "{status} incomplete response exposed a tool call: {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::TurnFinished(finished))
+                if finished.reason() == FinishReason::OutputLimit
+        ));
+    }
+}
+
+#[test]
+fn responses_and_messages_reject_unreplayable_reasoning_in_replies() {
+    for (protocol, body) in [
+        (
+            nexus_config::ProtocolKind::OpenAiResponses,
+            r#"{"status":"completed","output":[{"type":"reasoning","summary":[]},{"type":"message","content":[{"type":"output_text","text":"answer"}]}]}"#,
+        ),
+        (
+            nexus_config::ProtocolKind::AnthropicMessages,
+            r#"{"type":"message","content":[{"type":"thinking","thinking":"hidden trace","signature":"sig"}],"stop_reason":"end_turn"}"#,
+        ),
+    ] {
+        let (base, _) = serve(200, body, Duration::ZERO);
+        let adapter =
+            OpenAiProvider::new_for_protocol(&base, present_credential(), "model", protocol)
+                .expect("protocol adapter builds");
+        assert!(matches!(
+            adapter.stream(&base_request(), &live_context()).first(),
+            Some(ProviderEvent::Failed(error))
+                if error.category() == ErrorCategory::UnsupportedCapability
+        ));
+    }
+}
+
+#[test]
+fn responses_and_messages_sse_reject_unreplayable_reasoning() {
+    for (protocol, body) in [
+        (
+            nexus_config::ProtocolKind::OpenAiResponses,
+            "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"private\"}\n\n",
+        ),
+        (
+            nexus_config::ProtocolKind::AnthropicMessages,
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"private\",\"signature\":\"sig\"}}\n\n",
+        ),
+    ] {
+        let (base, _) = serve_raw(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            body,
+        );
+        let adapter =
+            OpenAiProvider::new_for_protocol(&base, present_credential(), "model", protocol)
+                .expect("protocol adapter builds");
+        assert!(matches!(
+            adapter.stream(&base_request(), &live_context()).first(),
+            Some(ProviderEvent::Failed(error))
+                if error.category() == ErrorCategory::UnsupportedCapability
+        ));
+    }
+}
+
+#[test]
+fn messages_sse_rejects_unclosed_or_misordered_content_blocks() {
+    for body in [
+        concat!(
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu-1\",\"name\":\"host_read\",\"input\":{}}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ),
+        concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ),
+    ] {
+        let (base, _) = serve_raw(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            body,
+        );
+        let adapter = OpenAiProvider::new_for_protocol(
+            &base,
+            present_credential(),
+            "model",
+            nexus_config::ProtocolKind::AnthropicMessages,
+        )
+        .expect("Messages adapter builds");
+        assert!(matches!(
+            adapter.stream(&base_request(), &live_context()).first(),
+            Some(ProviderEvent::Failed(error)) if error.category() == ErrorCategory::Protocol
+        ));
+    }
+}
+
+#[test]
+fn messages_sse_rejects_invalid_delta_fields_and_block_types() {
+    let tool = serde_json::json!({"type":"tool_use","id":"toolu-1","name":"host_read","input":{}});
+    let text = serde_json::json!({"type":"text","text":""});
+    for (block, delta) in [
+        (tool.clone(), serde_json::json!({"type":"input_json_delta"})),
+        (
+            tool.clone(),
+            serde_json::json!({"type":"input_json_delta","partial_json":42}),
+        ),
+        (
+            tool.clone(),
+            serde_json::json!({"type":"input_json_delta","partial_json":null}),
+        ),
+        (
+            tool.clone(),
+            serde_json::json!({"type":"text_delta","text":"wrong block"}),
+        ),
+        (tool.clone(), serde_json::json!({"type":"unknown_delta"})),
+        (tool, serde_json::json!({})),
+        (
+            text.clone(),
+            serde_json::json!({"type":"input_json_delta","partial_json":"{}"}),
+        ),
+        (text.clone(), serde_json::json!({"type":"text_delta"})),
+        (text, serde_json::json!({"type":"text_delta","text":42})),
+    ] {
+        let body = format!(
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{block}}}\n\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{delta}}}\n\n\
+             data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+             data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}}}}\n\n\
+             data: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let (base, _) = serve_raw(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            &body,
+        );
+        let adapter = OpenAiProvider::new_for_protocol(
+            &base,
+            present_credential(),
+            "model",
+            nexus_config::ProtocolKind::AnthropicMessages,
+        )
+        .expect("Messages adapter builds");
+        let provisional = Mutex::new(Vec::new());
+        let events = adapter.stream_with_sink(&base_request(), &live_context(), &|event| {
+            provisional.lock().unwrap().push(event);
+        });
+        assert!(
+            matches!(events.as_slice(), [ProviderEvent::Failed(error)] if error.category() == ErrorCategory::Protocol),
+            "invalid delta {delta} for block {block} was accepted: {events:?}"
+        );
+        assert!(provisional.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn messages_sse_rejects_repeated_starts_stops_and_post_stop_deltas() {
+    let start = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu-1\",\"name\":\"host_read\",\"input\":{}}}\n\n";
+    let stop = "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+    let delta = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n";
+    for prefix in [
+        format!("{start}{start}"),
+        format!("{start}{stop}{start}"),
+        format!("{start}{stop}{stop}"),
+        format!("{start}{stop}{delta}"),
+        stop.to_owned(),
+    ] {
+        let body = format!(
+            "{prefix}data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}}}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"
+        );
+        let (base, _) = serve_raw(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            &body,
+        );
+        let adapter = OpenAiProvider::new_for_protocol(
+            &base,
+            present_credential(),
+            "model",
+            nexus_config::ProtocolKind::AnthropicMessages,
+        )
+        .expect("Messages adapter builds");
+        let events = adapter.stream(&base_request(), &live_context());
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderEvent::Failed(error)] if error.category() == ErrorCategory::Protocol
+        ));
+    }
+}
+
+#[test]
+fn messages_rejects_redacted_thinking_in_json_and_sse() {
+    let block = r#"{"type":"redacted_thinking","data":"opaque"}"#;
+    for sse in [false, true] {
+        let (base, _) = if sse {
+            serve_raw(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                &format!(
+                    "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{block}}}\n\n"
+                ),
+            )
+        } else {
+            serve(
+                200,
+                &format!(
+                    "{{\"type\":\"message\",\"content\":[{block}],\"stop_reason\":\"end_turn\"}}"
+                ),
+                Duration::ZERO,
+            )
+        };
+        let adapter = OpenAiProvider::new_for_protocol(
+            &base,
+            present_credential(),
+            "model",
+            nexus_config::ProtocolKind::AnthropicMessages,
+        )
+        .expect("Messages adapter builds");
+        let events = adapter.stream(&base_request(), &live_context());
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderEvent::Failed(error)] if error.category() == ErrorCategory::UnsupportedCapability
+        ));
+    }
+}
+
+#[test]
+fn responses_and_messages_replay_tool_calls_with_their_results() {
+    let call = ToolCall::new(
+        RunId::new("run-1").expect("run id builds"),
+        TurnId::new("turn-1").expect("turn id builds"),
+        CallId::new("call-1").expect("call id builds"),
+        ToolId::new("host_read", M0_REVISION).expect("tool id builds"),
+        NormalizedArgs::new(r#"{"path":"src/main.rs"}"#).expect("arguments normalize"),
+    );
+    let outcome = ToolOutcome::new(
+        ExecutionStatus::Succeeded,
+        EffectState::KnownNotApplied,
+        Evidence::HostObserved,
+        "file contents",
+        false,
+    )
+    .expect("tool outcome builds");
+    let conversation = vec![
+        ModelContextItem::user_text("read the file").expect("user text builds"),
+        ModelContextItem::assistant_call("item-1", "provider-call-1", call)
+            .expect("assistant call builds"),
+        ModelContextItem::tool_result(
+            CallId::new("call-1").expect("call id builds"),
+            "item-1",
+            "provider-call-1",
+            ToolId::new("host_read", M0_REVISION).expect("tool id builds"),
+            outcome,
+        )
+        .expect("tool result builds"),
+    ];
+    for protocol in [
+        nexus_config::ProtocolKind::OpenAiResponses,
+        nexus_config::ProtocolKind::AnthropicMessages,
+    ] {
+        let response = match protocol {
+            nexus_config::ProtocolKind::OpenAiResponses => {
+                r#"{"id":"resp_2","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":3,"output_tokens":2}}"#
+            }
+            nexus_config::ProtocolKind::AnthropicMessages => {
+                r#"{"type":"message","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2}}"#
+            }
+            nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+        };
+        let (base, served) = serve(200, response, Duration::ZERO);
+        let adapter =
+            OpenAiProvider::new_for_protocol(&base, present_credential(), "model", protocol)
+                .expect("protocol adapter builds");
+        let request = base_request()
+            .with_conversation(conversation.clone())
+            .expect("tool transcript attaches")
+            .with_tool_definitions(vec![
+                ToolSpec::new(
+                    ToolId::new("host_read", M0_REVISION).expect("tool id builds"),
+                    "Read a file",
+                    r#"{"type":"object"}"#,
+                )
+                .expect("tool spec builds"),
+            ])
+            .expect("tool definition attaches");
+        let events = adapter.stream(&request, &live_context());
+        assert!(
+            matches!(
+                events.first(),
+                Some(ProviderEvent::TextDelta { text, .. }) if text == "done"
+            ),
+            "protocol {protocol:?} response events: {events:?}"
+        );
+        let captured = served.request.lock().expect("request captured").clone();
+        let captured = String::from_utf8_lossy(&captured);
+        let (_, body) = captured.split_once("\r\n\r\n").expect("request framed");
+        let body: Value = serde_json::from_str(body).expect("request body is JSON");
+        match protocol {
+            nexus_config::ProtocolKind::OpenAiResponses => {
+                assert_eq!(body["input"][1]["type"], "function_call");
+                assert_eq!(body["input"][1]["call_id"], "provider-call-1");
+                assert_eq!(body["input"][1]["arguments"], r#"{"path":"src/main.rs"}"#);
+                assert_eq!(body["input"][2]["type"], "function_call_output");
+                assert_eq!(body["input"][2]["call_id"], "provider-call-1");
+                assert_eq!(body["input"][2]["output"], "file contents");
+            }
+            nexus_config::ProtocolKind::AnthropicMessages => {
+                assert_eq!(body["messages"][1]["role"], "assistant");
+                assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+                assert_eq!(body["messages"][1]["content"][0]["id"], "provider-call-1");
+                assert_eq!(
+                    body["messages"][1]["content"][0]["input"]["path"],
+                    "src/main.rs"
+                );
+                assert_eq!(body["messages"][2]["role"], "user");
+                assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+                assert_eq!(
+                    body["messages"][2]["content"][0]["tool_use_id"],
+                    "provider-call-1"
+                );
+                assert_eq!(
+                    body["messages"][2]["content"][0]["content"],
+                    "file contents"
+                );
+            }
+            nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn responses_and_messages_errors_are_static_and_truncated_streams_fail() {
+    for protocol in [
+        nexus_config::ProtocolKind::OpenAiResponses,
+        nexus_config::ProtocolKind::AnthropicMessages,
+    ] {
+        let (base, _) = serve(
+            429,
+            r#"{"error":"private vendor response containing sensitive text"}"#,
+            Duration::ZERO,
+        );
+        let adapter =
+            OpenAiProvider::new_for_protocol(&base, present_credential(), "model", protocol)
+                .expect("protocol adapter builds");
+        let events = adapter.stream(&base_request(), &live_context());
+        assert_eq!(failed(events).0, ErrorCategory::RateLimited);
+
+        let (base, _) = match protocol {
+            nexus_config::ProtocolKind::OpenAiResponses => serve_raw(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            ),
+            nexus_config::ProtocolKind::AnthropicMessages => serve_raw(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            ),
+            nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+        };
+        let adapter =
+            OpenAiProvider::new_for_protocol(&base, present_credential(), "model", protocol)
+                .expect("protocol adapter builds");
+        let events = adapter.stream(&base_request(), &live_context());
+        assert_eq!(failed(events).0, ErrorCategory::Protocol);
+    }
 }
 
 #[test]

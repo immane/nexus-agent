@@ -60,13 +60,26 @@ fn get(port: u16, path: &str) -> (u16, Value) {
 }
 
 fn configured(endpoint: &str, credential: &str) -> nexus_config::UserConfig {
+    configured_protocol(
+        endpoint,
+        credential,
+        nexus_config::ProtocolKind::ChatCompletions,
+    )
+}
+
+fn configured_protocol(
+    endpoint: &str,
+    credential: &str,
+    protocol: nexus_config::ProtocolKind,
+) -> nexus_config::UserConfig {
     let mut config = nexus_config::UserConfig::default_config();
     config
         .add_provider(
-            nexus_config::ProviderProfile::new(
+            nexus_config::ProviderProfile::new_with_protocol(
                 "mock",
                 "Mock",
                 nexus_config::AdapterKind::Direct,
+                protocol,
                 Some(endpoint.to_owned()),
                 nexus_config::CredentialRef::env_var(credential).expect("valid"),
                 "mock-model",
@@ -156,7 +169,7 @@ fn events_until_terminal(port: u16, session: &str, run: &str) -> Vec<Value> {
 #[test]
 fn selection_is_validated_before_any_run_is_minted() {
     let (base, _) = serve_mock();
-    let port = spawn_server(configured(&base, "PATH"));
+    let port = spawn_server(configured(&base, "HOME"));
     let (status, _) = create_session(port, r#"{"provider":"ghost"}"#);
     assert_eq!(status, 400);
     let (status, _) = create_session(port, r#"{"provider":"mock","model":"ghost"}"#);
@@ -189,7 +202,7 @@ fn missing_credentials_fail_without_network_touch() {
 #[test]
 fn real_sessions_complete_with_mock_text_and_fake_sessions_coexist() {
     let (base, mock) = serve_mock();
-    let port = spawn_server(configured(&base, "PATH"));
+    let port = spawn_server(configured(&base, "HOME"));
 
     let (status, body) = create_session(port, r#"{"provider":"mock","model":"m"}"#);
     assert_eq!(status, 201, "selection accepted: {body}");
@@ -230,4 +243,61 @@ fn real_sessions_complete_with_mock_text_and_fake_sessions_coexist() {
     // A default session in the same process still serves the demo script.
     let (status, _) = create_session(port, "{}");
     assert_eq!(status, 201);
+}
+
+#[test]
+fn bound_sessions_route_all_configured_protocols_to_their_native_endpoint() {
+    for (protocol, path, auth) in [
+        (
+            nexus_config::ProtocolKind::ChatCompletions,
+            "/v1/chat/completions",
+            "authorization: bearer ",
+        ),
+        (
+            nexus_config::ProtocolKind::OpenAiResponses,
+            "/v1/responses",
+            "authorization: bearer ",
+        ),
+        (
+            nexus_config::ProtocolKind::AnthropicMessages,
+            "/v1/messages",
+            "x-api-key: ",
+        ),
+    ] {
+        let (base, mock) = serve_mock();
+        let port = spawn_server(configured_protocol(&base, "HOME", protocol));
+        let (status, created) = create_session(port, r#"{"provider":"mock","model":"m"}"#);
+        assert_eq!(status, 201, "selection accepted: {created}");
+        let session = created["session"].as_str().expect("session token");
+        let (status, submitted) = post(
+            port,
+            &format!("/sessions/{session}/runs"),
+            r#"{"input":"hello mock"}"#,
+        );
+        assert_eq!(status, 201, "submit accepted: {submitted}");
+        let run = submitted["run"].as_str().expect("run id");
+        let events = events_until_terminal(port, session, run);
+        assert_eq!(
+            events.last().expect("terminal event")["detail"]["outcome"],
+            "completed",
+            "protocol {protocol:?} failed: {:?}",
+            events.last()
+        );
+        let texts: Vec<&str> = events
+            .iter()
+            .filter(|event| event["kind"] == "assistant-text")
+            .filter_map(|event| event["detail"]["text"].as_str())
+            .collect();
+        assert_eq!(texts, ["mock says hi"]);
+        let request = String::from_utf8_lossy(&mock.request.lock().expect("request readable"))
+            .to_ascii_lowercase();
+        assert!(request.starts_with(&format!("post {path} http/1.1")));
+        assert!(
+            request.contains(auth),
+            "protocol {protocol:?} request: {request}"
+        );
+        if protocol == nexus_config::ProtocolKind::AnthropicMessages {
+            assert!(request.contains("anthropic-version: 2023-06-01"));
+        }
+    }
 }

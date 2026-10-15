@@ -92,6 +92,15 @@ fn adapter_vocabulary_is_closed() {
 }
 
 #[test]
+fn protocol_vocabulary_is_closed_and_serialized() {
+    assert_eq!(
+        nexus_config::ProtocolKind::parse("openai_responses"),
+        Ok(nexus_config::ProtocolKind::OpenAiResponses)
+    );
+    assert!(nexus_config::ProtocolKind::parse("unknown").is_err());
+}
+
+#[test]
 fn endpoints_require_http_shape_without_embedded_credentials() {
     let valid = [
         "https://api.example.com",
@@ -245,7 +254,7 @@ fn documents_round_trip_and_reject_bad_shapes() {
         "",
         "{",
         "[1,2]",
-        r#"{"revision":2,"providers":[],"models":[]}"#,
+        r#"{"revision":3,"providers":[],"models":[]}"#,
         r#"{"revision":"1","providers":[],"models":[]}"#,
         r#"{"revision":1,"providers":[],"models":[],"extra":[]}"#,
         r#"{"revision":1,"providers":[]}"#,
@@ -272,6 +281,25 @@ fn documents_round_trip_and_reject_bad_shapes() {
     assert!(
         UserConfig::from_json(&oversized).is_err(),
         "oversize rejected"
+    );
+}
+
+#[test]
+fn revision_one_migrates_chat_profiles_and_revision_two_requires_protocol() {
+    let legacy = r#"{"revision":1,"providers":[{"id":"acme","display_name":"acme display","adapter":"direct","endpoint":"https://api.example.com","credential":{"env":"NEXUS_TEST_KEY"},"default_model":"default-model"}],"models":[]}"#;
+    let migrated = UserConfig::from_json(legacy).expect("revision one migrates");
+    assert_eq!(
+        migrated.providers()[0].protocol,
+        nexus_config::ProtocolKind::ChatCompletions
+    );
+    let saved = migrated.to_json();
+    assert!(saved.contains("\"revision\":2"));
+    assert!(saved.contains("\"protocol\":\"chat_completions\""));
+
+    let missing = r#"{"revision":2,"providers":[{"id":"acme","display_name":"acme display","adapter":"direct","endpoint":null,"credential":{"env":"NEXUS_TEST_KEY"},"default_model":"default-model"}],"models":[]}"#;
+    assert!(
+        UserConfig::from_json(missing).is_err(),
+        "v2 protocol is required"
     );
 }
 
@@ -354,7 +382,7 @@ fn summaries_carry_no_secret_values() {
     config.add_favourite("fast").expect("favourite admits");
     let text = summary(&config).to_string();
     let value: serde_json::Value = serde_json::from_str(&text).expect("summary encodes");
-    assert_eq!(value["revision"], 1);
+    assert_eq!(value["revision"], nexus_config::model::CONFIG_REVISION);
     assert_eq!(value["providers"][0]["credential"]["env"], "NEXUS_TEST_KEY");
     assert_eq!(value["favourites"][0], "fast");
     for key in ["s3cret", "password", "api_key", "BEGIN"] {

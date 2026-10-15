@@ -72,7 +72,21 @@ pub fn serve_mock() -> (String, Mock) {
                 .expect("request log writable")
                 .extend_from_slice(&rest);
             captured.hits.fetch_add(1, Ordering::SeqCst);
-            let body = r#"{"choices":[{"message":{"role":"assistant","content":"mock says hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#;
+            let path = String::from_utf8_lossy(&head)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let body = if path.ends_with("/responses") {
+                r#"{"id":"resp_mock","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"mock says hi"}]}],"usage":{"input_tokens":2,"output_tokens":2}}"#
+            } else if path.ends_with("/messages") {
+                r#"{"type":"message","content":[{"type":"text","text":"mock says hi"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":2}}"#
+            } else {
+                r#"{"choices":[{"message":{"role":"assistant","content":"mock says hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#
+            };
             let response = format!(
                 "HTTP/1.1 200 Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()

@@ -284,6 +284,7 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "id": profile.id,
                 "display_name": profile.display_name,
                 "adapter": profile.adapter.name(),
+                "protocol": profile.protocol.name(),
                 "endpoint": profile.endpoint,
                 "credential": { "env": profile.credential.var_name() },
                 "default_model": profile.default_model,
