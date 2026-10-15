@@ -78,7 +78,7 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.4 — Own exec cleanup on every exit path
 
-**Implementation status: In progress.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If a descendant keeps a pipe open beyond cleanup, the exec worker retains ownership rather than returning; runtime timeout/cancellation quarantines that worker. The original process group is signalled, but escaped descendants that close inherited pipes cannot be proven terminated by this mechanism. Linux-specific sandbox execution and injected wait/read/probe failures remain unverified.
+**Implementation status: In progress.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If a descendant keeps a pipe open beyond cleanup, the exec worker retains ownership rather than returning; runtime timeout/cancellation quarantines that worker. The original process group is signalled, but escaped descendants that close inherited pipes cannot be proven terminated by this mechanism (**cross-platform cleanup limitation; unresolved**). **Linux validation: BLOCKED** — Linux-specific sandbox execution and injected wait/read/probe failures are unverified without a Linux environment.
 
 **Findings:** P1.4. **Paths:** `crates/nexus-tools/src/exec.rs`, tool exec tests. **Dependencies:** none; validate together with M1.3 when both are integrated.
 
@@ -172,7 +172,12 @@ passed.
 
 ### M1 gate
 
-All tasks above are resolved or have explicit evidence that the finding no longer applies. M1.7 may await an approved trust decision, but real-tool server product acceptance remains blocked while it is unresolved. Run affected-package and cross-frontend lifecycle tests; record finite bounds, confirmed cleanup capabilities, and platform limitations. No broad module moves belong in this phase.
+**Implementation status: In progress — Linux validation blocked.** M1.7's
+trust decision is resolved, but M1.4 still has the documented escaped-descendant
+cleanup limitation and Linux exec/sandbox validation remains blocked. macOS
+results do not establish Linux behavior. The temporary macOS-only development
+scope recorded at M4 allows work to proceed without changing this gate's status
+or claiming Linux hardening.
 
 ## M2 — Tighten permissions and concrete platform boundaries
 
@@ -230,7 +235,7 @@ test harness instead. No Linux filesystem or sandbox claim is made here.
 
 ### M2.3 — Bind file access and define update consistency
 
-**Implementation status: In progress.** D3's main baseline and compatibility
+**Implementation status: macOS verified; Linux blocked.** D3's main baseline and compatibility
 defaults have been approved: descriptor-bound access, staged same-directory
 replacement, no-clobber new files, multi-hardlink mutation refusal,
 execution-time object binding, and best-effort external-writer detection. New
@@ -241,11 +246,10 @@ only; crash durability is not promised. The initial Unix descriptor walk and
 writer/patch integration are implemented. Regressions cover parent-symlink
 swaps, concurrent source changes during staging, no-clobber creation,
 multi-hardlink refusal, in-root/out-of-root symlink behavior, and mode
-preservation. The serialized macOS tools behavior suite passes. Linux runtime
-behavior and platform-metadata preservation cannot currently be verified
-because no Linux test environment is available; defer those checks until a
-Linux environment (for example, a future Docker setup) is available. No
-cross-platform guarantee is inferred from macOS results.
+preservation. The serialized macOS tools behavior suite passes. **Linux runtime
+behavior and platform-metadata preservation remain BLOCKED** because no Linux
+test environment is available. No cross-platform guarantee is inferred from
+macOS results.
 
 **Findings:** P1.5. **Paths:** permissions, `crates/nexus-tools/src/fs.rs`, `development.rs`, filesystem tests; platform/security docs. **Dependencies:** M2.2 and accepted D3.
 
@@ -265,10 +269,9 @@ tools behavior suite passed all 44 tests, including all six exec sandbox tests:
 --test-threads=1`. An earlier parallel test run hit backend-availability
 assertions; use the serialized invocation for this evidence. Linux sandbox
 execution with the required backend remains unverified under M1.4; no Linux
-isolation evidence is claimed. Linux validation is deferred until a suitable
-Linux environment (for example, a future Docker setup) is available. M2.4
-remains blocked until that prerequisite is available and must be repeated after
-M2.3 as planned.
+isolation evidence is claimed. **Linux validation remains BLOCKED** until a
+suitable Linux environment is available. The Linux lane must be run after M2.3
+before claiming Linux sandbox isolation.
 
 **Findings:** P1 validation gap. **Paths:** `crates/nexus-tools/tests/exec_sandbox.rs`, `tests/behavior.rs`, CI workflow if authorized, platform documentation. **Dependencies:** M1.4; repeat relevant tests after M2.3.
 
@@ -280,7 +283,12 @@ M2.3 as planned.
 
 ### M2 gate
 
-Strict/development/read-only and exact approval invariants hold after policy changes. File-access and update guarantees have an approved compatibility description and regression coverage. Record both-platform sandbox results or explicitly block the corresponding capability. No general permission framework has been introduced.
+**Implementation status: In progress — Linux validation blocked.**
+Strict/development/read-only and exact approval invariants hold on the tested
+macOS path. Linux file-race/metadata behavior (M2.3) and sandbox isolation
+(M2.4) remain explicitly blocked; no Linux or cross-platform hardening claim is
+made. The M4 temporary macOS-only development scope permits continued work but
+does not close this gate. No general permission framework has been introduced.
 
 ## M3 — Reduce configuration and composition duplication
 
@@ -373,6 +381,27 @@ TUI config has one mutable owner and accepted runs have one actual selection. Sh
 
 ### M4.1 — Unify ordered event consumption where it is actually shared
 
+**Implementation status: Verified.** `nexus-runtime::transport::OrderedEventConsumer`
+now owns the common bounded merge, run/sequence rejection, gap accounting, and
+terminal cutoff. Saturation returns the unaccepted event without skipping a
+sequence. The TUI explicitly retains its counted, best-effort presentation gap
+policy and drains both queued channels before a terminal gap flush. Headless applies ordered events
+before its existing bounded retention and flushes only after terminal plus the
+already-queued data drain; a closed control channel without a terminal remains
+an error, not a fabricated result; reorder saturation refuses an incomplete
+report. Server SSE retains its own unacknowledged ordered events and terminal
+in the session, separately from the foreign-run pending store. It writes and
+acknowledges one event at a time, resuming after the last successful write and
+flush; a new subscription starts at sequence zero. A failed/partial write is
+retried on the replacement socket, not treated as client acknowledgment.
+Read-ahead stops at 256 events or the 1 MiB encoded-byte budget and waits on
+the other FIFO channel for the missing predecessor. Finite event reserves
+cover an in-progress predecessor, retry, and terminal. At most two stream
+states (a suspended run and a backlog-draining run) are retained per session;
+admitting a third returns 409 rather than evicting unacknowledged events.
+Channel closure without a terminal remains an incomplete
+stream. Formatting, retention, and reconnection stay frontend-owned.
+
 **Findings:** P2.7. **Paths:** runtime `transport.rs`, TUI merger, headless consumer, server SSE and related tests. **Dependencies:** M1.2–M1.3, M1.6; frontend contracts stable after M3.
 
 - Define one bounded ordering helper for run/sequence rejection, cross-channel merge, gaps, terminal handling, and closure. Prefer the existing transport module; introduce no event framework or mandatory background service.
@@ -381,7 +410,37 @@ TUI config has one mutable owner and accepted runs have one actual selection. Sh
 
 **Acceptance/tests:** reordered channels, duplicates, stale/post-terminal events, missing sequences, saturation, closure, and reconnect policies. Server output sequence is monotonic; TUI output is not duplicated; headless encoding/exit codes remain compatible. Cross-frontend tests exercise the same lifecycle fixtures.
 
+**Validation evidence:** `cargo nextest run -p nexus-runtime -p nexus-tui
+-p nexus-headless -p nexus-server --locked --offline` (1031 passed, 11 skipped).
+Shared transport regressions cover reordering, duplicate/stale and
+post-terminal rejection, ownership-preserving saturation, predecessor reserve,
+gap flush, and reconnect start. SSE regressions cover partial write/flush
+failure, queued successors and terminal retry, event/byte backpressure, and
+bounded stream admission without eviction. TUI presentation gaps and explicit
+headless saturation refusal are tested separately. Formatting and all-target
+Clippy with `-D warnings` passed for these four packages. No wire revision or
+event names changed; no live provider endpoint was used.
+
 ### M4.2 — Simplify development file-tool reuse
+
+**Implementation status: Verified.** Development registrations now hold one
+typed concrete filesystem operation each, built once against a descriptor-bound
+root. The runtime-authorized target is resolved and exact-scope checked before
+dispatch; the concrete operation receives that path and operation-specific
+arguments directly. There is no per-call adapter construction, tool-name
+redispatch, normalized-JSON rewrite, or reconstructed `ToolCall`. Descriptions
+are explicit per-tool development contracts; schemas and tool identities are
+copied unchanged. List/search keep protected-path filtering, while all
+operations deny protected targets. The root descriptor is `/` so an approved
+external/temp target can use the same operation; access remains behind the
+private development adapter's exact scope check and descriptor-relative
+no-follow walk.
+
+**Validation evidence:** `cargo nextest run -p nexus-tools --locked --offline`
+(56 passed), including strict/development operation parity, plus all-target
+Clippy with `-D warnings`, formatting, and diff checks. Development tests cover
+external-scope read/search/write/patch, exact scope refusal, protected
+read/write, cancellation, and expired deadlines.
 
 **Findings:** P2.8. **Paths:** tools `development.rs`, `fs.rs`, tool tests. **Dependencies:** M2.2–M2.3, M3.2.
 
@@ -392,6 +451,21 @@ TUI config has one mutable owner and accepted runs have one actual selection. Sh
 **Acceptance/tests:** strict and development paths perform equivalent allowed file operations, reject wrong scope/protected paths, preserve write/patch semantics, and observe cancellation/deadlines. No second session grant cache appears in tools.
 
 ### M4.3 — Remove unused contracts and split only cohesive modules
+
+**Implementation status: Verified (public APIs preserved).** The live provider boundary
+is `ProviderEvent` followed by runtime validation/admission/dispatch;
+`InvocationOutcome` has no in-workspace production consumer, but remains public
+and has API-specific core tests. By explicit user decision for this migration,
+it and other supported public contracts are retained; no breaking API removal
+is included. `CredentialRef` is used by config resolution and provider adapters.
+`ToolContext::new`'s bool/elapsed snapshot constructor is retained for public
+compatibility and fixture/fake callers; production runtime dispatch adds live
+cancellation/deadline control with `with_control`. No unchecked/panic constructor was found in
+the reviewed core contract set. TUI `map_key` is public and used by the actual
+frontend, not merely tests. No module split was justified by this slice: it
+would not reduce duplicated state or clarify ownership. Stale provider-event
+documentation was corrected to name its actual `TurnFinished`/`Failed`
+terminal variants. API retirement is explicitly out of scope for this migration.
 
 **Findings:** P2.10, P3. **Paths:** core and its callers/tests; runtime/TUI private modules only where justified; affected docs. **Dependencies:** preceding behavioral contracts stable; accepted D4 for public API removals.
 
@@ -405,7 +479,23 @@ TUI config has one mutable owner and accepted runs have one actual selection. Sh
 
 ### M4 gate
 
-Complete M1–M4 regression validation and diff review. Every finding has a resolution, a reproducible no-longer-applicable determination, or an explicit unresolved limitation. Unresolved P1 boundaries prevent claiming the affected capability hardened. Consolidation may be declared complete without implementing M5, but not by hiding an active correctness or security blocker.
+**Implementation status: In progress — temporarily unblocked for macOS-only
+development.** M4.1–M4.3 are implemented and the default-feature workspace
+regression suite passes on macOS. By the user's explicit direction, Linux-only
+validation blockers are marked and do not prevent continued macOS development
+for now. This is a temporary scope waiver, **not** Linux verification and **not**
+a cross-platform hardening claim. M1.4 still has an unresolved escaped-descendant
+cleanup limitation; M2.3/M2.4 still lack Linux file race/metadata and
+sandbox-isolation evidence. Those capabilities remain blocked/unverified on
+Linux. The unused public `InvocationOutcome` contract is retained by the
+explicit compatibility decision above, not silently retired. The migration
+gate must return to blocked before any claim of full cross-platform closure or
+Linux security readiness.
+
+**Current validation evidence:** `cargo nextest run --workspace --locked
+--offline` (2,151 passed, 15 skipped) on macOS; affected-package all-target
+Clippy, formatting, and diff checks passed. This workspace run does not provide
+Linux evidence. The full optional/all-features ignored suite was not run.
 
 ## M5 — Extension contracts only on concrete demand
 
@@ -424,7 +514,7 @@ These tasks are **deferred**, not prerequisites for current migration completion
 | D1 — Selection/error compatibility | Server sessions remain bound; conflicting submit fields are rejected; omitted selection uses the binding. TUI accepted runs keep their actual model despite later UI changes. | M1.1/M1.5 behavior changes; specify default-model equivalence and attribution rules |
 | D2 — Real-tool server trust | **Resolved for M1.7:** loopback-only; real tools or configured providers require `--auth-token-env`; fake demo may be unauthenticated; same-origin HTTP only; one server-wide bearer credential grants submit/approval/control; no OAuth/accounts or public listener. | M1.7 implemented and verified; see task evidence above |
 | D3 — File operation guarantees | A concrete supported platform access boundary plus separately specified update consistency; no universal capability framework. | M2.3; choose symlink/hardlink/permissions/identity semantics and residual concurrency limits |
-| D4 — API retirement | Remove/narrow a public legacy contract only after caller inventory and compatibility review; migrate meaningful tests. | M4.3 public API removal |
+| D4 — API retirement | **Resolved for M4.3:** preserve public contracts during this migration; no breaking API removals. Revisit removal only with a separate compatibility review and approval. | Any future M4.3 public API removal |
 | D5 — Effective budgets | Finite explicit event/byte/cleanup/server bounds; distinguish configurable limits from hard ceilings and keep terminal reserve. | M1.3/M1.4/M1.6; record chosen values and evidence, no silent widening |
 
 These are implementation review checkpoints, not permission to silently change accepted product defaults. Routine internal details can be resolved locally; material compatibility/security choices need confirmation or an accepted decision before coding them.

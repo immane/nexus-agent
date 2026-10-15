@@ -33,7 +33,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,6 +51,7 @@ use nexus_core::{
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
+use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsumer};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
@@ -78,7 +79,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_KEYS_PER_TICK: usize = 32;
 /// Finite cross-channel reorder buffer. Beyond this, missing sequences are
 /// skipped as explicitly counted presentation gaps, never reordered.
-const MAX_REORDER_EVENTS: usize = 256;
+const MAX_REORDER_EVENTS: usize = ORDERED_EVENT_BUFFER_CAPACITY;
 const DEMO_SESSION: &str = "sess-tui-m0-test";
 /// The M0 fixture default is intentionally small, but interactive coding
 /// runs need room for inspect/edit/check/retry cycles.
@@ -891,136 +892,78 @@ async fn run() -> io::Result<()> {
 /// The runtime assigns one contiguous per-run sequence across both bounded
 /// channels, but frontends must not assume cross-channel arrival order. This
 /// helper holds at most [`MAX_REORDER_EVENTS`] out-of-order events and yields
-/// them strictly by contiguous sequence. Missing sequences (the data channel
-/// may legitimately drop presentation traffic) are skipped as explicitly
-/// counted gaps, never reordered. Events for older runs, duplicates, and
-/// anything arriving after the terminal outcome are rejected; a finalized
-/// run never reopens.
+/// them by contiguous sequence until explicitly flushed or saturated. Unlike
+/// authoritative consumers, this TUI-only best-effort presentation policy
+/// skips missing sequences on saturation, counting gaps for `report_merger`.
+/// Late predecessors are then rejected rather than reordered. Events for older
+/// runs, duplicates, and anything arriving after the terminal outcome are
+/// rejected; a finalized run never reopens.
 #[derive(Debug)]
-struct EventMerger {
-    active: Option<RunId>,
-    expected: u64,
-    buffered: BTreeMap<u64, RunEvent>,
-    terminal_pending: bool,
-    finalized: bool,
-    gaps: u64,
-    rejected: u64,
-}
+struct EventMerger(OrderedEventConsumer);
 
 impl EventMerger {
     fn new() -> Self {
-        Self {
-            active: None,
-            expected: 0,
-            buffered: BTreeMap::new(),
-            terminal_pending: false,
-            finalized: false,
-            gaps: 0,
-            rejected: 0,
-        }
+        Self(OrderedEventConsumer::new(MAX_REORDER_EVENTS))
     }
 
     /// Adopts the runtime-accepted run. Called with the `Submit` reply before
     /// any event for that run is merged; events observed before adoption are
     /// rejected rather than guessed into a run.
     fn adopt(&mut self, run: &RunId) {
-        self.active = Some(run.clone());
-        self.expected = 0;
-        self.buffered.clear();
-        self.terminal_pending = false;
-        self.finalized = false;
+        self.0.adopt(run);
     }
 
     fn active_run(&self) -> Option<&RunId> {
-        self.active.as_ref()
+        self.0.active_run()
     }
 
     fn is_finalized(&self) -> bool {
-        self.finalized
+        self.0.is_finalized()
     }
 
     /// True when the terminal event was received but is still waiting behind
     /// a reorder gap.
     fn has_terminal(&self) -> bool {
-        self.terminal_pending
+        self.0.has_terminal()
     }
 
     fn has_pending(&self) -> bool {
-        !self.buffered.is_empty()
+        self.0.has_pending()
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.0.pending_len()
     }
 
     fn gaps(&self) -> u64 {
-        self.gaps
+        self.0.gaps()
     }
 
     fn rejected(&self) -> u64 {
-        self.rejected
+        self.0.rejected()
     }
 
-    /// Pushes one event and returns every newly contiguous event in order.
+    /// Pushes one event, flushing counted gaps on presentation-buffer saturation.
     fn push(&mut self, event: RunEvent) -> Vec<RunEvent> {
-        let mut ready = Vec::new();
-        if self.finalized || self.active.as_ref() != Some(event.run()) {
-            self.rejected += 1;
-            return ready;
-        }
-        if event.seq() < self.expected {
-            self.rejected += 1;
-            return ready;
-        }
-        if event.is_terminal() {
-            self.terminal_pending = true;
-        }
-        if event.seq() == self.expected {
-            self.note_emitted(&event);
-            ready.push(event);
-            self.expected = self.expected.saturating_add(1);
-            ready.extend(self.take_ready());
-        } else {
-            if self.buffered.insert(event.seq(), event).is_some() {
-                // A duplicate inside the reorder window replaces its earlier
-                // copy but is still counted as rejected.
-                self.rejected += 1;
-            }
-            if self.buffered.len() > MAX_REORDER_EVENTS {
-                ready.extend(self.flush());
+        match self.0.push(event) {
+            Ok(ready) => ready,
+            Err(event) => {
+                let mut ready = self.0.flush();
+                ready.extend(
+                    self.0
+                        .push(*event)
+                        .expect("flushed reorder buffer has room"),
+                );
+                ready
             }
         }
-        ready
-    }
-
-    fn take_ready(&mut self) -> Vec<RunEvent> {
-        let mut ready = Vec::new();
-        while let Some(event) = self.buffered.remove(&self.expected) {
-            self.note_emitted(&event);
-            ready.push(event);
-            self.expected = self.expected.saturating_add(1);
-        }
-        ready
     }
 
     /// Emits every buffered event in sequence order, counting sequences that
     /// never arrived as explicit gaps. The terminal event is always last.
     fn flush(&mut self) -> Vec<RunEvent> {
-        let mut ready = Vec::new();
-        while let Some((&seq, _)) = self.buffered.iter().next() {
-            if seq > self.expected {
-                self.gaps += seq - self.expected;
-                self.expected = seq;
-            }
-            let event = self.buffered.remove(&seq).expect("peeked key exists");
-            self.note_emitted(&event);
-            ready.push(event);
-            self.expected = self.expected.saturating_add(1);
-        }
-        ready
-    }
-
-    fn note_emitted(&mut self, event: &RunEvent) {
-        if event.is_terminal() {
-            self.terminal_pending = false;
-            self.finalized = true;
-        }
+        self.0.flush()
     }
 }
 
@@ -3277,19 +3220,20 @@ mod tests {
     }
 
     #[test]
-    fn reorder_buffer_is_finite_and_stays_ordered() {
+    fn reorder_buffer_holds_a_full_runtime_backlog_without_skipping_gaps() {
         let run = run_id("run-3");
         let mut merger = EventMerger::new();
         merger.adopt(&run);
         let mut emitted = Vec::new();
-        for seq in 1..=(MAX_REORDER_EVENTS as u64 + 32) {
+        for seq in 1..=MAX_REORDER_EVENTS as u64 {
             emitted.extend(merger.push(text(&run, seq, "x")));
         }
-        assert!(
-            merger.gaps() >= 1,
-            "missing sequence 0 was skipped explicitly"
-        );
+        assert_eq!(merger.pending_len(), MAX_REORDER_EVENTS);
+        emitted.extend(merger.push(text(&run, 0, "first")));
+        assert_eq!(merger.gaps(), 0, "a delayed predecessor is not a gap");
         let seqs: Vec<u64> = emitted.iter().map(|event| event.seq()).collect();
+        assert_eq!(seqs.len(), MAX_REORDER_EVENTS + 1);
+        assert_eq!(seqs.first(), Some(&0));
         assert!(
             seqs.windows(2).all(|pair| pair[0] < pair[1]),
             "emission order is strictly increasing"
@@ -3820,7 +3764,24 @@ mod cov_main_private {
     }
 
     #[test]
-    fn reorder_window_stays_inside_its_finite_bound() {
+    fn saturated_presentation_window_counts_gaps_and_rejects_late_predecessors() {
+        let run = run_id("run-saturated");
+        let mut merger = EventMerger(OrderedEventConsumer::new(2));
+        merger.adopt(&run);
+        assert!(merger.push(text(&run, 1, "one")).is_empty());
+        assert!(merger.push(text(&run, 2, "two")).is_empty());
+
+        assert_eq!(seqs(&merger.push(finished(&run, 3))), vec![1, 2, 3]);
+        assert_eq!(merger.gaps(), 1);
+        assert!(merger.is_finalized());
+        assert!(!merger.has_pending());
+        assert!(merger.push(text(&run, 0, "late predecessor")).is_empty());
+        assert_eq!(merger.rejected(), 1);
+        assert_eq!(merger.gaps(), 1);
+    }
+
+    #[test]
+    fn reorder_window_holds_the_runtime_backlog_until_the_gap_arrives() {
         let run = run_id("run-window");
         let mut merger = EventMerger::new();
         merger.adopt(&run);
@@ -3828,31 +3789,27 @@ mod cov_main_private {
         for seq in 1..=MAX_REORDER_EVENTS as u64 {
             assert!(merger.push(text(&run, seq, "x")).is_empty());
             assert!(
-                merger.buffered.len() <= MAX_REORDER_EVENTS,
+                merger.pending_len() <= MAX_REORDER_EVENTS,
                 "the reorder window is finite"
             );
         }
         assert_eq!(
-            merger.buffered.len(),
+            merger.pending_len(),
             MAX_REORDER_EVENTS,
             "a full window still holds every buffered event"
         );
 
-        // One arrival past the bound flushes the window instead of growing it.
-        let overflow = merger.push(text(&run, MAX_REORDER_EVENTS as u64 + 1, "y"));
-        assert!(
-            merger.buffered.is_empty(),
-            "the window is force-flushed at the bound"
-        );
-        assert_eq!(merger.gaps(), 1, "sequence 0 was skipped explicitly");
-        let emitted = seqs(&overflow);
+        // A full reorder buffer is not evidence that the gap is lost: a
+        // predecessor may still be queued on the other bounded channel.
+        let emitted = seqs(&merger.push(text(&run, 0, "first")));
         assert_eq!(emitted.len(), MAX_REORDER_EVENTS + 1);
-        assert_eq!(emitted.first(), Some(&1));
-        assert_eq!(emitted.last(), Some(&(MAX_REORDER_EVENTS as u64 + 1)));
+        assert_eq!(emitted.first(), Some(&0));
+        assert_eq!(emitted.last(), Some(&(MAX_REORDER_EVENTS as u64)));
         assert!(
             emitted.windows(2).all(|pair| pair[0] < pair[1]),
-            "emission stays strictly ordered across a flush"
+            "emission stays strictly ordered when the gap is filled"
         );
+        assert_eq!(merger.gaps(), 0);
         assert!(!merger.has_pending());
     }
 

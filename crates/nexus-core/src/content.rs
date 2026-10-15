@@ -5,9 +5,9 @@
 //! keys and call references are preserved for adapter round-trips but are
 //! never host identities: a [`CallCandidate`] carries no [`CallId`], and only
 //! an admitted [`ToolCall`] may reach an executor. Partial streaming output
-//! is marked [`TurnCompleteness::Partial`] and can only become executable
-//! through [`AssistantTurn::into_completed`], so it is never mistaken for a
-//! completed turn.
+//! is marked [`TurnCompleteness::Partial`]. [`AssistantTurn::into_completed`]
+//! is a compatibility conversion for this standalone model; production tool
+//! admission uses the provider-event validation path instead.
 
 use crate::approval::NormalizedArgs;
 use crate::error::{AgentError, ErrorCategory, RetryGuidance};
@@ -371,8 +371,9 @@ impl AssistantTurn {
         &self.blocks
     }
 
-    /// Consumes a complete turn into an executable record. Partial output
-    /// is rejected explicitly and can never convert silently.
+    /// Converts this standalone compatibility model into its complete form.
+    /// Partial output is rejected; production dispatch uses provider-event
+    /// validation instead of this conversion.
     pub fn into_completed(self) -> Result<CompletedTurn, AgentError> {
         if !self.is_complete() {
             return Err(content_error("partial output is not a completed turn"));
@@ -381,8 +382,8 @@ impl AssistantTurn {
     }
 }
 
-/// A turn proven complete. Dispatch and admission take this type, never a
-/// bare [`AssistantTurn`].
+/// Compatibility summary of a complete [`AssistantTurn`]. The production
+/// runtime does not use this type for dispatch or admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedTurn(AssistantTurn);
 

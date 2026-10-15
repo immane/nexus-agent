@@ -75,6 +75,7 @@ use nexus_core::{
     RunFinished, RunId, RunOutcome, SessionId, SubmitCommand, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool, candidate, stop_turn, tool_turn};
+use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsumer};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 
 /// Unstable test-only output revision. Parsers must exact-match this.
@@ -427,6 +428,8 @@ fn block_on_with_shutdown<F: Future>(
 /// Counts every observed event and retains a bounded, exactly-sized subset
 /// of formatted lines for the report.
 struct RunConsumer {
+    ordering: OrderedEventConsumer,
+    transport_over_limit: bool,
     retention: Retention,
     tool_started: usize,
     approval_required: usize,
@@ -437,6 +440,8 @@ struct RunConsumer {
 impl RunConsumer {
     fn new() -> Self {
         Self {
+            ordering: OrderedEventConsumer::new(ORDERED_EVENT_BUFFER_CAPACITY),
+            transport_over_limit: false,
             retention: Retention::new(),
             tool_started: 0,
             approval_required: 0,
@@ -446,6 +451,45 @@ impl RunConsumer {
     }
 
     fn observe(&mut self, event: RunEvent) {
+        if self.ordering.active_run().is_none() {
+            self.ordering.adopt_from(event.run(), event.seq());
+        }
+        let ready = match self.ordering.push(event) {
+            Ok(ready) => ready,
+            Err(_) => {
+                // Unlike TUI presentation, a headless report cannot skip a
+                // valid record and still claim success, even if a later
+                // predecessor or terminal allows the stream to resume.
+                self.transport_over_limit = true;
+                return;
+            }
+        };
+        for event in ready {
+            self.observe_ordered(event);
+        }
+    }
+
+    fn ensure_report_complete(&self) -> Result<(), HeadlessError> {
+        if self.transport_over_limit {
+            return Err(HeadlessError::Operation(
+                "event ordering buffer saturated; refusing an incomplete report".to_owned(),
+            ));
+        }
+        if self.retention.over_limit {
+            return Err(HeadlessError::Operation(
+                "mandatory control records exceed the finite report retention budget".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush_ordered(&mut self) {
+        for event in self.ordering.flush() {
+            self.observe_ordered(event);
+        }
+    }
+
+    fn observe_ordered(&mut self, event: RunEvent) {
         match event.payload() {
             EventPayload::ToolStarted(_) => self.tool_started += 1,
             EventPayload::ApprovalRequired(_) => self.approval_required += 1,
@@ -634,6 +678,7 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
         .expect("accepted submit issues a run");
 
     let mut consumer = RunConsumer::new();
+    consumer.ordering.adopt(&run);
     let watchdog = watchdog_budget(limits.run_duration.saturating_sub(started.elapsed()));
     let terminal = match tokio::time::timeout(
         watchdog,
@@ -665,11 +710,8 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
     while let Ok(event) = streams.data.try_recv() {
         consumer.observe(event);
     }
-    if consumer.retention.over_limit {
-        return Err(HeadlessError::Operation(
-            "mandatory control records exceed the finite report retention budget".to_owned(),
-        ));
-    }
+    consumer.flush_ordered();
+    consumer.ensure_report_complete()?;
 
     let RunConsumer {
         retention,
@@ -677,6 +719,8 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
         approval_required,
         tool_finished,
         denied_calls,
+        ordering: _,
+        transport_over_limit: _,
     } = consumer;
     let mut retained: Vec<RetainedLine> = retention
         .mandatory
@@ -1811,6 +1855,30 @@ mod cov_topup_private {
     }
 
     #[test]
+    fn ordering_saturation_refuses_success_even_after_a_completed_terminal() {
+        let mut consumer = RunConsumer::new();
+        consumer.ordering = nexus_runtime::transport::OrderedEventConsumer::new(2);
+        consumer.ordering.adopt(&run());
+        consumer.observe(tool_started_event(1));
+        consumer.observe(tool_finished_event(2, 0));
+        consumer.observe(approval_event(3));
+        assert!(consumer.transport_over_limit);
+        assert_eq!(consumer.ordering.pending_len(), 2);
+        assert_eq!(consumer.ordering.gaps(), 0);
+
+        consumer.observe(text_event(0, "late predecessor"));
+        consumer.observe(terminal_event(4));
+        consumer.flush_ordered();
+        assert!(consumer.ordering.is_finalized());
+        assert!(!consumer.retention.over_limit);
+        assert!(matches!(
+            consumer.ensure_report_complete(),
+            Err(super::HeadlessError::Operation(message))
+                if message.contains("ordering buffer saturated")
+        ));
+    }
+
+    #[test]
     fn an_approval_record_is_counted_and_retained_as_mandatory() {
         // The composition root installs no approval handler, so no public run
         // ever emits this record; the counter arm and the mandatory
@@ -1843,6 +1911,30 @@ mod cov_topup_private {
                 .iter()
                 .any(|record| record.line.contains("kind=approval-required"))
         );
+    }
+
+    #[test]
+    fn run_consumer_orders_both_channels_and_flushes_a_terminal_gap() {
+        let mut consumer = RunConsumer::new();
+        consumer.ordering.adopt(&run());
+        consumer.observe(terminal_event(2));
+        consumer.observe(text_event(1, "before terminal"));
+        consumer.observe(text_event(0, "start"));
+        consumer.flush_ordered();
+
+        let mut records: Vec<_> = consumer
+            .retention
+            .mandatory
+            .iter()
+            .chain(consumer.retention.presentation.iter())
+            .collect();
+        records.sort_by_key(|record| record.seq);
+        assert_eq!(
+            records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(consumer.ordering.gaps(), 0);
+        assert!(consumer.ordering.is_finalized());
     }
 
     #[test]
@@ -1992,6 +2084,7 @@ mod cov_topup_private {
         let (control, _control_sender) = half(vec![tool_started_event(2)]);
         let mut streams = EventStreams { data, control };
         let mut consumer = RunConsumer::new();
+        consumer.ordering.adopt_from(&run(), 1);
         let reconciled = block_on_with_shutdown(
             reconcile(&mut streams, &mut consumer, Duration::from_millis(50)),
             HELPER_SHUTDOWN,
