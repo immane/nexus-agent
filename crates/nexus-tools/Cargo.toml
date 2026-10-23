@@ -8,11 +8,17 @@ autotests = false
 default = []
 container = []
 container-worker = ["container"]
+container-keeper = ["container"]
 
 [[bin]]
 name = "container-worker"
 path = "src/bin/container-worker.rs"
 required-features = ["container-worker"]
+
+[[bin]]
+name = "container-keeper"
+path = "src/bin/container-keeper.rs"
+required-features = ["container-keeper"]
 
 [[test]]
 name = "behavior"

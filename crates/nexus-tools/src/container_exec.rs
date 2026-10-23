@@ -169,7 +169,7 @@ impl<T: ExecTransport> ContainerExecTool<T> {
                 Err(OutcomeFailure::Invalid)
             }
             Err(_) => {
-                session.poisoned = true;
+                session.poison();
                 Err(OutcomeFailure::Uncertain)
             }
         }

@@ -362,6 +362,7 @@ pub enum ContainerError {
     InvalidImage,
     InvalidCidrs,
     UnsafeDockerContext,
+    OwnershipUnresolved,
     DockerFailure,
     Timeout,
     CleanupUncertain { owner: String, container: String },
@@ -377,6 +378,9 @@ impl std::fmt::Display for ContainerError {
             Self::InvalidImage => "gateway image must be an immutable image reference",
             Self::InvalidCidrs => "a non-empty bounded list of IPv4 CIDRs is required",
             Self::UnsafeDockerContext => "Docker must use a local default engine context",
+            Self::OwnershipUnresolved => {
+                "container ownership state is unresolved; explicit reconciliation is required"
+            }
             Self::DockerFailure => "Docker gateway lifecycle operation failed",
             Self::Timeout => "Docker gateway operation timed out",
             Self::CleanupUncertain { .. } => {
@@ -403,6 +407,8 @@ pub struct ContainerEnvironment {
     docker: PathBuf,
     docker_config: Option<PathBuf>,
     identity: GatewayIdentity,
+    ownership: Option<std::sync::Arc<crate::container_ownership::OwnedRecord>>,
+    container_id: Option<String>,
     healthy: bool,
     deadline: Instant,
     cleanup_done: bool,
@@ -456,12 +462,43 @@ impl ContainerEnvironment {
             docker: docker.clone(),
             docker_config,
             identity: new_identity()?,
+            ownership: None,
+            container_id: None,
             healthy: false,
             deadline: Instant::now() + PREPARE_TIMEOUT,
-            cleanup_done: false,
+            cleanup_done: true,
         };
         env.verify_local()?;
         let owner = env.identity.container.clone();
+        let nonce = owner
+            .strip_prefix("nexus-gw-")
+            .ok_or(ContainerError::DockerFailure)?;
+        let store =
+            crate::container_ownership::OwnershipStore::process_default().map_err(|error| {
+                match error {
+                    crate::container_ownership::OwnershipError::StorageUnavailable => {
+                        ContainerError::DockerFailure
+                    }
+                    crate::container_ownership::OwnershipError::UnresolvedOwnership => {
+                        ContainerError::OwnershipUnresolved
+                    }
+                }
+            })?;
+        env.ownership = Some(
+            store
+                .create_record(crate::container_ownership::OwnershipRecord {
+                    nonce: nonce.to_owned(),
+                    gateway_name: owner.clone(),
+                    gateway_id: None,
+                    workload_name: None,
+                    workload_id: None,
+                    resolver_file: None,
+                    docker: env.docker.clone(),
+                    docker_config: env.docker_config.clone(),
+                })
+                .map_err(|_| ContainerError::DockerFailure)?,
+        );
+        env.cleanup_done = false;
         let mut mutation_failed = false;
         let result = (|| {
             let cidrs = blocked_cidrs.join(",");
@@ -498,13 +535,30 @@ impl ContainerEnvironment {
                 mutation_failed = true;
             }
             start_result?;
-            env.wait_healthy()
+            env.wait_healthy()?;
+            match env.inspect_owned("container", &env.identity.container) {
+                Inspect::Owned(id) if valid_container_id(&id) => {
+                    env.container_id = Some(id.clone());
+                    env.ownership
+                        .as_ref()
+                        .ok_or(ContainerError::DockerFailure)?
+                        .update(|record| record.gateway_id = Some(id))
+                        .map_err(|_| ContainerError::DockerFailure)?;
+                }
+                _ => return Err(ContainerError::DockerFailure),
+            }
+            Ok(())
         })();
         if let Err(error) = result {
-            let cleanup = env.cleanup();
             if mutation_failed {
+                // A timed-out/failed Docker mutation may still be completing in
+                // the daemon. Keep the durable owner record for explicit
+                // reconciliation rather than treating a momentary absence as
+                // proof that no resource will appear later.
+                env.cleanup_done = true;
                 return Err(env.cleanup_uncertain());
             }
+            let cleanup = env.cleanup();
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(e) => Err(e),
@@ -521,8 +575,40 @@ impl ContainerEnvironment {
         self.healthy
     }
 
+    pub(crate) fn container_id(&self) -> Option<&str> {
+        self.container_id.as_deref()
+    }
+
+    pub(crate) fn docker_executable(&self) -> &Path {
+        &self.docker
+    }
+
+    pub(crate) fn trusted_docker_config(&self) -> Option<&Path> {
+        self.docker_config.as_deref()
+    }
+
+    pub(crate) fn ownership_record(
+        &self,
+    ) -> Option<std::sync::Arc<crate::container_ownership::OwnedRecord>> {
+        self.ownership.as_ref().map(std::sync::Arc::clone)
+    }
+
+    pub(crate) fn quarantine(&mut self) {
+        self.healthy = false;
+        self.cleanup_done = true;
+    }
+
     pub fn close(mut self) -> Result<(), ContainerError> {
         self.cleanup()
+    }
+
+    pub(crate) fn close_for_workload(mut self) -> Result<(), Box<Self>> {
+        if self.cleanup().is_ok() {
+            Ok(())
+        } else {
+            self.quarantine();
+            Err(Box::new(self))
+        }
     }
 
     fn base(&self) -> Command {
@@ -597,13 +683,35 @@ impl ContainerEnvironment {
         let (kind, name) = ("container", self.identity.container.as_str());
         match self.inspect_owned(kind, name) {
             Inspect::Owned(id) => {
-                let args = vec!["rm", "--force", id.as_str()];
-                if run_bounded(self.base(), &args, CLEANUP_TIMEOUT).is_err() {
+                let id_matches = self.ownership.as_ref().is_none_or(|ownership| {
+                    ownership
+                        .snapshot()
+                        .gateway_id
+                        .as_deref()
+                        .is_none_or(|expected| expected == id)
+                });
+                let recorded = self.ownership.as_ref().is_none_or(|ownership| {
+                    ownership
+                        .update(|record| record.gateway_id = Some(id.clone()))
+                        .is_ok()
+                });
+                if !id_matches || !recorded {
                     uncertain = true;
+                } else {
+                    let args = vec!["rm", "--force", id.as_str()];
+                    if run_bounded(self.base(), &args, CLEANUP_TIMEOUT).is_err() {
+                        uncertain = true;
+                    }
                 }
             }
-            Inspect::Absent | Inspect::Unowned => {}
-            Inspect::Error => uncertain = true,
+            Inspect::Absent => {}
+            Inspect::Unowned | Inspect::Error => uncertain = true,
+        }
+        if !uncertain
+            && let Some(ownership) = &self.ownership
+            && (ownership.snapshot().workload_name.is_some() || ownership.remove().is_err())
+        {
+            uncertain = true;
         }
         // A failed cleanup is reported to the caller; Drop must not repeat a
         // potentially non-idempotent/ambiguous cleanup attempt.
@@ -663,7 +771,7 @@ impl ContainerEnvironment {
         let Some((id, owner)) = text.trim().split_once(' ') else {
             return Inspect::Error;
         };
-        if id.is_empty() {
+        if !valid_container_id(id) {
             Inspect::Error
         } else if owner == self.identity.container {
             Inspect::Owned(id.to_string())
@@ -671,6 +779,10 @@ impl ContainerEnvironment {
             Inspect::Unowned
         }
     }
+}
+
+fn valid_container_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 enum Inspect {
     Absent,
@@ -940,5 +1052,12 @@ mod tests {
             !("tcp://example.invalid:2375".starts_with("unix://")
                 || "tcp://example.invalid:2375".starts_with("npipe://./pipe/"))
         );
+    }
+
+    #[test]
+    fn gateway_resource_identity_requires_a_full_container_id() {
+        assert!(valid_container_id(&"a".repeat(64)));
+        assert!(!valid_container_id(&"a".repeat(63)));
+        assert!(!valid_container_id(&format!("{}g", "a".repeat(63))));
     }
 }

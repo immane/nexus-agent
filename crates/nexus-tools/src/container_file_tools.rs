@@ -49,7 +49,17 @@ pub struct ContainerFileTool<T> {
 pub fn container_file_tools<T: WorkerTransport>(
     client: ContainerWorkerClient<T>,
 ) -> ContainerFileTools<T> {
-    let session = Arc::new(ContainerSession::new(client.into_transport()));
+    container_file_tools_with_handler(client, None)
+}
+
+pub(crate) fn container_file_tools_with_handler<T: WorkerTransport>(
+    client: ContainerWorkerClient<T>,
+    poison_handler: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> ContainerFileTools<T> {
+    let session = Arc::new(ContainerSession::with_poison_handler(
+        client.into_transport(),
+        poison_handler,
+    ));
     let port = |operation, description, schema| ContainerFileTool {
         session: Arc::clone(&session),
         operation,
@@ -90,6 +100,13 @@ pub fn container_file_tools<T: WorkerTransport>(
 }
 
 impl<T> ContainerFileTools<T> {
+    pub(crate) fn quarantine(&self) {
+        match self.read.session.inner.lock() {
+            Ok(mut session) => session.poison(),
+            Err(poisoned) => poisoned.into_inner().poison(),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn exec_adapter(&self) -> crate::container_exec::ContainerExecTool<T>
     where
@@ -132,7 +149,7 @@ impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
                 Ok(session) => break session,
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                     let mut session = poisoned.into_inner();
-                    session.poisoned = true;
+                    session.poison();
                     return not_started(
                         ExecutionStatus::Failed,
                         "container worker session is poisoned",
@@ -196,12 +213,12 @@ impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
                     not_started(ExecutionStatus::Failed, "worker request was not started")
                 }
                 None => {
-                    session.poisoned = true;
+                    session.poison();
                     uncertain("container worker result is uncertain; do not retry")
                 }
             },
             Err(ClientError::InvalidResponse) => {
-                session.poisoned = true;
+                session.poison();
                 uncertain("container worker result is uncertain; do not retry")
             }
         }
@@ -560,6 +577,58 @@ mod tests {
         let next = exec.execute(&exec_call(), &context(WORKSPACE_SCOPE, false, deadline));
         assert_eq!(next.status(), ExecutionStatus::Succeeded);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn explicit_session_quarantine_blocks_file_and_exec_ports() {
+        let (tools, calls, _) = setup(false);
+        let exec = tools.exec_adapter();
+        tools.quarantine();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let file = tools.write.execute(
+            &call(HOST_WRITE_TOOL),
+            &context(WORKSPACE_SCOPE, false, deadline),
+        );
+        let command = exec.execute(&exec_call(), &context(WORKSPACE_SCOPE, false, deadline));
+        assert_eq!(file.effect(), EffectState::NotStarted);
+        assert_eq!(command.effect(), EffectState::NotStarted);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn uncertain_transport_invokes_shared_lifecycle_quarantine_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let callback_count = Arc::clone(&callbacks);
+        let handler: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+        });
+        let tools = container_file_tools_with_handler(
+            ContainerWorkerClient::new(Fake {
+                calls: Arc::clone(&calls),
+                operations,
+                response: success(),
+                fail: true,
+                deadline_before_dispatch: false,
+                entered: None,
+                release: None,
+            }),
+            Some(handler),
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = tools.write.execute(
+            &call(HOST_WRITE_TOOL),
+            &context(WORKSPACE_SCOPE, false, deadline),
+        );
+        assert_eq!(first.effect(), EffectState::Unknown);
+        let second = tools.read.execute(
+            &call(HOST_READ_TOOL),
+            &context(WORKSPACE_SCOPE, false, deadline),
+        );
+        assert_eq!(second.effect(), EffectState::NotStarted);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
     }
 
     #[test]

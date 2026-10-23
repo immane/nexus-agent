@@ -1,0 +1,10 @@
+.git
+target
+**/target
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+**/secrets
+**/secrets/**

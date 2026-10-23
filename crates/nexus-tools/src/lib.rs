@@ -51,6 +51,8 @@ mod container_exec;
 #[cfg(feature = "container")]
 pub mod container_file_tools;
 #[cfg(feature = "container")]
+mod container_ownership;
+#[cfg(feature = "container")]
 mod container_session;
 #[cfg(feature = "container")]
 pub mod container_worker_client;
@@ -58,6 +60,8 @@ pub mod container_worker_client;
 pub mod container_worker_protocol;
 #[cfg(feature = "container")]
 mod container_worker_transport;
+#[cfg(feature = "container")]
+mod container_workload;
 mod development;
 mod exec;
 mod fs_access;
