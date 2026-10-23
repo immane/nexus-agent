@@ -31,6 +31,8 @@ use std::os::fd::AsFd;
 pub(crate) enum DockerExecError {
     InvalidConfiguration,
     Deadline,
+    CancelledBeforeStart,
+    ExecutionUncertain,
     Io,
     Failed,
     Oversized,
@@ -42,6 +44,8 @@ impl fmt::Display for DockerExecError {
         f.write_str(match self {
             Self::InvalidConfiguration => "Docker worker transport configuration is invalid",
             Self::Deadline => "Docker worker exchange deadline expired",
+            Self::CancelledBeforeStart => "container command cancelled before dispatch",
+            Self::ExecutionUncertain => "container command outcome is uncertain",
             Self::Io => "Docker worker exchange I/O failed",
             Self::Failed => "Docker worker process failed",
             Self::Oversized => "Docker worker response exceeded its limit",
@@ -132,6 +136,8 @@ impl DockerExecTransport {
             PROBE_LIMIT,
             Instant::now() + PROBE_TIMEOUT,
             &self.reaper,
+            false,
+            None,
         )?;
         let _ = err;
         if !status.success() {
@@ -145,6 +151,72 @@ impl DockerExecTransport {
             return Err(DockerExecError::InvalidConfiguration);
         }
         Ok(())
+    }
+
+    /// Runs one argv directly in the already-running container. The caller
+    /// supplies validated arguments; no shell command string is constructed.
+    pub(crate) fn exec_argv(
+        &mut self,
+        argv: &[&str],
+        output_limit: usize,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>), DockerExecError> {
+        if argv.is_empty()
+            || argv.len() > 256
+            || argv.iter().any(|arg| arg.contains('\0'))
+            || argv
+                .iter()
+                .try_fold(0usize, |total, arg| total.checked_add(arg.len()))
+                .is_none_or(|total| total > 32 * 1024)
+            || output_limit > 65_536
+        {
+            return Err(DockerExecError::InvalidConfiguration);
+        }
+        if Instant::now() >= deadline {
+            return Err(DockerExecError::Deadline);
+        }
+        if cancelled() {
+            return Err(DockerExecError::CancelledBeforeStart);
+        }
+        let mut command = self.command();
+        command
+            .args(["exec", "--workdir", "/workspace"])
+            .arg(&self.container_id)
+            .args(argv);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if Instant::now() >= deadline {
+            return Err(DockerExecError::Deadline);
+        }
+        if cancelled() {
+            return Err(DockerExecError::CancelledBeforeStart);
+        }
+        let child = command.spawn().map_err(|_| DockerExecError::Io)?;
+        let (status, out, err) = match run_child(
+            child,
+            None,
+            output_limit,
+            deadline,
+            &self.reaper,
+            true,
+            Some(cancelled),
+        ) {
+            Ok(result) => result,
+            // Before spawn, `Deadline` guarantees no remote command was
+            // submitted. Once the CLI exists, timeout makes remote state
+            // uncertain even when local cleanup succeeds.
+            Err(DockerExecError::Deadline) => return Err(DockerExecError::ExecutionUncertain),
+            Err(error) => return Err(error),
+        };
+        Ok((status.code().unwrap_or(-1), out, err))
     }
 }
 
@@ -196,8 +268,15 @@ fn exchange_child(
     deadline: Instant,
     reaper: &Sender<Child>,
 ) -> Result<Vec<u8>, DockerExecError> {
-    let (status, output, stderr) =
-        run_child(child, Some(request), max_response_bytes, deadline, reaper)?;
+    let (status, output, stderr) = run_child(
+        child,
+        Some(request),
+        max_response_bytes,
+        deadline,
+        reaper,
+        false,
+        None,
+    )?;
     let _bounded_diagnostic = &stderr[..stderr.len().min(STDERR_LIMIT)];
     if !status.success() {
         return Err(DockerExecError::Failed);
@@ -211,6 +290,8 @@ fn run_child(
     stdout_limit: usize,
     deadline: Instant,
     reaper: &Sender<Child>,
+    drain_overflow: bool,
+    cancelled: Option<&dyn Fn() -> bool>,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), DockerExecError> {
     let Some(stdout) = child.stdout.take() else {
         cleanup(child, reaper)?;
@@ -253,6 +334,9 @@ fn run_child(
     let mut err_eof = false;
     let mut status = None;
     let result = 'run: loop {
+        if cancelled.is_some_and(|check| check()) {
+            break Err(DockerExecError::ExecutionUncertain);
+        }
         if Instant::now() >= deadline {
             break Err(DockerExecError::Deadline);
         }
@@ -269,18 +353,31 @@ fn run_child(
                 continue;
             }
             loop {
-                let amount = limit
-                    .saturating_add(1)
-                    .saturating_sub(target.len())
-                    .min(buf.len());
+                let stream_limit = if drain_overflow { stdout_limit } else { limit };
+                let amount = if drain_overflow {
+                    buf.len()
+                } else {
+                    stream_limit
+                        .saturating_add(1)
+                        .saturating_sub(target.len())
+                        .min(buf.len())
+                };
                 match rustix::io::read(fd, &mut buf[..amount]) {
                     Ok(0) => {
                         *eof = true;
                         break;
                     }
                     Ok(n) => {
-                        target.extend_from_slice(&buf[..n]);
-                        if target.len() > limit {
+                        let retained = if drain_overflow {
+                            stream_limit
+                                .saturating_add(1)
+                                .saturating_sub(target.len())
+                                .min(n)
+                        } else {
+                            n
+                        };
+                        target.extend_from_slice(&buf[..retained]);
+                        if target.len() > limit && !drain_overflow {
                             break 'run Err(DockerExecError::Oversized);
                         }
                     }
@@ -558,5 +655,41 @@ mod tests {
             Err(DockerExecError::Deadline)
         ));
         assert!(start.elapsed() < Duration::from_secs(6));
+    }
+
+    #[test]
+    fn argv_cancellation_is_not_started_or_is_uncertain_as_appropriate() {
+        let marker = std::env::temp_dir().join(format!("nexus-exec-marker-{}", std::process::id()));
+        let f = Fixture::new(&format!(
+            "if [ \"$1\" = context ]; then echo unix:///tmp/docker.sock; exit; fi\ntouch '{}'",
+            marker.display()
+        ));
+        let mut transport = DockerExecTransport::new(&f.docker(), ID, None).unwrap();
+        assert!(matches!(
+            transport.exec_argv(
+                &["true"],
+                64,
+                Instant::now() + Duration::from_secs(1),
+                &|| true,
+            ),
+            Err(DockerExecError::CancelledBeforeStart)
+        ));
+        assert!(!marker.exists());
+
+        let f = Fixture::new(
+            "if [ \"$1\" = context ]; then echo unix:///tmp/docker.sock; exit; fi\nsleep 10",
+        );
+        let mut transport = DockerExecTransport::new(&f.docker(), ID, None).unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            transport.exec_argv(
+                &["sleep", "10"],
+                64,
+                started + Duration::from_secs(2),
+                &|| started.elapsed() >= Duration::from_millis(50),
+            ),
+            Err(DockerExecError::ExecutionUncertain)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
