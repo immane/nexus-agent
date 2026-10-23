@@ -4,13 +4,14 @@
 //! process may continue, so uncertain outcomes poison this shared session.
 //! Keep this adapter uncomposed until environment kill/quarantine is wired.
 
-use std::{sync::Mutex, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use nexus_core::{
     EffectState, Evidence, ExecutionStatus, M0_REVISION, ToolCall, ToolContext, ToolId,
     ToolOutcome, ToolPort, ToolSpec,
 };
 
+use crate::container_session::ContainerSession;
 use crate::container_worker_transport::{DockerExecError, DockerExecTransport};
 
 const TOOL: &str = crate::exec::HOST_EXEC_TOOL;
@@ -19,16 +20,13 @@ const LIMIT: usize = 65_536;
 const SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}},"required":["argv"],"additionalProperties":false}"#;
 
 pub(crate) struct ContainerExecTool<T = DockerExecTransport> {
-    session: Mutex<ExecSession<T>>,
+    session: Arc<ContainerSession<T>>,
     spec: ToolSpec,
 }
 
-struct ExecSession<T> {
-    transport: T,
-    poisoned: bool,
-}
-
-pub(crate) trait ExecTransport: Send {
+pub(crate) trait ExecTransport:
+    crate::container_worker_client::WorkerTransport + Send
+{
     fn run(
         &mut self,
         argv: &[&str],
@@ -60,10 +58,19 @@ impl ContainerExecTool<DockerExecTransport> {
 impl<T: ExecTransport> ContainerExecTool<T> {
     fn with_transport(transport: T) -> Self {
         Self {
-            session: Mutex::new(ExecSession {
-                transport,
-                poisoned: false,
-            }),
+            session: Arc::new(ContainerSession::new(transport)),
+            spec: ToolSpec::new(
+                ToolId::new(TOOL, REVISION).expect("static tool id"),
+                "Run one argv directly in the existing container at /workspace, without a shell unless explicitly requested in argv. No TTY; results may be uncertain if the Docker CLI is interrupted.",
+                SCHEMA,
+            ).expect("static tool spec"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn from_session(session: Arc<ContainerSession<T>>) -> Self {
+        Self {
+            session,
             spec: ToolSpec::new(
                 ToolId::new(TOOL, REVISION).expect("static tool id"),
                 "Run one argv directly in the existing container at /workspace, without a shell unless explicitly requested in argv. No TTY; results may be uncertain if the Docker CLI is interrupted.",
@@ -113,7 +120,7 @@ impl<T: ExecTransport> ContainerExecTool<T> {
         let deadline = context.deadline().ok_or(OutcomeFailure::TimedOut)?;
         let mut session = loop {
             active(context)?;
-            match self.session.try_lock() {
+            match self.session.inner.try_lock() {
                 Ok(guard) => break guard,
                 Err(std::sync::TryLockError::WouldBlock) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -158,6 +165,9 @@ impl<T: ExecTransport> ContainerExecTool<T> {
             }
             Err(DockerExecError::Deadline) => Err(OutcomeFailure::TimedOut),
             Err(DockerExecError::CancelledBeforeStart) => Err(OutcomeFailure::Cancelled),
+            Err(DockerExecError::InvalidConfiguration | DockerExecError::RequestTooLarge) => {
+                Err(OutcomeFailure::Invalid)
+            }
             Err(_) => {
                 session.poisoned = true;
                 Err(OutcomeFailure::Uncertain)
@@ -269,7 +279,7 @@ mod tests {
     use nexus_core::{ApprovedScope, CallId, NormalizedArgs, RunId, TurnId};
     use std::{
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -278,6 +288,7 @@ mod tests {
     struct Fake {
         calls: Arc<AtomicUsize>,
         fail: bool,
+        invalid_before_dispatch: bool,
         seen: Arc<Mutex<Vec<String>>>,
     }
     impl ExecTransport for Fake {
@@ -290,10 +301,24 @@ mod tests {
         ) -> Result<(i32, Vec<u8>, Vec<u8>), DockerExecError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.seen.lock().unwrap() = argv.iter().map(|s| s.to_string()).collect();
-            if self.fail {
+            if self.invalid_before_dispatch {
+                self.invalid_before_dispatch = false;
+                Err(DockerExecError::InvalidConfiguration)
+            } else if self.fail {
                 Err(DockerExecError::Io)
             } else {
                 Ok((7, b"out".to_vec(), b"err".to_vec()))
+            }
+        }
+    }
+    impl crate::container_worker_client::WorkerTransport for Fake {
+        type Error = std::io::Error;
+        fn exchange(&mut self, _: &[u8], _: usize, _: Instant) -> Result<Vec<u8>, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(std::io::Error::other("lost response"))
+            } else {
+                Ok(br#"{"version":1,"result":{"status":"Succeeded","effect":"KnownApplied","content":"ok","truncated":false}}"#.to_vec())
             }
         }
     }
@@ -323,6 +348,7 @@ mod tests {
         let tool = ContainerExecTool::with_transport(Fake {
             calls: calls.clone(),
             fail: false,
+            invalid_before_dispatch: false,
             seen: seen.clone(),
         });
         let spec = tool.describe();
@@ -349,6 +375,7 @@ mod tests {
         let tool = ContainerExecTool::with_transport(Fake {
             calls: calls.clone(),
             fail: true,
+            invalid_before_dispatch: false,
             seen,
         });
         for (args, scope) in [
@@ -384,5 +411,25 @@ mod tests {
             EffectState::NotStarted
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pre_dispatch_transport_rejection_does_not_poison_session() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tool = ContainerExecTool::with_transport(Fake {
+            calls: calls.clone(),
+            fail: false,
+            invalid_before_dispatch: true,
+            seen,
+        });
+        let ctx = ctx("/workspace", Instant::now() + Duration::from_secs(1));
+        let first = tool.execute(&call(r#"{"argv":["x"]}"#), &ctx);
+        assert_eq!(first.status(), ExecutionStatus::Failed);
+        assert_eq!(first.effect(), EffectState::NotStarted);
+        let second = tool.execute(&call(r#"{"argv":["x"]}"#), &ctx);
+        assert_eq!(second.status(), ExecutionStatus::Failed);
+        assert_eq!(second.effect(), EffectState::Unknown);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

@@ -35,6 +35,7 @@ pub(crate) enum DockerExecError {
     ExecutionUncertain,
     Io,
     Failed,
+    RequestTooLarge,
     Oversized,
     CleanupUncertain,
 }
@@ -48,6 +49,7 @@ impl fmt::Display for DockerExecError {
             Self::ExecutionUncertain => "container command outcome is uncertain",
             Self::Io => "Docker worker exchange I/O failed",
             Self::Failed => "Docker worker process failed",
+            Self::RequestTooLarge => "Docker worker request exceeded its limit",
             Self::Oversized => "Docker worker response exceeded its limit",
             Self::CleanupUncertain => "Docker worker process cleanup could not be confirmed",
         })
@@ -223,6 +225,19 @@ impl DockerExecTransport {
 impl WorkerTransport for DockerExecTransport {
     type Error = DockerExecError;
 
+    fn pre_dispatch_failure(
+        error: &Self::Error,
+    ) -> Option<crate::container_worker_client::PreDispatchFailure> {
+        use crate::container_worker_client::PreDispatchFailure;
+        match error {
+            DockerExecError::Deadline => Some(PreDispatchFailure::Deadline),
+            DockerExecError::InvalidConfiguration | DockerExecError::RequestTooLarge => {
+                Some(PreDispatchFailure::InvalidRequest)
+            }
+            _ => None,
+        }
+    }
+
     fn exchange(
         &mut self,
         request: &[u8],
@@ -230,7 +245,7 @@ impl WorkerTransport for DockerExecTransport {
         deadline: Instant,
     ) -> Result<Vec<u8>, Self::Error> {
         if request.len() > crate::container_worker_protocol::MAX_REQUEST_BYTES {
-            return Err(DockerExecError::Oversized);
+            return Err(DockerExecError::RequestTooLarge);
         }
         if max_response_bytes > crate::container_worker_protocol::MAX_RESPONSE_BYTES
             || max_response_bytes.checked_add(1).is_none()
@@ -268,7 +283,7 @@ fn exchange_child(
     deadline: Instant,
     reaper: &Sender<Child>,
 ) -> Result<Vec<u8>, DockerExecError> {
-    let (status, output, stderr) = run_child(
+    let (status, output, stderr) = match run_child(
         child,
         Some(request),
         max_response_bytes,
@@ -276,7 +291,13 @@ fn exchange_child(
         reaper,
         false,
         None,
-    )?;
+    ) {
+        Ok(result) => result,
+        // Once spawned, a timeout cannot establish that the remote worker did
+        // not process the request.
+        Err(DockerExecError::Deadline) => return Err(DockerExecError::ExecutionUncertain),
+        Err(error) => return Err(error),
+    };
     let _bounded_diagnostic = &stderr[..stderr.len().min(STDERR_LIMIT)];
     if !status.success() {
         return Err(DockerExecError::Failed);
@@ -556,6 +577,19 @@ mod tests {
 
     #[test]
     fn rejects_remote_context_and_expired_deadline_without_exec() {
+        use crate::container_worker_client::PreDispatchFailure;
+        assert_eq!(
+            <DockerExecTransport as WorkerTransport>::pre_dispatch_failure(
+                &DockerExecError::RequestTooLarge
+            ),
+            Some(PreDispatchFailure::InvalidRequest)
+        );
+        assert_eq!(
+            <DockerExecTransport as WorkerTransport>::pre_dispatch_failure(
+                &DockerExecError::Oversized
+            ),
+            None
+        );
         let f = Fixture::new(
             "if [ \"$1\" = context ]; then echo tcp://remote; exit; fi\ntouch \"$MARKER\"",
         );
@@ -594,7 +628,7 @@ mod tests {
         let mut t = DockerExecTransport::new(&f.docker(), ID, None).unwrap();
         assert!(matches!(
             t.exchange(b"", 4, Instant::now() + Duration::from_millis(50)),
-            Err(DockerExecError::Deadline)
+            Err(DockerExecError::ExecutionUncertain)
         ));
     }
 
@@ -611,7 +645,7 @@ mod tests {
                 16,
                 start + Duration::from_millis(100)
             ),
-            Err(DockerExecError::Deadline)
+            Err(DockerExecError::ExecutionUncertain)
         ));
         assert!(start.elapsed() < Duration::from_secs(2));
     }

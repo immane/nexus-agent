@@ -4,7 +4,7 @@
 //! continue until its deadline. Keep these ports uncomposed until that
 //! lifecycle is integrated with trusted host-side cancellation handling.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_core::{
@@ -13,7 +13,10 @@ use nexus_core::{
 };
 use serde_json::Value;
 
-use crate::container_worker_client::{ClientError, ContainerWorkerClient, WorkerTransport};
+use crate::container_session::ContainerSession;
+use crate::container_worker_client::{
+    ClientError, ContainerWorkerClient, PreDispatchFailure, WorkerTransport,
+};
 use crate::fs::{
     HOST_LIST_TOOL, HOST_PATCH_TOOL, HOST_READ_TOOL, HOST_SEARCH_TOOL, HOST_WRITE_TOOL,
     LIST_SCHEMA, PATCH_SCHEMA, READ_SCHEMA, SEARCH_SCHEMA, WRITE_SCHEMA,
@@ -32,14 +35,9 @@ pub struct ContainerFileTools<T> {
 
 /// One fixed-operation container-backed file tool.
 pub struct ContainerFileTool<T> {
-    session: Arc<Mutex<Session<T>>>,
+    session: Arc<ContainerSession<T>>,
     operation: &'static str,
     spec: ToolSpec,
-}
-
-struct Session<T> {
-    client: ContainerWorkerClient<T>,
-    poisoned: bool,
 }
 
 /// Creates uncomposed `host_read`, `host_list`, `host_search`, `host_write`,
@@ -51,10 +49,7 @@ struct Session<T> {
 pub fn container_file_tools<T: WorkerTransport>(
     client: ContainerWorkerClient<T>,
 ) -> ContainerFileTools<T> {
-    let session = Arc::new(Mutex::new(Session {
-        client,
-        poisoned: false,
-    }));
+    let session = Arc::new(ContainerSession::new(client.into_transport()));
     let port = |operation, description, schema| ContainerFileTool {
         session: Arc::clone(&session),
         operation,
@@ -94,6 +89,16 @@ pub fn container_file_tools<T: WorkerTransport>(
     }
 }
 
+impl<T> ContainerFileTools<T> {
+    #[allow(dead_code)]
+    pub(crate) fn exec_adapter(&self) -> crate::container_exec::ContainerExecTool<T>
+    where
+        T: crate::container_exec::ExecTransport,
+    {
+        crate::container_exec::ContainerExecTool::from_session(Arc::clone(&self.read.session))
+    }
+}
+
 impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
     fn describe(&self) -> ToolSpec {
         self.spec.clone()
@@ -123,7 +128,7 @@ impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
         }
 
         let mut session = loop {
-            match self.session.try_lock() {
+            match self.session.inner.try_lock() {
                 Ok(session) => break session,
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                     let mut session = poisoned.into_inner();
@@ -167,7 +172,8 @@ impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
             Ok(arguments) => arguments,
             Err(_) => return not_started(ExecutionStatus::Failed, "tool arguments are invalid"),
         };
-        match session.client.execute(
+        match ContainerWorkerClient::<T>::execute_using(
+            &mut session.transport,
             self.operation,
             &arguments,
             context.output_budget_bytes(),
@@ -181,7 +187,20 @@ impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
                 ExecutionStatus::TimedOut,
                 "tool deadline exceeded before dispatch",
             ),
-            Err(ClientError::Transport(_) | ClientError::InvalidResponse) => {
+            Err(ClientError::Transport(error)) => match T::pre_dispatch_failure(&error) {
+                Some(PreDispatchFailure::Deadline) => not_started(
+                    ExecutionStatus::TimedOut,
+                    "tool deadline exceeded before dispatch",
+                ),
+                Some(PreDispatchFailure::InvalidRequest) => {
+                    not_started(ExecutionStatus::Failed, "worker request was not started")
+                }
+                None => {
+                    session.poisoned = true;
+                    uncertain("container worker result is uncertain; do not retry")
+                }
+            },
+            Err(ClientError::InvalidResponse) => {
                 session.poisoned = true;
                 uncertain("container worker result is uncertain; do not retry")
             }
@@ -234,7 +253,10 @@ mod tests {
     use nexus_core::{ApprovedScope, CallId, CancellationToken, NormalizedArgs, RunId, TurnId};
     use std::{
         io,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -243,6 +265,7 @@ mod tests {
         operations: Arc<Mutex<Vec<String>>>,
         response: Vec<u8>,
         fail: bool,
+        deadline_before_dispatch: bool,
         entered: Option<std::sync::mpsc::SyncSender<()>>,
         release: Option<Arc<std::sync::Barrier>>,
     }
@@ -264,10 +287,33 @@ mod tests {
                 entered.send(()).unwrap();
                 self.release.as_ref().unwrap().wait();
             }
-            if self.fail {
+            if self.deadline_before_dispatch {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            } else if self.fail {
                 Err(io::Error::other("lost response"))
             } else {
                 Ok(self.response.clone())
+            }
+        }
+
+        fn pre_dispatch_failure(error: &Self::Error) -> Option<PreDispatchFailure> {
+            (error.kind() == io::ErrorKind::TimedOut).then_some(PreDispatchFailure::Deadline)
+        }
+    }
+    impl crate::container_exec::ExecTransport for Fake {
+        fn run(
+            &mut self,
+            _: &[&str],
+            _: usize,
+            _: Instant,
+            _: &dyn Fn() -> bool,
+        ) -> Result<(i32, Vec<u8>, Vec<u8>), crate::container_worker_transport::DockerExecError>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(crate::container_worker_transport::DockerExecError::Io)
+            } else {
+                Ok((0, b"exec".to_vec(), Vec::new()))
             }
         }
     }
@@ -301,11 +347,31 @@ mod tests {
             NormalizedArgs::new(arguments).unwrap(),
         )
     }
+    fn exec_call() -> ToolCall {
+        ToolCall::new(
+            nexus_core::RunId::new("run").unwrap(),
+            nexus_core::TurnId::new("turn").unwrap(),
+            nexus_core::CallId::new("call").unwrap(),
+            ToolId::new(crate::exec::HOST_EXEC_TOOL, M0_REVISION + 1).unwrap(),
+            nexus_core::NormalizedArgs::new(r#"{"argv":["x"]}"#).unwrap(),
+        )
+    }
     fn success() -> Vec<u8> {
         br#"{"version":1,"result":{"status":"Succeeded","effect":"KnownApplied","content":"ok","truncated":false}}"#.to_vec()
     }
     fn setup(
         fail: bool,
+    ) -> (
+        ContainerFileTools<Fake>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        setup_with(fail, false)
+    }
+
+    fn setup_with(
+        fail: bool,
+        deadline_before_dispatch: bool,
     ) -> (
         ContainerFileTools<Fake>,
         Arc<AtomicUsize>,
@@ -319,6 +385,7 @@ mod tests {
                 operations: operations.clone(),
                 response: success(),
                 fail,
+                deadline_before_dispatch,
                 entered: None,
                 release: None,
             })),
@@ -418,6 +485,84 @@ mod tests {
     }
 
     #[test]
+    fn worker_and_exec_share_transport_and_poison_bidirectionally() {
+        let (tools, calls, _) = setup(true);
+        let exec = tools.exec_adapter();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            tools
+                .write
+                .execute(
+                    &call(HOST_WRITE_TOOL),
+                    &context(WORKSPACE_SCOPE, false, deadline)
+                )
+                .effect(),
+            EffectState::Unknown
+        );
+        assert_eq!(
+            exec.execute(&exec_call(), &context(WORKSPACE_SCOPE, false, deadline))
+                .effect(),
+            EffectState::NotStarted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (tools, calls, _) = setup(true);
+        let exec = tools.exec_adapter();
+        assert_eq!(
+            exec.execute(&exec_call(), &context(WORKSPACE_SCOPE, false, deadline))
+                .effect(),
+            EffectState::Unknown
+        );
+        assert_eq!(
+            tools
+                .read
+                .execute(
+                    &call(HOST_READ_TOOL),
+                    &context(WORKSPACE_SCOPE, false, deadline)
+                )
+                .effect(),
+            EffectState::NotStarted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (tools, calls, _) = setup(false);
+        let exec = tools.exec_adapter();
+        assert_eq!(
+            tools
+                .read
+                .execute(
+                    &call(HOST_READ_TOOL),
+                    &context(WORKSPACE_SCOPE, false, deadline)
+                )
+                .status(),
+            ExecutionStatus::Succeeded
+        );
+        assert_eq!(
+            exec.execute(&exec_call(), &context(WORKSPACE_SCOPE, false, deadline))
+                .status(),
+            ExecutionStatus::Succeeded
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pre_dispatch_transport_deadline_does_not_poison_shared_session() {
+        let (tools, calls, _) = setup_with(false, true);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let file = tools.write.execute(
+            &call(HOST_WRITE_TOOL),
+            &context(WORKSPACE_SCOPE, false, deadline),
+        );
+        assert_eq!(file.status(), ExecutionStatus::TimedOut);
+        assert_eq!(file.effect(), EffectState::NotStarted);
+
+        let exec = tools.exec_adapter();
+        let next = exec.execute(&exec_call(), &context(WORKSPACE_SCOPE, false, deadline));
+        assert_eq!(next.status(), ExecutionStatus::Succeeded);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn lock_wait_observes_cancellation_and_deadline_without_dispatch() {
         for cancel in [true, false] {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -429,6 +574,7 @@ mod tests {
                 operations: operations.clone(),
                 response: success(),
                 fail: false,
+                deadline_before_dispatch: false,
                 entered: Some(entered_tx),
                 release: Some(release.clone()),
             }));

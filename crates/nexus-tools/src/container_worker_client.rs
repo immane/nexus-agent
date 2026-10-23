@@ -19,6 +19,12 @@ use crate::container_worker_protocol::{
 pub trait WorkerTransport {
     type Error: Error + Send + Sync + 'static;
 
+    /// Identifies a transport failure that proves no request was dispatched.
+    /// The default is conservative: transport errors are considered ambiguous.
+    fn pre_dispatch_failure(_error: &Self::Error) -> Option<PreDispatchFailure> {
+        None
+    }
+
     /// Performs exactly one exchange for `request` and returns exactly one
     /// response followed by EOF. Implementations must honor the absolute
     /// `deadline`, cap bytes while collecting the response (not after it has
@@ -31,6 +37,12 @@ pub trait WorkerTransport {
         max_response_bytes: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreDispatchFailure {
+    Deadline,
+    InvalidRequest,
 }
 
 #[derive(Debug)]
@@ -70,12 +82,31 @@ impl<T: WorkerTransport> ContainerWorkerClient<T> {
         output_limit: usize,
         deadline: Instant,
     ) -> Result<ToolOutcome, ClientError<T::Error>> {
+        Self::execute_using(
+            &mut self.transport,
+            operation,
+            arguments,
+            output_limit,
+            deadline,
+        )
+    }
+
+    pub(crate) fn into_transport(self) -> T {
+        self.transport
+    }
+
+    pub(crate) fn execute_using(
+        transport: &mut T,
+        operation: &str,
+        arguments: &Value,
+        output_limit: usize,
+        deadline: Instant,
+    ) -> Result<ToolOutcome, ClientError<T::Error>> {
         let request = encode_request(operation, arguments, output_limit)?;
         if Instant::now() >= deadline {
             return Err(ClientError::DeadlineExpired);
         }
-        let response = self
-            .transport
+        let response = transport
             .exchange(&request, MAX_RESPONSE_BYTES, deadline)
             .map_err(ClientError::Transport)?;
         if response.len() > MAX_RESPONSE_BYTES {
