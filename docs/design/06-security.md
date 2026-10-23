@@ -92,3 +92,4 @@ Test denied and stale approvals, changed tool definitions, malformed calls, outp
 - [Configuration](../contracts/05-configuration.md)
 - [First-release defaults](decisions/01-first-release-defaults.md)
 - [API relay](08-api-relay.md)
+- [Optional container execution](11-container-execution.md) (draft; does not change current local policy)
