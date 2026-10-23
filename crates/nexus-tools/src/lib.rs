@@ -47,6 +47,8 @@
 #[cfg(feature = "container")]
 pub mod container;
 #[cfg(feature = "container")]
+pub mod container_file_tools;
+#[cfg(feature = "container")]
 pub mod container_worker_client;
 #[cfg(feature = "container")]
 pub mod container_worker_protocol;
