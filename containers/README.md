@@ -93,12 +93,13 @@ resistance.
 
 ## Validation status
 
-**Native Linux validation is deferred by project decision.** Until it is run,
-this prototype must not be treated as an approved isolation boundary or enabled
-for container execution. When resumed, validate on a native Linux Docker Engine
-with the actual host/LAN CIDRs: public HTTPS egress, denial of host/LAN and
-metadata destinations, IPv6 denial, and controlled DNS behavior. Record the
-engine/kernel versions and results here.
+**Native Linux validation is deferred by project decision; this does not block
+continued implementation and fake-transport testing.** Until the validation
+checklist below passes, do not treat the gateway as an approved isolation
+boundary, enable real workload execution, or claim Linux host/LAN isolation.
+When a supported native Linux Docker Engine is available, run the accumulated
+checklist as one validation pass and record engine/kernel versions, host/LAN
+CIDRs, commands, and results here.
 
 The current development host is macOS with Docker Desktop (`desktop-linux`,
 LinuxKit 6.12.76, arm64), not a native Linux Docker host. `check-docker.sh`
@@ -110,3 +111,27 @@ blocked by the policy. Host HTTPS works through the host's proxy, which the
 gateway does not inherit. Treat public egress as unverified until tested on a
 supported Linux Engine with ordinary DNS and direct egress; do not remove the
 reserved-range deny to accommodate this environment.
+
+### Deferred native-Linux validation checklist
+
+Run these checks together on the supported native Linux Docker Engine; do not
+count Docker Desktop or a missing daemon as a pass:
+
+- [ ] Record Docker Engine, kernel, architecture, selected context/socket, and
+  actual host/LAN interface and route CIDRs.
+- [ ] Run the default gateway checks for startup/readiness, workload capability
+  drops, resolver mount, DNS behavior, bridge listener denial, and forwarding
+  policy.
+- [ ] With controlled public fixtures, verify successful public HTTPS egress
+  and record the exact DNS answers and egress route.
+- [ ] Verify denial of every host/LAN CIDR (including publicly numbered LANs),
+  host gateway/interface addresses, sibling networks, and controlled metadata
+  destinations; verify the expected deny counters.
+- [ ] Verify IPv6 is denied and test IPv4-mapped IPv6 and relevant transition
+  paths.
+- [ ] Exercise DNS behavior, including attempts to use Docker embedded DNS,
+  controlled rebinding answers, and access to blocked destinations by resolved
+  address; record what the gateway does and does not prevent.
+- [ ] Repeat the opt-in native host-gateway probe and public-egress probe; retain
+  command output and distinguish direct egress failures from environment proxy
+  requirements.
