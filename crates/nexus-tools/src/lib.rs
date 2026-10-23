@@ -46,7 +46,9 @@
 
 #[cfg(feature = "container")]
 pub mod container;
-#[cfg(all(feature = "container-worker", unix))]
+#[cfg(feature = "container")]
+pub mod container_worker_client;
+#[cfg(feature = "container")]
 pub mod container_worker_protocol;
 mod development;
 mod exec;

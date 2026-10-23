@@ -115,7 +115,7 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<Request, ProtocolError> {
     Ok(request)
 }
 
-fn valid_arguments(operation: &str, value: &Value) -> bool {
+pub(crate) fn valid_arguments(operation: &str, value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
@@ -173,6 +173,16 @@ use serde::Deserialize;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use std::fmt;
 struct UniqueValue(Value);
+pub(crate) fn parse_unique(bytes: &[u8]) -> Result<Value, ProtocolError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = UniqueValue::deserialize(&mut deserializer)
+        .map_err(|_| ProtocolError::InvalidRequest)?
+        .0;
+    deserializer
+        .end()
+        .map_err(|_| ProtocolError::InvalidRequest)?;
+    Ok(value)
+}
 impl<'de> Deserialize<'de> for UniqueValue {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct V;

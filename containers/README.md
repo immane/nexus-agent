@@ -21,6 +21,24 @@ inspected bridge listener IP as an explicit blocked host/LAN CIDR and requires
 that the control can reach it while workload access fails and the exact
 `blocked_host_v4` counter increments.
 
+Set `CHECK_LINUX_HOST_ISOLATION=1` to additionally exercise a real Linux Docker
+host gateway. Before building or changing containers, this mode requires host
+Linux, Docker context `default`, a nonempty local Unix-socket endpoint, and a
+daemon not identified as Docker Desktop/LinuxKit; it also requires `ip`. A local
+Unix socket can still front a proxy, so these checks cannot prove daemon
+locality. It gathers all non-loopback IPv4 interface subnets and point-to-point
+peers, route destinations and gateways (including multipath), and collapses
+overlapping/adjacent CIDRs before blocking them along with the default bridge
+gateway. Unsupported `nhid` routes and malformed/incomplete IP JSON fail closed.
+A temporary Python listener binds only to that bridge gateway on an ephemeral
+port: a regular bridge control must connect, while the shared-namespace workload
+must be denied and increment the exact `blocked_host_v4` counter. The listener
+has a bounded accept timeout and is stopped/joined during cleanup. This does
+not modify host firewall state, publish ports, pull images, or make public
+requests; public egress remains independently opt-in via
+`CHECK_PUBLIC_EGRESS=1`. Native Linux host-isolation validation remains deferred
+until this opt-in check is run on a supported native Linux Docker host.
+
 The nftables input, output, and forward hooks default to drop; forwarding is
 explicitly denied. Output allows established replies and TCP/UDP egress, while
 blocking caller-supplied host/LAN IPv4 CIDRs before common non-global ranges.
@@ -46,12 +64,49 @@ python3 -m unittest -v containers/test_policy.py
 containers/check-docker.sh
 ```
 
+On a native Linux host only, an additional opt-in probe discovers interface and
+route CIDRs, binds a temporary listener exclusively to the Docker bridge
+gateway address, checks that an ordinary bridge container can reach it, and
+checks that the shared-namespace workload is blocked by the exact host-CIDR
+rule:
+
+```sh
+CHECK_LINUX_HOST_ISOLATION=1 containers/check-docker.sh
+```
+
+The opt-in preflight rejects Docker Desktop/LinuxKit, non-default contexts,
+remote endpoints, and explicit Docker endpoint overrides before building or
+creating test containers. A local Unix socket can still proxy another daemon,
+so the operator must trust the selected socket. This probe exercises the
+Docker bridge host address, not every upstream router or LAN destination.
+
 Runtime checks require a Linux Docker Engine with usable nftables kernel
 support. They test startup/readiness, shared-namespace workload hardening,
 read-only resolver mount, local DNS answer, embedded resolver unreachability,
 default-bridge listener connectivity and policy denial, and the drop-policy
 forward hook. The default check makes no public HTTPS request. Set
 `CHECK_PUBLIC_EGRESS=1` to add a request to `https://example.com/`; this is the
-only public endpoint probe. No image pull is enabled. The listener test verifies
+only public HTTPS probe (the image build may access the pinned public Alpine
+package repository if its layer is uncached). No image pull is enabled. The listener test verifies
 only the configured deny rule, not general host/LAN isolation or DNS rebinding
 resistance.
+
+## Validation status
+
+**Native Linux validation is deferred by project decision.** Until it is run,
+this prototype must not be treated as an approved isolation boundary or enabled
+for container execution. When resumed, validate on a native Linux Docker Engine
+with the actual host/LAN CIDRs: public HTTPS egress, denial of host/LAN and
+metadata destinations, IPv6 denial, and controlled DNS behavior. Record the
+engine/kernel versions and results here.
+
+The current development host is macOS with Docker Desktop (`desktop-linux`,
+LinuxKit 6.12.76, arm64), not a native Linux Docker host. `check-docker.sh`
+passes its firewall/readiness tests there, but that does not validate the
+Linux host's own LAN interfaces or routes. The opt-in public HTTPS probe does
+not pass in this environment: the configured DNS path returned
+`example.com -> 198.18.7.34`, an RFC 2544 benchmarking address intentionally
+blocked by the policy. Host HTTPS works through the host's proxy, which the
+gateway does not inherit. Treat public egress as unverified until tested on a
+supported Linux Engine with ordinary DNS and direct egress; do not remove the
+reserved-range deny to accommodate this environment.
