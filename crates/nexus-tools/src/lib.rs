@@ -50,6 +50,8 @@ pub mod container;
 pub mod container_worker_client;
 #[cfg(feature = "container")]
 pub mod container_worker_protocol;
+#[cfg(feature = "container")]
+mod container_worker_transport;
 mod development;
 mod exec;
 mod fs_access;
