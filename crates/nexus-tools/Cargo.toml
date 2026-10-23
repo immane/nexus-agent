@@ -4,6 +4,16 @@ version = "0.2.0-alpha"
 edition = "2024"
 autotests = false
 
+[features]
+default = []
+container = []
+container-worker = ["container"]
+
+[[bin]]
+name = "container-worker"
+path = "src/bin/container-worker.rs"
+required-features = ["container-worker"]
+
 [[test]]
 name = "behavior"
 path = "tests/behavior.rs"
@@ -16,5 +26,6 @@ nexus-permissions = { path = "../nexus-permissions" }
 nexus-core = { path = "../nexus-core" }
 # JSON for reading the admitted `{"path": ...}` arguments. No schema
 # framework is added here; schemas are validated at registration.
+serde = "1"
 serde_json = "1"
 rustix = { version = "1.1.5", features = ["event", "fs", "process"] }

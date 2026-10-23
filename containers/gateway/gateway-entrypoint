@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+rm -f /run/gateway-ready
+
+: "${GATEWAY_BLOCKED_IPV4_CIDRS:?GATEWAY_BLOCKED_IPV4_CIDRS must contain host/LAN IPv4 CIDRs}"
+case "$GATEWAY_BLOCKED_IPV4_CIDRS" in
+    *[!0-9./,]*|,*|*,|*,,*)
+        echo 'GATEWAY_BLOCKED_IPV4_CIDRS must be comma-separated IPv4 CIDRs' >&2
+        exit 1
+        ;;
+esac
+
+if ! nft -c -f /etc/nftables.conf; then
+    echo 'nftables policy check failed' >&2
+    exit 1
+fi
+if ! nft -f /etc/nftables.conf; then
+    echo 'nftables policy installation failed' >&2
+    exit 1
+fi
+old_ifs=$IFS
+IFS=,
+for cidr in $GATEWAY_BLOCKED_IPV4_CIDRS; do
+    if ! nft add element inet gateway blocked_host_v4 "{ $cidr }"; then
+        echo "invalid blocked host/LAN IPv4 CIDR: $cidr" >&2
+        exit 1
+    fi
+done
+IFS=$old_ifs
+if ! nft list table inet gateway >/dev/null; then
+    echo 'installed nftables policy cannot be verified' >&2
+    exit 1
+fi
+
+dnsmasq --no-daemon --conf-file=/etc/dnsmasq.conf &
+dns_pid=$!
+sleep 1
+if ! kill -0 "$dns_pid" 2>/dev/null || ! nft list table inet gateway | grep -q 'chain input' || ! nft list table inet gateway | grep -q 'chain output' || ! nft list set inet gateway blocked_host_v4 >/dev/null; then
+    echo 'DNS or firewall readiness verification failed' >&2
+    exit 1
+fi
+dns_answer=$(nslookup gateway.test 127.0.0.1 2>/dev/null)
+if ! printf '%s\n' "$dns_answer" | awk '$1 == "Name:" && $2 == "gateway.test" { answer=1; next } answer && $1 == "Address:" && $2 == "127.0.0.1" { found=1 } END { exit !found }'; then
+    echo 'DNS readiness verification failed' >&2
+    exit 1
+fi
+touch /run/gateway-ready
+wait "$dns_pid"

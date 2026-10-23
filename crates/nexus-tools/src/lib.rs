@@ -44,6 +44,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "container")]
+pub mod container;
+#[cfg(all(feature = "container-worker", unix))]
+pub mod container_worker_protocol;
 mod development;
 mod exec;
 mod fs_access;
