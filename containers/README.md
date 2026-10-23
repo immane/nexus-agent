@@ -1,13 +1,22 @@
-# Public-egress gateway prototype
+# Container execution prototypes and gateway checks
 
-This directory contains only a gateway prototype; it does not wire container
-execution into Nexus. The gateway runs in its own network namespace with
+This directory contains gateway and workload image prototypes plus opt-in
+gateway checks; none wires container execution into the Nexus runtime, TUI, or
+server. The internal `nexus-tools` adapters/lifecycle code is feature-gated and
+not user-selectable. The gateway runs in its own network namespace with
 `NET_ADMIN` confined to that container. A workload shares that namespace with
 `--cap-drop=ALL` and `no-new-privileges`; never grant `NET_RAW`, `NET_ADMIN`, or a
 Docker socket. It must not start until gateway health/readiness succeeds. Docker
 rejects `--dns 127.0.0.1` with `--network container:<id>`, so the workload instead
 receives a read-only `/etc/resolv.conf` bind mount containing
 `nameserver 127.0.0.1`.
+
+The workload image recipe and pinned **linux/arm64** builder/runtime inputs are
+documented in [`workload/README.md`](workload/README.md). A keeper-only smoke
+test passed on Docker Desktop with `--network none`, a read-only rootfs, no
+capabilities, and no workspace mount; it verified only keeper process
+liveness. The worker was not dispatched. This is not workload or network
+isolation evidence. The workload Dockerfile currently rejects non-arm64 targets.
 
 The gateway uses Docker's default `bridge`, not a per-session user-defined
 bridge. In the observed Docker Engine configuration, cached-image containers on
@@ -63,6 +72,19 @@ project code is uploaded.
 python3 -m unittest -v containers/test_policy.py
 containers/check-docker.sh
 ```
+
+The separate workload image is a development prototype and is built from the
+repository root (default inputs are digest-pinned and arm64-only):
+
+```sh
+docker buildx build --platform linux/arm64 --load \
+  -f containers/workload/Dockerfile \
+  -t nexus-workload-prototype:dev .
+```
+
+Building or smoke-testing this image does not approve it for agent sessions.
+Do not add workspace mounts, worker dispatch, or runtime wiring based on the
+keeper health result alone.
 
 On a native Linux host only, an additional opt-in probe discovers interface and
 route CIDRs, binds a temporary listener exclusively to the Docker bridge

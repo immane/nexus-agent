@@ -35,6 +35,12 @@ scoping, credential handling, provider requests, or unsafe handling of
 untrusted model/tool output. Features described only as planned or draft are
 not implemented security guarantees.
 
+The optional container backend is currently an internal, feature-gated
+prototype, not a selectable execution mode. Its keeper healthcheck and
+Docker Desktop smoke test do not establish workload isolation. Do not rely on
+it as a security boundary; native Linux host/LAN, metadata, DNS/IPv6, and public
+egress validation has not passed.
+
 The filesystem root restriction is not an OS sandbox, and explicitly enabled
 external plugins run with the launching user's OS privileges. Do not test
 against systems, accounts, provider endpoints, or data that you do not own or

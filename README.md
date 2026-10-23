@@ -65,7 +65,10 @@ These are platform- and build-profile-specific file sizes, not compressed downlo
 
 ## Architecture
 
-The host's core, runtime, frontend, and adapters are in-process components; built-in tools do not pay an IPC cost. The diagram includes planned durable storage and external plugins, which are not implemented. Provider TLS and sandboxed commands can launch helper processes.
+The first diagram shows the host's in-process core, runtime, frontend, and
+adapters; built-in tools do not pay an IPC cost. It includes planned durable
+storage and external plugins, which are not implemented. Provider TLS and
+sandboxed commands can launch helper processes.
 
 ```mermaid
 flowchart TB
@@ -89,7 +92,46 @@ flowchart TB
     Bridge <-->|stdio| Plugins
 ```
 
-Connections show runtime interactions and domain usage, **not source-code dependency direction**. The composition root injects concrete adapters; the runtime does not import their implementations. These are logical components, not fixed crate names or separate background services.
+Container support currently exists only as an optional, internal `nexus-tools`
+prototype. It is intentionally not connected to the runtime authorization or
+TUI/server composition roots. The prototype's present topology is shown
+separately; the dashed edge is a future integration boundary, not a callable
+path today:
+
+```mermaid
+flowchart LR
+    Runtime["Runtime / frontend<br/>local tools only"]
+    ContainerTools["Feature-gated container adapters<br/>file tools + host_exec"]
+    Session["Internal workload session<br/>lifecycle + quarantine"]
+    Transport["Bounded Docker CLI transport"]
+    Owner["Owner-only state record<br/>fail-closed on leftovers"]
+    Daemon["Local Docker Engine<br/>or Docker Desktop VM"]
+    Gateway["Gateway container<br/>nftables + DNS"]
+    Workload["Workload container<br/>keeper + worker"]
+    Workspace["Selected host workspace<br/>only user-data bind"]
+
+    Runtime -. "not wired" .-> ContainerTools
+    ContainerTools <--> Session
+    Session --> Transport
+    Session --> Owner
+    Transport <--> Daemon
+    Daemon --> Gateway
+    Daemon --> Workload
+    Workload -. "shares network namespace" .-> Gateway
+    Workspace -->|"read/write bind"| Workload
+```
+
+The prototype compiles only with `nexus-tools` container features. Its
+linux/arm64 workload image and keeper-only Docker Desktop smoke check do not
+establish workload or network isolation. Native Linux host/LAN, metadata,
+IPv6/DNS, and public-egress checks remain required before any runtime wiring;
+see the [container design](docs/design/11-container-execution.md),
+[gateway checklist](containers/README.md), and [workload image notes](containers/workload/README.md).
+
+In the first diagram, connections show runtime interactions and domain usage,
+**not source-code dependency direction**. The composition root injects concrete
+adapters; the runtime does not import their implementations. Those boxes are
+logical host components, not fixed crate names or separate background services.
 
 - **Domain core:** portable data, state transitions, and contracts; no terminal, HTTP, vendor SDK, or OS-specific types.
 - **Runtime:** authoritative run state, execution limits, authorization, cancellation, and ordered events.
@@ -254,11 +296,13 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Implement the shared runtime, live TUI, loopback HTTP/SSE server, scripted headless runner, file read/list/search/write/patch, and sandboxed exec.
 - [x] Implement Chat Completions, OpenAI Responses, and Anthropic Messages adapters with explicit protocol configuration and offline regression fixtures.
 - [x] Implement M4 consolidation slices: shared ordered-event consumption, tool composition, and current provider capability handling. The default-feature workspace suite has recorded passing macOS evidence; see [migration status](docs/tasks/08-architecture-migration.md) and [Testing](docs/testing.md).
+- [x] Add an optional, internal container worker/gateway/workload prototype with bounded Docker transport, keeper health gate, and fail-closed ownership records; it is not wired to runtime authorization or frontend execution. Image build and keeper-only smoke test are not isolation evidence.
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
 - [ ] Close migration gates: Linux file race/metadata and sandbox-isolation validation remain blocked; escaped-descendant cleanup remains unresolved. Temporary macOS-only development scope is not cross-platform acceptance.
 - [ ] Verify live compatibility for individual services/models and extend protocol coverage as needed; Gemini is not implemented.
 - [ ] Add bounded external-plugin interoperability and session recovery.
+- [ ] Complete native Linux container network/isolation validation and lifecycle recovery before considering runtime/frontend integration.
 
 Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The alpha version is not a stable-release or production-readiness claim.
 
