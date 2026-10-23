@@ -1,5 +1,6 @@
 //! Host-side framing and validation for a container worker transport.
-//! This module does not start workloads or provide cancellation guarantees.
+//! This module does not start workloads. Controlled cancellation depends on
+//! the selected transport's `exchange_controlled` implementation.
 
 use std::{
     error::Error,
@@ -37,6 +38,19 @@ pub trait WorkerTransport {
         max_response_bytes: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, Self::Error>;
+
+    /// Performs one exchange while observing live cancellation. Existing test
+    /// transports may use the default; the Docker transport overrides this to
+    /// stop its local CLI and report an uncertain remote outcome.
+    fn exchange_controlled(
+        &mut self,
+        request: &[u8],
+        max_response_bytes: usize,
+        deadline: Instant,
+        _cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, Self::Error> {
+        self.exchange(request, max_response_bytes, deadline)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,12 +116,30 @@ impl<T: WorkerTransport> ContainerWorkerClient<T> {
         output_limit: usize,
         deadline: Instant,
     ) -> Result<ToolOutcome, ClientError<T::Error>> {
+        Self::execute_using_controlled(
+            transport,
+            operation,
+            arguments,
+            output_limit,
+            deadline,
+            &|| false,
+        )
+    }
+
+    pub(crate) fn execute_using_controlled(
+        transport: &mut T,
+        operation: &str,
+        arguments: &Value,
+        output_limit: usize,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ToolOutcome, ClientError<T::Error>> {
         let request = encode_request(operation, arguments, output_limit)?;
         if Instant::now() >= deadline {
             return Err(ClientError::DeadlineExpired);
         }
         let response = transport
-            .exchange(&request, MAX_RESPONSE_BYTES, deadline)
+            .exchange_controlled(&request, MAX_RESPONSE_BYTES, deadline, cancelled)
             .map_err(ClientError::Transport)?;
         if response.len() > MAX_RESPONSE_BYTES {
             return Err(ClientError::InvalidResponse);

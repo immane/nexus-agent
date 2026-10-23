@@ -2,7 +2,8 @@
 //!
 //! Cancellation after dispatch only kills the local Docker CLI. The remote
 //! process may continue, so uncertain outcomes poison this shared session.
-//! Keep this adapter uncomposed until environment kill/quarantine is wired.
+//! The runtime composes it only in an explicit container session. Uncertain
+//! outcomes poison the shared transport and invoke workload cleanup.
 
 use std::{sync::Arc, time::Instant};
 

@@ -110,7 +110,7 @@ flowchart LR
     Workload["Workload container<br/>keeper + worker"]
     Workspace["Selected host workspace<br/>only user-data bind"]
 
-    Runtime -. "not wired" .-> ContainerTools
+    Runtime -. "opt-in container build only" .-> ContainerTools
     ContainerTools <--> Session
     Session --> Transport
     Session --> Owner
@@ -296,13 +296,13 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Implement the shared runtime, live TUI, loopback HTTP/SSE server, scripted headless runner, file read/list/search/write/patch, and sandboxed exec.
 - [x] Implement Chat Completions, OpenAI Responses, and Anthropic Messages adapters with explicit protocol configuration and offline regression fixtures.
 - [x] Implement M4 consolidation slices: shared ordered-event consumption, tool composition, and current provider capability handling. The default-feature workspace suite has recorded passing macOS evidence; see [migration status](docs/tasks/08-architecture-migration.md) and [Testing](docs/testing.md).
-- [x] Add an optional, internal container worker/gateway/workload prototype with bounded Docker transport, keeper health gate, and fail-closed ownership records; it is not wired to runtime authorization or frontend execution. Image build and keeper-only smoke test are not isolation evidence.
+- [x] Add an opt-in container worker/gateway/workload path with runtime authorization and TUI/server selection. It is not a validated isolation boundary: native Linux host/LAN, metadata, IPv6/DNS, and public-egress checks remain outstanding. Image build and keeper-only smoke test are not isolation evidence.
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
 - [ ] Close migration gates: Linux file race/metadata and sandbox-isolation validation remain blocked; escaped-descendant cleanup remains unresolved. Temporary macOS-only development scope is not cross-platform acceptance.
 - [ ] Verify live compatibility for individual services/models and extend protocol coverage as needed; Gemini is not implemented.
 - [ ] Add bounded external-plugin interoperability and session recovery.
-- [ ] Complete native Linux container network/isolation validation and lifecycle recovery before considering runtime/frontend integration.
+- [ ] Complete native Linux container network/isolation validation and lifecycle recovery before treating opt-in container mode as suitable for secure or production workloads.
 
 Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The alpha version is not a stable-release or production-readiness claim.
 

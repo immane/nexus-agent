@@ -244,6 +244,16 @@ impl WorkerTransport for DockerExecTransport {
         max_response_bytes: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, Self::Error> {
+        self.exchange_controlled(request, max_response_bytes, deadline, &|| false)
+    }
+
+    fn exchange_controlled(
+        &mut self,
+        request: &[u8],
+        max_response_bytes: usize,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, Self::Error> {
         if request.len() > crate::container_worker_protocol::MAX_REQUEST_BYTES {
             return Err(DockerExecError::RequestTooLarge);
         }
@@ -272,7 +282,14 @@ impl WorkerTransport for DockerExecTransport {
             return Err(DockerExecError::Deadline);
         }
         let child = command.spawn().map_err(|_| DockerExecError::Io)?;
-        exchange_child(child, request, max_response_bytes, deadline, &self.reaper)
+        exchange_child(
+            child,
+            request,
+            max_response_bytes,
+            deadline,
+            &self.reaper,
+            cancelled,
+        )
     }
 }
 
@@ -282,6 +299,7 @@ fn exchange_child(
     max_response_bytes: usize,
     deadline: Instant,
     reaper: &Sender<Child>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>, DockerExecError> {
     let (status, output, stderr) = match run_child(
         child,
@@ -290,7 +308,7 @@ fn exchange_child(
         deadline,
         reaper,
         false,
-        None,
+        Some(cancelled),
     ) {
         Ok(result) => result,
         // Once spawned, a timeout cannot establish that the remote worker did

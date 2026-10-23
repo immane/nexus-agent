@@ -1279,6 +1279,29 @@ fn chunked_sse_streams_parse_after_dechunking() {
 }
 
 #[test]
+fn sse_accepts_code_responses_with_more_than_four_thousand_records() {
+    let mut body = String::new();
+    for _ in 0..5_000 {
+        body.push_str(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n",
+        );
+    }
+    body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+    body.push_str("data: [DONE]\n");
+    let (base, _) = serve_raw(&sse_head(body.len()), &body);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::TextDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text.len(), 5_000);
+    assert_eq!(finished(&events).reason(), FinishReason::Stop);
+}
+
+#[test]
 fn https_construction_accepts_explicit_and_default_ports() {
     assert!(
         OpenAiProvider::new("https://h/v1", present_credential(), "m")

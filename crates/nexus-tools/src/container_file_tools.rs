@@ -1,8 +1,7 @@
 //! Uncomposed file-tool adapters for a shared container worker session.
 //!
-//! Cancellation after dispatch is not yet active: a worker exchange may
-//! continue until its deadline. Keep these ports uncomposed until that
-//! lifecycle is integrated with trusted host-side cancellation handling.
+//! Live cancellation after dispatch interrupts the Docker CLI exchange and
+//! poisons the shared session, which invokes bounded workload cleanup.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,9 +42,7 @@ pub struct ContainerFileTool<T> {
 /// Creates uncomposed `host_read`, `host_list`, `host_search`, `host_write`,
 /// and `host_patch` ports sharing one synchronized client session.
 ///
-/// This factory starts no workload, makes no authorization decision, and does
-/// not make any port automatically allowed. In-flight cancellation is not
-/// implemented, so these ports must not yet be composed into a runtime.
+/// This factory starts no workload and makes no authorization decision.
 pub fn container_file_tools<T: WorkerTransport>(
     client: ContainerWorkerClient<T>,
 ) -> ContainerFileTools<T> {
@@ -189,12 +186,14 @@ impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
             Ok(arguments) => arguments,
             Err(_) => return not_started(ExecutionStatus::Failed, "tool arguments are invalid"),
         };
-        match ContainerWorkerClient::<T>::execute_using(
+        let cancelled = || context.is_cancelled();
+        match ContainerWorkerClient::<T>::execute_using_controlled(
             &mut session.transport,
             self.operation,
             &arguments,
             context.output_budget_bytes(),
             deadline,
+            &cancelled,
         ) {
             Ok(outcome) => outcome,
             Err(ClientError::InvalidRequest) => {

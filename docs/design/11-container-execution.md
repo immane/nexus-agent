@@ -1,19 +1,19 @@
 # Optional Container Execution
 
-Status: Partial, feature-gated tools prototype; not selectable by users and not wired to runtime authorization, TUI, or server. The optional modules, bounded Docker transport, worker protocol/adapters, gateway and workload lifecycle owners, keeper, and owner-only state records exist in `nexus-tools`. A pinned linux/arm64 prototype image builds, and a keeper-only Docker Desktop smoke test passed. These checks are not evidence of workload or network isolation. Native Linux host/LAN, metadata, IPv6/DNS, and public-egress validation remain release/security gates. The design below distinguishes implemented prototype behavior from future integration proposals; none of it changes the default local execution path.
+Status: Partial, feature-gated and explicitly selectable through TUI/server startup options. Container tool registrations are composed with container-specific runtime authorization, and each TUI/server session owns its workload lifetime. This is **not a validated isolation boundary**. A pinned linux/arm64 prototype image builds, and a keeper-only Docker Desktop smoke test passed; neither is evidence of workload or network isolation. Native Linux host/LAN, metadata, IPv6/DNS, and public-egress validation remain outstanding security gates. Local execution remains the default and does not require container features.
 
 ### Implementation snapshot
 
 | Area | Implemented prototype | Still not implemented / validated |
 | --- | --- | --- |
-| Build | `container`, `container-worker`, and `container-keeper` features/targets in `nexus-tools`; local default build remains unchanged | Frontend feature forwarding, supported release artifacts, amd64 image inputs |
-| Transport/tools | Bounded Docker worker protocol/transport, workspace file adapters, container `host_exec`, shared poison state | Runtime authorization, TUI/server selection, session policy integration |
-| Lifecycle | Gateway/workload creation, keeper health gate, exact ID/label checks, two-slot process-local cap, cleanup/quarantine | Durable restart reconciliation or operator cleanup UX; lifecycle integration with runtime cancellation/session expiry |
+| Build | `container`, `container-worker`, and `container-keeper` features/targets in `nexus-tools`, forwarded by TUI/server `container` features; local default build remains unchanged | Supported release artifacts, amd64 image inputs |
+| Transport/tools | Bounded Docker worker protocol/transport, workspace file adapters, container `host_exec`, shared poison state | Native Linux isolation validation; tool cancellation stops local transport and quarantines uncertain remote work |
+| Lifecycle | Gateway/workload creation, keeper health gate, exact ID/label checks, two-slot process-local cap, TUI/server session ownership, cleanup/quarantine | Durable restart reconciliation or operator cleanup UX; cancellation/expiry behavior beyond normal runtime/session drop |
 | Ownership | Owner-only records under XDG state path (fallback `~/.local/state`); process lock; stale state blocks admission | Automatic stale-resource recovery; no record is ever automatically trusted as authority to delete after restart |
 | Images | Pinned linux/arm64 builder/runtime manifests and pinned Rust toolchain; Alpine CA package version recorded in `containers/workload/README.md` | Release image approval, amd64/multi-arch inputs, complete provenance/reproducibility review |
 | Isolation | Gateway policy/parser tests and Docker Desktop gateway checks; isolated keeper-only health smoke test | Native Linux isolation checklist, public egress, host/LAN/metadata denial, IPv6 and DNS/rebinding validation |
 
-Current prototype flow (not connected to the runtime) and intended integration boundary:
+Current opt-in flow and isolation boundary:
 
 ```mermaid
 flowchart LR
@@ -27,7 +27,7 @@ flowchart LR
     Workload["Workload container<br/>keeper + worker"]
     Workspace["Selected workspace bind"]
 
-    Runtime -. "not wired; future composition" .-> Adapters
+    Runtime -. "feature-gated opt-in" .-> Adapters
     Adapters <--> Session
     Session --> DockerCLI
     Session --> State
@@ -65,7 +65,7 @@ The prototype is intentionally kept behind `nexus-tools` features and is not exp
 
 The dependency direction remains frontend composition → concrete tools and runtime; runtime → domain types/shared validation. Runtime must not import Docker adapters. Do not introduce a universal execution framework, plugin registry, or permission DSL.
 
-Target composition (proposed; not wired):
+Current opt-in composition:
 
 ```text
 Host: TUI / authenticated loopback server
@@ -138,7 +138,7 @@ nexus-server --tools real --execution container \
   --tools-root /absolute/project --auth-token-env NEXUS_SERVER_TOKEN
 ```
 
-`--execution local|container` defaults to `local`. Omission preserves existing local, fake/demo, and strict-tools behavior. Container selection requires an explicitly supplied existing `--tools-root` in the first release, so an implicit working directory is never accidentally exposed. The server additionally requires `--tools real`; `--tools fake --execution container` is a usage error. `--strict-tools --execution container` is a usage error initially, rather than an ignored safety flag. Unknown values, missing values, and contradictory/repeated execution selections are rejected before side effects.
+`--execution local|container` defaults to `local`. Omission preserves existing local, fake/demo, and strict-tools behavior. Container selection uses `--tools-root` when supplied and otherwise defaults to the current working directory, matching local mode. The server additionally requires `--tools real`; `--tools fake --execution container` is a usage error. `--strict-tools --execution container` is a usage error initially, rather than an ignored safety flag. Unknown values, missing values, and contradictory/repeated execution selections are rejected before side effects.
 
 A local-only binary recognizes a container request and returns a clear unsupported-build error with the feature/build remedy. It never substitutes local execution or fake tools. Container-only options with local execution are rejected.
 
@@ -232,13 +232,13 @@ No network-layer rule can prevent uploading files to an allowed public destinati
 
 ## Tool Transport and Bounded Execution
 
-The internal tools prototype uses a shared session/transport and bounded Docker CLI path for file operations and `host_exec`; it is not yet supplied to runtime `ToolPort` composition. The gateway and workload owners use fixed create/inspect/exec/stop/remove argument shapes, a trusted absolute Docker executable, controlled environment, and exact inspected IDs/labels. No tool argument selects a Docker resource or CLI option. These internal adapters remain unavailable to a running agent until composition and authorization are implemented.
+The tools use a shared session/transport and bounded Docker CLI path for file operations and `host_exec`. The gateway and workload owners use fixed create/inspect/exec/stop/remove argument shapes, a trusted absolute Docker executable, controlled environment, and exact inspected IDs/labels. No tool argument selects a Docker resource or CLI option.
 
 For file tools, invoke the fixed Linux worker through non-TTY `docker exec` and send a single length-bounded JSON request on stdin. The worker executes one supported operation and returns one versioned, bounded JSON response. Include protocol version, operation, normalized arguments, and output allowance; keep lifecycle/scope authority on the host. Reject duplicate keys, trailing messages, invalid UTF-8, oversized frames, unknown operations, and unsupported versions. Content goes over stdin, not shell interpolation or command-line arguments. Drain stdout/stderr concurrently while retaining only bounded output. Protocol violations fail the call and invalidate the environment when integrity is uncertain.
 
 Exec passes the validated argv array through the CLI's argument boundary with fixed container/user/workdir flags; never join it into a shell command. An explicit shell argv is permitted in build mode. Preserve `/workspace` as working directory per call; shell `cd` or exported variables do not mutate subsequent calls. Files and container-local home persist during a healthy session. Match existing stdout/stderr/output budgets and safe diagnostics. Model-produced IDs or paths never select a Docker resource.
 
-The shared session poisons itself on uncertain worker/exec transport outcomes and invokes the internal lifecycle cleanup/quarantine handler. Killing a `docker exec` CLI process still does not establish termination of its remote/container process. Runtime cancellation/deadline integration is not implemented. Before runtime wiring, it must stop and inspect the entire workload/gateway under a finite deadline, confirm termination before reuse, preserve workspace changes, report lost container-local state, and never replay an interrupted command.
+The shared session poisons itself on uncertain worker/exec transport outcomes and invokes the lifecycle cleanup/quarantine handler. Cancellation is observed by the Docker transport and interrupts its local CLI; killing that CLI still does not establish termination of its remote/container process. The runtime quarantines uncertain tool work and does not replay an interrupted command.
 
 If the engine becomes unavailable, retain an explicit unknown/quarantined state and owned resource IDs for reconciliation. Do not report rollback, success, or verified termination. The runtime's existing worker quarantine must not be bypassed; additional dispatch is denied until reconciliation. Bound CLI startup, inspect, pull, preparation, execution, output-drain, and cleanup separately, using the remaining call deadline where applicable.
 
@@ -246,7 +246,7 @@ Proposed preparation limits: 2 seconds for local CLI/daemon probes, 120 seconds 
 
 ## Ownership, Lifecycle, and Resource Accounting
 
-In the prototype, the internal `ContainerWorkloadSession` owns one environment composition and shares adapters/transport references; it is not owned by a TUI/server session. Frontend startup, authenticated server session preparation, cancellation, expiry, and authorization binding remain unimplemented. When integrated, the frontend session must own the single environment handle; adapters must not create mounts or transfer ownership.
+`ContainerWorkloadSession` owns one environment composition and shares adapters/transport references. TUI runtime slots and server sessions own the registrations, which retain that shared owner; dropping the final registration attempts ordered cleanup. Server mode still requires its normal bearer authentication for real tools.
 
 Environment state is explicit: unprepared, preparing, ready, invalidated, cleaning, removed, or unknown/quarantined. Bind every authorization to an environment generation; never reuse old scopes after recreation. Record the actual IDs returned by create and inspect them; resource names are random host-generated correlation labels, not session IDs used directly as paths or authority.
 
@@ -254,15 +254,15 @@ The prototype labels gateway/workload resources with generated identities and re
 
 The prototype attempts bounded workload-then-gateway cleanup and only deletes resources after exact ID/label inspection. Uncertain cleanup keeps ownership metadata and quarantines capacity; ambiguous Docker create/start outcomes retain the record instead of treating a momentary absence as proof. `Drop` provides best-effort cleanup only. The prototype has no dedicated per-session network object, no restart reconciliation UX, and no stale record removal. Never run global prune, remove user images, or delete the host workspace.
 
-The prototype has a process-local cap of two active or quarantined environments. It does not yet coordinate capacity across TUI/server runtime sessions or implement a preparation queue. Any future server session limit must not imply an equivalent number of workloads at 4 GiB each; uncertain cleanup must continue consuming capacity rather than allowing unbounded replacement creation.
+The prototype has a process-local cap of two active or quarantined environments shared across TUI/server sessions. It does not implement a preparation queue. Any future server session limit must not imply an equivalent number of workloads at 4 GiB each; uncertain cleanup must continue consuming capacity rather than allowing unbounded replacement creation.
 
 No shared persistent dependency volume in the first release: it risks cross-session contamination and hidden disk growth. Reuse pinned immutable image layers; home/cache tmpfs disappears with the environment. Build output deliberately remains in the mapped workspace unless the operator selects another project layout. Document Linux artifacts versus native macOS artifacts and architecture mismatches.
 
 ## Implementation Sequence and Review Gates
 
-Completed prototype slices: bounded ownership/create/inspect/cleanup, worker protocol and workspace adapters, `host_exec`, keeper health gate, gateway/workload image recipes, durable owner-only records, and fake-runner coverage. The feature remains uncomposed with frontend/runtime policy. A keeper-only smoke test has run on Docker Desktop with no network or workspace mount; it validates process liveness only.
+Completed slices: bounded ownership/create/inspect/cleanup, worker protocol and workspace adapters, `host_exec`, keeper health gate, gateway/workload image recipes, durable owner-only records, fake-runner coverage, feature-gated runtime authorization, and opt-in TUI/server selection. A keeper-only smoke test has run on Docker Desktop with no network or workspace mount; it validates process liveness only.
 
-Next gates, in order: complete explicit crash/stale-owner reconciliation and lifecycle/cancellation integration design; obtain native Linux validation of gateway policy, host/LAN and metadata denial, IPv6/DNS behavior, and controlled public egress; review image provenance and supported architecture inputs. Only after those gates pass should runtime authorization, TUI selection, and authenticated server session lifecycle be considered. Do not connect real workload execution before then.
+Outstanding security/release gates: complete explicit crash/stale-owner reconciliation; obtain native Linux validation of gateway policy, host/LAN and metadata denial, IPv6/DNS behavior, and controlled public egress; review image provenance and supported architecture inputs. Container mode is intentionally selectable before these gates pass, per operator opt-in, but must not be described or relied on as a security boundary until validation is complete.
 
 Release requires separate Linux and macOS evidence for mount/ownership/isolation, networking, cancellation, cleanup, and architecture support. Measure local-only versus combined artifacts and publish exact runtime/image versions and known limitations. Update user-facing defaults/security documentation only when the corresponding behavior exists; this draft does not supersede accepted local policy.
 
@@ -274,16 +274,16 @@ Live container tests must be explicit opt-in, use preloaded pinned fixture image
 
 | Area | Required evidence |
 | --- | --- |
-| Build variants | `nexus-tools` local default and feature-gated helper/image targets compile; frontend feature forwarding and container-capable TUI/server builds are not implemented |
+| Build variants | Local-only default and feature-gated `nexus-tools`, TUI, and server builds compile |
 | Local compatibility | Existing fake, strict, development, provider, plan, approval, server authentication, and sandbox tests remain unchanged in meaning |
-| CLI and UI | No `--execution` option, frontend indicator, pull flow, or backend admission is implemented |
+| CLI and UI | `--execution local|container` exists; local is default. Container uses `--tools-root` or defaults to cwd, plus immutable gateway/workload digest references. No implicit pull flow is implemented; startup emits an isolation warning |
 | Files | All five file tools operate in the container; traversal/symlink swaps and host absolute paths fail; special files, nested mounts, socket exposure, Unicode and patch conflicts covered |
 | Scope | No container policy path reaches host file adapters; unknown tool/revision, stale environment, external `write_dir`, mount expansion, and plan exec are denied |
 | Credentials | Sentinel provider/host credentials, environment values, agents, home files, engine socket and config do not enter the workload |
 | Network | Public TCP/UDP succeeds as promised; private/host/gateway/metadata/sibling destinations fail for direct IP and DNS/rebinding paths; IPv6 bypass and unsolicited ingress fail |
 | Processes | Shell, compiler and project package installation work unprivileged; fork/PID/memory pressure is bounded; workspace disk exhaustion remains explicitly unguaranteed |
 | Cancellation | Detached child, retained pipes, CLI death, deadline, daemon loss, and concurrent exit produce verified removal or explicit unknown/quarantine, never automatic replay |
-| Lifecycle | Fake-runner checks cover partial setup, exact ownership, timeout/uncertainty, cleanup and process-local quarantine; restart reconciliation and runtime cancellation/expiry integration are not implemented |
+| Lifecycle | Fake-runner checks cover partial setup, exact ownership, timeout/uncertainty, cleanup and process-local quarantine; restart reconciliation remains unimplemented |
 | Mode changes | Build-to-plan terminates background work, replaces writable bind with read-only bind, rejects stale scopes, and keeps reads working |
 | Platforms | Real Linux Engine and macOS Desktop behavior verified separately; supported image architecture/UID and VM sharing documented |
 | Footprint | Executable/dependency delta, unchanged local startup, image/VM/cache cost and cold/warm container readiness measured separately |
@@ -306,7 +306,7 @@ Add explicit worker-target compilation/testing inside each supported Linux image
 
 ## Documentation and Remaining Approval Boundaries
 
-Before any user-selectable runtime integration, update QUICKSTART, testing guidance, component/security designs, affected tool/config contracts, and the accepted defaults decision where appropriate. Explain backend selection, build features, image preparation, internet/data-upload exposure, container-only path/schema behavior, credential differences, resource limits, live-bind risks, recovery, and unsupported workflows. Until then, keep user docs explicit that the backend is an internal prototype and do not present proposed CLI examples as working commands.
+Current startup selection is deliberately explicit and opt-in, while remaining an experimental interface: `--execution container` requires a container-enabled build and immutable image references; the workspace is `--tools-root` or cwd by default (the server additionally requires `--tools real` and its normal authentication token). Keep the unvalidated-isolation warning next to every user-facing description. User documentation must not suggest secure isolation, restart recovery, or a supported release workflow.
 
 Before release, obtain explicit approval for the proposed Docker-only scope, pinned default image/toolchain, trusted gateway with namespace NET_ADMIN, internet-only restrictions versus private-network workflows, non-root/user-package-only installation, local secret-guard behavior difference, and mode-switch loss of container-local state. These are material product/security choices that were not all decided by the initial request. If a choice changes, revise the relevant enforcement and acceptance criteria, not just the wording.
 
@@ -322,4 +322,4 @@ Before release, obtain explicit approval for the proposed Docker-only scope, pin
 - [Docker bridge network behavior](https://docs.docker.com/engine/network/drivers/bridge/)
 - [Cargo features and feature unification](https://doc.rust-lang.org/cargo/reference/features.html)
 
-The pinned image build and isolated keeper smoke are development evidence only. Docker Desktop is not a substitute for native Linux isolation tests. Actual release CLI flags, kernel controls, endpoint handling, image provenance, and architecture support still require review; no user-selectable execution backend or isolation guarantee is approved.
+The pinned image build and isolated keeper smoke are development evidence only. Docker Desktop is not a substitute for native Linux isolation tests. The opt-in CLI flags implemented here are experimental; kernel controls, endpoint handling, image provenance, architecture support, and all security gates still require review. No release-ready backend or isolation guarantee is approved.

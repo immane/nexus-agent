@@ -4,6 +4,14 @@ version = "0.2.0-alpha"
 edition = "2024"
 autotests = false
 
+[features]
+default = []
+container = [
+    "nexus-runtime/container",
+    "nexus-tools/container-worker",
+    "nexus-tools/container-keeper",
+]
+
 [[test]]
 name = "behavior"
 path = "tests/behavior.rs"

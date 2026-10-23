@@ -39,7 +39,10 @@ const TLS_PUMP_CHUNK_BYTES: usize = 8_192;
 /// Bound distinct provider tool identities before creating accumulator state.
 const MAX_SSE_TOOL_IDENTITIES: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize;
 /// Bound tiny SSE records independently of the response byte ceiling.
-const MAX_SSE_RECORDS: usize = 4_096;
+// Token-oriented providers may emit thousands of small SSE records for a
+// normal code response. Keep a separate CPU/event-count bound, but let the
+// existing 8 MiB response cap remain the primary payload limit.
+const MAX_SSE_RECORDS: usize = 65_536;
 
 fn provider_error(category: ErrorCategory, message: &'static str) -> ProviderEvent {
     ProviderEvent::Failed(

@@ -7,6 +7,11 @@ autotests = false
 [features]
 # Redundant coverage of the test-only keymap, not the binary's real keymap.
 low-value-tests = []
+container = [
+    "nexus-runtime/container",
+    "nexus-tools/container-worker",
+    "nexus-tools/container-keeper",
+]
 
 [[test]]
 name = "behavior"

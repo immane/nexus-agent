@@ -62,6 +62,8 @@ pub mod container_worker_protocol;
 mod container_worker_transport;
 #[cfg(feature = "container")]
 mod container_workload;
+#[cfg(feature = "container")]
+pub use container_workload::container_tool_registrations;
 mod development;
 mod exec;
 mod fs_access;

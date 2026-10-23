@@ -130,10 +130,20 @@ struct SessionConfig {
     /// with the template so every slot shares the startup wiring while
     /// keeping its own runtime and selection.
     tools_root: Option<std::path::PathBuf>,
+    tools_root_explicit: bool,
     strict_tools: bool,
+    execution: ExecutionMode,
+    gateway_image: Option<String>,
+    workload_image: Option<String>,
     /// Scripted demo explicitly requested with `--demo`. Without it the
     /// runtime never serves fakes, however unconfigured the selection is.
     demo: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode {
+    Local,
+    Container,
 }
 
 #[derive(Debug)]
@@ -170,10 +180,57 @@ fn load_session_config() -> io::Result<SessionConfig> {
         StartupAction::Usage => startup_usage(),
     };
     let mut session = session_config_at(resolve_path(None))?;
+    let root_resolved = resolve_tools_root(args.tools_root.clone()).is_some();
+    validate_execution_args(&args, root_resolved, cfg!(feature = "container"))?;
     session.tools_root = resolve_tools_root(args.tools_root);
     session.demo = args.demo;
     session.strict_tools = args.strict_tools;
+    session.tools_root_explicit = args.tools_root_explicit;
+    session.execution = args.execution;
+    session.gateway_image = args.gateway_image;
+    session.workload_image = args.workload_image;
     Ok(session)
+}
+
+fn validate_execution_args(
+    args: &StartupArgs,
+    root_resolved: bool,
+    container_feature: bool,
+) -> io::Result<()> {
+    if args.execution == ExecutionMode::Local {
+        if args.gateway_image.is_some() || args.workload_image.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "container images require --execution container",
+            ));
+        }
+        return Ok(());
+    }
+    if !root_resolved {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "container execution requires an available workspace directory",
+        ));
+    }
+    if args.strict_tools || args.demo {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "container execution cannot be combined with --strict-tools or --demo",
+        ));
+    }
+    if args.gateway_image.is_none() || args.workload_image.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "container execution requires --gateway-image and --container-image",
+        ));
+    }
+    if !container_feature {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "container execution is not enabled in this build; rebuild nexus-tui with --features container",
+        ));
+    }
+    Ok(())
 }
 
 /// Resolves the file-tool jail: an explicit `--tools-root` wins, otherwise
@@ -206,7 +263,11 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
         user_config: shared_user_config(config, path),
         active_model,
         tools_root: None,
+        tools_root_explicit: false,
         strict_tools: false,
+        execution: ExecutionMode::Local,
+        gateway_image: None,
+        workload_image: None,
         demo: false,
     })
 }
@@ -253,9 +314,13 @@ struct StartupArgs {
     /// the working directory by default; `None` (tests only) keeps every
     /// tool scripted. Development writes in this root are automatic.
     tools_root: Option<std::path::PathBuf>,
+    tools_root_explicit: bool,
     /// Serve the scripted demo wiring (fake provider/tools, canned
     /// submission). The dev-version default is off.
     demo: bool,
+    execution: ExecutionMode,
+    gateway_image: Option<String>,
+    workload_image: Option<String>,
 }
 
 /// Argument-parser outcome: run with the parsed jail, or print usage.
@@ -274,12 +339,45 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     let mut tools_root: Option<std::path::PathBuf> = None;
     let mut demo = false;
     let mut strict_tools = false;
+    let mut execution = ExecutionMode::Local;
+    let mut execution_set = false;
+    let mut gateway_image = None;
+    let mut workload_image = None;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return StartupAction::Usage,
             "--demo" => demo = true,
             "--strict-tools" => strict_tools = true,
+            "--execution" => {
+                if execution_set {
+                    return StartupAction::Usage;
+                }
+                execution_set = true;
+                execution = match args.next().map(String::as_str) {
+                    Some("local") => ExecutionMode::Local,
+                    Some("container") => ExecutionMode::Container,
+                    _ => return StartupAction::Usage,
+                };
+            }
+            "--gateway-image" => {
+                if gateway_image.is_some() {
+                    return StartupAction::Usage;
+                }
+                gateway_image = match args.next() {
+                    Some(value) if !value.is_empty() => Some(value.clone()),
+                    _ => return StartupAction::Usage,
+                };
+            }
+            "--container-image" => {
+                if workload_image.is_some() {
+                    return StartupAction::Usage;
+                }
+                workload_image = match args.next() {
+                    Some(value) if !value.is_empty() => Some(value.clone()),
+                    _ => return StartupAction::Usage,
+                };
+            }
             "--tools-root" => match args.next() {
                 Some(value) if !value.is_empty() => {
                     tools_root = Some(std::path::PathBuf::from(value));
@@ -290,16 +388,28 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
         }
     }
     StartupAction::Run(StartupArgs {
+        tools_root_explicit: tools_root.is_some(),
         tools_root,
         demo,
         strict_tools,
+        execution,
+        gateway_image,
+        workload_image,
     })
 }
 
 /// Prints usage and exits 2. Splitting the exit from the parser keeps
 /// every rejection path unit-testable.
 fn startup_usage() -> ! {
-    eprintln!("usage: nexus-tui [--tools-root PATH] [--strict-tools] [--demo] [--help]");
+    eprintln!(
+        "usage: nexus-tui [--tools-root PATH] [--strict-tools] [--demo] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--help]"
+    );
+    #[cfg(feature = "container")]
+    eprintln!(
+        "  container: --execution container [--tools-root PATH] --gateway-image IMAGE@sha256:DIGEST --container-image IMAGE@sha256:DIGEST"
+    );
+    #[cfg(not(feature = "container"))]
+    eprintln!("  --execution container is available only in container-enabled builds.");
     eprintln!("  Without --demo the TUI attempts live wiring; unconfigured runs");
     eprintln!("  fail with a not-configured diagnostic instead of serving fakes.");
     eprintln!("  With --demo, every tool is scripted and one canned submission fires.");
@@ -521,7 +631,11 @@ impl SessionRegistry {
         let label = format!("s{number}");
         front.state.set_session_label(&label);
         front.state.notice(&format!("session {label} started"));
-        front.attach_live(live, self.template.tools_root.as_deref());
+        front.attach_live(
+            live,
+            self.template.tools_root.as_deref(),
+            self.template.execution,
+        );
         self.slots.push(SessionSlot {
             label,
             runtime,
@@ -715,37 +829,88 @@ fn take_selection_for_run(binding: &LiveHandle, run: &RunId) -> LiveSelection {
 fn build_live_runtime(
     session_config: &SessionConfig,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
-    let config = RuntimeConfig {
-        limits: tui_runtime_limits(),
-        policy: match &session_config.tools_root {
+    let policy = match session_config.execution {
+        ExecutionMode::Local => match &session_config.tools_root {
             Some(root) if !session_config.strict_tools => {
                 Policy::development(root).map_err(io::Error::other)?
             }
             _ => Policy::m0_test(),
         },
-        has_approval_handler: true,
-    };
-    let tools = match &session_config.tools_root {
-        None => vec![
-            ToolRegistration::read(Arc::new(FakeTool::read_only())),
-            ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
-        ],
-        Some(root) => {
-            let canonical = std::fs::canonicalize(root).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "tools root is unusable")
-            })?;
-            if !canonical.is_dir() {
+        ExecutionMode::Container => {
+            #[cfg(feature = "container")]
+            {
+                if !session_config.tools_root_explicit || session_config.strict_tools {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "container execution requires an explicit workspace and development policy",
+                    ));
+                }
+                Policy::container()
+            }
+            #[cfg(not(feature = "container"))]
+            {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "tools root is unusable",
+                    io::ErrorKind::Unsupported,
+                    "container execution is not enabled in this build",
                 ));
             }
-            if !session_config.strict_tools {
-                let tools = nexus_tools::development_tools(&canonical).map_err(io::Error::other)?;
-                return runtime_with_tools(session_config, config, tools);
-            }
-            nexus_tools::strict_tools(&canonical).map_err(io::Error::other)?
         }
+    };
+    let config = RuntimeConfig {
+        limits: tui_runtime_limits(),
+        policy,
+        has_approval_handler: true,
+    };
+    let tools = match session_config.execution {
+        ExecutionMode::Container => {
+            #[cfg(feature = "container")]
+            {
+                let root = session_config.tools_root.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "container workspace is missing",
+                    )
+                })?;
+                let gateway_image = session_config.gateway_image.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "gateway image is missing")
+                })?;
+                let workload_image = session_config.workload_image.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "workload image is missing")
+                })?;
+                nexus_tools::container_tool_registrations(root, gateway_image, workload_image)
+                    .map_err(io::Error::other)?
+            }
+            #[cfg(not(feature = "container"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "container execution is not enabled in this build",
+                ));
+            }
+        }
+        ExecutionMode::Local => match &session_config.tools_root {
+            None => vec![
+                ToolRegistration::read(Arc::new(FakeTool::read_only())),
+                ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
+            ],
+            Some(root) => {
+                let canonical = std::fs::canonicalize(root).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "tools root is unusable")
+                })?;
+                if !canonical.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "tools root is unusable",
+                    ));
+                }
+                if !session_config.strict_tools {
+                    let tools =
+                        nexus_tools::development_tools(&canonical).map_err(io::Error::other)?;
+                    return runtime_with_tools(session_config, config, tools);
+                }
+                nexus_tools::strict_tools(&canonical).map_err(io::Error::other)?
+            }
+        },
     };
     runtime_with_tools(session_config, config, tools)
 }
@@ -770,15 +935,26 @@ fn runtime_with_tools(
 /// One-line wiring report for the transcript: which provider (if any) the
 /// next run resolves to, and whether file tools are real. Only counts and the
 /// operator's own identities appear; values never do.
-fn wiring_notice(selection: &LiveSelection, tools_root: Option<&std::path::Path>) -> String {
+fn wiring_notice(
+    selection: &LiveSelection,
+    tools_root: Option<&std::path::Path>,
+    execution: ExecutionMode,
+) -> String {
     let provider = match resolve_live_adapter(selection, env_credential) {
         LiveResolve::Demo => "demo script".to_owned(),
         LiveResolve::Live(adapter) => format!("live adapter ({})", adapter.model()),
         LiveResolve::Failed(_, message) => format!("unavailable ({message})"),
     };
-    let tools = match tools_root {
-        None => "scripted tools".to_owned(),
-        Some(root) => format!(
+    let tools = match (execution, tools_root) {
+        (ExecutionMode::Container, Some(root)) => format!(
+            "UNVALIDATED container tools at {} (workspace is writable; isolation is not established)",
+            root.display()
+        ),
+        (ExecutionMode::Container, None) => {
+            "UNVALIDATED container tools (workspace unavailable)".to_owned()
+        }
+        (ExecutionMode::Local, None) => "scripted tools".to_owned(),
+        (ExecutionMode::Local, Some(root)) => format!(
             "real file tools + sandboxed exec at {} (writes/exec require approval)",
             root.display()
         ),
@@ -791,8 +967,9 @@ fn main() {
     eprintln!(
         "nexus-tui dev: live wiring by default, ephemeral store. \
           A slot whose model resolves to a configured provider with a credential \
-          uses the real adapter (network egress, billable); --tools-root enables \
-           real jailed file tools + sandboxed exec (writes/exec require approval). \
+          uses the real adapter (network egress, billable); local --tools-root enables \
+           jailed file tools + sandboxed exec (writes/exec require approval). \
+           --execution container is experimental and does not establish isolation. \
            Without a configured provider, runs fail as not-configured; \
            relaunch with --demo for the scripted demo. No durable storage."
     );
@@ -829,6 +1006,13 @@ async fn run() -> io::Result<()> {
     // fail as a startup error on the plain stderr surface, never inside a
     // restored-screen report. Both paths below share this one load.
     let session_config = load_session_config()?;
+    if session_config.execution == ExecutionMode::Container {
+        eprintln!(
+            "SECURITY WARNING: container isolation is not validated on native Linux. \
+             The selected workspace is live-mounted; model/tool code can read and modify it. \
+             Public egress and host/LAN/metadata denial are not verified."
+        );
+    }
     if io::stdout().is_terminal() {
         match nexus_tui::TerminalGuard::setup() {
             Ok(mut guard) => {
@@ -1153,13 +1337,18 @@ impl Frontend {
     /// Attaches the slot's shared selection handle, syncs it, and reports
     /// the resolved wiring to the transcript. Production slots call this
     /// once, right after [`Frontend::with_config`].
-    fn attach_live(&mut self, live: LiveHandle, tools_root: Option<&std::path::Path>) {
+    fn attach_live(
+        &mut self,
+        live: LiveHandle,
+        tools_root: Option<&std::path::Path>,
+        execution: ExecutionMode,
+    ) {
         self.live = Some(live);
         self.sync_live_binding();
         let message = {
             let handle = self.live.as_ref().expect("live handle attached");
             let selection = handle.lock().expect("live selection lockable");
-            wiring_notice(&selection, tools_root)
+            wiring_notice(&selection, tools_root, execution)
         };
         self.state.notice(&message);
     }
@@ -2718,7 +2907,11 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
         SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?;
     let mut front = Frontend::with_config(session, session_config.clone());
     front.state.set_session_label("s1");
-    front.attach_live(live, session_config.tools_root.as_deref());
+    front.attach_live(
+        live,
+        session_config.tools_root.as_deref(),
+        session_config.execution,
+    );
     let demo = session_config.demo;
     let mut sessions = SessionRegistry::new(
         SessionSlot {
@@ -4486,8 +4679,12 @@ mod cov_main_topup {
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
+            tools_root_explicit: false,
             demo: false,
             strict_tools: true,
+            execution: ExecutionMode::Local,
+            gateway_image: None,
+            workload_image: None,
         }
     }
 
@@ -4527,8 +4724,12 @@ mod cov_main_topup {
             user_config: shared_user_config(config, None),
             active_model,
             tools_root: None,
+            tools_root_explicit: false,
             demo: false,
             strict_tools: true,
+            execution: ExecutionMode::Local,
+            gateway_image: None,
+            workload_image: None,
         }
     }
 
@@ -4942,7 +5143,7 @@ mod cov_main_topup {
             pending_run: None,
             pending_run_id: None,
         }));
-        front.attach_live(binding.clone(), None);
+        front.attach_live(binding.clone(), None, ExecutionMode::Local);
 
         front.prepare_run_selection();
         front.select_model("m1");
@@ -4968,7 +5169,7 @@ mod cov_main_topup {
             pending_run: None,
             pending_run_id: None,
         }));
-        front.attach_live(binding.clone(), None);
+        front.attach_live(binding.clone(), None, ExecutionMode::Local);
 
         assert!(front.prepare_run_selection());
         let first = run_id("cancelled-before-provider");
@@ -6560,6 +6761,59 @@ mod cov_live_wiring {
     }
 
     #[test]
+    fn container_selection_is_explicit_and_requires_a_workspace_and_images() {
+        let incomplete = match parse_startup_args(&argv(&["--execution", "container"])) {
+            StartupAction::Run(parsed) => parsed,
+            StartupAction::Usage => panic!("syntactically valid flags should parse"),
+        };
+        assert!(validate_execution_args(&incomplete, true, cfg!(feature = "container")).is_err());
+        let incomplete_images = match parse_startup_args(&argv(&[
+            "--execution",
+            "container",
+            "--tools-root",
+            "/workspace",
+            "--gateway-image",
+            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])) {
+            StartupAction::Run(parsed) => parsed,
+            StartupAction::Usage => panic!("syntactically valid flags should parse"),
+        };
+        assert!(
+            validate_execution_args(&incomplete_images, true, cfg!(feature = "container")).is_err()
+        );
+        match parse_startup_args(&argv(&[
+            "--execution",
+            "container",
+            "--tools-root",
+            "/workspace",
+            "--gateway-image",
+            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--container-image",
+            "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])) {
+            StartupAction::Run(parsed) => {
+                assert_eq!(parsed.execution, ExecutionMode::Container);
+                assert!(parsed.tools_root_explicit);
+                assert!(validate_execution_args(&parsed, true, true).is_ok());
+            }
+            StartupAction::Usage => panic!("complete container options should parse"),
+        }
+        let current_directory_default = match parse_startup_args(&argv(&[
+            "--execution",
+            "container",
+            "--gateway-image",
+            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--container-image",
+            "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])) {
+            StartupAction::Run(parsed) => parsed,
+            StartupAction::Usage => panic!("container images should parse without a root flag"),
+        };
+        assert!(!current_directory_default.tools_root_explicit);
+        assert!(validate_execution_args(&current_directory_default, true, true).is_ok());
+    }
+
+    #[test]
     fn tools_root_defaults_to_the_working_directory() {
         let explicit = std::path::PathBuf::from("/srv/root");
         assert_eq!(
@@ -6689,11 +6943,24 @@ mod cov_live_wiring {
         let notice = wiring_notice(
             &selection_with(Some("ghost")),
             Some(std::path::Path::new("/project")),
+            ExecutionMode::Local,
         );
         assert!(notice.contains("unavailable"));
         assert!(!notice.contains("demo script"));
         assert!(notice.contains("real file tools + sandboxed exec"));
         assert!(notice.contains("writes/exec require approval"));
+    }
+
+    #[test]
+    fn container_wiring_notice_does_not_claim_isolation() {
+        let notice = wiring_notice(
+            &selection_with(None),
+            Some(std::path::Path::new("/project")),
+            ExecutionMode::Container,
+        );
+        assert!(notice.contains("UNVALIDATED container tools"));
+        assert!(notice.contains("isolation is not established"));
+        assert!(!notice.contains("real file tools + sandboxed exec"));
     }
 
     #[test]
@@ -6866,8 +7133,12 @@ mod cov_live_wiring {
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: Some(missing),
+            tools_root_explicit: true,
             demo: false,
             strict_tools: true,
+            execution: ExecutionMode::Local,
+            gateway_image: None,
+            workload_image: None,
         };
         assert!(
             build_live_runtime(&session).is_err(),
@@ -6890,8 +7161,12 @@ mod cov_live_wiring {
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
+            tools_root_explicit: false,
             demo: false,
             strict_tools: true,
+            execution: ExecutionMode::Local,
+            gateway_image: None,
+            workload_image: None,
         };
         let (_runtime, _streams, live) = build_live_runtime(&session).expect("demo wiring builds");
         assert!(

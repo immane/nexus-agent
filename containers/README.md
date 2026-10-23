@@ -1,9 +1,9 @@
 # Container execution prototypes and gateway checks
 
 This directory contains gateway and workload image prototypes plus opt-in
-gateway checks; none wires container execution into the Nexus runtime, TUI, or
-server. The internal `nexus-tools` adapters/lifecycle code is feature-gated and
-not user-selectable. The gateway runs in its own network namespace with
+gateway checks. Container execution is selectable only in container-enabled
+TUI/server builds with explicit startup options; it remains an unvalidated
+prototype and is not an approved isolation boundary. The gateway runs in its own network namespace with
 `NET_ADMIN` confined to that container. A workload shares that namespace with
 `--cap-drop=ALL` and `no-new-privileges`; never grant `NET_RAW`, `NET_ADMIN`, or a
 Docker socket. It must not start until gateway health/readiness succeeds. Docker
@@ -82,9 +82,9 @@ docker buildx build --platform linux/arm64 --load \
   -t nexus-workload-prototype:dev .
 ```
 
-Building or smoke-testing this image does not approve it for agent sessions.
-Do not add workspace mounts, worker dispatch, or runtime wiring based on the
-keeper health result alone.
+Building or smoke-testing this image does not approve it for secure agent
+sessions. Do not treat workspace mounts, worker dispatch, or successful runtime
+startup as evidence of isolation; native Linux validation remains outstanding.
 
 On a native Linux host only, an additional opt-in probe discovers interface and
 route CIDRs, binds a temporary listener exclusively to the Docker bridge
@@ -115,10 +115,10 @@ resistance.
 
 ## Validation status
 
-**Native Linux validation is deferred by project decision; this does not block
-continued implementation and fake-transport testing.** Until the validation
-checklist below passes, do not treat the gateway as an approved isolation
-boundary, enable real workload execution, or claim Linux host/LAN isolation.
+**Native Linux validation is outstanding.** Container execution can be selected
+explicitly before the validation checklist passes, but do not treat the gateway
+as an approved isolation boundary or claim Linux host/LAN isolation. Use only a
+disposable workspace with no secrets or valuable data.
 When a supported native Linux Docker Engine is available, run the accumulated
 checklist as one validation pass and record engine/kernel versions, host/LAN
 CIDRs, commands, and results here.

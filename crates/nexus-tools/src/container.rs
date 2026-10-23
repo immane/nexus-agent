@@ -40,10 +40,65 @@ pub fn discover_host_ipv4_cidrs() -> Result<Vec<String>, ContainerError> {
     };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let cidrs: Vec<String> = return Err(ContainerError::InvalidCidrs);
+    let cidrs = collapse_ipv4_cidrs(&cidrs)?;
     if cidrs.is_empty() || cidrs.len() > MAX_DISCOVERED_CIDRS {
         return Err(ContainerError::InvalidCidrs);
     }
     Ok(cidrs)
+}
+
+/// Returns a minimal CIDR cover for the same IPv4 ranges. nftables interval
+/// sets reject overlapping elements, and host interface/routes commonly
+/// produce nested and adjacent networks.
+fn collapse_ipv4_cidrs(cidrs: &[String]) -> Result<Vec<String>, ContainerError> {
+    let mut ranges = Vec::with_capacity(cidrs.len());
+    for cidr in cidrs {
+        let (address, prefix) = cidr.split_once('/').ok_or(ContainerError::InvalidCidrs)?;
+        let ip = address
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|_| ContainerError::InvalidCidrs)?;
+        let prefix = prefix
+            .parse::<u8>()
+            .ok()
+            .filter(|prefix| (1..=32).contains(prefix))
+            .ok_or(ContainerError::InvalidCidrs)?;
+        let start = u64::from(u32::from(ip));
+        let size = 1u64 << (32 - prefix);
+        ranges.push((start, start + size - 1));
+    }
+    ranges.sort_unstable_by_key(|range| range.0);
+
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, current_end)) if start <= current_end.saturating_add(1) => {
+                *current_end = (*current_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+
+    let mut result = Vec::new();
+    for (mut start, end) in merged {
+        while start <= end {
+            let remaining = end - start + 1;
+            let alignment_power = if start == 0 {
+                32
+            } else {
+                u64::from((start as u32).trailing_zeros())
+            };
+            let size_power = u64::from(63 - remaining.leading_zeros());
+            let power = alignment_power.min(size_power);
+            let prefix = 32 - power as u8;
+            if prefix == 0 {
+                return Err(ContainerError::InvalidCidrs);
+            }
+            let address = std::net::Ipv4Addr::from(start as u32);
+            result.push(format!("{address}/{prefix}"));
+            start += 1u64 << power;
+        }
+    }
+    Ok(result)
 }
 
 fn discovery_command(path: &str, args: &[&str]) -> Result<String, ContainerError> {
@@ -309,15 +364,29 @@ fn parse_darwin_networks(ifconfig: &str, routes: &str) -> Result<Vec<String>, Co
         if fields[1].starts_with("link#") {
             continue;
         }
-        let gateway = fields[1]
-            .parse::<std::net::Ipv4Addr>()
-            .map_err(|_| ContainerError::InvalidCidrs)?;
+        let gateway = match fields[1].parse::<std::net::Ipv4Addr>() {
+            Ok(gateway) => gateway,
+            // Darwin's routing table includes resolved neighbor/ARP entries
+            // with a link-layer address in the Gateway column. Their IPv4
+            // destination was already added above; the MAC is not a route
+            // gateway CIDR and must not invalidate the complete snapshot.
+            Err(_) if is_darwin_mac_address(fields[1]) => continue,
+            Err(_) => return Err(ContainerError::InvalidCidrs),
+        };
         insert_network(&mut set, &gateway.to_string(), 32)?;
     }
     if !saw_routes_header || !saw_columns_header {
         return Err(ContainerError::InvalidCidrs);
     }
     Ok(set.into_iter().collect())
+}
+
+fn is_darwin_mac_address(value: &str) -> bool {
+    let octets: Vec<_> = value.split(':').collect();
+    octets.len() == 6
+        && octets.iter().all(|octet| {
+            (1..=2).contains(&octet.len()) && octet.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn expand_darwin_ipv4(value: &str) -> Result<String, ContainerError> {
@@ -364,6 +433,7 @@ pub enum ContainerError {
     UnsafeDockerContext,
     OwnershipUnresolved,
     DockerFailure,
+    WorkloadPreparation(&'static str),
     Timeout,
     CleanupUncertain { owner: String, container: String },
 }
@@ -371,6 +441,9 @@ pub enum ContainerError {
 impl std::fmt::Display for ContainerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::WorkloadPreparation(stage) => {
+                return write!(f, "container workload preparation failed at {stage}");
+            }
             Self::InvalidDockerExecutable => {
                 "Docker executable must be a trusted absolute executable path"
             }
@@ -841,6 +914,13 @@ fn valid_image(image: &str) -> bool {
         && digest.len() == 71
         && digest[7..].bytes().all(|b| b.is_ascii_hexdigit())
 }
+
+/// Validates an immutable image digest reference without contacting Docker.
+pub fn validate_image_reference(image: &str) -> Result<(), ContainerError> {
+    valid_image(image)
+        .then_some(())
+        .ok_or(ContainerError::InvalidImage)
+}
 fn valid_cidr(value: &str) -> bool {
     let Some((addr, prefix)) = value.split_once('/') else {
         return false;
@@ -950,7 +1030,7 @@ mod tests {
     #[test]
     fn parses_darwin_interface_and_routes_and_rejects_malformed_data() {
         let interfaces = "en0: flags=8863<UP>\n\tinet 198.51.100.7 netmask 0xffffff00 broadcast 198.51.100.255\nutun4: flags=8051<UP>\n\tinet 10.8.0.2 --> 10.8.0.2 netmask 0xffffff00\nlo0: flags=8049<UP>\n\tinet 127.0.0.1 netmask 0xff000000\n";
-        let routes = "Routing tables\nInternet:\nDestination Gateway Flags Netif\ndefault 203.0.113.1 UG en0\n203.0.113.0/24 198.51.100.1 UG en0\n10.9.0.0/16 10.8.0.1 UG utun4\n127 127.0.0.1 UCS lo0\n169.254 link#4 UCS en0\n192.168.1/24 link#4 UCS en0\n";
+        let routes = "Routing tables\nInternet:\nDestination Gateway Flags Netif\ndefault 203.0.113.1 UG en0\n203.0.113.0/24 198.51.100.1 UG en0\n10.9.0.0/16 10.8.0.1 UG utun4\n127 127.0.0.1 UCS lo0\n169.254 link#4 UCS en0\n192.168.1/24 link#4 UCS en0\n192.168.1.42 0:e0:4c:46:3c:9c UHLWI en0\n";
         assert_eq!(
             parse_darwin_networks(interfaces, routes).unwrap(),
             vec![
@@ -959,6 +1039,7 @@ mod tests {
                 "10.9.0.0/16",
                 "169.254.0.0/16",
                 "192.168.1.0/24",
+                "192.168.1.42/32",
                 "198.51.100.0/24",
                 "198.51.100.1/32",
                 "203.0.113.0/24",
@@ -973,6 +1054,11 @@ mod tests {
             .is_err()
         );
         assert!(parse_darwin_networks(interfaces, "truncated route output\n").is_err());
+        assert!(parse_darwin_networks(
+            interfaces,
+            "Routing tables\nInternet:\nDestination Gateway Flags Netif\n192.168.1.42 invalid-gateway U en0\n"
+        )
+        .is_err());
     }
     #[test]
     fn cidrs_fail_closed() {
@@ -987,6 +1073,23 @@ mod tests {
         ] {
             assert!(!valid_cidr(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn overlapping_and_adjacent_networks_collapse_without_widening() {
+        assert_eq!(
+            collapse_ipv4_cidrs(&[
+                "192.168.1.0/24".to_owned(),
+                "10.0.0.0/8".to_owned(),
+                "192.168.0.0/24".to_owned(),
+                "192.168.1.128/25".to_owned(),
+                "192.168.3.0/24".to_owned(),
+                "192.168.2.0/24".to_owned(),
+            ])
+            .expect("valid CIDRs collapse"),
+            ["10.0.0.0/8", "192.168.0.0/22"]
+        );
+        assert!(collapse_ipv4_cidrs(&["0.0.0.0/1".to_owned(), "128.0.0.0/1".to_owned(),]).is_err());
     }
     #[test]
     fn image_requires_immutable_digest() {

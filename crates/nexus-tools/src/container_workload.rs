@@ -1,9 +1,7 @@
-//! Internal, deliberately uncomposed workload-container lifecycle owner.
+//! Feature-gated workload-container lifecycle owner.
 //!
-//! Keeper health gates tool construction, but this remains uncomposed with
-//! runtime authorization and unvalidated as an isolation boundary.
-
-#![allow(dead_code)] // Intentionally uncomposed until a keeper health gate exists.
+//! Keeper health gates tool construction. Runtime authorization is supplied
+//! by the explicit container policy; network isolation remains unvalidated.
 
 use std::time::Duration;
 use std::{
@@ -12,6 +10,10 @@ use std::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
+};
+
+use nexus_core::{
+    ToolAccess, ToolCall, ToolContext, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
 };
 
 const OWNER_LABEL: &str = "io.nexus-agent.workload-owner";
@@ -331,6 +333,7 @@ struct Workload<R: Runner> {
 }
 
 impl<R: Runner> Workload<R> {
+    #[cfg(test)]
     fn new(runner: R, config: Config) -> Self {
         Self::new_with_ownership(runner, config, None)
     }
@@ -501,7 +504,7 @@ impl<R: Runner> Workload<R> {
             "/home/worker:rw,noexec,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0700".into(),
             "--mount".into(),
             format!(
-                "type=bind,src={},dst=/workspace,rw,bind-propagation=rprivate",
+                "type=bind,src={},dst=/workspace,bind-propagation=rprivate",
                 self.config.workspace.display()
             ),
             "--mount".into(),
@@ -517,6 +520,7 @@ impl<R: Runner> Workload<R> {
             "--entrypoint".into(),
             "/usr/local/bin/nexus-keeper".into(),
             self.config.image.clone(),
+            "run".into(),
         ];
         // Image entrypoint is explicitly overridden; no image defaults execute.
         a.shrink_to_fit();
@@ -653,7 +657,7 @@ impl<R: Runner> Workload<R> {
 }
 
 /// Owns one workload and creates tool adapters only after the keeper passes
-/// Docker's bounded health gate. This remains internal and is not runtime-wired.
+/// Docker's bounded health gate.
 pub(crate) struct ContainerWorkloadSession {
     workload: Arc<Mutex<Workload<DockerRunner>>>,
     resources: Arc<Mutex<LifecycleResources>>,
@@ -667,24 +671,149 @@ pub(crate) struct ContainerWorkloadSession {
     >,
 }
 
+#[derive(Clone, Copy)]
+enum OwnedPortKind {
+    Read,
+    List,
+    Search,
+    Write,
+    Patch,
+    Exec,
+}
+
+struct OwnedContainerPort {
+    owner: Arc<Mutex<ContainerWorkloadSession>>,
+    kind: OwnedPortKind,
+}
+
+impl ToolPort for OwnedContainerPort {
+    fn describe(&self) -> ToolSpec {
+        let owner = lock_container_session(&self.owner);
+        match self.kind {
+            OwnedPortKind::Read => owner.files.read.describe(),
+            OwnedPortKind::List => owner.files.list.describe(),
+            OwnedPortKind::Search => owner.files.search.describe(),
+            OwnedPortKind::Write => owner.files.write.describe(),
+            OwnedPortKind::Patch => owner.files.patch.describe(),
+            OwnedPortKind::Exec => owner.exec.describe(),
+        }
+    }
+
+    fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+        let owner = lock_container_session(&self.owner);
+        match self.kind {
+            OwnedPortKind::Read => owner.files.read.execute(call, context),
+            OwnedPortKind::List => owner.files.list.execute(call, context),
+            OwnedPortKind::Search => owner.files.search.execute(call, context),
+            OwnedPortKind::Write => owner.files.write.execute(call, context),
+            OwnedPortKind::Patch => owner.files.patch.execute(call, context),
+            OwnedPortKind::Exec => owner.exec.execute(call, context),
+        }
+    }
+}
+
+fn lock_container_session(
+    owner: &Mutex<ContainerWorkloadSession>,
+) -> MutexGuard<'_, ContainerWorkloadSession> {
+    owner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Prepares one gateway/workload pair and returns host-registered container
+/// tools. Every port retains the shared owner; dropping the final registration
+/// closes the workload before the gateway, or quarantines uncertain resources.
+pub fn container_tool_registrations(
+    workspace: &Path,
+    gateway_image: &str,
+    workload_image: &str,
+) -> Result<Vec<ToolRegistration>, crate::container::ContainerError> {
+    crate::container::validate_image_reference(gateway_image)?;
+    crate::container::validate_image_reference(workload_image)?;
+    let docker = resolve_docker_executable()
+        .ok_or(crate::container::ContainerError::InvalidDockerExecutable)?;
+    let blocked_cidrs = crate::container::discover_host_ipv4_cidrs()?;
+    let gateway = crate::container::ContainerEnvironment::prepare(
+        workspace,
+        &docker,
+        gateway_image,
+        &blocked_cidrs,
+    )?;
+    let nonce = gateway
+        .identity()
+        .name()
+        .strip_prefix("nexus-gw-")
+        .ok_or(crate::container::ContainerError::DockerFailure)?
+        .to_owned();
+    let session = ContainerWorkloadSession::prepare(gateway, workspace, workload_image, &nonce)
+        .map_err(crate::container::ContainerError::WorkloadPreparation)?;
+    let owner = Arc::new(Mutex::new(session));
+    let registration = |kind, access| {
+        let port: Arc<dyn ToolPort + Send + Sync> = Arc::new(OwnedContainerPort {
+            owner: Arc::clone(&owner),
+            kind,
+        });
+        match access {
+            ToolAccess::Read => ToolRegistration::read(port),
+            ToolAccess::Mutation => ToolRegistration::mutation(port),
+            ToolAccess::Process => ToolRegistration::process(port),
+            ToolAccess::Unknown => unreachable!("container built-ins are classified"),
+        }
+    };
+    Ok(vec![
+        registration(OwnedPortKind::Read, ToolAccess::Read),
+        registration(OwnedPortKind::List, ToolAccess::Read),
+        registration(OwnedPortKind::Search, ToolAccess::Read),
+        registration(OwnedPortKind::Write, ToolAccess::Mutation),
+        registration(OwnedPortKind::Patch, ToolAccess::Mutation),
+        registration(OwnedPortKind::Exec, ToolAccess::Process),
+    ])
+}
+
+fn resolve_docker_executable() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join("docker");
+        let Ok(canonical) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        if !canonical.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !canonical
+                .metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            {
+                continue;
+            }
+        }
+        return Some(canonical);
+    }
+    None
+}
+
 impl ContainerWorkloadSession {
     pub(crate) fn prepare(
         gateway: crate::container::ContainerEnvironment,
         workspace: &Path,
         image: &str,
         nonce: &str,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, &'static str> {
         if !gateway.is_healthy() {
-            return Err(());
+            return Err("gateway readiness");
         }
-        let mut slot = Some(LifecycleSlot::reserve()?);
-        let gateway_id = gateway.container_id().ok_or(())?;
-        let resolver_file = ResolverConfigFile::new(nonce)?;
-        let config = Config::new(workspace, &resolver_file.path, image, nonce, gateway_id)?;
+        let mut slot = Some(LifecycleSlot::reserve().map_err(|_| "session capacity")?);
+        let gateway_id = gateway.container_id().ok_or("gateway identity")?;
+        let resolver_file = ResolverConfigFile::new(nonce).map_err(|_| "resolver file")?;
+        let config = Config::new(workspace, &resolver_file.path, image, nonce, gateway_id)
+            .map_err(|_| "workload configuration")?;
         let docker = gateway.docker_executable();
         let trusted_config = gateway.trusted_docker_config();
-        let ownership = gateway.ownership_record().ok_or(())?;
-        let runner = DockerRunner::new(docker, trusted_config)?;
+        let ownership = gateway.ownership_record().ok_or("ownership record")?;
+        let runner = DockerRunner::new(docker, trusted_config).map_err(|_| "Docker runner")?;
         let mut workload = Workload::new_with_ownership(runner, config, Some(ownership));
         if workload.prepare().is_err() {
             if workload.close().is_err() {
@@ -695,7 +824,7 @@ impl ContainerWorkloadSession {
                     slot.take().expect("reserved lifecycle slot"),
                 );
             }
-            return Err(());
+            return Err("workload creation");
         }
         if workload.start().is_err() {
             if workload.state != State::Removed {
@@ -706,7 +835,7 @@ impl ContainerWorkloadSession {
                     slot.take().expect("reserved lifecycle slot"),
                 );
             }
-            return Err(());
+            return Err("workload readiness");
         }
         let Some(id) = workload.id.as_deref() else {
             if workload.close().is_err() {
@@ -717,7 +846,7 @@ impl ContainerWorkloadSession {
                     slot.take().expect("reserved lifecycle slot"),
                 );
             }
-            return Err(());
+            return Err("workload identity");
         };
         let transport = match crate::container_worker_transport::DockerExecTransport::new(
             docker,
@@ -734,7 +863,7 @@ impl ContainerWorkloadSession {
                         slot.take().expect("reserved lifecycle slot"),
                     );
                 }
-                return Err(());
+                return Err("worker transport");
             }
         };
         let workload = Arc::new(Mutex::new(workload));
@@ -797,11 +926,7 @@ impl ContainerWorkloadSession {
 
 impl Drop for ContainerWorkloadSession {
     fn drop(&mut self) {
-        self.files.quarantine();
-        let cleanup_failed = {
-            let mut workload = lock_workload(&self.workload);
-            workload.state != State::Removed && workload.close().is_err()
-        };
+        let cleanup_failed = self.close().is_err();
         if cleanup_failed || self.quarantined {
             quarantine_resources(&self.resources);
             if let Some(slot) = self.slot.take() {
@@ -975,19 +1100,43 @@ fn valid_nonce(n: &str) -> bool {
     (16..=64).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn valid_image(image: &str) -> bool {
-    let Some((repo, digest)) = image.split_once("@sha256:") else {
-        return false;
-    };
-    !repo.is_empty()
-        && !repo.starts_with('-')
-        && !repo.bytes().any(|b| b.is_ascii_whitespace() || b == 0)
-        && digest.len() == 64
-        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    crate::container::validate_image_reference(image).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workload_config_accepts_local_image_ids_and_repository_digests() {
+        let base = config();
+        for image in [
+            format!("sha256:{}", "a".repeat(64)),
+            format!("example/workload@sha256:{}", "b".repeat(64)),
+        ] {
+            let config = Config::new(
+                &base.workspace,
+                &base.resolver_file,
+                &image,
+                "0123456789abcdef",
+                &base.gateway_id,
+            )
+            .expect("workload accepts the same immutable references as the gateway");
+            assert_eq!(config.image, image);
+        }
+        for image in ["example/workload:latest", "sha256:abc", "-bad@sha256:abc"] {
+            assert!(
+                Config::new(
+                    &base.workspace,
+                    &base.resolver_file,
+                    image,
+                    "0123456789abcdef",
+                    &base.gateway_id,
+                )
+                .is_err()
+            );
+        }
+    }
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -1123,9 +1272,18 @@ mod tests {
         assert!(a.contains(&"--init".into()));
         assert!(a.contains(&"--memory-swap=4g".into()));
         assert!(a.contains(&"/usr/local/bin/nexus-keeper".into()));
+        assert_eq!(
+            &a[a.len() - 4..],
+            &[
+                "--entrypoint",
+                "/usr/local/bin/nexus-keeper",
+                &w.config.image,
+                "run"
+            ]
+        );
         assert!(a.contains(&format!("container:{}", "f".repeat(64))));
         assert!(a.iter().any(|x| x.starts_with("type=bind,src=")
-            && x.ends_with(",dst=/workspace,rw,bind-propagation=rprivate")));
+            && x.ends_with(",dst=/workspace,bind-propagation=rprivate")));
         assert!(
             a.iter()
                 .any(|x| x.contains("dst=/etc/resolv.conf,readonly"))

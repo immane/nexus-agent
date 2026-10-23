@@ -118,6 +118,15 @@ pub enum ToolsMode {
     },
     /// Development file/exec tools with session-scoped external grants.
     Development { root: std::path::PathBuf },
+    /// Explicitly selected container tools bound to this workspace and the
+    /// operator-supplied immutable images. Available only with the `container`
+    /// feature; this mode remains distinct from local `Development` tools.
+    #[cfg(feature = "container")]
+    Container {
+        root: std::path::PathBuf,
+        gateway_image: String,
+        workload_image: String,
+    },
 }
 
 /// Test-only demo provider: serves a fresh scripted demo script for every
@@ -463,6 +472,10 @@ impl Server {
         if let ToolsMode::RealFiles { root } | ToolsMode::Development { root } = &mode {
             ScopedReader::with_root(root)?;
         }
+        #[cfg(feature = "container")]
+        if let ToolsMode::Container { root, .. } = &mode {
+            ScopedReader::with_root(root)?;
+        }
         if let ToolsMode::Development { root } = &mode {
             Policy::development(root)?;
         }
@@ -531,6 +544,8 @@ impl Server {
             policy: match &self.tools_mode {
                 ToolsMode::Development { root } => Policy::development(root)
                     .map_err(|_| SessionError::new(500, "tool permissions are invalid"))?,
+                #[cfg(feature = "container")]
+                ToolsMode::Container { .. } => Policy::container(),
                 _ => Policy::m0_test(),
             },
             has_approval_handler: true,
@@ -548,6 +563,18 @@ impl Server {
                 .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?,
             ToolsMode::RealFiles { root } => nexus_tools::strict_tools(root)
                 .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+            #[cfg(feature = "container")]
+            ToolsMode::Container {
+                root,
+                gateway_image,
+                workload_image,
+            } => nexus_tools::container_tool_registrations(root, gateway_image, workload_image)
+                .map_err(|error| {
+                    // ContainerError contains fixed host-side diagnostics only,
+                    // never Docker output, environment values, or credentials.
+                    eprintln!("container environment preparation failed: {error}");
+                    SessionError::new(503, "container environment is unavailable")
+                })?,
         };
         let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)
             .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;

@@ -23,11 +23,24 @@ status before constructing its file/exec adapters. This is a process-liveness
 gate only; it does not validate network isolation, worker correctness, or
 security of an image that has not been reviewed and pinned.
 
+The lifecycle explicitly passes `--entrypoint /usr/local/bin/nexus-keeper`
+and the `run` argument; overriding the image entrypoint without that argument
+makes the keeper exit with status 2. Both local `sha256:<image-id>` references
+and `repository@sha256:<digest>` references use the gateway's immutable-image
+validation. Mutable tags are not accepted.
+
+If server session creation returns `503 container environment is unavailable`,
+check the host server's stderr for `container environment preparation failed`.
+Workload failures name the preparation stage (configuration, creation,
+readiness, or transport) without forwarding Docker output or credentials to
+the client.
+
 The session composes workload and gateway ownership internally and mounts a
 private host-generated resolver file containing only `nameserver 127.0.0.1`.
 The resolver file is retained if cleanup becomes uncertain so a possibly-live
-workload is not left with its DNS backing removed. Docker Desktop sharing of the
-host temporary directory and this file mount are not validated.
+workload is not left with its DNS backing removed. A local Docker Desktop arm64
+lifecycle smoke check passed with the resolver mount; other host sharing
+configurations and network isolation remain unvalidated.
 
 The internal owner caps active plus quarantined environments at two. A durable,
 owner-only metadata record is written under `XDG_STATE_HOME/nexus-agent/container`
@@ -35,12 +48,11 @@ owner-only metadata record is written under `XDG_STATE_HOME/nexus-agent/containe
 contains only generated names/IDs and trusted Docker/resolver paths. A process
 lock prevents another Nexus process from taking ownership; a stale lock or
 leftover record fails closed and is never automatically removed. Operator-facing
-inspection and targeted restart reconciliation are not implemented, so this is
-still not ready for frontend/session integration.
+inspection and targeted restart reconciliation are not implemented.
 
 These are development prototype inputs, not approved release image inputs. Do
 not publish this prototype as a supported image until its architecture,
 licenses, toolchain, dependency provenance, and runtime contents are reviewed.
-The lifecycle remains internal and is not wired into TUI/Server or an
-execution-mode option. Native Linux network/isolation validation remains a
-separate required gate.
+The lifecycle is available only through opt-in container-enabled TUI/server
+builds and explicit execution-mode flags. Native Linux network/isolation
+validation remains outstanding; successful startup is not security approval.
