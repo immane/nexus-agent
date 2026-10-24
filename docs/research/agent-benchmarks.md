@@ -304,7 +304,9 @@ report effective budgets and reductions. This is lossy deterministic eviction,
 not semantic summarization, and it does not promise knowledge of evicted
 investigation results. The aggregate context cap remains 1 MiB; this is not a
 provider tokenizer or a guarantee that a model's token window will fit. The
-repair has not yet been measured in another live benchmark run.
+Later live runs completed after this repair, as recorded below, but their saved
+diagnostics did not demonstrate an eviction event. They therefore do not yet
+validate eviction behavior under live context pressure.
 
 New-task history admission uses the same transactional projection as later
 turns. Unknown effects and uncertain evidence cannot be evicted (including
@@ -324,6 +326,147 @@ cached. Cache pressure evicts certain exchanges first; if uncertain evidence
 cannot fit, a runtime-wide safety latch blocks subsequent model work with
 `uncertain history retention budget exhausted`. This latch lasts for that
 runtime instance and is not persistent recovery storage.
+
+### Post-repair SymPy reruns and official evaluation (2026-10-24)
+
+These attempts used the existing local Ollama service, not a paid cloud API.
+The Nexus selection ID `ollama-local/qwen3-27b` maps to the actual wire model
+`qwen3.8-27b-iq3m-92k:latest`; these are not two different evaluated models.
+Tools ran with `--features container --execution container --benchmark-pilot`,
+using the cached SymPy workload image and a dedicated task checkout. Container
+isolation remains unvalidated; this result is not security validation.
+
+#### Execution sequence and operational findings
+
+1. The operator initially authorized runner limits of 30 minutes, 150 tool
+   calls, 1,500,000 input tokens, and 50,000 output tokens, plus one-shot
+   approvals for workspace tools in this task container. The runner gained
+   streaming assistant-text logging and optional budget cancellation.
+2. Preflight found that the configured Ollama endpoint needed proxy bypass.
+   A first session request used the wire model name instead of the Nexus model
+   ID and returned HTTP 400, before any model run. Selecting `qwen3-27b` fixed
+   session creation without changing the actual Ollama model.
+3. The budgeted run ended as `cancelled` after 1,213.954 seconds, 65 tool calls,
+   and 39 final usage events: 1,549,703 input / 44,819 output tokens. The stop
+   reason was `input-token budget reached`. Final-usage-based accounting
+   exceeded the input threshold by 49,703 tokens; it is not a strict
+   pre-generation token cap. A 476-byte prediction patch was preserved, adding
+   `__slots__ = ()` to `Printable`. No official score was run for this attempt.
+4. The operator then explicitly requested removal of runner token, time, and
+   call limits and a fresh run. The server retained its finite pilot ceilings:
+   500 model turns, 4,096 tool calls, and 24 hours. Optional runner limits were
+   left unset rather than bypassing runtime validation.
+5. The first fresh session request failed with HTTP 503 because the previous
+   server shutdown left unresolved container ownership state. Inspection
+   matched the ownership record, labels, container IDs, workspace mount, and a
+   dead owner PID. Only those identified old resources were reconciled before
+   retrying session creation. No model run began during that failed creation.
+   Killing the server did not reliably clean up its container resources; this
+   is a separate lifecycle issue, not evidence of model failure.
+6. The fresh run completed normally in 2,127.538 seconds (35 minutes 28 seconds),
+   with 153 tool calls and 128 final usage events: 4,930,308 input / 75,019 output
+   tokens. There was no runner budget stop. The final 476-byte patch changed
+   only `sympy/core/_print_helpers.py`, adding empty slots to `Printable`.
+   `approved_calls` was zero: no approval event was handled, so the opt-in
+   approval flag should not be credited with enabling progress in this run.
+7. Official scoring was initially omitted from the agent-run workflow. The
+   default Python had no `swebench` installation; a subsequent isolated
+   `uv run --with swebench==5.0.2` environment supplied the evaluator. Its first
+   invocation failed before testing because the local dataset JSON was a
+   single object, whereas the loader expects an array. Wrapping the unchanged
+   task row in a one-element array fixed the input format.
+8. The official evaluator then ran the saved prediction against the task image
+   with one worker and a 1,800-second test timeout. It completed in about 25
+   seconds and reported **1 resolved / 1 completed**, with zero unresolved,
+   infrastructure, ambiguous, or error instances and zero unstopped containers.
+   One task image remained cached. This establishes resolution under the
+   benchmark's tests, not correctness for every possible SymPy use case.
+
+The fresh run's artifacts are under
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-sympy-qwen-unbounded-20261024/`:
+
+- `model-output.log`: streamed assistant text and final run result.
+- `server.log`: startup and runtime diagnostics.
+- `sympy__sympy-20590.result.json`: agent termination, usage, and budgets.
+- `sympy__sympy-20590.prediction.jsonl`: exact prediction scored by the harness.
+- `official-evaluation/dataset.json`: one-element task array for the loader.
+- `official-evaluation/report/ollama-local__qwen3-27b.nexus-qwen-sympy-20590-unbounded-20261024.json`:
+  official aggregate result.
+
+The earlier budgeted attempt is preserved under the sibling directory
+`pilot-sympy-qwen-context-20261024/`. Generated patches must not be discarded
+when preparing another attempt. The fresh run's identified workload and gateway
+containers were removed after completion; ownership reconciliation and orderly
+server shutdown still need a durable operational solution.
+
+#### Why convergence was slow: evidence and limits
+
+The fresh run's assistant log identifies the right class by line 7, states the
+root cause and minimal fix by lines 17–31, and claims the first successful
+behavior check by lines 33–35. Most subsequent narration concerns validation
+and cleanup rather than discovering or changing the final fix:
+
+- Lines 37–67: missing pytest, exploration of SymPy's built-in runner, temporary
+  scripts, misunderstood return values, and an incorrect self-written assertion.
+- Lines 69–128: repeated MRO/attribute checks, broader regression suites, and
+  reverting/restoring the fix to investigate an apparently pre-existing xpass.
+- Lines 130–178: repeated checkout/diff confirmation, scratch-file cleanup, and
+  multiple purported final checks after the source fix was already stable.
+
+The container's `/workspace/.git` pointed to an unavailable macOS worktree
+metadata path. The model consequently resorted to comparing `/workspace` with
+the image's separate `/testbed` tree and repeatedly questioned which checkout
+was authoritative. This is a concrete environment defect to address.
+The task prompt also lacked an explicit validation stopping condition and did
+not identify the available test runner.
+
+The assistant repeatedly alleged scratch-file rewriting or concurrent writes.
+Those allegations are **unconfirmed**: saved assistant text is not a complete
+tool trace. It does not preserve every command, result, exit status, or per-call
+timestamp. Its reported test counts are not independently verified here, and
+line positions cannot establish time-to-first-fix. The official resolved result
+is stronger evidence than the assistant's test narrative.
+No context-reduction event was found in saved diagnostics; repetition cannot
+currently be attributed to eviction or missing semantic summaries. A single
+successful task also cannot establish a general performance improvement.
+
+#### Incremental optimization recommendations (not implemented)
+
+The best first change is a **container-valid Git checkout**. Prefer a dedicated
+checkout whose Git metadata resolves inside the container, rather than exposing
+an unrelated host directory to make a worktree pointer resolve. Verify offline
+that `git status`, `git diff`, and `git rev-parse HEAD` work from `/workspace`
+and that modifications are exactly those captured by the host prediction
+export. This addresses an observed defect, has a narrow scope, and can be
+validated without another expensive model run.
+
+Next, provide verified environment facts: `/workspace` is the modification root,
+Python imports resolve there, and an available project-specific test command
+works. Do not reveal gold patches or hidden evaluation tests. Clarifying the
+environment must not expand tool permissions or install arbitrary dependencies
+at model discretion.
+
+Then make completion criteria explicit in the task instructions: reproduce,
+apply the minimal fix, verify the reproduction, run relevant regression tests,
+inspect the final diff, and finish. Repeat a passed check only after relevant
+code/environment changes or new contradictory evidence; expand testing to
+answer a named unresolved risk, not merely for another final confirmation.
+This is guidance, not an automatic success declaration or forced early stop.
+
+Before making causal claims about file anomalies or repetition, add a bounded,
+redacted structured event trace alongside readable assistant output: call IDs,
+tool names/arguments, start/end timestamps, results/exit status, truncation
+markers, usage, and context reductions. Establish retention and output-size
+limits so observability does not become unbounded or leak secrets.
+
+Compare one change at a time on the same task/model/base commit, with explicit
+operator authorization for each live run and no automatic whole-task retries.
+Measure time to first valid patch, time from that patch to termination, repeated
+checks, tool errors, usage, and official resolution. Preserve exact predictions
+and run the official evaluator as a distinct required reporting step; agent
+completion alone is not a score. Only consider advisory stagnation detection
+after traces distinguish repeated work from legitimate verification. Semantic
+summaries and complex runtime stopping heuristics are not the first experiment.
 
 ### Deferred task: semantic context summaries
 
