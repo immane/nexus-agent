@@ -582,6 +582,28 @@ Validate with deterministic regressions and an explicitly budgeted local-model
 long-task comparison before enabling it by default. This is future work, not a
 change to the current eviction behavior or authorization for a live model run.
 
+### Contaminated Astropy challenge attempt (2026-10-24)
+
+A single run of SWE-bench Verified task `astropy__astropy-13398` was stopped
+after the agent log showed it had found and begun reconstructing the upstream
+solution before completing the task. This is **contaminated and invalid**; it
+has no agent score and must not be counted. The separate gold-patch preflight
+resolved successfully, but only validated the evaluator environment.
+
+The confirmed leak was the task checkout: it had been cloned from an older local
+Astropy workspace whose `origin/main` refs included commits beyond the task's
+base revision, including the solution. Public egress was also not independently
+verified as blocked, so additional exposure cannot be ruled out. The run was
+stopped before a patch was produced or official agent evaluation was run; final
+usage is unknown/incomplete. Only the two containers owned by this run were
+removed. Logs and the run manifest remain under
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-astropy-13398-unbounded-20261024/`.
+
+Do not reuse this task as a blind sample. Before another challenge run, create a
+workspace with a fresh, minimal Git object/ref set anchored at the task base,
+audit refs and reachable commits for future fixes, remove upstream remotes, and
+restrict task egress before starting the model.
+
 For a one-task run, first make a disposable checkout at the dataset row's
 `base_commit`, then build that task's adapter image with its immutable registry
 digest:

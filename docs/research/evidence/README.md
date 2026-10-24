@@ -48,5 +48,15 @@ containers. Retained task images are cache entries, not running containers.
 Missing provenance fields must not be reconstructed from current repository or
 model state as if they were historical measurements.
 
+## Excluded contaminated attempt
+
+The separate SWE-bench Verified attempt on `astropy__astropy-13398` is not part
+of the result table and has no valid score. The agent found the upstream fix in
+future commits exposed by inherited Git refs; the run was stopped before a patch
+or official agent evaluation. Its gold-patch preflight is environment validation
+only. Do not reuse this task as a blind sample. The run manifest and logs remain
+outside the repository at
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-astropy-13398-unbounded-20261024/`.
+
 See [benchmark methodology and run history](../agent-benchmarks.md) and the
 [reliability follow-up](../../tasks/09-agent-reliability.md).
