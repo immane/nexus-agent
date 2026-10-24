@@ -41,25 +41,6 @@ research components, not requirements for the Agent Core.
 
 See the [research concept, related papers, and evaluation criteria](docs/research/task-context-compiler.md).
 
-## Screenshots
-
-<div align="center">
-<table>
-<tr>
-<td align="center" width="50%">
-<img src="docs/images/title.jpg" alt="nexus-tui title screen" />
-<br />
-<sub>Title screen — live adapter, sandboxed exec, first reply</sub>
-</td>
-<td align="center" width="50%">
-<img src="docs/images/message.jpg" alt="nexus-tui conversation view" />
-<br />
-<sub>Conversation view — architecture, status, and remaining work</sub>
-</td>
-</tr>
-</table>
-</div>
-
 ## Design Goals
 
 | Priority | Direction |
