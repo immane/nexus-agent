@@ -92,6 +92,7 @@ flowchart TB
     Frontend["Rust TUI / headless / HTTP frontend"]
     Core["Domain core<br/>Types, transitions, contracts"]
     Runtime["Agent runtime<br/>Policy, lifecycle, cancellation"]
+    Context["Context engine: nexus-context<br/>Estimation, safe reduction, memory projection"]
     Provider["Provider adapters<br/>Direct APIs and relay plugins"]
     Tools["Tool execution adapters"]
     Store["Session persistence"]
@@ -101,6 +102,8 @@ flowchart TB
 
     Frontend <-->|Commands / events| Runtime
     Core --- Runtime
+    Runtime --> Context
+    Context --> Core
     Runtime <-->|Provider port| Provider
     Runtime <-->|Tool port| Tools
     Runtime <-->|Store port| Store
@@ -108,6 +111,15 @@ flowchart TB
     Tools --> Bridge
     Bridge <-->|stdio| Plugins
 ```
+
+`nexus-context` is the independent context-processing crate. It owns token
+estimation/calibration, safe exchange selection and staged reduction plans, and
+untrusted derived-memory projection. It depends only on shared `nexus-core`
+types; it cannot call providers, execute tools, or grant permissions. The runtime
+owns model invocation (including summaries), cancellation, deadlines, usage and
+transactional commits. This is the optimization boundary for future context
+work, not an implementation of the Semantic IR, graph/vector retrieval, or LoRA
+research described above.
 
 Container execution is an opt-in path in container-enabled TUI/server builds;
 the runtime applies its normal authorization and lifecycle controls to the

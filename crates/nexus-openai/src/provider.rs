@@ -126,6 +126,7 @@ fn status_error(status: u16) -> ProviderEvent {
 /// `openssl s_client` TLS bridge. The profile selects Chat Completions,
 /// Responses, or Anthropic Messages; see [`OpenAiProvider::from_profile`].
 pub struct OpenAiProvider {
+    context_management: nexus_core::ContextManagementSettings,
     host: String,
     port: u16,
     base_path: String,
@@ -263,6 +264,7 @@ impl OpenAiProvider {
             ));
         }
         Ok(Self {
+            context_management: nexus_core::ContextManagementSettings::default(),
             host,
             port,
             base_path: base_path.trim_end_matches('/').to_owned(),
@@ -290,6 +292,17 @@ impl OpenAiProvider {
             model,
             profile.protocol,
         )
+    }
+
+    /// Binds validated host settings. This does not perform discovery or enable
+    /// token counting or automatic compaction for any protocol.
+    #[must_use]
+    pub fn with_context_management(
+        mut self,
+        settings: nexus_core::ContextManagementSettings,
+    ) -> Self {
+        self.context_management = settings;
+        self
     }
 
     /// Returns the vendor model string sent on the wire.
@@ -348,7 +361,7 @@ impl OpenAiProvider {
             "messages": messages,
             "stream": true,
             "stream_options": {"include_usage": true},
-            "max_tokens": request.output_budget_bytes().div_ceil(4).max(1),
+            "max_tokens": output_token_limit(request),
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
@@ -548,6 +561,13 @@ fn protocol_path(protocol: ProtocolKind, base_path: &str) -> &'static str {
     }
 }
 
+fn output_token_limit(request: &ModelRequest) -> usize {
+    request.max_output_tokens().map_or_else(
+        || request.output_budget_bytes().div_ceil(4).max(1),
+        |tokens| tokens as usize,
+    )
+}
+
 fn protocol_request_body(
     protocol: ProtocolKind,
     model: &str,
@@ -566,7 +586,7 @@ fn protocol_request_body(
             Ok((spec, schema))
         })
         .collect::<Result<Vec<_>, ProviderEvent>>()?;
-    let max_tokens = request.output_budget_bytes().div_ceil(4).max(1);
+    let max_tokens = output_token_limit(request);
     match protocol {
         ProtocolKind::ChatCompletions => unreachable!("handled by the chat request encoder"),
         ProtocolKind::OpenAiResponses => {
@@ -2694,6 +2714,10 @@ fn events_for_json(body: &[u8]) -> Vec<ProviderEvent> {
 }
 
 impl ProviderPort for OpenAiProvider {
+    fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        self.context_management
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             text: true,

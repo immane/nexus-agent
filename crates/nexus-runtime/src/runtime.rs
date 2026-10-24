@@ -29,6 +29,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use nexus_context::CONTEXT_NOTICE_ITEM_KEY;
+use nexus_context::{
+    CONTEXT_NOTICE_TEXT, ContextBounds, TokenEstimator, context_calls_are_paired,
+    history_exchange_effects_certain, is_context_notice, memory_bytes, project_bounded_history,
+};
 use nexus_core::commands::{EventSequence, MAX_TEXT_FRAGMENT_BYTES};
 use nexus_core::{
     AgentError, ApprovalBinding, ApprovalId, ApprovalNotice, ApproveCommand, AssistantText,
@@ -48,8 +54,10 @@ use tokio::task::JoinHandle;
 
 use crate::policy::Policy;
 use crate::transport::EventStreams;
+mod context_compaction;
 #[cfg(test)]
 use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY};
+use context_compaction::{PendingCompaction, prepare_context_request};
 
 /// Single-run lifecycle states (design 02-execution baseline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +156,7 @@ struct State {
 struct RetainedExchange {
     session: SessionId,
     items: Vec<ModelContextItem>,
+    derived_memory: Option<String>,
 }
 
 struct HistoryOmission {
@@ -220,6 +229,11 @@ const CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES: usize = 65_536;
 const MAX_HISTORY_OMISSION_SESSIONS: usize = 128;
 
 struct ActiveRun {
+    context_management: nexus_core::ContextManagementSettings,
+    derived_memory: Option<String>,
+    pending_compaction: Option<PendingCompaction>,
+    input_estimate: u64,
+    token_estimator: TokenEstimator,
     instruction_bytes: usize,
     context_note: String,
     context_note_bytes: usize,
@@ -248,6 +262,7 @@ struct ActiveRun {
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
     history_len: usize,
+    inherited_history: bool,
     initial_context_reduction: Option<ContextReduction>,
     pending_omission_items: usize,
     queue: VecDeque<QueuedCall>,
@@ -296,9 +311,6 @@ struct ContextReduction {
     retained_items: usize,
     retained_bytes: usize,
 }
-
-const CONTEXT_NOTICE_ITEM_KEY: &str = "nexus-context-note";
-const CONTEXT_NOTICE_TEXT: &str = "Nexus context note: Earlier completed exchanges were omitted to fit the context budget. They were not summarized. Re-check earlier facts before relying on them.";
 
 impl Terminal {
     fn completed() -> Self {
@@ -650,7 +662,18 @@ impl Runtime {
                 .saturating_add(self.shared.instructions.payload_bytes())
                 .saturating_add(context_note_bytes),
         });
+        let derived_memory = state
+            .history
+            .iter()
+            .rev()
+            .filter(|exchange| exchange.session == command.session)
+            .find_map(|exchange| exchange.derived_memory.clone());
         state.active = Some(ActiveRun {
+            context_management: self.shared.provider.context_management(),
+            derived_memory,
+            pending_compaction: None,
+            input_estimate: 0,
+            token_estimator: TokenEstimator::default(),
             instruction_bytes: self.shared.instructions.payload_bytes(),
             context_note,
             context_note_bytes,
@@ -674,6 +697,7 @@ impl Runtime {
             continuation: None,
             conversation,
             history_len,
+            inherited_history: history_len > 0,
             initial_context_reduction,
             pending_omission_items: history_omitted_items,
             queue: VecDeque::new(),
@@ -1038,6 +1062,14 @@ impl Runtime {
             if StdInstant::now() >= active.deadline {
                 return Err(Terminal::limit("run duration exhausted"));
             }
+            if self
+                .shared
+                .limits
+                .check_model_turns(active.turns_used)
+                .is_err()
+            {
+                return Err(Terminal::limit("model turn budget exhausted"));
+            }
             let compacted = compact_context(active, self.shared.context_items_bound)?;
             let initial = active.initial_context_reduction.take();
             let mut reduction = match (compacted, initial) {
@@ -1052,9 +1084,14 @@ impl Runtime {
             };
             if let Some(reduction) = reduction.as_mut() {
                 reduction.retained_items = active.conversation.len();
+                reduction.retained_items += usize::from(active.derived_memory.is_some());
                 reduction.retained_bytes = conversation_bytes(&active.conversation)
                     .saturating_add(active.instruction_bytes)
-                    .saturating_add(active.context_note_bytes);
+                    .saturating_add(active.context_note_bytes)
+                    .saturating_add(context_compaction::projection_overhead(
+                        active,
+                        &active.context_note,
+                    ));
             }
             if let Some(reduction) = reduction {
                 publish_context_reduction(&self.shared, active, run, reduction);
@@ -1066,34 +1103,7 @@ impl Runtime {
                 self.shared.incarnation, active.run_n
             ))
             .map_err(|_| Terminal::failed_internal("turn identity is invalid"))?;
-            let enabled: Vec<ToolId> = self
-                .shared
-                .tool_order
-                .iter()
-                .filter_map(|name| {
-                    self.shared
-                        .tools
-                        .get(name)
-                        .map(|tool| tool.spec.id().clone())
-                })
-                .collect();
-            let request = ModelRequest::new(
-                active.run.clone(),
-                turn.clone(),
-                active.profile.clone(),
-                enabled,
-                active.continuation.clone(),
-                self.shared.effective_output_budget,
-            )
-            .map_err(|_| Terminal::limit("model request budget is invalid"))?
-            .with_instructions(self.shared.instructions.clone())
-            .map_err(|_| Terminal::limit("model instructions exceed their budget"))?
-            .with_context_note(active.context_note.clone())
-            .map_err(|_| Terminal::limit("model context note exceeds its budget"))?
-            .with_conversation(active.conversation.clone())
-            .map_err(|_| Terminal::limit("model conversation exceeds its budget"))?
-            .with_tool_definitions(self.shared.tool_definitions.clone())
-            .map_err(|_| Terminal::limit("model tool definitions exceed their budget"))?;
+            let request = prepare_context_request(&self.shared, active, &turn)?;
             let context = ProviderContext::new(active.started.elapsed(), active.cancelled, None)
                 .with_control(active.token.clone(), active.deadline);
             (request, context, turn, active.deadline)
@@ -1178,6 +1188,29 @@ impl Runtime {
                 // biased, do not accept the provider batch without checking
                 // the invocation's live control state again.
                 if let Err(error) = context.check_active() {
+                    let mut state = self.shared.state.lock().await;
+                    if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+                        && active.pending_compaction.is_some()
+                    {
+                        context_compaction::record_summary_usage(
+                            &self.shared,
+                            active,
+                            run,
+                            &events,
+                            &mut prefix,
+                        );
+                        if let Some(outcome) = active.terminal {
+                            return Err(Terminal {
+                                outcome,
+                                error: active.terminal_error.clone(),
+                            });
+                        }
+                        if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                            return Err(Terminal::limit(
+                                "summary provider stream exceeded its bound",
+                            ));
+                        }
+                    }
                     return Err(match error.category() {
                         ErrorCategory::Cancelled => Terminal::cancelled_with(error),
                         ErrorCategory::Timeout => {
@@ -1191,14 +1224,13 @@ impl Runtime {
                 // publishes before the authoritative batch ingests.
                 self.drain_stream(run, &turn, &mut stream_rx, &stream_bytes, &mut prefix)
                     .await;
-                if stream_overflow.load(Ordering::SeqCst) {
-                    return Err(Terminal::limit(
-                        "provisional provider stream exceeded its bound",
-                    ));
-                }
-                if prefix.exceeded {
-                    return Err(Terminal::limit("provisional output budget exhausted"));
-                }
+                self.check_completed_stream_limits(
+                    run,
+                    &events,
+                    &mut prefix,
+                    stream_overflow.load(Ordering::SeqCst),
+                )
+                .await?;
                 self.ingest_model_batch(run, &turn, events, &mut prefix)
                     .await
             }
@@ -1261,6 +1293,37 @@ impl Runtime {
         }
     }
 
+    /// Account an available summary batch even when draining its provisional
+    /// prefixes exhausted a stream bound. Limit handling never commits memory.
+    async fn check_completed_stream_limits(
+        &self,
+        run: &RunId,
+        events: &[ProviderEvent],
+        prefix: &mut StreamedPrefix,
+        overflow: bool,
+    ) -> Result<(), Terminal> {
+        let message = if overflow {
+            "provisional provider stream exceeded its bound"
+        } else if prefix.exceeded {
+            "provisional output budget exhausted"
+        } else {
+            return Ok(());
+        };
+        let mut state = self.shared.state.lock().await;
+        if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+            && active.pending_compaction.is_some()
+        {
+            context_compaction::record_summary_usage(&self.shared, active, run, events, prefix);
+            if let Some(outcome) = active.terminal {
+                return Err(Terminal {
+                    outcome,
+                    error: active.terminal_error.clone(),
+                });
+            }
+        }
+        Err(Terminal::limit(message))
+    }
+
     /// Publishes one provisional provider event while its turn is still in
     /// flight. Only presentation-safe prefixes publish here: text fragments
     /// (flushed at once so the frontend updates now, not at the terminal),
@@ -1315,8 +1378,10 @@ impl Runtime {
                     .entry(item_key.clone())
                     .or_default()
                     .push_str(&text);
-                buffer_text_fragments(&self.shared, active, run, turn, &item_key, &text);
-                flush_text(&self.shared, active);
+                if active.pending_compaction.is_none() {
+                    buffer_text_fragments(&self.shared, active, run, turn, &item_key, &text);
+                    flush_text(&self.shared, active);
+                }
             }
             ProviderEvent::ToolCallDelta { item_key, .. } => {
                 if !record_identity(prefix, item_key.len()) {
@@ -1326,12 +1391,14 @@ impl Runtime {
                     return;
                 }
                 prefix.preview_keys.insert(item_key.clone());
-                emit_data(
-                    &self.shared,
-                    active,
-                    run,
-                    EventPayload::ToolCallPreview { item_key },
-                );
+                if active.pending_compaction.is_none() {
+                    emit_data(
+                        &self.shared,
+                        active,
+                        run,
+                        EventPayload::ToolCallPreview { item_key },
+                    );
+                }
             }
             ProviderEvent::Usage(usage) => {
                 if usage.finality() == UsageFinality::Provisional {
@@ -1379,6 +1446,20 @@ impl Runtime {
         events: Vec<ProviderEvent>,
         prefix: &mut StreamedPrefix,
     ) -> Result<RunState, Terminal> {
+        {
+            let mut state = self.shared.state.lock().await;
+            if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+                && active.pending_compaction.is_some()
+            {
+                return context_compaction::ingest_summary(
+                    &self.shared,
+                    active,
+                    run,
+                    events,
+                    prefix,
+                );
+            }
+        }
         // Full-turn atomic validation: duplicate references, partial/final
         // disagreement, and finish-reason conflicts fail before any
         // admission, identity consumption, or queue mutation. An honestly
@@ -1428,6 +1509,7 @@ impl Runtime {
             _ => None,
         };
         let successful_turn = terminal.as_ref().is_some_and(Result::is_ok);
+        context_compaction::calibrate_estimate(active, &events);
         let mut streamed_index = 0;
         let mut usage_prefix_matches = true;
         let mut unmatched_usage = prefix.usage_prefix.clone();
@@ -2520,7 +2602,11 @@ impl Runtime {
         // The exception is a narrowly retained exchange containing an
         // uncertain tool effect: it is required evidence against blind retry.
         if outcome == RunOutcome::Completed || preserve_uncertain_exchange {
-            let mut items = active.conversation[active.history_len..].to_vec();
+            let mut items = if outcome == RunOutcome::Completed {
+                active.conversation.clone()
+            } else {
+                active.conversation[active.history_len..].to_vec()
+            };
             if outcome != RunOutcome::Completed {
                 let complete_dispatched_calls: HashSet<CallId> = items
                     .iter()
@@ -2549,32 +2635,69 @@ impl Runtime {
                     state.history_safety_exhausted = true;
                 }
             }
+            // The completed request can contain inherited exchanges plus the
+            // new answer. Admit the current exchange as before, then let the
+            // cache's whole-exchange eviction enforce its aggregate ceiling.
+            // Checking the entire projected transcript here would silently
+            // keep stale history whenever appending an answer crosses the cap.
+            let current_items = if outcome == RunOutcome::Completed {
+                &items[active.history_len..]
+            } else {
+                &items
+            };
             if !context_calls_are_paired(&items) {
                 // Never cache orphan results or incomplete calls, including
                 // defensive terminal paths that bypass normal recording.
                 state.history_safety_exhausted = true;
-            } else if items.len() <= self.shared.context_items_bound
-                && conversation_bytes(&items) <= nexus_core::provider::MAX_CONVERSATION_BYTES
+            } else if current_items.len() <= self.shared.context_items_bound
+                && conversation_bytes(current_items) <= nexus_core::provider::MAX_CONVERSATION_BYTES
             {
                 if outcome == RunOutcome::Completed && active.pending_omission_items > 0 {
                     state
                         .history_omissions
                         .retain(|omission| omission.session != active.session);
                 }
-                state.history.push_back(RetainedExchange {
-                    session: active.session.clone(),
-                    items,
-                });
+                if outcome == RunOutcome::Completed && active.inherited_history {
+                    // Commit the selected projection, not the original cache:
+                    // omitted summary sources must not reappear next submit.
+                    state
+                        .history
+                        .retain(|exchange| exchange.session != active.session);
+                }
+                let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
+                for item in items {
+                    if exchanges.is_empty() || matches!(item, ModelContextItem::UserText(_)) {
+                        exchanges.push(Vec::new());
+                    }
+                    exchanges.last_mut().expect("exchange exists").push(item);
+                }
+                let last = exchanges.len().saturating_sub(1);
+                for (index, items) in exchanges.into_iter().enumerate() {
+                    state.history.push_back(RetainedExchange {
+                        session: active.session.clone(),
+                        items,
+                        derived_memory: if outcome == RunOutcome::Completed && index == last {
+                            active.derived_memory.clone()
+                        } else {
+                            None
+                        },
+                    });
+                }
                 while state
                     .history
                     .iter()
-                    .map(|exchange| exchange.items.len())
+                    .map(|exchange| {
+                        exchange.items.len() + usize::from(exchange.derived_memory.is_some())
+                    })
                     .sum::<usize>()
                     > self.shared.context_items_bound
                     || state
                         .history
                         .iter()
-                        .map(|exchange| conversation_bytes(&exchange.items))
+                        .map(|exchange| {
+                            conversation_bytes(&exchange.items)
+                                .saturating_add(memory_bytes(exchange.derived_memory.as_deref()))
+                        })
                         .sum::<usize>()
                         > nexus_core::provider::MAX_CONVERSATION_BYTES
                 {
@@ -2604,7 +2727,26 @@ impl Runtime {
                     }
                 }
             } else {
-                mark_history_omitted(&mut state, active.session.clone(), items.len());
+                let omitted_items = if outcome == RunOutcome::Completed && active.inherited_history
+                {
+                    // Cache rejection must not resurrect source exchanges
+                    // removed from this completed run's selected projection.
+                    // Keep uncertain effects even when their replacement
+                    // cannot be admitted into the finite cache.
+                    let mut removed_items = current_items.len();
+                    state.history.retain(|exchange| {
+                        let remove = exchange.session == active.session
+                            && history_exchange_effects_certain(&exchange.items);
+                        if remove {
+                            removed_items = removed_items.saturating_add(exchange.items.len());
+                        }
+                        !remove
+                    });
+                    removed_items
+                } else {
+                    items.len()
+                };
+                mark_history_omitted(&mut state, active.session.clone(), omitted_items);
                 if preserve_uncertain_exchange || !history_exchange_effects_certain(&items) {
                     state.history_safety_exhausted = true;
                 }
@@ -2761,13 +2903,18 @@ fn compact_context(
 ) -> Result<Option<ContextReduction>, Terminal> {
     // Stage reductions so a context that ultimately cannot fit is not left
     // partially altered before its explicit limit terminal.
-    let mut items = active.conversation.clone();
-    let mut history_len = active.history_len;
-    let mut bytes = conversation_bytes(&items)
+    let items = &active.conversation;
+    let memory_items = usize::from(active.derived_memory.is_some());
+    let item_bound = bound.saturating_sub(memory_items);
+    let bytes = conversation_bytes(items)
         .saturating_add(active.instruction_bytes)
-        .saturating_add(active.context_note_bytes);
+        .saturating_add(active.context_note_bytes)
+        .saturating_add(context_compaction::projection_overhead(
+            active,
+            &active.context_note,
+        ));
     let notice_count = items.iter().filter(|item| is_context_notice(item)).count();
-    if items.len() <= bound
+    if items.len() <= item_bound
         && bytes <= nexus_core::provider::MAX_CONVERSATION_BYTES
         && notice_count <= 1
     {
@@ -2779,104 +2926,39 @@ fn compact_context(
         return Err(context_limit(active, bound));
     }
 
-    let mut removed_items = notice_count;
-    // Remove legacy in-history notices before choosing exchanges. New omission
-    // notices live outside history, so they cannot consume retained-item slots
-    // or become part of a later cached exchange.
-    let historical_notices = items[..history_len]
-        .iter()
-        .filter(|item| is_context_notice(item))
-        .count();
-    items.retain(|item| !is_context_notice(item));
-    history_len -= historical_notices;
-    if !matches!(items.get(history_len), Some(ModelContextItem::UserText(_))) {
-        return Err(context_limit(active, bound));
-    }
     let note = if active.context_note.is_empty() {
         CONTEXT_NOTICE_TEXT
     } else {
         active.context_note.as_str()
     };
     let note_bytes = runtime_note_bytes(note, active.instruction_bytes > 0);
-    bytes = conversation_bytes(&items)
-        .saturating_add(active.instruction_bytes)
-        .saturating_add(note_bytes);
-    while items.len() > bound || bytes > nexus_core::provider::MAX_CONVERSATION_BYTES {
-        let (start, end) = if history_len > 0 {
-            let end = items[..history_len]
-                .iter()
-                .enumerate()
-                .skip(1)
-                .find_map(|(index, item)| {
-                    matches!(item, ModelContextItem::UserText(_)).then_some(index)
-                })
-                .unwrap_or(history_len);
-            if !history_exchange_effects_certain(&items[..end]) {
-                // Historical tool evidence is still needed to avoid an
-                // unsafe blind retry. Never discard it to satisfy this run's
-                // smaller context budget.
-                return Err(context_limit(active, bound));
-            }
-            (0, end)
-        } else {
-            let Some(range) = oldest_removable_exchange(&items) else {
-                return Err(context_limit(active, bound));
-            };
-            range
-        };
+    let reserved_bytes = active
+        .instruction_bytes
+        .saturating_add(note_bytes)
+        .saturating_add(context_compaction::projection_overhead(active, note));
+    let projection = project_bounded_history(
+        items,
+        active.history_len,
+        ContextBounds {
+            max_items: bound,
+            max_bytes: nexus_core::provider::MAX_CONVERSATION_BYTES,
+            reserved_items: memory_items,
+            reserved_bytes,
+        },
+    )
+    .ok_or_else(|| context_limit(active, bound))?;
 
-        let range_bytes = conversation_bytes(&items[start..end]);
-        bytes = bytes.saturating_sub(range_bytes);
-        let count_removed = end - start;
-        items.drain(start..end);
-        if start == 0 {
-            history_len -= end;
-        }
-        removed_items = removed_items.saturating_add(count_removed);
-    }
-
-    active.conversation = items;
-    active.history_len = history_len;
-    if removed_items > 0 {
+    active.conversation = projection.items;
+    active.history_len = projection.history_len;
+    if projection.removed_items > 0 {
         active.context_note = note.to_owned();
         active.context_note_bytes = note_bytes;
     }
     Ok(Some(ContextReduction {
-        removed_items,
-        retained_items: active.conversation.len(),
-        retained_bytes: bytes,
+        removed_items: projection.removed_items,
+        retained_items: active.conversation.len() + memory_items,
+        retained_bytes: projection.retained_bytes,
     }))
-}
-
-fn history_exchange_effects_certain(items: &[ModelContextItem]) -> bool {
-    items.iter().all(|item| match item {
-        ModelContextItem::ToolResult { outcome, .. } => {
-            outcome.effect() != EffectState::Unknown && outcome.evidence() != Evidence::Uncertain
-        }
-        _ => true,
-    })
-}
-
-fn context_calls_are_paired(items: &[ModelContextItem]) -> bool {
-    let mut seen = HashSet::new();
-    let mut pending = HashSet::new();
-    for item in items {
-        match item {
-            ModelContextItem::AssistantCall { call, .. } => {
-                if !seen.insert(call.call()) || !pending.insert(call.call()) {
-                    return false;
-                }
-            }
-            ModelContextItem::AssistantDeniedCall { call, .. } => {
-                if !seen.insert(call) || !pending.insert(call) {
-                    return false;
-                }
-            }
-            ModelContextItem::ToolResult { call, .. } if !pending.remove(call) => return false,
-            _ => {}
-        }
-    }
-    pending.is_empty()
 }
 
 #[cfg(test)]
@@ -2892,15 +2974,6 @@ fn runtime_note_bytes(note: &str, has_host_instructions: bool) -> usize {
     note.len()
         .saturating_add("Runtime context note:\n".len())
         .saturating_add(usize::from(has_host_instructions) * 2)
-}
-
-fn is_context_notice(item: &ModelContextItem) -> bool {
-    matches!(
-        item,
-        ModelContextItem::AssistantText { item_key, text, .. }
-            if item_key.as_str() == CONTEXT_NOTICE_ITEM_KEY
-                && text.as_str() == CONTEXT_NOTICE_TEXT
-    )
 }
 
 fn publish_context_reduction(
@@ -2929,67 +3002,6 @@ fn publish_context_reduction(
             byte_limit: nexus_core::provider::MAX_CONVERSATION_BYTES,
         },
     );
-}
-
-/// Calls for a turn precede its results (including denied proposals). Only a
-/// complete exchange with conclusive effects may be evicted. Protect the
-/// current task and any runtime-authored context notice.
-fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, usize)> {
-    if !matches!(items.first(), Some(ModelContextItem::UserText(_))) {
-        return None;
-    }
-    let start = if items.get(1).is_some_and(is_context_notice) {
-        2
-    } else {
-        1
-    };
-    let mut pending = HashSet::new();
-    let mut effects_certain = true;
-    let mut first_end = None;
-    for (index, item) in items.iter().enumerate().skip(start) {
-        match item {
-            ModelContextItem::AssistantCall { call, .. } => {
-                if !pending.insert(call.call()) {
-                    return None;
-                }
-                if pending.len() == 1 {
-                    effects_certain = true;
-                }
-            }
-            ModelContextItem::AssistantDeniedCall { call, .. } => {
-                if !pending.insert(call) {
-                    return None;
-                }
-                if pending.len() == 1 {
-                    effects_certain = true;
-                }
-            }
-            ModelContextItem::ToolResult { call, outcome, .. } => {
-                if !pending.remove(call) {
-                    return None;
-                }
-                effects_certain &= outcome.effect() != EffectState::Unknown
-                    && outcome.evidence() != Evidence::Uncertain
-                    && !matches!(
-                        outcome.status(),
-                        ExecutionStatus::Cancelled | ExecutionStatus::TimedOut
-                    );
-                if pending.is_empty() {
-                    if !effects_certain {
-                        // Keep evidence needed to avoid a blind retry.
-                        return None;
-                    }
-                    if let Some(end) = first_end {
-                        return Some((start, end));
-                    }
-                    first_end = Some(index + 1);
-                }
-            }
-            ModelContextItem::UserText(_) => return None,
-            _ => {}
-        }
-    }
-    None
 }
 
 fn context_limit(active: &ActiveRun, bound: usize) -> Terminal {
@@ -5984,7 +5996,7 @@ mod cov_runtime_private {
         }
     }
 
-    fn shared_with_data() -> (Arc<Shared>, mpsc::Receiver<RunEvent>) {
+    pub(super) fn shared_with_data() -> (Arc<Shared>, mpsc::Receiver<RunEvent>) {
         let (runtime, streams) = Runtime::new(
             RuntimeConfig {
                 limits: Limits::m0_test(),
@@ -5999,6 +6011,11 @@ mod cov_runtime_private {
 
     fn active_for(run: &RunId) -> ActiveRun {
         ActiveRun {
+            context_management: nexus_core::ContextManagementSettings::default(),
+            derived_memory: None,
+            pending_compaction: None,
+            input_estimate: 0,
+            token_estimator: TokenEstimator::default(),
             instruction_bytes: 0,
             context_note: String::new(),
             context_note_bytes: 0,
@@ -6022,6 +6039,7 @@ mod cov_runtime_private {
             continuation: None,
             conversation: Vec::new(),
             history_len: 0,
+            inherited_history: false,
             initial_context_reduction: None,
             pending_omission_items: 0,
             queue: VecDeque::new(),
@@ -6046,7 +6064,11 @@ mod cov_runtime_private {
         }
     }
 
-    fn context_exchange(run: &RunId, n: usize, output_bytes: usize) -> Vec<ModelContextItem> {
+    pub(super) fn context_exchange(
+        run: &RunId,
+        n: usize,
+        output_bytes: usize,
+    ) -> Vec<ModelContextItem> {
         let call = ToolCall::new(
             run.clone(),
             TurnId::new(format!("turn-{n}")).expect("valid turn"),
@@ -6076,7 +6098,7 @@ mod cov_runtime_private {
         ]
     }
 
-    fn context_run() -> ActiveRun {
+    pub(super) fn context_run() -> ActiveRun {
         let mut active = active_for(&RunId::new("run-context").expect("valid run"));
         active
             .conversation
@@ -6405,6 +6427,7 @@ mod cov_runtime_private {
                 .push_back(RetainedExchange {
                     session: session.clone(),
                     items: previous.conversation,
+                    derived_memory: None,
                 });
             let response = runtime
                 .submit(
@@ -6472,6 +6495,7 @@ mod cov_runtime_private {
                 state.history.push_back(RetainedExchange {
                     session: active.session.clone(),
                     items: active.conversation.clone(),
+                    derived_memory: None,
                 });
                 state.active = Some(active);
             }
@@ -7690,6 +7714,11 @@ mod cov_runtime_topup_private {
     fn active_for(run: &RunId) -> ActiveRun {
         let now = StdInstant::now();
         ActiveRun {
+            context_management: nexus_core::ContextManagementSettings::default(),
+            derived_memory: None,
+            pending_compaction: None,
+            input_estimate: 0,
+            token_estimator: TokenEstimator::default(),
             instruction_bytes: 0,
             context_note: String::new(),
             context_note_bytes: 0,
@@ -7713,6 +7742,7 @@ mod cov_runtime_topup_private {
             continuation: None,
             conversation: Vec::new(),
             history_len: 0,
+            inherited_history: false,
             initial_context_reduction: None,
             pending_omission_items: 0,
             queue: VecDeque::new(),

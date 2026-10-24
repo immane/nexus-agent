@@ -60,6 +60,8 @@ const POLL: Duration = Duration::from_millis(5);
 /// Scripted provider double: pops one complete event batch per call and
 /// reports a caller-chosen capability set.
 struct ScriptedProvider {
+    context_management: StdMutex<nexus_core::ContextManagementSettings>,
+    requested_context_management: StdMutex<Vec<nexus_core::ContextManagementSettings>>,
     calls: AtomicUsize,
     capabilities: ProviderCapabilities,
     script: StdMutex<VecDeque<Vec<ProviderEvent>>>,
@@ -69,6 +71,8 @@ struct ScriptedProvider {
 impl ScriptedProvider {
     fn new(capabilities: ProviderCapabilities, script: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
+            context_management: StdMutex::new(nexus_core::ContextManagementSettings::default()),
+            requested_context_management: StdMutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
             capabilities,
             script: StdMutex::new(script.into()),
@@ -107,11 +111,19 @@ impl ScriptedProvider {
 }
 
 impl ProviderPort for ScriptedProvider {
+    fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        *self.context_management.lock().unwrap()
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
     }
 
     fn stream(&self, request: &ModelRequest, _context: &ProviderContext) -> Vec<ProviderEvent> {
+        self.requested_context_management
+            .lock()
+            .unwrap()
+            .push(request.context_management());
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.continuations
             .lock()
@@ -692,6 +704,52 @@ fn continuation_state_is_applied_only_when_it_matches_the_adapter_and_profile() 
             RunLifecycle::Finalized(RunOutcome::Failed)
         );
     });
+}
+
+#[test]
+fn context_settings_are_snapshotted_per_run_without_enabling_compaction() {
+    use nexus_core::{ContextManagementSettings, ContextWindow, ContextWindowSource};
+    let mut bed = make_bed(
+        config(Limits::m0_test(), Policy::m0_test(), false),
+        vec![stop_turn("first"), stop_turn("second")],
+    );
+    let configured = ContextManagementSettings {
+        window: Some(ContextWindow::new(94_208, ContextWindowSource::Configured).unwrap()),
+        ..Default::default()
+    };
+    *bed.provider.context_management.lock().unwrap() = configured;
+    test_rt().block_on(async {
+        assert_eq!(
+            bed.runtime
+                .submit(submit_cmd("context-first"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        // Admission already captured the window; a later model switch cannot
+        // mutate an in-flight run, even before its first provider call.
+        *bed.provider.context_management.lock().unwrap() = ContextManagementSettings::default();
+        let (data, _, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(
+            !data
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ContextReduced { .. }))
+        );
+        assert_eq!(
+            bed.runtime
+                .submit(submit_cmd("context-second"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (_, _, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+    });
+    assert_eq!(
+        *bed.provider.requested_context_management.lock().unwrap(),
+        vec![configured, ContextManagementSettings::default()]
+    );
 }
 
 #[test]

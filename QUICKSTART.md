@@ -103,6 +103,7 @@ the full optional suite is documented in [Testing](docs/testing.md).
 | `crates/nexus-core` | Domain types, errors, limits, ports. Dependency-free |
 | `crates/nexus-validation` | Closed M0 JSON/schema validator for tool arguments |
 | `crates/nexus-config` | Revision-2 provider/protocol/model/mode config, favourites/recents, revision-1 migration, file persistence |
+| `crates/nexus-context` | Pure context estimation/calibration, safe reduction planning, and untrusted memory projection; no provider/tool I/O |
 | `crates/nexus-fakes` | Scripted deterministic provider/tool/store doubles (test-only) |
 | `crates/nexus-tools` | Real file tools and sandboxed `host_exec`: `host_read`/`host_list`/`host_search`/`host_write`/`host_patch` plus mandatory-OS-sandbox `argv` execution; development adapters accept exact canonical runtime scopes |
 | `crates/nexus-permissions` | Shared canonical project/temp/protected-path rules for runtime policy and real adapters; session grants stay runtime-owned and non-persistent |
@@ -196,6 +197,65 @@ cycles `build`, read-only `plan`, and custom modes; `default_mode` initializes
 the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
 `:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
 command.
+
+### Automatic context management
+
+All three provider protocols accept the same optional configuration fields.
+At the document root, `context_management` defaults to:
+
+```json
+{
+  "trigger_percent": 65,
+  "target_percent": 10,
+  "strategy": "summarize"
+}
+```
+
+Percentages are integers and must satisfy
+`0 < target_percent < trigger_percent < 100`; `target_percent: 5` is supported.
+The other strategy value is `"truncate"`. A model entry may supply its own
+`context_management` object, replacing the global policy. Omitted fields in
+that object use the built-in defaults, not individual global fields.
+
+A model entry may set `context_window_tokens`, for example `94208` for a
+92 × 1024-token window. A provider may set the same field for its
+`default_model` only; selecting another model does not inherit that limit.
+Explicit model limits take precedence. Missing windows remain unknown;
+zero, explicit null, and invalid types are rejected.
+
+TUI/server pass these settings through the provider interface; the runtime
+snapshots them at admission. A known window enables automatic reduction before
+model requests. `summarize` uses an additional tool-free model turn to replace
+eligible completed history with derived memory; `truncate` removes eligible
+history without an extra model call. The target is best-effort: current tasks,
+recent exchanges, and evidence of uncertain tool effects take precedence over
+the requested percentage. Required instructions and tool definitions also
+consume the window, so a 5% target may not be reachable.
+
+Input occupancy is an estimate, not a tokenizer-exact measurement or cumulative
+run usage. It includes instructions, runtime notes, conversation/reasoning, and
+tool schemas. Output tokens have a separate ceiling from response/tool bytes;
+runtime reserves generation headroom rather than always requesting the legacy
+byte-derived token limit. Normal turns reserve up to one quarter of the window,
+capped at 16,384 output tokens; internal summaries are capped at 2,048 output
+tokens and 8 KiB of retained text. A single generation can still reach its
+output limit.
+
+The initial input estimate has a 25% safety margin, increased when final
+per-request provider input usage shows underestimation. Summary calls consume
+model turns, usage, and run time like normal requests; their text is internal
+derived memory, not a new user-facing answer or execution evidence. If a safe
+summary cannot fit, fails validation, or leaves too little budget for continuing,
+the runtime may fall back to safe truncation with an explicit omission notice.
+Cancellation, deadline expiry, and exhausted limits do not authorize another
+model call. Memory is bounded and session-local, not durable storage.
+
+Window provenance distinguishes configured, provider-reported, and
+model-metadata values. **Automatic window discovery is not implemented**: set
+`context_window_tokens` for the serving model explicitly. Unknown windows retain
+the existing byte/item protections and do not claim a token occupancy percentage.
+No Ollama configuration is changed, no model is loaded for discovery, and no
+live benchmark runs are started by this feature.
 
 ## Test a real LLM (local Ollama, end to end)
 

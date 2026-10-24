@@ -9,6 +9,7 @@
 pub mod approval;
 pub mod commands;
 pub mod content;
+pub mod context;
 pub mod error;
 pub mod execution;
 pub mod ids;
@@ -29,6 +30,10 @@ pub use content::{
     AssistantTurn, CallCandidate, CompletedTurn, ContentBlock, ContinuationData,
     MAX_CONTINUATION_BYTES, MAX_ITEM_KEY_LEN, MAX_PROVIDER_REF_LEN, TextContent, ToolCall,
     ToolResult, TurnCompleteness,
+};
+pub use context::{
+    ContextCompactionStrategy, ContextManagementPolicy, ContextManagementSettings, ContextWindow,
+    ContextWindowSource,
 };
 pub use error::{AgentError, CorrelationData, ErrorBuildError, ErrorCategory, RetryGuidance};
 pub use execution::{CancellationToken, Deadline};

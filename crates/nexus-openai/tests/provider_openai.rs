@@ -177,6 +177,39 @@ fn stop_body(text: &str) -> String {
 }
 
 #[test]
+fn context_settings_are_protocol_independent_local_metadata() {
+    use nexus_config::ProtocolKind;
+    use nexus_core::{ContextManagementSettings, ContextWindow, ContextWindowSource};
+    let settings = ContextManagementSettings {
+        window: Some(ContextWindow::new(94_208, ContextWindowSource::Configured).unwrap()),
+        ..Default::default()
+    };
+    for protocol in [
+        ProtocolKind::ChatCompletions,
+        ProtocolKind::OpenAiResponses,
+        ProtocolKind::AnthropicMessages,
+    ] {
+        let provider = OpenAiProvider::new_for_protocol(
+            "http://localhost:1/v1",
+            present_credential(),
+            "model",
+            protocol,
+        )
+        .unwrap();
+        assert_eq!(
+            provider.context_management(),
+            ContextManagementSettings::default()
+        );
+        assert_eq!(
+            provider
+                .with_context_management(settings)
+                .context_management(),
+            settings
+        );
+    }
+}
+
+#[test]
 fn capabilities_describe_text_tool_calls_and_streaming() {
     let capabilities = OpenAiProvider::new("http://localhost:11434/v1", present_credential(), "m")
         .expect("provider builds")
@@ -354,6 +387,92 @@ fn configured_responses_and_messages_protocols_use_their_wire_contracts() {
                 assert!(request.contains("\"input_schema\""));
             }
             nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn all_protocols_use_explicit_output_tokens_or_legacy_byte_fallback() {
+    use nexus_config::ProtocolKind;
+
+    for (protocol, response) in [
+        (ProtocolKind::ChatCompletions, stop_body("done")),
+        (
+            ProtocolKind::OpenAiResponses,
+            r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}"#.to_owned(),
+        ),
+        (
+            ProtocolKind::AnthropicMessages,
+            r#"{"type":"message","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}"#.to_owned(),
+        ),
+    ] {
+        for (byte_budget, explicit_tokens, expected_tokens) in [
+            (1, None, 1),
+            (4, None, 1),
+            (5, None, 2),
+            (4097, None, 1025),
+            (4097, Some(1), 1),
+            (4097, Some(321), 321),
+            (1, Some(u32::MAX), u32::MAX),
+        ] {
+            let (base, served) = serve(200, &response, Duration::ZERO);
+            let adapter = OpenAiProvider::new_for_protocol(
+                &base,
+                present_credential(),
+                "reasoning-model",
+                protocol,
+            )
+            .expect("protocol adapter builds");
+            let mut request = ModelRequest::new(
+                RunId::new("run-token-limit").expect("run id builds"),
+                TurnId::new("turn-token-limit").expect("turn id builds"),
+                "web-test",
+                Vec::new(),
+                None,
+                byte_budget,
+            )
+            .expect("request builds")
+            .with_conversation(vec![
+                ModelContextItem::user_text("fixture prompt").expect("user text builds"),
+            ])
+            .expect("conversation attaches");
+            if let Some(tokens) = explicit_tokens {
+                request = request
+                    .with_max_output_tokens(tokens)
+                    .expect("positive output token limit attaches");
+            }
+            assert_eq!(request.output_budget_bytes(), byte_budget);
+            let events = adapter.stream(&request, &live_context());
+            assert_eq!(finished(&events).reason(), FinishReason::Stop);
+            let raw = served.request.lock().expect("request captured");
+            let raw = String::from_utf8_lossy(&raw);
+            let (_, body) = raw.split_once("\r\n\r\n").expect("HTTP body exists");
+            let body: Value = serde_json::from_str(body).expect("request body is JSON");
+            let expected = match protocol {
+                ProtocolKind::ChatCompletions => serde_json::json!({
+                    "model": "reasoning-model",
+                    "messages": [{"role":"user","content":"fixture prompt"}],
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "max_tokens": expected_tokens,
+                }),
+                ProtocolKind::OpenAiResponses => serde_json::json!({
+                    "model": "reasoning-model",
+                    "input": [{"role":"user","content":"fixture prompt"}],
+                    "stream": true,
+                    "max_output_tokens": expected_tokens,
+                }),
+                ProtocolKind::AnthropicMessages => serde_json::json!({
+                    "model": "reasoning-model",
+                    "messages": [{"role":"user","content":[{"type":"text","text":"fixture prompt"}]}],
+                    "stream": true,
+                    "max_tokens": expected_tokens,
+                }),
+            };
+            assert_eq!(
+                body, expected,
+                "{protocol:?}, bytes={byte_budget}, tokens={explicit_tokens:?}: no inferred reasoning or unsupported fields"
+            );
         }
     }
 }

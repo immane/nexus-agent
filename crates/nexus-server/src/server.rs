@@ -638,7 +638,7 @@ impl Server {
         let profile = {
             let config = self.config.lock().expect("config lockable");
             let profile = config.provider(id).ok_or_else(unknown_provider)?.clone();
-            match model {
+            let (profile, vendor) = match model {
                 None => (profile, None),
                 Some(name) => {
                     let entry = config
@@ -652,13 +652,18 @@ impl Server {
                     }
                     (profile, Some(entry.name.clone()))
                 }
-            }
+            };
+            let context_management = config.context_management_for(id, model).map_err(|_| {
+                SessionError::new(400, "selected model context configuration is invalid")
+            })?;
+            (profile, vendor, context_management)
         };
-        let (profile, vendor) = profile;
+        let (profile, vendor, context_management) = profile;
         let vendor = vendor.unwrap_or(profile.default_model.clone());
         resolve_credential(&profile.credential)
             .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
+            .map(|adapter| adapter.with_context_management(context_management))
             .map_err(|_| SessionError::new(400, "selected provider is invalid"))
     }
 
@@ -2092,6 +2097,56 @@ mod tests {
         match resolve_selection(Some("gated"), Some("gated-fast"), &submit_body(None, None)) {
             Ok(model) => assert_eq!(model.as_deref(), Some("gated-fast")),
             Err(response) => panic!("omitted fields use the binding: {}", response.status),
+        }
+    }
+
+    /// Context configuration is local metadata for every supported protocol.
+    #[test]
+    fn selected_context_settings_reach_all_protocol_adapters_without_network_io() {
+        use nexus_core::{ContextWindowSource, ProviderPort};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        for protocol in ["chat_completions", "openai_responses", "anthropic_messages"] {
+            let config = UserConfig::from_json(
+                &serde_json::json!({
+                    "revision": 2,
+                    "context_management": {"trigger_percent": 70},
+                    "providers": [{
+                        "id": "configured", "display_name": "Configured", "adapter": "direct",
+                        "protocol": protocol, "endpoint": "http://127.0.0.1:1/v1",
+                        "credential": {"env": "PATH"}, "default_model": "default",
+                        "context_window_tokens": 94_208
+                    }],
+                    "models": [{
+                        "id": "other", "provider": "configured", "name": "other",
+                        "context_window_tokens": 32_768,
+                        "context_management": {"trigger_percent": 60, "target_percent": 5}
+                    }], "favourites": [], "recent": []
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut server = Server::new(runtime.handle().clone());
+            server.set_config(config, None);
+            let defaults = server
+                .select_provider("configured", None)
+                .unwrap_or_else(|_| panic!("configured default adapter must resolve"))
+                .context_management();
+            assert_eq!(defaults.policy.trigger_percent(), 70);
+            assert_eq!(defaults.window.unwrap().tokens(), 94_208);
+            let selected = server
+                .select_provider("configured", Some("other"))
+                .unwrap_or_else(|_| panic!("configured selected adapter must resolve"))
+                .context_management();
+            assert_eq!(selected.policy.trigger_percent(), 60);
+            assert_eq!(selected.policy.target_percent(), 5);
+            assert_eq!(selected.window.unwrap().tokens(), 32_768);
+            assert_eq!(
+                selected.window.unwrap().source(),
+                ContextWindowSource::Configured
+            );
         }
     }
 

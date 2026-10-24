@@ -206,6 +206,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-context"
+version = "0.2.2-alpha"
+dependencies = [
+ "nexus-core",
+]
+
+[[package]]
 name = "nexus-core"
 version = "0.2.2-alpha"
 
@@ -231,11 +238,14 @@ dependencies = [
 name = "nexus-integration"
 version = "0.2.2-alpha"
 dependencies = [
+ "nexus-config",
  "nexus-core",
  "nexus-fakes",
  "nexus-headless",
+ "nexus-openai",
  "nexus-runtime",
  "nexus-tui",
+ "serde_json",
  "tokio",
 ]
 
@@ -259,6 +269,7 @@ version = "0.2.2-alpha"
 name = "nexus-runtime"
 version = "0.2.2-alpha"
 dependencies = [
+ "nexus-context",
  "nexus-core",
  "nexus-permissions",
  "nexus-validation",

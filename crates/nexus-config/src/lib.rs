@@ -16,7 +16,7 @@
 //! by construction; error messages are static and never interpolate
 //! caller text.
 //!
-//! # File format (revision 1, the only accepted revision)
+//! # File format (revision 2, with revision 1 migration)
 //!
 //! ```json
 //! {
@@ -46,9 +46,20 @@
 //! A missing file is NOT an error: [`load`] returns `None` and the caller
 //! falls back to [`UserConfig::default_config`].
 //!
+//! Optional global `context_management` configures `trigger_percent` (65),
+//! `target_percent` (10), and `strategy` (`"summarize"` or `"truncate"`).
+//! Omitted policy fields use those defaults; percentages must satisfy
+//! `0 < target_percent < trigger_percent < 100`. Model entries may override
+//! the policy with their own `context_management` object. Providers and models
+//! may set a positive `context_window_tokens` (`u32`); the provider limit is
+//! only for its `default_model`, never a blanket limit for all its models.
+//! [`UserConfig::context_management_for`] resolves these settings without
+//! discovery, token estimation, or automatic compaction. Absent optional fields
+//! preserve existing behavior and canonical output; explicit null is invalid.
+//!
 //! # Dependency justification
 //!
-//! `nexus-core` supplies domain error conventions only. `nexus-validation`
+//! `nexus-core` supplies validated context-management types. `nexus-validation`
 //! supplies the strict duplicate-rejecting parse. `serde_json` owns lexing
 //! and the in-memory value model. Filesystem access is confined to
 //! [`load`]/[`save`] with atomic writes; no network, no discovery, no

@@ -516,8 +516,18 @@ fn resolve_live_adapter(
             "provider credential is unavailable",
         );
     }
+    let Ok(context_management) = selection
+        .config
+        .context_management_for(&entry.provider, Some(model_id))
+    else {
+        return LiveResolve::Failed(
+            ErrorCategory::InvalidInput,
+            "selected model context configuration is invalid",
+        );
+    };
     match OpenAiProvider::from_profile(profile, &entry.name) {
         Ok(adapter) => {
+            let adapter = adapter.with_context_management(context_management);
             let capabilities = adapter.capabilities();
             match admit_adapter(adapter, &capabilities) {
                 Ok(adapter) => LiveResolve::Live(adapter),
@@ -736,6 +746,23 @@ impl PerRunProvider {
 impl ProviderPort for PerRunProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
+    }
+
+    fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        let binding = self.binding.lock().expect("live selection lockable");
+        let selection = binding.pending_run.as_deref().unwrap_or(&binding);
+        let Some(model_id) = selection.active_model.as_deref() else {
+            return nexus_core::ContextManagementSettings::default();
+        };
+        let Some(entry) = selection.config.model(model_id) else {
+            return nexus_core::ContextManagementSettings::default();
+        };
+        // Invalid selections fail explicitly when resolving the live adapter;
+        // no window or policy is inferred for an unavailable model.
+        selection
+            .config
+            .context_management_for(&entry.provider, Some(model_id))
+            .unwrap_or_default()
     }
 
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
@@ -6900,6 +6927,46 @@ mod cov_live_wiring {
             pending_run: None,
             pending_run_id: None,
         }
+    }
+
+    #[test]
+    fn context_settings_follow_the_pending_model_snapshot() {
+        let mut selected = selection_with(Some("m0"));
+        selected.config = UserConfig::from_json(
+            r#"{
+            "revision": 2,
+            "providers": [{
+                "id": "demo-provider", "display_name": "Demo", "adapter": "direct",
+                "protocol": "chat_completions", "endpoint": "https://example.invalid",
+                "credential": {"env": "NEXUS_TUI_TEST_KEY"}, "default_model": "demo-model"
+            }],
+            "models": [{"id": "m0", "provider": "demo-provider", "name": "demo-model",
+                "context_window_tokens": 94208, "context_management": {"target_percent": 5}}],
+            "favourites": [], "recent": []
+        }"#,
+        )
+        .unwrap();
+        let expected = selected
+            .config
+            .context_management_for("demo-provider", Some("m0"))
+            .unwrap();
+        let LiveResolve::Live(adapter) =
+            resolve_live_adapter(&selected, |_| Some("secret".to_owned()))
+        else {
+            panic!("configured adapter must resolve without network I/O");
+        };
+        assert_eq!(adapter.context_management(), expected);
+        let mut latest = selected.clone();
+        latest.active_model = None;
+        latest.pending_run = Some(Box::new(selected));
+        let binding = Arc::new(Mutex::new(latest));
+        let provider = PerRunProvider::live(binding.clone());
+        assert_eq!(provider.context_management(), expected);
+        binding.lock().unwrap().pending_run = None;
+        assert_eq!(
+            provider.context_management(),
+            nexus_core::ContextManagementSettings::default()
+        );
     }
 
     #[test]

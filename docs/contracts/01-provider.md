@@ -23,6 +23,25 @@ A relay MUST preserve call references and required continuation state, declare t
 
 `ModelRequest` contains the run/turn identity, selected model profile, accepted conversation, authorized instructions, enabled tool definitions, context/output budgets, and compatible continuation state.
 
+### Implemented token-budget metadata
+
+`ProviderPort::context_management` returns local settings without mandatory
+network discovery. The runtime snapshots those settings for a run; a missing
+window remains unknown. Configured windows, provider-reported windows, and model
+metadata have distinct provenance rather than being treated as equally verified.
+
+`ModelRequest::max_output_tokens` is an optional positive generation ceiling,
+independent of `output_budget_bytes`. Chat Completions and Anthropic Messages
+encode it as `max_tokens`; Responses encodes it as `max_output_tokens`. Without
+an explicit ceiling, adapters retain the legacy byte-derived default. A token
+ceiling does not disable response-byte validation or imply a successful finish.
+
+`nexus_context::estimated_input_tokens` includes instruction/note payloads,
+conversation and reasoning, call/result metadata, tool definitions, and framing
+allowances. Its three-UTF-8-bytes-per-token heuristic is not a tokenizer or an
+upper bound, and must not be emitted as provider-reported `Usage`. Runtime
+headroom and calibration do not establish a guarantee for every tokenizer.
+
 ### Implemented instruction placeholder
 
 The Rust API now carries a separate `ModelInstructions` value, with `agent` and

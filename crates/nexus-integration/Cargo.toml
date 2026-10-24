@@ -12,6 +12,11 @@ path = "src/lib.rs"
 # path dependencies only; no new capability enters through these.
 nexus-core = { path = "../nexus-core" }
 nexus-runtime = { path = "../nexus-runtime" }
+# Context compaction exercises the runtime through all real protocol encoders
+# against loopback fixtures, never a live provider.
+nexus-config = { path = "../nexus-config" }
+nexus-openai = { path = "../nexus-openai" }
+serde_json = "1"
 nexus-fakes = { path = "../nexus-fakes" }
 nexus-tui = { path = "../nexus-tui" }
 nexus-headless = { path = "../nexus-headless" }

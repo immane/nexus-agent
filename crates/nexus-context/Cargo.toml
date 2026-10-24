@@ -1,0 +1,9 @@
+[package]
+name = "nexus-context"
+version = "0.2.2-alpha"
+edition = "2024"
+
+[dependencies]
+# Shared conversation/evidence types only. Execution and provider I/O stay in
+# nexus-runtime and adapters; context processing must not depend on either.
+nexus-core = { path = "../nexus-core" }

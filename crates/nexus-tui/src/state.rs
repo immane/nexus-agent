@@ -1179,7 +1179,7 @@ impl AppState {
             }
             EventPayload::ContextReduced { removed_items, .. } => {
                 self.push_system(format!(
-                    "context reduced: omitted {removed_items} earlier items; this is not a summary"
+                    "context reduced: replaced or omitted {removed_items} earlier items; re-check earlier facts before relying on them"
                 ));
             }
             EventPayload::ToolCallPreview { item_key } => {
@@ -3098,6 +3098,29 @@ mod tests {
                 request: RequestId::new("req-1").expect("valid"),
             },
         )
+    }
+
+    #[test]
+    fn reduction_notice_does_not_claim_summarization_is_unavailable() {
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let (session, run) = session_run();
+        assert!(state.apply_event(&RunEvent::new(
+            session,
+            run,
+            1,
+            EventPayload::ContextReduced {
+                removed_items: 4,
+                retained_items: 3,
+                item_limit: 256,
+                retained_bytes: 1024,
+                byte_limit: 1_048_576,
+            }
+        )));
+        let notice = render_entry_lines(state.entries.back().unwrap(), 200).join("\n");
+        assert!(notice.contains("4 earlier items"));
+        assert!(notice.contains("re-check earlier facts"));
+        assert!(!notice.contains("not a summary"));
     }
 
     fn started_run(run: &str, seq: u64) -> RunEvent {
