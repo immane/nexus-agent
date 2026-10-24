@@ -702,6 +702,7 @@ impl SessionRegistry {
 struct PerRunProvider {
     capabilities: ProviderCapabilities,
     binding: LiveHandle,
+    discovered_context: Mutex<HashMap<String, nexus_core::ContextWindow>>,
     current: Mutex<PerRunState>,
 }
 
@@ -735,6 +736,7 @@ impl PerRunProvider {
         Self {
             capabilities: tui_provider_capabilities(),
             binding,
+            discovered_context: Mutex::new(HashMap::new()),
             current: Mutex::new(PerRunState {
                 run: None,
                 provider: ActiveProvider::Fake(FakeProvider::demo_two_turn()),
@@ -749,20 +751,66 @@ impl ProviderPort for PerRunProvider {
     }
 
     fn context_management(&self) -> nexus_core::ContextManagementSettings {
-        let binding = self.binding.lock().expect("live selection lockable");
-        let selection = binding.pending_run.as_deref().unwrap_or(&binding);
-        let Some(model_id) = selection.active_model.as_deref() else {
-            return nexus_core::ContextManagementSettings::default();
+        let selection_info = {
+            let binding = self.binding.lock().expect("live selection lockable");
+            let selection = binding.pending_run.as_deref().unwrap_or(&binding);
+            let Some(model_id) = selection.active_model.as_deref() else {
+                return nexus_core::ContextManagementSettings::default();
+            };
+            let Some(entry) = selection.config.model(model_id) else {
+                return nexus_core::ContextManagementSettings::default();
+            };
+            // Invalid selections fail explicitly when resolving the live adapter;
+            // no window or policy is inferred for an unavailable model.
+            let settings = selection
+                .config
+                .context_management_for(&entry.provider, Some(model_id))
+                .unwrap_or_default();
+            let Some(profile) = selection.config.provider(&entry.provider) else {
+                return settings;
+            };
+            (
+                settings,
+                format!("{}:{}:{}", entry.provider, entry.id, entry.name),
+                profile.clone(),
+                entry.name.clone(),
+            )
         };
-        let Some(entry) = selection.config.model(model_id) else {
-            return nexus_core::ContextManagementSettings::default();
+        let (mut settings, cache_key, profile, model_name) = selection_info;
+        if settings.window.is_some() {
+            return settings;
+        }
+        if let Some(window) = self
+            .discovered_context
+            .lock()
+            .expect("discovered context lockable")
+            .get(&cache_key)
+            .copied()
+        {
+            settings.window = Some(window);
+            return settings;
+        }
+        let Ok(adapter) = OpenAiProvider::from_profile(&profile, &model_name) else {
+            return settings;
         };
-        // Invalid selections fail explicitly when resolving the live adapter;
-        // no window or policy is inferred for an unavailable model.
-        selection
-            .config
-            .context_management_for(&entry.provider, Some(model_id))
-            .unwrap_or_default()
+        let adapter = adapter.with_context_management(settings);
+        if let Some(window) = adapter
+            .is_ollama_endpoint()
+            .then(|| {
+                adapter
+                    .discover_context_management()
+                    .context_management()
+                    .window
+            })
+            .flatten()
+        {
+            self.discovered_context
+                .lock()
+                .expect("discovered context lockable")
+                .insert(cache_key, window);
+            settings.window = Some(window);
+        }
+        settings
     }
 
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {

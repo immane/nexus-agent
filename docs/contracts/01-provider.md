@@ -25,10 +25,16 @@ A relay MUST preserve call references and required continuation state, declare t
 
 ### Implemented token-budget metadata
 
-`ProviderPort::context_management` returns local settings without mandatory
-network discovery. The runtime snapshots those settings for a run; a missing
-window remains unknown. Configured windows, provider-reported windows, and model
-metadata have distinct provenance rather than being treated as equally verified.
+`ProviderPort::context_management` returns local settings; the runtime snapshots
+them for a run. The OpenAI-compatible adapter additionally makes one bounded,
+best-effort read-only Ollama `/api/show` request for Chat Completions profiles
+on port `11434` or a hostname containing `ollama`, when no configured window
+exists. It prefers `parameters.num_ctx`, then a
+`model_info.*.context_length` value. Such values are marked `ModelMetadata`, not
+treated as exact active serving limits. Explicit configured windows take
+precedence. Unsupported endpoints, protocols, and discovery failures leave the
+window unknown; no model-name inference is performed. Other API protocols do not
+define a common model-window discovery contract.
 
 `ModelRequest::max_output_tokens` is an optional positive generation ceiling,
 independent of `output_budget_bytes`. Chat Completions and Anthropic Messages

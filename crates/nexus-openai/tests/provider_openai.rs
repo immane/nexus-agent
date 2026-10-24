@@ -210,6 +210,75 @@ fn context_settings_are_protocol_independent_local_metadata() {
 }
 
 #[test]
+fn ollama_context_window_is_discovered_from_model_metadata() {
+    use nexus_core::ContextWindowSource;
+    let (endpoint, served) = serve(
+        200,
+        r#"{"parameters":"temperature 0.2\nnum_ctx 94208","model_info":{"qwen.context_length":131072}}"#,
+        Duration::ZERO,
+    );
+    let discovered = provider(&endpoint).discover_context_management();
+    let settings = discovered.context_management();
+    let window = settings.window.expect("Ollama metadata supplies a window");
+    assert_eq!(window.tokens(), 94_208);
+    assert_eq!(window.source(), ContextWindowSource::ModelMetadata);
+    let request = String::from_utf8(served.request.lock().unwrap().clone()).unwrap();
+    assert!(request.starts_with("POST /api/show HTTP/1.1\r\n"));
+    assert!(request.contains(r#""model":"test-model""#));
+}
+
+#[test]
+fn ollama_architecture_window_is_only_a_metadata_fallback() {
+    let (endpoint, _) = serve(
+        200,
+        r#"{"model_info":{"qwen.context_length":131072}}"#,
+        Duration::ZERO,
+    );
+    let window = provider(&endpoint)
+        .discover_context_management()
+        .context_management()
+        .window
+        .expect("architecture metadata supplies a fallback");
+    assert_eq!(window.tokens(), 131_072);
+}
+
+#[test]
+fn explicit_window_skips_discovery_and_unsupported_metadata_stays_unknown() {
+    use nexus_core::{ContextManagementSettings, ContextWindow, ContextWindowSource};
+    let configured = ContextManagementSettings {
+        window: Some(ContextWindow::new(32_768, ContextWindowSource::Configured).unwrap()),
+        ..Default::default()
+    };
+    let (endpoint, _) = serve(200, r#"{"parameters":"num_ctx 94208"}"#, Duration::ZERO);
+    let explicit = provider(&endpoint)
+        .with_context_management(configured)
+        .discover_context_management();
+    assert_eq!(explicit.context_management(), configured);
+
+    let (endpoint, _) = serve(404, "{}", Duration::ZERO);
+    assert_eq!(
+        provider(&endpoint)
+            .discover_context_management()
+            .context_management()
+            .window,
+        None
+    );
+}
+
+#[test]
+fn automatic_discovery_is_limited_to_ollama_named_or_default_port_endpoints() {
+    let local =
+        OpenAiProvider::new("http://127.0.0.1:11434/v1", present_credential(), "model").unwrap();
+    assert!(local.is_ollama_endpoint());
+    let named =
+        OpenAiProvider::new("https://ollama.example/v1", present_credential(), "model").unwrap();
+    assert!(named.is_ollama_endpoint());
+    let generic =
+        OpenAiProvider::new("https://api.example/v1", present_credential(), "model").unwrap();
+    assert!(!generic.is_ollama_endpoint());
+}
+
+#[test]
 fn capabilities_describe_text_tool_calls_and_streaming() {
     let capabilities = OpenAiProvider::new("http://localhost:11434/v1", present_credential(), "m")
         .expect("provider builds")

@@ -251,11 +251,17 @@ Cancellation, deadline expiry, and exhausted limits do not authorize another
 model call. Memory is bounded and session-local, not durable storage.
 
 Window provenance distinguishes configured, provider-reported, and
-model-metadata values. **Automatic window discovery is not implemented**: set
-`context_window_tokens` for the serving model explicitly. Unknown windows retain
-the existing byte/item protections and do not claim a token occupancy percentage.
-No Ollama configuration is changed, no model is loaded for discovery, and no
-live benchmark runs are started by this feature.
+model-metadata values. Configured `context_window_tokens` always wins. For
+Ollama endpoints (port `11434` or a hostname containing `ollama`), the adapter
+makes one bounded, best-effort read-only Ollama `/api/show` request when no
+window is configured:
+it prefers the model's `num_ctx` parameter, then falls back to an architecture
+`context_length` field. This does not load a model or change Ollama settings.
+Other protocols/providers, unsupported metadata, and discovery failures leave
+the window unknown; no model-name inference is used. The discovered value is
+cached for that selected model in the TUI process but is not written to config.
+Unknown windows retain byte/item protections and do not claim token occupancy.
+No live benchmark runs are started by this feature.
 
 ## Test a real LLM (local Ollama, end to end)
 

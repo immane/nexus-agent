@@ -663,7 +663,14 @@ impl Server {
         resolve_credential(&profile.credential)
             .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
-            .map(|adapter| adapter.with_context_management(context_management))
+            .map(|adapter| {
+                let adapter = adapter.with_context_management(context_management);
+                if adapter.is_ollama_endpoint() {
+                    adapter.discover_context_management()
+                } else {
+                    adapter
+                }
+            })
             .map_err(|_| SessionError::new(400, "selected provider is invalid"))
     }
 
