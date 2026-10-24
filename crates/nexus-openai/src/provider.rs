@@ -16,11 +16,14 @@ use nexus_core::{
 };
 use serde_json::{Value, json};
 
-/// Maximum aggregated response in bytes per turn, covering answer text,
-/// reasoning traces, and tool-call arguments together. Anything larger
-/// fails instead of allocating unboundedly. Sized for long-reasoning
-/// models, whose thinking traces alone can reach hundreds of kilobytes.
+/// Maximum aggregated response content in bytes per turn, covering answer
+/// text, reasoning traces, and tool-call arguments together.
 pub const MAX_RESPONSE_BYTES: usize = 8_388_608;
+/// SSE framing and JSON envelopes can be substantially larger than the
+/// response content. Bound total bytes read separately from retained content.
+const MAX_STREAM_WIRE_BYTES: usize = 64 * 1_024 * 1_024;
+/// Bound one not-yet-parsed SSE record so a peer cannot stream an endless line.
+const MAX_SSE_RECORD_BYTES: usize = MAX_RESPONSE_BYTES;
 /// Maximum vendor model name in bytes, matching the configuration bound.
 pub const MAX_MODEL_LEN: usize = 128;
 /// Socket connect timeout. Reads use the remaining run deadline.
@@ -38,11 +41,9 @@ const TLS_PUMP_CHUNKS: usize = 16;
 const TLS_PUMP_CHUNK_BYTES: usize = 8_192;
 /// Bound distinct provider tool identities before creating accumulator state.
 const MAX_SSE_TOOL_IDENTITIES: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize;
-/// Bound tiny SSE records independently of the response byte ceiling.
-// Token-oriented providers may emit thousands of small SSE records for a
-// normal code response. Keep a separate CPU/event-count bound, but let the
-// existing 8 MiB response cap remain the primary payload limit.
-const MAX_SSE_RECORDS: usize = 65_536;
+/// Bound record count independently of byte limits to cap parser CPU work.
+/// Leave room for several framing events per output token at the request cap.
+const MAX_SSE_RECORDS: usize = 262_144;
 
 fn provider_error(category: ErrorCategory, message: &'static str) -> ProviderEvent {
     ProviderEvent::Failed(
@@ -308,6 +309,7 @@ impl OpenAiProvider {
             "messages": messages,
             "stream": true,
             "stream_options": {"include_usage": true},
+            "max_tokens": request.output_budget_bytes().div_ceil(4).max(1),
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
@@ -1189,7 +1191,7 @@ impl ProtocolSseLive {
             )]
         };
         self.raw_bytes = self.raw_bytes.saturating_add(bytes.len());
-        if self.raw_bytes > MAX_RESPONSE_BYTES {
+        if self.raw_bytes > MAX_STREAM_WIRE_BYTES {
             return Err(too_large());
         }
         if let Some(dechunker) = self.dechunker.as_mut() {
@@ -1204,7 +1206,7 @@ impl ProtocolSseLive {
         } else {
             self.buf.extend_from_slice(bytes);
         }
-        if self.buf.len() > MAX_RESPONSE_BYTES {
+        if self.buf.len() > MAX_SSE_RECORD_BYTES {
             return Err(too_large());
         }
         while let Some(line) = take_line(&mut self.buf) {
@@ -1473,14 +1475,13 @@ impl ProtocolSseLive {
                 }
                 ProtocolKind::ChatCompletions => unreachable!(),
             }
-            if self.response_text.len() > MAX_RESPONSE_BYTES
-                || self
-                    .calls
+            let content_bytes = self.response_text.len().saturating_add(
+                self.calls
                     .values()
                     .map(|call| call.arguments.len())
-                    .sum::<usize>()
-                    > MAX_RESPONSE_BYTES
-            {
+                    .sum::<usize>(),
+            );
+            if content_bytes > MAX_RESPONSE_BYTES {
                 return Err(too_large());
             }
         }
@@ -1553,7 +1554,7 @@ impl SseLive {
             )]
         };
         self.raw_bytes = self.raw_bytes.saturating_add(bytes.len());
-        if self.raw_bytes > MAX_RESPONSE_BYTES {
+        if self.raw_bytes > MAX_STREAM_WIRE_BYTES {
             return Err(too_large());
         }
         if let Some(dechunker) = self.dechunker.as_mut() {
@@ -1568,7 +1569,7 @@ impl SseLive {
         } else {
             self.buf.extend_from_slice(bytes);
         }
-        if self.buf.len() > MAX_RESPONSE_BYTES {
+        if self.buf.len() > MAX_SSE_RECORD_BYTES {
             return Err(too_large());
         }
         while let Some(line) = take_line(&mut self.buf) {
@@ -1698,7 +1699,7 @@ impl Dechunker {
                         self.state = DechunkState::Done;
                         return Ok(());
                     }
-                    if out.len().saturating_add(size) > MAX_RESPONSE_BYTES {
+                    if out.len().saturating_add(size) > MAX_STREAM_WIRE_BYTES {
                         return Err(());
                     }
                     self.state = DechunkState::Data(size);

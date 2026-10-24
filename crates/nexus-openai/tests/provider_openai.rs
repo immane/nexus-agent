@@ -1034,6 +1034,37 @@ fn oversized_replies_fail_resource_limit() {
 }
 
 #[test]
+fn chunked_sse_wire_overhead_can_exceed_content_budget() {
+    let padding_line = format!(":{}\n", "x".repeat(512));
+    let padding = padding_line.repeat(18_000);
+    assert!(padding.len() > nexus_openai::provider::MAX_RESPONSE_BYTES);
+    let data = format!(
+        "{padding}data: {{\"choices\":[{{\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n"
+    );
+    let body = format!("{:X}\r\n{data}\r\n0\r\n\r\n", data.len());
+    let head = "HTTP/1.1 200 Test\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+    let (base, _) = serve_raw(head, &body);
+    let events = provider(&base).stream(&base_request(), &live_context());
+    assert_eq!(finished(&events).reason(), FinishReason::Stop);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ProviderEvent::TextDelta { text, .. } if text == "ok"
+    )));
+}
+
+#[test]
+fn sse_single_record_is_bounded_independently_of_wire_budget() {
+    let content = "x".repeat(nexus_openai::provider::MAX_RESPONSE_BYTES + 1);
+    let payload = serde_json::json!({
+        "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {payload}\n\ndata: [DONE]\n");
+    let (base, _) = serve_raw(&sse_head(body.len()), &body);
+    let error = failed(provider(&base).stream(&base_request(), &live_context()));
+    assert_eq!(error.0, ErrorCategory::ResourceLimit);
+}
+
+#[test]
 fn unreachable_peers_fail_protocol() {
     let provider = OpenAiProvider::new("http://127.0.0.1:9/", present_credential(), "m")
         .expect("provider builds");
@@ -1093,6 +1124,7 @@ fn requests_carry_model_messages_tools_and_credentials() {
     assert_eq!(payload["model"], "test-model");
     assert_eq!(payload["stream"], true);
     assert_eq!(payload["stream_options"]["include_usage"], true);
+    assert_eq!(payload["max_tokens"], 1024);
     let messages = payload["messages"].as_array().expect("messages");
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[0]["role"], "user");
@@ -1279,9 +1311,9 @@ fn chunked_sse_streams_parse_after_dechunking() {
 }
 
 #[test]
-fn sse_accepts_code_responses_with_more_than_four_thousand_records() {
+fn sse_accepts_code_responses_with_more_than_sixty_five_thousand_records() {
     let mut body = String::new();
-    for _ in 0..5_000 {
+    for _ in 0..70_000 {
         body.push_str(
             "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n",
         );
@@ -1297,7 +1329,7 @@ fn sse_accepts_code_responses_with_more_than_four_thousand_records() {
             _ => None,
         })
         .collect();
-    assert_eq!(text.len(), 5_000);
+    assert_eq!(text.len(), 70_000);
     assert_eq!(finished(&events).reason(), FinishReason::Stop);
 }
 
