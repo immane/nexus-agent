@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.0--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.1--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent designed around very fast startup, a minimal core, and a native terminal interface. Broader capabilities belong in replaceable tools and plugins, not an ever-growing engine.
 
@@ -11,12 +11,35 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 <img src="docs/images/demo.gif" alt="Nexus Agent terminal demo" width="100%" />
 </div>
 
-[Quickstart](QUICKSTART.md) · [Documentation](docs/index.md) · [Contributing](CONTRIBUTING.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
+[Quickstart](QUICKSTART.md) · [Vision](#vision) · [Documentation](docs/index.md) · [Contributing](CONTRIBUTING.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
 > Nexus Agent is **0.2.1-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+
+## Vision
+
+**A small, dependable execution core with a memory system that carries forward
+the evidence a task needs—not an ever-growing transcript.**
+
+Our research direction is a compiler-inspired semantic-memory system: transform
+conversation and tool records into a typed **Semantic IR**, track provenance,
+versions, and dependencies, and construct bounded context for the next decision.
+Combine graph relationships with retrieval—including vector search—to find
+relevant evidence, while retaining losslessly compressed source records for
+traceability and on-demand recovery. Explore specialized **LoRA** adapters for
+reading and producing the IR, with the goal of helping lightweight models work
+reliably on complex, long-running tasks within limited context windows.
+
+This is a **research vision, not an implemented feature or a claim of lossless
+semantic compression**. Original records can be recovered only while retained;
+structured interpretations can be wrong and must remain correctable. Memory
+selection must not grant tool permissions, hide uncertain effects, or replace
+execution evidence. Graph/vector databases and model training are optional
+research components, not requirements for the Agent Core.
+
+See the [research concept, related papers, and evaluation criteria](docs/research/task-context-compiler.md).
 
 ## Screenshots
 
@@ -314,6 +337,7 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
 - [x] Implement the shared runtime, live TUI, loopback HTTP/SSE server, scripted headless runner, file read/list/search/write/patch, and sandboxed exec.
 - [x] Implement Chat Completions, OpenAI Responses, and Anthropic Messages adapters with explicit protocol configuration and offline regression fixtures.
+- [x] Add bounded host instructions with native protocol mapping and runtime history projection that protects tool-call pairing and uncertain-effect evidence. Conversation history remains memory-only; semantic memory and durable recovery are not implemented. See the [provider contract](docs/contracts/01-provider.md).
 - [x] Implement M4 consolidation slices: shared ordered-event consumption, tool composition, and current provider capability handling. The default-feature workspace suite has recorded passing macOS evidence; see [migration status](docs/tasks/08-architecture-migration.md) and [Testing](docs/testing.md).
 - [x] Add an opt-in container worker/gateway/workload path with runtime authorization and TUI/server selection. It is not a validated isolation boundary: native Linux host/LAN, metadata, IPv6/DNS, and public-egress checks remain outstanding. Image build and keeper-only smoke test are not isolation evidence.
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
@@ -339,6 +363,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull-request guida
 | [API relay](docs/design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries. |
 | [Implementation readiness](docs/design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review. |
 | [Architecture migration](docs/tasks/08-architecture-migration.md) | Implemented consolidation slices, protocol extension evidence, and platform blockers. |
+| [Semantic-memory research](docs/research/task-context-compiler.md) | Compiler-inspired Semantic IR, hybrid retrieval, graph relationships, and LoRA research; not an accepted architecture or implemented capability. |
 | [Overview](docs/design/00-overview.md) | First-release boundaries and non-goals. |
 | [Common contract](docs/contracts/00-common.md) | Identifiers, outcomes, errors, limits, and compatibility. |
 | [Commands and events](docs/contracts/03-command-events.md) | Frontend/runtime interaction and backpressure. |

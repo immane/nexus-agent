@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,17 @@ const MAX_HEAD_BYTES: usize = 16_384;
 /// Read poll quantum: cancellation and deadlines are re-checked between
 /// quanta so a stalled peer cannot park the worker past its bound.
 const READ_QUANTUM: Duration = Duration::from_secs(1);
+/// OpenCode V2 documents bounded provider retries; use a longer, explicit
+/// schedule for transient model-service failures.
+const PROVIDER_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+const MAX_PROVIDER_RETRIES: usize = PROVIDER_RETRY_DELAYS.len();
 /// The TLS stdout pump retains at most this many fixed-size chunks while the
 /// parser is behind (128 KiB total). A closed consumer releases a blocked send.
 const TLS_PUMP_CHUNKS: usize = 16;
@@ -49,6 +61,13 @@ fn provider_error(category: ErrorCategory, message: &'static str) -> ProviderEve
     ProviderEvent::Failed(
         AgentError::new(category, message, RetryGuidance::DoNotRetry)
             .expect("static safe provider message builds"),
+    )
+}
+
+fn retryable_provider_error(category: ErrorCategory, message: &'static str) -> ProviderEvent {
+    ProviderEvent::Failed(
+        AgentError::new(category, message, RetryGuidance::RetryAfterBackoff)
+            .expect("static safe retryable provider message builds"),
     )
 }
 
@@ -76,6 +95,14 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
     )
 }
 
+fn status_retry_guidance(status: u16) -> RetryGuidance {
+    if matches!(status, 408 | 425 | 429 | 500..=599) {
+        RetryGuidance::RetryAfterBackoff
+    } else {
+        RetryGuidance::DoNotRetry
+    }
+}
+
 /// Vendor bodies can echo prompts, paths, or credentials without any secret
 /// marker. Only the status classification crosses the diagnostic boundary.
 fn status_error(status: u16) -> ProviderEvent {
@@ -85,8 +112,13 @@ fn status_error(status: u16) -> ProviderEvent {
         .push("http_status", status.to_string())
         .expect("numeric status is safe");
     ProviderEvent::Failed(
-        AgentError::with_correlation(category, fallback, correlation, RetryGuidance::DoNotRetry)
-            .expect("static status diagnostic is safe"),
+        AgentError::with_correlation(
+            category,
+            fallback,
+            correlation,
+            status_retry_guidance(status),
+        )
+        .expect("static status diagnostic is safe"),
     )
 }
 
@@ -286,7 +318,14 @@ impl OpenAiProvider {
         if self.protocol != ProtocolKind::ChatCompletions {
             return protocol_request_body(self.protocol, &self.model, request);
         }
-        let messages: Vec<Value> = conversation_messages(request.conversation());
+        let mut messages = Vec::new();
+        if let Some(instructions) = request.rendered_instructions() {
+            messages.push(json!({
+                "role": "system",
+                "content": instructions,
+            }));
+        }
+        messages.extend(conversation_messages(request.conversation()));
         let mut tools: Vec<Value> = Vec::new();
         for spec in request.tool_definitions() {
             let schema: Value = serde_json::from_str(spec.input_schema_json()).map_err(|_| {
@@ -380,38 +419,122 @@ impl OpenAiProvider {
             address,
             body.len(),
         );
-        if self.use_tls {
-            match spawn_tls(&self.host, self.port, head.as_bytes(), body) {
-                Ok(tls) => {
-                    let mut source = tls;
-                    stream_response(&mut source, deadline, context, sink, self.protocol)
+        for retry in 0..=MAX_PROVIDER_RETRIES {
+            let emitted = AtomicBool::new(false);
+            let tracked_sink = |event: ProviderEvent| {
+                emitted.store(true, Ordering::Relaxed);
+                sink(event);
+            };
+            let events = if self.use_tls {
+                match spawn_tls(&self.host, self.port, head.as_bytes(), body) {
+                    Ok(mut source) => stream_response(
+                        &mut source,
+                        deadline,
+                        context,
+                        &tracked_sink,
+                        self.protocol,
+                    ),
+                    Err(failure) => vec![failure],
                 }
-                Err(failure) => vec![failure],
+            } else {
+                match connect_plain(&self.host, self.port) {
+                    Ok(mut stream) => {
+                        if stream.write_all(head.as_bytes()).is_err()
+                            || stream.write_all(body).is_err()
+                        {
+                            return vec![provider_error(
+                                ErrorCategory::Protocol,
+                                "provider request failed",
+                            )];
+                        }
+                        if context.is_cancelled() {
+                            return vec![provider_error(
+                                ErrorCategory::Cancelled,
+                                "provider call was cancelled",
+                            )];
+                        }
+                        let mut source = TcpSource {
+                            stream: &mut stream,
+                        };
+                        stream_response(
+                            &mut source,
+                            deadline,
+                            context,
+                            &tracked_sink,
+                            self.protocol,
+                        )
+                    }
+                    Err(failure) => vec![failure],
+                }
+            };
+
+            let will_retry = retry < MAX_PROVIDER_RETRIES
+                && !emitted.load(Ordering::Relaxed)
+                && has_retryable_terminal(&events);
+            if let Some(ProviderEvent::Failed(error)) = events.last() {
+                log_provider_failure(error, retry + 1, will_retry.then(|| retry_delay(retry)));
             }
-        } else {
-            match connect_plain(&self.host, self.port) {
-                Ok(mut stream) => {
-                    if stream.write_all(head.as_bytes()).is_err() || stream.write_all(body).is_err()
-                    {
-                        return vec![provider_error(
-                            ErrorCategory::Protocol,
-                            "provider request failed",
-                        )];
-                    }
-                    if context.is_cancelled() {
-                        return vec![provider_error(
-                            ErrorCategory::Cancelled,
-                            "provider call was cancelled",
-                        )];
-                    }
-                    let mut source = TcpSource {
-                        stream: &mut stream,
-                    };
-                    stream_response(&mut source, deadline, context, sink, self.protocol)
+            if !will_retry {
+                return events;
+            }
+            if let Err(failure) = wait_before_retry(context, deadline, retry) {
+                if let ProviderEvent::Failed(error) = &failure {
+                    log_provider_failure(error, retry + 1, None);
                 }
-                Err(failure) => vec![failure],
+                return vec![failure];
             }
         }
+        unreachable!("bounded retry loop always returns")
+    }
+}
+
+fn has_retryable_terminal(events: &[ProviderEvent]) -> bool {
+    matches!(
+        events.last(),
+        Some(ProviderEvent::Failed(error))
+            if error.retry() == RetryGuidance::RetryAfterBackoff
+    )
+}
+
+/// Logs only static provider diagnostics, retry classification, and numeric
+/// HTTP status. Request/response bodies, prompts, and credentials never enter
+/// this diagnostic line.
+fn log_provider_failure(error: &AgentError, attempt: usize, delay: Option<Duration>) {
+    let http_status = error
+        .correlation()
+        .iter()
+        .find(|(key, _)| key == "http_status")
+        .map_or("none", |(_, value)| value.as_str());
+    let retry = delay.map_or_else(
+        || "not-scheduled".to_owned(),
+        |delay| format!("in {delay:?}"),
+    );
+    eprintln!(
+        "nexus-openai: provider attempt {attempt}/{} failed: category={:?}, retry={:?} ({retry}), http_status={http_status}, message={}",
+        MAX_PROVIDER_RETRIES + 1,
+        error.category(),
+        error.retry(),
+        error.message(),
+    );
+}
+
+fn retry_delay(retry: usize) -> Duration {
+    PROVIDER_RETRY_DELAYS[retry]
+}
+
+fn wait_before_retry(
+    context: &ProviderContext,
+    deadline: Option<Instant>,
+    retry: usize,
+) -> Result<(), ProviderEvent> {
+    let until = Instant::now() + retry_delay(retry);
+    loop {
+        check_live(context, deadline)?;
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
 }
 
@@ -512,6 +635,9 @@ fn protocol_request_body(
                 "stream":true,
                 "max_output_tokens":max_tokens,
             });
+            if let Some(instructions) = request.rendered_instructions() {
+                body["instructions"] = Value::String(instructions);
+            }
             if !tools.is_empty() {
                 body["tools"] = Value::Array(tools);
             }
@@ -595,6 +721,9 @@ fn protocol_request_body(
                 "max_tokens":max_tokens,
                 "stream":true,
             });
+            if let Some(instructions) = request.rendered_instructions() {
+                body["system"] = Value::String(instructions);
+            }
             if !tools.is_empty() {
                 body["tools"] = Value::Array(tools);
             }
@@ -612,7 +741,7 @@ fn connect_plain(host: &str, port: u16) -> Result<TcpStream, ProviderEvent> {
         .and_then(|mut addresses| {
             addresses.find_map(|address| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).ok())
         })
-        .ok_or_else(|| provider_error(ErrorCategory::Protocol, "provider is unreachable"))
+        .ok_or_else(|| retryable_provider_error(ErrorCategory::Protocol, "provider is unreachable"))
 }
 
 /// Spawns the verified-TLS helper, writes one request into its encrypted
@@ -779,7 +908,7 @@ impl ChunkSource for TlsSource {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 check_live(context, deadline)?;
                 if self.first_byte && self.started.elapsed() >= CONNECT_TIMEOUT {
-                    return Err(provider_error(
+                    return Err(retryable_provider_error(
                         ErrorCategory::Protocol,
                         "provider is unreachable",
                     ));
@@ -2621,5 +2750,58 @@ impl ProviderPort for OpenAiProvider {
             )];
         }
         self.stream_with_sink_impl(&body, context, sink)
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::{
+        MAX_PROVIDER_RETRIES, PROVIDER_RETRY_DELAYS, connect_plain, status_class,
+        status_retry_guidance,
+    };
+    use nexus_core::{ErrorCategory, ProviderEvent, RetryGuidance};
+
+    #[test]
+    fn retry_schedule_is_bounded_and_increases_to_one_minute() {
+        assert_eq!(MAX_PROVIDER_RETRIES, 6);
+        assert_eq!(
+            PROVIDER_RETRY_DELAYS,
+            [
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(60),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_transient_http_statuses_are_retryable() {
+        for status in [408, 425, 429, 500, 503, 599] {
+            assert_eq!(
+                status_retry_guidance(status),
+                RetryGuidance::RetryAfterBackoff,
+                "status {status}"
+            );
+        }
+        for status in [400, 401, 403, 404, 422] {
+            assert_eq!(
+                status_retry_guidance(status),
+                RetryGuidance::DoNotRetry,
+                "status {status}"
+            );
+        }
+        assert_eq!(status_class(429).0, ErrorCategory::RateLimited);
+    }
+
+    #[test]
+    fn connection_refusal_is_retryable_before_a_request_is_sent() {
+        let error = connect_plain("127.0.0.1", 9).expect_err("port 9 refuses connections");
+        assert!(matches!(
+            error,
+            ProviderEvent::Failed(error) if error.retry() == RetryGuidance::RetryAfterBackoff
+        ));
     }
 }

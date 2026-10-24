@@ -124,6 +124,23 @@ pub fn event_json(event: &RunEvent) -> Value {
             "assistant-text",
             json!({ "turn": fragment.turn.as_str(), "item": fragment.item_key, "text": fragment.text }),
         ),
+        EventPayload::ContextReduced {
+            removed_items,
+            retained_items,
+            item_limit,
+            retained_bytes,
+            byte_limit,
+        } => (
+            "context-reduced",
+            json!({
+                "removed_items": removed_items,
+                "retained_items": retained_items,
+                "item_limit": item_limit,
+                "retained_bytes": retained_bytes,
+                "byte_limit": byte_limit,
+                "summarized": false,
+            }),
+        ),
         EventPayload::ToolCallPreview { item_key } => {
             ("tool-call-preview", json!({ "item": item_key }))
         }

@@ -20,7 +20,7 @@ use nexus_core::{
 
 const OUTPUT_BUDGET: usize = 1024;
 const TEXT_BUDGET: usize = Limits::M0_TEST_TOOL_OUTPUT_BYTES;
-/// 128 items of 8192 bytes fill both maxima exactly.
+/// Equal-sized payloads fill both representation maxima exactly.
 const CHUNK: usize = MAX_CONVERSATION_BYTES / MAX_CONVERSATION_ITEMS;
 /// Owned identity bytes of `result_item` beyond content: host call, item key,
 /// provider reference, and tool name.

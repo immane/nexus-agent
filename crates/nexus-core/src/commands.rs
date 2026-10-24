@@ -479,6 +479,20 @@ pub enum EventPayload {
     },
     /// Ordered presentation fragment.
     AssistantTextDelta(AssistantText),
+    /// Runtime omitted older completed exchanges from model context to fit its
+    /// validated context budget. This is not a summary of the omitted content.
+    ContextReduced {
+        /// Number of transcript items omitted in this reduction.
+        removed_items: usize,
+        /// Number of context items retained after the reduction.
+        retained_items: usize,
+        /// Effective runtime item limit.
+        item_limit: usize,
+        /// Retained aggregate context bytes after the reduction.
+        retained_bytes: usize,
+        /// Aggregate byte limit.
+        byte_limit: usize,
+    },
     /// Non-executable proposed-call progress.
     ToolCallPreview {
         /// Turn-local item key.
@@ -506,6 +520,7 @@ impl EventPayload {
     pub fn validate(&self) -> Result<(), AgentError> {
         match self {
             Self::AssistantTextDelta(text) => text.validate(),
+            Self::ContextReduced { .. } => Ok(()),
             Self::ToolCallPreview { item_key } => {
                 if item_key.is_empty() || item_key.len() > crate::content::MAX_ITEM_KEY_LEN {
                     return Err(command_error("tool call preview is invalid"));

@@ -23,3 +23,9 @@ lcov.info/
 
 # Local Obsidian vault metadata and workspace state.
 /.obsidian/
+
+# Generated evaluator logs; retain only reviewed evidence for the recorded pilot.
+/logs/**
+!/logs/**/
+!/logs/run_evaluation/nexus-qwen-sympy-20590-unbounded-20261024/ollama-local__qwen3-27b/sympy__sympy-20590/report.json
+!/logs/run_evaluation/nexus-qwen-sympy-20590-unbounded-20261024/ollama-local__qwen3-27b/sympy__sympy-20590/patch.diff

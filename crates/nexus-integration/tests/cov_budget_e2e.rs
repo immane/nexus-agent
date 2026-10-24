@@ -11,8 +11,8 @@
 //!   effective budget on a UTF-8 character boundary, marks it truncated, and
 //!   leaves `status`, `effect`, and `evidence` untouched, so truncated output
 //!   is never presented as complete (lock 12);
-//! - retained-context exhaustion ends the run `LimitReached` before the next
-//!   model invocation is even requested;
+//! - an uncompactable newest exchange ends the run `LimitReached` before the
+//!   next model invocation is even requested;
 //! - the per-run call budget ends the run `LimitReached` at admission time, so
 //!   the over-budget candidate and any already-admitted remainder reach neither
 //!   the host port nor an outcome record;
@@ -89,7 +89,7 @@ fn started_calls(data: &[RunEvent], control: &[RunEvent]) -> Vec<CallId> {
         .collect()
 }
 
-/// Asserts a budget-exhaustion terminal: `LimitReached` carrying its static
+/// Asserts a budget-exhaustion terminal: `LimitReached` carrying its expected
 /// resource-limit cause, never a fabricated completion and never a silent
 /// fallback that hides which budget bound.
 fn assert_limit_terminal(finished: &RunFinished, message: &str) {
@@ -355,11 +355,9 @@ fn output_exactly_at_the_budget_is_recorded_whole_and_untruncated() {
 
 /// Retained-context exhaustion ends the run before the next model call.
 ///
-/// The bound is checked against the accumulated conversation, not against the
-/// items a single turn adds. Once the retained bound is passed, the run must
-/// report `LimitReached` with the resource-limit cause and must not issue
-/// another model request: the check runs ahead of the provider call, so a
-/// provider that only fails after being asked is never consulted here.
+/// The current user task and newest complete exchange cannot be evicted. If
+/// they exceed the bound, the run records a numeric resource-limit diagnostic
+/// without issuing another model request or rewriting the recorded outcome.
 #[test]
 fn retained_context_exhaustion_ends_the_run_before_the_next_model_call() {
     let rt = common::test_rt();
@@ -378,7 +376,15 @@ fn retained_context_exhaustion_ends_the_run_before_the_next_model_call() {
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         common::assert_contiguous(&data, &control);
         common::assert_single_terminal(&data, &control);
-        assert_limit_terminal(&finished, "retained context budget exhausted");
+        let message = finished.error().expect("context diagnostic").message();
+        let bytes = message
+            .strip_prefix("context budget exhausted: items=3 max_items=2 bytes=")
+            .and_then(|suffix| suffix.strip_suffix(" max_bytes=1048576 continuation=0"))
+            .expect("diagnostic contains only numeric context accounting")
+            .parse::<usize>()
+            .expect("payload byte count is numeric");
+        assert!(bytes > 0 && bytes <= nexus_core::MAX_CONVERSATION_BYTES);
+        assert_limit_terminal(&finished, message);
         assert_eq!(
             bed.provider.call_count(),
             1,
@@ -418,16 +424,17 @@ fn retained_context_exhaustion_ends_the_run_before_the_next_model_call() {
 
 /// A conversation exactly at the retained bound still calls the model.
 ///
-/// The context check rejects strictly above the bound, so one item of headroom
-/// below the limit must complete the run normally; otherwise exhaustion would
-/// fire a turn early and truncate honest work.
+/// The context check rejects strictly above the bound. An empty final response
+/// adds no item, so the task and complete exchange remain exactly at the bound.
 #[test]
 fn retained_context_exactly_at_the_bound_still_calls_the_model() {
     let rt = common::test_rt();
     rt.block_on(async {
         let mut limits = Limits::m0_test();
         limits.retained_context_items = 3;
-        let mut bed = common::make_bed(read_then_stop(), config_with(limits));
+        let mut script = read_then_stop();
+        script[1] = stop_turn("");
+        let mut bed = common::make_bed(script, config_with(limits));
         let response = bed.runtime.submit(common::submit_cmd("ctx-exact")).await;
         assert_eq!(response.reply(), CommandReply::Accepted);
 
@@ -447,6 +454,7 @@ fn retained_context_exactly_at_the_bound_still_calls_the_model() {
         );
         assert_eq!(bed.read_tool.execution_count(), 1);
         assert_eq!(recorded_outcomes(&data, &control).len(), 1);
+        assert_eq!(bed.provider.requests()[1].conversation().len(), 3);
     });
 }
 

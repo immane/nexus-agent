@@ -72,14 +72,9 @@ fn m0_test_profile_is_computed_from_the_locked_constants() {
 }
 
 #[test]
-fn derived_public_caps_agree_with_the_locked_context_and_turn_values() {
-    // The runtime computes effective bounds as a minimum of the configured
-    // budget and these public caps; a drift here silently changes the
-    // effective context and per-turn budgets.
-    assert_eq!(
-        nexus_core::provider::MAX_CONVERSATION_ITEMS,
-        Limits::M0_TEST_RETAINED_CONTEXT_ITEMS
-    );
+fn representation_ceiling_is_independent_of_locked_policy_defaults() {
+    assert_eq!(nexus_core::provider::MAX_CONVERSATION_ITEMS, 8192);
+    assert_eq!(Limits::m0_test().retained_context_items, 256);
     assert_eq!(
         nexus_core::store::MAX_STORED_MESSAGES,
         Limits::M0_TEST_RETAINED_CONTEXT_ITEMS

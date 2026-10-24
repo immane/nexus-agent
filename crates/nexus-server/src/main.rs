@@ -15,10 +15,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use nexus_config::{UserConfig, load, resolve_path};
+use nexus_core::Limits;
 use nexus_server::{Server, ToolsMode};
 
 /// Default loopback port.
 const DEFAULT_PORT: u16 = 8471;
+const BENCHMARK_MAX_MODEL_TURNS: u32 = 500;
+const BENCHMARK_MAX_TOOL_CALLS: u32 = 4_096;
+const BENCHMARK_MAX_TOOL_CALLS_PER_TURN: u32 = 64;
+const BENCHMARK_RETAINED_CONTEXT_ITEMS: usize = 8_192;
 /// Maximum simultaneously serviced sockets; excess connections are closed
 /// immediately instead of creating another unbounded thread.
 const MAX_CONNECTIONS: usize = 64;
@@ -26,10 +31,13 @@ const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--auth-token-env NAME] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
+    eprintln!(
+        "  --benchmark-pilot opts into finite 500-turn/24-hour limits; intended only for isolated benchmark runs."
+    );
     eprintln!(
         "  --auth-token-env reads a 64-hex-character bearer token from the named environment variable."
     );
@@ -63,6 +71,7 @@ enum CliAction {
         gateway_image: Option<String>,
         workload_image: Option<String>,
         auth_token_env: Option<String>,
+        benchmark_pilot: bool,
     },
     /// Print usage and exit 2.
     Usage,
@@ -85,11 +94,18 @@ fn parse_args(argv: &[String]) -> CliAction {
     let mut gateway_image = None;
     let mut workload_image = None;
     let mut auth_token_env = None;
+    let mut benchmark_pilot = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return CliAction::Usage,
             "--strict-tools" => strict_tools = true,
+            "--benchmark-pilot" => {
+                if benchmark_pilot {
+                    return CliAction::Usage;
+                }
+                benchmark_pilot = true;
+            }
             "--execution" => {
                 if execution_set {
                     return CliAction::Usage;
@@ -155,6 +171,9 @@ fn parse_args(argv: &[String]) -> CliAction {
     {
         return CliAction::Usage;
     }
+    if benchmark_pilot && (execution != ExecutionMode::Container || !tools_real || strict_tools) {
+        return CliAction::Usage;
+    }
     if execution == ExecutionMode::Local && (gateway_image.is_some() || workload_image.is_some()) {
         return CliAction::Usage;
     }
@@ -168,6 +187,7 @@ fn parse_args(argv: &[String]) -> CliAction {
         gateway_image,
         workload_image,
         auth_token_env,
+        benchmark_pilot,
     }
 }
 
@@ -211,6 +231,7 @@ fn main() {
         gateway_image,
         workload_image,
         auth_token_env,
+        benchmark_pilot,
     ) = match parse_args(&argv) {
         CliAction::Run {
             port,
@@ -222,6 +243,7 @@ fn main() {
             gateway_image,
             workload_image,
             auth_token_env,
+            benchmark_pilot,
         } => (
             port,
             config,
@@ -232,6 +254,7 @@ fn main() {
             gateway_image,
             workload_image,
             auth_token_env,
+            benchmark_pilot,
         ),
         CliAction::Usage => usage(),
     };
@@ -289,6 +312,22 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
+    if benchmark_pilot {
+        let mut limits = Limits::m0_test();
+        limits.max_model_turns_per_run = BENCHMARK_MAX_MODEL_TURNS;
+        limits.max_tool_calls_per_run = BENCHMARK_MAX_TOOL_CALLS;
+        limits.max_tool_calls_per_turn = BENCHMARK_MAX_TOOL_CALLS_PER_TURN;
+        limits.run_duration = Limits::M0_TEST_MAX_DURATION;
+        limits.per_tool_timeout = std::time::Duration::from_secs(2 * 60);
+        limits.retained_context_items = BENCHMARK_RETAINED_CONTEXT_ITEMS;
+        if let Err(error) = server.set_limits(limits) {
+            eprintln!("nexus-server: invalid benchmark pilot limits ({error})");
+            std::process::exit(2);
+        }
+        eprintln!(
+            "nexus-server: finite benchmark pilot limits enabled (500 turns, 4096 tool calls, 24 hours)"
+        );
+    }
     if let Some(token) = token.as_deref()
         && let Err(error) = server.set_auth_token(token)
     {
@@ -441,7 +480,11 @@ mod cov_main_args {
     //! environment, or network access, so the suite is deterministic and
     //! leaves no listening socket behind.
 
-    use super::{CliAction, DEFAULT_PORT, ExecutionMode, parse_args};
+    use super::{
+        BENCHMARK_MAX_MODEL_TURNS, BENCHMARK_MAX_TOOL_CALLS, BENCHMARK_MAX_TOOL_CALLS_PER_TURN,
+        BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, DEFAULT_PORT, ExecutionMode, Limits,
+        parse_args,
+    };
 
     #[test]
     fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {
@@ -572,6 +615,50 @@ mod cov_main_args {
             "--container-image",
             "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ]);
+    }
+
+    #[test]
+    fn benchmark_pilot_is_explicit_and_requires_container_tools() {
+        usage(&["--benchmark-pilot"]);
+        usage(&["--tools", "real", "--benchmark-pilot"]);
+        let args = [
+            "--tools",
+            "real",
+            "--execution",
+            "container",
+            "--gateway-image",
+            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--container-image",
+            "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--benchmark-pilot",
+        ];
+        assert!(matches!(
+            parse_args(&argv(&args)),
+            CliAction::Run {
+                benchmark_pilot: true,
+                execution: ExecutionMode::Container,
+                ..
+            }
+        ));
+        usage(&["--benchmark-pilot", "--benchmark-pilot"]);
+    }
+
+    #[test]
+    fn benchmark_pilot_budget_is_large_but_finite_and_validated() {
+        let mut limits = Limits::m0_test();
+        limits.max_model_turns_per_run = BENCHMARK_MAX_MODEL_TURNS;
+        limits.max_tool_calls_per_run = BENCHMARK_MAX_TOOL_CALLS;
+        limits.max_tool_calls_per_turn = BENCHMARK_MAX_TOOL_CALLS_PER_TURN;
+        limits.run_duration = Limits::M0_TEST_MAX_DURATION;
+        limits.per_tool_timeout = std::time::Duration::from_secs(2 * 60);
+        limits.retained_context_items = BENCHMARK_RETAINED_CONTEXT_ITEMS;
+        assert_eq!(limits.max_model_turns_per_run, 500);
+        assert_eq!(limits.max_tool_calls_per_run, 4_096);
+        assert_eq!(
+            limits.run_duration,
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        assert!(limits.validate().is_ok());
     }
 
     #[test]

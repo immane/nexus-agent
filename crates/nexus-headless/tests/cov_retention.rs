@@ -56,11 +56,11 @@ const MANDATORY_KINDS: [&str; 6] = [
     "run-finished",
 ];
 
-const PRESENTATION_KINDS: [&str; 3] = ["text", "preview", "tool-output"];
+const PRESENTATION_KINDS: [&str; 4] = ["text", "context-reduced", "preview", "tool-output"];
 
 /// Every kind this crate can emit, so the sweep over a report rejects a kind
 /// that neither list claims rather than quietly ignoring it.
-const ALL_KINDS: [&str; 9] = [
+const ALL_KINDS: [&str; 10] = [
     "run-started",
     "usage",
     "tool-started",
@@ -69,6 +69,7 @@ const ALL_KINDS: [&str; 9] = [
     "tool-finished",
     "preview",
     "text",
+    "context-reduced",
     "run-finished",
 ];
 
@@ -188,6 +189,13 @@ fn the_published_kind_classification_covers_every_documented_kind() {
 fn documented_tail(kind: &str) -> Option<&'static [&'static str]> {
     let tail: &'static [&'static str] = match kind {
         "run-started" => &["request"],
+        "context-reduced" => &[
+            "removed-items",
+            "retained-items",
+            "item-limit",
+            "retained-bytes",
+            "byte-limit",
+        ],
         "usage" => &["input", "output", "finality"],
         "tool-started" => &["call"],
         "approval-required" => &["approval", "call", "scope", "args-preview"],

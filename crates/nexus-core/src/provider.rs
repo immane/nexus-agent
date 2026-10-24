@@ -21,12 +21,16 @@ use crate::tool::ToolSpec;
 pub const MAX_CREDENTIAL_REF_LEN: usize = 128;
 /// Maximum model-profile name length in bytes (M0-TEST choice).
 pub const MAX_PROFILE_LEN: usize = 128;
-/// Maximum conversation items accepted by one request (M0-TEST choice: the
-/// lock's retained-context table value).
-pub const MAX_CONVERSATION_ITEMS: usize = Limits::M0_TEST_RETAINED_CONTEXT_ITEMS;
-/// Maximum aggregate conversation payload in bytes (M0-TEST representation
-/// choice; the lock sets no table value for aggregate conversation bytes).
+/// Representation ceiling for one request, independent of the effective
+/// runtime policy (whose M0-test default remains 256 retained items).
+pub const MAX_CONVERSATION_ITEMS: usize = 8192;
+/// Maximum request-context payload including instructions, note, and conversation
+/// (M0-TEST representation choice; the lock sets no table value for aggregate bytes).
 pub const MAX_CONVERSATION_BYTES: usize = 1_048_576;
+/// Maximum aggregate agent and environment instruction payload in bytes.
+pub const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+/// Maximum runtime-generated context note carried outside conversation history.
+pub const MAX_CONTEXT_NOTE_BYTES: usize = 4 * 1024;
 /// Maximum tool definitions accepted by one request (M0-TEST choice: the
 /// per-turn declared-call bound).
 pub const MAX_TOOL_DEFINITIONS: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize;
@@ -358,7 +362,69 @@ impl ModelContextItem {
     }
 }
 
-/// One model-turn request: identities, profile, accepted conversation
+/// Bounded agent and environment instructions supplied separately from history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelInstructions {
+    agent: String,
+    environment: String,
+}
+
+impl ModelInstructions {
+    /// Validates the combined UTF-8 payload against [`MAX_INSTRUCTIONS_BYTES`].
+    /// Both fields may be empty; their contents are preserved verbatim.
+    pub fn new(
+        agent: impl Into<String>,
+        environment: impl Into<String>,
+    ) -> Result<Self, AgentError> {
+        let instructions = Self {
+            agent: agent.into(),
+            environment: environment.into(),
+        };
+        if instructions.payload_bytes() > MAX_INSTRUCTIONS_BYTES {
+            return Err(port_limit_error(
+                "model instructions exceed aggregate byte budget",
+            ));
+        }
+        Ok(instructions)
+    }
+
+    /// Returns the agent instructions.
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// Returns the environment instructions.
+    #[must_use]
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+
+    /// Returns rendered UTF-8 bytes, including the separator between nonempty fields.
+    #[must_use]
+    pub fn payload_bytes(&self) -> usize {
+        self.agent
+            .len()
+            .saturating_add(self.environment.len())
+            .saturating_add(if !self.agent.is_empty() && !self.environment.is_empty() {
+                2
+            } else {
+                0
+            })
+    }
+
+    /// Renders nonempty fields in agent/environment order, separated by a blank line.
+    #[must_use]
+    pub fn rendered_text(&self) -> String {
+        match (self.agent.is_empty(), self.environment.is_empty()) {
+            (true, _) => self.environment.clone(),
+            (_, true) => self.agent.clone(),
+            (false, false) => format!("{}\n\n{}", self.agent, self.environment),
+        }
+    }
+}
+
+/// One model-turn request: identities, profile, instructions, accepted conversation
 /// budget, enabled tools, and compatible continuation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
@@ -368,6 +434,8 @@ pub struct ModelRequest {
     enabled_tools: Vec<ToolId>,
     continuation: Option<ContinuationData>,
     output_budget_bytes: usize,
+    instructions: ModelInstructions,
+    context_note: String,
     conversation: Vec<ModelContextItem>,
     tool_definitions: Vec<ToolSpec>,
 }
@@ -399,6 +467,8 @@ impl ModelRequest {
             enabled_tools,
             continuation,
             output_budget_bytes,
+            instructions: ModelInstructions::default(),
+            context_note: String::new(),
             conversation: Vec::new(),
             tool_definitions: Vec::new(),
         })
@@ -440,8 +510,91 @@ impl ModelRequest {
         self.output_budget_bytes
     }
 
+    /// Installs instructions, replacing previously accepted instructions.
+    /// Instructions, note, and conversation share [`MAX_CONVERSATION_BYTES`].
+    pub fn with_instructions(
+        mut self,
+        instructions: ModelInstructions,
+    ) -> Result<Self, AgentError> {
+        let total = instructions
+            .payload_bytes()
+            .saturating_add(self.context_note_cost(&self.context_note, &instructions))
+            .saturating_add(conversation_payload_bytes(&self.conversation));
+        if total > MAX_CONVERSATION_BYTES {
+            return Err(port_limit_error(
+                "model request context exceeds aggregate byte budget",
+            ));
+        }
+        self.instructions = instructions;
+        Ok(self)
+    }
+
+    /// Returns the accepted instructions (empty by default).
+    #[must_use]
+    pub fn instructions(&self) -> &ModelInstructions {
+        &self.instructions
+    }
+
+    /// Adds a bounded runtime-generated context annotation outside history.
+    /// Replaces any previous note; an empty note clears it.
+    pub fn with_context_note(mut self, note: impl Into<String>) -> Result<Self, AgentError> {
+        let note = note.into();
+        if note.len() > MAX_CONTEXT_NOTE_BYTES {
+            return Err(port_limit_error("model context note exceeds byte budget"));
+        }
+        let total = self
+            .instructions
+            .payload_bytes()
+            .saturating_add(self.context_note_cost(&note, &self.instructions))
+            .saturating_add(conversation_payload_bytes(&self.conversation));
+        if total > MAX_CONVERSATION_BYTES {
+            return Err(port_limit_error(
+                "model request context exceeds aggregate byte budget",
+            ));
+        }
+        self.context_note = note;
+        Ok(self)
+    }
+
+    /// Returns the current runtime-generated context annotation.
+    #[must_use]
+    pub fn context_note(&self) -> &str {
+        &self.context_note
+    }
+
+    /// Rendered byte cost of the runtime context note, including its label.
+    #[must_use]
+    pub fn context_note_bytes(&self) -> usize {
+        self.context_note_cost(&self.context_note, &self.instructions)
+    }
+
+    fn context_note_cost(&self, note: &str, instructions: &ModelInstructions) -> usize {
+        if note.is_empty() {
+            return 0;
+        }
+        note.len()
+            .saturating_add("Runtime context note:\n".len())
+            .saturating_add(usize::from(instructions.payload_bytes() > 0) * 2)
+    }
+
+    /// Renders host instructions and the optional runtime note for a native
+    /// provider system-instruction field. The note is deliberately labeled.
+    #[must_use]
+    pub fn rendered_instructions(&self) -> Option<String> {
+        let instructions = self.instructions.rendered_text();
+        match (instructions.is_empty(), self.context_note.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(instructions),
+            (true, false) => Some(format!("Runtime context note:\n{}", self.context_note)),
+            (false, false) => Some(format!(
+                "{instructions}\n\nRuntime context note:\n{}",
+                self.context_note
+            )),
+        }
+    }
+
     /// Installs a bounded conversation, replacing any previously accepted
-    /// items. Count and aggregate payload bytes are checked here.
+    /// items. Count and aggregate instructions/note/conversation bytes are checked here.
     pub fn with_conversation(
         mut self,
         conversation: Vec<ModelContextItem>,
@@ -454,9 +607,11 @@ impl ModelRequest {
         for item in &conversation {
             validate_reasoning(item.reasoning())?;
         }
-        let total = conversation
-            .iter()
-            .fold(0usize, |acc, item| acc.saturating_add(item.payload_bytes()));
+        let total = self
+            .instructions
+            .payload_bytes()
+            .saturating_add(self.context_note_bytes())
+            .saturating_add(conversation_payload_bytes(&conversation));
         if total > MAX_CONVERSATION_BYTES {
             return Err(port_limit_error(
                 "model conversation exceeds aggregate byte budget",
@@ -775,6 +930,12 @@ fn tool_definitions_bytes(tool_definitions: &[ToolSpec]) -> usize {
         acc.saturating_add(spec.id().name().len())
             .saturating_add(spec.description().len())
             .saturating_add(spec.input_schema_json().len())
+    })
+}
+
+fn conversation_payload_bytes(conversation: &[ModelContextItem]) -> usize {
+    conversation.iter().fold(0usize, |total, item| {
+        total.saturating_add(item.payload_bytes())
     })
 }
 

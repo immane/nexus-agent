@@ -480,7 +480,11 @@ fn event_count_budget_boundary_is_exact() {
     runtime.block_on(async {
         let at_bound = event_count_batch(MAX_BATCH_EVENTS - 1);
         assert_eq!(at_bound.len(), MAX_BATCH_EVENTS);
-        let (mut bed, provider) = make_bed(Limits::m0_test(), vec![at_bound], vec![stop()]);
+        // Isolate the event-count limit from the independently enforced
+        // retained-context budget: this batch contains distinct text items.
+        let mut limits = Limits::m0_test();
+        limits.retained_context_items = nexus_core::MAX_CONVERSATION_ITEMS;
+        let (mut bed, provider) = make_bed(limits, vec![at_bound], vec![stop()]);
         let probe = submit_and_settle(&mut bed, &provider, "events-exact").await;
         assert_eq!(
             probe.finished.outcome(),

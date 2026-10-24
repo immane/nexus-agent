@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
-    ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, ModelRequest,
+    ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelRequest,
     ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunId,
     SessionId, SubmitCommand, ToolRegistration,
 };
@@ -397,6 +397,8 @@ pub struct Server {
     /// File the configuration is persisted to. `None` keeps every change in
     /// memory: a server without a configured path never writes a file.
     config_path: Option<PathBuf>,
+    /// Finite runtime limits applied to sessions created after startup.
+    limits: Limits,
     /// Accepted run id to the model id it was submitted with. Entries are
     /// consumed by the completion watcher, a terminal SSE event, a subsequent
     /// run, or safe idle reclamation; admission caps retained entries.
@@ -468,6 +470,7 @@ impl Server {
             next_session: AtomicU64::new(1),
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
+            limits: Limits::m0_test(),
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
@@ -490,6 +493,14 @@ impl Server {
             Policy::development(root)?;
         }
         self.tools_mode = mode;
+        Ok(())
+    }
+
+    /// Sets the validated finite run limits for subsequently created sessions.
+    /// Startup-only, like tool wiring; existing sessions are never changed.
+    pub fn set_limits(&mut self, limits: Limits) -> Result<(), nexus_core::AgentError> {
+        limits.validate()?;
+        self.limits = limits;
         Ok(())
     }
 
@@ -554,7 +565,7 @@ impl Server {
         let token = format!("sess-web-{n}");
         let session = SessionId::new(&token).expect("counter session id is valid");
         let config = RuntimeConfig {
-            limits: nexus_core::Limits::m0_test(),
+            limits: self.limits,
             policy: match &self.tools_mode {
                 ToolsMode::Development { root } => Policy::development(root)
                     .map_err(|_| SessionError::new(500, "tool permissions are invalid"))?,

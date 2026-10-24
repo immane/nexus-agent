@@ -41,8 +41,9 @@ pub use outcomes::{
     PersistenceState, RunFinished, RunOutcome, ToolOutcome, TurnFinished, Usage, UsageFinality,
 };
 pub use provider::{
-    CredentialRef, DEFAULT_ADAPTER_IDENTITY, ItemKey, MAX_CONVERSATION_BYTES,
-    MAX_CONVERSATION_ITEMS, MAX_TOOL_DEFINITION_BYTES, MAX_TOOL_DEFINITIONS, ModelContextItem,
+    CredentialRef, DEFAULT_ADAPTER_IDENTITY, ItemKey, MAX_CONTEXT_NOTE_BYTES,
+    MAX_CONVERSATION_BYTES, MAX_CONVERSATION_ITEMS, MAX_INSTRUCTIONS_BYTES,
+    MAX_TOOL_DEFINITION_BYTES, MAX_TOOL_DEFINITIONS, ModelContextItem, ModelInstructions,
     ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, ProviderRef,
 };
 pub use store::{
@@ -98,7 +99,7 @@ mod cov_lib_private {
             UsageFinality,
         });
         alias_all!(provider::{
-            CredentialRef, ItemKey, ModelContextItem, ModelRequest, ProviderCapabilities,
+            CredentialRef, ItemKey, ModelContextItem, ModelInstructions, ModelRequest, ProviderCapabilities,
             ProviderContext, ProviderEvent, ProviderRef,
         });
         alias_all!(store::{
@@ -142,6 +143,10 @@ mod cov_lib_private {
         assert_eq!(
             crate::MAX_CONVERSATION_BYTES,
             crate::provider::MAX_CONVERSATION_BYTES
+        );
+        assert_eq!(
+            crate::MAX_INSTRUCTIONS_BYTES,
+            crate::provider::MAX_INSTRUCTIONS_BYTES
         );
         assert_eq!(
             crate::MAX_TOOL_DEFINITIONS,

@@ -884,6 +884,15 @@ fn format_event(event: &RunEvent) -> String {
             text.text.len(),
             sanitize(&text.text),
         ),
+        EventPayload::ContextReduced {
+            removed_items,
+            retained_items,
+            item_limit,
+            retained_bytes,
+            byte_limit,
+        } => format!(
+            "{head}context-reduced removed-items={removed_items} retained-items={retained_items} item-limit={item_limit} retained-bytes={retained_bytes} byte-limit={byte_limit}"
+        ),
         EventPayload::ToolCallPreview { item_key } => {
             format!("{head}preview item={}", sanitize(item_key))
         }

@@ -32,6 +32,8 @@ use nexus_headless::{
 /// it private, so it is pinned here by value: changing it changes the documented
 /// CLI contract.
 const INVALID_ARGV_DIAGNOSTIC: &str = "nexus-headless: error: arguments must be valid UTF-8";
+const RUNTIME_CONTEXT_BUDGET: &str =
+    "nexus-runtime: context budget configured_items=256 effective_items=256 max_bytes=1048576";
 
 /// Exit codes as the operating system reports them, taken from the public
 /// mapping so a changed constant cannot silently disagree with the assertions.
@@ -44,6 +46,16 @@ const EXIT_STDOUT_CLOSED_CODE: i32 = EXIT_STDOUT_CLOSED;
 const REQUIRED_KEYS: &[(&str, &[&str])] = &[
     ("run-started", &["request"]),
     ("text", &["item", "text-len", "text"]),
+    (
+        "context-reduced",
+        &[
+            "removed-items",
+            "retained-items",
+            "item-limit",
+            "retained-bytes",
+            "byte-limit",
+        ],
+    ),
     ("preview", &["item"]),
     (
         "approval-required",
@@ -722,16 +734,17 @@ fn oversize_task_is_a_usage_error_without_echoing_input() {
     let lines: Vec<&str> = invocation.stderr.lines().collect();
     assert_eq!(
         lines.len(),
-        4,
-        "banner, mode, one diagnostic, usage: {lines:?}"
+        5,
+        "banner, mode, runtime budget, one diagnostic, usage: {lines:?}"
     );
     assert_eq!(lines[0], FAKE_BANNER);
     assert_eq!(lines[1], "nexus-headless: mode=build");
+    assert_eq!(lines[2], RUNTIME_CONTEXT_BUDGET);
     assert!(
-        lines[2].starts_with("nexus-headless: error:"),
+        lines[3].starts_with("nexus-headless: error:"),
         "the rejection is a diagnostic: {lines:?}"
     );
-    assert_eq!(lines[3], USAGE);
+    assert_eq!(lines[4], USAGE);
     assert!(
         !invocation.stderr.contains(sentinel) && !invocation.stderr.contains(&filler),
         "rejected input never reaches diagnostics"
@@ -773,7 +786,10 @@ fn stdout_carries_only_machine_records_and_stderr_carries_the_banner() {
         );
         for line in invocation.stderr.lines() {
             assert!(
-                line == FAKE_BANNER || line == USAGE || line.starts_with("nexus-headless: "),
+                line == FAKE_BANNER
+                    || line == USAGE
+                    || line == RUNTIME_CONTEXT_BUDGET
+                    || line.starts_with("nexus-headless: "),
                 "stderr carries only diagnostics: {line}"
             );
             assert!(
@@ -1063,7 +1079,8 @@ fn merged_stream_orders_the_banner_before_the_records() {
         lines[1], "nexus-headless: mode=build",
         "the invocation names its mode after the banner: {lines:?}"
     );
-    let body = &lines[2..lines.len() - 1];
+    assert_eq!(lines[2], RUNTIME_CONTEXT_BUDGET);
+    let body = &lines[3..lines.len() - 1];
     assert!(!body.is_empty(), "records follow the banner: {lines:?}");
     let prefix = format!("rev={OUTPUT_REV} ");
     for line in body {
@@ -1106,7 +1123,11 @@ fn broken_stdout_pipe_exits_without_panic() {
     assert!(invocation.stdout.is_empty(), "no stdout survived the pipe");
     assert_stderr_lines(
         &invocation.stderr,
-        &[FAKE_BANNER, "nexus-headless: mode=build"],
+        &[
+            FAKE_BANNER,
+            "nexus-headless: mode=build",
+            RUNTIME_CONTEXT_BUDGET,
+        ],
     );
     for marker in ["panicked", "Broken pipe", "BrokenPipe", "run="] {
         assert!(

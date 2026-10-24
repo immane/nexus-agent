@@ -590,6 +590,7 @@ fn retention_evicts_whole_exchanges_and_reserves_space_for_new_input() {
     assert_eq!(
         requests[3]["messages"],
         json!([
+            {"role":"system","content":"Runtime context note:\nNexus context note: Earlier completed exchanges were omitted to fit the context budget. They were not summarized. Re-check earlier facts before relying on them."},
             {"role":"user","content":"third"},
             {"role":"assistant","content":"three","reasoning_content":"final trace"},
             {"role":"user","content":"fourth"}
@@ -620,7 +621,8 @@ fn inherited_history_yields_to_current_tool_round_without_splitting_pairs() {
     let requests = mock.requests.lock().unwrap();
     assert_eq!(requests[1]["messages"][0]["content"], "baseline");
     let followup = requests[2]["messages"].as_array().unwrap();
-    assert_eq!(followup[0]["content"], "tools");
-    assert_eq!(followup.len(), 4);
-    assert_pairing(followup);
+    assert_eq!(followup[0]["role"], "system");
+    assert_eq!(followup[1]["content"], "tools");
+    assert_eq!(followup.len(), 5);
+    assert_pairing(&followup[1..]);
 }

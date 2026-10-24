@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use nexus_config::{AdapterKind, CredentialRef, ProviderProfile};
 use nexus_core::{
     CallId, CancellationToken, ContinuationData, EffectState, ErrorCategory, Evidence,
-    ExecutionStatus, FinishReason, M0_REVISION, ModelContextItem, ModelRequest, NormalizedArgs,
-    ProviderContext, ProviderEvent, ProviderPort, RunId, ToolCall, ToolId, ToolOutcome, ToolSpec,
-    TurnFinished, TurnId, Usage, UsageFinality,
+    ExecutionStatus, FinishReason, M0_REVISION, ModelContextItem, ModelInstructions, ModelRequest,
+    NormalizedArgs, ProviderContext, ProviderEvent, ProviderPort, RetryGuidance, RunId, ToolCall,
+    ToolId, ToolOutcome, ToolSpec, TurnFinished, TurnId, Usage, UsageFinality,
 };
 use nexus_openai::OpenAiProvider;
 use serde_json::Value;
@@ -29,6 +29,17 @@ struct Served {
 
 /// Serves one canned HTTP response after an optional delay, then closes.
 fn serve(status: u16, body: &str, delay: Duration) -> (String, Served) {
+    serve_n(status, body, delay, 1)
+}
+
+/// Serves the same response for a bounded number of connections.
+fn serve_n(status: u16, body: &str, delay: Duration, requests: usize) -> (String, Served) {
+    serve_sequence(&vec![status; requests], body, delay)
+}
+
+/// Serves one response status per connection, allowing retry tests to end
+/// with a non-retryable response rather than waiting through the full policy.
+fn serve_sequence(statuses: &[u16], body: &str, delay: Duration) -> (String, Served) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback binds");
     let port = listener.local_addr().expect("port known").port();
     let served = Served {
@@ -40,50 +51,53 @@ fn serve(status: u16, body: &str, delay: Duration) -> (String, Served) {
         request: Arc::clone(&served.request),
     };
     let body = body.to_owned();
+    let statuses = statuses.to_vec();
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            match stream.read_exact(&mut byte) {
-                Ok(()) => head.push(byte[0]),
-                Err(_) => break,
+        for status in statuses {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read_exact(&mut byte) {
+                    Ok(()) => head.push(byte[0]),
+                    Err(_) => break,
+                }
+                if head.len() > 65_536 {
+                    break;
+                }
             }
-            if head.len() > 65_536 {
-                break;
-            }
+            let length: usize = String::from_utf8_lossy(&head)
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .or_else(|| line.strip_prefix("Content-Length:"))
+                })
+                .filter_map(|value| value.trim().parse().ok())
+                .next()
+                .unwrap_or(0);
+            let mut rest = vec![0u8; length.min(1_048_576)];
+            let _ = stream.read_exact(&mut rest);
+            captured
+                .request
+                .lock()
+                .expect("request log writable")
+                .extend_from_slice(&head);
+            captured
+                .request
+                .lock()
+                .expect("request log writable")
+                .extend_from_slice(&rest);
+            captured.hits.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
         }
-        let length: usize = String::from_utf8_lossy(&head)
-            .lines()
-            .filter_map(|line| {
-                line.strip_prefix("content-length:")
-                    .or_else(|| line.strip_prefix("Content-Length:"))
-            })
-            .filter_map(|value| value.trim().parse().ok())
-            .next()
-            .unwrap_or(0);
-        let mut rest = vec![0u8; length.min(1_048_576)];
-        let _ = stream.read_exact(&mut rest);
-        captured
-            .request
-            .lock()
-            .expect("request log writable")
-            .extend_from_slice(&head);
-        captured
-            .request
-            .lock()
-            .expect("request log writable")
-            .extend_from_slice(&rest);
-        captured.hits.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(delay);
-        let response = format!(
-            "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = stream.write_all(response.as_bytes());
     });
     (format!("http://127.0.0.1:{port}/v1"), served)
 }
@@ -340,6 +354,95 @@ fn configured_responses_and_messages_protocols_use_their_wire_contracts() {
                 assert!(request.contains("\"input_schema\""));
             }
             nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn all_protocols_encode_instructions_without_changing_conversation() {
+    for (protocol, response) in [
+        (nexus_config::ProtocolKind::ChatCompletions, stop_body("done")),
+        (
+            nexus_config::ProtocolKind::OpenAiResponses,
+            r#"{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}"#.to_owned(),
+        ),
+        (
+            nexus_config::ProtocolKind::AnthropicMessages,
+            r#"{"type":"message","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}"#.to_owned(),
+        ),
+    ] {
+        for instruction_parts in [
+            None,
+            Some(("", "")),
+            Some(("Agent fixture: \"quoted\"\nUnicode: 日本語", "")),
+            Some(("", "Environment fixture: /workspace/project")),
+            Some(("Agent fixture", "Environment fixture\nsecond line")),
+        ] {
+            let (base, served) = serve(200, &response, Duration::ZERO);
+            let adapter = OpenAiProvider::new_for_protocol(
+                &base,
+                present_credential(),
+                "test-model",
+                protocol,
+            )
+            .expect("adapter builds");
+            let mut request = base_request()
+                .with_conversation(vec![
+                    ModelContextItem::user_text("fixture prompt").expect("user text builds"),
+                ])
+                .expect("conversation attaches");
+            if let Some((agent, environment)) = instruction_parts {
+                request = request
+                    .with_instructions(
+                        ModelInstructions::new(agent, environment).expect("instructions build"),
+                    )
+                    .expect("instructions attach");
+            }
+            request = request
+                .with_context_note("Earlier completed exchanges were omitted.")
+                .expect("runtime note attaches");
+            let rendered = request
+                .rendered_instructions()
+                .expect("note renders in native instruction field");
+            let events = adapter.stream(&request, &live_context());
+            assert_eq!(finished(&events).reason(), FinishReason::Stop);
+            let raw = served.request.lock().expect("request captured");
+            let raw = String::from_utf8_lossy(&raw);
+            let (_, body) = raw.split_once("\r\n\r\n").expect("HTTP body exists");
+            let body: Value = serde_json::from_str(body).expect("request body is JSON");
+            match protocol {
+                nexus_config::ProtocolKind::ChatCompletions => {
+                    let mut expected = Vec::new();
+                    expected.push(serde_json::json!({"role":"system","content":rendered}));
+                    expected.push(serde_json::json!({"role":"user","content":"fixture prompt"}));
+                    assert_eq!(body["messages"], Value::Array(expected));
+                    assert!(body.get("instructions").is_none());
+                    assert!(body.get("system").is_none());
+                }
+                nexus_config::ProtocolKind::OpenAiResponses => {
+                    assert_eq!(
+                        body["input"],
+                        serde_json::json!([{"role":"user","content":"fixture prompt"}])
+                    );
+                    assert_eq!(
+                        body.get("instructions"),
+                        Some(Value::String(rendered)).as_ref()
+                    );
+                    assert!(body.get("system").is_none());
+                    assert!(body.get("messages").is_none());
+                }
+                nexus_config::ProtocolKind::AnthropicMessages => {
+                    assert_eq!(
+                        body["messages"],
+                        serde_json::json!([{"role":"user","content":[{"type":"text","text":"fixture prompt"}]}])
+                    );
+                    assert_eq!(
+                        body.get("system"),
+                        Some(Value::String(rendered)).as_ref()
+                    );
+                    assert!(body.get("instructions").is_none());
+                }
+            }
         }
     }
 }
@@ -831,15 +934,18 @@ fn responses_and_messages_errors_are_static_and_truncated_streams_fail() {
         nexus_config::ProtocolKind::AnthropicMessages,
     ] {
         let (base, _) = serve(
-            429,
+            401,
             r#"{"error":"private vendor response containing sensitive text"}"#,
             Duration::ZERO,
         );
         let adapter =
             OpenAiProvider::new_for_protocol(&base, present_credential(), "model", protocol)
                 .expect("protocol adapter builds");
-        let events = adapter.stream(&base_request(), &live_context());
-        assert_eq!(failed(events).0, ErrorCategory::RateLimited);
+        let events = adapter.stream(
+            &base_request(),
+            &ProviderContext::new(Duration::from_millis(1_500), false, None),
+        );
+        assert_eq!(failed(events).0, ErrorCategory::Authentication);
 
         let (base, _) = match protocol {
             nexus_config::ProtocolKind::OpenAiResponses => serve_raw(
@@ -956,14 +1062,11 @@ fn http_failures_map_to_typed_categories() {
     for (status, category) in [
         (401, ErrorCategory::Authentication),
         (403, ErrorCategory::Authentication),
-        (429, ErrorCategory::RateLimited),
-        (500, ErrorCategory::Protocol),
-        (503, ErrorCategory::Protocol),
     ] {
         let (base, _) = serve(status, r#"{"error":"nope"}"#, Duration::ZERO);
         let error = failed(provider(&base).stream(&base_request(), &live_context()));
         assert_eq!(error.0, category, "{status}");
-        assert_eq!(error.1, nexus_core::RetryGuidance::DoNotRetry);
+        assert_eq!(error.1, RetryGuidance::DoNotRetry);
     }
     let (base, _) = serve(200, "not json{{{", Duration::ZERO);
     let error = failed(provider(&base).stream(&base_request(), &live_context()));
@@ -971,6 +1074,24 @@ fn http_failures_map_to_typed_categories() {
     let (base, _) = serve(200, r#"{"choices":[]}"#, Duration::ZERO);
     let error = failed(provider(&base).stream(&base_request(), &live_context()));
     assert_eq!(error.0, ErrorCategory::Protocol);
+}
+
+#[test]
+fn transient_http_failure_retries_before_nonretryable_status() {
+    let (base, served) = serve_sequence(
+        &[503, 401],
+        r#"{"error":"temporarily unavailable"}"#,
+        Duration::ZERO,
+    );
+    let started = Instant::now();
+    let error = failed(provider(&base).stream(&base_request(), &live_context()));
+    assert_eq!(error.0, ErrorCategory::Authentication);
+    assert_eq!(
+        served.hits.load(Ordering::SeqCst),
+        2,
+        "the retry follows the first transient response"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(1_000));
 }
 
 #[test]
@@ -1062,14 +1183,6 @@ fn sse_single_record_is_bounded_independently_of_wire_budget() {
     let (base, _) = serve_raw(&sse_head(body.len()), &body);
     let error = failed(provider(&base).stream(&base_request(), &live_context()));
     assert_eq!(error.0, ErrorCategory::ResourceLimit);
-}
-
-#[test]
-fn unreachable_peers_fail_protocol() {
-    let provider = OpenAiProvider::new("http://127.0.0.1:9/", present_credential(), "m")
-        .expect("provider builds");
-    let error = failed(provider.stream(&base_request(), &live_context()));
-    assert_eq!(error.0, ErrorCategory::Protocol);
 }
 
 #[test]

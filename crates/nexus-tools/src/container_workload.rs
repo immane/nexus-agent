@@ -569,10 +569,8 @@ impl<R: Runner> Workload<R> {
                 self.config.resolver_file.display()
             ),
             "--workdir=/workspace".into(),
-            "--env=PATH=/usr/local/bin:/usr/bin:/bin".into(),
             "--env=HOME=/home/worker".into(),
             "--env=TMPDIR=/tmp".into(),
-            "--env=LC_ALL=C.UTF-8".into(),
             "--entrypoint".into(),
             "/usr/local/bin/nexus-keeper".into(),
             self.config.image.clone(),
@@ -1370,6 +1368,8 @@ mod tests {
         assert!(a.contains(&"--init".into()));
         assert!(a.contains(&"--memory-swap=4g".into()));
         assert!(a.contains(&"/usr/local/bin/nexus-keeper".into()));
+        assert!(!a.iter().any(|arg| arg.starts_with("--env=PATH=")));
+        assert!(!a.iter().any(|arg| arg.starts_with("--env=LC_ALL=")));
         assert!(a.iter().any(|arg| {
             arg == "/workspace/node_modules:rw,exec,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0755"
         }));

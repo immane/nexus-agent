@@ -102,6 +102,10 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 | [04 - Session store](contracts/04-session-store.md) | Persistence, durability, interrupted operations, and recovery | Draft contract |
 | [05 - Configuration](contracts/05-configuration.md) | Configuration snapshots, credentials, permissions, and bounded defaults | Draft contract |
 
+## Research
+
+- [Agent benchmarks](research/agent-benchmarks.md): benchmark fit, integration gaps, safe bring-up, and error accounting for Nexus.
+
 ## Decisions
 
 - [00 - Project foundation](design/decisions/00-project-foundation.md): accepted project direction.

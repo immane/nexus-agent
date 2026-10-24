@@ -1177,6 +1177,11 @@ impl AppState {
                     self.push_stream_fragment(EntryKind::Assistant, "assistant", key, &clean);
                 }
             }
+            EventPayload::ContextReduced { removed_items, .. } => {
+                self.push_system(format!(
+                    "context reduced: omitted {removed_items} earlier items; this is not a summary"
+                ));
+            }
             EventPayload::ToolCallPreview { item_key } => {
                 self.push_tool_with_fold(
                     format!("preview {item_key}"),
