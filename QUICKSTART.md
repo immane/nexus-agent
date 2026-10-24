@@ -3,7 +3,7 @@
 ## Status snapshot
 
 - See `git status` and `git log` for the current worktree and revision.
-- Implementation stage: **0.2.0-alpha**, built on the M0 runtime:
+- Implementation stage: **0.2.1-alpha**, built on the M0 runtime:
   Chat Completions, OpenAI Responses, and Anthropic Messages adapters
   (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
