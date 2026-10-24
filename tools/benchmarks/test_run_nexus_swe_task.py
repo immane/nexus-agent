@@ -1,8 +1,9 @@
 """Offline tests for benchmark result classification."""
 
 import unittest
+from argparse import Namespace
 
-from run_nexus_swe_task import summarize_result
+from run_nexus_swe_task import reached_budget, summarize_result
 
 
 class SummaryTests(unittest.TestCase):
@@ -49,6 +50,29 @@ class SummaryTests(unittest.TestCase):
     def test_wrong_instance_report_is_rejected(self):
         with self.assertRaises(RuntimeError):
             summarize_result(self.result, {"submitted_ids": ["other-task"]})
+
+
+class BudgetTests(unittest.TestCase):
+    def test_unset_runner_limits_do_not_stop_a_run(self):
+        args = Namespace(
+            max_run_seconds=None,
+            max_tool_calls=None,
+            max_input_tokens=None,
+            max_output_tokens=None,
+        )
+        self.assertIsNone(reached_budget(10**9, args, 10**6, {"input": 10**12, "output": 10**9}, False, 0))
+
+    def test_configured_runner_limit_still_stops(self):
+        args = Namespace(
+            max_run_seconds=None,
+            max_tool_calls=150,
+            max_input_tokens=None,
+            max_output_tokens=None,
+        )
+        self.assertEqual(
+            reached_budget(1, args, 150, {"input": 0, "output": 0}, True, 1),
+            "tool-call budget reached",
+        )
 
 
 if __name__ == "__main__":

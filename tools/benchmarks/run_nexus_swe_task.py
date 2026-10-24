@@ -11,7 +11,6 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-MAX_RUN_SECONDS = 24 * 60 * 60
 RUNNER_GRACE_SECONDS = 60
 
 
@@ -93,6 +92,25 @@ def summarize_result(result, report=None):
     return summary
 
 
+def reached_budget(elapsed, args, tool_calls, usage, usage_complete, final_usage_events):
+    """Return the first explicitly configured runner budget that was reached."""
+    if args.max_run_seconds is not None and elapsed >= args.max_run_seconds:
+        return "wall-clock budget reached"
+    if args.max_tool_calls is not None and tool_calls >= args.max_tool_calls:
+        return "tool-call budget reached"
+    if args.max_input_tokens is not None:
+        if final_usage_events and not usage_complete:
+            return "provider usage incomplete; input-token budget cannot be enforced"
+        if usage["input"] >= args.max_input_tokens:
+            return "input-token budget reached"
+    if args.max_output_tokens is not None:
+        if final_usage_events and not usage_complete:
+            return "provider usage incomplete; output-token budget cannot be enforced"
+        if usage["output"] >= args.max_output_tokens:
+            return "output-token budget reached"
+    return None
+
+
 def summarize_main(argv):
     parser = argparse.ArgumentParser(description="Summarize a saved agent result and optional official report; no model requests.")
     parser.add_argument("--result", type=Path, required=True)
@@ -115,7 +133,20 @@ def main():
     parser.add_argument("--provider", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--max-run-seconds", type=int)
+    parser.add_argument("--max-tool-calls", type=int)
+    parser.add_argument("--max-input-tokens", type=int)
+    parser.add_argument("--max-output-tokens", type=int)
+    parser.add_argument(
+        "--approve-container-tools",
+        action="store_true",
+        help="approve each requested built-in container tool once; only for an isolated task workspace",
+    )
     args = parser.parse_args()
+
+    for name in ("max_run_seconds", "max_tool_calls", "max_input_tokens", "max_output_tokens"):
+        if getattr(args, name) is not None and getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
 
     token = os.environ.get(args.token_env)
     if not token:
@@ -145,8 +176,12 @@ def main():
     usage_complete = True
     final_usage_events = 0
     tool_calls = 0
+    approved_calls = 0
     outcome = None
     error = None
+    budget_stop_reason = None
+    budget_cancelled_at = None
+    model_output_started = False
     started = time.monotonic()
 
     with urlopen(
@@ -157,15 +192,40 @@ def main():
         timeout=60,
     ) as stream:
         for raw in stream:
-            if time.monotonic() - started > MAX_RUN_SECONDS + RUNNER_GRACE_SECONDS:
-                raise TimeoutError("SSE exceeded the benchmark pilot's 24-hour run budget")
+            if budget_stop_reason is None:
+                budget_stop_reason = reached_budget(
+                    time.monotonic() - started,
+                    args,
+                    tool_calls,
+                    usage,
+                    usage_complete,
+                    final_usage_events,
+                )
+                if budget_stop_reason is not None:
+                    budget_cancelled_at = time.monotonic()
+                    print(f"\n[budget] {budget_stop_reason}; requesting run cancellation", file=sys.stderr, flush=True)
+                    try:
+                        request(args.server, token, f"/sessions/{session}/runs/{run}/cancel", {}, timeout=30)
+                    except RuntimeError as cancel_error:
+                        print(f"[budget] cancellation request returned: {cancel_error}", file=sys.stderr, flush=True)
+            elif budget_cancelled_at is not None and time.monotonic() - budget_cancelled_at > RUNNER_GRACE_SECONDS:
+                raise TimeoutError("run did not reach a terminal state within the cancellation grace period")
             if not raw.startswith(b"data: "):
                 continue
             event = json.loads(raw[6:])
             detail = event.get("detail") or {}
-            if event.get("kind") == "tool-started":
+            kind = event.get("kind")
+            if kind == "assistant-text":
+                text = detail.get("text", "")
+                if text:
+                    if not model_output_started:
+                        sys.stdout.write("\n[model output]\n")
+                        model_output_started = True
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+            elif kind == "tool-started":
                 tool_calls += 1
-            elif event.get("kind") == "usage" and detail.get("finality") == "Final":
+            elif kind == "usage" and detail.get("finality") == "Final":
                 final_usage_events += 1
                 for name in ("input", "output"):
                     value = detail.get(name)
@@ -173,14 +233,31 @@ def main():
                         usage_complete = False
                     else:
                         usage[name] += value
-            elif event.get("kind") == "approval-required":
+            elif kind == "approval-required":
+                if args.approve_container_tools:
+                    approved_calls += 1
+                    print(
+                        f"\n[approval] granting once: scope={detail.get('scope')} "
+                        f"args={detail.get('args_preview')}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    decision = "approve"
+                    body = {
+                        "approval": detail["approval"],
+                        "call": detail["call"],
+                        "scope": "once",
+                    }
+                else:
+                    decision = "deny"
+                    body = {"approval": detail["approval"], "call": detail["call"]}
                 request(
                     args.server,
                     token,
-                    f"/sessions/{session}/runs/{run}/deny",
-                    {"approval": detail["approval"], "call": detail["call"]},
+                    f"/sessions/{session}/runs/{run}/{decision}",
+                    body,
                 )
-            elif event.get("kind") == "run-finished":
+            elif kind == "run-finished":
                 outcome = detail.get("outcome")
                 error = detail.get("error")
             if event.get("terminal"):
@@ -202,11 +279,19 @@ def main():
         "outcome": outcome,
         "error": error,
         "tool_calls": tool_calls,
+        "approved_calls": approved_calls,
         "final_usage_events": final_usage_events,
         "usage": usage if usage_complete and final_usage_events else None,
         "usage_note": "sum of provider-reported Final usage events; null means unavailable/incomplete",
         "duration_seconds": round(time.monotonic() - started, 3),
         "patch_bytes": len(patch.encode()),
+        "budget_stop_reason": budget_stop_reason,
+        "budget": {
+            "max_run_seconds": args.max_run_seconds,
+            "max_tool_calls": args.max_tool_calls,
+            "max_input_tokens": args.max_input_tokens,
+            "max_output_tokens": args.max_output_tokens,
+        },
     }
     (args.output_dir / f"{instance}.result.json").write_text(
         json.dumps(result, indent=2) + "\n"
