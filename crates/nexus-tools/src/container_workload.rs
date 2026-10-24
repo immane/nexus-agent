@@ -507,6 +507,15 @@ impl<R: Runner> Workload<R> {
                 "type=bind,src={},dst=/workspace,bind-propagation=rprivate",
                 self.config.workspace.display()
             ),
+            // Keep Linux dependency trees and Next build artifacts off the
+            // host bind mount. Besides avoiding cross-OS native packages,
+            // this sidesteps Docker Desktop's non-POSIX rename behavior that
+            // makes npm fail with ENOTEMPTY while replacing package folders.
+            "--tmpfs".into(),
+            "/workspace/node_modules:rw,exec,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0755"
+                .into(),
+            "--tmpfs".into(),
+            "/workspace/.next:rw,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0755".into(),
             "--mount".into(),
             format!(
                 "type=bind,src={},dst=/etc/resolv.conf,readonly,bind-propagation=rprivate",
@@ -1272,6 +1281,12 @@ mod tests {
         assert!(a.contains(&"--init".into()));
         assert!(a.contains(&"--memory-swap=4g".into()));
         assert!(a.contains(&"/usr/local/bin/nexus-keeper".into()));
+        assert!(a.iter().any(|arg| {
+            arg == "/workspace/node_modules:rw,exec,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0755"
+        }));
+        assert!(a.iter().any(|arg| {
+            arg == "/workspace/.next:rw,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0755"
+        }));
         assert_eq!(
             &a[a.len() - 4..],
             &[

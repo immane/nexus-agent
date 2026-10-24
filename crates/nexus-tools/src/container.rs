@@ -541,7 +541,7 @@ impl ContainerEnvironment {
             deadline: Instant::now() + PREPARE_TIMEOUT,
             cleanup_done: true,
         };
-        env.verify_local()?;
+        let docker_desktop_proxy = env.verify_local()?;
         let owner = env.identity.container.clone();
         let nonce = owner
             .strip_prefix("nexus-gw-")
@@ -584,6 +584,12 @@ impl ContainerEnvironment {
                 &format!("{LABEL}={owner}"),
                 "--env",
                 &format!("GATEWAY_BLOCKED_IPV4_CIDRS={cidrs}"),
+                "--env",
+                if docker_desktop_proxy {
+                    "GATEWAY_DOCKER_DESKTOP_PROXY=1"
+                } else {
+                    "GATEWAY_DOCKER_DESKTOP_PROXY=0"
+                },
                 "--network",
                 "bridge",
                 "--cap-drop",
@@ -704,7 +710,7 @@ impl ContainerEnvironment {
         )
         .map(|_| ())
     }
-    fn verify_local(&self) -> Result<(), ContainerError> {
+    fn verify_local(&self) -> Result<bool, ContainerError> {
         // An explicitly selected default context is the only accepted engine.
         let out = run_bounded(
             self.base(),
@@ -719,11 +725,20 @@ impl ContainerEnvironment {
         )?;
         let endpoint = String::from_utf8(out).map_err(|_| ContainerError::UnsafeDockerContext)?;
         let endpoint = endpoint.trim();
-        if endpoint.starts_with("unix://") || endpoint.starts_with("npipe://./pipe/") {
-            Ok(())
-        } else {
-            Err(ContainerError::UnsafeDockerContext)
+        if !endpoint.starts_with("unix://") && !endpoint.starts_with("npipe://./pipe/") {
+            return Err(ContainerError::UnsafeDockerContext);
         }
+        let out = run_bounded(
+            self.base(),
+            &["info", "--format", "{{.OperatingSystem}}"],
+            self.deadline.saturating_duration_since(Instant::now()),
+        )?;
+        let operating_system =
+            String::from_utf8(out).map_err(|_| ContainerError::UnsafeDockerContext)?;
+        if operating_system.trim().is_empty() {
+            return Err(ContainerError::UnsafeDockerContext);
+        }
+        Ok(is_docker_desktop(&operating_system))
     }
     fn wait_healthy(&self) -> Result<(), ContainerError> {
         let deadline = self.deadline;
@@ -852,6 +867,12 @@ impl ContainerEnvironment {
             Inspect::Unowned
         }
     }
+}
+
+fn is_docker_desktop(operating_system: &str) -> bool {
+    operating_system
+        .to_ascii_lowercase()
+        .contains("docker desktop")
 }
 
 fn valid_container_id(id: &str) -> bool {
@@ -1007,6 +1028,13 @@ fn run_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn docker_desktop_detection_is_specific_and_case_insensitive() {
+        assert!(is_docker_desktop("Docker Desktop"));
+        assert!(is_docker_desktop("docker desktop (linux)"));
+        assert!(!is_docker_desktop("Docker Engine - Community"));
+        assert!(!is_docker_desktop("LinuxKit"));
+    }
     #[test]
     fn parses_linux_public_and_private_networks_and_rejects_malformed_data() {
         let addresses = r#"[{"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.9","prefixlen":24}]},{"ifname":"tun0","addr_info":[{"family":"inet","local":"10.8.0.2","prefixlen":24}]}]"#;

@@ -61,6 +61,22 @@ data-exfiltration channel. Allowed public endpoints can themselves proxy
 traffic. This is not proof against every special-purpose registry allocation
 or indirect relay.
 
+Docker Desktop may synthesize public DNS answers in `198.18.0.0/15` and route
+TCP through its host-side network proxy. The host detects Docker Desktop from
+`docker info` and enables a narrow exception for that range on TCP ports 80 and
+443 only. The configured host/LAN deny set is checked first; other RFC 2544
+destinations and all non-TCP traffic to the synthetic range remain denied. The
+exception is off for ordinary Docker Engine. This adapts the firewall to Docker
+Desktop's synthetic routing and does not pass host proxy variables or credentials
+into the gateway/workload.
+
+The workload bind-mounts the project source but overlays `/workspace/node_modules`
+and `/workspace/.next` with private tmpfs mounts. Dependency installs therefore
+use Linux binaries and Linux filesystem rename semantics without modifying or
+reusing host `node_modules`; generated dependencies/build output are ephemeral
+when the workload is removed. Source and lockfile changes remain on the workspace
+bind mount.
+
 ## Build and checks
 
 The base must already be cached exactly as the pinned digest in
@@ -112,6 +128,11 @@ only public HTTPS probe (the image build may access the pinned public Alpine
 package repository if its layer is uncached). No image pull is enabled. The listener test verifies
 only the configured deny rule, not general host/LAN isolation or DNS rebinding
 resistance.
+Set `CHECK_NPM_REGISTRY=1` to additionally install the small public
+`is-number@7.0.0` package into a temporary, read-only-rootfs `node:22-alpine`
+container sharing the gateway namespace. npm lifecycle scripts are disabled;
+the test uses no project or host credentials and requires the Node image to be
+cached locally.
 
 ## Validation status
 
@@ -124,15 +145,13 @@ checklist as one validation pass and record engine/kernel versions, host/LAN
 CIDRs, commands, and results here.
 
 The current development host is macOS with Docker Desktop (`desktop-linux`,
-LinuxKit 6.12.76, arm64), not a native Linux Docker host. `check-docker.sh`
-passes its firewall/readiness tests there, but that does not validate the
-Linux host's own LAN interfaces or routes. The opt-in public HTTPS probe does
-not pass in this environment: the configured DNS path returned
-`example.com -> 198.18.7.34`, an RFC 2544 benchmarking address intentionally
-blocked by the policy. Host HTTPS works through the host's proxy, which the
-gateway does not inherit. Treat public egress as unverified until tested on a
-supported Linux Engine with ordinary DNS and direct egress; do not remove the
-reserved-range deny to accommodate this environment.
+LinuxKit 6.12.76, arm64), not a native Linux Docker host. Docker Desktop's
+resolver was observed returning `198.18.7.38` for `registry.npmjs.org`; a plain
+bridge container could reach the registry through that synthetic route, while
+the original gateway policy rejected the reserved range. The opt-in probes now
+exercise this narrow exception. Passing them on Docker Desktop still does not
+validate the Linux host's own LAN interfaces or routes; native Linux validation
+remains outstanding.
 
 ### Deferred native-Linux validation checklist
 

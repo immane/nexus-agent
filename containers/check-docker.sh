@@ -31,6 +31,7 @@ listener = "nexus-egress-listener-" + suffix
 control = "nexus-egress-control-" + suffix
 resolver_name = None
 resolver_contents = "nameserver 127.0.0.1\noptions ndots:0\n"
+desktop_proxy = "docker desktop" in subprocess.check_output(["docker", "info", "--format", "{{.OperatingSystem}}"], text=True, timeout=5).lower()
 def run(args, **kwargs): subprocess.run(args, timeout=20, check=True, **kwargs)
 def parse_host_cidrs(addresses, routes):
     if not isinstance(addresses, list) or not isinstance(routes, list): raise RuntimeError("ip JSON output must be arrays")
@@ -139,7 +140,7 @@ try:
         run(["docker", "run", "-d", "--name", listener, "--network", "bridge", "--entrypoint", "/bin/sh", image, "-c", "while :; do nc -l -p 8080; done"], stdout=subprocess.DEVNULL)
         listener_ip = subprocess.check_output(["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", listener], text=True, timeout=5).strip()
         listener_port = 8080
-    run(["docker", "run", "-d", "--name", gateway, "--cap-add", "NET_ADMIN", "--network", "bridge", "-e", "GATEWAY_BLOCKED_IPV4_CIDRS=" + ",".join(blocked_cidrs or [listener_ip + "/32"]), image], stdout=subprocess.DEVNULL)
+    run(["docker", "run", "-d", "--name", gateway, "--cap-add", "NET_ADMIN", "--network", "bridge", "-e", "GATEWAY_BLOCKED_IPV4_CIDRS=" + ",".join(blocked_cidrs or [listener_ip + "/32"]), "-e", "GATEWAY_DOCKER_DESKTOP_PROXY=" + ("1" if desktop_proxy else "0"), image], stdout=subprocess.DEVNULL)
     for _ in range(20):
         state = subprocess.check_output(["docker", "inspect", "-f", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", gateway], text=True, timeout=5).strip()
         if state == "running healthy": break
@@ -185,6 +186,16 @@ try:
                 diagnostic = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=5)
                 print("$ docker " + " ".join(args) + "\n" + diagnostic.stdout + diagnostic.stderr, file=sys.stderr)
             raise RuntimeError("public HTTPS egress probe failed")
+    if os.environ.get("CHECK_NPM_REGISTRY") == "1":
+        node_image = "node:22-alpine"
+        subprocess.run(["docker", "image", "inspect", node_image], check=True, stdout=subprocess.DEVNULL, timeout=5)
+        npm_install = subprocess.run(["docker", "run", "--rm", "--network", "container:" + gateway, "--mount", "type=bind,src=" + resolver_name + ",dst=/etc/resolv.conf,readonly", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", "--tmpfs=/tmp:rw,noexec,nosuid,size=64m", "--env", "npm_config_cache=/tmp/npm-cache", "--entrypoint", "npm", node_image, "install", "--prefix", "/tmp/npm-probe", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--fetch-retries=0", "--fetch-timeout=15000", "is-number@7.0.0"], capture_output=True, text=True, timeout=45)
+        if npm_install.returncode:
+            print("npm registry install probe failed: " + npm_install.stdout + npm_install.stderr, file=sys.stderr)
+            for args in (("exec", workload, "nslookup", "registry.npmjs.org"), ("exec", gateway, "nft", "list", "chain", "inet", "gateway", "output")):
+                diagnostic = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=5)
+                print("$ docker " + " ".join(args) + "\n" + diagnostic.stdout + diagnostic.stderr, file=sys.stderr)
+            raise RuntimeError("npm package installation failed through the Docker gateway")
 finally:
     if host_listener is not None:
         if stop_listener is not None: stop_listener.set()

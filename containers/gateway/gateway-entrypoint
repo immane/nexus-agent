@@ -3,6 +3,7 @@ set -eu
 rm -f /run/gateway-ready
 
 : "${GATEWAY_BLOCKED_IPV4_CIDRS:?GATEWAY_BLOCKED_IPV4_CIDRS must contain host/LAN IPv4 CIDRs}"
+: "${GATEWAY_DOCKER_DESKTOP_PROXY:=0}"
 case "$GATEWAY_BLOCKED_IPV4_CIDRS" in
     *[!0-9./,]*|,*|*,|*,,*)
         echo 'GATEWAY_BLOCKED_IPV4_CIDRS must be comma-separated IPv4 CIDRs' >&2
@@ -27,12 +28,41 @@ for cidr in $GATEWAY_BLOCKED_IPV4_CIDRS; do
     fi
 done
 IFS=$old_ifs
+case "$GATEWAY_DOCKER_DESKTOP_PROXY" in
+    0)
+        set -- --server=1.1.1.1 --server=1.0.0.1
+        ;;
+    1)
+        if ! nft add element inet gateway docker_desktop_proxy_v4 "{ 198.18.0.0/15 }"; then
+            echo 'Docker Desktop proxy exception installation failed' >&2
+            exit 1
+        fi
+        desktop_dns=$(awk '$1 == "nameserver" { if (count == 0) value = $2; count++ } END { if (count != 1) exit 1; print value }' /etc/resolv.conf) || {
+            echo 'Docker Desktop must provide exactly one IPv4 DNS upstream' >&2
+            exit 1
+        }
+        if ! printf '%s\n' "$desktop_dns" | awk -F. 'NF != 4 { exit 1 } { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255 || (length($i) > 1 && substr($i, 1, 1) == "0")) exit 1; if ($1 == 0 || $1 == 127 || $1 >= 224) exit 1 }'; then
+            echo 'Docker Desktop DNS upstream is not a usable IPv4 address' >&2
+            exit 1
+        fi
+        if ! nft add element inet gateway docker_desktop_dns_v4 "{ $desktop_dns }"; then
+            echo 'Docker Desktop DNS exception installation failed' >&2
+            exit 1
+        fi
+        set -- "--server=$desktop_dns"
+        ;;
+    *)
+        echo 'GATEWAY_DOCKER_DESKTOP_PROXY must be 0 or 1' >&2
+        exit 1
+        ;;
+esac
 if ! nft list table inet gateway >/dev/null; then
     echo 'installed nftables policy cannot be verified' >&2
     exit 1
 fi
 
-dnsmasq --no-daemon --conf-file=/etc/dnsmasq.conf &
+set -- --no-daemon --conf-file=/etc/dnsmasq.conf "$@"
+dnsmasq "$@" &
 dns_pid=$!
 sleep 1
 if ! kill -0 "$dns_pid" 2>/dev/null || ! nft list table inet gateway | grep -q 'chain input' || ! nft list table inet gateway | grep -q 'chain output' || ! nft list set inet gateway blocked_host_v4 >/dev/null; then

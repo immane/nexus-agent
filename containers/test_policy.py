@@ -42,9 +42,11 @@ class GatewayPolicyTests(unittest.TestCase):
         self.assertIn("ip protocol tcp accept", POLICY)
         self.assertIn("ip protocol udp accept", POLICY)
         dns = (Path(__file__).parent / "gateway/dnsmasq.conf").read_text()
-        self.assertIn("server=1.1.1.1", dns)
-        self.assertIn("server=1.0.0.1", dns)
+        entrypoint = (Path(__file__).parent / "gateway/gateway-entrypoint").read_text()
+        self.assertIn("--server=1.1.1.1 --server=1.0.0.1", entrypoint)
+        self.assertIn('set -- "--server=$desktop_dns"', entrypoint)
         self.assertIn("local=/gateway.test/", dns)
+        self.assertIn("cache-size=1000", dns)
         self.assertIn("udp dport 53 drop", POLICY)
         self.assertIn("tcp dport 53 drop", POLICY)
         forward = re.search(r"chain forward \{(.*?)\n    \}", POLICY, re.S).group(1)
@@ -59,10 +61,31 @@ class GatewayPolicyTests(unittest.TestCase):
         output = re.search(r"chain output \{(.*?)\n    \}", POLICY, re.S).group(1)
         self.assertLess(output.index("ip daddr @blocked_host_v4 counter drop"), output.index("ip daddr @non_global_v4 counter drop"))
 
+    def test_docker_desktop_synthetic_proxy_exception_is_opt_in_and_narrow(self):
+        input_chain = re.search(r"chain input \{(.*?)\n    \}", POLICY, re.S).group(1)
+        output = re.search(r"chain output \{(.*?)\n    \}", POLICY, re.S).group(1)
+        inbound = "ip saddr @docker_desktop_proxy_v4 tcp sport { 80, 443 } ct state established,related accept"
+        outbound = "ip daddr @docker_desktop_proxy_v4 tcp dport { 80, 443 } counter accept"
+        self.assertIn("set docker_desktop_proxy_v4", POLICY)
+        self.assertIn("set docker_desktop_dns_v4", POLICY)
+        self.assertLess(input_chain.index("ip saddr @blocked_host_v4 counter drop"), input_chain.index(inbound))
+        self.assertLess(input_chain.index(inbound), input_chain.index("ip saddr @non_global_v4 drop"))
+        self.assertLess(output.index("ip daddr @blocked_host_v4 counter drop"), output.index(outbound))
+        self.assertLess(output.index(outbound), output.index("ip daddr @non_global_v4 counter drop"))
+        dns_input = "ip saddr @docker_desktop_dns_v4 udp sport 53 ct state established,related accept"
+        dns_output = "ip daddr @docker_desktop_dns_v4 udp dport 53 accept"
+        self.assertLess(input_chain.index("ip saddr @blocked_host_v4 counter drop"), input_chain.index(dns_input))
+        self.assertLess(output.index("ip daddr @blocked_host_v4 counter drop"), output.index(dns_output))
+        entrypoint = (Path(__file__).parent / "gateway/gateway-entrypoint").read_text()
+        self.assertIn('GATEWAY_DOCKER_DESKTOP_PROXY:=0', entrypoint)
+        self.assertIn('1)\n        if ! nft add element inet gateway docker_desktop_proxy_v4 "{ 198.18.0.0/15 }";', entrypoint)
+        self.assertIn('nft add element inet gateway docker_desktop_dns_v4', entrypoint)
+        self.assertIn('GATEWAY_DOCKER_DESKTOP_PROXY must be 0 or 1', entrypoint)
+
     def test_denies_precede_conntrack_accepts_without_blocking_loopback_dns(self):
         input_chain = re.search(r"chain input \{(.*?)\n    \}", POLICY, re.S).group(1)
         output_chain = re.search(r"chain output \{(.*?)\n    \}", POLICY, re.S).group(1)
-        input_established = input_chain.index("ct state established,related accept")
+        input_established = input_chain.index("\n        ct state established,related accept")
         for rule in ("ip saddr @blocked_host_v4 counter drop", "ip saddr @non_global_v4 drop"):
             self.assertLess(input_chain.index(rule), input_established)
         output_established = output_chain.index("ct state established,related accept")
