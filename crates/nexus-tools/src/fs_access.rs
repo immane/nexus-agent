@@ -759,7 +759,7 @@ mod tests {
         use rustix::io::Errno;
 
         assert_eq!(
-            copyable_file_flags(Ok(IFlags::empty())).unwrap(),
+            copyable_file_flags(Ok(IFlags::empty()), ReplacementMetadata::RequireAll).unwrap(),
             Some(IFlags::empty())
         );
         assert!(copyable_file_flags(Err(Errno::NOTTY), ReplacementMetadata::RequireAll).is_err());
