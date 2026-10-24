@@ -5,12 +5,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nexus_container::worker_protocol::{read_request, validate_workspace_paths, write_response};
 use nexus_core::{
     ApprovedScope, CallId, CancellationToken, NormalizedArgs, RunId, ToolCall, ToolContext, ToolId,
     ToolPort, TurnId,
-};
-use nexus_tools::container_worker_protocol::{
-    read_request, validate_workspace_paths, write_response,
 };
 use nexus_tools::{ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter};
 
@@ -36,8 +34,12 @@ fn run<R: io::Read, W: io::Write>(
         "host_read" => Arc::new(ScopedReader::with_root(Path::new("/workspace"))?),
         "host_list" => Arc::new(ScopedLister::with_root(Path::new("/workspace"))?),
         "host_search" => Arc::new(ScopedSearcher::with_root(Path::new("/workspace"))?),
-        "host_write" => Arc::new(ScopedWriter::with_container_root(Path::new("/workspace"))?),
-        "host_patch" => Arc::new(ScopedPatcher::with_container_root(Path::new("/workspace"))?),
+        "host_write" => Arc::new(ScopedWriter::with_shared_workspace_root(Path::new(
+            "/workspace",
+        ))?),
+        "host_patch" => Arc::new(ScopedPatcher::with_shared_workspace_root(Path::new(
+            "/workspace",
+        ))?),
         _ => return Err("unknown operation".into()),
     };
     let spec = port.describe();

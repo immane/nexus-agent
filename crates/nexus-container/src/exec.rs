@@ -12,10 +12,10 @@ use nexus_core::{
     ToolOutcome, ToolPort, ToolSpec,
 };
 
-use crate::container_session::ContainerSession;
-use crate::container_worker_transport::{DockerExecError, DockerExecTransport};
+use crate::session::ContainerSession;
+use crate::worker_transport::{DockerExecError, DockerExecTransport};
 
-const TOOL: &str = crate::exec::HOST_EXEC_TOOL;
+const TOOL: &str = "host_exec";
 const REVISION: u32 = M0_REVISION + 1;
 const LIMIT: usize = 65_536;
 const SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}},"required":["argv"],"additionalProperties":false}"#;
@@ -25,9 +25,7 @@ pub(crate) struct ContainerExecTool<T = DockerExecTransport> {
     spec: ToolSpec,
 }
 
-pub(crate) trait ExecTransport:
-    crate::container_worker_client::WorkerTransport + Send
-{
+pub(crate) trait ExecTransport: crate::worker_client::WorkerTransport + Send {
     fn run(
         &mut self,
         argv: &[&str],
@@ -312,7 +310,7 @@ mod tests {
             }
         }
     }
-    impl crate::container_worker_client::WorkerTransport for Fake {
+    impl crate::worker_client::WorkerTransport for Fake {
         type Error = std::io::Error;
         fn exchange(&mut self, _: &[u8], _: usize, _: Instant) -> Result<Vec<u8>, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);

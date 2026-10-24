@@ -271,7 +271,7 @@ fn main() {
     if execution == ExecutionMode::Container {
         for image in [gateway_image.as_deref(), workload_image.as_deref()] {
             if let Some(image) = image
-                && nexus_tools::container::validate_image_reference(image).is_err()
+                && nexus_container::validate_image_reference(image).is_err()
             {
                 eprintln!("nexus-server: container images must use immutable sha256 digests");
                 std::process::exit(2);
@@ -603,7 +603,7 @@ mod cov_main_args {
         ));
         usage(&["--execution", "container"]);
         #[cfg(feature = "container")]
-        assert!(nexus_tools::container::validate_image_reference("gateway:latest").is_err());
+        assert!(nexus_container::validate_image_reference("gateway:latest").is_err());
         usage(&[
             "--tools",
             "real",

@@ -6,7 +6,7 @@ Status: Partial, feature-gated and explicitly selectable through TUI/server star
 
 | Area | Implemented prototype | Still not implemented / validated |
 | --- | --- | --- |
-| Build | `container`, `container-worker`, and `container-keeper` features/targets in `nexus-tools`, forwarded by TUI/server `container` features; local default build remains unchanged | Supported release artifacts, amd64 image inputs |
+| Build | `nexus-container` owns the `container-worker` and `container-keeper` targets; TUI/server `container` features enable the crate and forward its binary features; local default build remains unchanged | Supported release artifacts, amd64 image inputs |
 | Transport/tools | Bounded Docker worker protocol/transport, workspace file adapters, container `host_exec`, shared poison state | Native Linux isolation validation; tool cancellation stops local transport and quarantines uncertain remote work |
 | Lifecycle | Gateway/workload creation, keeper health gate, exact ID/label checks, two-slot process-local cap, TUI/server session ownership, cleanup/quarantine | Durable restart reconciliation or operator cleanup UX; cancellation/expiry behavior beyond normal runtime/session drop |
 | Ownership | Owner-only records under XDG state path (fallback `~/.local/state`); process lock; stale state blocks admission | Automatic stale-resource recovery; no record is ever automatically trusted as authority to delete after restart |
@@ -54,10 +54,10 @@ The prototype is kept behind additive Cargo features and is explicitly exposed t
 | --- | --- | --- |
 | `crates/nexus-core/src/tool.rs` | `ToolPort`, bounded `ToolContext`, cancellation/deadline and approved scope | Preserve the tool execution port; add only a narrow container-scope representation if existing scope cannot encode it safely |
 | `crates/nexus-runtime/src/policy.rs` | Strict/development and feature-gated container authorization | Bind future grants to an environment generation if lifecycle recreation is introduced |
-| `crates/nexus-tools/src/development.rs`, `container*.rs` | Shared local registration plus feature-gated container tool factory and session lifecycle | Keep the adapter boundary narrow; finish restart reconciliation and isolation validation |
+| `crates/nexus-tools/src/development.rs` | Shared local tool registration and adapters | Keep the adapter boundary narrow |
+| `crates/nexus-container/src/*.rs` | Feature-gated gateway/workload, transport, worker, keeper and ownership prototype | Complete restart recovery and isolation validation before security claims |
 | `crates/nexus-tools/src/fs.rs`, `fs_access/` | Descriptor-bound file operations | Reuse inside a Linux worker rooted at `/workspace`, not on the host |
 | `crates/nexus-tools/src/exec.rs` | Mandatory local OS sandbox | Leave local behavior unchanged; container commands use a separate adapter |
-| `crates/nexus-tools/src/container*.rs`, `src/bin/container-{worker,keeper}.rs` | Feature-gated gateway/workload, transport, worker, keeper and ownership prototype | Complete restart recovery and isolation validation before security claims |
 | `crates/nexus-tui/src/main.rs` | Startup parsing, session composition, notices; mode switching is disabled for container sessions | Implement verified workload recreation before supporting read-only mode transitions |
 | `crates/nexus-server/src/main.rs`, `server.rs` | CLI, `ToolsMode`, per-session composition/cleanup under authenticated real-tools admission | Keep container setup off the sessions-map lock and cleanup outside it |
 | `crates/nexus-headless/src/main.rs` | Scripted fake runner | Preserve fake-only behavior; reject container selection rather than implying real execution |
@@ -95,9 +95,16 @@ not passed the native Linux gate.
 
 ## Build and Distribution
 
-Local remains an unconditional capability. `nexus-tools` provides `container`, `container-worker`, and `container-keeper` features; TUI and server forward the opt-in `container` feature and expose backend selection at startup. The default build remains local-only.
+Local remains an unconditional capability in `nexus-tools`. The separate
+`nexus-container` crate owns gateway/workload lifecycles, Docker transports,
+container registrations, and the `container-worker`/`container-keeper` targets.
+TUI and server forward their opt-in `container` feature to the crate; the
+default build remains local-only.
 
-The `container-worker` feature and required-feature worker binary exist in `nexus-tools`; `container-keeper` adds the keeper target. The workload image builds both Linux executables in its digest-pinned musl/Alpine builder stage. The image defaults currently pin arm64 manifests; do not claim amd64 support.
+The `container-worker` and `container-keeper` features gate their binaries in
+`nexus-container`. The workload image builds both Linux executables in its
+digest-pinned musl/Alpine builder stage. The image defaults currently pin arm64
+manifests; do not claim amd64 support.
 
 Verified prototype build (not a release command):
 
@@ -275,7 +282,7 @@ Live container tests must be explicit opt-in, use preloaded pinned fixture image
 
 | Area | Required evidence |
 | --- | --- |
-| Build variants | Local-only default and feature-gated `nexus-tools`, TUI, and server builds compile |
+| Build variants | Local-only default and feature-gated `nexus-container`, TUI, and server builds compile |
 | Local compatibility | Existing fake, strict, development, provider, plan, approval, server authentication, and sandbox tests remain unchanged in meaning |
 | CLI and UI | `--execution local|container` exists; local is default. Container uses `--tools-root` or defaults to cwd, plus immutable gateway/workload digest references. No implicit pull flow is implemented; startup emits an isolation warning |
 | Files | All five file tools operate in the container; traversal/symlink swaps and host absolute paths fail; special files, nested mounts, socket exposure, Unicode and patch conflicts covered |
@@ -293,12 +300,12 @@ Follow [development testing](../testing.md): run affected-package Cargo commands
 
 ```sh
 cargo fmt --all --check
-cargo nextest run -p nexus-runtime -p nexus-tools -p nexus-tui -p nexus-server --locked --offline
-cargo clippy -p nexus-runtime -p nexus-tools -p nexus-tui -p nexus-server \
+cargo nextest run -p nexus-runtime -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server --locked --offline
+cargo clippy -p nexus-runtime -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server \
   --all-targets --locked --offline -- -D warnings
-cargo nextest run -p nexus-runtime -p nexus-tools -p nexus-tui -p nexus-server \
+cargo nextest run -p nexus-runtime -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server \
   --features nexus-tui/container,nexus-server/container --locked --offline
-cargo clippy -p nexus-runtime -p nexus-tools -p nexus-tui -p nexus-server \
+cargo clippy -p nexus-runtime -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server \
   --features nexus-tui/container,nexus-server/container \
   --all-targets --locked --offline -- -D warnings
 ```

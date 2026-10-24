@@ -106,6 +106,7 @@ the full optional suite is documented in [Testing](docs/testing.md).
 | `crates/nexus-context` | Pure context estimation/calibration, safe reduction planning, and untrusted memory projection; no provider/tool I/O |
 | `crates/nexus-fakes` | Scripted deterministic provider/tool/store doubles (test-only) |
 | `crates/nexus-tools` | Real file tools and sandboxed `host_exec`: `host_read`/`host_list`/`host_search`/`host_write`/`host_patch` plus mandatory-OS-sandbox `argv` execution; development adapters accept exact canonical runtime scopes |
+| `crates/nexus-container` | Opt-in container gateway/workload lifecycle, Docker worker transport, container tool composition, and worker/keeper binaries; depends on `nexus-tools` for filesystem executors |
 | `crates/nexus-permissions` | Shared canonical project/temp/protected-path rules for runtime policy and real adapters; session grants stay runtime-owned and non-persistent |
 | `crates/nexus-openai` | Streaming Chat Completions, Responses, and Messages adapters over HTTP/HTTPS |
 | `crates/nexus-runtime` | Single-active-run loop: policy, cancellation, quarantine, ordered events |

@@ -947,7 +947,7 @@ fn build_live_runtime(
                 let workload_image = session_config.workload_image.as_deref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "workload image is missing")
                 })?;
-                nexus_tools::container_tool_registrations(root, gateway_image, workload_image)
+                nexus_container::tool_registrations(root, gateway_image, workload_image)
                     .map_err(io::Error::other)?
             }
             #[cfg(not(feature = "container"))]

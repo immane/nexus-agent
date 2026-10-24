@@ -206,6 +206,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-container"
+version = "0.2.2-alpha"
+dependencies = [
+ "nexus-core",
+ "nexus-tools",
+ "rustix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexus-context"
 version = "0.2.2-alpha"
 dependencies = [
@@ -282,6 +293,7 @@ name = "nexus-server"
 version = "0.2.2-alpha"
 dependencies = [
  "nexus-config",
+ "nexus-container",
  "nexus-core",
  "nexus-fakes",
  "nexus-openai",
@@ -298,7 +310,6 @@ dependencies = [
  "nexus-core",
  "nexus-permissions",
  "rustix",
- "serde",
  "serde_json",
 ]
 
@@ -308,6 +319,7 @@ version = "0.2.2-alpha"
 dependencies = [
  "crossterm",
  "nexus-config",
+ "nexus-container",
  "nexus-core",
  "nexus-fakes",
  "nexus-openai",

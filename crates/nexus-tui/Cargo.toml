@@ -9,8 +9,9 @@ autotests = false
 low-value-tests = []
 container = [
     "nexus-runtime/container",
-    "nexus-tools/container-worker",
-    "nexus-tools/container-keeper",
+    "dep:nexus-container",
+    "nexus-container/container-worker",
+    "nexus-container/container-keeper",
 ]
 
 [[test]]
@@ -56,6 +57,7 @@ nexus-openai = { path = "../nexus-openai" }
 # jail (mirrors the server's `--tools real`); otherwise file tools stay
 # scripted. Reads are automatic; writes always need an approval grant.
 nexus-tools = { path = "../nexus-tools" }
+nexus-container = { path = "../nexus-container", optional = true }
 # Rationale: ratatui is the ONE terminal library for M0. Immediate-mode
 # rendering over a single crossterm backend covers the fixed composer,
 # bounded viewport, approval card, and footer with no extra fullscreen

@@ -593,13 +593,14 @@ impl Server {
                 root,
                 gateway_image,
                 workload_image,
-            } => nexus_tools::container_tool_registrations(root, gateway_image, workload_image)
-                .map_err(|error| {
+            } => nexus_container::tool_registrations(root, gateway_image, workload_image).map_err(
+                |error| {
                     // ContainerError contains fixed host-side diagnostics only,
                     // never Docker output, environment values, or credentials.
                     eprintln!("container environment preparation failed: {error}");
                     SessionError::new(503, "container environment is unavailable")
-                })?,
+                },
+            )?,
         };
         let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)
             .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;

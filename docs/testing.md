@@ -9,16 +9,16 @@ checks it).
 
 ```sh
 cargo fmt --all --check
-cargo nextest run -p nexus-tools -p nexus-tui -p nexus-server --locked --offline
-cargo clippy -p nexus-tools -p nexus-tui -p nexus-server --all-targets --locked --offline -- -D warnings
+cargo nextest run -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server --locked --offline
+cargo clippy -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server --all-targets --locked --offline -- -D warnings
 ```
 
 Use only the relevant `-p` arguments. To test one integration module, use its
 name (for example `cargo nextest run -p nexus-tools fs_patch --locked --offline`).
-TUI, server, and tools integration tests now share one `behavior` target per
-package instead of linking an executable for every source file. New integration
-modules in these packages must be added to `tests/behavior.rs`; automatic test
-target discovery is disabled in their manifests.
+TUI, server, tools, and container integration tests share one `behavior` target
+per package instead of linking an executable for every source file. New
+integration modules in these packages must be added to `tests/behavior.rs`;
+automatic test target discovery is disabled in their manifests.
 
 Development/test builds retain line-table debug information, debug assertions,
 overflow checks, and incremental compilation. Dependencies omit debug information.

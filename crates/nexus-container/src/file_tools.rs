@@ -12,11 +12,11 @@ use nexus_core::{
 };
 use serde_json::Value;
 
-use crate::container_session::ContainerSession;
-use crate::container_worker_client::{
+use crate::session::ContainerSession;
+use crate::worker_client::{
     ClientError, ContainerWorkerClient, PreDispatchFailure, WorkerTransport,
 };
-use crate::fs::{
+use nexus_tools::fs::{
     HOST_LIST_TOOL, HOST_PATCH_TOOL, HOST_READ_TOOL, HOST_SEARCH_TOOL, HOST_WRITE_TOOL,
     LIST_SCHEMA, PATCH_SCHEMA, READ_SCHEMA, SEARCH_SCHEMA, WRITE_SCHEMA,
 };
@@ -105,11 +105,11 @@ impl<T> ContainerFileTools<T> {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn exec_adapter(&self) -> crate::container_exec::ContainerExecTool<T>
+    pub(crate) fn exec_adapter(&self) -> crate::exec::ContainerExecTool<T>
     where
-        T: crate::container_exec::ExecTransport,
+        T: crate::exec::ExecTransport,
     {
-        crate::container_exec::ContainerExecTool::from_session(Arc::clone(&self.read.session))
+        crate::exec::ContainerExecTool::from_session(Arc::clone(&self.read.session))
     }
 }
 
@@ -316,18 +316,17 @@ mod tests {
             (error.kind() == io::ErrorKind::TimedOut).then_some(PreDispatchFailure::Deadline)
         }
     }
-    impl crate::container_exec::ExecTransport for Fake {
+    impl crate::exec::ExecTransport for Fake {
         fn run(
             &mut self,
             _: &[&str],
             _: usize,
             _: Instant,
             _: &dyn Fn() -> bool,
-        ) -> Result<(i32, Vec<u8>, Vec<u8>), crate::container_worker_transport::DockerExecError>
-        {
+        ) -> Result<(i32, Vec<u8>, Vec<u8>), crate::worker_transport::DockerExecError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                Err(crate::container_worker_transport::DockerExecError::Io)
+                Err(crate::worker_transport::DockerExecError::Io)
             } else {
                 Ok((0, b"exec".to_vec(), Vec::new()))
             }
@@ -368,7 +367,7 @@ mod tests {
             nexus_core::RunId::new("run").unwrap(),
             nexus_core::TurnId::new("turn").unwrap(),
             nexus_core::CallId::new("call").unwrap(),
-            ToolId::new(crate::exec::HOST_EXEC_TOOL, M0_REVISION + 1).unwrap(),
+            ToolId::new("host_exec", M0_REVISION + 1).unwrap(),
             nexus_core::NormalizedArgs::new(r#"{"argv":["x"]}"#).unwrap(),
         )
     }

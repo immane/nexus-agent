@@ -1,4 +1,4 @@
-use nexus_tools::container_worker_protocol::{
+use nexus_container::worker_protocol::{
     MAX_RESPONSE_BYTES, ProtocolError, read_request, validate_workspace_paths, write_response,
 };
 use serde_json::json;

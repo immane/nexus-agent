@@ -13,7 +13,7 @@ ENV RUSTUP_TOOLCHAIN=1.99.0-x86_64-unknown-linux-musl
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked \
-    -p nexus-tools --features container-worker,container-keeper \
+    -p nexus-container --features container-worker,container-keeper \
     --bin container-worker --bin container-keeper
 
 FROM ${TASK_IMAGE}

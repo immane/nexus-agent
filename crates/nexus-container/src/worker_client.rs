@@ -12,7 +12,7 @@ use std::{
 use nexus_core::{EffectState, Evidence, ExecutionStatus, ToolOutcome};
 use serde_json::Value;
 
-use crate::container_worker_protocol::{
+use crate::worker_protocol::{
     MAX_ARGUMENT_BYTES, MAX_OUTPUT_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION,
     parse_unique, valid_arguments, validate_workspace_paths,
 };

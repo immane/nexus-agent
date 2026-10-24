@@ -8,8 +8,9 @@ autotests = false
 default = []
 container = [
     "nexus-runtime/container",
-    "nexus-tools/container-worker",
-    "nexus-tools/container-keeper",
+    "dep:nexus-container",
+    "nexus-container/container-worker",
+    "nexus-container/container-keeper",
 ]
 
 [[test]]
@@ -35,6 +36,7 @@ nexus-openai = { path = "../nexus-openai" }
 # Real root-jailed file reader for opt-in `--tools real` sessions.
 # Mutations stay scripted; reads that escape the jail are denied.
 nexus-tools = { path = "../nexus-tools" }
+nexus-container = { path = "../nexus-container", optional = true }
 # JSON for the HTTP API only: request parsing and event/snapshot encoding.
 # No HTTP framework is used; the transport is hand-rolled std I/O.
 serde_json = "1"

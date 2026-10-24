@@ -1,0 +1,31 @@
+[package]
+name = "nexus-container"
+version = "0.2.2-alpha"
+edition = "2024"
+autotests = false
+
+[features]
+default = []
+container-worker = []
+container-keeper = []
+
+[[bin]]
+name = "container-worker"
+path = "src/bin/worker.rs"
+required-features = ["container-worker"]
+
+[[bin]]
+name = "container-keeper"
+path = "src/bin/keeper.rs"
+required-features = ["container-keeper"]
+
+[[test]]
+name = "behavior"
+path = "tests/behavior.rs"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-tools = { path = "../nexus-tools" }
+serde = "1"
+serde_json = "1"
+rustix = { version = "1.1.5", features = ["event", "fs", "process"] }

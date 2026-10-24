@@ -95,22 +95,28 @@ flowchart TB
     Context["Context engine: nexus-context<br/>Estimation, safe reduction, memory projection"]
     Provider["Provider adapters<br/>Direct APIs and relay plugins"]
     Tools["Tool execution adapters"]
+    Container["Container environment crate<br/>Gateway, worker, lifecycle"]
     Store["Session persistence"]
     Builtin["Built-in Rust coding tools"]
     Bridge["External tool adapter"]
     Plugins["External tool processes<br/>Any language"]
 
     Frontend <-->|Commands / events| Runtime
+    Frontend -. "optional composition" .-> Container
     Core --- Runtime
     Runtime --> Context
     Context --> Core
     Runtime <-->|Provider port| Provider
     Runtime <-->|Tool port| Tools
+    Container -. "filesystem executors" .-> Tools
     Runtime <-->|Store port| Store
     Tools -->|Direct calls| Builtin
     Tools --> Bridge
     Bridge <-->|stdio| Plugins
 ```
+
+Container-backed execution is isolated in `nexus-container`; ordinary local
+filesystem and sandboxed process tools remain in `nexus-tools`.
 
 `nexus-context` is the independent context-processing crate. It owns token
 estimation/calibration, safe exchange selection and staged reduction plans, and
