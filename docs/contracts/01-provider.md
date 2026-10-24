@@ -48,6 +48,16 @@ instructions are not ordinary history items and cannot be evicted or cached as
 an earlier task exchange. Reduction events' retained byte counts include the
 reserved instruction bytes; item counts still describe conversation items only.
 
+Runtime-generated context notes (for example, that earlier completed exchanges
+were omitted) are also separate from conversation history and are sent through
+the same native instruction field with an explicit `Runtime context note:`
+label. They are bounded to 4 KiB of note text; the rendered label, separator,
+host instructions, note, and conversation all count toward the same 1 MiB
+request budget. Notes do not consume retained-item slots or become part of a
+later cached exchange. If a note must be emitted because history was reduced,
+its rendered bytes are reserved before eviction. Reduction-event retained byte
+counts include it.
+
 The adapter renders nonempty fields in agent/environment order. Chat Completions
 uses a leading `system` message, Responses uses the top-level `instructions`
 field, and Anthropic Messages uses the top-level `system` field. Empty

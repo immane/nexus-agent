@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 use nexus_core::{
-    ErrorCategory, Limits, MAX_CONVERSATION_BYTES, MAX_INSTRUCTIONS_BYTES, ModelContextItem,
-    ModelInstructions, ModelRequest, RunId, TurnId,
+    ErrorCategory, Limits, MAX_CONTEXT_NOTE_BYTES, MAX_CONVERSATION_BYTES, MAX_INSTRUCTIONS_BYTES,
+    ModelContextItem, ModelInstructions, ModelRequest, RunId, TurnId,
 };
 
 fn request() -> ModelRequest {
@@ -128,4 +128,44 @@ fn builders_replace_payloads_instead_of_accumulating_them() {
         .with_conversation(conversation(MAX_CONVERSATION_BYTES))
         .unwrap();
     assert_eq!(request.instructions().payload_bytes(), 0);
+}
+
+#[test]
+fn runtime_context_note_is_separate_from_history_and_charged_as_rendered() {
+    let note = "Earlier context was omitted.";
+    let with_note = request()
+        .with_instructions(ModelInstructions::new("host", "env").unwrap())
+        .unwrap()
+        .with_context_note(note)
+        .unwrap();
+    assert!(with_note.conversation().is_empty());
+    assert_eq!(with_note.context_note(), note);
+    assert_eq!(
+        with_note.rendered_instructions().as_deref(),
+        Some("host\n\nenv\n\nRuntime context note:\nEarlier context was omitted.")
+    );
+    assert_eq!(
+        with_note.context_note_bytes(),
+        note.len() + "Runtime context note:\n".len() + 2
+    );
+
+    let max_note = "x".repeat(MAX_CONTEXT_NOTE_BYTES);
+    assert!(request().with_context_note(max_note).is_ok());
+    assert!(
+        request()
+            .with_context_note("x".repeat(MAX_CONTEXT_NOTE_BYTES + 1))
+            .is_err()
+    );
+
+    let note_cost = "note".len() + "Runtime context note:\n".len();
+    let exact = request()
+        .with_context_note("note")
+        .unwrap()
+        .with_conversation(conversation(MAX_CONVERSATION_BYTES - note_cost));
+    assert!(exact.is_ok());
+    let over = request()
+        .with_context_note("note")
+        .unwrap()
+        .with_conversation(conversation(MAX_CONVERSATION_BYTES - note_cost + 1));
+    assert_eq!(over.unwrap_err().category(), ErrorCategory::ResourceLimit);
 }

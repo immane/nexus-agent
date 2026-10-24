@@ -319,10 +319,10 @@ impl OpenAiProvider {
             return protocol_request_body(self.protocol, &self.model, request);
         }
         let mut messages = Vec::new();
-        if request.instructions().payload_bytes() != 0 {
+        if let Some(instructions) = request.rendered_instructions() {
             messages.push(json!({
                 "role": "system",
-                "content": request.instructions().rendered_text(),
+                "content": instructions,
             }));
         }
         messages.extend(conversation_messages(request.conversation()));
@@ -635,8 +635,8 @@ fn protocol_request_body(
                 "stream":true,
                 "max_output_tokens":max_tokens,
             });
-            if request.instructions().payload_bytes() != 0 {
-                body["instructions"] = Value::String(request.instructions().rendered_text());
+            if let Some(instructions) = request.rendered_instructions() {
+                body["instructions"] = Value::String(instructions);
             }
             if !tools.is_empty() {
                 body["tools"] = Value::Array(tools);
@@ -721,8 +721,8 @@ fn protocol_request_body(
                 "max_tokens":max_tokens,
                 "stream":true,
             });
-            if request.instructions().payload_bytes() != 0 {
-                body["system"] = Value::String(request.instructions().rendered_text());
+            if let Some(instructions) = request.rendered_instructions() {
+                body["system"] = Value::String(instructions);
             }
             if !tools.is_empty() {
                 body["tools"] = Value::Array(tools);

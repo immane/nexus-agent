@@ -398,7 +398,12 @@ fn all_protocols_encode_instructions_without_changing_conversation() {
                     )
                     .expect("instructions attach");
             }
-            let rendered = request.instructions().rendered_text();
+            request = request
+                .with_context_note("Earlier completed exchanges were omitted.")
+                .expect("runtime note attaches");
+            let rendered = request
+                .rendered_instructions()
+                .expect("note renders in native instruction field");
             let events = adapter.stream(&request, &live_context());
             assert_eq!(finished(&events).reason(), FinishReason::Stop);
             let raw = served.request.lock().expect("request captured");
@@ -408,9 +413,7 @@ fn all_protocols_encode_instructions_without_changing_conversation() {
             match protocol {
                 nexus_config::ProtocolKind::ChatCompletions => {
                     let mut expected = Vec::new();
-                    if !rendered.is_empty() {
-                        expected.push(serde_json::json!({"role":"system","content":rendered}));
-                    }
+                    expected.push(serde_json::json!({"role":"system","content":rendered}));
                     expected.push(serde_json::json!({"role":"user","content":"fixture prompt"}));
                     assert_eq!(body["messages"], Value::Array(expected));
                     assert!(body.get("instructions").is_none());
@@ -423,7 +426,7 @@ fn all_protocols_encode_instructions_without_changing_conversation() {
                     );
                     assert_eq!(
                         body.get("instructions"),
-                        (!rendered.is_empty()).then_some(Value::String(rendered)).as_ref()
+                        Some(Value::String(rendered)).as_ref()
                     );
                     assert!(body.get("system").is_none());
                     assert!(body.get("messages").is_none());
@@ -435,7 +438,7 @@ fn all_protocols_encode_instructions_without_changing_conversation() {
                     );
                     assert_eq!(
                         body.get("system"),
-                        (!rendered.is_empty()).then_some(Value::String(rendered)).as_ref()
+                        Some(Value::String(rendered)).as_ref()
                     );
                     assert!(body.get("instructions").is_none());
                 }

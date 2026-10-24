@@ -221,6 +221,8 @@ const MAX_HISTORY_OMISSION_SESSIONS: usize = 128;
 
 struct ActiveRun {
     instruction_bytes: usize,
+    context_note: String,
+    context_note_bytes: usize,
     phase: RunState,
     run: RunId,
     run_n: u64,
@@ -632,33 +634,26 @@ impl Runtime {
         let history_omitted_items =
             session_omitted_items.saturating_add(state.history_omission_fallback_items);
         let history_omitted = history_omitted_items > 0;
-        let omission_notice = if history_omitted {
-            match context_notice_item() {
-                Ok(notice) => Some(notice),
-                Err(_) => {
-                    return CommandResponse::new(
-                        command.request,
-                        CommandReply::Rejected,
-                        Some(run),
-                    );
-                }
-            }
-        } else {
-            None
-        };
         let history_len = conversation.len();
         conversation.push(user_item);
-        if let Some(notice) = omission_notice {
-            conversation.push(notice);
-        }
+        let context_note = if history_omitted {
+            CONTEXT_NOTICE_TEXT.to_owned()
+        } else {
+            String::new()
+        };
+        let context_note_bytes =
+            runtime_note_bytes(&context_note, self.shared.instructions.payload_bytes() > 0);
         let initial_context_reduction = history_omitted.then(|| ContextReduction {
             removed_items: history_omitted_items,
             retained_items: conversation.len(),
             retained_bytes: conversation_bytes(&conversation)
-                .saturating_add(self.shared.instructions.payload_bytes()),
+                .saturating_add(self.shared.instructions.payload_bytes())
+                .saturating_add(context_note_bytes),
         });
         state.active = Some(ActiveRun {
             instruction_bytes: self.shared.instructions.payload_bytes(),
+            context_note,
+            context_note_bytes,
             phase: RunState::Preparing,
             run: run.clone(),
             run_n,
@@ -1058,7 +1053,8 @@ impl Runtime {
             if let Some(reduction) = reduction.as_mut() {
                 reduction.retained_items = active.conversation.len();
                 reduction.retained_bytes = conversation_bytes(&active.conversation)
-                    .saturating_add(active.instruction_bytes);
+                    .saturating_add(active.instruction_bytes)
+                    .saturating_add(active.context_note_bytes);
             }
             if let Some(reduction) = reduction {
                 publish_context_reduction(&self.shared, active, run, reduction);
@@ -1092,6 +1088,8 @@ impl Runtime {
             .map_err(|_| Terminal::limit("model request budget is invalid"))?
             .with_instructions(self.shared.instructions.clone())
             .map_err(|_| Terminal::limit("model instructions exceed their budget"))?
+            .with_context_note(active.context_note.clone())
+            .map_err(|_| Terminal::limit("model context note exceeds its budget"))?
             .with_conversation(active.conversation.clone())
             .map_err(|_| Terminal::limit("model conversation exceeds its budget"))?
             .with_tool_definitions(self.shared.tool_definitions.clone())
@@ -2765,7 +2763,9 @@ fn compact_context(
     // partially altered before its explicit limit terminal.
     let mut items = active.conversation.clone();
     let mut history_len = active.history_len;
-    let mut bytes = conversation_bytes(&items).saturating_add(active.instruction_bytes);
+    let mut bytes = conversation_bytes(&items)
+        .saturating_add(active.instruction_bytes)
+        .saturating_add(active.context_note_bytes);
     let notice_count = items.iter().filter(|item| is_context_notice(item)).count();
     if items.len() <= bound
         && bytes <= nexus_core::provider::MAX_CONVERSATION_BYTES
@@ -2779,11 +2779,10 @@ fn compact_context(
         return Err(context_limit(active, bound));
     }
 
-    let mut removed_items = notice_count.saturating_sub(1);
-    // Normalize all historical notices before choosing what to evict. Charge
-    // exactly one notice in the current task's protected prefix, including its
-    // metadata bytes. This also prevents multiple inherited notices from
-    // accumulating when several historical exchanges are removed together.
+    let mut removed_items = notice_count;
+    // Remove legacy in-history notices before choosing exchanges. New omission
+    // notices live outside history, so they cannot consume retained-item slots
+    // or become part of a later cached exchange.
     let historical_notices = items[..history_len]
         .iter()
         .filter(|item| is_context_notice(item))
@@ -2793,8 +2792,15 @@ fn compact_context(
     if !matches!(items.get(history_len), Some(ModelContextItem::UserText(_))) {
         return Err(context_limit(active, bound));
     }
-    items.insert(history_len + 1, context_notice_item()?);
-    bytes = conversation_bytes(&items).saturating_add(active.instruction_bytes);
+    let note = if active.context_note.is_empty() {
+        CONTEXT_NOTICE_TEXT
+    } else {
+        active.context_note.as_str()
+    };
+    let note_bytes = runtime_note_bytes(note, active.instruction_bytes > 0);
+    bytes = conversation_bytes(&items)
+        .saturating_add(active.instruction_bytes)
+        .saturating_add(note_bytes);
     while items.len() > bound || bytes > nexus_core::provider::MAX_CONVERSATION_BYTES {
         let (start, end) = if history_len > 0 {
             let end = items[..history_len]
@@ -2831,6 +2837,10 @@ fn compact_context(
 
     active.conversation = items;
     active.history_len = history_len;
+    if removed_items > 0 {
+        active.context_note = note.to_owned();
+        active.context_note_bytes = note_bytes;
+    }
     Ok(Some(ContextReduction {
         removed_items,
         retained_items: active.conversation.len(),
@@ -2869,9 +2879,19 @@ fn context_calls_are_paired(items: &[ModelContextItem]) -> bool {
     pending.is_empty()
 }
 
+#[cfg(test)]
 fn context_notice_item() -> Result<ModelContextItem, Terminal> {
     ModelContextItem::assistant_text(CONTEXT_NOTICE_ITEM_KEY, CONTEXT_NOTICE_TEXT)
         .map_err(Terminal::failed)
+}
+
+fn runtime_note_bytes(note: &str, has_host_instructions: bool) -> usize {
+    if note.is_empty() {
+        return 0;
+    }
+    note.len()
+        .saturating_add("Runtime context note:\n".len())
+        .saturating_add(usize::from(has_host_instructions) * 2)
 }
 
 fn is_context_notice(item: &ModelContextItem) -> bool {
@@ -2982,7 +3002,9 @@ fn context_limit(active: &ActiveRun, bound: usize) -> Terminal {
                 "context budget exhausted: items={} max_items={} bytes={} max_bytes={} continuation={}",
                 active.conversation.len(),
                 bound,
-                conversation_bytes(&active.conversation).saturating_add(active.instruction_bytes),
+                conversation_bytes(&active.conversation)
+                    .saturating_add(active.instruction_bytes)
+                    .saturating_add(active.context_note_bytes),
                 nexus_core::provider::MAX_CONVERSATION_BYTES,
                 u8::from(active.continuation.is_some()),
             ),
@@ -5978,6 +6000,8 @@ mod cov_runtime_private {
     fn active_for(run: &RunId) -> ActiveRun {
         ActiveRun {
             instruction_bytes: 0,
+            context_note: String::new(),
+            context_note_bytes: 0,
             phase: RunState::Preparing,
             run: run.clone(),
             run_n: 1,
@@ -6070,13 +6094,12 @@ mod cov_runtime_private {
             assert!(compact_context(&mut active, 256).is_ok());
             assert!(active.conversation.len() <= 256);
         }
-        assert_eq!(active.conversation.len(), 256);
+        assert_eq!(active.conversation.len(), 255);
         assert!(
             matches!(&active.conversation[0], ModelContextItem::UserText(text) if text.as_str() == "current task")
         );
-        assert!(is_context_notice(&active.conversation[1]));
         assert!(
-            matches!(&active.conversation[2], ModelContextItem::AssistantCall { provider_ref, .. } if provider_ref.as_str() == "reference-73")
+            matches!(&active.conversation[1], ModelContextItem::AssistantCall { provider_ref, .. } if provider_ref.as_str() == "reference-73")
         );
         let expected = context_exchange(&active.run, 199, 1);
         assert_eq!(
@@ -6113,12 +6136,16 @@ mod cov_runtime_private {
         assert!(compact_context(&mut active, 8192).is_ok());
         assert_eq!(
             active.conversation.len(),
-            11,
-            "the oldest exchange is removed and a bounded notice is retained"
+            10,
+            "the omission note does not consume a conversation item"
         );
-        assert!(conversation_bytes(&active.conversation) <= nexus_core::MAX_CONVERSATION_BYTES);
+        assert!(!active.context_note.is_empty());
         assert!(
-            matches!(&active.conversation[2], ModelContextItem::AssistantText { item_key, reasoning: Some(trace), .. } if item_key.as_str() == "text-1" && trace.len() == 100)
+            conversation_bytes(&active.conversation) + active.context_note_bytes
+                <= nexus_core::MAX_CONVERSATION_BYTES
+        );
+        assert!(
+            matches!(&active.conversation[1], ModelContextItem::AssistantText { item_key, reasoning: Some(trace), .. } if item_key.as_str() == "text-1" && trace.len() == 100)
         );
     }
 
@@ -6139,7 +6166,9 @@ mod cov_runtime_private {
             .expect("instruction pressure evicts an old exchange");
         assert_eq!(
             reduction.retained_bytes,
-            conversation_bytes(&active.conversation) + active.instruction_bytes
+            conversation_bytes(&active.conversation)
+                + active.instruction_bytes
+                + active.context_note_bytes
         );
         assert!(reduction.retained_bytes <= nexus_core::MAX_CONVERSATION_BYTES);
         assert_eq!(active.instruction_bytes, nexus_core::MAX_INSTRUCTIONS_BYTES);
@@ -6182,7 +6211,7 @@ mod cov_runtime_private {
         active.conversation.push(second[1].clone());
         assert!(compact_context(&mut active, 6).is_ok());
         assert_eq!(
-            &active.conversation[2..],
+            &active.conversation[1..],
             &[
                 first[0].clone(),
                 second[0].clone(),
@@ -6306,35 +6335,32 @@ mod cov_runtime_private {
                 .iter()
                 .filter(|item| is_context_notice(item))
                 .count(),
-            1
+            0
         );
-        assert!(is_context_notice(&active.conversation[3]));
+        assert!(!active.context_note.is_empty());
         assert_eq!(reduction.retained_items, active.conversation.len());
         assert_eq!(
             reduction.retained_bytes,
-            conversation_bytes(&active.conversation)
+            conversation_bytes(&active.conversation) + active.context_note_bytes
         );
         assert_eq!(
-            reduction.removed_items, 1,
-            "only the duplicate notice was evicted"
+            reduction.removed_items, 2,
+            "legacy notices are represented by one out-of-history note"
         );
     }
 
     #[test]
-    fn inherited_history_cannot_be_omitted_when_the_notice_cannot_fit() {
+    fn omission_note_does_not_consume_a_retained_context_item() {
         let mut active = context_run();
         active.history_len = 1;
         active
             .conversation
             .push(ModelContextItem::user_text("new task").expect("user"));
         let before = active.conversation.clone();
-        assert_eq!(
-            compact_context(&mut active, 1)
-                .expect_err("notice is required")
-                .outcome,
-            RunOutcome::LimitReached
-        );
-        assert_eq!(active.conversation, before);
+        assert!(compact_context(&mut active, 1).is_ok());
+        assert_ne!(active.conversation, before);
+        assert_eq!(active.conversation.len(), 1);
+        assert!(!active.context_note.is_empty());
     }
 
     #[test]
@@ -6812,7 +6838,7 @@ mod cov_runtime_private {
             .extend(context_exchange(&active.run, 1, 1));
         assert!(compact_context(&mut active, 4).is_ok());
         assert_eq!(active.history_len, 0);
-        assert_eq!(active.conversation.len(), 4);
+        assert_eq!(active.conversation.len(), 3);
         assert!(
             matches!(&active.conversation[0], ModelContextItem::UserText(text) if text.as_str() == "new task")
         );
@@ -7665,6 +7691,8 @@ mod cov_runtime_topup_private {
         let now = StdInstant::now();
         ActiveRun {
             instruction_bytes: 0,
+            context_note: String::new(),
+            context_note_bytes: 0,
             phase: RunState::Preparing,
             run: run.clone(),
             run_n: 1,
