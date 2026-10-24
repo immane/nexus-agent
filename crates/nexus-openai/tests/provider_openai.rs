@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 use nexus_config::{AdapterKind, CredentialRef, ProviderProfile};
 use nexus_core::{
     CallId, CancellationToken, ContinuationData, EffectState, ErrorCategory, Evidence,
-    ExecutionStatus, FinishReason, M0_REVISION, ModelContextItem, ModelRequest, NormalizedArgs,
-    ProviderContext, ProviderEvent, ProviderPort, RetryGuidance, RunId, ToolCall, ToolId,
-    ToolOutcome, ToolSpec, TurnFinished, TurnId, Usage, UsageFinality,
+    ExecutionStatus, FinishReason, M0_REVISION, ModelContextItem, ModelInstructions, ModelRequest,
+    NormalizedArgs, ProviderContext, ProviderEvent, ProviderPort, RetryGuidance, RunId, ToolCall,
+    ToolId, ToolOutcome, ToolSpec, TurnFinished, TurnId, Usage, UsageFinality,
 };
 use nexus_openai::OpenAiProvider;
 use serde_json::Value;
@@ -354,6 +354,92 @@ fn configured_responses_and_messages_protocols_use_their_wire_contracts() {
                 assert!(request.contains("\"input_schema\""));
             }
             nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn all_protocols_encode_instructions_without_changing_conversation() {
+    for (protocol, response) in [
+        (nexus_config::ProtocolKind::ChatCompletions, stop_body("done")),
+        (
+            nexus_config::ProtocolKind::OpenAiResponses,
+            r#"{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}"#.to_owned(),
+        ),
+        (
+            nexus_config::ProtocolKind::AnthropicMessages,
+            r#"{"type":"message","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}"#.to_owned(),
+        ),
+    ] {
+        for instruction_parts in [
+            None,
+            Some(("", "")),
+            Some(("Agent fixture: \"quoted\"\nUnicode: 日本語", "")),
+            Some(("", "Environment fixture: /workspace/project")),
+            Some(("Agent fixture", "Environment fixture\nsecond line")),
+        ] {
+            let (base, served) = serve(200, &response, Duration::ZERO);
+            let adapter = OpenAiProvider::new_for_protocol(
+                &base,
+                present_credential(),
+                "test-model",
+                protocol,
+            )
+            .expect("adapter builds");
+            let mut request = base_request()
+                .with_conversation(vec![
+                    ModelContextItem::user_text("fixture prompt").expect("user text builds"),
+                ])
+                .expect("conversation attaches");
+            if let Some((agent, environment)) = instruction_parts {
+                request = request
+                    .with_instructions(
+                        ModelInstructions::new(agent, environment).expect("instructions build"),
+                    )
+                    .expect("instructions attach");
+            }
+            let rendered = request.instructions().rendered_text();
+            let events = adapter.stream(&request, &live_context());
+            assert_eq!(finished(&events).reason(), FinishReason::Stop);
+            let raw = served.request.lock().expect("request captured");
+            let raw = String::from_utf8_lossy(&raw);
+            let (_, body) = raw.split_once("\r\n\r\n").expect("HTTP body exists");
+            let body: Value = serde_json::from_str(body).expect("request body is JSON");
+            match protocol {
+                nexus_config::ProtocolKind::ChatCompletions => {
+                    let mut expected = Vec::new();
+                    if !rendered.is_empty() {
+                        expected.push(serde_json::json!({"role":"system","content":rendered}));
+                    }
+                    expected.push(serde_json::json!({"role":"user","content":"fixture prompt"}));
+                    assert_eq!(body["messages"], Value::Array(expected));
+                    assert!(body.get("instructions").is_none());
+                    assert!(body.get("system").is_none());
+                }
+                nexus_config::ProtocolKind::OpenAiResponses => {
+                    assert_eq!(
+                        body["input"],
+                        serde_json::json!([{"role":"user","content":"fixture prompt"}])
+                    );
+                    assert_eq!(
+                        body.get("instructions"),
+                        (!rendered.is_empty()).then_some(Value::String(rendered)).as_ref()
+                    );
+                    assert!(body.get("system").is_none());
+                    assert!(body.get("messages").is_none());
+                }
+                nexus_config::ProtocolKind::AnthropicMessages => {
+                    assert_eq!(
+                        body["messages"],
+                        serde_json::json!([{"role":"user","content":[{"type":"text","text":"fixture prompt"}]}])
+                    );
+                    assert_eq!(
+                        body.get("system"),
+                        (!rendered.is_empty()).then_some(Value::String(rendered)).as_ref()
+                    );
+                    assert!(body.get("instructions").is_none());
+                }
+            }
         }
     }
 }

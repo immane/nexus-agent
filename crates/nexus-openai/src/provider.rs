@@ -318,7 +318,14 @@ impl OpenAiProvider {
         if self.protocol != ProtocolKind::ChatCompletions {
             return protocol_request_body(self.protocol, &self.model, request);
         }
-        let messages: Vec<Value> = conversation_messages(request.conversation());
+        let mut messages = Vec::new();
+        if request.instructions().payload_bytes() != 0 {
+            messages.push(json!({
+                "role": "system",
+                "content": request.instructions().rendered_text(),
+            }));
+        }
+        messages.extend(conversation_messages(request.conversation()));
         let mut tools: Vec<Value> = Vec::new();
         for spec in request.tool_definitions() {
             let schema: Value = serde_json::from_str(spec.input_schema_json()).map_err(|_| {
@@ -628,6 +635,9 @@ fn protocol_request_body(
                 "stream":true,
                 "max_output_tokens":max_tokens,
             });
+            if request.instructions().payload_bytes() != 0 {
+                body["instructions"] = Value::String(request.instructions().rendered_text());
+            }
             if !tools.is_empty() {
                 body["tools"] = Value::Array(tools);
             }
@@ -711,6 +721,9 @@ fn protocol_request_body(
                 "max_tokens":max_tokens,
                 "stream":true,
             });
+            if request.instructions().payload_bytes() != 0 {
+                body["system"] = Value::String(request.instructions().rendered_text());
+            }
             if !tools.is_empty() {
                 body["tools"] = Value::Array(tools);
             }

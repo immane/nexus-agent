@@ -1,6 +1,6 @@
 # Provider Contract
 
-Status: Draft contract, revision `draft-1`. Read the [common contract](00-common.md) first. API configuration and relay scope are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md); no provider trait or adapter exists yet.
+Status: Draft contract, revision `draft-1`, with implemented subsets identified below. Read the [common contract](00-common.md) first. API configuration and relay scope are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). The Rust provider port and HTTP adapters exist; draft requirements beyond the implemented subsets are not implementation claims.
 
 ## Semantic Operations
 
@@ -22,6 +22,40 @@ A relay MUST preserve call references and required continuation state, declare t
 ## Request
 
 `ModelRequest` contains the run/turn identity, selected model profile, accepted conversation, authorized instructions, enabled tool definitions, context/output budgets, and compatible continuation state.
+
+### Implemented instruction placeholder
+
+The Rust API now carries a separate `ModelInstructions` value, with `agent` and
+`environment` text supplied by the trusted application composition layer. Both
+default to empty; no built-in coding rules, environment detection, file loading,
+CLI configuration, or benchmark-specific commands are enabled by this API.
+Task descriptions, repository files, and tool output remain conversation data;
+they must not be promoted to host instructions merely because they contain
+instruction-like text. Instructions do not grant tool permissions.
+
+`Runtime::try_new_with_instructions` installs a fixed snapshot for that runtime's
+lifetime and attaches it to every model request. Existing constructors retain
+the empty default. Changing instructions or execution environment requires a new
+runtime; there is no hot-update API. Applications must supply environment facts
+appropriate to the actual backend rather than sending container paths in local
+mode.
+
+Instructions have a 16 KiB rendered UTF-8 limit, including the blank-line
+separator between nonempty fields. Their bytes also consume the request's
+1 MiB aggregate conversation/instruction budget, regardless of builder order.
+Runtime history projection reserves these bytes before pruning whole exchanges;
+instructions are not ordinary history items and cannot be evicted or cached as
+an earlier task exchange. Reduction events' retained byte counts include the
+reserved instruction bytes; item counts still describe conversation items only.
+
+The adapter renders nonempty fields in agent/environment order. Chat Completions
+uses a leading `system` message, Responses uses the top-level `instructions`
+field, and Anthropic Messages uses the top-level `system` field. Empty
+instructions omit those fields/messages, preserving existing wire behavior.
+Adapters must encode instructions natively or explicitly reject them as
+unsupported; silently dropping them or converting them to ordinary user text is
+not permitted. This section describes implemented behavior; other draft
+proposals in this document are not implied to be implemented.
 
 `ProviderContext` contains cancellation, deadlines, and implementation-owned connection/credential access. Credentials MUST NOT become ordinary conversation fields or be passed to unrelated tools.
 

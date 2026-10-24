@@ -24,9 +24,11 @@ pub const MAX_PROFILE_LEN: usize = 128;
 /// Representation ceiling for one request, independent of the effective
 /// runtime policy (whose M0-test default remains 256 retained items).
 pub const MAX_CONVERSATION_ITEMS: usize = 8192;
-/// Maximum aggregate conversation payload in bytes (M0-TEST representation
-/// choice; the lock sets no table value for aggregate conversation bytes).
+/// Maximum aggregate instructions-plus-conversation payload in bytes (M0-TEST
+/// representation choice; the lock sets no table value for aggregate bytes).
 pub const MAX_CONVERSATION_BYTES: usize = 1_048_576;
+/// Maximum aggregate agent and environment instruction payload in bytes.
+pub const MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 /// Maximum tool definitions accepted by one request (M0-TEST choice: the
 /// per-turn declared-call bound).
 pub const MAX_TOOL_DEFINITIONS: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize;
@@ -358,7 +360,69 @@ impl ModelContextItem {
     }
 }
 
-/// One model-turn request: identities, profile, accepted conversation
+/// Bounded agent and environment instructions supplied separately from history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelInstructions {
+    agent: String,
+    environment: String,
+}
+
+impl ModelInstructions {
+    /// Validates the combined UTF-8 payload against [`MAX_INSTRUCTIONS_BYTES`].
+    /// Both fields may be empty; their contents are preserved verbatim.
+    pub fn new(
+        agent: impl Into<String>,
+        environment: impl Into<String>,
+    ) -> Result<Self, AgentError> {
+        let instructions = Self {
+            agent: agent.into(),
+            environment: environment.into(),
+        };
+        if instructions.payload_bytes() > MAX_INSTRUCTIONS_BYTES {
+            return Err(port_limit_error(
+                "model instructions exceed aggregate byte budget",
+            ));
+        }
+        Ok(instructions)
+    }
+
+    /// Returns the agent instructions.
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// Returns the environment instructions.
+    #[must_use]
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+
+    /// Returns rendered UTF-8 bytes, including the separator between nonempty fields.
+    #[must_use]
+    pub fn payload_bytes(&self) -> usize {
+        self.agent
+            .len()
+            .saturating_add(self.environment.len())
+            .saturating_add(if !self.agent.is_empty() && !self.environment.is_empty() {
+                2
+            } else {
+                0
+            })
+    }
+
+    /// Renders nonempty fields in agent/environment order, separated by a blank line.
+    #[must_use]
+    pub fn rendered_text(&self) -> String {
+        match (self.agent.is_empty(), self.environment.is_empty()) {
+            (true, _) => self.environment.clone(),
+            (_, true) => self.agent.clone(),
+            (false, false) => format!("{}\n\n{}", self.agent, self.environment),
+        }
+    }
+}
+
+/// One model-turn request: identities, profile, instructions, accepted conversation
 /// budget, enabled tools, and compatible continuation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
@@ -368,6 +432,7 @@ pub struct ModelRequest {
     enabled_tools: Vec<ToolId>,
     continuation: Option<ContinuationData>,
     output_budget_bytes: usize,
+    instructions: ModelInstructions,
     conversation: Vec<ModelContextItem>,
     tool_definitions: Vec<ToolSpec>,
 }
@@ -399,6 +464,7 @@ impl ModelRequest {
             enabled_tools,
             continuation,
             output_budget_bytes,
+            instructions: ModelInstructions::default(),
             conversation: Vec::new(),
             tool_definitions: Vec::new(),
         })
@@ -440,8 +506,35 @@ impl ModelRequest {
         self.output_budget_bytes
     }
 
+    /// Installs instructions, replacing previously accepted instructions.
+    /// Instructions and conversation share [`MAX_CONVERSATION_BYTES`].
+    pub fn with_instructions(
+        mut self,
+        instructions: ModelInstructions,
+    ) -> Result<Self, AgentError> {
+        let total = self
+            .conversation
+            .iter()
+            .fold(instructions.payload_bytes(), |acc, item| {
+                acc.saturating_add(item.payload_bytes())
+            });
+        if total > MAX_CONVERSATION_BYTES {
+            return Err(port_limit_error(
+                "model instructions and conversation exceed aggregate byte budget",
+            ));
+        }
+        self.instructions = instructions;
+        Ok(self)
+    }
+
+    /// Returns the accepted instructions (empty by default).
+    #[must_use]
+    pub fn instructions(&self) -> &ModelInstructions {
+        &self.instructions
+    }
+
     /// Installs a bounded conversation, replacing any previously accepted
-    /// items. Count and aggregate payload bytes are checked here.
+    /// items. Count and aggregate instructions-plus-conversation bytes are checked here.
     pub fn with_conversation(
         mut self,
         conversation: Vec<ModelContextItem>,
@@ -456,7 +549,9 @@ impl ModelRequest {
         }
         let total = conversation
             .iter()
-            .fold(0usize, |acc, item| acc.saturating_add(item.payload_bytes()));
+            .fold(self.instructions.payload_bytes(), |acc, item| {
+                acc.saturating_add(item.payload_bytes())
+            });
         if total > MAX_CONVERSATION_BYTES {
             return Err(port_limit_error(
                 "model conversation exceeds aggregate byte budget",

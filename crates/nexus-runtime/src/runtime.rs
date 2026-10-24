@@ -35,11 +35,11 @@ use nexus_core::{
     CallCandidate, CallId, CancelCommand, CancellationToken, Command, CommandReply,
     CommandResponse, ContinuationData, DenyCommand, EffectState, ErrorCategory, EventPayload,
     Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits, ModelContextItem,
-    ModelRequest, OutcomeSummary, PersistenceState, ProviderContext, ProviderEvent, ProviderPort,
-    RequestId, RetryGuidance, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome, SessionId,
-    Snapshot, SubmitCommand, ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId,
-    ToolOutcome, ToolPort, ToolRegistration, ToolSpec, ToolStartedInfo, TurnId, Usage,
-    UsageFinality,
+    ModelInstructions, ModelRequest, OutcomeSummary, PersistenceState, ProviderContext,
+    ProviderEvent, ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId,
+    RunLifecycle, RunOutcome, SessionId, Snapshot, SubmitCommand, ToolAccess, ToolCall,
+    ToolContext, ToolFinishedInfo, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
+    ToolStartedInfo, TurnId, Usage, UsageFinality,
 };
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
@@ -92,6 +92,7 @@ pub struct Runtime {
 }
 
 struct Shared {
+    instructions: ModelInstructions,
     limits: Limits,
     effective_output_budget: usize,
     context_items_bound: usize,
@@ -219,6 +220,7 @@ const CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES: usize = 65_536;
 const MAX_HISTORY_OMISSION_SESSIONS: usize = 128;
 
 struct ActiveRun {
+    instruction_bytes: usize,
     phase: RunState,
     run: RunId,
     run_n: u64,
@@ -384,6 +386,18 @@ impl Runtime {
         provider: Arc<dyn ProviderPort + Send + Sync>,
         tools: Vec<ToolRegistration>,
     ) -> Result<(Self, EventStreams), AgentError> {
+        Self::try_new_with_instructions(config, provider, tools, ModelInstructions::default())
+    }
+
+    /// Constructs a runtime with an immutable host-authorized instruction snapshot.
+    /// Instructions are not conversation history and never authorize tools.
+    /// Existing callers opt out through the empty default in [`Self::try_new`].
+    pub fn try_new_with_instructions(
+        config: RuntimeConfig,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        instructions: ModelInstructions,
+    ) -> Result<(Self, EventStreams), AgentError> {
         config.limits.validate()?;
         if config.policy.is_container() {
             config.policy.validate()?;
@@ -483,6 +497,7 @@ impl Runtime {
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
+            instructions,
             limits: config.limits,
             effective_output_budget,
             context_items_bound,
@@ -639,9 +654,11 @@ impl Runtime {
         let initial_context_reduction = history_omitted.then(|| ContextReduction {
             removed_items: history_omitted_items,
             retained_items: conversation.len(),
-            retained_bytes: conversation_bytes(&conversation),
+            retained_bytes: conversation_bytes(&conversation)
+                .saturating_add(self.shared.instructions.payload_bytes()),
         });
         state.active = Some(ActiveRun {
+            instruction_bytes: self.shared.instructions.payload_bytes(),
             phase: RunState::Preparing,
             run: run.clone(),
             run_n,
@@ -1040,7 +1057,8 @@ impl Runtime {
             };
             if let Some(reduction) = reduction.as_mut() {
                 reduction.retained_items = active.conversation.len();
-                reduction.retained_bytes = conversation_bytes(&active.conversation);
+                reduction.retained_bytes = conversation_bytes(&active.conversation)
+                    .saturating_add(active.instruction_bytes);
             }
             if let Some(reduction) = reduction {
                 publish_context_reduction(&self.shared, active, run, reduction);
@@ -1072,6 +1090,8 @@ impl Runtime {
                 self.shared.effective_output_budget,
             )
             .map_err(|_| Terminal::limit("model request budget is invalid"))?
+            .with_instructions(self.shared.instructions.clone())
+            .map_err(|_| Terminal::limit("model instructions exceed their budget"))?
             .with_conversation(active.conversation.clone())
             .map_err(|_| Terminal::limit("model conversation exceeds its budget"))?
             .with_tool_definitions(self.shared.tool_definitions.clone())
@@ -2745,7 +2765,7 @@ fn compact_context(
     // partially altered before its explicit limit terminal.
     let mut items = active.conversation.clone();
     let mut history_len = active.history_len;
-    let mut bytes = conversation_bytes(&items);
+    let mut bytes = conversation_bytes(&items).saturating_add(active.instruction_bytes);
     let notice_count = items.iter().filter(|item| is_context_notice(item)).count();
     if items.len() <= bound
         && bytes <= nexus_core::provider::MAX_CONVERSATION_BYTES
@@ -2774,7 +2794,7 @@ fn compact_context(
         return Err(context_limit(active, bound));
     }
     items.insert(history_len + 1, context_notice_item()?);
-    bytes = conversation_bytes(&items);
+    bytes = conversation_bytes(&items).saturating_add(active.instruction_bytes);
     while items.len() > bound || bytes > nexus_core::provider::MAX_CONVERSATION_BYTES {
         let (start, end) = if history_len > 0 {
             let end = items[..history_len]
@@ -2962,7 +2982,7 @@ fn context_limit(active: &ActiveRun, bound: usize) -> Terminal {
                 "context budget exhausted: items={} max_items={} bytes={} max_bytes={} continuation={}",
                 active.conversation.len(),
                 bound,
-                conversation_bytes(&active.conversation),
+                conversation_bytes(&active.conversation).saturating_add(active.instruction_bytes),
                 nexus_core::provider::MAX_CONVERSATION_BYTES,
                 u8::from(active.continuation.is_some()),
             ),
@@ -4101,6 +4121,60 @@ mod tests {
             policy: Policy::m0_test(),
             has_approval_handler: true,
         }
+    }
+
+    #[test]
+    fn host_instructions_are_fixed_and_sent_on_every_model_turn() {
+        struct InstructionProvider {
+            seen: AtomicUsize,
+            expected: ModelInstructions,
+        }
+        impl ProviderPort for InstructionProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                FakeProvider::new(vec![]).capabilities()
+            }
+
+            fn stream(&self, request: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
+                assert_eq!(request.instructions(), &self.expected);
+                if self.seen.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                    FakeProvider::tool_turn(vec![
+                        CallCandidate::new(
+                            "item-0",
+                            "ref-0",
+                            "host_read",
+                            r#"{"path":"src/main.rs"}"#,
+                        )
+                        .unwrap(),
+                    ])
+                } else {
+                    FakeProvider::stop_turn("done")
+                }
+            }
+        }
+        test_rt().block_on(async {
+            let instructions = ModelInstructions::new("host rule", "workspace fact").unwrap();
+            let provider = Arc::new(InstructionProvider {
+                seen: AtomicUsize::new(0),
+                expected: instructions.clone(),
+            });
+            let (runtime, mut streams) = Runtime::try_new_with_instructions(
+                quick_config(),
+                provider.clone(),
+                vec![ToolRegistration::read(Arc::new(FakeTool::succeeding(
+                    "host_read",
+                    nexus_core::M0_REVISION,
+                )))],
+                instructions,
+            )
+            .unwrap();
+            for tag in ["first", "second"] {
+                runtime.submit(submit_cmd(tag)).await;
+                let (_, finished) =
+                    collect_until_finished(&mut streams.data, &mut streams.control).await;
+                assert_eq!(finished.outcome(), RunOutcome::Completed);
+            }
+            assert_eq!(provider.seen.load(Ordering::SeqCst), 4);
+        });
     }
 
     fn submit_cmd(tag: &str) -> SubmitCommand {
@@ -5903,6 +5977,7 @@ mod cov_runtime_private {
 
     fn active_for(run: &RunId) -> ActiveRun {
         ActiveRun {
+            instruction_bytes: 0,
             phase: RunState::Preparing,
             run: run.clone(),
             run_n: 1,
@@ -6045,6 +6120,29 @@ mod cov_runtime_private {
         assert!(
             matches!(&active.conversation[2], ModelContextItem::AssistantText { item_key, reasoning: Some(trace), .. } if item_key.as_str() == "text-1" && trace.len() == 100)
         );
+    }
+
+    #[test]
+    fn context_projection_reserves_instruction_bytes_when_evicting_history() {
+        let mut active = context_run();
+        for n in 0..4 {
+            active.conversation.extend(context_exchange(
+                &active.run,
+                n,
+                Limits::M0_TEST_TOOL_OUTPUT_BYTES - 1024,
+            ));
+        }
+        assert!(conversation_bytes(&active.conversation) < nexus_core::MAX_CONVERSATION_BYTES);
+        active.instruction_bytes = nexus_core::MAX_INSTRUCTIONS_BYTES;
+        let reduction = compact_context(&mut active, 8192)
+            .unwrap_or_else(|_| panic!("context fits after eviction"))
+            .expect("instruction pressure evicts an old exchange");
+        assert_eq!(
+            reduction.retained_bytes,
+            conversation_bytes(&active.conversation) + active.instruction_bytes
+        );
+        assert!(reduction.retained_bytes <= nexus_core::MAX_CONVERSATION_BYTES);
+        assert_eq!(active.instruction_bytes, nexus_core::MAX_INSTRUCTIONS_BYTES);
     }
 
     #[test]
@@ -7566,6 +7664,7 @@ mod cov_runtime_topup_private {
     fn active_for(run: &RunId) -> ActiveRun {
         let now = StdInstant::now();
         ActiveRun {
+            instruction_bytes: 0,
             phase: RunState::Preparing,
             run: run.clone(),
             run_n: 1,
