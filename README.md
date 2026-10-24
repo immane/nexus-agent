@@ -329,6 +329,29 @@ The default permission policy and session behavior are accepted; automatic acces
 
 See the [security design](docs/design/06-security.md) and [session recovery contract](docs/contracts/04-session-store.md).
 
+## Benchmark Observations
+
+Local SWE-bench Lite pilots with `ollama-local/qwen3-27b` produced patches
+marked **resolved** by the official SWE-bench evaluator (2026-10-24):
+
+| Task | Repair | Official evaluation | Agent termination |
+| --- | --- | --- | --- |
+| `sympy__sympy-20590` | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Limit reached |
+| `astropy__astropy-12907` | Preserve separability matrices in nested compound models. | Resolved | Model output limit reached |
+| `django__django-11099` | Reject trailing newlines in username validators. | Resolved | Completed |
+
+These are three selected tasks, **not a leaderboard score or a general success
+rate**; SymPy was attempted repeatedly. The table reports the latest evaluated
+run for each task, not every attempt. Passing task tests does not imply clean
+agent completion or polished delivery: the SymPy and Astropy predictions also
+included temporary scripts. None of these runs triggered context reduction,
+so they do not establish a benefit from the context-retention changes or validate
+the semantic-memory vision.
+
+See [benchmark methodology and earlier run records](docs/research/agent-benchmarks.md)
+and the [reliability follow-up backlog](docs/tasks/09-agent-reliability.md) for
+remaining work on convergence, verification, result recording, and cleanup.
+
 ## Project Status
 
 - [x] MIT license and confirmed project direction.
@@ -363,6 +386,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull-request guida
 | [API relay](docs/design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries. |
 | [Implementation readiness](docs/design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review. |
 | [Architecture migration](docs/tasks/08-architecture-migration.md) | Implemented consolidation slices, protocol extension evidence, and platform blockers. |
+| [Agent reliability follow-up](docs/tasks/09-agent-reliability.md) | Prioritized work on convergence, verification, experiment reliability, and context-reduction evaluation. |
 | [Semantic-memory research](docs/research/task-context-compiler.md) | Compiler-inspired Semantic IR, hybrid retrieval, graph relationships, and LoRA research; not an accepted architecture or implemented capability. |
 | [Overview](docs/design/00-overview.md) | First-release boundaries and non-goals. |
 | [Common contract](docs/contracts/00-common.md) | Identifiers, outcomes, errors, limits, and compatibility. |
