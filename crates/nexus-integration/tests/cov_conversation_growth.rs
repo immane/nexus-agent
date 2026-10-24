@@ -729,12 +729,12 @@ fn retained_item_pressure_evicts_the_oldest_complete_exchange() {
             vec![started_calls(&data, &control)[0].clone()],
             "the earlier snapshot is unchanged by later compaction"
         );
-        assert_eq!(kinds(&requests[2]), vec!["user", "text", "call", "result"]);
-        assert!(requests[2].conversation().iter().any(|item| matches!(
-            item,
-            ModelContextItem::AssistantText { text, .. }
-                if text.as_str().contains("Earlier completed exchanges were omitted")
-        )));
+        assert_eq!(kinds(&requests[2]), vec!["user", "call", "result"]);
+        assert!(
+            requests[2]
+                .context_note()
+                .contains("Earlier completed exchanges were omitted")
+        );
         assert!(data.iter().any(|event| matches!(
             event.payload(),
             EventPayload::ContextReduced {
@@ -754,7 +754,7 @@ fn retained_item_pressure_evicts_the_oldest_complete_exchange() {
             )]
         );
         assert!(matches!(
-            &requests[2].conversation()[3],
+            &requests[2].conversation()[2],
             ModelContextItem::ToolResult { outcome, .. } if outcome == &recorded[1].1
         ));
         assert!(
@@ -810,11 +810,11 @@ fn omitted_inherited_history_is_noted_in_context_and_published() {
         let requests = bed.provider.requests();
         let request = &requests[2];
         assert_eq!(user_texts(request), vec!["do work".to_owned()]);
-        assert!(request.conversation().iter().any(|item| matches!(
-            item,
-            ModelContextItem::AssistantText { text, .. }
-                if text.as_str().contains("Earlier completed exchanges were omitted")
-        )));
+        assert!(
+            request
+                .context_note()
+                .contains("Earlier completed exchanges were omitted")
+        );
     });
 }
 
@@ -860,11 +860,10 @@ fn cache_eviction_notice_survives_until_the_next_run() {
 
         let requests = bed.provider.requests();
         let last = requests.last().expect("third run request");
-        assert!(last.conversation().iter().any(|item| matches!(
-            item,
-            ModelContextItem::AssistantText { text, .. }
-                if text.as_str().contains("Earlier completed exchanges were omitted")
-        )));
+        assert!(
+            last.context_note()
+                .contains("Earlier completed exchanges were omitted")
+        );
     });
 }
 
@@ -907,11 +906,11 @@ fn cache_omission_notice_survives_a_failed_submit_and_reaches_the_next_submit() 
                 let requests = bed.provider.requests();
                 let request = requests.last().expect("request from submitted run");
                 assert_eq!(
-                    request.conversation().iter().filter(|item| matches!(
-                        item,
-                        ModelContextItem::AssistantText { text, .. }
-                            if text.as_str().contains("Earlier completed exchanges were omitted")
-                    )).count(),
+                    usize::from(
+                        request
+                            .context_note()
+                            .contains("Earlier completed exchanges were omitted")
+                    ),
                     1,
                     "both failed and recovered submissions receive exactly one notice"
                 );
@@ -1001,15 +1000,12 @@ fn aggregate_byte_pressure_evicts_oldest_exchanges_and_completes() {
         );
         assert_eq!(
             kinds(last),
-            vec![
-                "user", "text", "call", "result", "call", "result", "call", "result"
-            ]
+            vec!["user", "call", "result", "call", "result", "call", "result"]
         );
-        assert!(last.conversation().iter().any(|item| matches!(
-            item,
-            ModelContextItem::AssistantText { text, .. }
-                if text.as_str().contains("Earlier completed exchanges were omitted")
-        )));
+        assert!(
+            last.context_note()
+                .contains("Earlier completed exchanges were omitted")
+        );
         assert!(
             data.iter()
                 .any(|event| matches!(event.payload(), EventPayload::ContextReduced { .. }))
