@@ -44,6 +44,26 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "container")]
+pub mod container;
+#[cfg(feature = "container")]
+mod container_exec;
+#[cfg(feature = "container")]
+pub mod container_file_tools;
+#[cfg(feature = "container")]
+mod container_ownership;
+#[cfg(feature = "container")]
+mod container_session;
+#[cfg(feature = "container")]
+pub mod container_worker_client;
+#[cfg(feature = "container")]
+pub mod container_worker_protocol;
+#[cfg(feature = "container")]
+mod container_worker_transport;
+#[cfg(feature = "container")]
+mod container_workload;
+#[cfg(feature = "container")]
+pub use container_workload::container_tool_registrations;
 mod development;
 mod exec;
 mod fs_access;

@@ -118,6 +118,15 @@ pub enum ToolsMode {
     },
     /// Development file/exec tools with session-scoped external grants.
     Development { root: std::path::PathBuf },
+    /// Explicitly selected container tools bound to this workspace and the
+    /// operator-supplied immutable images. Available only with the `container`
+    /// feature; this mode remains distinct from local `Development` tools.
+    #[cfg(feature = "container")]
+    Container {
+        root: std::path::PathBuf,
+        gateway_image: String,
+        workload_image: String,
+    },
 }
 
 /// Test-only demo provider: serves a fresh scripted demo script for every
@@ -379,6 +388,7 @@ impl Session {
 pub struct Server {
     handle: tokio::runtime::Handle,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    pending_sessions: AtomicUsize,
     next_session: AtomicU64,
     /// The live configuration document. Every read and write goes through
     /// this one lock so a run's usage record and the redacted summary can
@@ -433,6 +443,14 @@ impl SessionError {
     }
 }
 
+struct SessionAdmission<'a>(&'a AtomicUsize);
+
+impl Drop for SessionAdmission<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Server {
     /// Creates shared state around the Tokio handle used for `block_on`.
     ///
@@ -446,6 +464,7 @@ impl Server {
         Self {
             handle,
             sessions: Mutex::new(HashMap::new()),
+            pending_sessions: AtomicUsize::new(0),
             next_session: AtomicU64::new(1),
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
@@ -461,6 +480,10 @@ impl Server {
     /// startup, never at the first submit.
     pub fn set_tools_mode(&mut self, mode: ToolsMode) -> Result<(), nexus_core::AgentError> {
         if let ToolsMode::RealFiles { root } | ToolsMode::Development { root } = &mode {
+            ScopedReader::with_root(root)?;
+        }
+        #[cfg(feature = "container")]
+        if let ToolsMode::Container { root, .. } = &mode {
             ScopedReader::with_root(root)?;
         }
         if let ToolsMode::Development { root } = &mode {
@@ -504,14 +527,18 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, SessionError> {
-        // Hold admission ownership through construction so concurrent
-        // creators cannot pass the cap together. The lock is not held over
-        // runtime execution or network I/O.
-        let mut sessions = self.sessions.lock().expect("sessions lockable");
-        self.remove_idle_sessions(&mut sessions, Instant::now());
-        if sessions.len() >= MAX_SESSIONS {
-            return Err(SessionError::new(503, "session capacity is full"));
-        }
+        // Reserve capacity under the map lock, then release it before any
+        // provider/container construction so existing sessions remain
+        // cancellable while Docker is slow.
+        self.cleanup_idle_sessions();
+        let admission = {
+            let sessions = self.sessions.lock().expect("sessions lockable");
+            if sessions.len() + self.pending_sessions.load(Ordering::Acquire) >= MAX_SESSIONS {
+                return Err(SessionError::new(503, "session capacity is full"));
+            }
+            self.pending_sessions.fetch_add(1, Ordering::AcqRel);
+            SessionAdmission(&self.pending_sessions)
+        };
         if provider.is_none() && model.is_some() {
             return Err(SessionError::new(400, "selected model needs a provider"));
         }
@@ -531,6 +558,8 @@ impl Server {
             policy: match &self.tools_mode {
                 ToolsMode::Development { root } => Policy::development(root)
                     .map_err(|_| SessionError::new(500, "tool permissions are invalid"))?,
+                #[cfg(feature = "container")]
+                ToolsMode::Container { .. } => Policy::container(),
                 _ => Policy::m0_test(),
             },
             has_approval_handler: true,
@@ -548,6 +577,18 @@ impl Server {
                 .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?,
             ToolsMode::RealFiles { root } => nexus_tools::strict_tools(root)
                 .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+            #[cfg(feature = "container")]
+            ToolsMode::Container {
+                root,
+                gateway_image,
+                workload_image,
+            } => nexus_tools::container_tool_registrations(root, gateway_image, workload_image)
+                .map_err(|error| {
+                    // ContainerError contains fixed host-side diagnostics only,
+                    // never Docker output, environment values, or credentials.
+                    eprintln!("container environment preparation failed: {error}");
+                    SessionError::new(503, "container environment is unavailable")
+                })?,
         };
         let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)
             .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
@@ -565,7 +606,11 @@ impl Server {
             last_activity: Mutex::new(Instant::now()),
             last_run: Mutex::new(None),
         });
-        sessions.insert(token.clone(), entry);
+        self.sessions
+            .lock()
+            .expect("sessions lockable")
+            .insert(token.clone(), entry);
+        drop(admission);
         Ok(token)
     }
 
@@ -618,53 +663,74 @@ impl Server {
         Some(session)
     }
 
-    /// Reclaims only idle sessions whose runtime proves the most recent run
-    /// finalized (or which never ran), and which have no external owners or
-    /// active SSE subscriber. Active/quarantined runtime state is retained.
-    /// Called under the session-map lock during maintenance or admission.
-    fn remove_idle_sessions(&self, sessions: &mut HashMap<String, Arc<Session>>, now: Instant) {
-        sessions.retain(|_, session| {
-            if Arc::strong_count(session) != 1
-                || *session.streaming.lock().expect("stream flag lockable")
-                || now.saturating_duration_since(
-                    *session.last_activity.lock().expect("activity lockable"),
-                ) < SESSION_IDLE
-            {
-                return true;
-            }
-            let last_run = session.last_run.lock().expect("last run lockable").clone();
-            let Some(run) = last_run else {
-                return false;
-            };
-            let request = GetSnapshotCommand {
-                request: session.request_id(),
-                run: run.clone(),
-            };
-            let runtime = session.runtime.lock().expect("runtime lockable");
-            if self.handle.block_on(runtime.has_unconfirmed_work()) {
-                return true;
-            }
-            let (reply, snapshot) = self.handle.block_on(runtime.get_snapshot(request));
-            match (reply.reply(), snapshot) {
-                (CommandReply::Accepted, Some(snapshot)) => {
-                    if snapshot.lifecycle() == nexus_core::RunLifecycle::Active {
-                        return true;
-                    }
-                    self.record_model_use(run.as_str());
-                    false
-                }
-                // Unknown state is not evidence that workers and grants are
-                // safe to release; retain conservatively.
-                _ => true,
-            }
-        });
-    }
-
     /// Performs bounded idle-session maintenance. The binary calls this from
     /// one housekeeping thread; embedders may call it on their own schedule.
     pub fn cleanup_idle_sessions(&self) {
-        let mut sessions = self.sessions.lock().expect("sessions lockable");
-        self.remove_idle_sessions(&mut sessions, Instant::now());
+        let now = Instant::now();
+        let candidates = {
+            let sessions = self.sessions.lock().expect("sessions lockable");
+            sessions
+                .iter()
+                .filter(|(_, session)| {
+                    Arc::strong_count(session) == 1
+                        && !*session.streaming.lock().expect("stream flag lockable")
+                        && now.saturating_duration_since(
+                            *session.last_activity.lock().expect("activity lockable"),
+                        ) >= SESSION_IDLE
+                })
+                .map(|(token, session)| (token.clone(), Arc::clone(session)))
+                .collect::<Vec<_>>()
+        };
+
+        for (token, candidate) in candidates {
+            let last_run = candidate
+                .last_run
+                .lock()
+                .expect("last run lockable")
+                .clone();
+            let reclaimable = match last_run.as_ref() {
+                None => true,
+                Some(run) => {
+                    let request = GetSnapshotCommand {
+                        request: candidate.request_id(),
+                        run: run.clone(),
+                    };
+                    let runtime = candidate.runtime.lock().expect("runtime lockable");
+                    if self.handle.block_on(runtime.has_unconfirmed_work()) {
+                        false
+                    } else {
+                        let (reply, snapshot) = self.handle.block_on(runtime.get_snapshot(request));
+                        matches!(
+                            (reply.reply(), snapshot),
+                            (CommandReply::Accepted, Some(snapshot))
+                                if snapshot.lifecycle() != nexus_core::RunLifecycle::Active
+                        )
+                    }
+                }
+            };
+            if !reclaimable {
+                continue;
+            }
+            let removed = {
+                let mut sessions = self.sessions.lock().expect("sessions lockable");
+                let unchanged = sessions.get(&token).is_some_and(|current| {
+                    Arc::ptr_eq(current, &candidate)
+                        && Arc::strong_count(current) == 2
+                        && !*current.streaming.lock().expect("stream flag lockable")
+                        && now.saturating_duration_since(
+                            *current.last_activity.lock().expect("activity lockable"),
+                        ) >= SESSION_IDLE
+                });
+                unchanged.then(|| sessions.remove(&token)).flatten()
+            };
+            if let Some(removed) = removed {
+                if let Some(run) = last_run {
+                    self.record_model_use(run.as_str());
+                }
+                drop(removed);
+            }
+            drop(candidate);
+        }
     }
 
     /// Serves one connection to completion, then returns for the caller to
@@ -2090,6 +2156,11 @@ mod tests {
             .create_session_with(Some("gated"), Some("second-fast"))
             .expect_err("the pair contradicts itself");
         assert_eq!(error.status(), 400);
+        assert_eq!(
+            server.pending_sessions.load(Ordering::Acquire),
+            0,
+            "failed construction releases its admission reservation"
+        );
     }
 
     /// A submit selection that contradicts the session binding is refused,
@@ -2180,21 +2251,28 @@ mod tests {
     fn idle_session_cleanup_waits_for_expiry_and_external_owners() {
         let (server, _runtime) = server_with_gated_config();
         let token = server.create_session().expect("demo session creates");
-        let mut sessions = server.sessions.lock().expect("sessions lockable");
-        let entry = sessions.get(&token).expect("session is registered").clone();
+        let entry = server.session(&token).expect("session is registered");
         let old = Instant::now() - SESSION_IDLE - Duration::from_secs(1);
         *entry.last_activity.lock().expect("activity lockable") = old;
 
-        server.remove_idle_sessions(&mut sessions, Instant::now());
+        server.cleanup_idle_sessions();
         assert!(
-            sessions.contains_key(&token),
+            server
+                .sessions
+                .lock()
+                .expect("sessions lockable")
+                .contains_key(&token),
             "live Arc owner prevents removal"
         );
 
         drop(entry);
-        server.remove_idle_sessions(&mut sessions, Instant::now());
+        server.cleanup_idle_sessions();
         assert!(
-            !sessions.contains_key(&token),
+            !server
+                .sessions
+                .lock()
+                .expect("sessions lockable")
+                .contains_key(&token),
             "expired idle session is reclaimed"
         );
     }
@@ -2239,13 +2317,16 @@ mod tests {
             Instant::now() - SESSION_IDLE - Duration::from_secs(1);
         drop(session);
 
-        let mut sessions = server.sessions.lock().expect("sessions lockable");
-        server.remove_idle_sessions(&mut sessions, Instant::now());
+        server.cleanup_idle_sessions();
         assert!(
-            sessions.contains_key(&token),
+            server
+                .sessions
+                .lock()
+                .expect("sessions lockable")
+                .contains_key(&token),
             "active runtime is never evicted"
         );
-        let session = sessions.get(&token).expect("retained session").clone();
+        let session = server.session(&token).expect("retained session");
 
         let cancel = nexus_core::CancelCommand {
             request: session.request_id(),

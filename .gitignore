@@ -18,5 +18,8 @@ lcov.info/
 # macOS metadata.
 .DS_Store
 
+# Playwright browser artifacts.
+/.playwright-mcp/
+
 # Local Obsidian vault metadata and workspace state.
 /.obsidian/

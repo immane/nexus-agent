@@ -1,8 +1,24 @@
 [package]
 name = "nexus-tools"
-version = "0.2.0-alpha"
+version = "0.2.1-alpha"
 edition = "2024"
 autotests = false
+
+[features]
+default = []
+container = []
+container-worker = ["container"]
+container-keeper = ["container"]
+
+[[bin]]
+name = "container-worker"
+path = "src/bin/container-worker.rs"
+required-features = ["container-worker"]
+
+[[bin]]
+name = "container-keeper"
+path = "src/bin/container-keeper.rs"
+required-features = ["container-keeper"]
 
 [[test]]
 name = "behavior"
@@ -16,5 +32,6 @@ nexus-permissions = { path = "../nexus-permissions" }
 nexus-core = { path = "../nexus-core" }
 # JSON for reading the admitted `{"path": ...}` arguments. No schema
 # framework is added here; schemas are validated at registration.
+serde = "1"
 serde_json = "1"
 rustix = { version = "1.1.5", features = ["event", "fs", "process"] }

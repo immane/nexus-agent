@@ -356,6 +356,9 @@ impl Runtime {
         tools: Vec<ToolRegistration>,
     ) -> Result<(Self, EventStreams), AgentError> {
         config.limits.validate()?;
+        if config.policy.is_container() {
+            config.policy.validate()?;
+        }
         let capabilities = provider.capabilities();
         if !capabilities.text {
             return Err(runtime_error(
@@ -381,7 +384,10 @@ impl Runtime {
             let (tool, access) = registration.into_parts();
             let spec = tool.describe();
             let id = spec.id().clone();
-            if id.revision() != nexus_core::M0_REVISION {
+            if !config
+                .policy
+                .accepts_tool_revision(id.name(), id.revision())
+            {
                 return Err(runtime_error(
                     ErrorCategory::InvalidInput,
                     "tool revision is not the M0 revision",
@@ -1677,7 +1683,7 @@ impl Runtime {
             });
             return Ok(RunState::RecordingResult);
         }
-        if self.shared.policy.is_development() {
+        if self.shared.policy.is_development() || self.shared.policy.is_container() {
             queued.needs_approval = self
                 .shared
                 .policy
@@ -2063,7 +2069,7 @@ impl Runtime {
                     }
                 },
             };
-            if self.shared.policy.is_development()
+            if (self.shared.policy.is_development() || self.shared.policy.is_container())
                 && self.shared.policy.approval_scope(&call).as_ref().ok() != Some(&scope)
             {
                 active.outcome_slot = Some((

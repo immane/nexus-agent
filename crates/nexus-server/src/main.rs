@@ -26,7 +26,7 @@ const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--auth-token-env NAME] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--auth-token-env NAME] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
@@ -39,6 +39,12 @@ fn usage() -> ! {
     eprintln!(
         "  real tools default to development mode; --strict-tools requires approval for writes/exec. Fake tools touch no real files."
     );
+    #[cfg(feature = "container")]
+    eprintln!(
+        "  container mode requires --tools real and both immutable image references; --tools-root defaults to the current directory. Isolation is unvalidated."
+    );
+    #[cfg(not(feature = "container"))]
+    eprintln!("  container mode requires a build with --features container.");
     std::process::exit(2);
 }
 
@@ -53,10 +59,19 @@ enum CliAction {
         tools_real: bool,
         tools_root: Option<String>,
         strict_tools: bool,
+        execution: ExecutionMode,
+        gateway_image: Option<String>,
+        workload_image: Option<String>,
         auth_token_env: Option<String>,
     },
     /// Print usage and exit 2.
     Usage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionMode {
+    Local,
+    Container,
 }
 
 fn parse_args(argv: &[String]) -> CliAction {
@@ -65,12 +80,45 @@ fn parse_args(argv: &[String]) -> CliAction {
     let mut tools_real = false;
     let mut tools_root: Option<String> = None;
     let mut strict_tools = false;
+    let mut execution = ExecutionMode::Local;
+    let mut execution_set = false;
+    let mut gateway_image = None;
+    let mut workload_image = None;
     let mut auth_token_env = None;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return CliAction::Usage,
             "--strict-tools" => strict_tools = true,
+            "--execution" => {
+                if execution_set {
+                    return CliAction::Usage;
+                }
+                execution_set = true;
+                execution = match args.next().map(String::as_str) {
+                    Some("local") => ExecutionMode::Local,
+                    Some("container") => ExecutionMode::Container,
+                    _ => return CliAction::Usage,
+                };
+            }
+            "--gateway-image" => {
+                if gateway_image.is_some() {
+                    return CliAction::Usage;
+                }
+                gateway_image = match args.next() {
+                    Some(value) if !value.is_empty() => Some(value.clone()),
+                    _ => return CliAction::Usage,
+                };
+            }
+            "--container-image" => {
+                if workload_image.is_some() {
+                    return CliAction::Usage;
+                }
+                workload_image = match args.next() {
+                    Some(value) if !value.is_empty() => Some(value.clone()),
+                    _ => return CliAction::Usage,
+                };
+            }
             "--auth-token-env" => match args.next() {
                 Some(value) if !value.is_empty() => auth_token_env = Some(value.clone()),
                 _ => return CliAction::Usage,
@@ -98,12 +146,27 @@ fn parse_args(argv: &[String]) -> CliAction {
             _ => return CliAction::Usage,
         }
     }
+    if execution == ExecutionMode::Container
+        && (!tools_real
+            || tools_root.as_deref().is_some_and(str::is_empty)
+            || strict_tools
+            || gateway_image.is_none()
+            || workload_image.is_none())
+    {
+        return CliAction::Usage;
+    }
+    if execution == ExecutionMode::Local && (gateway_image.is_some() || workload_image.is_some()) {
+        return CliAction::Usage;
+    }
     CliAction::Run {
         port,
         config,
         tools_real,
         tools_root,
         strict_tools,
+        execution,
+        gateway_image,
+        workload_image,
         auth_token_env,
     }
 }
@@ -138,25 +201,60 @@ fn load_user_config(explicit: Option<&str>) -> (UserConfig, Option<PathBuf>) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let (port, explicit_config, tools_real, tools_root, strict_tools, auth_token_env) =
-        match parse_args(&argv) {
-            CliAction::Run {
-                port,
-                config,
-                tools_real,
-                tools_root,
-                strict_tools,
-                auth_token_env,
-            } => (
-                port,
-                config,
-                tools_real,
-                tools_root,
-                strict_tools,
-                auth_token_env,
-            ),
-            CliAction::Usage => usage(),
-        };
+    let (
+        port,
+        explicit_config,
+        tools_real,
+        tools_root,
+        strict_tools,
+        execution,
+        gateway_image,
+        workload_image,
+        auth_token_env,
+    ) = match parse_args(&argv) {
+        CliAction::Run {
+            port,
+            config,
+            tools_real,
+            tools_root,
+            strict_tools,
+            execution,
+            gateway_image,
+            workload_image,
+            auth_token_env,
+        } => (
+            port,
+            config,
+            tools_real,
+            tools_root,
+            strict_tools,
+            execution,
+            gateway_image,
+            workload_image,
+            auth_token_env,
+        ),
+        CliAction::Usage => usage(),
+    };
+    #[cfg(not(feature = "container"))]
+    let _ = (&gateway_image, &workload_image);
+    #[cfg(not(feature = "container"))]
+    if execution == ExecutionMode::Container {
+        eprintln!(
+            "nexus-server: container execution is not enabled; rebuild with --features container"
+        );
+        std::process::exit(2);
+    }
+    #[cfg(feature = "container")]
+    if execution == ExecutionMode::Container {
+        for image in [gateway_image.as_deref(), workload_image.as_deref()] {
+            if let Some(image) = image
+                && nexus_tools::container::validate_image_reference(image).is_err()
+            {
+                eprintln!("nexus-server: container images must use immutable sha256 digests");
+                std::process::exit(2);
+            }
+        }
+    }
     let (config, path) = load_user_config(explicit_config.as_deref());
     let needs_auth = tools_real || !config.providers().is_empty();
     let token = match auth_token_env.as_deref() {
@@ -214,22 +312,48 @@ fn main() {
         // Fail fast on an unreadable jail: a missing default working
         // directory and an explicit bad root are both startup errors.
         let root = tools_root.unwrap_or_else(|| ".".to_owned());
-        let mode = if strict_tools {
-            ToolsMode::RealFiles {
+        let mode = match execution {
+            ExecutionMode::Local if strict_tools => ToolsMode::RealFiles {
                 root: PathBuf::from(&root),
-            }
-        } else {
-            ToolsMode::Development {
+            },
+            ExecutionMode::Local => ToolsMode::Development {
                 root: PathBuf::from(&root),
+            },
+            ExecutionMode::Container => {
+                #[cfg(feature = "container")]
+                {
+                    let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|error| {
+                        eprintln!("nexus-server: container workspace is unusable ({error})");
+                        std::process::exit(1);
+                    });
+                    ToolsMode::Container {
+                        root: canonical_root,
+                        gateway_image: gateway_image
+                            .expect("container mode requires gateway image"),
+                        workload_image: workload_image
+                            .expect("container mode requires workload image"),
+                    }
+                }
+                #[cfg(not(feature = "container"))]
+                unreachable!("container mode rejected for local-only build")
             }
         };
         if let Err(error) = server.set_tools_mode(mode) {
             eprintln!("nexus-server: real tool root is unusable ({error}): {root}");
             std::process::exit(1);
         }
-        eprintln!(
-            "nexus-server loopback API on 127.0.0.1:{port} (real tools at {root}, strict={strict_tools}, {providers}, authenticated; never expose)"
-        );
+        if execution == ExecutionMode::Container {
+            eprintln!(
+                "SECURITY WARNING: container isolation is not validated on native Linux; workspace is live-mounted and public egress/host-LAN-metadata denial are unverified."
+            );
+            eprintln!(
+                "nexus-server loopback API on 127.0.0.1:{port} (container tools at {root}, {providers}, authenticated; never expose)"
+            );
+        } else {
+            eprintln!(
+                "nexus-server loopback API on 127.0.0.1:{port} (real tools at {root}, strict={strict_tools}, {providers}, authenticated; never expose)"
+            );
+        }
     } else {
         eprintln!(
             "nexus-server M0 TEST-ONLY demo: loopback API on 127.0.0.1:{port} (scripted fakes by default, {providers}, {}; never expose)",
@@ -317,7 +441,7 @@ mod cov_main_args {
     //! environment, or network access, so the suite is deterministic and
     //! leaves no listening socket behind.
 
-    use super::{CliAction, DEFAULT_PORT, parse_args};
+    use super::{CliAction, DEFAULT_PORT, ExecutionMode, parse_args};
 
     #[test]
     fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {
@@ -411,6 +535,43 @@ mod cov_main_args {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn container_mode_requires_real_tools_and_digest_images_and_defaults_workspace() {
+        let args = [
+            "--tools",
+            "real",
+            "--execution",
+            "container",
+            "--gateway-image",
+            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--container-image",
+            "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ];
+        assert!(matches!(
+            parse_args(&argv(&args)),
+            CliAction::Run {
+                execution: ExecutionMode::Container,
+                tools_real: true,
+                tools_root: None,
+                ..
+            }
+        ));
+        usage(&["--execution", "container"]);
+        #[cfg(feature = "container")]
+        assert!(nexus_tools::container::validate_image_reference("gateway:latest").is_err());
+        usage(&[
+            "--tools",
+            "real",
+            "--strict-tools",
+            "--execution",
+            "container",
+            "--gateway-image",
+            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--container-image",
+            "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ]);
     }
 
     #[test]

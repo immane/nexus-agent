@@ -89,6 +89,7 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 | [08 - API relay](design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries | Draft design; integration scope accepted |
 | [09 - Implementation readiness](design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review | Draft engineering gates |
 | [10 - Pi architecture reference](design/10-pi-reference.md) | Observed Pi patterns adopted in principle and explicitly excluded | Draft reference note |
+| [11 - Optional container execution](design/11-container-execution.md) | Internal prototype status, target backend architecture, isolation gates, lifecycle, and acceptance | Partial feature-gated tools prototype; no runtime/frontend integration; isolation unvalidated |
 
 ## Contracts
 

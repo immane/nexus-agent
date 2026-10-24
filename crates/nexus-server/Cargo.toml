@@ -1,8 +1,16 @@
 [package]
 name = "nexus-server"
-version = "0.2.0-alpha"
+version = "0.2.1-alpha"
 edition = "2024"
 autotests = false
+
+[features]
+default = []
+container = [
+    "nexus-runtime/container",
+    "nexus-tools/container-worker",
+    "nexus-tools/container-keeper",
+]
 
 [[test]]
 name = "behavior"

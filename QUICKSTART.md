@@ -3,7 +3,7 @@
 ## Status snapshot
 
 - See `git status` and `git log` for the current worktree and revision.
-- Implementation stage: **0.2.0-alpha**, built on the M0 runtime:
+- Implementation stage: **0.2.1-alpha**, built on the M0 runtime:
   Chat Completions, OpenAI Responses, and Anthropic Messages adapters
   (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
@@ -46,6 +46,37 @@ cargo run -p nexus-headless --locked --offline -- "hello"
 # Interactive terminal; configure a provider/model below before submitting:
 cargo run -p nexus-tui --locked --offline
 ```
+
+### Experimental container mode
+
+An explicit prototype path is available with container-enabled builds. This
+does **not** provide a validated isolation boundary: native Linux host/LAN,
+metadata, IPv6/DNS, and public-egress checks remain outstanding. Do not use it
+with secrets or valuable workspace data. The workspace is live-mounted and
+container tool calls can modify it. See [`containers/README.md`](containers/README.md)
+and the [container design](docs/design/11-container-execution.md) before opting
+in. TUI mode switching is disabled in container execution; the writable
+workspace mount remains active for the lifetime of the session. Local mode
+remains the default.
+
+```sh
+# Replace both references with the exact immutable repo@sha256:digest values
+# for locally available, reviewed development images.
+cargo run -p nexus-tui --features container --locked --offline -- \
+  --execution container --tools-root "$PWD" \
+  --gateway-image 'gateway@sha256:<64-hex-digest>' \
+  --container-image 'worker@sha256:<64-hex-digest>'
+
+# The server additionally requires --tools real and its normal auth token.
+cargo run -p nexus-server --features container --locked --offline -- \
+  --tools real --execution container --tools-root "$PWD" \
+  --gateway-image 'gateway@sha256:<64-hex-digest>' \
+  --container-image 'worker@sha256:<64-hex-digest>' \
+  --auth-token-env NEXUS_SERVER_TOKEN
+```
+
+These are experimental startup options, not a supported secure deployment
+recipe. Images must already be available locally; startup does not pull them.
 
 ## Everyday commands
 

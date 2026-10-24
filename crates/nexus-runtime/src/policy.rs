@@ -102,6 +102,7 @@ pub struct Policy {
     auto_tools: Vec<String>,
     revision: u32,
     development: Option<nexus_permissions::DirectoryPolicy>,
+    container: bool,
 }
 
 impl Policy {
@@ -130,6 +131,22 @@ impl Policy {
             auto_tools,
             revision,
             development: None,
+            container: false,
+        }
+    }
+
+    /// Policy for the trusted, host-composed container adapters. This grants
+    /// only the fixed built-in container tool set and binds each call to the
+    /// adapter's single `/workspace` scope. Read-only runs are still filtered
+    /// by registration access in the runtime dispatch loop.
+    #[cfg(feature = "container")]
+    #[must_use]
+    pub fn container() -> Self {
+        Self {
+            auto_tools: Vec::new(),
+            revision: M0_REVISION,
+            development: None,
+            container: true,
         }
     }
 
@@ -148,6 +165,22 @@ impl Policy {
         self.development.is_some()
     }
 
+    pub fn is_container(&self) -> bool {
+        self.container
+    }
+
+    /// Whether a host registration revision is allowed by this policy.
+    /// Container `host_exec` has a distinct argument contract and therefore
+    /// deliberately uses the next revision; all other registrations remain
+    /// on the M0 revision.
+    pub fn accepts_tool_revision(&self, name: &str, revision: u32) -> bool {
+        if self.container && name == "host_exec" {
+            revision == M0_REVISION + 1
+        } else {
+            revision == self.revision
+        }
+    }
+
     /// Per-call decision; a tool name alone cannot decide external access.
     ///
     /// `access` is the host registration category carried by the registered
@@ -162,6 +195,10 @@ impl Policy {
         directories: &[std::path::PathBuf],
         access: ToolAccess,
     ) -> Result<bool, AgentError> {
+        if self.container {
+            self.validate_container_call(call, access)?;
+            return Ok(false);
+        }
         let Some(policy) = &self.development else {
             return Ok(self.requires_approval(access, call.tool()));
         };
@@ -185,6 +222,10 @@ impl Policy {
         directories: &[std::path::PathBuf],
         access: ToolAccess,
     ) -> Result<ApprovedScope, AgentError> {
+        if self.container {
+            self.validate_container_call(call, access)?;
+            return bounded_scope("/workspace");
+        }
         if !self.is_development() {
             return self.authorize(call);
         }
@@ -254,6 +295,44 @@ impl Policy {
         Ok(Some(target))
     }
 
+    fn validate_container_call(
+        &self,
+        call: &ToolCall,
+        access: ToolAccess,
+    ) -> Result<(), AgentError> {
+        self.validate()?;
+        let expected_revision = if call.tool().name() == "host_exec" {
+            M0_REVISION + 1
+        } else {
+            M0_REVISION
+        };
+        if call.tool().revision() != expected_revision {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "tool revision does not match the container policy",
+            ));
+        }
+        let expected = match call.tool().name() {
+            "host_read" | "host_list" | "host_search" => ToolAccess::Read,
+            "host_write" | "host_patch" => ToolAccess::Mutation,
+            "host_exec" => ToolAccess::Process,
+            _ => {
+                return Err(policy_error(
+                    ErrorCategory::PermissionDenied,
+                    "tool is not registered by the container backend",
+                ));
+            }
+        };
+        if access != expected {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "container tool classification is invalid",
+            ));
+        }
+        parse_object_args(call)?;
+        Ok(())
+    }
+
     /// Builds a validated policy, rejecting anything but the exact M0
     /// revision and the automatic read/search set.
     pub fn try_new(auto_tools: Vec<String>, revision: u32) -> Result<Self, AgentError> {
@@ -269,6 +348,15 @@ impl Policy {
     /// automatic execution. Diagnostics are static and never interpolate
     /// tool names or arguments.
     pub fn validate(&self) -> Result<(), AgentError> {
+        if self.container {
+            if self.revision != M0_REVISION || self.development.is_some() {
+                return Err(policy_error(
+                    ErrorCategory::InvalidInput,
+                    "container policy configuration is invalid",
+                ));
+            }
+            return Ok(());
+        }
         if self.revision != M0_REVISION {
             return Err(policy_error(
                 ErrorCategory::InvalidInput,
@@ -321,6 +409,16 @@ impl Policy {
     /// rejected arguments. The returned scope is `read:<path>` or
     /// `search:<path>`. No filesystem or symlink claim is made.
     pub fn authorize(&self, call: &ToolCall) -> Result<ApprovedScope, AgentError> {
+        if self.container {
+            let access = match call.tool().name() {
+                "host_read" | "host_list" | "host_search" => ToolAccess::Read,
+                "host_write" | "host_patch" => ToolAccess::Mutation,
+                "host_exec" => ToolAccess::Process,
+                _ => ToolAccess::Unknown,
+            };
+            self.validate_container_call(call, access)?;
+            return bounded_scope("/workspace");
+        }
         self.validate()?;
         if call.tool().revision() != self.revision {
             return Err(policy_error(
@@ -387,6 +485,16 @@ impl Policy {
     /// approval prompt must not make two different commands look identical.
     pub fn approval_scope(&self, call: &ToolCall) -> Result<ApprovedScope, AgentError> {
         self.validate()?;
+        if self.container {
+            let access = match call.tool().name() {
+                "host_read" | "host_list" | "host_search" => ToolAccess::Read,
+                "host_write" | "host_patch" => ToolAccess::Mutation,
+                "host_exec" => ToolAccess::Process,
+                _ => ToolAccess::Unknown,
+            };
+            self.validate_container_call(call, access)?;
+            return bounded_scope("/workspace");
+        }
         if self.is_development() {
             return match self.development_target(call)? {
                 Some(path) => {
@@ -697,6 +805,30 @@ mod tests {
         assert!(policy.requires_approval(ToolAccess::Mutation, &write));
         assert!(policy.requires_approval(ToolAccess::Process, &exec));
         assert_eq!(policy.revision(), M0_REVISION);
+    }
+
+    #[cfg(feature = "container")]
+    #[test]
+    fn container_policy_accepts_only_container_tool_contract_revisions() {
+        let policy = Policy::container();
+        assert!(policy.validate().is_ok());
+        assert!(policy.accepts_tool_revision("host_read", M0_REVISION));
+        assert!(policy.accepts_tool_revision("host_exec", M0_REVISION + 1));
+        assert!(!policy.accepts_tool_revision("host_exec", M0_REVISION));
+        assert!(!policy.accepts_tool_revision("host_write", M0_REVISION + 1));
+
+        let exec = call("host_exec", M0_REVISION + 1, r#"{"argv":["true"]}"#);
+        assert_eq!(
+            policy
+                .authorize_with_directories(&exec, &[], ToolAccess::Process)
+                .expect("container exec is scoped"),
+            bounded_scope("/workspace").expect("static scope")
+        );
+        assert!(
+            policy
+                .authorize_with_directories(&exec, &[], ToolAccess::Mutation)
+                .is_err()
+        );
     }
 
     #[test]

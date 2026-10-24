@@ -16,7 +16,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.0-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.1-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
 
 ## Screenshots
 
@@ -53,7 +53,7 @@ The startup target includes local configuration and interface initialization, bu
 
 ### Historical executable sizes
 
-Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.0-alpha**:
+Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.1-alpha**:
 
 | Executable | File size |
 | --- | ---: |
@@ -63,9 +63,25 @@ Previously recorded optimized, unstripped Cargo release binaries on **macOS arm6
 
 These are platform- and build-profile-specific file sizes, not compressed download sizes or cross-platform guarantees. We will continue working to keep Nexus Agent lightweight and fast; the 100 ms first-interactive startup target remains a goal, and measurements for it are still pending.
 
+### Current server size measurements
+
+Measured on **macOS arm64** for `nexus-server --features container` (Mach-O):
+
+| Release profile | File size |
+| --- | ---: |
+| Default Cargo release | 3,116,512 bytes (2.97 MiB) |
+| Default release, copied and stripped with `strip -x` | 2,537,160 bytes (2.42 MiB) |
+| `opt-level = "s"`, LTO, one codegen unit, symbols stripped | 1,499,664 bytes (1.43 MiB) |
+| `opt-level = "z"`, LTO, one codegen unit, symbols stripped | 1,206,112 bytes (1.15 MiB) |
+
+The optimized variants were comparison builds only; repository build profiles were not changed. They compiled successfully, but runtime performance and the full test suite were not measured for these profiles. `opt-level = "z"` is the smallest measured build, not yet a production default. Sizes are platform-specific executable file sizes, not download or installed-package sizes.
+
 ## Architecture
 
-The host's core, runtime, frontend, and adapters are in-process components; built-in tools do not pay an IPC cost. The diagram includes planned durable storage and external plugins, which are not implemented. Provider TLS and sandboxed commands can launch helper processes.
+The first diagram shows the host's in-process core, runtime, frontend, and
+adapters; built-in tools do not pay an IPC cost. It includes planned durable
+storage and external plugins, which are not implemented. Provider TLS and
+sandboxed commands can launch helper processes.
 
 ```mermaid
 flowchart TB
@@ -89,7 +105,52 @@ flowchart TB
     Bridge <-->|stdio| Plugins
 ```
 
-Connections show runtime interactions and domain usage, **not source-code dependency direction**. The composition root injects concrete adapters; the runtime does not import their implementations. These are logical components, not fixed crate names or separate background services.
+Container execution is an opt-in path in container-enabled TUI/server builds;
+the runtime applies its normal authorization and lifecycle controls to the
+container-backed tools. It remains a prototype, not an approved isolation
+boundary. The topology is shown separately:
+
+```mermaid
+flowchart LR
+    Runtime["Runtime / frontend<br/>local or opt-in container tools"]
+    ContainerTools["Feature-gated container adapters<br/>file tools + host_exec"]
+    Session["Internal workload session<br/>lifecycle + quarantine"]
+    Transport["Bounded Docker CLI transport"]
+    Owner["Owner-only state record<br/>fail-closed on leftovers"]
+    Daemon["Local Docker Engine<br/>or Docker Desktop VM"]
+    Gateway["Gateway container<br/>nftables + DNS"]
+    Workload["Workload container<br/>keeper + worker"]
+    Workspace["Selected host workspace<br/>only user-data bind"]
+
+    Runtime -->|"explicit container selection"| ContainerTools
+    ContainerTools <--> Session
+    Session --> Transport
+    Session --> Owner
+    Transport <--> Daemon
+    Daemon --> Gateway
+    Daemon --> Workload
+    Workload -. "shares network namespace" .-> Gateway
+    Workspace -->|"read/write bind"| Workload
+```
+
+Container support is feature-gated and requires explicit startup selection and
+images. On Docker Desktop, the gateway detects the platform and permits only
+the narrow synthetic `198.18.0.0/15` TCP 80/443 proxy path; configured host/LAN
+denies take precedence. The workload overlays `node_modules` and `.next` with
+private tmpfs mounts so Linux dependency installation and builds do not reuse
+host artifacts. The opt-in public HTTPS and npm-registry probes passed on the
+development Docker Desktop host. A production build succeeded in an equivalently
+constrained container; the end-to-end Nexus `host_exec` attempt exceeded its
+per-tool deadline, so that integration result is inconclusive. This is not
+evidence of native Linux host/LAN isolation: native Linux validation remains
+outstanding, and the container path must not be treated as an approved isolation
+boundary. See the [container design](docs/design/11-container-execution.md),
+[gateway checklist](containers/README.md), and [workload image notes](containers/workload/README.md).
+
+In the first diagram, connections show runtime interactions and domain usage,
+**not source-code dependency direction**. The composition root injects concrete
+adapters; the runtime does not import their implementations. Those boxes are
+logical host components, not fixed crate names or separate background services.
 
 - **Domain core:** portable data, state transitions, and contracts; no terminal, HTTP, vendor SDK, or OS-specific types.
 - **Runtime:** authoritative run state, execution limits, authorization, cancellation, and ordered events.
@@ -254,11 +315,13 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 - [x] Implement the shared runtime, live TUI, loopback HTTP/SSE server, scripted headless runner, file read/list/search/write/patch, and sandboxed exec.
 - [x] Implement Chat Completions, OpenAI Responses, and Anthropic Messages adapters with explicit protocol configuration and offline regression fixtures.
 - [x] Implement M4 consolidation slices: shared ordered-event consumption, tool composition, and current provider capability handling. The default-feature workspace suite has recorded passing macOS evidence; see [migration status](docs/tasks/08-architecture-migration.md) and [Testing](docs/testing.md).
+- [x] Add an opt-in container worker/gateway/workload path with runtime authorization and TUI/server selection. It is not a validated isolation boundary: native Linux host/LAN, metadata, IPv6/DNS, and public-egress checks remain outstanding. Image build and keeper-only smoke test are not isolation evidence.
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
 - [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
 - [ ] Close migration gates: Linux file race/metadata and sandbox-isolation validation remain blocked; escaped-descendant cleanup remains unresolved. Temporary macOS-only development scope is not cross-platform acceptance.
 - [ ] Verify live compatibility for individual services/models and extend protocol coverage as needed; Gemini is not implemented.
 - [ ] Add bounded external-plugin interoperability and session recovery.
+- [ ] Complete native Linux container network/isolation validation and lifecycle recovery before treating opt-in container mode as suitable for secure or production workloads.
 
 Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The alpha version is not a stable-release or production-readiness claim.
 
