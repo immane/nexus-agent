@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.1--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.2--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent designed around very fast startup, a minimal core, and a native terminal interface. Broader capabilities belong in replaceable tools and plugins, not an ever-growing engine.
 
@@ -16,7 +16,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.1-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.2-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -76,7 +76,7 @@ The startup target includes local configuration and interface initialization, bu
 
 ### Historical executable sizes
 
-Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.1-alpha**:
+Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.2-alpha**:
 
 | Executable | File size |
 | --- | ---: |
@@ -329,6 +329,29 @@ The default permission policy and session behavior are accepted; automatic acces
 
 See the [security design](docs/design/06-security.md) and [session recovery contract](docs/contracts/04-session-store.md).
 
+## Benchmark Observations
+
+Local SWE-bench Lite pilots with `ollama-local/qwen3-27b` produced patches
+marked **resolved** by the official SWE-bench evaluator (2026-10-24):
+
+| Task | Repair | Official evaluation | Agent termination |
+| --- | --- | --- | --- |
+| `sympy__sympy-20590` | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Limit reached |
+| `astropy__astropy-12907` | Preserve separability matrices in nested compound models. | Resolved | Model output limit reached |
+| `django__django-11099` | Reject trailing newlines in username validators. | Resolved | Completed |
+
+These are three selected tasks, **not a leaderboard score or a general success
+rate**; SymPy was attempted repeatedly. The table reports the latest evaluated
+run for each task, not every attempt. Passing task tests does not imply clean
+agent completion or polished delivery: the SymPy and Astropy predictions also
+included temporary scripts. None of these runs triggered context reduction,
+so they do not establish a benefit from the context-retention changes or validate
+the semantic-memory vision.
+
+See [benchmark methodology and earlier run records](docs/research/agent-benchmarks.md)
+and the [reliability follow-up backlog](docs/tasks/09-agent-reliability.md) for
+remaining work on convergence, verification, result recording, and cleanup.
+
 ## Project Status
 
 - [x] MIT license and confirmed project direction.
@@ -363,6 +386,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull-request guida
 | [API relay](docs/design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries. |
 | [Implementation readiness](docs/design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review. |
 | [Architecture migration](docs/tasks/08-architecture-migration.md) | Implemented consolidation slices, protocol extension evidence, and platform blockers. |
+| [Agent reliability follow-up](docs/tasks/09-agent-reliability.md) | Prioritized work on convergence, verification, experiment reliability, and context-reduction evaluation. |
 | [Semantic-memory research](docs/research/task-context-compiler.md) | Compiler-inspired Semantic IR, hybrid retrieval, graph relationships, and LoRA research; not an accepted architecture or implemented capability. |
 | [Overview](docs/design/00-overview.md) | First-release boundaries and non-goals. |
 | [Common contract](docs/contracts/00-common.md) | Identifiers, outcomes, errors, limits, and compatibility. |
