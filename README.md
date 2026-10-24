@@ -41,25 +41,6 @@ research components, not requirements for the Agent Core.
 
 See the [research concept, related papers, and evaluation criteria](docs/research/task-context-compiler.md).
 
-## Screenshots
-
-<div align="center">
-<table>
-<tr>
-<td align="center" width="50%">
-<img src="docs/images/title.jpg" alt="nexus-tui title screen" />
-<br />
-<sub>Title screen — live adapter, sandboxed exec, first reply</sub>
-</td>
-<td align="center" width="50%">
-<img src="docs/images/message.jpg" alt="nexus-tui conversation view" />
-<br />
-<sub>Conversation view — architecture, status, and remaining work</sub>
-</td>
-</tr>
-</table>
-</div>
-
 ## Design Goals
 
 | Priority | Direction |
@@ -290,7 +271,7 @@ The extension design gives built-in and external tools one semantic contract, bu
 | **Built-in Rust tools** | Compiled modules registered through the tool port | Direct calls, no IPC; implementation changes require rebuilding. |
 | **External plugins** | Separate programs connected through an adapter | Any language implementing a supported protocol; additional process and serialization overhead. |
 
-MCP over stdio is the preferred initial external-tool transport candidate, kept outside the domain core. Protocol versions and optional capabilities have not been selected, and **MCP compliance is not currently claimed**.
+**Nexus considers MCP an outdated integration approach**, not the preferred direction for new external-tool integrations. A `legacy-mcp` external compatibility interface will still be reserved for legacy MCP integrations, kept outside the domain core. This is a planned boundary, not an implemented adapter: protocol versions and optional capabilities have not been selected, and **MCP compliance is not currently claimed**.
 
 API relay is separate from tool plugins: a relay is a provider implementation behind the provider port, not a model-invoked tool. Existing relay services come first; local relay execution remains an optional boundary and never mandatory startup work.
 
