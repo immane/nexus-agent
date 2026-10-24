@@ -1,0 +1,41 @@
+diff --git a/django/contrib/auth/validators.py b/django/contrib/auth/validators.py
+index b4878cfd45..4f46d73d20 100644
+--- a/django/contrib/auth/validators.py
++++ b/django/contrib/auth/validators.py
+@@ -7,19 +7,17 @@ from django.utils.translation import gettext_lazy as _
+ 
+ @deconstructible
+ class ASCIIUsernameValidator(validators.RegexValidator):
+-    regex = r'^[\w.@+-]+$'
++    regex = re.compile(r'\A[\w.@+-]+\Z', re.ASCII)
+     message = _(
+         'Enter a valid username. This value may contain only English letters, '
+         'numbers, and @/./+/-/_ characters.'
+     )
+-    flags = re.ASCII
+ 
+ 
+ @deconstructible
+ class UnicodeUsernameValidator(validators.RegexValidator):
+-    regex = r'^[\w.@+-]+$'
++    regex = re.compile(r'\A[\w.@+-]+\Z', re.UNICODE)
+     message = _(
+         'Enter a valid username. This value may contain only letters, '
+         'numbers, and @/./+/-/_ characters.'
+     )
+-    flags = 0
+diff --git a/docs/releases/3.0.txt b/docs/releases/3.0.txt
+index 69925e7fca..4af02a7212 100644
+--- a/docs/releases/3.0.txt
++++ b/docs/releases/3.0.txt
+@@ -54,7 +54,9 @@ Minor features
+ :mod:`django.contrib.auth`
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+-* ...
++* :class:`~django.contrib.auth.validators.ASCIIUsernameValidator` and
++  :class:`~django.contrib.auth.validators.UnicodeUsernameValidator` now reject
++  usernames ending with a newline.
+ 
+ :mod:`django.contrib.contenttypes`
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -1,0 +1,23 @@
+{
+  "instance_id": "django__django-11099",
+  "run": "re7464918df4031c2-1",
+  "outcome": "completed",
+  "error": null,
+  "tool_calls": 94,
+  "approved_calls": 0,
+  "final_usage_events": 68,
+  "usage": {
+    "input": 1849831,
+    "output": 83948
+  },
+  "usage_note": "sum of provider-reported Final usage events; null means unavailable/incomplete",
+  "duration_seconds": 2041.529,
+  "patch_bytes": 1437,
+  "budget_stop_reason": null,
+  "budget": {
+    "max_run_seconds": null,
+    "max_tool_calls": null,
+    "max_input_tokens": null,
+    "max_output_tokens": null
+  }
+}
