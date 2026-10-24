@@ -1,6 +1,6 @@
 [package]
 name = "nexus-validation"
-version = "0.2.1-alpha"
+version = "0.2.2-alpha"
 edition = "2024"
 
 [dependencies]

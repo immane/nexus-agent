@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.1--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.2--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent designed around very fast startup, a minimal core, and a native terminal interface. Broader capabilities belong in replaceable tools and plugins, not an ever-growing engine.
 
@@ -16,7 +16,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.1-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.2-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -76,7 +76,7 @@ The startup target includes local configuration and interface initialization, bu
 
 ### Historical executable sizes
 
-Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.1-alpha**:
+Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.2-alpha**:
 
 | Executable | File size |
 | --- | ---: |
