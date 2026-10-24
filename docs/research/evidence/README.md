@@ -58,5 +58,12 @@ only. Do not reuse this task as a blind sample. The run manifest and logs remain
 outside the repository at
 `/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-astropy-13398-unbounded-20261024/`.
 
+The two attempts on `sphinx-doc__sphinx-9461` are also excluded from the result
+table: the first failed on provider HTTP 500, and the post-exposure retry ended
+with an empty patch, which the official evaluator classified as empty-patch
+(not an infrastructure failure). The issue was exposed to the model, so this
+task is not a blind sample. Its attempt-2 report and finalized manifest are at
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-sphinx-9461-isolated-20261024/`.
+
 See [benchmark methodology and run history](../agent-benchmarks.md) and the
 [reliability follow-up](../../tasks/09-agent-reliability.md).

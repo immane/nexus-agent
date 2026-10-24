@@ -604,6 +604,29 @@ workspace with a fresh, minimal Git object/ref set anchored at the task base,
 audit refs and reachable commits for future fixes, remove upstream remotes, and
 restrict task egress before starting the model.
 
+### Exposed Sphinx task attempts (2026-10-24)
+
+The separate SWE-bench Verified task `sphinx-doc__sphinx-9461` was submitted in
+two attempts. Attempt 1 ended after provider HTTP 500 errors (17 tool calls,
+633.374 seconds); attempt 2 was an explicitly non-blind retry after the issue
+statement had already been sent to the same model. Attempt 2 ended with
+`ResourceLimit: model output limit reached` (41 tool calls, 819.489 seconds) and
+an empty prediction. The official evaluator completed successfully and
+classified it as an empty patch: 1 submitted, 0 completed/resolved/unresolved,
+0 infrastructure failures, and 0 unstopped containers. The task image remains
+as a cache entry. Neither attempt is a task score, and this task must not be
+reused as a blind sample. The report and manifest are retained under
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-sphinx-9461-isolated-20261024/`.
+
+Although the pilot's dedicated gateway probe confirmed denied public TCP egress,
+the task log also reported no network access and its server emitted a warning
+that isolation was unvalidated on native Linux. This does not meet the owner's
+requirement for network-capable task Docker environments. Resolve and verify the
+intended task-network policy on the actual execution platform before another
+agent run; successful image-build networking is not evidence of task-container
+network access. The `model output limit reached` result alone does not establish
+whether input context or generation output was the limiting factor.
+
 For a one-task run, first make a disposable checkout at the dataset row's
 `base_commit`, then build that task's adapter image with its immutable registry
 digest:
