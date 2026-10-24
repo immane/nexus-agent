@@ -4,10 +4,10 @@
 //! fakes.
 //!
 //! Invariants under test:
-//! - the retained conversation is additive: the submitted user text, every
-//!   admitted assistant call, and every recorded tool result accumulate in
-//!   order, and each model request carries a strictly longer conversation than
-//!   the one before it;
+//! - within the budgets, the retained conversation is additive: the submitted
+//!   user text, every admitted assistant call, and every recorded tool result
+//!   accumulate in order, and each model request carries a strictly longer
+//!   conversation than the one before it;
 //! - the provider observes the accumulation: every turn's conversation is a
 //!   prefix of the next turn's conversation (nothing is rewritten, reordered,
 //!   or dropped), the calls and results it carries correlate to the observed
@@ -17,11 +17,10 @@
 //!   count equals the provider invocation count, every request owns a distinct
 //!   turn identity, and an earlier request's snapshot is never retroactively
 //!   grown by later turns;
-//! - conversation overflow maps to an explicit `LimitReached` terminal instead
-//!   of a fabricated completion: exhausting the retained-item bound, and
-//!   overflowing the aggregate conversation byte budget, both end the run with
-//!   their resource-limit cause while every already-recorded outcome stays
-//!   intact.
+//! - budget pressure evicts oldest complete exchanges, keeping the task and
+//!   newest exchange intact; an uncompactable newest exchange maps to an
+//!   explicit `LimitReached` terminal with numeric accounting, while every
+//!   already-recorded outcome stays intact.
 //!
 //! Determinism: scripts are fixed turn lists, timeouts come from the shared
 //! helpers as generous failure backstops, and every assertion reads recorded
@@ -207,15 +206,26 @@ fn started_calls(data: &[RunEvent], control: &[RunEvent]) -> Vec<CallId> {
         .collect()
 }
 
-/// Asserts an exhausted-budget terminal: `LimitReached` carrying its static
-/// resource-limit cause, never a fabricated completion.
-fn assert_limit_terminal(finished: &RunFinished, message: &str) {
+/// Asserts an exhausted byte-budget terminal with numeric-only accounting.
+fn assert_byte_limit_terminal(finished: &RunFinished, items: usize) {
     assert_eq!(finished.outcome(), RunOutcome::LimitReached);
     let error = finished
         .error()
         .expect("an exhausted conversation budget records its cause");
     assert_eq!(error.category(), ErrorCategory::ResourceLimit);
-    assert_eq!(error.message(), message);
+    let prefix = format!(
+        "context budget exhausted: items={items} max_items={} bytes=",
+        Limits::M0_TEST_RETAINED_CONTEXT_ITEMS
+    );
+    let suffix = format!(" max_bytes={MAX_CONVERSATION_BYTES} continuation=0");
+    let bytes = error
+        .message()
+        .strip_prefix(&prefix)
+        .and_then(|message| message.strip_suffix(&suffix))
+        .expect("diagnostic contains only numeric context accounting")
+        .parse::<usize>()
+        .expect("payload byte count is numeric");
+    assert!(bytes > MAX_CONVERSATION_BYTES);
     assert_eq!(
         error.retry(),
         RetryGuidance::DoNotRetry,
@@ -449,7 +459,7 @@ fn provider_observes_a_growing_prefix_conversation_each_turn() {
                 index + 1
             );
             assert!(
-                request.conversation().len() <= MAX_CONVERSATION_BYTES,
+                request.conversation().len() <= MAX_CONVERSATION_ITEMS,
                 "every observed request stays inside the item bound"
             );
             assert!(
@@ -667,10 +677,10 @@ fn failed_result_accumulates_as_observed_and_authorizes_no_redispatch() {
     });
 }
 
-/// Retained-item overflow ends the run `LimitReached` before the next model
-/// request is issued, and every already-recorded outcome survives.
+/// Retained-item pressure evicts the oldest complete exchange, not its
+/// recorded outcome, and the newest call/result pair reaches the provider.
 #[test]
-fn retained_item_overflow_ends_the_run_as_limit_reached() {
+fn retained_item_pressure_evicts_the_oldest_complete_exchange() {
     let rt = common::test_rt();
     rt.block_on(async {
         let script = vec![
@@ -681,7 +691,7 @@ fn retained_item_overflow_ends_the_run_as_limit_reached() {
         let mut limits = Limits::m0_test();
         // One user item plus, per dispatched call, one assistant-call item and
         // one result item: three items after the first call, five after the
-        // second. A bound of four is exceeded only by the second call's items.
+        // second. A bound of four requires evicting the first complete pair.
         limits.retained_context_items = 4;
         let mut bed = common::make_bed(script, config_with(limits));
         let response = bed
@@ -694,15 +704,15 @@ fn retained_item_overflow_ends_the_run_as_limit_reached() {
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         common::assert_contiguous(&data, &control);
         common::assert_single_terminal(&data, &control);
-        assert_limit_terminal(&finished, "retained context budget exhausted");
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(finished.error().is_none());
         assert_eq!(
             bed.provider.call_count(),
-            2,
-            "the overflow is detected before the next provider invocation"
+            3,
+            "compaction makes room for the final provider invocation"
         );
 
-        // Truncating the future never rewrites the recorded past: the calls
-        // that fit the bound still ran and still carry their outcomes.
+        // Evicting context never rewrites recorded tool outcomes.
         assert_eq!(bed.read_tool.execution_count(), 2);
         let recorded = recorded_outcomes(&data, &control);
         assert_eq!(recorded.len(), 2, "both admitted calls recorded an outcome");
@@ -713,12 +723,40 @@ fn retained_item_overflow_ends_the_run_as_limit_reached() {
             "recorded outcomes stay successful: {recorded:?}"
         );
         let requests = bed.provider.requests();
-        assert_eq!(requests.len(), 2, "only two requests were ever inspected");
+        assert_eq!(requests.len(), 3, "every request was inspected");
         assert_eq!(
             result_calls(&requests[1]),
             vec![started_calls(&data, &control)[0].clone()],
-            "the last inspected request still carries exactly the results it had"
+            "the earlier snapshot is unchanged by later compaction"
         );
+        assert_eq!(kinds(&requests[2]), vec!["user", "text", "call", "result"]);
+        assert!(requests[2].conversation().iter().any(|item| matches!(
+            item,
+            ModelContextItem::AssistantText { text, .. }
+                if text.as_str().contains("Earlier completed exchanges were omitted")
+        )));
+        assert!(data.iter().any(|event| matches!(
+            event.payload(),
+            EventPayload::ContextReduced {
+                removed_items: 2,
+                ..
+            }
+        )));
+        assert_eq!(user_texts(&requests[2]), vec!["do work".to_owned()]);
+        assert_eq!(call_calls(&requests[2]), vec![recorded[1].0.clone()]);
+        assert_eq!(result_calls(&requests[2]), vec![recorded[1].0.clone()]);
+        assert_eq!(
+            carried_calls(&requests[2]),
+            vec![(
+                "prov-1".to_owned(),
+                "item-1".to_owned(),
+                "host_read".to_owned()
+            )]
+        );
+        assert!(matches!(
+            &requests[2].conversation()[3],
+            ModelContextItem::ToolResult { outcome, .. } if outcome == &recorded[1].1
+        ));
         assert!(
             requests
                 .iter()
@@ -732,14 +770,172 @@ fn retained_item_overflow_ends_the_run_as_limit_reached() {
     });
 }
 
-/// Aggregate conversation-byte overflow ends the run `LimitReached`.
+#[test]
+fn omitted_inherited_history_is_noted_in_context_and_published() {
+    let rt = common::test_rt();
+    rt.block_on(async {
+        let mut limits = Limits::m0_test();
+        limits.retained_context_items = 4;
+        let script = vec![
+            tool_turn(vec![read("item-0", "prov-0", "a")]),
+            stop_turn("first answer"),
+            stop_turn("second answer"),
+        ];
+        let mut bed = common::make_bed(script, config_with(limits));
+
+        assert_eq!(
+            bed.runtime
+                .submit(common::submit_cmd("first"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (_, _, first) = common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(first.outcome(), RunOutcome::Completed);
+
+        assert_eq!(
+            bed.runtime
+                .submit(common::submit_cmd("second"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (data, _, second) = common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(second.outcome(), RunOutcome::Completed);
+        assert!(
+            data.iter()
+                .any(|event| matches!(event.payload(), EventPayload::ContextReduced { .. }))
+        );
+
+        let requests = bed.provider.requests();
+        let request = &requests[2];
+        assert_eq!(user_texts(request), vec!["do work".to_owned()]);
+        assert!(request.conversation().iter().any(|item| matches!(
+            item,
+            ModelContextItem::AssistantText { text, .. }
+                if text.as_str().contains("Earlier completed exchanges were omitted")
+        )));
+    });
+}
+
+#[test]
+fn cache_eviction_notice_survives_until_the_next_run() {
+    let rt = common::test_rt();
+    rt.block_on(async {
+        let mut limits = Limits::m0_test();
+        limits.retained_context_items = 4;
+        let script = vec![
+            tool_turn(vec![read("item-0", "prov-0", "a")]),
+            stop_turn("first answer"),
+            tool_turn(vec![read("item-1", "prov-1", "b")]),
+            stop_turn("second answer"),
+            stop_turn("third answer"),
+        ];
+        let mut bed = common::make_bed(script, config_with(limits));
+
+        for tag in ["cache-one", "cache-two"] {
+            assert_eq!(
+                bed.runtime.submit(common::submit_cmd(tag)).await.reply(),
+                CommandReply::Accepted
+            );
+            let (_, _, finished) =
+                common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+        }
+
+        assert_eq!(
+            bed.runtime
+                .submit(common::submit_cmd("cache-three"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (data, _, finished) =
+            common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(data.iter().any(|event| matches!(
+            event.payload(),
+            EventPayload::ContextReduced { removed_items, .. } if *removed_items >= 4
+        )));
+
+        let requests = bed.provider.requests();
+        let last = requests.last().expect("third run request");
+        assert!(last.conversation().iter().any(|item| matches!(
+            item,
+            ModelContextItem::AssistantText { text, .. }
+                if text.as_str().contains("Earlier completed exchanges were omitted")
+        )));
+    });
+}
+
+#[test]
+fn cache_omission_notice_survives_a_failed_submit_and_reaches_the_next_submit() {
+    let rt = common::test_rt();
+    rt.block_on(async {
+        let mut limits = Limits::m0_test();
+        limits.retained_context_items = 4;
+        let script = vec![
+            tool_turn(vec![read("item-0", "prov-0", "a")]),
+            stop_turn("first answer"),
+            tool_turn(vec![read("item-1", "prov-1", "b")]),
+            stop_turn("second answer"),
+            vec![ProviderEvent::Failed(
+                nexus_core::AgentError::new(
+                    ErrorCategory::Internal,
+                    "scripted provider failure",
+                    RetryGuidance::DoNotRetry,
+                )
+                .expect("error"),
+            )],
+            stop_turn("recovered answer"),
+        ];
+        let mut bed = common::make_bed(script, config_with(limits));
+        for (tag, expected) in [
+            ("notice-first", RunOutcome::Completed),
+            ("notice-second", RunOutcome::Completed),
+            ("notice-failed", RunOutcome::Failed),
+            ("notice-recovered", RunOutcome::Completed),
+        ] {
+            assert_eq!(
+                bed.runtime.submit(common::submit_cmd(tag)).await.reply(),
+                CommandReply::Accepted
+            );
+            let (data, _, finished) =
+                common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(finished.outcome(), expected);
+            if tag == "notice-failed" || tag == "notice-recovered" {
+                let requests = bed.provider.requests();
+                let request = requests.last().expect("request from submitted run");
+                assert_eq!(
+                    request.conversation().iter().filter(|item| matches!(
+                        item,
+                        ModelContextItem::AssistantText { text, .. }
+                            if text.as_str().contains("Earlier completed exchanges were omitted")
+                    )).count(),
+                    1,
+                    "both failed and recovered submissions receive exactly one notice"
+                );
+                assert!(data.iter().any(|event| matches!(
+                    event.payload(),
+                    EventPayload::ContextReduced { removed_items, retained_items, .. }
+                        if *removed_items >= 4
+                            && *retained_items == request.conversation().len()
+                )));
+            }
+        }
+        assert_eq!(bed.provider.call_count(), 6);
+        assert_eq!(bed.read_tool.execution_count(), 2, "no tool was replayed");
+    });
+}
+
+/// Aggregate byte pressure evicts whole oldest exchanges and completes.
 ///
 /// Each recorded tool result carries the full effective output budget, so the
 /// accumulated conversation passes the one-MiB aggregate bound while the item
-/// bound is nowhere near: the byte bound, not the count bound, is what ends the
-/// run, and no inspected request ever exceeds the bound.
+/// bound is nowhere near. The byte bound triggers compaction, and no inspected
+/// request ever exceeds either bound.
 #[test]
-fn aggregate_byte_overflow_ends_the_run_as_limit_reached() {
+fn aggregate_byte_pressure_evicts_oldest_exchanges_and_completes() {
     let rt = common::test_rt();
     rt.block_on(async {
         let read_tool = FakeTool::oversized("host_read", Limits::M0_TEST_TOOL_OUTPUT_BYTES);
@@ -771,12 +967,14 @@ fn aggregate_byte_overflow_ends_the_run_as_limit_reached() {
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         common::assert_contiguous(&data, &control);
         common::assert_single_terminal(&data, &control);
-        assert_limit_terminal(&finished, "model conversation exceeds its budget");
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(finished.error().is_none());
 
         let requests = bed.provider.requests();
-        assert!(
-            !requests.is_empty(),
-            "the conversation accumulated before the byte bound ended the run"
+        assert_eq!(
+            requests.len(),
+            7,
+            "all six tool turns and the stop turn run"
         );
         assert_eq!(
             requests.len(),
@@ -792,7 +990,7 @@ fn aggregate_byte_overflow_ends_the_run_as_limit_reached() {
             );
             assert!(
                 request.conversation().len() < MAX_CONVERSATION_ITEMS,
-                "the byte bound ended the run while the item bound was untouched"
+                "the item bound is untouched"
             );
         }
         let last = requests.last().expect("at least one request");
@@ -801,23 +999,42 @@ fn aggregate_byte_overflow_ends_the_run_as_limit_reached() {
             "the run really did accumulate a large conversation: {} bytes",
             payload_bytes(last)
         );
-        // The turn that could not be inspected would have carried the last
-        // conversation plus one call and one result. That item count is far
-        // inside the retained bound, so the aggregate byte bound is
-        // unambiguously what ended this run.
-        let rejected_items = last.conversation().len() + 2;
+        assert_eq!(
+            kinds(last),
+            vec![
+                "user", "text", "call", "result", "call", "result", "call", "result"
+            ]
+        );
+        assert!(last.conversation().iter().any(|item| matches!(
+            item,
+            ModelContextItem::AssistantText { text, .. }
+                if text.as_str().contains("Earlier completed exchanges were omitted")
+        )));
         assert!(
-            rejected_items <= Limits::M0_TEST_RETAINED_CONTEXT_ITEMS,
-            "the retained item bound was not the cause: {rejected_items} items"
+            data.iter()
+                .any(|event| matches!(event.payload(), EventPayload::ContextReduced { .. }))
+        );
+        assert_eq!(user_texts(last), vec!["do work".to_owned()]);
+        assert_eq!(
+            carried_calls(last)
+                .iter()
+                .map(|(reference, _, _)| reference.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prov-3", "prov-4", "prov-5"],
+            "only the oldest complete exchanges are evicted"
+        );
+        assert_eq!(
+            result_calls(&requests[1]).len(),
+            1,
+            "earlier snapshots remain intact"
         );
 
-        // Every recorded result is still intact after the limit terminal: the
-        // budget ends the run, it does not roll back observed effects.
+        // Compaction does not roll back or truncate observed effects.
         let recorded = recorded_outcomes(&data, &control);
         assert_eq!(
             recorded.len(),
-            requests.len(),
-            "every inspected turn recorded its call's outcome, and the turn that could not be inspected records nothing"
+            6,
+            "every tool turn records an outcome, including evicted exchanges"
         );
         assert_eq!(
             recorded.len(),
@@ -825,21 +1042,88 @@ fn aggregate_byte_overflow_ends_the_run_as_limit_reached() {
             "one recorded outcome per dispatched call"
         );
         assert!(
-            recorded
-                .iter()
-                .all(|(_, outcome)| outcome.status() == ExecutionStatus::Succeeded
-                    && outcome.content().len() == Limits::M0_TEST_TOOL_OUTPUT_BYTES),
+            recorded.iter().all(
+                |(_, outcome)| outcome.status() == ExecutionStatus::Succeeded
+                    && outcome.content().len() == Limits::M0_TEST_TOOL_OUTPUT_BYTES
+            ),
             "recorded outcomes keep their full bounded content: {:?}",
             recorded
                 .iter()
                 .map(|(call, outcome)| (call.as_str(), outcome.content().len()))
                 .collect::<Vec<_>>()
         );
-        for call in result_calls(last) {
-            assert!(
-                recorded.iter().any(|(recorded_call, _)| recorded_call == &call),
-                "the last inspected request carries only recorded results"
-            );
+        assert_eq!(
+            call_calls(last),
+            recorded[3..]
+                .iter()
+                .map(|(call, _)| call.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(result_calls(last), call_calls(last));
+        for item in last.conversation() {
+            if let ModelContextItem::ToolResult { call, outcome, .. } = item {
+                assert_eq!(
+                    outcome,
+                    &recorded
+                        .iter()
+                        .find(|(recorded_call, _)| recorded_call == call)
+                        .expect("recorded result")
+                        .1
+                );
+            }
         }
+    });
+}
+
+/// A parallel exchange cannot be split to fit the byte budget, even when each
+/// individual tool result fits its own output budget. All observed results
+/// remain recorded, but the provider never receives an oversized request.
+#[test]
+fn newest_exchange_exceeding_byte_budget_ends_as_limit_reached() {
+    let rt = common::test_rt();
+    rt.block_on(async {
+        let script = vec![
+            tool_turn(
+                (0..4)
+                    .map(|index| read(&format!("item-{index}"), &format!("prov-{index}"), "a"))
+                    .collect(),
+            ),
+            stop_turn("done"),
+        ];
+        let mut bed = common::make_bed_with_tools(
+            script,
+            config_with(Limits::m0_test()),
+            FakeTool::oversized("host_read", Limits::M0_TEST_TOOL_OUTPUT_BYTES),
+            FakeTool::mutation(),
+        );
+        let response = bed
+            .runtime
+            .submit(common::submit_cmd("newest-exchange-byte-overflow"))
+            .await;
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        let (data, control, finished) =
+            common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        common::assert_contiguous(&data, &control);
+        common::assert_single_terminal(&data, &control);
+        assert_byte_limit_terminal(&finished, 9);
+        assert_eq!(bed.provider.call_count(), 1);
+        let requests = bed.provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(kinds(&requests[0]), vec!["user"]);
+        assert_eq!(bed.read_tool.execution_count(), 4);
+        let recorded = recorded_outcomes(&data, &control);
+        assert_eq!(recorded.len(), 4);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|(call, _)| call.clone())
+                .collect::<Vec<_>>(),
+            started_calls(&data, &control)
+        );
+        assert!(recorded.iter().all(|(_, outcome)| {
+            outcome.status() == ExecutionStatus::Succeeded
+                && outcome.content().len() == Limits::M0_TEST_TOOL_OUTPUT_BYTES
+                && !outcome.is_truncated()
+        }));
     });
 }

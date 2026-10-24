@@ -481,6 +481,16 @@ mod cov_transport_private {
                 ),
             ),
             (
+                "ContextReduced",
+                EventPayload::ContextReduced {
+                    removed_items: 2,
+                    retained_items: 4,
+                    item_limit: 8,
+                    retained_bytes: 128,
+                    byte_limit: 1024,
+                },
+            ),
+            (
                 "ToolCallPreview",
                 EventPayload::ToolCallPreview {
                     item_key: "item-0".to_owned(),
@@ -530,7 +540,7 @@ mod cov_transport_private {
     #[test]
     fn control_classification_covers_every_payload_variant() {
         let payloads = all_payloads();
-        assert_eq!(payloads.len(), 9, "one fixture per EventPayload variant");
+        assert_eq!(payloads.len(), 10, "one fixture per EventPayload variant");
 
         let mut control = Vec::new();
         let mut data = Vec::new();
@@ -546,6 +556,7 @@ mod cov_transport_private {
                 | EventPayload::UsageUpdated(_)
                 | EventPayload::RunFinished(_) => true,
                 EventPayload::AssistantTextDelta(_)
+                | EventPayload::ContextReduced { .. }
                 | EventPayload::ToolCallPreview { .. }
                 | EventPayload::ToolOutput(_) => false,
             };
@@ -558,7 +569,7 @@ mod cov_transport_private {
         }
 
         // Approvals, outcomes, usage, and the terminal travel on control;
-        // text deltas, previews, and progress travel on data.
+        // text deltas, context notices, previews, and progress travel on data.
         assert_eq!(
             control,
             [
@@ -572,7 +583,12 @@ mod cov_transport_private {
         );
         assert_eq!(
             data,
-            ["AssistantTextDelta", "ToolCallPreview", "ToolOutput"]
+            [
+                "AssistantTextDelta",
+                "ContextReduced",
+                "ToolCallPreview",
+                "ToolOutput"
+            ]
         );
     }
 

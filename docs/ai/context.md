@@ -42,6 +42,15 @@
 
 ## Landed recently (newest first)
 
+- Active model context is bounded by effective item and 1 MiB payload budgets.
+  Old inherited user exchanges are evicted first, then oldest completed tool
+  exchanges; the current task, newest completed exchange, pending calls, and
+  call/result associations are preserved. Required reduction with opaque
+  continuation fails explicitly. This is deterministic eviction, not a model
+  summary or durable-history deletion. Numeric runtime logs disclose effective
+  budgets and reduction. The request representation ceiling is 8,192 items;
+  normal M0 runtime policy remains 256 items. No additional model calls occur.
+
 - `5aa81cc` CI fix: uniform slice casts (Linux-only `cfg` type error invisible on macOS) + fmt normalization.
 - `8f65f69` M0 budgets 64/16/256 + coherent dependent caps + lock doc/table sync.
 - `fc7081e` Ollama `reasoning` field support (verified live against operator box; throwaway test deleted).

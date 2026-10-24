@@ -61,7 +61,52 @@ def collect_patch(repo, base_commit):
     return "".join(chunks)
 
 
+def summarize_result(result, report=None):
+    """Keep agent termination separate from authoritative evaluator results."""
+    instance = result["instance_id"]
+    summary = {
+        "instance_id": instance,
+        "agent_outcome": result["outcome"],
+        "agent_error": result.get("error"),
+        "patch_bytes": result["patch_bytes"],
+        "evaluation_outcome": "not-run",
+        "infrastructure_outcome": "unknown",
+    }
+    if report is None:
+        return summary
+    if instance not in report.get("submitted_ids", []):
+        raise RuntimeError("evaluation report does not include the result instance")
+    if instance in report.get("infra_failure_ids", []):
+        summary.update(evaluation_outcome="infrastructure-failure", infrastructure_outcome="failed")
+    elif instance in report.get("ambiguous_failure_ids", []):
+        summary.update(evaluation_outcome="ambiguous", infrastructure_outcome="unknown")
+    elif instance in report.get("error_ids", []):
+        summary["evaluation_outcome"] = "error"
+    elif instance in report.get("resolved_ids", []):
+        summary.update(evaluation_outcome="resolved", infrastructure_outcome="valid")
+    elif instance in report.get("unresolved_ids", []):
+        summary.update(evaluation_outcome="unresolved", infrastructure_outcome="valid")
+    elif instance in report.get("empty_patch_ids", []):
+        summary["evaluation_outcome"] = "empty-patch"
+    else:
+        summary["evaluation_outcome"] = "incomplete"
+    return summary
+
+
+def summarize_main(argv):
+    parser = argparse.ArgumentParser(description="Summarize a saved agent result and optional official report; no model requests.")
+    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--evaluation-report", type=Path)
+    args = parser.parse_args(argv)
+    result = json.loads(args.result.read_text())
+    report = json.loads(args.evaluation_report.read_text()) if args.evaluation_report else None
+    print(json.dumps(summarize_result(result, report), indent=2))
+    return 0
+
+
 def main():
+    if sys.argv[1:2] == ["summarize"]:
+        return summarize_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-json", type=Path, required=True, help="one canonical SWE-bench dataset row")
     parser.add_argument("--workspace", type=Path, required=True, help="disposable checkout at task base_commit")

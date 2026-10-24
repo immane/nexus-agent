@@ -21,8 +21,8 @@
 //! - every admitted candidate (including denials) consumes the per-run call
 //!   budget; registration is fallible, descriptors are cached once, and
 //!   schemas compile through `nexus-validation`;
-//! - the model conversation is rebuilt additively with exact input, call,
-//!   result, item-key, and provider-reference round-trips.
+//! - model context retains exact input, call, result, item-key, and provider
+//!   references; reduction removes only whole completed exchanges.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -129,6 +129,15 @@ struct State {
     last: Option<FinishedRun>,
     /// Whole completed exchanges, globally bounded by the context budgets.
     history: VecDeque<RetainedExchange>,
+    /// Sessions whose completed cache lost one or more exchanges and need a
+    /// model-visible notice on their next accepted run.
+    history_omissions: Vec<HistoryOmission>,
+    /// Bounded fallback for overflowed per-session omission markers. Kept
+    /// pending for the runtime lifetime so no session silently loses notice.
+    history_omission_fallback_items: usize,
+    /// Once uncertain evidence cannot be retained within the finite cache,
+    /// refuse further model work rather than silently authorizing blind retries.
+    history_safety_exhausted: bool,
     /// Workers whose termination is not yet established. A non-empty list
     /// blocks new runs and further dispatch; at most one entry exists in the
     /// sequential M0 baseline.
@@ -138,6 +147,11 @@ struct State {
 struct RetainedExchange {
     session: SessionId,
     items: Vec<ModelContextItem>,
+}
+
+struct HistoryOmission {
+    session: SessionId,
+    removed_items: usize,
 }
 
 struct QuarantineMeta {
@@ -170,6 +184,7 @@ struct CurrentCall {
     item_key: String,
     provider_ref: String,
     binding: Option<ApprovalBinding>,
+    dispatched: bool,
 }
 
 /// Provisional prefixes already published live while a streaming provider
@@ -201,6 +216,7 @@ const PROVISIONAL_USAGE_UPDATE_LIMIT: usize = 16;
 const CONTROL_OUTBOX_EVENT_LIMIT: usize = 256;
 const CONTROL_OUTBOX_BYTE_LIMIT: usize = 1_048_576;
 const CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES: usize = 65_536;
+const MAX_HISTORY_OMISSION_SESSIONS: usize = 128;
 
 struct ActiveRun {
     phase: RunState,
@@ -228,8 +244,11 @@ struct ActiveRun {
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
     history_len: usize,
+    initial_context_reduction: Option<ContextReduction>,
+    pending_omission_items: usize,
     queue: VecDeque<QueuedCall>,
     current: Option<CurrentCall>,
+    dispatched_calls: HashSet<CallId>,
     pending: HashMap<ApprovalId, PendingApproval>,
     decided: HashMap<ApprovalId, bool>,
     outcomes: Vec<OutcomeSummary>,
@@ -266,6 +285,16 @@ struct Terminal {
     outcome: RunOutcome,
     error: Option<AgentError>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextReduction {
+    removed_items: usize,
+    retained_items: usize,
+    retained_bytes: usize,
+}
+
+const CONTEXT_NOTICE_ITEM_KEY: &str = "nexus-context-note";
+const CONTEXT_NOTICE_TEXT: &str = "Nexus context note: Earlier completed exchanges were omitted to fit the context budget. They were not summarized. Re-check earlier facts before relying on them.";
 
 impl Terminal {
     fn completed() -> Self {
@@ -445,6 +474,12 @@ impl Runtime {
                 "provider declares no usable context budget",
             ));
         }
+        eprintln!(
+            "nexus-runtime: context budget configured_items={} effective_items={} max_bytes={}",
+            config.limits.retained_context_items,
+            context_items_bound,
+            nexus_core::provider::MAX_CONVERSATION_BYTES,
+        );
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
@@ -462,6 +497,9 @@ impl Runtime {
                 active: None,
                 last: None,
                 history: VecDeque::new(),
+                history_omissions: Vec::new(),
+                history_omission_fallback_items: 0,
+                history_safety_exhausted: false,
                 quarantine: Vec::new(),
             }),
             data_tx,
@@ -560,30 +598,49 @@ impl Runtime {
         // so the next accepted run starts with a fresh control budget.
         self.shared.control_exhausted.store(false, Ordering::SeqCst);
         let mut conversation = Vec::new();
-        let mut count = 1;
-        let mut bytes = user_item.payload_bytes();
-        let mut retained = Vec::new();
+        // The cache is already bounded. Include it whole, then use the same
+        // transactional projection as every later model turn: admission must
+        // not bypass uncertain-effect protection or notice accounting.
         for exchange in state
             .history
             .iter()
-            .rev()
             .filter(|exchange| exchange.session == command.session)
         {
-            let size = conversation_bytes(&exchange.items);
-            if count + exchange.items.len() > self.shared.context_items_bound
-                || bytes.saturating_add(size) > nexus_core::provider::MAX_CONVERSATION_BYTES
-            {
-                break;
-            }
-            count += exchange.items.len();
-            bytes += size;
-            retained.push(exchange);
-        }
-        for exchange in retained.into_iter().rev() {
             conversation.extend(exchange.items.iter().cloned());
         }
+        let session_omitted_items = state
+            .history_omissions
+            .iter()
+            .filter(|omission| omission.session == command.session)
+            .map(|omission| omission.removed_items)
+            .sum::<usize>();
+        let history_omitted_items =
+            session_omitted_items.saturating_add(state.history_omission_fallback_items);
+        let history_omitted = history_omitted_items > 0;
+        let omission_notice = if history_omitted {
+            match context_notice_item() {
+                Ok(notice) => Some(notice),
+                Err(_) => {
+                    return CommandResponse::new(
+                        command.request,
+                        CommandReply::Rejected,
+                        Some(run),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let history_len = conversation.len();
         conversation.push(user_item);
+        if let Some(notice) = omission_notice {
+            conversation.push(notice);
+        }
+        let initial_context_reduction = history_omitted.then(|| ContextReduction {
+            removed_items: history_omitted_items,
+            retained_items: conversation.len(),
+            retained_bytes: conversation_bytes(&conversation),
+        });
         state.active = Some(ActiveRun {
             phase: RunState::Preparing,
             run: run.clone(),
@@ -605,8 +662,11 @@ impl Runtime {
             continuation: None,
             conversation,
             history_len,
+            initial_context_reduction,
+            pending_omission_items: history_omitted_items,
             queue: VecDeque::new(),
             current: None,
+            dispatched_calls: HashSet::new(),
             pending: HashMap::new(),
             decided: HashMap::new(),
             outcomes: Vec::new(),
@@ -932,6 +992,11 @@ impl Runtime {
         if &active.run != run || active.cancelled || active.token.is_cancelled() {
             return Err(Terminal::cancelled());
         }
+        if state.history_safety_exhausted {
+            return Err(Terminal::limit(
+                "uncertain history retention budget exhausted",
+            ));
+        }
         if StdInstant::now() >= active.deadline {
             return Err(Terminal::limit("run duration exhausted"));
         }
@@ -961,9 +1026,24 @@ impl Runtime {
             if StdInstant::now() >= active.deadline {
                 return Err(Terminal::limit("run duration exhausted"));
             }
-            trim_inherited_history(active, self.shared.context_items_bound);
-            if active.conversation.len() > self.shared.context_items_bound {
-                return Err(Terminal::limit("retained context budget exhausted"));
+            let compacted = compact_context(active, self.shared.context_items_bound)?;
+            let initial = active.initial_context_reduction.take();
+            let mut reduction = match (compacted, initial) {
+                (Some(mut compacted), Some(initial)) => {
+                    compacted.removed_items = compacted
+                        .removed_items
+                        .saturating_add(initial.removed_items);
+                    Some(compacted)
+                }
+                (Some(compacted), None) | (None, Some(compacted)) => Some(compacted),
+                (None, None) => None,
+            };
+            if let Some(reduction) = reduction.as_mut() {
+                reduction.retained_items = active.conversation.len();
+                reduction.retained_bytes = conversation_bytes(&active.conversation);
+            }
+            if let Some(reduction) = reduction {
+                publish_context_reduction(&self.shared, active, run, reduction);
             }
             let turn_n = active.turn_seq;
             active.turn_seq += 1;
@@ -1534,6 +1614,11 @@ impl Runtime {
                             candidates,
                             if has_text { "" } else { &reasoning },
                         )?;
+                        if let Some(reduction) =
+                            compact_context(active, self.shared.context_items_bound)?
+                        {
+                            publish_context_reduction(&self.shared, active, run, reduction);
+                        }
                         Ok(RunState::ValidatingTools)
                     }
                 }
@@ -1680,6 +1765,7 @@ impl Runtime {
                 item_key: queued.item_key,
                 provider_ref: queued.provider_ref,
                 binding: None,
+                dispatched: false,
             });
             return Ok(RunState::RecordingResult);
         }
@@ -1713,6 +1799,7 @@ impl Runtime {
                 item_key: queued.item_key,
                 provider_ref: queued.provider_ref,
                 binding: None,
+                dispatched: false,
             });
             return Ok(RunState::RecordingResult);
         }
@@ -1727,6 +1814,7 @@ impl Runtime {
                 item_key: queued.item_key,
                 provider_ref: queued.provider_ref,
                 binding: None,
+                dispatched: false,
             });
             return Ok(RunState::RecordingResult);
         }
@@ -1736,6 +1824,7 @@ impl Runtime {
                 item_key: queued.item_key,
                 provider_ref: queued.provider_ref,
                 binding: None,
+                dispatched: false,
             });
             return Ok(RunState::ExecutingTool);
         }
@@ -1811,6 +1900,7 @@ impl Runtime {
             item_key: queued.item_key,
             provider_ref: queued.provider_ref,
             binding: Some(binding),
+            dispatched: false,
         });
         let delivery = emit_control(
             &self.shared,
@@ -2103,6 +2193,9 @@ impl Runtime {
             if active.terminal.is_some() {
                 return Ok(RunState::Finished);
             }
+            if let Some(current) = active.current.as_mut() {
+                current.dispatched = true;
+            }
             let tool = registered.port.clone();
             let wake = active.wake.clone();
             let token = active.token.clone();
@@ -2194,6 +2287,9 @@ impl Runtime {
             evidence: outcome.evidence(),
         });
         if let Some(current) = active.current.take() {
+            if current.dispatched {
+                active.dispatched_calls.insert(call.clone());
+            }
             let item = ModelContextItem::tool_result(
                 call.clone(),
                 current.item_key,
@@ -2214,6 +2310,9 @@ impl Runtime {
         if let Some(outcome) = active.force_terminal.take() {
             active.terminal = Some(outcome);
             return Ok(RunState::Finished);
+        }
+        if let Some(reduction) = compact_context(active, self.shared.context_items_bound)? {
+            publish_context_reduction(&self.shared, active, run, reduction);
         }
         if active.queue.is_empty() {
             Ok(RunState::Preparing)
@@ -2280,6 +2379,27 @@ impl Runtime {
             return;
         }
         if let Some((call, decided)) = active.outcome_slot.take() {
+            let dispatched = active
+                .current
+                .as_ref()
+                .is_some_and(|current| current.dispatched && current.call.call() == &call);
+            if dispatched
+                && !active.conversation.iter().any(|item| {
+                    matches!(item, ModelContextItem::ToolResult { call: recorded, .. } if recorded == &call)
+                })
+                && let Some(current) = active.current.as_ref()
+            {
+                match ModelContextItem::tool_result(
+                    call.clone(),
+                    current.item_key.clone(),
+                    current.provider_ref.clone(),
+                    current.call.tool().clone(),
+                    decided.clone(),
+                ) {
+                    Ok(result) => active.conversation.push(result),
+                    Err(_) => state.history_safety_exhausted = true,
+                }
+            }
             active.outcomes.push(OutcomeSummary {
                 call: call.clone(),
                 status: decided.status(),
@@ -2299,9 +2419,14 @@ impl Runtime {
         // Defensive: a supervised driver failure can end the run while a
         // call was admitted but no outcome was recorded. The honest record
         // is an unknown cancellation, never a fabricated success.
+        let mut unrecorded_current_call = false;
         if let Some(current) = active.current.take() {
             let call = current.call.call().clone();
+            if current.dispatched {
+                active.dispatched_calls.insert(call.clone());
+            }
             if !active.outcomes.iter().any(|summary| summary.call == call) {
+                unrecorded_current_call = current.dispatched;
                 let decided = cancelled_outcome("run ended before the tool outcome was recorded");
                 active.outcomes.push(OutcomeSummary {
                     call: call.clone(),
@@ -2350,13 +2475,74 @@ impl Runtime {
         }
         active.finished_sent = true;
         active.phase = RunState::Finished;
+        // Even an uncommitted run can have executed a tool whose effects are
+        // unknown. Without durable outcome history, fail closed for this
+        // runtime rather than letting a later task repeat the action blindly.
+        let has_uncertain_outcome = active
+            .outcomes
+            .iter()
+            .any(|outcome| !outcome_summary_is_certain(outcome));
+        let has_uncertain_result = active.conversation[active.history_len..]
+            .iter()
+            .any(|item| {
+                matches!(item, ModelContextItem::ToolResult { call, outcome, .. }
+                if active.dispatched_calls.contains(call)
+                    && (outcome.effect() == EffectState::Unknown
+                        || outcome.evidence() == Evidence::Uncertain))
+            });
+        let preserve_uncertain_exchange =
+            has_uncertain_outcome && (has_uncertain_result || unrecorded_current_call);
+        if unrecorded_current_call {
+            // The tool may have been dispatched, but no result was recorded;
+            // there is no complete exchange to carry forward safely.
+            state.history_safety_exhausted = true;
+        }
         // Failed/cancelled/limited runs are not committed: their partial
         // calls or provisional text must never contaminate the next request.
-        if outcome == RunOutcome::Completed {
-            let items = active.conversation[active.history_len..].to_vec();
-            if items.len() <= self.shared.context_items_bound
+        // The exception is a narrowly retained exchange containing an
+        // uncertain tool effect: it is required evidence against blind retry.
+        if outcome == RunOutcome::Completed || preserve_uncertain_exchange {
+            let mut items = active.conversation[active.history_len..].to_vec();
+            if outcome != RunOutcome::Completed {
+                let complete_dispatched_calls: HashSet<CallId> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ModelContextItem::ToolResult { call, .. }
+                            if active.dispatched_calls.contains(call) =>
+                        {
+                            Some(call.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                items.retain(|item| match item {
+                    ModelContextItem::UserText(_) => true,
+                    ModelContextItem::AssistantCall { call, .. } => {
+                        complete_dispatched_calls.contains(call.call())
+                    }
+                    ModelContextItem::ToolResult { call, .. } => {
+                        complete_dispatched_calls.contains(call)
+                    }
+                    _ => is_context_notice(item),
+                });
+                if history_exchange_effects_certain(&items) {
+                    // The terminal summary says the effect was uncertain but
+                    // no corresponding result can be carried forward.
+                    state.history_safety_exhausted = true;
+                }
+            }
+            if !context_calls_are_paired(&items) {
+                // Never cache orphan results or incomplete calls, including
+                // defensive terminal paths that bypass normal recording.
+                state.history_safety_exhausted = true;
+            } else if items.len() <= self.shared.context_items_bound
                 && conversation_bytes(&items) <= nexus_core::provider::MAX_CONVERSATION_BYTES
             {
+                if outcome == RunOutcome::Completed && active.pending_omission_items > 0 {
+                    state
+                        .history_omissions
+                        .retain(|omission| omission.session != active.session);
+                }
                 state.history.push_back(RetainedExchange {
                     session: active.session.clone(),
                     items,
@@ -2374,7 +2560,35 @@ impl Runtime {
                         .sum::<usize>()
                         > nexus_core::provider::MAX_CONVERSATION_BYTES
                 {
-                    state.history.pop_front();
+                    if let Some(index) = state
+                        .history
+                        .iter()
+                        .position(|exchange| history_exchange_effects_certain(&exchange.items))
+                    {
+                        let removed = &state.history[index];
+                        let session = removed.session.clone();
+                        let removed_items = removed.items.len();
+                        state.history.remove(index);
+                        mark_history_omitted(&mut state, session, removed_items);
+                    } else {
+                        // Do not rewrite the completed outcome. Bound the
+                        // cache, but latch a fail-closed state before losing
+                        // evidence: no later run in this runtime may call the
+                        // model or dispatch tools based on incomplete history.
+                        state.history_safety_exhausted = true;
+                        if let Some(discarded) = state.history.pop_back() {
+                            mark_history_omitted(
+                                &mut state,
+                                discarded.session,
+                                discarded.items.len(),
+                            );
+                        }
+                    }
+                }
+            } else {
+                mark_history_omitted(&mut state, active.session.clone(), items.len());
+                if preserve_uncertain_exchange || !history_exchange_effects_certain(&items) {
+                    state.history_safety_exhausted = true;
                 }
             }
         }
@@ -2492,25 +2706,269 @@ fn conversation_bytes(items: &[ModelContextItem]) -> usize {
     })
 }
 
-/// Make room for the current run without splitting any inherited exchange.
-/// Current-run items are never evicted to hide a budget violation or pending
-/// tool call; an oversized current run still terminates with a limit error.
-fn trim_inherited_history(active: &mut ActiveRun, bound: usize) {
-    while active.history_len > 0
-        && (active.conversation.len() > bound
-            || conversation_bytes(&active.conversation)
-                > nexus_core::provider::MAX_CONVERSATION_BYTES)
+fn outcome_summary_is_certain(outcome: &OutcomeSummary) -> bool {
+    outcome.effect != EffectState::Unknown && outcome.evidence != Evidence::Uncertain
+}
+
+fn mark_history_omitted(state: &mut State, session: SessionId, removed_items: usize) {
+    if removed_items == 0 {
+        return;
+    }
+    if let Some(omission) = state
+        .history_omissions
+        .iter_mut()
+        .find(|omission| omission.session == session)
     {
-        let remove = active.conversation[..active.history_len]
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find_map(|(index, item)| {
-                matches!(item, ModelContextItem::UserText(_)).then_some(index)
-            })
-            .unwrap_or(active.history_len);
-        active.conversation.drain(..remove);
-        active.history_len -= remove;
+        omission.removed_items = omission.removed_items.saturating_add(removed_items);
+    } else if state.history_omissions.len() < MAX_HISTORY_OMISSION_SESSIONS {
+        state.history_omissions.push(HistoryOmission {
+            session,
+            removed_items,
+        });
+    } else {
+        state.history_omission_fallback_items = state
+            .history_omission_fallback_items
+            .saturating_add(removed_items);
+    }
+}
+
+/// Bounded request projection, also used after accepting a turn/result so
+/// active state cannot grow into an unbounded source transcript. A single
+/// bounded provider batch/tool result may transiently exceed the budget.
+/// Inherited user exchanges go first, then oldest complete tool exchanges;
+/// the current user task, newest complete exchange and pending calls stay.
+fn compact_context(
+    active: &mut ActiveRun,
+    bound: usize,
+) -> Result<Option<ContextReduction>, Terminal> {
+    // Stage reductions so a context that ultimately cannot fit is not left
+    // partially altered before its explicit limit terminal.
+    let mut items = active.conversation.clone();
+    let mut history_len = active.history_len;
+    let mut bytes = conversation_bytes(&items);
+    let notice_count = items.iter().filter(|item| is_context_notice(item)).count();
+    if items.len() <= bound
+        && bytes <= nexus_core::provider::MAX_CONVERSATION_BYTES
+        && notice_count <= 1
+    {
+        return Ok(None);
+    }
+    // No adapter contract currently establishes that opaque continuation
+    // remains valid after transcript reduction. Never discard it or guess.
+    if active.continuation.is_some() {
+        return Err(context_limit(active, bound));
+    }
+
+    let mut removed_items = notice_count.saturating_sub(1);
+    // Normalize all historical notices before choosing what to evict. Charge
+    // exactly one notice in the current task's protected prefix, including its
+    // metadata bytes. This also prevents multiple inherited notices from
+    // accumulating when several historical exchanges are removed together.
+    let historical_notices = items[..history_len]
+        .iter()
+        .filter(|item| is_context_notice(item))
+        .count();
+    items.retain(|item| !is_context_notice(item));
+    history_len -= historical_notices;
+    if !matches!(items.get(history_len), Some(ModelContextItem::UserText(_))) {
+        return Err(context_limit(active, bound));
+    }
+    items.insert(history_len + 1, context_notice_item()?);
+    bytes = conversation_bytes(&items);
+    while items.len() > bound || bytes > nexus_core::provider::MAX_CONVERSATION_BYTES {
+        let (start, end) = if history_len > 0 {
+            let end = items[..history_len]
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(index, item)| {
+                    matches!(item, ModelContextItem::UserText(_)).then_some(index)
+                })
+                .unwrap_or(history_len);
+            if !history_exchange_effects_certain(&items[..end]) {
+                // Historical tool evidence is still needed to avoid an
+                // unsafe blind retry. Never discard it to satisfy this run's
+                // smaller context budget.
+                return Err(context_limit(active, bound));
+            }
+            (0, end)
+        } else {
+            let Some(range) = oldest_removable_exchange(&items) else {
+                return Err(context_limit(active, bound));
+            };
+            range
+        };
+
+        let range_bytes = conversation_bytes(&items[start..end]);
+        bytes = bytes.saturating_sub(range_bytes);
+        let count_removed = end - start;
+        items.drain(start..end);
+        if start == 0 {
+            history_len -= end;
+        }
+        removed_items = removed_items.saturating_add(count_removed);
+    }
+
+    active.conversation = items;
+    active.history_len = history_len;
+    Ok(Some(ContextReduction {
+        removed_items,
+        retained_items: active.conversation.len(),
+        retained_bytes: bytes,
+    }))
+}
+
+fn history_exchange_effects_certain(items: &[ModelContextItem]) -> bool {
+    items.iter().all(|item| match item {
+        ModelContextItem::ToolResult { outcome, .. } => {
+            outcome.effect() != EffectState::Unknown && outcome.evidence() != Evidence::Uncertain
+        }
+        _ => true,
+    })
+}
+
+fn context_calls_are_paired(items: &[ModelContextItem]) -> bool {
+    let mut seen = HashSet::new();
+    let mut pending = HashSet::new();
+    for item in items {
+        match item {
+            ModelContextItem::AssistantCall { call, .. } => {
+                if !seen.insert(call.call()) || !pending.insert(call.call()) {
+                    return false;
+                }
+            }
+            ModelContextItem::AssistantDeniedCall { call, .. } => {
+                if !seen.insert(call) || !pending.insert(call) {
+                    return false;
+                }
+            }
+            ModelContextItem::ToolResult { call, .. } if !pending.remove(call) => return false,
+            _ => {}
+        }
+    }
+    pending.is_empty()
+}
+
+fn context_notice_item() -> Result<ModelContextItem, Terminal> {
+    ModelContextItem::assistant_text(CONTEXT_NOTICE_ITEM_KEY, CONTEXT_NOTICE_TEXT)
+        .map_err(Terminal::failed)
+}
+
+fn is_context_notice(item: &ModelContextItem) -> bool {
+    matches!(
+        item,
+        ModelContextItem::AssistantText { item_key, text, .. }
+            if item_key.as_str() == CONTEXT_NOTICE_ITEM_KEY
+                && text.as_str() == CONTEXT_NOTICE_TEXT
+    )
+}
+
+fn publish_context_reduction(
+    shared: &Arc<Shared>,
+    active: &mut ActiveRun,
+    run: &RunId,
+    reduction: ContextReduction,
+) {
+    eprintln!(
+        "nexus-runtime: context reduced: removed_items={} retained_items={} max_items={} retained_bytes={} max_bytes={}",
+        reduction.removed_items,
+        reduction.retained_items,
+        shared.context_items_bound,
+        reduction.retained_bytes,
+        nexus_core::provider::MAX_CONVERSATION_BYTES,
+    );
+    emit_data(
+        shared,
+        active,
+        run,
+        EventPayload::ContextReduced {
+            removed_items: reduction.removed_items,
+            retained_items: reduction.retained_items,
+            item_limit: shared.context_items_bound,
+            retained_bytes: reduction.retained_bytes,
+            byte_limit: nexus_core::provider::MAX_CONVERSATION_BYTES,
+        },
+    );
+}
+
+/// Calls for a turn precede its results (including denied proposals). Only a
+/// complete exchange with conclusive effects may be evicted. Protect the
+/// current task and any runtime-authored context notice.
+fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, usize)> {
+    if !matches!(items.first(), Some(ModelContextItem::UserText(_))) {
+        return None;
+    }
+    let start = if items.get(1).is_some_and(is_context_notice) {
+        2
+    } else {
+        1
+    };
+    let mut pending = HashSet::new();
+    let mut effects_certain = true;
+    let mut first_end = None;
+    for (index, item) in items.iter().enumerate().skip(start) {
+        match item {
+            ModelContextItem::AssistantCall { call, .. } => {
+                if !pending.insert(call.call()) {
+                    return None;
+                }
+                if pending.len() == 1 {
+                    effects_certain = true;
+                }
+            }
+            ModelContextItem::AssistantDeniedCall { call, .. } => {
+                if !pending.insert(call) {
+                    return None;
+                }
+                if pending.len() == 1 {
+                    effects_certain = true;
+                }
+            }
+            ModelContextItem::ToolResult { call, outcome, .. } => {
+                if !pending.remove(call) {
+                    return None;
+                }
+                effects_certain &= outcome.effect() != EffectState::Unknown
+                    && outcome.evidence() != Evidence::Uncertain
+                    && !matches!(
+                        outcome.status(),
+                        ExecutionStatus::Cancelled | ExecutionStatus::TimedOut
+                    );
+                if pending.is_empty() {
+                    if !effects_certain {
+                        // Keep evidence needed to avoid a blind retry.
+                        return None;
+                    }
+                    if let Some(end) = first_end {
+                        return Some((start, end));
+                    }
+                    first_end = Some(index + 1);
+                }
+            }
+            ModelContextItem::UserText(_) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn context_limit(active: &ActiveRun, bound: usize) -> Terminal {
+    // Only numeric state enters diagnostics, never transcript or opaque data.
+    Terminal {
+        outcome: RunOutcome::LimitReached,
+        error: Some(AgentError::new(
+            ErrorCategory::ResourceLimit,
+            format!(
+                "context budget exhausted: items={} max_items={} bytes={} max_bytes={} continuation={}",
+                active.conversation.len(),
+                bound,
+                conversation_bytes(&active.conversation),
+                nexus_core::provider::MAX_CONVERSATION_BYTES,
+                u8::from(active.continuation.is_some()),
+            ),
+            RetryGuidance::DoNotRetry,
+        )
+        .expect("numeric context diagnostic is safe")),
     }
 }
 
@@ -2688,6 +3146,13 @@ fn control_event_bytes(event: &RunEvent) -> usize {
         EventPayload::AssistantTextDelta(text) => {
             text.turn.as_str().len() + text.item_key.len() + text.text.len()
         }
+        EventPayload::ContextReduced {
+            removed_items: _,
+            retained_items: _,
+            item_limit: _,
+            retained_bytes: _,
+            byte_limit: _,
+        } => 5 * std::mem::size_of::<usize>(),
         EventPayload::ToolCallPreview { item_key } => item_key.len(),
         EventPayload::ApprovalRequired(notice) => {
             notice.approval.as_str().len()
@@ -3211,6 +3676,144 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| Self::stop_turn("idle"))
         }
+    }
+
+    struct ContextCheckingProvider {
+        inner: FakeProvider,
+        bound: usize,
+        largest: AtomicUsize,
+    }
+
+    impl ProviderPort for ContextCheckingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
+            let items = request.conversation();
+            assert!(items.len() <= self.bound);
+            assert!(conversation_bytes(items) <= nexus_core::MAX_CONVERSATION_BYTES);
+            assert!(matches!(&items[0], ModelContextItem::UserText(_)));
+            self.largest.fetch_max(items.len(), Ordering::SeqCst);
+            let mut calls = HashMap::new();
+            for item in items {
+                match item {
+                    ModelContextItem::AssistantCall {
+                        call,
+                        item_key,
+                        provider_ref,
+                        ..
+                    } => {
+                        assert!(
+                            calls
+                                .insert(call.call(), (item_key, provider_ref, call.tool()))
+                                .is_none()
+                        );
+                    }
+                    ModelContextItem::ToolResult {
+                        call,
+                        item_key,
+                        provider_ref,
+                        tool,
+                        ..
+                    } => {
+                        assert_eq!(calls.remove(call), Some((item_key, provider_ref, tool)));
+                    }
+                    _ => {}
+                }
+            }
+            assert!(calls.is_empty(), "requests never contain unmatched calls");
+            self.inner.stream(request, context)
+        }
+    }
+
+    #[test]
+    fn active_tool_run_exceeds_256_source_items_with_bounded_paired_context() {
+        for bound in [256, 8192] {
+            let mut script = Vec::new();
+            for turn in 0..10 {
+                script.push(FakeProvider::tool_turn(
+                    (0..16)
+                        .map(|n| {
+                            CallCandidate::new(
+                                format!("item-{n}"),
+                                format!("ref-{turn}-{n}"),
+                                "host_read",
+                                r#"{"path":"src"}"#,
+                            )
+                            .expect("candidate")
+                        })
+                        .collect(),
+                ));
+            }
+            script.push(FakeProvider::stop_turn("done"));
+            let provider = Arc::new(ContextCheckingProvider {
+                inner: FakeProvider::new(script),
+                bound,
+                largest: AtomicUsize::new(0),
+            });
+            let tool = Arc::new(FakeTool::succeeding("host_read", nexus_core::M0_REVISION));
+            let mut config = quick_config();
+            config.limits.max_model_turns_per_run = 11;
+            config.limits.max_tool_calls_per_run = 160;
+            config.limits.retained_context_items = bound;
+            let (runtime, mut streams) = Runtime::new(
+                config,
+                provider.clone(),
+                vec![ToolRegistration::read(tool.clone())],
+            );
+            test_rt().block_on(async {
+                assert_eq!(
+                    runtime.submit(submit_cmd("long-context")).await.reply(),
+                    CommandReply::Accepted
+                );
+                let (_, finished) =
+                    collect_until_finished(&mut streams.data, &mut streams.control).await;
+                assert_eq!(finished.outcome(), RunOutcome::Completed);
+                assert_eq!(tool.executed.load(Ordering::SeqCst), 160);
+                assert_eq!(provider.inner.calls.load(Ordering::SeqCst), 11);
+                let state = runtime.shared.state.lock().await;
+                let retained = &state
+                    .history
+                    .back()
+                    .expect("completed context retained")
+                    .items;
+                assert!(retained.len() <= bound);
+                assert!(conversation_bytes(retained) <= nexus_core::MAX_CONVERSATION_BYTES);
+            });
+            if bound > 256 {
+                assert_eq!(
+                    provider.largest.load(Ordering::SeqCst),
+                    321,
+                    "representation is not clamped to the M0 default"
+                );
+            } else {
+                assert!(provider.largest.load(Ordering::SeqCst) <= 256);
+            }
+        }
+    }
+
+    #[test]
+    fn final_answer_completes_even_when_it_cannot_be_retained_in_context() {
+        let provider = Arc::new(FakeProvider::new(vec![FakeProvider::stop_turn("answer")]));
+        let mut config = quick_config();
+        config.limits.retained_context_items = 1;
+        let (runtime, mut streams) = Runtime::new(config, provider, Vec::new());
+        test_rt().block_on(async {
+            assert_eq!(
+                runtime.submit(submit_cmd("task")).await.reply(),
+                CommandReply::Accepted
+            );
+            let (_, finished) =
+                collect_until_finished(&mut streams.data, &mut streams.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert!(finished.error().is_none());
+            let state = runtime.shared.state.lock().await;
+            assert!(
+                state.history.is_empty(),
+                "oversized completed history is not retained"
+            );
+        });
     }
 
     struct PanicProvider;
@@ -5320,8 +5923,11 @@ mod cov_runtime_private {
             continuation: None,
             conversation: Vec::new(),
             history_len: 0,
+            initial_context_reduction: None,
+            pending_omission_items: 0,
             queue: VecDeque::new(),
             current: None,
+            dispatched_calls: HashSet::new(),
             pending: HashMap::new(),
             decided: HashMap::new(),
             outcomes: Vec::new(),
@@ -5339,6 +5945,823 @@ mod cov_runtime_private {
             delivery_closed: false,
             finished_sent: false,
         }
+    }
+
+    fn context_exchange(run: &RunId, n: usize, output_bytes: usize) -> Vec<ModelContextItem> {
+        let call = ToolCall::new(
+            run.clone(),
+            TurnId::new(format!("turn-{n}")).expect("valid turn"),
+            CallId::new(format!("call-{n}")).expect("valid call"),
+            ToolId::new("host_read", nexus_core::M0_REVISION).expect("valid tool"),
+            nexus_core::NormalizedArgs::new("{}").expect("valid args"),
+        );
+        let item = format!("item-{n}");
+        let reference = format!("reference-{n}");
+        vec![
+            ModelContextItem::assistant_call(&item, &reference, call.clone()).expect("call item"),
+            ModelContextItem::tool_result(
+                call.call().clone(),
+                item,
+                reference,
+                call.tool().clone(),
+                ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownApplied,
+                    Evidence::HostObserved,
+                    "x".repeat(output_bytes),
+                    false,
+                )
+                .expect("bounded outcome"),
+            )
+            .expect("result item"),
+        ]
+    }
+
+    fn context_run() -> ActiveRun {
+        let mut active = active_for(&RunId::new("run-context").expect("valid run"));
+        active
+            .conversation
+            .push(ModelContextItem::user_text("current task").expect("user"));
+        active
+    }
+
+    #[test]
+    fn context_projection_prunes_oldest_complete_exchanges_and_bounds_active_memory() {
+        let mut active = context_run();
+        for n in 0..200 {
+            active
+                .conversation
+                .extend(context_exchange(&active.run, n, 1));
+            assert!(compact_context(&mut active, 256).is_ok());
+            assert!(active.conversation.len() <= 256);
+        }
+        assert_eq!(active.conversation.len(), 256);
+        assert!(
+            matches!(&active.conversation[0], ModelContextItem::UserText(text) if text.as_str() == "current task")
+        );
+        assert!(is_context_notice(&active.conversation[1]));
+        assert!(
+            matches!(&active.conversation[2], ModelContextItem::AssistantCall { provider_ref, .. } if provider_ref.as_str() == "reference-73")
+        );
+        let expected = context_exchange(&active.run, 199, 1);
+        assert_eq!(
+            &active.conversation[active.conversation.len() - expected.len()..],
+            expected.as_slice()
+        );
+        let before = active.conversation.clone();
+        assert!(compact_context(&mut active, 256).is_ok());
+        assert_eq!(
+            active.conversation, before,
+            "projection is deterministic and idempotent"
+        );
+    }
+
+    #[test]
+    fn context_projection_enforces_bytes_including_identity_and_reasoning() {
+        let mut active = context_run();
+        for n in 0..4 {
+            active.conversation.push(
+                ModelContextItem::assistant_text_with_reasoning(
+                    format!("text-{n}"),
+                    "answer",
+                    Some("r".repeat(100)),
+                )
+                .expect("reasoning item"),
+            );
+            active.conversation.extend(context_exchange(
+                &active.run,
+                n,
+                Limits::M0_TEST_TOOL_OUTPUT_BYTES,
+            ));
+        }
+        assert!(conversation_bytes(&active.conversation) > nexus_core::MAX_CONVERSATION_BYTES);
+        assert!(compact_context(&mut active, 8192).is_ok());
+        assert_eq!(
+            active.conversation.len(),
+            11,
+            "the oldest exchange is removed and a bounded notice is retained"
+        );
+        assert!(conversation_bytes(&active.conversation) <= nexus_core::MAX_CONVERSATION_BYTES);
+        assert!(
+            matches!(&active.conversation[2], ModelContextItem::AssistantText { item_key, reasoning: Some(trace), .. } if item_key.as_str() == "text-1" && trace.len() == 100)
+        );
+    }
+
+    #[test]
+    fn context_projection_keeps_parallel_calls_and_denials_with_their_results() {
+        let mut active = context_run();
+        let old = context_exchange(&active.run, 0, 1);
+        let mut first = context_exchange(&active.run, 1, 1);
+        let second = context_exchange(&active.run, 2, 1);
+        let denied =
+            CallCandidate::new("denied", "denied-ref", "unknown", "{}").expect("candidate");
+        first[0] = ModelContextItem::assistant_denied_call(
+            CallId::new("call-1").expect("call"),
+            denied,
+            None,
+        )
+        .expect("denied item");
+        // Use the exact correlation of the denied candidate on its result.
+        if let ModelContextItem::ToolResult {
+            item_key,
+            provider_ref,
+            tool,
+            outcome,
+            ..
+        } = &mut first[1]
+        {
+            *item_key = ItemKey::new("denied").expect("key");
+            *provider_ref = nexus_core::ProviderRef::new("denied-ref").expect("ref");
+            *tool = ToolId::new("unknown", nexus_core::M0_REVISION).expect("tool");
+            *outcome = denied_outcome("unknown tool");
+        }
+        active.conversation.extend(old);
+        active
+            .conversation
+            .extend([first[0].clone(), second[0].clone(), first[1].clone()]);
+        // The newest turn is incomplete: it is never a removable boundary.
+        assert!(compact_context(&mut active, 4).is_err());
+        active.conversation.push(second[1].clone());
+        assert!(compact_context(&mut active, 6).is_ok());
+        assert_eq!(
+            &active.conversation[2..],
+            &[
+                first[0].clone(),
+                second[0].clone(),
+                first[1].clone(),
+                second[1].clone()
+            ]
+        );
+        assert!(
+            compact_context(&mut active, 4).is_err(),
+            "newest complete turn is protected"
+        );
+    }
+
+    #[test]
+    fn context_projection_rejects_opaque_continuation_without_mutation() {
+        let mut active = context_run();
+        active
+            .conversation
+            .extend(context_exchange(&active.run, 0, 1));
+        active
+            .conversation
+            .extend(context_exchange(&active.run, 1, 1));
+        active.continuation =
+            Some(ContinuationData::new("adapter", "profile", vec![1, 2, 3]).expect("continuation"));
+        let before = active.conversation.clone();
+        let continuation = active.continuation.clone();
+        assert!(compact_context(&mut active, 5).is_ok());
+        let terminal = compact_context(&mut active, 3).expect_err("explicit limit");
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        let error = terminal.error.expect("numeric diagnostic");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert!(error.message().contains("max_items=3"));
+        assert!(error.message().contains("continuation=1"));
+        assert!(!error.message().contains("current task"));
+        assert_eq!(active.conversation, before);
+        assert_eq!(active.continuation, continuation);
+    }
+
+    #[test]
+    fn context_projection_never_evicts_unknown_or_uncertain_effects() {
+        for (effect, evidence) in [
+            (EffectState::Unknown, Evidence::HostObserved),
+            (EffectState::KnownApplied, Evidence::Uncertain),
+        ] {
+            let mut active = context_run();
+            let mut uncertain = context_exchange(&active.run, 0, 1);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut uncertain[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    effect,
+                    evidence,
+                    "outcome could not establish retry safety",
+                    false,
+                )
+                .expect("bounded uncertain outcome");
+            } else {
+                panic!("exchange ends in its tool result");
+            }
+            active.conversation.extend(uncertain);
+            active
+                .conversation
+                .extend(context_exchange(&active.run, 1, 1));
+            let before = active.conversation.clone();
+            let terminal = compact_context(&mut active, 4)
+                .expect_err("uncertain oldest exchange cannot be evicted");
+            assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+            assert_eq!(active.conversation, before);
+        }
+    }
+
+    #[test]
+    fn context_projection_never_evicts_uncertain_inherited_exchanges() {
+        let mut active = active_for(&RunId::new("run-context").expect("valid run"));
+        let mut history = context_exchange(&active.run, 0, 1);
+        if let ModelContextItem::ToolResult { outcome, .. } = &mut history[1] {
+            *outcome = ToolOutcome::new(
+                ExecutionStatus::TimedOut,
+                EffectState::Unknown,
+                Evidence::Uncertain,
+                "tool outcome is uncertain",
+                false,
+            )
+            .expect("bounded uncertain outcome");
+        }
+        active.conversation.extend(history);
+        active.history_len = active.conversation.len();
+        active
+            .conversation
+            .push(ModelContextItem::user_text("new task").expect("user"));
+        let before = active.conversation.clone();
+
+        let terminal = compact_context(&mut active, 2)
+            .expect_err("uncertain inherited effects cannot be evicted");
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        assert_eq!(active.conversation, before);
+    }
+
+    #[test]
+    fn inherited_notices_are_deduplicated_before_budget_accounting() {
+        let mut active = context_run();
+        active
+            .conversation
+            .push(context_notice_item().unwrap_or_else(|_| panic!("valid notice")));
+        active
+            .conversation
+            .push(ModelContextItem::user_text("older task").expect("user"));
+        active
+            .conversation
+            .push(context_notice_item().unwrap_or_else(|_| panic!("valid notice")));
+        active.history_len = active.conversation.len();
+        active
+            .conversation
+            .push(ModelContextItem::user_text("new task").expect("user"));
+        let reduction = compact_context(&mut active, 4)
+            .unwrap_or_else(|_| panic!("duplicate notices alone make room"))
+            .expect("reduction is visible");
+        assert_eq!(active.history_len, 2);
+        assert_eq!(
+            active
+                .conversation
+                .iter()
+                .filter(|item| is_context_notice(item))
+                .count(),
+            1
+        );
+        assert!(is_context_notice(&active.conversation[3]));
+        assert_eq!(reduction.retained_items, active.conversation.len());
+        assert_eq!(
+            reduction.retained_bytes,
+            conversation_bytes(&active.conversation)
+        );
+        assert_eq!(
+            reduction.removed_items, 1,
+            "only the duplicate notice was evicted"
+        );
+    }
+
+    #[test]
+    fn inherited_history_cannot_be_omitted_when_the_notice_cannot_fit() {
+        let mut active = context_run();
+        active.history_len = 1;
+        active
+            .conversation
+            .push(ModelContextItem::user_text("new task").expect("user"));
+        let before = active.conversation.clone();
+        assert_eq!(
+            compact_context(&mut active, 1)
+                .expect_err("notice is required")
+                .outcome,
+            RunOutcome::LimitReached
+        );
+        assert_eq!(active.conversation, before);
+    }
+
+    #[test]
+    fn submit_does_not_bypass_uncertain_history_protection() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut limits = Limits::m0_test();
+            limits.retained_context_items = 3;
+            let (runtime, mut streams) = Runtime::new(
+                RuntimeConfig {
+                    limits,
+                    policy: Policy::m0_test(),
+                    has_approval_handler: false,
+                },
+                Arc::new(NoopProvider),
+                Vec::new(),
+            );
+            let mut previous = context_run();
+            let mut exchange = context_exchange(&previous.run, 0, 1);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut exchange[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "unknown effects",
+                    false,
+                )
+                .expect("outcome");
+            }
+            previous.conversation.extend(exchange);
+            let session = previous.session.clone();
+            let before = previous.conversation.clone();
+            runtime
+                .shared
+                .state
+                .lock()
+                .await
+                .history
+                .push_back(RetainedExchange {
+                    session: session.clone(),
+                    items: previous.conversation,
+                });
+            let response = runtime
+                .submit(
+                    SubmitCommand::new(
+                        RequestId::new("req-next").expect("request"),
+                        session,
+                        "next task",
+                        "m0-test",
+                    )
+                    .expect("submit"),
+                )
+                .await;
+            assert_eq!(response.reply(), CommandReply::Accepted);
+            while let Some(event) = streams.control.recv().await {
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    assert_eq!(
+                        finished.outcome(),
+                        RunOutcome::LimitReached,
+                        "NoopProvider would fail if called"
+                    );
+                    break;
+                }
+            }
+            assert_eq!(runtime.shared.state.lock().await.history[0].items, before);
+        });
+    }
+
+    #[test]
+    fn completed_uncertain_history_overflow_blocks_future_model_work() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut limits = Limits::m0_test();
+            limits.retained_context_items = 3;
+            let (runtime, _streams) = Runtime::new(
+                RuntimeConfig {
+                    limits,
+                    policy: Policy::m0_test(),
+                    has_approval_handler: false,
+                },
+                Arc::new(NoopProvider),
+                Vec::new(),
+            );
+            let mut active = context_run();
+            let mut exchange = context_exchange(&active.run, 0, 1);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut exchange[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "unknown effects",
+                    false,
+                )
+                .expect("outcome");
+            }
+            active.conversation.extend(exchange);
+            active
+                .dispatched_calls
+                .insert(CallId::new("call-0").expect("call"));
+            let run = active.run.clone();
+            {
+                let mut state = runtime.shared.state.lock().await;
+                state.history.push_back(RetainedExchange {
+                    session: active.session.clone(),
+                    items: active.conversation.clone(),
+                });
+                state.active = Some(active);
+            }
+            runtime.finish_run(&run, RunOutcome::Completed, None).await;
+            {
+                let mut state = runtime.shared.state.lock().await;
+                assert!(state.history_safety_exhausted);
+                assert_eq!(state.history.len(), 1, "cache remains bounded");
+                assert_eq!(
+                    state.last.as_ref().expect("finished").outcome,
+                    RunOutcome::Completed
+                );
+                state.active = Some(context_run());
+            }
+            assert_eq!(
+                runtime
+                    .on_preparing(&run)
+                    .await
+                    .expect_err("unsafe history cannot authorize model work")
+                    .outcome,
+                RunOutcome::LimitReached
+            );
+        });
+    }
+
+    #[test]
+    fn history_omission_markers_are_bounded_with_a_global_fallback() {
+        let mut state = State {
+            active: None,
+            last: None,
+            history: VecDeque::new(),
+            history_omissions: Vec::new(),
+            history_omission_fallback_items: 0,
+            history_safety_exhausted: false,
+            quarantine: Vec::new(),
+        };
+        for index in 0..=MAX_HISTORY_OMISSION_SESSIONS {
+            mark_history_omitted(
+                &mut state,
+                SessionId::new(format!("session-{index}")).expect("session"),
+                3,
+            );
+        }
+        assert_eq!(state.history_omissions.len(), MAX_HISTORY_OMISSION_SESSIONS);
+        assert_eq!(state.history_omission_fallback_items, 3);
+    }
+
+    #[test]
+    fn omission_marker_survives_failed_run_and_clears_after_completed_cache() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (runtime, _streams) = Runtime::new(
+                RuntimeConfig {
+                    limits: Limits::m0_test(),
+                    policy: Policy::m0_test(),
+                    has_approval_handler: false,
+                },
+                Arc::new(NoopProvider),
+                Vec::new(),
+            );
+            let mut active = context_run();
+            let session = active.session.clone();
+            let failed_run = active.run.clone();
+            active.pending_omission_items = 3;
+            active
+                .conversation
+                .push(context_notice_item().unwrap_or_else(|_| panic!("notice")));
+            {
+                let mut state = runtime.shared.state.lock().await;
+                state.history_omissions.push(HistoryOmission {
+                    session: session.clone(),
+                    removed_items: 3,
+                });
+                state.active = Some(active);
+            }
+            runtime
+                .finish_run(&failed_run, RunOutcome::Failed, None)
+                .await;
+            assert_eq!(
+                runtime.shared.state.lock().await.history_omissions[0].removed_items,
+                3,
+                "failed runs do not acknowledge an omission notice"
+            );
+
+            let mut completed = context_run();
+            completed.pending_omission_items = 3;
+            completed
+                .conversation
+                .push(context_notice_item().unwrap_or_else(|_| panic!("notice")));
+            let completed_run = completed.run.clone();
+            runtime.shared.state.lock().await.active = Some(completed);
+            runtime
+                .finish_run(&completed_run, RunOutcome::Completed, None)
+                .await;
+            assert!(
+                runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .history_omissions
+                    .is_empty(),
+                "a completed cached exchange carries the notice forward"
+            );
+        });
+    }
+
+    #[test]
+    fn failed_run_with_uncertain_effect_retains_evidence_for_future_model_work() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (runtime, _streams) = Runtime::new(
+                RuntimeConfig {
+                    limits: Limits::m0_test(),
+                    policy: Policy::m0_test(),
+                    has_approval_handler: false,
+                },
+                Arc::new(NoopProvider),
+                Vec::new(),
+            );
+            let mut active = context_run();
+            active.outcomes.push(OutcomeSummary {
+                call: CallId::new("call-0").expect("call"),
+                status: ExecutionStatus::TimedOut,
+                effect: EffectState::Unknown,
+                evidence: Evidence::Uncertain,
+            });
+            let mut exchange = context_exchange(&active.run, 0, 1);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut exchange[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::TimedOut,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "tool outcome is uncertain",
+                    false,
+                )
+                .expect("outcome");
+            }
+            active.conversation.extend(exchange);
+            let queued = context_exchange(&active.run, 1, 1);
+            active.conversation.push(queued[0].clone());
+            active
+                .dispatched_calls
+                .insert(CallId::new("call-0").expect("call"));
+            let run = active.run.clone();
+            runtime.shared.state.lock().await.active = Some(active);
+
+            runtime.finish_run(&run, RunOutcome::Failed, None).await;
+            let state = runtime.shared.state.lock().await;
+            assert!(!state.history_safety_exhausted);
+            assert!(
+                state.history.iter().any(|exchange| {
+                    exchange.items.iter().any(|item| {
+                        matches!(
+                            item,
+                            ModelContextItem::ToolResult { outcome, .. }
+                                if outcome.effect() == EffectState::Unknown
+                                    && outcome.evidence() == Evidence::Uncertain
+                        )
+                    })
+                }),
+                "failed-run uncertain evidence is retained for the next request"
+            );
+            let retained = &state.history.back().expect("retained exchange").items;
+            let assistant_calls: Vec<CallId> = retained
+                .iter()
+                .filter_map(|item| match item {
+                    ModelContextItem::AssistantCall { call, .. } => Some(call.call().clone()),
+                    _ => None,
+                })
+                .collect();
+            let results: Vec<CallId> = retained
+                .iter()
+                .filter_map(|item| match item {
+                    ModelContextItem::ToolResult { call, .. } => Some(call.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(assistant_calls, vec![CallId::new("call-0").expect("call")]);
+            assert_eq!(
+                results, assistant_calls,
+                "no incomplete queued call is retained"
+            );
+            assert_eq!(
+                state.last.as_ref().expect("finished").outcome,
+                RunOutcome::Failed
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_outcome_slot_for_dispatched_call_becomes_retained_tool_result() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let (runtime, _streams) = Runtime::new(
+                RuntimeConfig {
+                    limits: Limits::m0_test(),
+                    policy: Policy::m0_test(),
+                    has_approval_handler: false,
+                },
+                Arc::new(NoopProvider),
+                Vec::new(),
+            );
+            let mut active = context_run();
+            let run = active.run.clone();
+            let call = ToolCall::new(
+                run.clone(),
+                TurnId::new("turn-terminal-slot").expect("turn"),
+                CallId::new("call-terminal-slot").expect("call"),
+                ToolId::new("host_read", nexus_core::M0_REVISION).expect("tool"),
+                nexus_core::NormalizedArgs::new("{}").expect("args"),
+            );
+            active.conversation.push(
+                ModelContextItem::assistant_call(
+                    "item-terminal-slot",
+                    "provider-terminal-slot",
+                    call.clone(),
+                )
+                .expect("call item"),
+            );
+            active.current = Some(CurrentCall {
+                call: call.clone(),
+                item_key: "item-terminal-slot".to_owned(),
+                provider_ref: "provider-terminal-slot".to_owned(),
+                binding: None,
+                dispatched: true,
+            });
+            active.outcome_slot = Some((
+                call.call().clone(),
+                ToolOutcome::new(
+                    ExecutionStatus::TimedOut,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "tool termination is unconfirmed",
+                    false,
+                )
+                .expect("outcome"),
+            ));
+            runtime.shared.state.lock().await.active = Some(active);
+
+            runtime.finish_run(&run, RunOutcome::Failed, None).await;
+            let state = runtime.shared.state.lock().await;
+            let retained = &state
+                .history
+                .back()
+                .expect("uncertain exchange retained")
+                .items;
+            assert!(retained.iter().any(|item| matches!(
+                item,
+                ModelContextItem::ToolResult { call: retained_call, outcome, .. }
+                    if retained_call == call.call()
+                        && outcome.effect() == EffectState::Unknown
+            )));
+            assert!(!state.history_safety_exhausted);
+            assert!(context_calls_are_paired(retained));
+        });
+    }
+
+    #[test]
+    fn retained_context_rejects_orphan_results_and_incomplete_calls() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            for (outcome, orphan_result) in [
+                (RunOutcome::Completed, false),
+                (RunOutcome::Completed, true),
+                (RunOutcome::Failed, true),
+            ] {
+                let (runtime, _streams) = Runtime::new(
+                    RuntimeConfig {
+                        limits: Limits::m0_test(),
+                        policy: Policy::m0_test(),
+                        has_approval_handler: false,
+                    },
+                    Arc::new(NoopProvider),
+                    Vec::new(),
+                );
+                let mut active = context_run();
+                let run = active.run.clone();
+                let mut exchange = context_exchange(&run, 0, 1);
+                if outcome == RunOutcome::Failed {
+                    if let ModelContextItem::ToolResult { outcome, .. } = &mut exchange[1] {
+                        *outcome = timeout_outcome("uncertain orphan result");
+                    }
+                    let call = CallId::new("call-0").expect("call");
+                    active.dispatched_calls.insert(call.clone());
+                    active.outcomes.push(OutcomeSummary {
+                        call,
+                        status: ExecutionStatus::TimedOut,
+                        effect: EffectState::Unknown,
+                        evidence: Evidence::Uncertain,
+                    });
+                }
+                active
+                    .conversation
+                    .push(exchange[usize::from(orphan_result)].clone());
+                runtime.shared.state.lock().await.active = Some(active);
+                runtime.finish_run(&run, outcome, None).await;
+                let state = runtime.shared.state.lock().await;
+                assert!(state.history.is_empty(), "malformed context is not cached");
+                assert!(state.history_safety_exhausted);
+                assert_eq!(state.last.as_ref().expect("finished").outcome, outcome);
+            }
+        });
+    }
+
+    #[test]
+    fn context_projection_byte_limit_is_inclusive_and_uncompactable_text_fails() {
+        let mut active = context_run();
+        let remaining =
+            nexus_core::MAX_CONVERSATION_BYTES - conversation_bytes(&active.conversation);
+        for n in 0..4 {
+            active.conversation.push(
+                ModelContextItem::assistant_reasoning(
+                    "r".repeat(remaining / 4 + usize::from(n < remaining % 4)),
+                )
+                .expect("bounded reasoning"),
+            );
+        }
+        assert_eq!(
+            conversation_bytes(&active.conversation),
+            nexus_core::MAX_CONVERSATION_BYTES
+        );
+        assert!(compact_context(&mut active, 256).is_ok());
+        active
+            .conversation
+            .push(ModelContextItem::assistant_text("k", "x").expect("text"));
+        let before = active.conversation.clone();
+        let terminal = compact_context(&mut active, 256).expect_err("cannot prune current text");
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        assert!(
+            terminal
+                .error
+                .expect("diagnostic")
+                .message()
+                .contains("max_bytes=1048576")
+        );
+        assert_eq!(active.conversation, before);
+    }
+
+    #[test]
+    fn context_projection_evicts_inherited_exchanges_before_current_tools() {
+        let mut active = context_run();
+        active
+            .conversation
+            .extend(context_exchange(&active.run, 0, 1));
+        active.history_len = active.conversation.len();
+        active
+            .conversation
+            .push(ModelContextItem::user_text("new task").expect("user"));
+        active
+            .conversation
+            .extend(context_exchange(&active.run, 1, 1));
+        assert!(compact_context(&mut active, 4).is_ok());
+        assert_eq!(active.history_len, 0);
+        assert_eq!(active.conversation.len(), 4);
+        assert!(
+            matches!(&active.conversation[0], ModelContextItem::UserText(text) if text.as_str() == "new task")
+        );
+    }
+
+    #[test]
+    fn cancelled_run_does_not_project_or_dispatch_another_request() {
+        let (runtime, _streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        let mut active = context_run();
+        for n in 0..130 {
+            active
+                .conversation
+                .extend(context_exchange(&active.run, n, 1));
+        }
+        active.cancelled = true;
+        active.token.cancel();
+        let run = active.run.clone();
+        let before = active.conversation.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            let terminal = runtime.on_calling_model(&run).await.expect_err("cancelled");
+            assert_eq!(terminal.outcome, RunOutcome::Cancelled);
+            assert_eq!(
+                runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .as_ref()
+                    .expect("active")
+                    .conversation,
+                before
+            );
+        });
     }
 
     fn fragment(turn: &str, item_key: &str, text: &str) -> AssistantText {
@@ -6117,6 +7540,7 @@ mod cov_runtime_topup_private {
             item_key: "item-0".to_owned(),
             provider_ref: "prov-ref-0".to_owned(),
             binding,
+            dispatched: false,
         }
     }
 
@@ -6162,8 +7586,11 @@ mod cov_runtime_topup_private {
             continuation: None,
             conversation: Vec::new(),
             history_len: 0,
+            initial_context_reduction: None,
+            pending_omission_items: 0,
             queue: VecDeque::new(),
             current: None,
+            dispatched_calls: HashSet::new(),
             pending: HashMap::new(),
             decided: HashMap::new(),
             outcomes: Vec::new(),

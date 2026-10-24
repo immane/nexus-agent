@@ -21,9 +21,9 @@ use crate::tool::ToolSpec;
 pub const MAX_CREDENTIAL_REF_LEN: usize = 128;
 /// Maximum model-profile name length in bytes (M0-TEST choice).
 pub const MAX_PROFILE_LEN: usize = 128;
-/// Maximum conversation items accepted by one request (M0-TEST choice: the
-/// lock's retained-context table value).
-pub const MAX_CONVERSATION_ITEMS: usize = Limits::M0_TEST_RETAINED_CONTEXT_ITEMS;
+/// Representation ceiling for one request, independent of the effective
+/// runtime policy (whose M0-test default remains 256 retained items).
+pub const MAX_CONVERSATION_ITEMS: usize = 8192;
 /// Maximum aggregate conversation payload in bytes (M0-TEST representation
 /// choice; the lock sets no table value for aggregate conversation bytes).
 pub const MAX_CONVERSATION_BYTES: usize = 1_048_576;

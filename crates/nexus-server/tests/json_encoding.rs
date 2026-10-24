@@ -788,6 +788,17 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
             false,
         ),
         (
+            EventPayload::ContextReduced {
+                removed_items: 3,
+                retained_items: 8,
+                item_limit: 16,
+                retained_bytes: 512,
+                byte_limit: 1024,
+            },
+            "context-reduced",
+            false,
+        ),
+        (
             EventPayload::ToolCallPreview {
                 item_key: "item-1".to_owned(),
             },
@@ -852,6 +863,19 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
         );
         assert_eq!(encoded["seq"], seq, "the envelope sequence is preserved");
         assert_eq!(encoded["run"], "run-1", "the envelope run is preserved");
+        if kind == "context-reduced" {
+            assert_eq!(
+                encoded["detail"],
+                json!({
+                    "removed_items": 3,
+                    "retained_items": 8,
+                    "item_limit": 16,
+                    "retained_bytes": 512,
+                    "byte_limit": 1024,
+                    "summarized": false,
+                })
+            );
+        }
         assert_eq!(
             field_count(&encoded),
             5,
@@ -865,6 +889,7 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
         vec![
             "run-started",
             "assistant-text",
+            "context-reduced",
             "tool-call-preview",
             "approval-required",
             "tool-started",
@@ -873,7 +898,7 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
             "usage",
             "run-finished",
         ],
-        "all nine payload kinds are covered"
+        "all ten payload kinds are covered"
     );
 }
 

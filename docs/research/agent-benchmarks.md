@@ -284,8 +284,8 @@ this is not a leaderboard score:
   `Printable` base class and a regression test. The agent run then ended with
   `ResourceLimit: retained context budget exhausted`; this is distinct from
   provider failure and the retry diagnostics showed no provider retry events.
-  The limiting bound is the core `MAX_CONVERSATION_ITEMS` ceiling of 256,
-  which caps the pilot's configured 8,192 retained items. The official
+  At the time, the limiting bound was the core `MAX_CONVERSATION_ITEMS` ceiling
+  of 256, which capped the pilot's configured 8,192 retained items. The official
   SWE-bench evaluator nevertheless marked `sympy__sympy-20590` **resolved**,
   with zero infrastructure failures, ambiguous failures, or evaluator errors.
   The checkout retains the generated patch for inspection; Nexus-owned
@@ -294,6 +294,52 @@ this is not a leaderboard score:
   `/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-sympy-qwen-retry-20261024/`;
   server diagnostics are in
   `/private/var/folders/qp/1943jsm56652bhm60grnl74m0000gn/T/opencode/nexus-swebench-qwen-retry-server.log`.
+
+The subsequent runtime repair separates the 8,192-item request representation
+ceiling from the normal 256-item policy. Active context evicts oldest complete
+exchanges when effective item or aggregate-byte budgets are exceeded, without
+splitting calls/results or losing the current task, newest complete exchange,
+or pending calls. Opaque continuation prevents unsafe eviction. Numeric logs
+report effective budgets and reductions. This is lossy deterministic eviction,
+not semantic summarization, and it does not promise knowledge of evicted
+investigation results. The aggregate context cap remains 1 MiB; this is not a
+provider tokenizer or a guarantee that a model's token window will fit. The
+repair has not yet been measured in another live benchmark run.
+
+New-task history admission uses the same transactional projection as later
+turns. Unknown effects and uncertain evidence cannot be evicted (including
+cancelled/timed-out outcomes whose effects remain uncertain). Uncertain results
+from a non-completed run are retained only when the corresponding tool was
+actually dispatched; pre-dispatch cancellation does not leak the proposed call
+into the next run. Terminal-staged uncertain outcomes are materialized as
+tool-result items when their call was dispatched; incomplete/unpaired calls are
+never carried forward. Omission notices remain pending until a completed
+exchange containing the notice is cached. Per-session omission markers are
+capped at 128; overflow folds into a runtime-wide, fixed-size fallback notice.
+A single model-visible omission notice is charged to the
+budget; if it cannot fit safely, the run reaches its limit before calling the
+provider. Reduction events report the actual post-deduplication item and byte
+counts. Completed runs remain completed even if their final context cannot be
+cached. Cache pressure evicts certain exchanges first; if uncertain evidence
+cannot fit, a runtime-wide safety latch blocks subsequent model work with
+`uncertain history retention budget exhausted`. This latch lasts for that
+runtime instance and is not persistent recovery storage.
+
+### Deferred task: semantic context summaries
+
+Status: deferred; not implemented. First rerun a long task with deterministic
+eviction and look for repeated file reads, repeated failed approaches, or lost
+investigation conclusions. If these materially affect progress, implement a
+bounded summary of evicted history that preserves established findings,
+constraints, attempted approaches, validation results, and remaining work.
+Treat summaries as lossy model-generated context, not authoritative evidence:
+unknown effects and unfinished calls still require their original safety
+records and must never be replayed based only on a summary. Define summary
+generation budgets, cancellation and failure behavior, and frontend notices;
+charge both generation and retained summaries to the applicable budgets.
+Validate with deterministic regressions and an explicitly budgeted local-model
+long-task comparison before enabling it by default. This is future work, not a
+change to the current eviction behavior or authorization for a live model run.
 
 For a one-task run, first make a disposable checkout at the dataset row's
 `base_commit`, then build that task's adapter image with its immutable registry
@@ -316,6 +362,23 @@ server must remain loopback-only. The runner writes artifacts but does not
 launch the server, prepare task dependencies, or score predictions; use the
 official SWE-bench evaluator after checking that dependencies required by the
 task's evaluation script are available to the agent.
+
+To classify a saved run independently of the agent's exit status, use the
+offline summary command (omit `--evaluation-report` if scoring was not run):
+
+```sh
+python3 tools/benchmarks/run_nexus_swe_task.py summarize \
+  --result RESULTS/INSTANCE.result.json \
+  --evaluation-report RESULTS/official-report/REPORT.json
+python3 -B -m unittest discover -s tools/benchmarks -p 'test_*.py'
+```
+
+This command makes no model/evaluator requests and does not rewrite artifacts.
+It reports agent termination, patch size, official evaluation outcome, and
+infrastructure classification separately. A resolved patch does not change an
+agent's `limit-reached` status into `completed`; a process exit code alone does
+not establish that the task was resolved. Report absence is `not-run`, and
+evaluator errors and ambiguous infrastructure failures remain distinct.
 
 ## Comparison with other agent loop caps
 

@@ -1083,10 +1083,7 @@ fn provider_surface_smoke() {
         SmokeProvider.continuation_scope("profile-b")
     );
 
-    assert_eq!(
-        MAX_CONVERSATION_ITEMS,
-        Limits::M0_TEST_RETAINED_CONTEXT_ITEMS
-    );
+    assert_eq!(MAX_CONVERSATION_ITEMS, 8192);
     assert_eq!(
         MAX_TOOL_DEFINITIONS,
         Limits::M0_TEST_TOOL_CALLS_PER_TURN as usize
@@ -1319,10 +1316,7 @@ fn module_level_items_resolve_and_match_root_reexports() {
     }
     assert_eq!(nexus_core::provider::MAX_CREDENTIAL_REF_LEN, 128);
     assert_eq!(nexus_core::provider::MAX_PROFILE_LEN, 128);
-    assert_eq!(
-        nexus_core::provider::MAX_CONVERSATION_ITEMS,
-        Limits::M0_TEST_RETAINED_CONTEXT_ITEMS
-    );
+    assert_eq!(nexus_core::provider::MAX_CONVERSATION_ITEMS, 8192);
     assert_eq!(nexus_core::provider::MAX_CONVERSATION_BYTES, 1_048_576);
     assert_eq!(
         nexus_core::provider::MAX_TOOL_DEFINITIONS,
