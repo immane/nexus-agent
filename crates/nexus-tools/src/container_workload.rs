@@ -1166,6 +1166,7 @@ mod tests {
     #[test]
     fn workload_config_accepts_local_image_ids_and_repository_digests() {
         let base = config();
+        let nonce = test_nonce();
         for image in [
             format!("sha256:{}", "a".repeat(64)),
             format!("example/workload@sha256:{}", "b".repeat(64)),
@@ -1174,7 +1175,7 @@ mod tests {
                 &base.workspace,
                 &base.resolver_file,
                 &image,
-                "0123456789abcdef",
+                &nonce,
                 &base.gateway_id,
             )
             .expect("workload accepts the same immutable references as the gateway");
@@ -1186,7 +1187,7 @@ mod tests {
                     &base.workspace,
                     &base.resolver_file,
                     image,
-                    "0123456789abcdef",
+                    &nonce,
                     &base.gateway_id,
                 )
                 .is_err()
@@ -1199,12 +1200,12 @@ mod tests {
         let image = format!("example/workload@sha256:{}", "a".repeat(64));
         let resolver = std::env::temp_dir().join("nexus-resolver-test");
         let id = "f".repeat(64);
-        let nonce = "0123456789abcdef";
+        let nonce = test_nonce();
 
         #[cfg(unix)]
         {
             let system_dir = std::fs::canonicalize("/etc").expect("system config directory");
-            assert!(Config::new(&system_dir, &resolver, &image, nonce, &id).is_err());
+            assert!(Config::new(&system_dir, &resolver, &image, &nonce, &id).is_err());
         }
 
         let root = PathBuf::from(std::env::var_os("HOME").expect("test home directory"))
@@ -1229,6 +1230,15 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn test_nonce() -> String {
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        format!(
+            "{:016x}{:016x}",
+            u64::from(std::process::id()),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
 
     #[cfg(unix)]
     struct FakeDocker(PathBuf);
@@ -1339,7 +1349,7 @@ mod tests {
             &path,
             &resolver,
             &format!("example/workload@sha256:{}", "a".repeat(64)),
-            "0123456789abcdef",
+            &test_nonce(),
             &"f".repeat(64),
         )
         .unwrap()
@@ -1389,7 +1399,8 @@ mod tests {
 
     #[test]
     fn resolver_file_is_private_and_removed_when_owner_drops() {
-        let resolver = ResolverConfigFile::new("0123456789abcdef").unwrap();
+        let nonce = test_nonce();
+        let resolver = ResolverConfigFile::new(&nonce).unwrap();
         assert_eq!(
             std::fs::read(&resolver.path).unwrap(),
             b"nameserver 127.0.0.1\n"
@@ -1424,6 +1435,8 @@ mod tests {
     fn start_failure_cleans_up_in_verified_order() {
         let f = Fake::default();
         let id = "a".repeat(64);
+        let config = config();
+        let owner = config.owner.clone();
         f.0.lock().unwrap().replies.extend([
             ok(&format!("{id}\n")),
             ResultBytes {
@@ -1431,11 +1444,11 @@ mod tests {
                 stdout: vec![],
                 timed_out: false,
             },
-            ok(&format!("{id}\tworkload-0123456789abcdef\n")),
+            ok(&format!("{id}\t{owner}\n")),
             ok(""),
             ok(""),
         ]);
-        let mut w = Workload::new(f.clone(), config());
+        let mut w = Workload::new(f.clone(), config);
         w.prepare().unwrap();
         assert!(w.start().is_err());
         let calls = &f.0.lock().unwrap().calls;
@@ -1473,9 +1486,11 @@ mod tests {
         w.state = State::Removed;
 
         let f = Fake::default();
+        let config = config();
+        let owner = config.owner.clone();
         f.0.lock().unwrap().replies.extend([
             ok(&format!("{id}\n")),
-            ok(&format!("{id}\tworkload-0123456789abcdef\n")),
+            ok(&format!("{id}\t{owner}\n")),
             ok(""),
             ResultBytes {
                 status: None,
@@ -1483,7 +1498,7 @@ mod tests {
                 timed_out: true,
             },
         ]);
-        let mut w = Workload::new(f.clone(), config());
+        let mut w = Workload::new(f.clone(), config);
         w.prepare().unwrap();
         assert!(w.close().is_err());
         assert_eq!(w.state, State::Unknown);
@@ -1513,7 +1528,7 @@ mod tests {
                 &dir,
                 &std::env::temp_dir().join("nexus-resolver-test"),
                 &format!("example/workload@sha256:{}", "a".repeat(64)),
-                "0123456789abcdef",
+                &test_nonce(),
                 &"f".repeat(64)
             )
             .is_err()
@@ -1523,6 +1538,8 @@ mod tests {
     #[test]
     fn create_timeout_reconciles_exact_name_and_label() {
         let f = Fake::default();
+        let config = config();
+        let owner = config.owner.clone();
         let mut s = f.0.lock().unwrap();
         s.replies.extend([
             ResultBytes {
@@ -1531,12 +1548,12 @@ mod tests {
                 timed_out: true,
             },
             ok(&format!("{}\n", "c".repeat(64))),
-            ok(&format!("{}\tworkload-0123456789abcdef\n", "c".repeat(64))),
+            ok(&format!("{}\t{owner}\n", "c".repeat(64))),
             ok(""),
             ok(""),
         ]);
         drop(s);
-        let mut w = Workload::new(f.clone(), config());
+        let mut w = Workload::new(f.clone(), config);
         assert!(w.prepare().is_err());
         assert_eq!(
             w.id.as_deref(),
@@ -1546,7 +1563,7 @@ mod tests {
         assert!(
             f.0.lock().unwrap().calls[1]
                 .iter()
-                .any(|x| x == "label=io.nexus-agent.workload-owner=workload-0123456789abcdef")
+                .any(|x| x == &format!("label={OWNER_LABEL}={owner}"))
         );
         assert!(
             f.0.lock().unwrap().calls[1]
@@ -1567,21 +1584,21 @@ mod tests {
     #[test]
     fn readiness_is_not_healthy_and_close_verifies_owner() {
         let f = Fake::default();
+        let config = config();
+        let owner = config.owner.clone();
         let mut s = f.0.lock().unwrap();
         let id = "d".repeat(64);
         s.replies.extend([
             ok(&format!("{id}\n")),
             ok("started\n"),
-            ok(&format!(
-                "{id}\tworkload-0123456789abcdef\ttrue\tstarting\n"
-            )),
-            ok(&format!("{id}\tworkload-0123456789abcdef\ttrue\thealthy\n")),
-            ok(&format!("{id}\tworkload-0123456789abcdef\n")),
+            ok(&format!("{id}\t{owner}\ttrue\tstarting\n")),
+            ok(&format!("{id}\t{owner}\ttrue\thealthy\n")),
+            ok(&format!("{id}\t{owner}\n")),
             ok("stopped\n"),
             ok(""),
         ]);
         drop(s);
-        let mut w = Workload::new(f.clone(), config());
+        let mut w = Workload::new(f.clone(), config);
         w.prepare().unwrap();
         w.start().unwrap();
         assert_eq!(w.state, State::Ready);
@@ -1595,17 +1612,17 @@ mod tests {
     fn unhealthy_keeper_is_cleaned_and_never_becomes_ready() {
         let f = Fake::default();
         let id = "d".repeat(64);
+        let config = config();
+        let owner = config.owner.clone();
         f.0.lock().unwrap().replies.extend([
             ok(&format!("{id}\n")),
             ok("started\n"),
-            ok(&format!(
-                "{id}\tworkload-0123456789abcdef\ttrue\tunhealthy\n"
-            )),
-            ok(&format!("{id}\tworkload-0123456789abcdef\n")),
+            ok(&format!("{id}\t{owner}\ttrue\tunhealthy\n")),
+            ok(&format!("{id}\t{owner}\n")),
             ok("stopped\n"),
             ok(""),
         ]);
-        let mut w = Workload::new(f.clone(), config());
+        let mut w = Workload::new(f.clone(), config);
         w.prepare().unwrap();
         assert!(w.start().is_err());
         assert_eq!(w.state, State::Removed);

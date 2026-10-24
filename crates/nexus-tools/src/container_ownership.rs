@@ -389,6 +389,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn test_nonce() -> String {
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        format!("{:016x}", NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
     struct TempRoot(PathBuf);
 
     impl TempRoot {
@@ -411,7 +416,7 @@ mod tests {
     }
 
     fn record() -> OwnershipRecord {
-        let nonce = "0123456789abcdef".to_owned();
+        let nonce = test_nonce();
         OwnershipRecord {
             gateway_name: format!("nexus-gw-{nonce}"),
             nonce,
@@ -446,7 +451,7 @@ mod tests {
                 0o700
             );
             assert_eq!(
-                fs::metadata(root.0.join("0123456789abcdef.json"))
+                fs::metadata(root.0.join(format!("{}.json", owner.snapshot().nonce)))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -485,12 +490,14 @@ mod tests {
     #[test]
     fn leftover_owner_records_block_new_container_admission() {
         let root = TempRoot::new();
+        let record = record();
+        let record_path = root.0.join(format!("{}.json", record.nonce));
         {
             let store = Arc::new(OwnershipStore::open(&root.0).unwrap());
-            store.create_record(record()).unwrap();
+            store.create_record(record).unwrap();
         }
         assert!(OwnershipStore::open_for_admission(&root.0).is_err());
-        assert!(root.0.join("0123456789abcdef.json").is_file());
+        assert!(record_path.is_file());
     }
 
     #[test]
