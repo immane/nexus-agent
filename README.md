@@ -63,6 +63,19 @@ Previously recorded optimized, unstripped Cargo release binaries on **macOS arm6
 
 These are platform- and build-profile-specific file sizes, not compressed download sizes or cross-platform guarantees. We will continue working to keep Nexus Agent lightweight and fast; the 100 ms first-interactive startup target remains a goal, and measurements for it are still pending.
 
+### Current server size measurements
+
+Measured on **macOS arm64** for `nexus-server --features container` (Mach-O):
+
+| Release profile | File size |
+| --- | ---: |
+| Default Cargo release | 3,116,512 bytes (2.97 MiB) |
+| Default release, copied and stripped with `strip -x` | 2,537,160 bytes (2.42 MiB) |
+| `opt-level = "s"`, LTO, one codegen unit, symbols stripped | 1,499,664 bytes (1.43 MiB) |
+| `opt-level = "z"`, LTO, one codegen unit, symbols stripped | 1,206,112 bytes (1.15 MiB) |
+
+The optimized variants were comparison builds only; repository build profiles were not changed. They compiled successfully, but runtime performance and the full test suite were not measured for these profiles. `opt-level = "z"` is the smallest measured build, not yet a production default. Sizes are platform-specific executable file sizes, not download or installed-package sizes.
+
 ## Architecture
 
 The first diagram shows the host's in-process core, runtime, frontend, and
@@ -92,15 +105,14 @@ flowchart TB
     Bridge <-->|stdio| Plugins
 ```
 
-Container support currently exists only as an optional, internal `nexus-tools`
-prototype. It is intentionally not connected to the runtime authorization or
-TUI/server composition roots. The prototype's present topology is shown
-separately; the dashed edge is a future integration boundary, not a callable
-path today:
+Container execution is an opt-in path in container-enabled TUI/server builds;
+the runtime applies its normal authorization and lifecycle controls to the
+container-backed tools. It remains a prototype, not an approved isolation
+boundary. The topology is shown separately:
 
 ```mermaid
 flowchart LR
-    Runtime["Runtime / frontend<br/>local tools only"]
+    Runtime["Runtime / frontend<br/>local or opt-in container tools"]
     ContainerTools["Feature-gated container adapters<br/>file tools + host_exec"]
     Session["Internal workload session<br/>lifecycle + quarantine"]
     Transport["Bounded Docker CLI transport"]
@@ -110,7 +122,7 @@ flowchart LR
     Workload["Workload container<br/>keeper + worker"]
     Workspace["Selected host workspace<br/>only user-data bind"]
 
-    Runtime -. "opt-in container build only" .-> ContainerTools
+    Runtime -->|"explicit container selection"| ContainerTools
     ContainerTools <--> Session
     Session --> Transport
     Session --> Owner
@@ -121,11 +133,18 @@ flowchart LR
     Workspace -->|"read/write bind"| Workload
 ```
 
-The prototype compiles only with `nexus-tools` container features. Its
-linux/arm64 workload image and keeper-only Docker Desktop smoke check do not
-establish workload or network isolation. Native Linux host/LAN, metadata,
-IPv6/DNS, and public-egress checks remain required before any runtime wiring;
-see the [container design](docs/design/11-container-execution.md),
+Container support is feature-gated and requires explicit startup selection and
+images. On Docker Desktop, the gateway detects the platform and permits only
+the narrow synthetic `198.18.0.0/15` TCP 80/443 proxy path; configured host/LAN
+denies take precedence. The workload overlays `node_modules` and `.next` with
+private tmpfs mounts so Linux dependency installation and builds do not reuse
+host artifacts. The opt-in public HTTPS and npm-registry probes passed on the
+development Docker Desktop host. A production build succeeded in an equivalently
+constrained container; the end-to-end Nexus `host_exec` attempt exceeded its
+per-tool deadline, so that integration result is inconclusive. This is not
+evidence of native Linux host/LAN isolation: native Linux validation remains
+outstanding, and the container path must not be treated as an approved isolation
+boundary. See the [container design](docs/design/11-container-execution.md),
 [gateway checklist](containers/README.md), and [workload image notes](containers/workload/README.md).
 
 In the first diagram, connections show runtime interactions and domain usage,
