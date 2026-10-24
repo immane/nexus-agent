@@ -1,5 +1,10 @@
 # Agent benchmark options for Nexus
 
+For the Context Management development workflow, metric definitions, artifact
+storage, and 92K -> 64K -> 32K comparison matrix, see the
+[context management design](../design/12-context-management.md). That design
+separates proposed measurement capabilities from the current experimental runner.
+
 Research date: 2026-10-24. This is a recommendation for choosing and preparing
 an evaluation, not a claim that Nexus has benchmark support or has been scored.
 Benchmark versions, hosted services, and CLI syntax change; pin a dataset/task

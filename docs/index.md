@@ -76,6 +76,12 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 
 ## Design
 
+Context Management is a central project priority. The
+[context management design](design/12-context-management.md) records the
+source-history/active-view architecture, evidence-system extension boundary,
+benchmark metrics, and 92K -> 64K -> 32K validation direction. Its detailed
+interfaces remain proposed; this link is not a claim of completed implementation.
+
 | Document | Purpose | Status |
 | --- | --- | --- |
 | [00 - Overview](design/00-overview.md) | Goals, scope, and first-release boundaries | Draft design; confirmed requirements identified |
@@ -90,6 +96,7 @@ Follow explicit user requirements and applicable repository guidance. Accepted d
 | [09 - Implementation readiness](design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review | Draft engineering gates |
 | [10 - Pi architecture reference](design/10-pi-reference.md) | Observed Pi patterns adopted in principle and explicitly excluded | Draft reference note |
 | [11 - Optional container execution](design/11-container-execution.md) | Internal prototype status, target backend architecture, isolation gates, lifecycle, and acceptance | Partial feature-gated tools prototype; no runtime/frontend integration; isolation unvalidated |
+| [12 - Context management](design/12-context-management.md) | Source history, transactional compaction, evidence-system evolution, benchmark metrics, and shrinking-window validation | Owner-confirmed priority/direction; detailed design proposed; partial existing implementation |
 
 ## Contracts
 

@@ -41,6 +41,13 @@ research components, not requirements for the Agent Core.
 
 See the [research concept, related papers, and evaluation criteria](docs/research/task-context-compiler.md).
 
+**Context Management is a central engineering priority.** The
+[context management design](docs/design/12-context-management.md) records the
+minimal source-history/active-context architecture, its path toward the evidence
+system above, and a measurable 92K -> 64K -> 32K validation workflow. Conventional
+compaction is partly implemented; the complete history separation and evaluation
+system remain proposed work, not claims of achieved small-window repair quality.
+
 ## Design Goals
 
 | Priority | Direction |
