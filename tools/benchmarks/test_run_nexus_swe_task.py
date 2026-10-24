@@ -6,7 +6,12 @@ import subprocess
 import tempfile
 import unittest
 
-from run_nexus_swe_task import reached_budget, summarize_result, validate_container_git_checkout
+from run_nexus_swe_task import (
+    build_task_prompt,
+    reached_budget,
+    summarize_result,
+    validate_container_git_checkout,
+)
 
 
 class SummaryTests(unittest.TestCase):
@@ -100,6 +105,16 @@ class ContainerGitCheckoutTests(unittest.TestCase):
             alternates.write_text("/host-only/git/objects\n")
             with self.assertRaisesRegex(RuntimeError, "object alternates"):
                 validate_container_git_checkout(repo)
+
+
+class TaskPromptTests(unittest.TestCase):
+    def test_prompt_identifies_authoritative_workspace_and_project_test_docs(self):
+        prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
+        self.assertIn("mounted at /workspace", prompt)
+        self.assertIn("authoritative checkout", prompt)
+        self.assertIn("Do not treat other image paths such as /testbed", prompt)
+        self.assertIn("follow the test instructions documented in this checkout", prompt)
+        self.assertIn("do not assume a particular test framework", prompt)
 
 
 if __name__ == "__main__":

@@ -427,6 +427,18 @@ was authoritative. This is a concrete environment defect to address.
 The task prompt also lacked an explicit validation stopping condition and did
 not identify the available test runner.
 
+As an offline environment-only check, a fresh independent clone at the task's
+base commit was mounted into the existing Nexus SymPy adapter image with network
+disabled. Python imported SymPy from `/workspace/sympy`, and the image's own
+`bin/test -C --verbose` runner executed a public core test module: 52 passed and
+2 expected failures in 18.50 seconds. This verifies that the container has a
+working project runner and that imports resolve from the mounted checkout; it
+does not verify the agent patch or evaluator result. The benchmark prompt now
+states the generic `/workspace` authority and directs agents to follow test
+instructions in the current repository rather than assuming pytest or a
+particular framework. It does not inject this SymPy-specific command into other
+tasks.
+
 The assistant repeatedly alleged scratch-file rewriting or concurrent writes.
 Those allegations are **unconfirmed**: saved assistant text is not a complete
 tool trace. It does not preserve every command, result, exit status, or per-call
