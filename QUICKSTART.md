@@ -55,7 +55,9 @@ metadata, IPv6/DNS, and public-egress checks remain outstanding. Do not use it
 with secrets or valuable workspace data. The workspace is live-mounted and
 container tool calls can modify it. See [`containers/README.md`](containers/README.md)
 and the [container design](docs/design/11-container-execution.md) before opting
-in. Local mode remains the default.
+in. TUI mode switching is disabled in container execution; the writable
+workspace mount remains active for the lifetime of the session. Local mode
+remains the default.
 
 ```sh
 # Replace both references with the exact immutable repo@sha256:digest values

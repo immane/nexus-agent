@@ -297,7 +297,7 @@ impl Config {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .and_then(|p| std::fs::canonicalize(p).ok());
-        if home.as_deref() == Some(&workspace)
+        if is_protected_workspace(&workspace, home.as_deref())
             || !valid_image(image)
             || !valid_nonce(nonce)
             || !valid_id(gateway_id)
@@ -321,6 +321,53 @@ impl Config {
             gateway_id: gateway_id.to_ascii_lowercase(),
         })
     }
+}
+
+fn is_protected_workspace(workspace: &Path, home: Option<&Path>) -> bool {
+    if home.is_some_and(|home| home == workspace || home.starts_with(workspace)) {
+        return true;
+    }
+
+    let protected = [
+        "/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev", "/proc",
+        "/sys", "/run", "/root",
+    ];
+    #[cfg(target_os = "macos")]
+    let protected = protected
+        .into_iter()
+        .chain([
+            "/System/Library",
+            "/System/Applications",
+            "/System/DriverKit",
+            "/System/Volumes/Preboot",
+            "/System/Volumes/Update",
+            "/System/Volumes/iSCPreboot",
+            "/Library",
+            "/Applications",
+            "/private/etc",
+            "/private/var",
+        ])
+        .collect::<Vec<_>>();
+
+    let mut paths: Vec<PathBuf> = protected.into_iter().map(PathBuf::from).collect();
+    paths.extend([
+        PathBuf::from("/var/lib/docker"),
+        PathBuf::from("/var/run/docker"),
+        PathBuf::from("/run/docker"),
+    ]);
+    if let Some(home) = home {
+        paths.extend([
+            home.join(".docker"),
+            home.join(".config/docker"),
+            home.join(".local/share/docker"),
+            home.join(".local/state/docker"),
+        ]);
+    }
+
+    paths
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|path| workspace.starts_with(&path) || path.starts_with(workspace))
 }
 
 struct Workload<R: Runner> {
@@ -504,7 +551,7 @@ impl<R: Runner> Workload<R> {
             "/home/worker:rw,noexec,nosuid,nodev,size=1g,uid=1000,gid=1000,mode=0700".into(),
             "--mount".into(),
             format!(
-                "type=bind,src={},dst=/workspace,bind-propagation=rprivate",
+                "type=bind,src={},dst=/workspace,bind-propagation=rprivate,bind-recursive=disabled",
                 self.config.workspace.display()
             ),
             // Keep Linux dependency trees and Next build artifacts off the
@@ -1146,6 +1193,38 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn workload_config_rejects_system_and_docker_control_workspaces() {
+        let image = format!("example/workload@sha256:{}", "a".repeat(64));
+        let resolver = std::env::temp_dir().join("nexus-resolver-test");
+        let id = "f".repeat(64);
+        let nonce = "0123456789abcdef";
+
+        #[cfg(unix)]
+        {
+            let system_dir = std::fs::canonicalize("/etc").expect("system config directory");
+            assert!(Config::new(&system_dir, &resolver, &image, nonce, &id).is_err());
+        }
+
+        let root = PathBuf::from(std::env::var_os("HOME").expect("test home directory"))
+            .join(format!(".nexus-workspace-guard-{}", std::process::id()));
+        let home = root.join("home");
+        let project = home.join("project");
+        let docker = home.join(".docker");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&docker).unwrap();
+        let home = std::fs::canonicalize(home).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+        let docker = std::fs::canonicalize(docker).unwrap();
+
+        assert!(is_protected_workspace(&home, Some(&home)));
+        assert!(is_protected_workspace(home.parent().unwrap(), Some(&home)));
+        assert!(is_protected_workspace(&docker, Some(&home)));
+        assert!(!is_protected_workspace(&project, Some(&home)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -1298,7 +1377,7 @@ mod tests {
         );
         assert!(a.contains(&format!("container:{}", "f".repeat(64))));
         assert!(a.iter().any(|x| x.starts_with("type=bind,src=")
-            && x.ends_with(",dst=/workspace,bind-propagation=rprivate")));
+            && x.ends_with(",dst=/workspace,bind-propagation=rprivate,bind-recursive=disabled")));
         assert!(
             a.iter()
                 .any(|x| x.contains("dst=/etc/resolv.conf,readonly"))

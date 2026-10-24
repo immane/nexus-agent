@@ -391,39 +391,35 @@ fn run_child(
             if *eof {
                 continue;
             }
-            loop {
-                let stream_limit = if drain_overflow { stdout_limit } else { limit };
-                let amount = if drain_overflow {
-                    buf.len()
-                } else {
-                    stream_limit
-                        .saturating_add(1)
-                        .saturating_sub(target.len())
-                        .min(buf.len())
-                };
-                match rustix::io::read(fd, &mut buf[..amount]) {
-                    Ok(0) => {
-                        *eof = true;
-                        break;
+            let stream_limit = if drain_overflow { stdout_limit } else { limit };
+            let amount = if drain_overflow {
+                buf.len()
+            } else {
+                stream_limit
+                    .saturating_add(1)
+                    .saturating_sub(target.len())
+                    .min(buf.len())
+            };
+            match rustix::io::read(fd, &mut buf[..amount]) {
+                Ok(0) => *eof = true,
+                Ok(n) => {
+                    let retained = if drain_overflow {
+                        stream_limit
+                            .saturating_add(1)
+                            .saturating_sub(target.len())
+                            .min(n)
+                    } else {
+                        n
+                    };
+                    target.extend_from_slice(&buf[..retained]);
+                    if target.len() > limit && !drain_overflow {
+                        break 'run Err(DockerExecError::Oversized);
                     }
-                    Ok(n) => {
-                        let retained = if drain_overflow {
-                            stream_limit
-                                .saturating_add(1)
-                                .saturating_sub(target.len())
-                                .min(n)
-                        } else {
-                            n
-                        };
-                        target.extend_from_slice(&buf[..retained]);
-                        if target.len() > limit && !drain_overflow {
-                            break 'run Err(DockerExecError::Oversized);
-                        }
-                    }
-                    Err(rustix::io::Errno::AGAIN) => break,
-                    Err(rustix::io::Errno::INTR) => break,
-                    Err(_) => break 'run Err(DockerExecError::Io),
+                    // One bounded read per stream per pass keeps cancellation
+                    // checks and the other pipe responsive under continuous output.
                 }
+                Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => (),
+                Err(_) => break 'run Err(DockerExecError::Io),
             }
         }
         if let (Some(data), Some(fd)) = (input, stdin.as_ref()) {
@@ -682,6 +678,25 @@ mod tests {
             ));
             assert!(start.elapsed() < Duration::from_secs(2));
         }
+    }
+
+    #[test]
+    fn continuous_output_does_not_starve_cancellation() {
+        let f = Fixture::new(
+            "if [ \"$1\" = context ]; then echo unix:///tmp/docker.sock; exit; fi\nyes output",
+        );
+        let mut transport = DockerExecTransport::new(&f.docker(), ID, None).unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            transport.exec_argv(
+                &["yes", "output"],
+                8,
+                started + Duration::from_secs(2),
+                &|| { started.elapsed() >= Duration::from_millis(50) },
+            ),
+            Err(DockerExecError::ExecutionUncertain)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

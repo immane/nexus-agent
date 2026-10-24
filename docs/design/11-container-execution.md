@@ -17,7 +17,7 @@ Current opt-in flow and isolation boundary:
 
 ```mermaid
 flowchart LR
-    Runtime["Runtime + frontend<br/>current local path"]
+    Runtime["Runtime + frontend<br/>local or opt-in container path"]
     Adapters["Feature-gated file/exec adapters"]
     Session["Internal workload session<br/>health gate + lifecycle"]
     DockerCLI["Bounded Docker CLI"]
@@ -46,26 +46,26 @@ The isolation objective is to expose only the selected host workspace, not to pr
 
 The proposed first release covers Linux containers through a local Docker Engine endpoint on Linux or Docker Desktop on macOS, for separately validated architectures. The current workload prototype is arm64-only. It does not add Podman, remote engines, Windows, Kubernetes, arbitrary extra mounts, port publishing, host credentials, external plugins, or live-provider headless support. Rootless Engine is desirable but must pass the same capability tests before being advertised as supported.
 
-The prototype is intentionally kept behind `nexus-tools` features and is not exposed through startup or runtime policy. Do not infer an executable backend from the presence of internal adapters.
+The prototype is kept behind additive Cargo features and is explicitly exposed through TUI/server startup and container-specific runtime policy. Local execution remains the default. Do not infer validated isolation from the existence of this executable backend.
 
 ## Current Implementation and Integration Boundaries
 
 | Existing location | Current responsibility | Proposed change |
 | --- | --- | --- |
 | `crates/nexus-core/src/tool.rs` | `ToolPort`, bounded `ToolContext`, cancellation/deadline and approved scope | Preserve the tool execution port; add only a narrow container-scope representation if existing scope cannot encode it safely |
-| `crates/nexus-runtime/src/policy.rs` | Strict/development authorization; development resolves host paths | Add explicit container authorization without host filesystem canonicalization or host directory grants |
-| `crates/nexus-tools/src/development.rs` | Shared local tool registration for TUI/server | Keep existing factories unchanged; add a feature-gated container factory |
+| `crates/nexus-runtime/src/policy.rs` | Strict/development and feature-gated container authorization | Bind future grants to an environment generation if lifecycle recreation is introduced |
+| `crates/nexus-tools/src/development.rs`, `container*.rs` | Shared local registration plus feature-gated container tool factory and session lifecycle | Keep the adapter boundary narrow; finish restart reconciliation and isolation validation |
 | `crates/nexus-tools/src/fs.rs`, `fs_access/` | Descriptor-bound file operations | Reuse inside a Linux worker rooted at `/workspace`, not on the host |
 | `crates/nexus-tools/src/exec.rs` | Mandatory local OS sandbox | Leave local behavior unchanged; container commands use a separate adapter |
-| `crates/nexus-tools/src/container*.rs`, `src/bin/container-{worker,keeper}.rs` | Feature-gated internal gateway/workload, transport, worker, keeper and ownership prototype | Keep internal until native isolation evidence, restart recovery, and trusted runtime composition are complete |
-| `crates/nexus-tui/src/main.rs` | Startup parsing, session composition, notices | Select backend and own one environment per live session |
-| `crates/nexus-server/src/main.rs`, `server.rs` | CLI, `ToolsMode`, per-session composition/cleanup | Add container wiring under existing authenticated real-tools admission |
+| `crates/nexus-tools/src/container*.rs`, `src/bin/container-{worker,keeper}.rs` | Feature-gated gateway/workload, transport, worker, keeper and ownership prototype | Complete restart recovery and isolation validation before security claims |
+| `crates/nexus-tui/src/main.rs` | Startup parsing, session composition, notices; mode switching is disabled for container sessions | Implement verified workload recreation before supporting read-only mode transitions |
+| `crates/nexus-server/src/main.rs`, `server.rs` | CLI, `ToolsMode`, per-session composition/cleanup under authenticated real-tools admission | Keep container setup off the sessions-map lock and cleanup outside it |
 | `crates/nexus-headless/src/main.rs` | Scripted fake runner | Preserve fake-only behavior; reject container selection rather than implying real execution |
 | `crates/nexus-config` | User/provider/mode configuration | No persistent container configuration required in the first release |
 
 The dependency direction remains frontend composition → concrete tools and runtime; runtime → domain types/shared validation. Runtime must not import Docker adapters. Do not introduce a universal execution framework, plugin registry, or permission DSL.
 
-Current opt-in composition:
+Current opt-in composition (the backend is wired through TUI/server startup and runtime authorization):
 
 ```text
 Host: TUI / authenticated loopback server
@@ -86,18 +86,18 @@ Host: TUI / authenticated loopback server
                           public internet
 ```
 
-This remains the target composition, not the current runtime call graph. The
-current internal prototype topology and not-wired boundary are shown in the
-[repository architecture diagram](../../README.md#architecture). The gateway
+This is the current opt-in composition. The
+[repository architecture diagram](../../README.md#architecture) also shows
+the local default and the experimental container path. The gateway
 prototype is intended to enforce outbound restrictions that a normal bridge
 does not provide; it is not a generic orchestration service and its policy has
 not passed the native Linux gate.
 
 ## Build and Distribution
 
-Local remains an unconditional capability. `nexus-tools` currently has `container`, `container-worker`, and `container-keeper` features, but the frontend crates do not forward these features and contain no backend-selection wiring. A future integration must add explicit frontend gates rather than assuming a dependency feature enables frontend support.
+Local remains an unconditional capability. `nexus-tools` provides `container`, `container-worker`, and `container-keeper` features; TUI and server forward the opt-in `container` feature and expose backend selection at startup. The default build remains local-only.
 
-The `container-worker` feature and required-feature worker binary exist in `nexus-tools`; `container-keeper` adds the keeper target. The workload image builds both Linux executables in its digest-pinned musl/Alpine builder stage. The host frontend does not enable these targets, and no frontend feature forwarding exists. The image defaults currently pin arm64 manifests; do not claim amd64 support.
+The `container-worker` feature and required-feature worker binary exist in `nexus-tools`; `container-keeper` adds the keeper target. The workload image builds both Linux executables in its digest-pinned musl/Alpine builder stage. The image defaults currently pin arm64 manifests; do not claim amd64 support.
 
 Verified prototype build (not a release command):
 
@@ -109,7 +109,7 @@ docker buildx build --platform linux/arm64 --load \
 
 This build succeeded on Docker Desktop using the pinned image manifests and Rust 1.99.0 musl toolchain. The Alpine CA package version is pinned, but repository availability and complete build reproducibility are not guaranteed. See [`containers/workload/README.md`](../../containers/workload/README.md).
 
-Proposed commands, valid only after implementation:
+Current build commands (the combined feature build is experimental):
 
 ```sh
 # Local-only artifacts, unchanged default capability.
@@ -128,7 +128,7 @@ Record executable size, dependency closure, build time, warm local startup, cont
 
 ## Startup Interface and Compatibility
 
-Not implemented; proposed CLI only:
+Implemented experimental CLI (feature-gated; not a release workflow):
 
 ```sh
 nexus-tui --execution local --tools-root /absolute/project
@@ -138,7 +138,7 @@ nexus-server --tools real --execution container \
   --tools-root /absolute/project --auth-token-env NEXUS_SERVER_TOKEN
 ```
 
-`--execution local|container` defaults to `local`. Omission preserves existing local, fake/demo, and strict-tools behavior. Container selection uses `--tools-root` when supplied and otherwise defaults to the current working directory, matching local mode. The server additionally requires `--tools real`; `--tools fake --execution container` is a usage error. `--strict-tools --execution container` is a usage error initially, rather than an ignored safety flag. Unknown values, missing values, and contradictory/repeated execution selections are rejected before side effects.
+`--execution local|container` defaults to `local`. Omission preserves existing local, fake/demo, and strict-tools behavior. Container selection uses `--tools-root` when supplied and otherwise defaults to the current working directory, matching local mode. The server additionally requires `--tools real`; `--tools fake --execution container` is a usage error. `--strict-tools --execution container` is rejected rather than silently ignored. Unknown values, missing values, and contradictory/repeated execution selections are rejected before side effects.
 
 A local-only binary recognizes a container request and returns a clear unsupported-build error with the feature/build remedy. It never substitutes local execution or fake tools. Container-only options with local execution are rejected.
 
@@ -150,16 +150,17 @@ The TUI shows a persistent `LOCAL` or `CONTAINER` indicator and container readin
 
 ## Filesystem Exposure and Paths
 
-The following describes the intended integration contract, not a guarantee of
-the uncomposed adapters. The prototype canonicalizes the selected workspace,
+The following describes the integration contract, not a guarantee of
+isolation. The prototype canonicalizes the selected workspace,
 rejects its comma/control-character mount forms, and binds it read/write at
 `/workspace`; worker file operations are rooted there. Host socket/device
 scanning, adversarial concurrent mount insertion defense, runtime path-scope
-authorization, and frontend display/approval are not complete.
+authorization, and frontend display are implemented; operating-system isolation
+and adversarial concurrent mount insertion remain unvalidated.
 
 The only user-data bind is the canonical selected directory at `/workspace`, writable for build sessions. Reject the host root, the user's home itself, container-engine control directories, and broad system directories. Validate an existing absolute directory and present the canonical selection before preparation. A project may still contain credentials; canonicalization is not secret detection.
 
-Prefer explicit `--mount` construction, reject input that cannot be safely represented by the selected CLI encoding, and test commas, spaces, quotes, newlines, and leading dashes. Do not interpolate paths into a shell. Disable recursive inclusion of nested host mounts where supported; otherwise fail the isolation capability check. Keep private propagation. Reject unsafe socket/device exposure inside the workspace, including daemon/agent sockets, and do not claim a one-time traversal prevents concurrent insertion. Strict protection against a hostile host concurrently inserting sockets, special files, mounts, or hard links requires a staged workspace or stronger mediation and is outside the live-bind guarantee.
+The workload uses explicit `--mount` construction with `bind-recursive=disabled` and private propagation; an engine that does not support the option fails container creation. Paths containing commas/control characters are rejected, and arguments are not interpolated through a shell. This does not prevent a hostile host from concurrently inserting sockets, special files, mounts, or hard links; strict protection requires a staged workspace or stronger mediation and is outside the live-bind guarantee.
 
 Reject remote Docker endpoints. Resolve and pin one operator-authorized local context/endpoint for the session; Docker Desktop's local VM is supported only through its validated host-sharing mechanism. Do not inherit arbitrary `DOCKER_HOST`, `DOCKER_CONTEXT`, proxy, or credential-helper settings from model/tool input. Reuse only explicitly trusted host Docker configuration needed for local endpoint authentication and image pulls. Never pass that configuration into the workload.
 
@@ -173,7 +174,7 @@ Known local protected-path guards are not a secret barrier in this mode: arbitra
 
 ## Runtime Authorization
 
-No container-specific runtime authorization exists yet. The following remains a proposal: add an explicit container policy bound by trusted composition to a live environment identity and immutable workspace mapping. It should auto-authorize only the host-registered, supported revisions of the six built-in read/list/search/write/patch/exec tools after schema and scope validation. Neither a tool name alone, an external descriptor, nor a model argument may opt into it.
+Container-specific runtime authorization is implemented for trusted host-registered revisions of the built-in read/list/search/write/patch/exec tools, with schema validation and the fixed `/workspace` scope. Neither a tool name alone, an external descriptor, nor a model argument opts into it. The current implementation does not yet bind authorization to a generation-specific environment identity, and mode switching does not recreate the workload read-only; container mode therefore disables TUI mode switching until that lifecycle is implemented.
 
 | Agent mode / tool | Container policy |
 | --- | --- |
@@ -308,7 +309,7 @@ Add explicit worker-target compilation/testing inside each supported Linux image
 
 Current startup selection is deliberately explicit and opt-in, while remaining an experimental interface: `--execution container` requires a container-enabled build and immutable image references; the workspace is `--tools-root` or cwd by default (the server additionally requires `--tools real` and its normal authentication token). Keep the unvalidated-isolation warning next to every user-facing description. User documentation must not suggest secure isolation, restart recovery, or a supported release workflow.
 
-Before release, obtain explicit approval for the proposed Docker-only scope, pinned default image/toolchain, trusted gateway with namespace NET_ADMIN, internet-only restrictions versus private-network workflows, non-root/user-package-only installation, local secret-guard behavior difference, and mode-switch loss of container-local state. These are material product/security choices that were not all decided by the initial request. If a choice changes, revise the relevant enforcement and acceptance criteria, not just the wording.
+Before release, obtain explicit approval for the proposed Docker-only scope, pinned default image/toolchain, trusted gateway with namespace NET_ADMIN, internet-only restrictions versus private-network workflows, and non-root/user-package-only installation. The local secret-guard behavior differs in container mode and must remain clearly disclosed. TUI mode switching is currently disabled in container sessions; any future re-enablement requires verified termination and read-only workload recreation, including a decision on container-local state loss. These are material product/security choices; if a choice changes, revise enforcement and acceptance criteria, not just wording.
 
 ## References
 

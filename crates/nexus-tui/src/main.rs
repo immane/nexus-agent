@@ -130,7 +130,6 @@ struct SessionConfig {
     /// with the template so every slot shares the startup wiring while
     /// keeping its own runtime and selection.
     tools_root: Option<std::path::PathBuf>,
-    tools_root_explicit: bool,
     strict_tools: bool,
     execution: ExecutionMode,
     gateway_image: Option<String>,
@@ -185,7 +184,6 @@ fn load_session_config() -> io::Result<SessionConfig> {
     session.tools_root = resolve_tools_root(args.tools_root);
     session.demo = args.demo;
     session.strict_tools = args.strict_tools;
-    session.tools_root_explicit = args.tools_root_explicit;
     session.execution = args.execution;
     session.gateway_image = args.gateway_image;
     session.workload_image = args.workload_image;
@@ -263,7 +261,6 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
         user_config: shared_user_config(config, path),
         active_model,
         tools_root: None,
-        tools_root_explicit: false,
         strict_tools: false,
         execution: ExecutionMode::Local,
         gateway_image: None,
@@ -314,7 +311,6 @@ struct StartupArgs {
     /// the working directory by default; `None` (tests only) keeps every
     /// tool scripted. Development writes in this root are automatic.
     tools_root: Option<std::path::PathBuf>,
-    tools_root_explicit: bool,
     /// Serve the scripted demo wiring (fake provider/tools, canned
     /// submission). The dev-version default is off.
     demo: bool,
@@ -388,7 +384,6 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
         }
     }
     StartupAction::Run(StartupArgs {
-        tools_root_explicit: tools_root.is_some(),
         tools_root,
         demo,
         strict_tools,
@@ -839,10 +834,10 @@ fn build_live_runtime(
         ExecutionMode::Container => {
             #[cfg(feature = "container")]
             {
-                if !session_config.tools_root_explicit || session_config.strict_tools {
+                if session_config.tools_root.is_none() || session_config.strict_tools {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "container execution requires an explicit workspace and development policy",
+                        "container execution requires a workspace and development policy",
                     ));
                 }
                 Policy::container()
@@ -1182,6 +1177,7 @@ struct Frontend {
     /// right after [`Frontend::with_config`] and refresh it on every
     /// model switch so the next run resolves the new selection.
     live: Option<LiveHandle>,
+    execution: ExecutionMode,
     /// Queued `:session` intents in recording order: key handling appends on
     /// the active front, and the loop drains them against the registry after
     /// the batch, where runtimes can be built. At most one push per Enter
@@ -1211,6 +1207,7 @@ impl Frontend {
             run_models: HashMap::new(),
             demo: false,
             live: None,
+            execution: ExecutionMode::Local,
             pending_session_cmds: Vec::new(),
             pointer_press: None,
             g_pending: false,
@@ -1343,6 +1340,7 @@ impl Frontend {
         tools_root: Option<&std::path::Path>,
         execution: ExecutionMode,
     ) {
+        self.execution = execution;
         self.live = Some(live);
         self.sync_live_binding();
         let message = {
@@ -2717,7 +2715,13 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             // Composer-only binding: the mode gates the next submit. No
             // transcript entry is added; the composer border and title
             // already report the switch where the user is looking.
-            front.state.cycle_mode();
+            if front.execution == ExecutionMode::Container {
+                front
+                    .state
+                    .notice("mode switching is unavailable in container execution");
+            } else {
+                front.state.cycle_mode();
+            }
         }
         Action::ParkFocus => {
             front.state.clear_text_selection();
@@ -4679,7 +4683,6 @@ mod cov_main_topup {
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
-            tools_root_explicit: false,
             demo: false,
             strict_tools: true,
             execution: ExecutionMode::Local,
@@ -4724,7 +4727,6 @@ mod cov_main_topup {
             user_config: shared_user_config(config, None),
             active_model,
             tools_root: None,
-            tools_root_explicit: false,
             demo: false,
             strict_tools: true,
             execution: ExecutionMode::Local,
@@ -5612,6 +5614,25 @@ mod cov_main_topup {
         );
         assert!(!front.state.approval_detail_open(), "Esc never decides");
         assert_eq!(front.request_counter, 0, "no focus key issues a command");
+    }
+
+    #[tokio::test]
+    async fn container_execution_refuses_mode_switching() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        let mut front = Frontend::new(session());
+        front.execution = ExecutionMode::Container;
+        front.focus = Focus::Composer;
+        let before = front.state.mode().id.clone();
+
+        assert!(!handle_key(&mut front, &runtime, press(KeyCode::Tab)).await);
+        assert_eq!(front.state.mode().id, before);
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|entry| entry.contains("mode switching is unavailable"))
+        );
     }
 
     #[tokio::test]
@@ -6793,7 +6814,6 @@ mod cov_live_wiring {
         ])) {
             StartupAction::Run(parsed) => {
                 assert_eq!(parsed.execution, ExecutionMode::Container);
-                assert!(parsed.tools_root_explicit);
                 assert!(validate_execution_args(&parsed, true, true).is_ok());
             }
             StartupAction::Usage => panic!("complete container options should parse"),
@@ -6809,7 +6829,6 @@ mod cov_live_wiring {
             StartupAction::Run(parsed) => parsed,
             StartupAction::Usage => panic!("container images should parse without a root flag"),
         };
-        assert!(!current_directory_default.tools_root_explicit);
         assert!(validate_execution_args(&current_directory_default, true, true).is_ok());
     }
 
@@ -7133,7 +7152,6 @@ mod cov_live_wiring {
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: Some(missing),
-            tools_root_explicit: true,
             demo: false,
             strict_tools: true,
             execution: ExecutionMode::Local,
@@ -7161,7 +7179,6 @@ mod cov_live_wiring {
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
-            tools_root_explicit: false,
             demo: false,
             strict_tools: true,
             execution: ExecutionMode::Local,
