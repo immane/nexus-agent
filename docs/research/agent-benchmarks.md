@@ -42,6 +42,7 @@ has been independently validated.
 |---|---|---|---|---|
 | [SWE-bench Lite](https://www.swebench.com/lite.html) | Real GitHub issue repair, judged by tests; narrower and more directly relevant to coding than general computer-use suites. | Not plug-and-play. Build a task adapter that launches a live Nexus agent, captures the final repository diff, and writes one prediction JSONL row per instance. Use the official harness for scoring. | Docker images, disk, CPU/RAM, and model tokens; start with a few pinned instances and one worker. Evaluator infrastructure is separate from agent success. | Best first external task benchmark after adapter and safe runner exist. |
 | [Terminal-Bench](https://github.com/harbor-framework/terminal-bench) 4.0 | Diverse terminal tasks with explicit success criteria; useful for shell/tool-use breadth, not exclusively code changes. | Harbor documents a generic ACP integration. Nexus has no ACP entry point in this repository, so an ACP-compatible agent adapter is required. Alternatively implement a reviewed Harbor agent integration. | Some tasks use GPUs or multiple containers. The project README recommends testing oracle solutions repeatedly and describes hosted environments for scale. API and hosted compute can cost money. | Strong second benchmark; start with a small task subset and pinned release, not the whole moving `latest` dataset. |
+| [Harness-Bench](https://www.harness-bench.ai/) | Paired evaluation of model–harness configurations on broad, realistic workflows; includes 81 software-engineering tasks but is not a coding-only benchmark. | Nexus is not one of the published harness configurations. The upstream runner lists seven named harnesses and would need a dedicated Nexus integration, image, and trace/artifact mapping. | The paper reports 300 tasks and 20,454 configuration-task evaluations, with 200K input-context and 150-turn limits. Full reproduction is a substantial model/compute effort; begin with a pinned small pilot. | Valuable follow-up for harness effects and complete-delivery behavior, after integration and safe execution are independently validated. |
 | Existing `tools/perf/startup.py` | Fresh-process spawn-to-exit timing only. | Directly runnable against a built binary. | No model calls. Not first-interactive startup, end-to-end task quality, or reliable RSS attribution. | Run as a local performance metric, never as an agent-quality score. |
 
 SWE-bench Verified is a human-validated 500-instance subset, but it is larger
@@ -49,6 +50,82 @@ than Lite and retains the same patch-generation/integration work. Consider it
 only after the small-sample pipeline is stable. The complete SWE-bench suite
 and Terminal-Bench's full evolving task set are not sensible first debugging
 targets.
+
+## Harness-Bench assessment
+
+**Research snapshot: 2026-10-24.** Harness-Bench is a third-party benchmark and
+reusable evaluation pipeline for measuring how native agent harnesses affect
+delivery across model backends. Its paper is an arXiv preprint (v2 dated
+2026-10-15); the following description reflects the cited paper, project
+repository, and website, not an independent replication.
+
+### Suite and scoring
+
+- The published suite contains 300 sandboxed workflow tasks: 274 general and
+  26 multimodal, organized into six work categories and 17 subcategories. The
+  general suite includes 81 software-engineering tasks (implementation/repair
+  and repository maintenance); other categories cover business operations,
+  systems engineering, research and analysis, web development, and content
+  production.
+- Each task defines resources, deliverables, and constraints. Task-specific
+  hidden oracles check final artifacts/workspace state in weighted modules;
+  safety and risk gates can zero the task score. The project describes
+  deterministic module checks rather than a general LLM judge, with bounded
+  semantic fallback only where a task explicitly declares one.
+- The paper reports seven native harnesses and ten model backends on general
+  tasks, and seven model backends on multimodal tasks: 20,454
+  configuration-task evaluations. It reports mean score, the share scoring at
+  least 0.80 (R0.8), full-credit rate (R1), trajectory/request/token usage, and
+  provider-price estimates. Its execution settings use a 200K input-context
+  threshold and a 150-turn limit; each configuration-task pair is run once.
+- Published findings are third-party claims: harness rankings vary by model and
+  delivery metric, and higher expenditure does not always produce better
+  delivery. The paper also analyzes partial work that appears internally
+  consistent but omits a required artifact or evidence.
+
+### Relevance to Nexus
+
+Harness-Bench complements SWE-bench Lite. SWE-bench tests repository issue
+repair against project tests; Harness-Bench asks how a whole model–harness
+configuration completes varied workflows and produces verifiable final
+artifacts. Its full-credit metric and trajectory analysis are relevant to
+Nexus's observed distinction between a correct patch and a normally completed,
+cleanly delivered run. Its broader tasks could also reveal behavior not covered
+by code-repair benchmarks.
+
+It is **not** a drop-in score for this repository. The published lineup includes
+a harness named OpenCode, but that result does not represent Nexus Agent and
+must not be attributed to it. Nexus would need a first-class upstream-compatible
+runner integration that preserves its native prompting, tools, context policy,
+recovery behavior, and run limits while exporting the benchmark's required
+artifacts and traces. A wrapper that substitutes the scripted `nexus-headless`
+fake provider would not be a valid live-agent evaluation.
+
+### Limitations and pilot recommendation
+
+- The public leaderboard and paper summarize upstream configurations; they do
+  not establish Nexus performance. In particular, their Qwen results are not a
+  controlled comparison with Nexus's configured quantized local model, task
+  selection, tool environment, or budget.
+- A full run is large (20,454 reported evaluations), and the published paper
+  includes provider-price estimates for hosted models. Do not launch a full
+  reproduction without a pinned revision, explicit budget, and a validated
+  runner. Start with task-oracle validation and one or a few preselected tasks;
+  record valid, failed, and infrastructure-invalid runs separately.
+- The upstream site/repository description is not independent evidence of task
+  validity or reproducibility. Before use, pin the repository commit, task-set
+  lock, harness images, evaluator, model identity, and configuration; verify
+  licenses and task/oracle access requirements for the selected materials.
+- The benchmark's sandbox does not validate Nexus's container prototype as a
+  security boundary. Run untrusted tasks in a disposable, independently
+  validated Linux VM/runner without credentials or valuable host mounts.
+
+**Recommendation:** add Harness-Bench to the candidate set for a later
+harness-level evaluation, not as a replacement for the current SWE-bench Lite
+pilot. First stabilize Nexus task-runner completion, trace capture, and resource
+cleanup. Then assess the upstream integration contract and licenses before
+committing to even a small live-model pilot. No Harness-Bench tasks have been
+run by Nexus as of this snapshot.
 
 ## Current project constraints
 
@@ -586,6 +663,9 @@ possible later use.
 - [Terminal-Bench repository](https://github.com/harbor-framework/terminal-bench): task benchmark and Harbor usage; README recommends running oracle solutions repeatedly before evaluating an agent.
 - [Terminal-Bench 4.0 announcement](https://www.tbench.ai/news/terminal-bench-4-0): resource calibration, task fixes, saturated-task removal, and remaining sources of evaluation error.
 - [Harbor ACP documentation](https://www.harborframework.com/docs/agents/acp): registry and local ACP agent integration, credential forwarding, and run artifacts.
+- [Harness-Bench paper, arXiv:2605.27922v2](https://arxiv.org/abs/2605.27922v2): task construction, module-level scoring, model–harness comparisons, limits, and analysis.
+- [Harness-Bench project website](https://www.harness-bench.ai/): task taxonomy, methodology summary, and published leaderboard.
+- [Harness-Bench source repository](https://github.com/Qihoo360/harness-bench): runner, task catalog, evaluator, and operational documentation; pin a commit before any reproduction.
 - [Token-consumption study on SWE-bench Verified](https://arxiv.org/abs/2604.22750): agentic token usage, input-token dominance, model differences, and run-to-run variability; results are from OpenHands, not Nexus.
 - [Public Terminal-Bench 4.0 Harbor run](https://hub.harborframework.com/jobs/3de0aee9-6de7-4d94-83c4-ac5e789fe757) and [second model run](https://hub.harborframework.com/jobs/a5758f1a-9ef2-4100-9893-34a99c99bd9c): observed tokens and cost for specific 330-trial runs.
 - Project context: [`tools/perf/README.md`](../../tools/perf/README.md), [`docs/design/05-performance.md`](../design/05-performance.md), and [`QUICKSTART.md`](../../QUICKSTART.md).
