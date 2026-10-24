@@ -36,8 +36,8 @@ fn run<R: io::Read, W: io::Write>(
         "host_read" => Arc::new(ScopedReader::with_root(Path::new("/workspace"))?),
         "host_list" => Arc::new(ScopedLister::with_root(Path::new("/workspace"))?),
         "host_search" => Arc::new(ScopedSearcher::with_root(Path::new("/workspace"))?),
-        "host_write" => Arc::new(ScopedWriter::with_root(Path::new("/workspace"))?),
-        "host_patch" => Arc::new(ScopedPatcher::with_root(Path::new("/workspace"))?),
+        "host_write" => Arc::new(ScopedWriter::with_container_root(Path::new("/workspace"))?),
+        "host_patch" => Arc::new(ScopedPatcher::with_container_root(Path::new("/workspace"))?),
         _ => return Err("unknown operation".into()),
     };
     let spec = port.describe();

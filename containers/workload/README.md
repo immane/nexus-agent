@@ -29,6 +29,15 @@ makes the keeper exit with status 2. Both local `sha256:<image-id>` references
 and `repository@sha256:<digest>` references use the gateway's immutable-image
 validation. Mutable tags are not accepted.
 
+The container worker uses a container-specific replacement-metadata policy for
+workspace writes and patches. If the mounted filesystem explicitly reports
+Linux xattrs or inode flags as unsupported (as Docker Desktop's `fakeowner`
+mount does), replacement proceeds atomically while preserving mode bits and
+all metadata the filesystem exposes. Unsupported xattrs/flags cannot be copied
+through that filesystem; local host file tools retain the stricter fail-closed
+policy. This is a compatibility limitation, not a claim that host metadata is
+fully preserved by every Docker sharing backend.
+
 If server session creation returns `503 container environment is unavailable`,
 check the host server's stderr for `container environment preparation failed`.
 Workload failures name the preparation stage (configuration, creation,

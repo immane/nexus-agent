@@ -720,9 +720,25 @@ pub struct ScopedPatcher {
 impl ScopedPatcher {
     /// Bind the tool to an existing directory root.
     pub fn with_root(root: &Path) -> Result<Self, AgentError> {
+        Self::with_root_policy(root, false)
+    }
+
+    /// Container workspaces may be backed by shared filesystems that report
+    /// Linux metadata features as unsupported. Preserve all metadata the
+    /// filesystem exposes, but allow those explicitly unsupported features.
+    #[cfg(feature = "container-worker")]
+    pub fn with_container_root(root: &Path) -> Result<Self, AgentError> {
+        Self::with_root_policy(root, true)
+    }
+
+    fn with_root_policy(root: &Path, container_workspace: bool) -> Result<Self, AgentError> {
         let root = canonical_root(root)?;
-        let access = BoundRoot::open(&root)
-            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
+        let access = (if container_workspace {
+            BoundRoot::open_container_workspace(&root)
+        } else {
+            BoundRoot::open(&root)
+        })
+        .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
         let spec = ToolSpec::new(
             ToolId::new(HOST_PATCH_TOOL, M0_REVISION).expect("static tool identity builds"),
             "Replace one unique exact text occurrence in an existing UTF-8 file inside the tool root. Requires approval.",
@@ -857,6 +873,7 @@ impl ScopedPatcher {
             &source,
             stamp,
             replacement.as_bytes(),
+            self.access.replacement_metadata(),
             || context.check_active().is_err(),
         )
         .map_err(|error| {
@@ -1019,6 +1036,18 @@ impl ScopedWriter {
     /// Binds the jail to `root`, canonicalized once. Fails when the root
     /// cannot be canonicalized or is not a directory.
     pub fn with_root(root: &Path) -> Result<Self, AgentError> {
+        Self::with_root_policy(root, false)
+    }
+
+    /// Container workspaces may be backed by shared filesystems that report
+    /// Linux metadata features as unsupported. Preserve all metadata the
+    /// filesystem exposes, but allow those explicitly unsupported features.
+    #[cfg(feature = "container-worker")]
+    pub fn with_container_root(root: &Path) -> Result<Self, AgentError> {
+        Self::with_root_policy(root, true)
+    }
+
+    fn with_root_policy(root: &Path, container_workspace: bool) -> Result<Self, AgentError> {
         let root = std::fs::canonicalize(root)
             .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
         if !root.is_dir() {
@@ -1027,8 +1056,12 @@ impl ScopedWriter {
                 "tool root is invalid",
             ));
         }
-        let access = BoundRoot::open(&root)
-            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
+        let access = (if container_workspace {
+            BoundRoot::open_container_workspace(&root)
+        } else {
+            BoundRoot::open(&root)
+        })
+        .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tool root is invalid"))?;
         let spec = ToolSpec::new(
             ToolId::new(HOST_WRITE_TOOL, M0_REVISION).expect("static tool identity builds"),
             "Write a file inside the tool root, creating it when missing and replacing its whole content otherwise. Parent directories must already exist. Takes exactly {\"path\": \"notes/todo.txt\", \"content\": \"...\"}.",
@@ -1155,6 +1188,7 @@ impl ScopedWriter {
                     &source,
                     stamp,
                     content.as_bytes(),
+                    self.access.replacement_metadata(),
                     || context.check_active().is_err(),
                 )
                 .map_err(|error| {

@@ -21,10 +21,28 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct BoundRoot {
     path: PathBuf,
     directory: File,
+    replacement_metadata: ReplacementMetadata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplacementMetadata {
+    RequireAll,
+    AllowUnsupported,
 }
 
 impl BoundRoot {
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_replacement_metadata(path, ReplacementMetadata::RequireAll)
+    }
+
+    pub(crate) fn open_container_workspace(path: &Path) -> io::Result<Self> {
+        Self::open_with_replacement_metadata(path, ReplacementMetadata::AllowUnsupported)
+    }
+
+    fn open_with_replacement_metadata(
+        path: &Path,
+        replacement_metadata: ReplacementMetadata,
+    ) -> io::Result<Self> {
         let canonical = std::fs::canonicalize(path)?;
         if !canonical.is_dir() {
             return Err(io::Error::new(
@@ -45,7 +63,12 @@ impl BoundRoot {
         Ok(Self {
             path: canonical,
             directory,
+            replacement_metadata,
         })
+    }
+
+    pub(crate) fn replacement_metadata(&self) -> ReplacementMetadata {
+        self.replacement_metadata
     }
 
     pub(crate) fn open_file(&self, path: &Path) -> io::Result<File> {
@@ -196,6 +219,7 @@ pub(crate) fn replace_existing(
     source: &File,
     expected: FileStamp,
     content: &[u8],
+    replacement_metadata: ReplacementMetadata,
     cancelled: impl Fn() -> bool,
 ) -> io::Result<()> {
     let expected = expected.validate_replaceable()?;
@@ -211,7 +235,7 @@ pub(crate) fn replace_existing(
     let mut replacement = temporary.file;
     replacement.set_len(0)?;
     replacement.write_all(content)?;
-    preserve_metadata(source, &replacement, expected)?;
+    preserve_metadata(source, &replacement, expected, replacement_metadata)?;
     if FileStamp::read(source)? != expected {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -360,7 +384,12 @@ impl Drop for TempCleanup {
 }
 
 #[cfg(target_os = "macos")]
-fn preserve_metadata(_source: &File, _replacement: &File, _stamp: FileStamp) -> io::Result<()> {
+fn preserve_metadata(
+    _source: &File,
+    _replacement: &File,
+    _stamp: FileStamp,
+    _metadata_policy: ReplacementMetadata,
+) -> io::Result<()> {
     // `fclonefileat` creates the staged copy with the source file's metadata,
     // ACLs, extended attributes, and platform flags. Unsupported filesystems
     // fail the clone and therefore fail closed.
@@ -368,7 +397,12 @@ fn preserve_metadata(_source: &File, _replacement: &File, _stamp: FileStamp) -> 
 }
 
 #[cfg(target_os = "linux")]
-fn preserve_metadata(source: &File, replacement: &File, stamp: FileStamp) -> io::Result<()> {
+fn preserve_metadata(
+    source: &File,
+    replacement: &File,
+    stamp: FileStamp,
+    metadata_policy: ReplacementMetadata,
+) -> io::Result<()> {
     use rustix::buffer::spare_capacity;
     use rustix::fs::{
         Gid, IFlags, Uid, XattrFlags, fchmod, fchown, fgetxattr, flistxattr, fsetxattr,
@@ -383,40 +417,57 @@ fn preserve_metadata(source: &File, replacement: &File, stamp: FileStamp) -> io:
     .map_err(io::Error::from)?;
 
     let mut names = Vec::with_capacity(MAX_XATTR_BYTES);
-    let names_len = flistxattr(source, spare_capacity(&mut names)).map_err(io::Error::from)?;
-    if names_len > MAX_XATTR_BYTES {
+    let names_len = match flistxattr(source, spare_capacity(&mut names)) {
+        Ok(length) => Some(length),
+        Err(error) if unsupported_metadata_error(error) => {
+            if metadata_policy == ReplacementMetadata::AllowUnsupported {
+                None
+            } else {
+                return Err(error.into());
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if names_len.is_some_and(|length| length > MAX_XATTR_BYTES) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file metadata exceeds its bound",
         ));
     }
-    let names = names.as_slice();
-    for raw_name in names
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-    {
-        let name = std::str::from_utf8(raw_name).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "unsupported attribute name")
-        })?;
-        if name == "security.capability" {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "capability-bearing files cannot be replaced",
-            ));
+    if names_len.is_some() {
+        for raw_name in names
+            .as_slice()
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            let name = std::str::from_utf8(raw_name).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "unsupported attribute name")
+            })?;
+            if name == "security.capability" {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "capability-bearing files cannot be replaced",
+                ));
+            }
+            let mut value = Vec::with_capacity(MAX_XATTR_BYTES);
+            let value_len =
+                fgetxattr(source, name, spare_capacity(&mut value)).map_err(io::Error::from)?;
+            if value_len > MAX_XATTR_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file metadata exceeds its bound",
+                ));
+            }
+            fsetxattr(replacement, name, &value, XattrFlags::empty()).map_err(io::Error::from)?;
         }
-        let mut value = Vec::with_capacity(MAX_XATTR_BYTES);
-        let value_len =
-            fgetxattr(source, name, spare_capacity(&mut value)).map_err(io::Error::from)?;
-        if value_len > MAX_XATTR_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "file metadata exceeds its bound",
-            ));
-        }
-        fsetxattr(replacement, name, &value, XattrFlags::empty()).map_err(io::Error::from)?;
     }
     fchmod(replacement, Mode::from_raw_mode(stamp.mode & 0o7777)).map_err(io::Error::from)?;
-    let flags = ioctl_getflags(source).map_err(io::Error::from)?;
+    let Some(flags) = copyable_file_flags(ioctl_getflags(source), metadata_policy)? else {
+        // When an explicitly configured container workspace uses a filesystem
+        // that exposes no Linux inode flags, retain atomic replacement and let
+        // that filesystem enforce its own rename rules. Host tools stay strict.
+        return Ok(());
+    };
     if flags.intersects(IFlags::IMMUTABLE | IFlags::APPEND) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -426,8 +477,39 @@ fn preserve_metadata(source: &File, replacement: &File, stamp: FileStamp) -> io:
     ioctl_setflags(replacement, flags).map_err(io::Error::from)
 }
 
+#[cfg(target_os = "linux")]
+fn copyable_file_flags(
+    result: Result<rustix::fs::IFlags, rustix::io::Errno>,
+    policy: ReplacementMetadata,
+) -> io::Result<Option<rustix::fs::IFlags>> {
+    match result {
+        Ok(flags) => Ok(Some(flags)),
+        Err(error) if unsupported_metadata_error(error) => {
+            if policy == ReplacementMetadata::AllowUnsupported {
+                Ok(None)
+            } else {
+                Err(error.into())
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unsupported_metadata_error(error: rustix::io::Errno) -> bool {
+    matches!(
+        error,
+        rustix::io::Errno::NOTTY | rustix::io::Errno::OPNOTSUPP
+    )
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn preserve_metadata(_source: &File, _replacement: &File, _stamp: FileStamp) -> io::Result<()> {
+fn preserve_metadata(
+    _source: &File,
+    _replacement: &File,
+    _stamp: FileStamp,
+    _metadata_policy: ReplacementMetadata,
+) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "file replacement metadata is unsupported on this platform",
@@ -460,7 +542,7 @@ fn open_absolute_directory(path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundRoot, FileStamp, create_new, replace_existing};
+    use super::{BoundRoot, FileStamp, ReplacementMetadata, create_new, replace_existing};
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -500,6 +582,23 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(&root.0).expect("directory reads").count(),
             0
+        );
+    }
+
+    #[test]
+    fn container_roots_allow_only_explicitly_unsupported_replacement_metadata() {
+        let root = TempRoot::new();
+        assert_eq!(
+            BoundRoot::open(&root.0)
+                .expect("strict root binds")
+                .replacement_metadata(),
+            ReplacementMetadata::RequireAll
+        );
+        assert_eq!(
+            BoundRoot::open_container_workspace(&root.0)
+                .expect("container root binds")
+                .replacement_metadata(),
+            ReplacementMetadata::AllowUnsupported
         );
     }
 
@@ -595,6 +694,7 @@ mod tests {
             &source,
             stamp,
             b"our replacement",
+            ReplacementMetadata::RequireAll,
             || {
                 std::fs::write(&path, b"external update").expect("concurrent update writes");
                 false
@@ -628,6 +728,7 @@ mod tests {
             &source,
             stamp,
             b"replacement",
+            ReplacementMetadata::RequireAll,
             || {
                 assert!(
                     std::fs::read_dir(&root.0).expect("directory reads").count() > 1,
@@ -647,6 +748,33 @@ mod tests {
             std::fs::read_dir(&root.0).expect("directory reads").count(),
             1,
             "the staged temporary is cleaned up"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_inode_flag_ioctl_is_optional_but_other_errors_fail_closed() {
+        use super::copyable_file_flags;
+        use rustix::fs::IFlags;
+        use rustix::io::Errno;
+
+        assert_eq!(
+            copyable_file_flags(Ok(IFlags::empty())).unwrap(),
+            Some(IFlags::empty())
+        );
+        assert!(copyable_file_flags(Err(Errno::NOTTY), ReplacementMetadata::RequireAll).is_err());
+        assert!(
+            copyable_file_flags(Err(Errno::NOTTY), ReplacementMetadata::AllowUnsupported)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            copyable_file_flags(Err(Errno::OPNOTSUPP), ReplacementMetadata::AllowUnsupported)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            copyable_file_flags(Err(Errno::IO), ReplacementMetadata::AllowUnsupported).is_err()
         );
     }
 }
