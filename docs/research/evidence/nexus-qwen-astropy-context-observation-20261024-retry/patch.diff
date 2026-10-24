@@ -1,0 +1,63 @@
+diff --git a/astropy/modeling/separable.py b/astropy/modeling/separable.py
+index a308e27297..45bea36085 100644
+--- a/astropy/modeling/separable.py
++++ b/astropy/modeling/separable.py
+@@ -242,7 +242,7 @@ def _cstack(left, right):
+         cright = _coord_matrix(right, 'right', noutp)
+     else:
+         cright = np.zeros((noutp, right.shape[1]))
+-        cright[-right.shape[0]:, -right.shape[1]:] = 1
++        cright[-right.shape[0]:, -right.shape[1]:] = right
+ 
+     return np.hstack([cleft, cright])
+ 
+diff --git a/repro.py b/repro.py
+new file mode 100644
+index 0000000000..34f98a644b
+--- /dev/null
++++ b/repro.py
+@@ -0,0 +1,12 @@
++from astropy.modeling import models as m
++from astropy.modeling.separable import separability_matrix
++
++cm = m.Linear1D(10) & m.Linear1D(5)
++print("cm:")
++print(separability_matrix(cm))
++print()
++print("pix & L10 & L5:")
++print(separability_matrix(m.Pix2Sky_TAN() & m.Linear1D(10) & m.Linear1D(5)))
++print()
++print("pix & cm:")
++print(separability_matrix(m.Pix2Sky_TAN() & cm))
+diff --git a/repro2.py b/repro2.py
+new file mode 100644
+index 0000000000..1106a5bad6
+--- /dev/null
++++ b/repro2.py
+@@ -0,0 +1,26 @@
++import numpy as np
++from astropy.modeling import models as m
++from astropy.modeling.separable import separability_matrix, is_separable
++
++cm = m.Linear1D(10) & m.Linear1D(5)
++
++# flat vs nested equivalent of the issue
++flat = separability_matrix(m.Pix2Sky_TAN() & m.Linear1D(10) & m.Linear1D(5))
++nested = separability_matrix(m.Pix2Sky_TAN() & cm)
++assert (flat == nested).all(), "issue case fails"
++print("issue case OK")
++
++# deeply nested: right child of root '&' is itself a compound
++deep = m.Pix2Sky_TAN() & (cm & m.Linear1D(7))
++flatdeep = m.Pix2Sky_TAN() & m.Linear1D(10) & m.Linear1D(5) & m.Linear1D(7)
++fm = separability_matrix(flatdeep)
++dm = separability_matrix(deep)
++assert (fm == dm).all()
++print("deep nesting OK")
++
++# (L1 & L2) | R1 where the right-hand '&' compound is (R1 & ...)
++comp_right = (m.Linear1D(1) & m.Linear1D(2)) | m.Rotation2D(1)
++print("composition with rotated right-hand compound:"); print(separability_matrix(comp_right))
++assert is_separable(comp_right).tolist() == [False, False, False]  # rot couples all
++
++print("all good")

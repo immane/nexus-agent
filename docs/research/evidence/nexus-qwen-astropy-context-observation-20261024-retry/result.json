@@ -1,0 +1,27 @@
+{
+  "instance_id": "astropy__astropy-12907",
+  "run": "re5349f0866b031c2-1",
+  "outcome": "limit-reached",
+  "error": {
+    "category": "ResourceLimit",
+    "message": "model output limit reached",
+    "retry": "DoNotRetry"
+  },
+  "tool_calls": 28,
+  "approved_calls": 0,
+  "final_usage_events": 19,
+  "usage": {
+    "input": 1485927,
+    "output": 23084
+  },
+  "usage_note": "sum of provider-reported Final usage events; null means unavailable/incomplete",
+  "duration_seconds": 818.949,
+  "patch_bytes": 2213,
+  "budget_stop_reason": null,
+  "budget": {
+    "max_run_seconds": null,
+    "max_tool_calls": null,
+    "max_input_tokens": null,
+    "max_output_tokens": null
+  }
+}

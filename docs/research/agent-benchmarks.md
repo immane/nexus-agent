@@ -476,12 +476,14 @@ when preparing another attempt. The fresh run's identified workload and gateway
 containers were removed after completion; ownership reconciliation and orderly
 server shutdown still need a durable operational solution.
 
-Reviewed in-repository evidence is retained under
-`logs/run_evaluation/nexus-qwen-sympy-20590-unbounded-20261024/ollama-local__qwen3-27b/sympy__sympy-20590/`:
+Reviewed in-repository evidence is retained in the
+[SymPy evidence archive](evidence/nexus-qwen-sympy-20590-unbounded-20261024/report.json):
 `report.json` records the resolved result, the passing `test_immutable`
-FAIL_TO_PASS test, and 21 passing PASS_TO_PASS tests; `patch.diff` is the exact
-patch applied by the evaluator. Other generated logs are ignored, not deleted;
-the allowlist does not automatically admit artifacts from future runs.
+FAIL_TO_PASS test, and 21 passing PASS_TO_PASS tests;
+[`patch.diff`](evidence/nexus-qwen-sympy-20590-unbounded-20261024/patch.diff) is the
+exact patch applied by the evaluator. Generated files under `/logs/` are ignored,
+not deleted. See the [evidence index](evidence/README.md) for reviewed artifacts
+from subsequent runs.
 
 #### Why convergence was slow: evidence and limits
 
