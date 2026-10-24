@@ -3,8 +3,8 @@
 use super::*;
 use nexus_context::{
     SUMMARY_PROMPT, TRUNCATE_NOTE, conversation_with_memory, estimated_input_tokens,
-    needs_compaction, output_reserve_tokens as reserve, plan_reduction, render_context_note,
-    summary_text,
+    needs_compaction, output_reserve_tokens as reserve, plan_reduction, project_old_tool_outputs,
+    project_tool_outputs, render_context_note, summary_text,
 };
 use nexus_core::ContextCompactionStrategy;
 
@@ -218,7 +218,42 @@ pub(super) fn prepare_context_request(
             request = normal_request(shared, active, turn, &active.conversation)?;
         }
     }
-    let input = estimate(active, &request);
+    let mut input = estimate(active, &request);
+    if active.continuation.is_none() && needs_compaction(input, window, policy.trigger_percent()) {
+        // Project only into this request after safe exchange removal. Preserve
+        // original records, exact arguments, reasoning and uncertain effects.
+        let source = request.conversation().to_vec();
+        let projected = project_old_tool_outputs(&source, 2048).map_err(Terminal::failed)?;
+        request = request
+            .with_conversation(projected)
+            .map_err(Terminal::failed)?;
+        input = estimate(active, &request);
+        let mut preview_bytes = 2048;
+        while input.saturating_add(output) > window {
+            // A single parallel tool group can exceed the window by itself.
+            // Shorten even its bodies only when preserving them leaves too
+            // little generation headroom. Rebuild from source, not previews.
+            request = request
+                .with_conversation(
+                    project_tool_outputs(&source, preview_bytes, false)
+                        .map_err(Terminal::failed)?,
+                )
+                .map_err(Terminal::failed)?;
+            input = estimate(active, &request);
+            if preview_bytes == 128 {
+                break;
+            }
+            preview_bytes /= 2;
+        }
+        request = request
+            .with_context_note(render_context_note(
+                active.context_management,
+                &active.context_note,
+                input,
+            ))
+            .map_err(Terminal::failed)?;
+        input = estimate(active, &request);
+    }
     if input >= window {
         return Err(Terminal::limit(
             "estimated context occupancy leaves no output headroom",
@@ -735,7 +770,11 @@ mod tests {
             let original = active.conversation.clone();
             let result = prepare_context_request(&shared, &mut active, &turn());
             if uncertain {
-                assert_eq!(active.conversation, original);
+                assert!(result.is_ok());
+                assert_eq!(&active.conversation[..3], &original[..3]);
+                assert_eq!(&active.conversation[3..5], newest);
+                assert_eq!(active.conversation.last(), Some(&pending));
+                assert_eq!(active.conversation.len(), original.len() - 2);
             } else {
                 assert!(result.is_ok());
                 assert_eq!(&active.conversation[1..3], newest);
@@ -748,6 +787,170 @@ mod tests {
                 assert!(active.pending_compaction.is_none());
             }
         }
+    }
+
+    #[test]
+    fn oversized_safe_output_is_compacted_after_an_uncertain_exec() {
+        for strategy in [
+            ContextCompactionStrategy::Truncate,
+            ContextCompactionStrategy::Summarize,
+        ] {
+            let (shared, _data) = shared_with_data();
+            let mut active = context_run();
+            known(&mut active, strategy);
+            active
+                .conversation
+                .extend(context_exchange(&active.run, 0, 32));
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut active.conversation[2] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::Unknown,
+                    Evidence::HostObserved,
+                    "command completed; effects unknown",
+                    false,
+                )
+                .unwrap();
+            }
+            active
+                .conversation
+                .extend(context_exchange(&active.run, 1, 16_000));
+            active
+                .conversation
+                .extend(context_exchange(&active.run, 2, 32));
+            let pinned = active.conversation[..3].to_vec();
+            let latest = active.conversation[5..].to_vec();
+            let request = prepare(&shared, &mut active);
+            if strategy == ContextCompactionStrategy::Summarize
+                && active.pending_compaction.is_some()
+            {
+                let run = active.run.clone();
+                ingest_summary(
+                    &shared,
+                    &mut active,
+                    &run,
+                    stop("Earlier read-only inspection completed."),
+                    &mut StreamedPrefix::default(),
+                )
+                .unwrap_or_else(|terminal| panic!("summary failed: {:?}", terminal.error));
+            } else {
+                assert!(request.max_output_tokens().is_some());
+            }
+            assert_eq!(&active.conversation[..3], pinned);
+            assert_eq!(&active.conversation[3..], latest);
+            assert!(context_calls_are_paired(&active.conversation));
+            assert!(prepare(&shared, &mut active).max_output_tokens().is_some());
+        }
+    }
+
+    #[test]
+    fn oversized_latest_parallel_group_has_emergency_output_previews() {
+        for strategy in [
+            ContextCompactionStrategy::Truncate,
+            ContextCompactionStrategy::Summarize,
+        ] {
+            let (shared, _data) = shared_with_data();
+            let mut active = context_run();
+            known(&mut active, strategy);
+            let mut calls = Vec::new();
+            let mut results = Vec::new();
+            for n in 0..3 {
+                let mut exchange = context_exchange(&active.run, n, 16_000);
+                if let ModelContextItem::ToolResult { outcome, .. } = &mut exchange[1] {
+                    *outcome = ToolOutcome::new(
+                        ExecutionStatus::Succeeded,
+                        EffectState::Unknown,
+                        Evidence::HostObserved,
+                        "x".repeat(16_000),
+                        false,
+                    )
+                    .unwrap();
+                }
+                results.push(exchange.pop().unwrap());
+                calls.extend(exchange);
+            }
+            active.conversation.extend(calls);
+            active.conversation.extend(results);
+            let original = active.conversation.clone();
+            let request = prepare(&shared, &mut active);
+            assert_eq!(active.conversation, original);
+            assert!(active.pending_compaction.is_none());
+            assert!(context_calls_are_paired(request.conversation()));
+            assert_eq!(&request.conversation()[..4], &original[..4]);
+            assert!(estimate(&active, &request) + reserve(4096) <= 4096);
+            for item in &request.conversation()[4..] {
+                let ModelContextItem::ToolResult { outcome, .. } = item else {
+                    panic!("result missing")
+                };
+                assert_eq!(outcome.effect(), EffectState::Unknown);
+                assert!(outcome.is_truncated());
+                assert_eq!(
+                    outcome
+                        .content()
+                        .matches("Nexus model-context projection")
+                        .count(),
+                    1
+                );
+            }
+            // Non-output payloads remain protected even when previews cannot
+            // provide enough room. Failure must not rewrite execution records.
+            if let ModelContextItem::AssistantCall { reasoning, .. } = &mut active.conversation[1] {
+                *reasoning = Some("required reasoning".repeat(1000));
+            }
+            let protected = active.conversation.clone();
+            assert!(prepare_context_request(&shared, &mut active, &turn()).is_err());
+            assert_eq!(active.conversation, protected);
+        }
+    }
+
+    #[test]
+    fn pinned_exec_output_is_projected_without_rewriting_execution_records() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        known(&mut active, ContextCompactionStrategy::Summarize);
+        for n in 0..3 {
+            active
+                .conversation
+                .extend(context_exchange(&active.run, n, 32));
+            if let Some(ModelContextItem::ToolResult { outcome, .. }) =
+                active.conversation.last_mut()
+            {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::Unknown,
+                    Evidence::HostObserved,
+                    if n == 0 {
+                        "x".repeat(16_000)
+                    } else {
+                        "command completed".to_owned()
+                    },
+                    false,
+                )
+                .unwrap();
+            }
+        }
+        let original = active.conversation.clone();
+        let full = normal_request(&shared, &active, &turn(), &original)
+            .unwrap_or_else(|terminal| panic!("request failed: {:?}", terminal.error));
+        assert!(estimate(&active, &full) > 4096);
+        let request = prepare(&shared, &mut active);
+        assert_eq!(active.conversation, original);
+        assert!(active.pending_compaction.is_none());
+        assert_eq!(&request.conversation()[5..], &original[5..]);
+        assert!(context_calls_are_paired(request.conversation()));
+        assert!(
+            estimate(&active, &request) + u64::from(request.max_output_tokens().unwrap()) <= 4096
+        );
+        let ModelContextItem::ToolResult { outcome, .. } = &request.conversation()[2] else {
+            panic!("expected projected outcome");
+        };
+        assert_eq!(outcome.effect(), EffectState::Unknown);
+        assert_eq!(outcome.evidence(), Evidence::HostObserved);
+        assert!(outcome.is_truncated());
+        assert!(
+            outcome
+                .content()
+                .contains("Unknown effects remain unresolved")
+        );
     }
 
     #[test]

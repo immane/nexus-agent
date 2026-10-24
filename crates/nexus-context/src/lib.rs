@@ -259,14 +259,105 @@ pub fn context_calls_are_paired(items: &[ModelContextItem]) -> bool {
     pending.is_empty()
 }
 
+/// Model-only projection of old completed output bodies. The source records,
+/// exact call arguments, reasoning required by provider protocols, identities,
+/// and outcome status/effect/evidence remain unchanged. The newest complete
+/// exchange and all pending calls retain their full output.
+pub fn project_old_tool_outputs(
+    items: &[ModelContextItem],
+    output_bytes: usize,
+) -> Result<Vec<ModelContextItem>, AgentError> {
+    project_tool_outputs(items, output_bytes, true)
+}
+
+/// Model-only output previews for fully paired histories. Normally preserves
+/// the latest tool group; callers may shorten it as an emergency headroom
+/// fallback. Never modifies call metadata or the source execution records.
+pub fn project_tool_outputs(
+    items: &[ModelContextItem],
+    output_bytes: usize,
+    preserve_latest: bool,
+) -> Result<Vec<ModelContextItem>, AgentError> {
+    let mut projected = items.to_vec();
+    if output_bytes == 0 || !context_calls_are_paired(items) {
+        return Ok(projected);
+    }
+    let mut pending = HashSet::new();
+    let mut latest_start = 0;
+    let mut group_start = 0;
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            ModelContextItem::AssistantCall { call, .. } => {
+                if pending.is_empty() {
+                    group_start = index;
+                }
+                pending.insert(call.call());
+            }
+            ModelContextItem::AssistantDeniedCall { call, .. } => {
+                if pending.is_empty() {
+                    group_start = index;
+                }
+                pending.insert(call);
+            }
+            ModelContextItem::ToolResult { call, .. } => {
+                pending.remove(call);
+                if pending.is_empty() {
+                    latest_start = group_start;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = if preserve_latest {
+        latest_start
+    } else {
+        projected.len()
+    };
+    for item in &mut projected[..end] {
+        if let ModelContextItem::ToolResult { outcome, .. } = item
+            && outcome.content().len() > output_bytes
+        {
+            let mut prefix_end = output_bytes / 2;
+            while !outcome.content().is_char_boundary(prefix_end) {
+                prefix_end -= 1;
+            }
+            let mut suffix_start = outcome.content().len() - output_bytes / 2;
+            while !outcome.content().is_char_boundary(suffix_start) {
+                suffix_start += 1;
+            }
+            let content = format!(
+                "{}\n[Nexus model-context projection: middle of tool output omitted; not a complete result. status={:?} effect={:?} evidence={:?} original_output_truncated={}. Unknown effects remain unresolved; do not blindly retry.]\n{}",
+                &outcome.content()[..prefix_end],
+                outcome.status(),
+                outcome.effect(),
+                outcome.evidence(),
+                outcome.is_truncated(),
+                &outcome.content()[suffix_start..]
+            );
+            if content.len() >= outcome.content().len() {
+                continue;
+            }
+            *outcome = nexus_core::ToolOutcome::from_bounded_content(
+                outcome.status(),
+                outcome.effect(),
+                outcome.evidence(),
+                content,
+                true,
+            )?;
+        }
+    }
+    Ok(projected)
+}
+
 /// Oldest completed tool exchange in the current task. Keeps the user task and
-/// newest complete exchange; uncertain effects pin the relevant prefix.
+/// newest complete exchange. Uncertain exchanges stay pinned, but do not block
+/// removal of later, independently paired exchanges with certain effects.
 #[must_use]
 pub fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, usize)> {
     if !matches!(items.first(), Some(ModelContextItem::UserText(_))) {
         return None;
     }
-    let start = if items.get(1).is_some_and(is_context_notice) {
+    let mut start = if items.get(1).is_some_and(is_context_notice) {
         2
     } else {
         1
@@ -274,7 +365,7 @@ pub fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, u
     let mut pending = HashSet::new();
     let mut effects_certain = true;
     let mut seen = HashSet::new();
-    let mut first_end = None;
+    let mut first_range = None;
     for (index, item) in items.iter().enumerate().skip(start) {
         match item {
             ModelContextItem::AssistantCall { call, .. } => {
@@ -299,13 +390,13 @@ pub fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, u
                 }
                 effects_certain &= history_exchange_effects_certain(std::slice::from_ref(item));
                 if pending.is_empty() {
-                    if !effects_certain {
-                        return None;
+                    if let Some(range) = first_range {
+                        return Some(range);
                     }
-                    if let Some(end) = first_end {
-                        return Some((start, end));
+                    if effects_certain {
+                        first_range = Some((start, index + 1));
                     }
-                    first_end = Some(index + 1);
+                    start = index + 1;
                 }
             }
             ModelContextItem::UserText(_) => return None,
@@ -331,17 +422,28 @@ pub fn removable_exchange(
     if !matches!(items.first(), Some(ModelContextItem::UserText(_))) {
         return None;
     }
-    let end = items[..history_len]
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(index, item)| matches!(item, ModelContextItem::UserText(_)).then_some(index))
-        .unwrap_or(history_len);
-    if !context_calls_are_paired(&items[..end]) || !history_exchange_effects_certain(&items[..end])
-    {
+    if !context_calls_are_paired(&items[..history_len]) {
         return None;
     }
-    Some((0, end))
+    let mut start = 0;
+    while start < history_len {
+        let end = items[start..history_len]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, item)| {
+                matches!(item, ModelContextItem::UserText(_)).then_some(start + index)
+            })
+            .unwrap_or(history_len);
+        if context_calls_are_paired(&items[start..end])
+            && history_exchange_effects_certain(&items[start..end])
+        {
+            return Some((start, end));
+        }
+        start = end;
+    }
+    oldest_removable_exchange(&items[history_len..])
+        .map(|(start, end)| (history_len + start, history_len + end))
 }
 
 /// Staged reduction only; the caller must validate/commit after model work and
@@ -375,8 +477,8 @@ pub fn plan_reduction<E>(
             break;
         };
         plan.removed.extend(plan.items.drain(start..end));
-        if start == 0 {
-            plan.history_len -= end;
+        if start < plan.history_len {
+            plan.history_len -= end - start;
         }
     }
     Ok(plan)
@@ -446,8 +548,8 @@ pub fn project_bounded_history(
         });
         bytes = bytes.saturating_sub(removed_bytes);
         projected.drain(start..end);
-        if start == 0 {
-            history_len -= end;
+        if start < history_len {
+            history_len -= end - start;
         }
     }
     Some(BoundedProjection {
@@ -658,6 +760,178 @@ mod tests {
         unmatched.push(exchange("pending", EffectState::KnownNotApplied).remove(0));
         unmatched.push(ModelContextItem::user_text("current task").unwrap());
         assert!(removable_exchange(&unmatched, 2).is_none());
+    }
+
+    #[test]
+    fn output_projection_preserves_uncertainty_and_original_records() {
+        let mut items = vec![ModelContextItem::user_text("task").unwrap()];
+        items.extend(exchange("uncertain", EffectState::Unknown));
+        if let ModelContextItem::ToolResult { outcome, .. } = &mut items[2] {
+            *outcome = nexus_core::ToolOutcome::new(
+                ExecutionStatus::TimedOut,
+                EffectState::Unknown,
+                Evidence::Uncertain,
+                "中文".repeat(4000),
+                false,
+            )
+            .unwrap();
+        }
+        items.extend(exchange("latest", EffectState::KnownNotApplied));
+        let original = items.clone();
+        let projected = project_old_tool_outputs(&items, 2048).unwrap();
+        assert_eq!(items, original);
+        assert_eq!(projected[1], items[1]);
+        assert_eq!(&projected[3..], &items[3..]);
+        let ModelContextItem::ToolResult { outcome, .. } = &projected[2] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(outcome.status(), ExecutionStatus::TimedOut);
+        assert_eq!(outcome.effect(), EffectState::Unknown);
+        assert_eq!(outcome.evidence(), Evidence::Uncertain);
+        assert!(outcome.is_truncated());
+        assert!(outcome.content().contains("not a complete result"));
+        assert!(
+            outcome
+                .content()
+                .contains("status=TimedOut effect=Unknown evidence=Uncertain")
+        );
+        assert!(outcome.content().len() < 2500);
+        assert!(context_calls_are_paired(&projected));
+        let mut pending = items.clone();
+        pending.push(exchange("pending", EffectState::KnownNotApplied).remove(0));
+        assert_eq!(project_old_tool_outputs(&pending, 2048).unwrap(), pending);
+    }
+
+    #[test]
+    fn output_projection_keeps_latest_multi_call_group_and_provider_reasoning() {
+        let mut items = vec![ModelContextItem::user_text("task").unwrap()];
+        let mut old = exchange("old", EffectState::Unknown);
+        if let ModelContextItem::AssistantCall { reasoning, .. } = &mut old[0] {
+            *reasoning = Some("provider-required reasoning".to_owned());
+        }
+        if let ModelContextItem::ToolResult { outcome, .. } = &mut old[1] {
+            *outcome = nexus_core::ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::Unknown,
+                Evidence::HostObserved,
+                "x".repeat(4096),
+                false,
+            )
+            .unwrap();
+        }
+        items.extend(old);
+        let first = exchange("latest-read", EffectState::KnownNotApplied);
+        let second = exchange("latest-exec", EffectState::Unknown);
+        items.extend([
+            first[0].clone(),
+            second[0].clone(),
+            first[1].clone(),
+            second[1].clone(),
+        ]);
+        let projected = project_old_tool_outputs(&items, 1).unwrap();
+        assert_eq!(projected[1], items[1]);
+        assert_ne!(projected[2], items[2]);
+        assert_eq!(&projected[3..], &items[3..]);
+        assert!(context_calls_are_paired(&projected));
+    }
+
+    #[test]
+    fn emergency_projection_preserves_latest_group_metadata_and_pending_records() {
+        let mut items = vec![ModelContextItem::user_text("task").unwrap()];
+        let mut first = exchange("first", EffectState::Unknown);
+        let mut second = exchange("second", EffectState::Unknown);
+        for group in [&mut first, &mut second] {
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut group[1] {
+                *outcome = nexus_core::ToolOutcome::new(
+                    ExecutionStatus::TimedOut,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "中文".repeat(4000),
+                    true,
+                )
+                .unwrap();
+            }
+        }
+        items.extend([
+            first[0].clone(),
+            second[0].clone(),
+            first[1].clone(),
+            second[1].clone(),
+        ]);
+        let original = items.clone();
+        assert_eq!(project_old_tool_outputs(&items, 2048).unwrap(), original);
+        let projected = project_tool_outputs(&items, 2048, false).unwrap();
+        assert_eq!(items, original);
+        assert_eq!(&projected[..3], &items[..3]);
+        assert!(context_calls_are_paired(&projected));
+        for item in &projected[3..] {
+            let ModelContextItem::ToolResult { outcome, .. } = item else {
+                panic!("result missing")
+            };
+            assert_eq!(outcome.status(), ExecutionStatus::TimedOut);
+            assert_eq!(outcome.effect(), EffectState::Unknown);
+            assert_eq!(outcome.evidence(), Evidence::Uncertain);
+            assert!(outcome.is_truncated());
+            assert!(outcome.content().contains("original_output_truncated=true"));
+            assert!(outcome.content().len() < 2500);
+        }
+        items.push(exchange("pending", EffectState::Unknown).remove(0));
+        assert_eq!(project_tool_outputs(&items, 2048, false).unwrap(), items);
+    }
+
+    #[test]
+    fn pinned_effects_do_not_block_later_safe_exchanges() {
+        let mut items = vec![ModelContextItem::user_text("current task").unwrap()];
+        items.extend(exchange("uncertain", EffectState::Unknown));
+        items.extend(exchange("safe", EffectState::KnownNotApplied));
+        items.extend(exchange("latest", EffectState::KnownApplied));
+        let plan = plan_reduction(&items, 0, 0, |items| Ok::<_, ()>(items.len() as u64)).unwrap();
+        assert_eq!(plan.removed, items[3..5]);
+        assert_eq!(&plan.items[..3], &items[..3]);
+        assert_eq!(&plan.items[3..], &items[5..]);
+        assert!(context_calls_are_paired(&plan.items));
+        assert!(!history_exchange_effects_certain(&plan.items));
+
+        let projected = project_bounded_history(
+            &items,
+            0,
+            ContextBounds {
+                max_items: 5,
+                max_bytes: usize::MAX,
+                reserved_items: 0,
+                reserved_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(projected.items, plan.items);
+    }
+
+    #[test]
+    fn uncertain_latest_exchange_does_not_pin_older_safe_exchange() {
+        let mut items = vec![ModelContextItem::user_text("task").unwrap()];
+        items.extend(exchange("safe", EffectState::KnownNotApplied));
+        items.extend(exchange("uncertain", EffectState::Unknown));
+        let plan = plan_reduction(&items, 0, 0, |items| Ok::<_, ()>(items.len() as u64)).unwrap();
+        assert_eq!(plan.removed, items[1..3]);
+        assert_eq!(&plan.items[1..], &items[3..]);
+    }
+
+    #[test]
+    fn pinned_inherited_task_allows_later_history_and_current_task_reduction() {
+        let mut items = vec![ModelContextItem::user_text("uncertain old task").unwrap()];
+        items.extend(exchange("uncertain", EffectState::Unknown));
+        items.push(ModelContextItem::user_text("safe old task").unwrap());
+        items.extend(exchange("old-safe", EffectState::KnownNotApplied));
+        items.push(ModelContextItem::user_text("current task").unwrap());
+        items.extend(exchange("current-safe", EffectState::KnownNotApplied));
+        items.extend(exchange("latest", EffectState::KnownNotApplied));
+        let plan = plan_reduction(&items, 6, 0, |items| Ok::<_, ()>(items.len() as u64)).unwrap();
+        assert_eq!(plan.history_len, 3);
+        assert_eq!(&plan.items[..3], &items[..3]);
+        assert_eq!(plan.items[3], items[6]);
+        assert_eq!(&plan.items[4..], &items[9..]);
+        assert_eq!(plan.removed.len(), 5);
+        assert!(context_calls_are_paired(&plan.items));
     }
 
     #[test]

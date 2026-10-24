@@ -232,6 +232,22 @@ history without an extra model call. The target is best-effort: current tasks,
 recent exchanges, and evidence of uncertain tool effects take precedence over
 the requested percentage. Required instructions and tool definitions also
 consume the window, so a 5% target may not be reachable.
+Uncertain execution records remain intact, but do not block removal of later
+safe, paired exchanges or separate completed tasks. If safe history reduction
+still leaves window pressure, the model-only request view shortens older tool
+output bodies to a UTF-8-safe head/tail preview (up to 2 KiB plus an explicit
+omission notice). Call identities/arguments, status, effects, evidence, and
+provider-required reasoning remain unchanged; the latest complete tool group
+is normally not shortened. If that still leaves less than the normal generation
+reserve, the request view also shortens the latest complete tool group's output
+bodies as an emergency fallback, with the same metadata and omission markers.
+Emergency previews shrink from 2 KiB down to 128 bytes of head/tail text per
+result as needed; the omission notice is additional to that budget.
+Projected output is marked truncated, and unknown effects
+remain unresolved, never permission to retry. The source records are not
+rewritten by this projection. Unknown windows and opaque provider continuations
+do not enable it. If the retained evidence still exhausts the window, the run
+stops rather than silently discarding it.
 
 Input occupancy is an estimate, not a tokenizer-exact measurement or cumulative
 run usage. It includes instructions, runtime notes, conversation/reasoning, and
