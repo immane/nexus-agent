@@ -399,6 +399,13 @@ when preparing another attempt. The fresh run's identified workload and gateway
 containers were removed after completion; ownership reconciliation and orderly
 server shutdown still need a durable operational solution.
 
+Reviewed in-repository evidence is retained under
+`logs/run_evaluation/nexus-qwen-sympy-20590-unbounded-20261024/ollama-local__qwen3-27b/sympy__sympy-20590/`:
+`report.json` records the resolved result, the passing `test_immutable`
+FAIL_TO_PASS test, and 21 passing PASS_TO_PASS tests; `patch.diff` is the exact
+patch applied by the evaluator. Other generated logs are ignored, not deleted;
+the allowlist does not automatically admit artifacts from future runs.
+
 #### Why convergence was slow: evidence and limits
 
 The fresh run's assistant log identifies the right class by line 7, states the
