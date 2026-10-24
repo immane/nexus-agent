@@ -37,6 +37,42 @@ def git(repo, *args, allow_one=False):
     return result
 
 
+def validate_container_git_checkout(repo):
+    """Require Git metadata that is available inside the /workspace bind mount."""
+    repo = repo.resolve(strict=True)
+    metadata = repo / ".git"
+    if metadata.is_symlink() or not metadata.is_dir():
+        raise RuntimeError(
+            "container benchmark workspace must be a standalone Git checkout "
+            "with a .git directory; linked worktrees point outside the "
+            "container mount. Create an independent clone for this task."
+        )
+
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
+    common_value = Path(git(repo, "rev-parse", "--git-common-dir").stdout.strip())
+    common_dir = (repo / common_value if not common_value.is_absolute() else common_value).resolve()
+    top_level = Path(git(repo, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+    if top_level != repo:
+        raise RuntimeError("container workspace Git top-level does not match the mounted checkout")
+    for label, path in (("Git directory", git_dir), ("Git common directory", common_dir)):
+        if not path.is_relative_to(repo):
+            raise RuntimeError(f"container workspace {label} resolves outside the mounted checkout")
+
+    object_dir = (common_dir / "objects").resolve()
+    if not object_dir.is_relative_to(repo):
+        raise RuntimeError("container workspace Git object storage resolves outside the mounted checkout")
+    alternates = object_dir / "info/alternates"
+    if alternates.is_file():
+        for entry in alternates.read_text().splitlines():
+            alternate = Path(entry)
+            alternate = (object_dir / alternate if not alternate.is_absolute() else alternate).resolve()
+            if not alternate.is_relative_to(repo):
+                raise RuntimeError(
+                    "container benchmark workspace uses external Git object alternates; "
+                    "create an independent clone for this task"
+                )
+
+
 def collect_patch(repo, base_commit):
     tracked = git(repo, "diff", "--binary", base_commit).stdout
     untracked = git(repo, "ls-files", "--others", "--exclude-standard").stdout.splitlines()
@@ -152,6 +188,7 @@ def main():
     if not token:
         parser.error(f"required bearer token environment variable is unavailable: {args.token_env}")
     repo = args.workspace.resolve(strict=True)
+    validate_container_git_checkout(repo)
     row = json.loads(args.task_json.read_text())
     instance = row["instance_id"]
     base_commit = row["base_commit"]

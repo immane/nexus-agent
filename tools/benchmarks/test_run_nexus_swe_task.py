@@ -1,9 +1,12 @@
 """Offline tests for benchmark result classification."""
 
-import unittest
 from argparse import Namespace
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
 
-from run_nexus_swe_task import reached_budget, summarize_result
+from run_nexus_swe_task import reached_budget, summarize_result, validate_container_git_checkout
 
 
 class SummaryTests(unittest.TestCase):
@@ -73,6 +76,30 @@ class BudgetTests(unittest.TestCase):
             reached_budget(1, args, 150, {"input": 0, "output": 0}, True, 1),
             "tool-call budget reached",
         )
+
+
+class ContainerGitCheckoutTests(unittest.TestCase):
+    def test_standalone_checkout_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+            validate_container_git_checkout(repo)
+
+    def test_linked_worktree_git_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            (repo / ".git").write_text("gitdir: /host-only/worktree/.git\n")
+            with self.assertRaisesRegex(RuntimeError, "standalone Git checkout"):
+                validate_container_git_checkout(repo)
+
+    def test_external_object_alternates_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+            alternates = repo / ".git/objects/info/alternates"
+            alternates.write_text("/host-only/git/objects\n")
+            with self.assertRaisesRegex(RuntimeError, "object alternates"):
+                validate_container_git_checkout(repo)
 
 
 if __name__ == "__main__":

@@ -508,10 +508,22 @@ container`, real tools, immutable gateway/workload image references, and
 credential in environment variables, not command arguments. Then run
 `tools/benchmarks/run_nexus_swe_task.py --task-json ROW.json --workspace
 CHECKOUT --provider PROVIDER_ID --model MODEL_ID --output-dir RESULTS`. The
-server must remain loopback-only. The runner writes artifacts but does not
-launch the server, prepare task dependencies, or score predictions; use the
-official SWE-bench evaluator after checking that dependencies required by the
-task's evaluation script are available to the agent.
+server must remain loopback-only. `CHECKOUT` must be a standalone Git clone,
+not a `git worktree` or a clone using external object alternates: only the
+workspace directory is mounted into the container. For example:
+
+```sh
+git clone --no-hardlinks --no-checkout SOURCE_REPO CHECKOUT
+git -C CHECKOUT checkout --detach BASE_COMMIT
+```
+
+The runner checks that `.git`, the common Git directory, and object storage are
+self-contained before creating a provider session, so a broken host-only
+worktree pointer fails fast without spending model tokens. The runner writes
+artifacts but does not launch the server, prepare task dependencies, or score
+predictions; use the official SWE-bench evaluator after checking that
+dependencies required by the task's evaluation script are available to the
+agent.
 
 To classify a saved run independently of the agent's exit status, use the
 offline summary command (omit `--evaluation-report` if scoring was not run):
