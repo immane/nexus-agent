@@ -283,6 +283,7 @@ dependencies = [
  "nexus-context",
  "nexus-core",
  "nexus-permissions",
+ "nexus-session",
  "nexus-validation",
  "serde_json",
  "tokio",

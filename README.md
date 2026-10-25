@@ -94,7 +94,8 @@ The optimized variants were comparison builds only; repository build profiles we
 
 The first diagram shows the host's in-process core, runtime, frontend, and
 adapters; built-in tools do not pay an IPC cost. `nexus-session` has an
-initial file-backed store implementation, but it is not yet wired to runtime;
+initial file-backed store implementation, and runtime offers opt-in durable
+tool-operation recording; application-level session history and restore are not yet wired;
 external plugins are also not implemented. Provider TLS and sandboxed commands
 can launch helper processes.
 
@@ -107,7 +108,7 @@ flowchart TB
     Provider["Provider adapters<br/>Direct APIs and relay plugins"]
     Tools["Tool execution adapters"]
     Container["Container environment crate<br/>Gateway, worker, lifecycle"]
-    Store["nexus-session<br/>initial file store; not runtime-wired"]
+    Store["nexus-session<br/>file store; operation journal opt-in"]
     Builtin["Built-in Rust coding tools"]
     Bridge["External tool adapter"]
     Plugins["External tool processes<br/>Any language"]

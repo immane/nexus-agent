@@ -24,10 +24,12 @@ Semantic operations include bounded/paged session metadata listing, loading a se
 `nexus-core` defines a `SessionStore` port and bounded checkpoint/operation
 types. `nexus-session` provides a file-backed implementation, including
 append-only, paged source records for complete original model-context items.
-Production runtime wiring does not use it. The runtime's session cache is
-process-local, terminal persistence is ephemeral, and list/restore commands are
-rejected. Thus the store can preserve source history when called directly, but
-the application cannot yet promise full source recovery. See the
+Runtime exposes an opt-in constructor that writes tool intents before dispatch
+and records outcomes afterward, but hosts do not yet wire that constructor.
+Automatic source-history writes and application restore commands are not
+implemented. The runtime's session cache remains process-local and terminal
+persistence reports ephemeral. Thus the store can preserve source history when
+called directly, but the application cannot yet promise full source recovery. See the
 [context-management design](../design/12-context-management.md) for the current
 gap and the source-history/active-view boundary.
 

@@ -1,8 +1,8 @@
 //! Single-active-run execution loop: lifecycle, policy, ordered events.
 //!
 //! M0 scope: one active run (a second `Submit` gets an explicit `Busy`
-//! reply), declared-order sequential tool dispatch, ephemeral persistence,
-//! no session-store I/O. Core ports stay synchronous; this crate adapts them
+//! reply), declared-order sequential tool dispatch, and opt-in durable tool
+//! operation records. Core ports stay synchronous; this crate adapts them
 //! at its boundary with the blocking pool, never leaking async types into
 //! `nexus-core`.
 //!
@@ -43,9 +43,10 @@ use nexus_core::{
     Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits, ModelContextItem,
     ModelInstructions, ModelRequest, OutcomeSummary, PersistenceState, ProviderContext,
     ProviderEvent, ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId,
-    RunLifecycle, RunOutcome, SessionId, Snapshot, SubmitCommand, ToolAccess, ToolCall,
-    ToolContext, ToolFinishedInfo, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
-    ToolStartedInfo, TurnId, Usage, UsageFinality,
+    RunLifecycle, RunOutcome, SessionId, SessionStore, Snapshot, SubmitCommand, ToolAccess,
+    ToolCall, ToolContext, ToolFinishedInfo, ToolId, ToolIntentRecord, ToolOutcome,
+    ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec, ToolStartedInfo, TurnId, Usage,
+    UsageFinality,
 };
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
@@ -111,6 +112,7 @@ struct Shared {
     tools: HashMap<String, RegisteredTool>,
     tool_order: Vec<String>,
     tool_definitions: Vec<ToolSpec>,
+    session_store: Option<Arc<StdMutex<Box<dyn SessionStore + Send>>>>,
     state: Mutex<State>,
     data_tx: mpsc::Sender<RunEvent>,
     control_tx: mpsc::Sender<RunEvent>,
@@ -285,6 +287,7 @@ struct ActiveRun {
     force_terminal: Option<RunOutcome>,
     terminal: Option<RunOutcome>,
     terminal_error: Option<AgentError>,
+    persistence_error: Option<AgentError>,
     delivery_closed: bool,
     finished_sent: bool,
 }
@@ -413,6 +416,31 @@ impl Runtime {
         tools: Vec<ToolRegistration>,
         instructions: ModelInstructions,
     ) -> Result<(Self, EventStreams), AgentError> {
+        Self::try_new_inner(config, provider, tools, instructions, None)
+    }
+
+    /// Constructs a runtime with an explicit session store. Tool intents are
+    /// durably recorded before dispatch and observed outcomes are recorded
+    /// afterward. Original conversation persistence and restore commands are
+    /// not yet wired; terminal persistence therefore remains `Ephemeral` unless
+    /// an operation-record write failed.
+    pub fn try_new_with_session_store(
+        config: RuntimeConfig,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        instructions: ModelInstructions,
+        store: Box<dyn SessionStore + Send>,
+    ) -> Result<(Self, EventStreams), AgentError> {
+        Self::try_new_inner(config, provider, tools, instructions, Some(store))
+    }
+
+    fn try_new_inner(
+        config: RuntimeConfig,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        instructions: ModelInstructions,
+        session_store: Option<Box<dyn SessionStore + Send>>,
+    ) -> Result<(Self, EventStreams), AgentError> {
         config.limits.validate()?;
         if config.policy.is_container() {
             config.policy.validate()?;
@@ -523,6 +551,7 @@ impl Runtime {
             tools: registry,
             tool_order: order,
             tool_definitions,
+            session_store: session_store.map(|store| Arc::new(StdMutex::new(store))),
             state: Mutex::new(State {
                 active: None,
                 last: None,
@@ -719,6 +748,7 @@ impl Runtime {
             force_terminal: None,
             terminal: None,
             terminal_error: None,
+            persistence_error: None,
             delivery_closed: false,
             finished_sent: false,
         });
@@ -2365,10 +2395,117 @@ impl Runtime {
                 self.shared.effective_output_budget,
                 tool_deadline.saturating_duration_since(active.started),
                 false,
-                scope,
+                scope.clone(),
             )
             .map_err(|_| Terminal::failed_internal("tool context is invalid"))?
             .with_control(active.token.clone(), tool_deadline);
+            let intent = ToolIntentRecord {
+                run: call.run().clone(),
+                call: call.call().clone(),
+                tool: call.tool().clone(),
+                args: call.args().clone(),
+                scope,
+            };
+            let tool = registered.port.clone();
+            let wake = active.wake.clone();
+            let token = active.token.clone();
+            (call, tool, context, tool_deadline, wake, token, intent)
+        };
+        let (call, tool, context, tool_deadline, wake, token, intent) = setup;
+        let call_id = call.call().clone();
+        if let Err(error) = self.persist_tool_intent(intent.clone()).await {
+            let mut state = self.shared.state.lock().await;
+            if let Some(active) = state.active.as_mut()
+                && &active.run == run
+            {
+                active.persistence_error = Some(error.clone());
+                active.terminal = Some(RunOutcome::Failed);
+                active.terminal_error = Some(error);
+                active.outcome_slot = Some((
+                    call_id,
+                    ToolOutcome::new(
+                        ExecutionStatus::Failed,
+                        EffectState::NotStarted,
+                        Evidence::HostObserved,
+                        "tool intent could not be persisted",
+                        false,
+                    )
+                    .expect("bounded not-started persistence outcome builds"),
+                ));
+                return Ok(RunState::RecordingResult);
+            }
+            return Err(Terminal::cancelled());
+        }
+
+        // Persistence may block long enough for cancellation, deadline, or a
+        // scoped approval to change. Revalidate all dispatch authority after
+        // the durable intent and immediately before marking the call started.
+        {
+            let mut state = self.shared.state.lock().await;
+            let Some(active) = state.active.as_mut() else {
+                return Err(Terminal::cancelled());
+            };
+            if &active.run != run {
+                return Err(Terminal::cancelled());
+            }
+            if active.cancelled || active.token.is_cancelled() {
+                active.outcome_slot =
+                    Some((call_id, cancelled_outcome("cancelled before dispatch")));
+                active.force_terminal = Some(RunOutcome::Cancelled);
+                return Ok(RunState::RecordingResult);
+            }
+            if StdInstant::now() >= active.deadline {
+                active.outcome_slot = Some((
+                    call_id,
+                    timeout_outcome("run deadline passed before dispatch"),
+                ));
+                active.force_terminal = Some(RunOutcome::LimitReached);
+                return Ok(RunState::RecordingResult);
+            }
+            let Some(current) = active.current.as_ref() else {
+                return Ok(RunState::ValidatingTools);
+            };
+            let authorization = if let Some(binding) = current.binding.as_ref() {
+                binding
+                    .check_valid_for_dispatch(
+                        call.run(),
+                        call.call(),
+                        call.tool(),
+                        call.args(),
+                        self.shared.policy.revision(),
+                        active.started.elapsed(),
+                    )
+                    .ok()
+                    .map(|()| binding.scope().clone())
+            } else {
+                let Some(registered) = self.shared.tools.get(call.tool().name()) else {
+                    active.outcome_slot = Some((
+                        call_id,
+                        denied_outcome("tool registration changed before dispatch"),
+                    ));
+                    return Ok(RunState::RecordingResult);
+                };
+                self.shared
+                    .policy
+                    .authorize_with_directories(
+                        &call,
+                        self.shared
+                            .session_directories
+                            .lock()
+                            .expect("session permissions lock")
+                            .get(&active.session)
+                            .map_or(&[], Vec::as_slice),
+                        registered.access,
+                    )
+                    .ok()
+            };
+            if authorization.as_ref() != Some(&intent.scope) {
+                active.outcome_slot = Some((
+                    call_id,
+                    denied_outcome("dispatch authority changed during persistence"),
+                ));
+                return Ok(RunState::RecordingResult);
+            }
             let delivery = emit_control(
                 &self.shared,
                 active,
@@ -2386,13 +2523,7 @@ impl Runtime {
             if let Some(current) = active.current.as_mut() {
                 current.dispatched = true;
             }
-            let tool = registered.port.clone();
-            let wake = active.wake.clone();
-            let token = active.token.clone();
-            (call, tool, context, tool_deadline, wake, token)
-        };
-        let (call, tool, context, tool_deadline, wake, token) = setup;
-        let call_id = call.call().clone();
+        }
         let mut handle = tokio::task::spawn_blocking(move || tool.execute(&call, &context));
         let mut cancelled_first = false;
         let joined = loop {
@@ -2459,12 +2590,44 @@ impl Runtime {
     }
 
     async fn on_recording(&self, run: &RunId) -> Result<RunState, Terminal> {
+        let pending_record = {
+            let state = self.shared.state.lock().await;
+            state
+                .active
+                .as_ref()
+                .filter(|active| &active.run == run)
+                .and_then(|active| {
+                    active.outcome_slot.as_ref().map(|(call, outcome)| {
+                        let outcome = bound_outcome(&self.shared, outcome.clone());
+                        ToolOutcomeRecord {
+                            run: active.run.clone(),
+                            call: call.clone(),
+                            status: outcome.status(),
+                            effect: outcome.effect(),
+                            evidence: outcome.evidence(),
+                            truncated: outcome.is_truncated(),
+                        }
+                    })
+                })
+        };
+        let persistence_error = if let Some(record) = pending_record {
+            self.persist_tool_outcome(record).await.err()
+        } else {
+            None
+        };
         let mut state = self.shared.state.lock().await;
         let Some(active) = state.active.as_mut() else {
             return Err(Terminal::cancelled());
         };
         if &active.run != run {
             return Err(Terminal::cancelled());
+        }
+        if let Some(error) = persistence_error {
+            active.persistence_error = Some(error.clone());
+            if active.terminal.is_none() {
+                active.terminal = Some(RunOutcome::Failed);
+                active.terminal_error = Some(error);
+            }
         }
         let Some((call, outcome)) = active.outcome_slot.take() else {
             return Ok(RunState::ValidatingTools);
@@ -2518,6 +2681,40 @@ impl Runtime {
         {
             active.phase = phase;
         }
+    }
+
+    async fn persist_tool_intent(&self, intent: ToolIntentRecord) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.record_intent(&intent)
+        })
+        .await
+        .map_err(|_| runtime_error(ErrorCategory::StorageFailure, "session store worker failed"))?
+    }
+
+    async fn persist_tool_outcome(&self, outcome: ToolOutcomeRecord) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.record_outcome(&outcome)
+        })
+        .await
+        .map_err(|_| runtime_error(ErrorCategory::StorageFailure, "session store worker failed"))?
     }
 
     async fn set_terminal(&self, run: &RunId, outcome: RunOutcome, error: Option<AgentError>) {
@@ -2635,8 +2832,14 @@ impl Runtime {
                 );
             }
         }
-        let finished = RunFinished::new(outcome, PersistenceState::Ephemeral, None)
-            .expect("ephemeral terminal record builds");
+        let persistence_error = active.persistence_error.clone();
+        let persistence = if persistence_error.is_some() {
+            PersistenceState::SaveFailed
+        } else {
+            PersistenceState::Ephemeral
+        };
+        let finished = RunFinished::new(outcome, persistence, persistence_error)
+            .expect("terminal persistence record builds");
         let finished = match error.clone() {
             Some(error) => finished.with_error(error),
             None => finished,
@@ -6168,6 +6371,7 @@ mod cov_runtime_private {
             force_terminal: None,
             terminal: None,
             terminal_error: None,
+            persistence_error: None,
             delivery_closed: false,
             finished_sent: false,
         }
@@ -7871,6 +8075,7 @@ mod cov_runtime_topup_private {
             force_terminal: None,
             terminal: None,
             terminal_error: None,
+            persistence_error: None,
             delivery_closed: false,
             finished_sent: false,
         }
@@ -8934,5 +9139,177 @@ mod cov_runtime_topup_private {
                 Some(true)
             );
         });
+    }
+
+    #[test]
+    fn session_store_records_intent_before_dispatch_and_actual_outcome_afterward() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-store-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        let run = run_id("persistent-tool");
+        let call = read_call(&run, call_id("persistent-tool"));
+        let mut active = active_for(&run);
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(read.execution_count(), 1);
+            assert!(matches!(
+                runtime.on_recording(&run).await,
+                Ok(RunState::Preparing)
+            ));
+        });
+        drop(runtime);
+
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let snapshot = std::fs::read_to_string(directory.join("session-store.json")).unwrap();
+        assert!(snapshot.contains("run-persistent-tool"));
+        assert!(snapshot.contains("call-persistent-tool"));
+        assert!(snapshot.contains("succeeded"));
+        assert!(snapshot.contains("known_applied"));
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_store_intent_failure_prevents_tool_dispatch() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-store-failure-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, "block store directory creation").unwrap();
+        let run = run_id("persistent-intent-failure");
+        let call = read_call(&run, call_id("persistent-intent-failure"));
+        let mut active = active_for(&run);
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(read.execution_count(), 0);
+            assert!(
+                runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .persistence_error
+                    .is_some()
+            );
+        });
+        drop(runtime);
+        std::fs::remove_file(directory).unwrap();
+    }
+
+    #[test]
+    fn session_store_outcome_failure_preserves_observation_and_marks_save_failed() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-outcome-failure-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+
+        let run = run_id("persistent-outcome-failure");
+        let call = read_call(&run, call_id("persistent-outcome-failure"));
+        let mut active = active_for(&run);
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(read.execution_count(), 1);
+
+            std::fs::remove_dir_all(&directory).unwrap();
+            std::fs::write(&directory, "block store directory creation").unwrap();
+            assert!(matches!(
+                runtime.on_recording(&run).await,
+                Ok(RunState::Preparing)
+            ));
+            let state = runtime.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert_eq!(active.terminal, Some(RunOutcome::Failed));
+            assert!(active.persistence_error.is_some());
+            assert_eq!(active.outcomes.len(), 1);
+            assert_eq!(active.outcomes[0].effect, EffectState::KnownApplied);
+            let terminal_error = active.terminal_error.clone();
+            drop(state);
+            runtime
+                .finish_run(&run, RunOutcome::Failed, terminal_error)
+                .await;
+            let finished = loop {
+                let event = streams
+                    .control
+                    .recv()
+                    .await
+                    .expect("terminal control event is delivered");
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    break finished.clone();
+                }
+            };
+            assert_eq!(finished.persistence(), PersistenceState::SaveFailed);
+            assert!(finished.persistence_error().is_some());
+        });
+        drop(runtime);
+        std::fs::remove_file(directory).unwrap();
     }
 }

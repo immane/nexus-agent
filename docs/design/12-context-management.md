@@ -59,7 +59,7 @@ recheck these locations rather than assume this snapshot remains current.
 | `crates/nexus-context/src/lib.rs` | Pure estimation/calibration, paired-exchange selection, bounded history projection, summary validation, UTF-8-safe tool-output previews | Selection and derived representations are not an independent source-history store |
 | `crates/nexus-runtime/src/runtime/context_compaction.rs` | Request construction, isolated tool-free summarization, validation/commit, generation headroom checks, emergency previews | Summary failure preserves the previous conversation and terminates; full source/view separation remains unimplemented |
 | `crates/nexus-runtime/src/runtime.rs` | Agent loop, accepted results, cancellation, usage, active conversation, bounded session cache | Both hard-limit projection and compaction replace active conversation; the cache can evict records |
-| `crates/nexus-session/src/lib.rs` | Revision-2 bounded JSON snapshot for checkpoints, operation records, and ordered original `ModelContextItem` source history; private Unix directory/file, atomic replacement, and OS single-writer lock | Not wired to runtime; active-view checkpoint and source-history lifecycle are not yet coordinated |
+| `crates/nexus-session/src/lib.rs` | Revision-2 bounded JSON snapshot, ordered source history, and explicit recovery assembler; private Unix directory/file, atomic replacement, and OS single-writer lock | Host runtime construction is not wired; active-view and source-history lifecycle are not coordinated |
 | `nexus-core` request/result types | Call identities, status/effect/evidence, provider continuation, settings | Reuse domain facts; do not add algorithm-specific memory types to the core |
 | `tools/benchmarks/run_nexus_swe_task.py` | Tool/usage/reduction logs, result metadata, prediction export, evaluator separation | Structured event retention, complete compaction classification, and comparable derived metrics are not yet present |
 
@@ -81,8 +81,10 @@ cancelled runs do not commit ordinary partial conversation. Uncertain execution
 evidence receives special retention, with fail-closed behavior when it cannot
 be carried forward safely.
 
-Production runtime wiring does not use `SessionStore`. The file-backed
-implementation now has versioned source records for complete original
+The runtime has an opt-in `try_new_with_session_store` constructor that
+durably writes tool intents before dispatch and records observed operation
+outcomes afterward. Host applications do not yet use it. The file-backed
+implementation has versioned source records for complete original
 `ModelContextItem` values, including tool content and execution uncertainty,
 alongside the existing checkpoint and operation records. However, the runtime
 does not write or load these records; `ListSessions` and `RestoreSession` are
