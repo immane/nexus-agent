@@ -61,6 +61,16 @@ data-exfiltration channel. Allowed public endpoints can themselves proxy
 traffic. This is not proof against every special-purpose registry allocation
 or indirect relay.
 
+On macOS, broad routes (`/8` or broader) attached to `utun` interfaces are
+treated as VPN/exit-node routing rather than host/LAN subnets and are omitted
+from the blocked-host set. Specific routes through a tunnel and all connected
+interface networks remain blocked. This is necessary when an exit node installs
+split-default routes; otherwise those routes can cover every public IPv4 address
+and silently turn a network-capable task container into a networkless one. It
+does not prove isolation against every tunnel implementation or publicly
+numbered network behind a tunnel; validate the effective CIDRs and egress on the
+actual host before relying on this policy.
+
 Docker Desktop may synthesize public DNS answers in `198.18.0.0/15` and route
 TCP through its host-side network proxy. The host detects Docker Desktop from
 `docker info` and enables a narrow exception for that range on TCP ports 80 and

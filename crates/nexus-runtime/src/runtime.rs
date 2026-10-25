@@ -2329,20 +2329,40 @@ impl Runtime {
             return Ok(RunState::RecordingResult);
         }
         if self.shared.policy.is_development() || self.shared.policy.is_container() {
-            queued.needs_approval = self
-                .shared
-                .policy
-                .call_requires_approval(
-                    &queued.call,
-                    self.shared
-                        .session_directories
-                        .lock()
-                        .expect("session permissions lock")
-                        .get(&active.session)
-                        .map_or(&[], Vec::as_slice),
-                    queued.access,
-                )
-                .unwrap_or(true);
+            let approval = self.shared.policy.call_requires_approval(
+                &queued.call,
+                self.shared
+                    .session_directories
+                    .lock()
+                    .expect("session permissions lock")
+                    .get(&active.session)
+                    .map_or(&[], Vec::as_slice),
+                queued.access,
+            );
+            queued.needs_approval = match approval {
+                Ok(needs_approval) => needs_approval,
+                Err(error) => {
+                    active.outcome_slot = Some((
+                        queued.call.call().clone(),
+                        ToolOutcome::new(
+                            ExecutionStatus::Denied,
+                            EffectState::NotStarted,
+                            Evidence::HostObserved,
+                            error.message(),
+                            false,
+                        )
+                        .expect("validated policy error builds a denial"),
+                    ));
+                    active.current = Some(CurrentCall {
+                        call: queued.call,
+                        item_key: queued.item_key,
+                        provider_ref: queued.provider_ref,
+                        binding: None,
+                        dispatched: false,
+                    });
+                    return Ok(RunState::RecordingResult);
+                }
+            };
         }
         if active.read_only && (queued.needs_approval || queued.access != ToolAccess::Read) {
             // Read-only runs never prompt and never execute: the denial is
@@ -5632,6 +5652,47 @@ mod tests {
                     .any(|event| matches!(event.payload(), EventPayload::ApprovalRequired(_)))
             );
         });
+    }
+
+    #[test]
+    fn development_unresolvable_path_is_reported_without_terminating_the_run() {
+        for has_approval_handler in [true, false] {
+            let root = std::env::temp_dir();
+            let missing = format!("nexus-missing-parent-{}/file.txt", std::process::id());
+            assert!(!root.join(&missing).parent().unwrap().exists());
+            let mut config = quick_config();
+            config.policy = Policy::development(&root).unwrap();
+            config.has_approval_handler = has_approval_handler;
+            let mut bed = bed_with(
+                vec![
+                    FakeProvider::tool_turn(vec![candidate(
+                        "host_write",
+                        &format!(r#"{{"path":"{missing}"}}"#),
+                    )]),
+                    FakeProvider::stop_turn("The parent directory does not exist."),
+                ],
+                config,
+                Duration::ZERO,
+            );
+            test_rt().block_on(async {
+                bed.runtime.submit(submit_cmd("missing-parent")).await;
+                let (events, finished) =
+                    collect_until_finished(&mut bed.data, &mut bed.control).await;
+                assert_eq!(finished.outcome(), RunOutcome::Completed);
+                assert_eq!(bed.write_tool.executed.load(Ordering::SeqCst), 0);
+                assert_eq!(bed.provider.calls.load(Ordering::SeqCst), 2);
+                let outcomes = tool_finished_map(&events);
+                assert_eq!(outcomes.len(), 1);
+                let outcome = outcomes.values().next().unwrap();
+                assert_eq!(outcome.status(), ExecutionStatus::Denied);
+                assert_eq!(outcome.effect(), EffectState::NotStarted);
+                assert_eq!(outcome.content(), "tool path cannot be resolved");
+                assert!(!events.control.iter().any(|event| matches!(
+                    event.payload(),
+                    EventPayload::ApprovalRequired(_) | EventPayload::ToolStarted(_)
+                )));
+            });
+        }
     }
 
     #[cfg(unix)]

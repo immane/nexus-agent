@@ -20,8 +20,10 @@ const DISCOVERY_OUTPUT_LIMIT: usize = 256 * 1024;
 const MAX_DISCOVERED_CIDRS: usize = 64;
 
 /// Discovers host interface networks and best-effort non-default route networks.
-/// Topology changes require revalidation; Windows is unsupported. Route discovery
-/// is best-effort and must be checked before dispatch (it is not an egress policy).
+/// Broad macOS `utun` routes are omitted: split-default VPN routes describe
+/// outbound routing, not a host/LAN subnet, and would otherwise deny all public
+/// egress. Specific tunnel routes remain blocked. Topology changes require
+/// revalidation; Windows is unsupported. This is not an egress policy.
 pub fn discover_host_ipv4_cidrs() -> Result<Vec<String>, ContainerError> {
     #[cfg(target_os = "macos")]
     let cidrs = {
@@ -357,7 +359,13 @@ fn parse_darwin_networks(ifconfig: &str, routes: &str) -> Result<Vec<String>, Co
                 let (ip, prefix) = parse_darwin_route_destination(fields[0])?;
                 (ip, prefix)
             };
-            insert_network(&mut set, &ip, prefix)?;
+            let broad_tunnel_route = fields
+                .get(3)
+                .is_some_and(|interface| interface.starts_with("utun"))
+                && prefix <= 8;
+            if !broad_tunnel_route {
+                insert_network(&mut set, &ip, prefix)?;
+            }
         }
         // Capture gateways as host routes as well as route destinations. This
         // includes the default gateway, which is often outside a host /32.
@@ -1086,6 +1094,23 @@ mod tests {
             "Routing tables\nInternet:\nDestination Gateway Flags Netif\n192.168.1.42 invalid-gateway U en0\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn omits_broad_darwin_tunnel_routes_but_keeps_specific_routes() {
+        let interfaces = "en0: flags=8863<UP>\n\tinet 192.0.2.9 netmask 0xffffff00 broadcast 192.0.2.255\nutun4: flags=8051<UP>\n\tinet 100.64.0.2 --> 100.64.0.1 netmask 0xfffffffc\n";
+        let routes = "Routing tables\nInternet:\nDestination Gateway Flags Netif\ndefault 192.0.2.1 UG en0\n0/1 100.64.0.1 UG utun4\n128/1 100.64.0.1 UG utun4\n1/8 100.64.0.1 UG utun4\n198.51.100/24 100.64.0.1 UG utun4\n";
+        let parsed = parse_darwin_networks(interfaces, routes).unwrap();
+        assert_eq!(
+            parsed,
+            [
+                "100.64.0.0/30",
+                "100.64.0.1/32",
+                "192.0.2.0/24",
+                "192.0.2.1/32",
+                "198.51.100.0/24",
+            ]
+        );
     }
     #[test]
     fn cidrs_fail_closed() {
