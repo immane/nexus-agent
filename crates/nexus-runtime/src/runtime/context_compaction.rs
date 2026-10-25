@@ -632,7 +632,15 @@ pub(super) fn ingest_summary(
             return Ok(RunState::CallingModel);
         }
     }
-    if valid && let Some(summary) = summary_text(&events, &prefix.text) {
+    let summary = valid.then(|| summary_text(&events, &prefix.text)).flatten();
+    let mut rejection_reason = if !valid {
+        "provider_batch_invalid"
+    } else if summary.is_none() {
+        "summary_text_invalid"
+    } else {
+        "summary_candidate_rejected"
+    };
+    if let Some(summary) = summary {
         // Representation ceilings are independent of token estimates. An
         // oversized derived memory is a failed summary, not a partial commit.
         if !stage.summary_chunks.is_empty() && stage.summary_index + 1 < stage.summary_chunks.len()
@@ -651,29 +659,55 @@ pub(super) fn ingest_summary(
         }
         let turn = TurnId::new("context-projection")
             .map_err(|_| Terminal::failed_internal("projection turn identity is invalid"))?;
-        if normal_request_with_memory(shared, active, &turn, &stage.items, Some(&summary))
-            .and_then(|request| {
-                if let Some(window) = active.context_management.window {
+        match normal_request_with_memory(shared, active, &turn, &stage.items, Some(&summary)) {
+            Err(_) => rejection_reason = "projected_request_build_failed",
+            Ok(request) => {
+                let request = if let Some(window) = active.context_management.window {
                     let window = u64::from(window.tokens());
                     let output = active.context_management.output_reserve_tokens(window);
                     if estimate(active, &request).saturating_add(output) > window {
-                        return preview_request_for_headroom(active, request, window, output);
+                        match preview_request_for_headroom(active, request, window, output) {
+                            Ok(previewed) => Some(previewed),
+                            Err(_) => {
+                                rejection_reason = "headroom_projection_failed";
+                                None
+                            }
+                        }
+                    } else {
+                        Some(request)
+                    }
+                } else {
+                    Some(request)
+                };
+                if let Some(request) = request {
+                    let input = estimate(active, &request);
+                    let output = active.context_management.window.map_or(0, |window| {
+                        active
+                            .context_management
+                            .output_reserve_tokens(u64::from(window.tokens()))
+                    });
+                    let items_fit = request.conversation().len() <= shared.context_items_bound;
+                    let budget_fits = active.context_management.window.is_none_or(|window| {
+                        input.saturating_add(output) <= u64::from(window.tokens())
+                    });
+                    if items_fit && budget_fits {
+                        commit(shared, active, stage, Some(summary), "summarize")?;
+                        return Ok(RunState::CallingModel);
+                    }
+                    if !items_fit {
+                        rejection_reason = "projected_context_item_limit_exceeded";
+                    } else {
+                        rejection_reason = "projected_request_exceeds_input_plus_output_budget";
+                        diagnostic(format_args!(
+                            "nexus-runtime: summary candidate does not fit estimated_input_tokens={input} output_reserve_tokens={output} window_tokens={}; candidate_preserved=false",
+                            active
+                                .context_management
+                                .window
+                                .map_or(0, |window| u64::from(window.tokens())),
+                        ));
                     }
                 }
-                Ok(request)
-            })
-            .is_ok_and(|request| {
-                request.conversation().len() <= shared.context_items_bound
-                    && active.context_management.window.is_none_or(|window| {
-                        let window = u64::from(window.tokens());
-                        estimate(active, &request)
-                            .saturating_add(active.context_management.output_reserve_tokens(window))
-                            <= window
-                    })
-            })
-        {
-            commit(shared, active, stage, Some(summary), "summarize")?;
-            return Ok(RunState::CallingModel);
+            }
         }
     }
     let text_bytes = events.iter().fold(0usize, |bytes, event| match event {
@@ -681,13 +715,19 @@ pub(super) fn ingest_summary(
         _ => bytes,
     });
     diagnostic(format_args!(
-        "nexus-runtime: summary rejected: protocol_valid={valid} finish_reason={finish_reason:?} retry_depth={} text_bytes={text_bytes} memory_byte_limit={}; original conversation preserved",
+        "nexus-runtime: summary rejected reason={rejection_reason} protocol_valid={valid} finish_reason={finish_reason:?} retry_depth={} text_bytes={text_bytes} memory_byte_limit={}; original conversation preserved",
         stage.summary_retry_depth,
         nexus_context::MAX_MEMORY_BYTES,
     ));
-    Err(Terminal::limit(
-        "context summary failed; original conversation preserved",
-    ))
+    Err(Terminal::limit(match rejection_reason {
+        "projected_request_exceeds_input_plus_output_budget" => {
+            "valid context summary cannot fit the configured input and output budget; original conversation preserved"
+        }
+        "projected_context_item_limit_exceeded" => {
+            "valid context summary exceeds the projected context item limit; original conversation preserved"
+        }
+        _ => "context summary failed validation; original conversation preserved",
+    }))
 }
 
 pub(super) fn record_summary_usage(
@@ -1199,6 +1239,12 @@ mod tests {
         )
         .expect_err("do not commit a candidate that would fail its next request");
         assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        assert_eq!(
+            terminal.error.as_ref().map(AgentError::message),
+            Some(
+                "valid context summary cannot fit the configured input and output budget; original conversation preserved"
+            )
+        );
         assert_eq!(active.conversation, original);
         assert!(active.derived_memory.is_none());
     }

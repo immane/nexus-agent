@@ -263,6 +263,16 @@ baseline, not the complete current workspace.
 
 #### Inspected implementation
 
+The 2026-10-26 follow-up now reports summary rejection categories separately:
+invalid provider batch, invalid summary text, projected request construction or
+headroom projection failure, projected item-limit overflow, and a valid summary
+whose projected input plus output reserve remains over the configured window.
+The latter has a specific `LimitReached` message and reports estimated input,
+output reserve, and window; it preserves the original active conversation and
+does not adopt the candidate summary. These figures remain estimates, not
+provider-reported occupancy. This diagnostic change does not yet reduce the
+protected-context floor or alter provider reasoning replay.
+
 The estimator uses `ceil(payload_bytes / 3)` plus message/tool framing. It starts
 with a 1.25 safety multiplier and now exposes the raw estimate, adjusted estimate
 and multiplier on each request-start event. Provider usage remains correlated to
