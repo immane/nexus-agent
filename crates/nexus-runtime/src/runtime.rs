@@ -143,6 +143,22 @@ impl SessionStoreHandle {
     pub fn new(store: Box<dyn SessionStore + Send>) -> Self {
         Self(Arc::new(StdMutex::new(store)))
     }
+
+    /// Deletes one explicitly selected persisted conversation.
+    pub fn delete_session(&self, session: &SessionId) -> Result<(), AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .delete_session(session)
+    }
+
+    /// Explicitly reads and imports legacy sessions through the shared store.
+    pub fn import_legacy_sessions(&self) -> Result<usize, AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .import_legacy_sessions()
+    }
 }
 
 struct RegisteredTool {
@@ -2661,11 +2677,20 @@ impl Runtime {
             let tool = registered.port.clone();
             let wake = active.wake.clone();
             let token = active.token.clone();
-            (call, tool, context, tool_deadline, wake, token, intent)
+            (
+                active.session.clone(),
+                call,
+                tool,
+                context,
+                tool_deadline,
+                wake,
+                token,
+                intent,
+            )
         };
-        let (call, tool, context, tool_deadline, wake, token, intent) = setup;
+        let (session, call, tool, context, tool_deadline, wake, token, intent) = setup;
         let call_id = call.call().clone();
-        if let Err(error) = self.persist_tool_intent(intent.clone()).await {
+        if let Err(error) = self.persist_tool_intent(&session, intent.clone()).await {
             let mut state = self.shared.state.lock().await;
             if let Some(active) = state.active.as_mut()
                 && &active.run == run
@@ -2851,21 +2876,25 @@ impl Runtime {
                 .as_ref()
                 .filter(|active| &active.run == run)
                 .and_then(|active| {
-                    active.outcome_slot.as_ref().map(|(call, outcome)| {
-                        let outcome = bound_outcome(&self.shared, outcome.clone());
-                        ToolOutcomeRecord {
-                            run: active.run.clone(),
-                            call: call.clone(),
-                            status: outcome.status(),
-                            effect: outcome.effect(),
-                            evidence: outcome.evidence(),
-                            truncated: outcome.is_truncated(),
-                        }
-                    })
+                    active
+                        .outcome_slot
+                        .as_ref()
+                        .map(|(call, outcome)| {
+                            let outcome = bound_outcome(&self.shared, outcome.clone());
+                            ToolOutcomeRecord {
+                                run: active.run.clone(),
+                                call: call.clone(),
+                                status: outcome.status(),
+                                effect: outcome.effect(),
+                                evidence: outcome.evidence(),
+                                truncated: outcome.is_truncated(),
+                            }
+                        })
+                        .map(|record| (active.session.clone(), record))
                 })
         };
-        let persistence_error = if let Some(record) = pending_record {
-            self.persist_tool_outcome(record).await.err()
+        let persistence_error = if let Some((session, record)) = pending_record {
+            self.persist_tool_outcome(&session, record).await.err()
         } else {
             None
         };
@@ -2957,7 +2986,11 @@ impl Runtime {
         }
     }
 
-    async fn persist_tool_intent(&self, intent: ToolIntentRecord) -> Result<(), AgentError> {
+    async fn persist_tool_intent(
+        &self,
+        session: &SessionId,
+        intent: ToolIntentRecord,
+    ) -> Result<(), AgentError> {
         let Some(store) = self.shared.session_store.clone() else {
             return Ok(());
         };
@@ -2968,6 +3001,7 @@ impl Runtime {
             ));
         }
         let run = intent.run.clone();
+        let session = session.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().map_err(|_| {
                 runtime_error(
@@ -2975,12 +3009,16 @@ impl Runtime {
                     "session store is unavailable",
                 )
             })?;
-            store.record_intent(&intent)
+            store.record_session_intent(&session, &intent)
         });
         self.await_store(&run, worker).await
     }
 
-    async fn persist_tool_outcome(&self, outcome: ToolOutcomeRecord) -> Result<(), AgentError> {
+    async fn persist_tool_outcome(
+        &self,
+        session: &SessionId,
+        outcome: ToolOutcomeRecord,
+    ) -> Result<(), AgentError> {
         let Some(store) = self.shared.session_store.clone() else {
             return Ok(());
         };
@@ -2991,6 +3029,7 @@ impl Runtime {
             ));
         }
         let run = outcome.run.clone();
+        let session = session.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().map_err(|_| {
                 runtime_error(
@@ -2998,7 +3037,7 @@ impl Runtime {
                     "session store is unavailable",
                 )
             })?;
-            store.record_outcome(&outcome)
+            store.record_session_outcome(&session, &outcome)
         });
         self.await_store(&run, worker).await
     }

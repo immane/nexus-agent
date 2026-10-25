@@ -160,6 +160,283 @@ pub struct FileSessionStore {
     _lock: File,
 }
 
+/// Directory-backed store that keeps each conversation in its own bounded
+/// snapshot. Opening it reads only a small metadata index; session bodies are
+/// loaded only for the selected conversation or one being updated.
+pub struct DirectorySessionStore {
+    sessions_directory: PathBuf,
+    index_path: PathBuf,
+    sessions: Vec<SessionMetadata>,
+    write_uncertain: bool,
+    _lock: File,
+}
+
+impl DirectorySessionStore {
+    /// Opens a private store whose index contains metadata only. Session files
+    /// are decoded only when that session is loaded or changed.
+    pub fn open(directory: impl Into<PathBuf>) -> Result<Self, AgentError> {
+        let directory = directory.into();
+        prepare_directory(&directory)?;
+        let lock = acquire_lock(&directory)?;
+        let sessions_directory = directory.join("sessions");
+        prepare_directory(&sessions_directory)?;
+        let index_path = directory.join("session-index.json");
+        let sessions = read_session_index(&index_path)?;
+        let mut store = Self {
+            sessions_directory,
+            index_path,
+            sessions,
+            write_uncertain: false,
+            _lock: lock,
+        };
+        store.recover_transaction()?;
+        // No journal now references staging. Discard a pre-intent interrupted
+        // update so explicit deletion cannot leave another copy of its body.
+        store.discard_staging()?;
+        Ok(store)
+    }
+
+    fn ensure_available(&self) -> Result<(), AgentError> {
+        if self.write_uncertain {
+            return Err(store_error(
+                "session store publication is uncertain; reopen required",
+            ));
+        }
+        Ok(())
+    }
+
+    fn session_path(&self, session: &SessionId) -> PathBuf {
+        // Encode bytes to avoid case-folding collisions on macOS filesystems.
+        let name: String = session
+            .as_str()
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        self.sessions_directory.join(format!("{name}.json"))
+    }
+
+    fn staging_path(&self) -> PathBuf {
+        self.sessions_directory.join("pending-body.json")
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.index_path.with_file_name("session-pending.json")
+    }
+
+    fn discard_staging(&self) -> Result<(), AgentError> {
+        match fs::remove_file(self.staging_path()) {
+            Ok(()) => sync_directory(&self.sessions_directory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(store_error("unpublished staging data could not be removed")),
+        }
+    }
+
+    fn publish(&mut self, session: &SessionId, revision: Option<u64>) -> Result<(), AgentError> {
+        self.ensure_available()?;
+        if revision.is_none() {
+            self.discard_staging()?;
+        }
+        let bytes = serde_json::to_vec(&json!({
+            "session": session.as_str(), "revision": revision,
+        }))
+        .map_err(|_| store_error("session transaction could not be encoded"))?;
+        atomic_write(
+            &self.journal_path(),
+            &bytes,
+            &mut self.write_uncertain,
+            sync_directory,
+        )?;
+        // Once the journal is durable, failures require reopening and replaying
+        // this metadata-only transaction before any further store access.
+        let result = self.recover_transaction();
+        if result.is_err() {
+            self.write_uncertain = true;
+        }
+        result
+    }
+
+    fn recover_transaction(&mut self) -> Result<(), AgentError> {
+        let Some(bytes) = read_snapshot(&self.journal_path())? else {
+            return Ok(());
+        };
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| store_error("session transaction is invalid"))?;
+        let root = nexus_validation::parse_document_object(text, 1024)
+            .map_err(|_| store_error("session transaction is invalid"))?;
+        check_keys(&root, &["session", "revision"])?;
+        let session = SessionId::new(string(field(&root, "session")?)?)
+            .map_err(|_| store_error("session transaction identity is invalid"))?;
+        let value = field(&root, "revision")?;
+        let revision = if value.is_null() {
+            None
+        } else {
+            Some(number(value)?)
+        };
+        if revision.is_some() {
+            if fs::symlink_metadata(self.staging_path()).is_ok() {
+                fs::rename(self.staging_path(), self.session_path(&session))
+                    .map_err(|_| store_error("session body could not be published"))?;
+            } else if read_snapshot(&self.session_path(&session))?.is_none() {
+                return Err(store_error("pending session body is missing"));
+            }
+            sync_directory(&self.sessions_directory)?;
+        }
+        let mut entries = self.sessions.clone();
+        entries.retain(|entry| entry.session != session);
+        if let Some(logical_revision) = revision {
+            entries.push(SessionMetadata {
+                session: session.clone(),
+                logical_revision,
+            });
+        }
+        entries.sort_by(|left, right| left.session.as_str().cmp(right.session.as_str()));
+        self.write_index(entries)?;
+        if revision.is_none() {
+            match fs::remove_file(self.session_path(&session)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(store_error("session data could not be removed")),
+            }
+            sync_directory(&self.sessions_directory)?;
+        }
+        fs::remove_file(self.journal_path())
+            .map_err(|_| store_error("session transaction could not be completed"))?;
+        sync_directory(self.index_path.parent().expect("store directory"))
+    }
+
+    fn update<T>(
+        &mut self,
+        session: &SessionId,
+        change: impl FnOnce(&mut FileSessionStore) -> Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        let mut store = self.load_file_store(session)?;
+        store.path = self.staging_path();
+        match fs::remove_file(&store.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(store_error("unpublished staging data could not be removed")),
+        }
+        let result = change(&mut store);
+        self.write_uncertain |= store.write_uncertain;
+        let value = result?;
+        // Even an idempotent operation must stage a complete snapshot; an old
+        // staging file must never be mistaken for the current transaction.
+        if !store.path.exists() {
+            let staged = store.commit(
+                store.sessions.clone(),
+                store.intents.clone(),
+                store.outcomes.clone(),
+                store.source_records.clone(),
+            );
+            self.write_uncertain |= store.write_uncertain;
+            staged?;
+        }
+        self.save_loaded(store)?;
+        Ok(value)
+    }
+
+    fn load_file_store(&self, session: &SessionId) -> Result<FileSessionStore, AgentError> {
+        self.ensure_available()?;
+        if !self.sessions.iter().any(|entry| &entry.session == session) {
+            return Err(store_error("session was not found"));
+        }
+        let path = self.session_path(session);
+        let (sessions, intents, outcomes, source_records) = match read_snapshot(&path)? {
+            Some(bytes) => decode(&bytes)?,
+            None => return Err(store_error("session data is missing")),
+        };
+        if sessions.len() != 1 || sessions[0].session() != session {
+            return Err(store_error("session data identity is invalid"));
+        }
+        Ok(FileSessionStore {
+            path,
+            sessions,
+            intents,
+            outcomes,
+            source_records,
+            write_uncertain: false,
+            _lock: self
+                ._lock
+                .try_clone()
+                .map_err(|_| store_error("session store is unavailable"))?,
+        })
+    }
+
+    fn write_index(&mut self, entries: Vec<SessionMetadata>) -> Result<(), AgentError> {
+        self.ensure_available()?;
+        let value = json!({
+            "revision": 1,
+            "sessions": entries.iter().map(|entry| json!({
+                "session": entry.session.as_str(),
+                "logical_revision": entry.logical_revision,
+            })).collect::<Vec<_>>(),
+        });
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|_| store_error("session index could not be encoded"))?;
+        if bytes.len() > 16 * 1024 {
+            return Err(store_error("session index size limit is exceeded"));
+        }
+        atomic_write(
+            &self.index_path,
+            &bytes,
+            &mut self.write_uncertain,
+            sync_directory,
+        )?;
+        self.sessions = entries;
+        Ok(())
+    }
+
+    fn save_loaded(&mut self, store: FileSessionStore) -> Result<(), AgentError> {
+        self.write_uncertain |= store.write_uncertain;
+        store.ensure_available()?;
+        let checkpoint = store
+            .sessions
+            .first()
+            .ok_or_else(|| store_error("session data is missing"))?;
+        let session = checkpoint.session().clone();
+        let revision = checkpoint.logical_revision();
+        self.publish(&session, Some(revision))
+    }
+}
+
+fn read_session_index(path: &Path) -> Result<Vec<SessionMetadata>, AgentError> {
+    let Some(bytes) = read_snapshot(path)? else {
+        return Ok(Vec::new());
+    };
+    if bytes.len() > 16 * 1024 {
+        return Err(store_error("session index size limit is exceeded"));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| store_error("session index is invalid"))?;
+    let root = nexus_validation::parse_document_object(text, 16 * 1024)
+        .map_err(|_| store_error("session index is invalid"))?;
+    check_keys(&root, &["revision", "sessions"])?;
+    if number(field(&root, "revision")?)? != 1 {
+        return Err(store_error("session index format revision is unsupported"));
+    }
+    let values = bounded_array(field(&root, "sessions")?, nexus_core::store::MAX_SESSIONS)?;
+    let entries = values
+        .iter()
+        .map(|value| {
+            check_keys(value, &["session", "logical_revision"])?;
+            let session = SessionId::new(string(field(value, "session")?)?.to_owned())
+                .map_err(|_| store_error("session index identity is invalid"))?;
+            let logical_revision = number(field(value, "logical_revision")?)?;
+            Ok(SessionMetadata {
+                session,
+                logical_revision,
+            })
+        })
+        .collect::<Result<Vec<_>, AgentError>>()?;
+    let mut seen = HashSet::new();
+    if entries
+        .iter()
+        .any(|entry| !seen.insert(entry.session.as_str()))
+    {
+        return Err(store_error("session index contains duplicate sessions"));
+    }
+    Ok(entries)
+}
+
 /// Defers reading the bounded snapshot until the first store operation.
 /// Applications can construct a runtime and open a fresh conversation without
 /// materializing prior session history during startup.
@@ -257,6 +534,255 @@ impl SessionStore for LazyFileSessionStore {
             .as_mut()
             .unwrap()
             .append_source_items(session, run, items)
+    }
+}
+
+impl SessionStore for DirectorySessionStore {
+    fn import_legacy_sessions(&mut self) -> Result<usize, AgentError> {
+        self.ensure_available()?;
+        let legacy = self.index_path.with_file_name("session-store.json");
+        let Some(bytes) = read_snapshot(&legacy)? else {
+            return Err(store_error("legacy session store was not found"));
+        };
+        let (checkpoints, intents, outcomes, records) = decode(&bytes)?;
+        // Tool records predate session ownership. Infer it only from original
+        // source records, never by guessing which conversation owns a run.
+        let mut owners = std::collections::HashMap::new();
+        for record in &records {
+            if !checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.session() == record.session())
+            {
+                return Err(store_error("legacy source has no owning session"));
+            }
+            if let Some(owner) = owners.insert(record.run().clone(), record.session().clone())
+                && owner != *record.session()
+            {
+                return Err(store_error("legacy run belongs to multiple sessions"));
+            }
+        }
+        if intents
+            .iter()
+            .any(|record| !owners.contains_key(&record.run))
+            || outcomes
+                .iter()
+                .any(|record| !owners.contains_key(&record.run))
+        {
+            return Err(store_error(
+                "legacy tool ownership is unknown; original file preserved",
+            ));
+        }
+        let missing = checkpoints
+            .iter()
+            .filter(|checkpoint| {
+                !self
+                    .sessions
+                    .iter()
+                    .any(|entry| &entry.session == checkpoint.session())
+            })
+            .count();
+        if self.sessions.len() + missing > nexus_core::store::MAX_SESSIONS {
+            return Err(store_error(
+                "import exceeds session capacity; delete old saved sessions first",
+            ));
+        }
+        let mut snapshots = Vec::new();
+        for checkpoint in checkpoints {
+            let session = checkpoint.session();
+            let selected_intents = intents
+                .iter()
+                .filter(|record| owners.get(&record.run) == Some(session))
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_outcomes = outcomes
+                .iter()
+                .filter(|record| owners.get(&record.run) == Some(session))
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_records = records
+                .iter()
+                .filter(|record| record.session() == session)
+                .cloned()
+                .collect::<Vec<_>>();
+            let bytes = encode(
+                std::slice::from_ref(&checkpoint),
+                &selected_intents,
+                &selected_outcomes,
+                &selected_records,
+            )?;
+            decode(&bytes)?;
+            if self.sessions.iter().any(|entry| &entry.session == session) {
+                let existing = self.load_file_store(session)?;
+                if encode(
+                    &existing.sessions,
+                    &existing.intents,
+                    &existing.outcomes,
+                    &existing.source_records,
+                )? != bytes
+                {
+                    return Err(store_error(
+                        "legacy session conflicts with existing data; import refused",
+                    ));
+                }
+                continue;
+            }
+            if fs::symlink_metadata(self.session_path(session)).is_ok() {
+                return Err(store_error(
+                    "orphaned session data exists; refusing to overwrite it",
+                ));
+            }
+            snapshots.push((session.clone(), checkpoint.logical_revision(), bytes));
+        }
+        let count = snapshots.len();
+        for (session, revision, bytes) in snapshots {
+            atomic_write(
+                &self.staging_path(),
+                &bytes,
+                &mut self.write_uncertain,
+                sync_directory,
+            )?;
+            self.publish(&session, Some(revision))?;
+        }
+        // The legacy file remains an untouched backup. Repeating an interrupted
+        // import skips identical sessions and refuses conflicts.
+        Ok(count)
+    }
+
+    fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMetadata>, AgentError> {
+        self.ensure_available()?;
+        let mut entries = self.sessions.clone();
+        entries.sort_by(|left, right| left.session.as_str().cmp(right.session.as_str()));
+        entries.truncate(limit);
+        Ok(entries)
+    }
+
+    fn load_session(&self, id: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+        self.load_file_store(id)?
+            .sessions
+            .into_iter()
+            .next()
+            .ok_or_else(|| store_error("session was not found"))
+    }
+
+    fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError> {
+        nexus_core::store::check_format_revision(checkpoint.format_revision())?;
+        nexus_core::store::check_checkpoint_bounds(checkpoint)?;
+        if !self
+            .sessions
+            .iter()
+            .any(|entry| entry.session == *checkpoint.session())
+        {
+            return Err(store_error("session was not initialized"));
+        }
+        self.update(checkpoint.session(), |store| {
+            store.save_checkpoint(checkpoint)
+        })
+    }
+
+    fn initialize_session(&mut self, checkpoint: &SessionCheckpoint) -> Result<bool, AgentError> {
+        self.ensure_available()?;
+        nexus_core::store::check_format_revision(checkpoint.format_revision())?;
+        nexus_core::store::check_checkpoint_bounds(checkpoint)?;
+        if self
+            .sessions
+            .iter()
+            .any(|entry| entry.session == *checkpoint.session())
+        {
+            return Ok(false);
+        }
+        if self.sessions.len() >= nexus_core::store::MAX_SESSIONS {
+            return Err(store_error(
+                "session capacity reached; delete an old session with :session delete <id>",
+            ));
+        }
+        let path = self.session_path(checkpoint.session());
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(store_error(
+                "orphaned session data exists; refusing to overwrite it",
+            ));
+        }
+        let mut store = FileSessionStore {
+            path: self.staging_path(),
+            sessions: Vec::new(),
+            intents: Vec::new(),
+            outcomes: Vec::new(),
+            source_records: Vec::new(),
+            write_uncertain: false,
+            _lock: self
+                ._lock
+                .try_clone()
+                .map_err(|_| store_error("session store is unavailable"))?,
+        };
+        let result = store.save_checkpoint(checkpoint);
+        self.write_uncertain |= store.write_uncertain;
+        result?;
+        self.save_loaded(store)?;
+        Ok(true)
+    }
+
+    fn record_intent(&mut self, _intent: &ToolIntentRecord) -> Result<(), AgentError> {
+        Err(store_error(
+            "session identity is required for operation records",
+        ))
+    }
+
+    fn record_session_intent(
+        &mut self,
+        session: &SessionId,
+        intent: &ToolIntentRecord,
+    ) -> Result<(), AgentError> {
+        self.update(session, |store| store.record_intent(intent))
+    }
+
+    fn record_outcome(&mut self, _outcome: &ToolOutcomeRecord) -> Result<(), AgentError> {
+        Err(store_error(
+            "session identity is required for operation records",
+        ))
+    }
+
+    fn record_session_outcome(
+        &mut self,
+        session: &SessionId,
+        outcome: &ToolOutcomeRecord,
+    ) -> Result<(), AgentError> {
+        self.update(session, |store| store.record_outcome(outcome))
+    }
+
+    fn delete_session(&mut self, session: &SessionId) -> Result<(), AgentError> {
+        self.ensure_available()?;
+        if !self.sessions.iter().any(|entry| &entry.session == session) {
+            return Err(store_error("session was not found"));
+        }
+        self.publish(session, None)
+    }
+
+    fn append_source_record(&mut self, record: &SourceRecord) -> Result<(), AgentError> {
+        self.update(record.session(), |store| store.append_source_record(record))
+    }
+
+    fn load_source_records(
+        &self,
+        session: &SessionId,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SourceRecord>, AgentError> {
+        self.load_file_store(session)?
+            .load_source_records(session, after_sequence, limit)
+    }
+
+    fn last_source_sequence(&self, session: &SessionId) -> Result<u64, AgentError> {
+        self.load_file_store(session)?.last_source_sequence(session)
+    }
+
+    fn append_source_items(
+        &mut self,
+        session: &SessionId,
+        run: &RunId,
+        items: &[ModelContextItem],
+    ) -> Result<u64, AgentError> {
+        self.update(session, |store| {
+            store.append_source_items(session, run, items)
+        })
     }
 }
 
@@ -370,7 +896,9 @@ impl SessionStore for FileSessionStore {
             *current = checkpoint.clone();
         } else {
             if sessions.len() >= nexus_core::store::MAX_SESSIONS {
-                return Err(store_error("session store capacity is exhausted"));
+                return Err(store_error(
+                    "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+                ));
             }
             sessions.push(checkpoint.clone());
         }
@@ -413,7 +941,9 @@ impl SessionStore for FileSessionStore {
             };
         }
         if self.intents.len() >= nexus_core::store::MAX_INTENT_RECORDS {
-            return Err(store_error("session store capacity is exhausted"));
+            return Err(store_error(
+                "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+            ));
         }
         let mut intents = self.intents.clone();
         intents.push(intent.clone());
@@ -442,7 +972,9 @@ impl SessionStore for FileSessionStore {
             };
         }
         if self.outcomes.len() >= nexus_core::store::MAX_OUTCOME_RECORDS {
-            return Err(store_error("session store capacity is exhausted"));
+            return Err(store_error(
+                "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+            ));
         }
         let mut outcomes = self.outcomes.clone();
         outcomes.push(outcome.clone());
@@ -485,7 +1017,9 @@ impl SessionStore for FileSessionStore {
             return Err(store_error("source record sequence is not contiguous"));
         }
         if self.source_records.len() >= MAX_SOURCE_RECORDS {
-            return Err(store_error("source history capacity is exhausted"));
+            return Err(store_error(
+                "session source history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+            ));
         }
         let mut records = self.source_records.clone();
         records.push(record.clone());
@@ -540,7 +1074,9 @@ impl SessionStore for FileSessionStore {
         }
         let mut sequence = self.last_source_sequence(session)?;
         if self.source_records.len().saturating_add(items.len()) > MAX_SOURCE_RECORDS {
-            return Err(store_error("source history capacity is exhausted"));
+            return Err(store_error(
+                "session source history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+            ));
         }
         let mut records = self.source_records.clone();
         for item in items {
@@ -1312,6 +1848,368 @@ mod tests {
             "profile-a",
         )
         .expect("valid checkpoint")
+    }
+
+    fn checkpoint_for(id: &str, revision: u64, text: &str) -> SessionCheckpoint {
+        SessionCheckpoint::new(
+            SessionId::new(id).expect("valid session"),
+            nexus_core::STORE_FORMAT_REVISION,
+            revision,
+            vec![StoredMessage {
+                source: "user".to_owned(),
+                text: text.to_owned(),
+                complete: true,
+            }],
+            "profile-a",
+        )
+        .expect("valid checkpoint")
+    }
+
+    #[test]
+    fn directory_transactions_recover_create_update_and_delete_without_loading_bodies() {
+        for boundary in 0..3 {
+            let directory = directory("transaction-recovery");
+            let mut store = DirectorySessionStore::open(&directory).unwrap();
+            let checkpoint = checkpoint_for("pending", 1, "retained");
+            let bytes = encode(std::slice::from_ref(&checkpoint), &[], &[], &[]).unwrap();
+            atomic_write(&store.staging_path(), &bytes, &mut false, sync_directory).unwrap();
+            let journal = json!({"session": "pending", "revision": 1});
+            atomic_write(
+                &store.journal_path(),
+                &serde_json::to_vec(&journal).unwrap(),
+                &mut false,
+                sync_directory,
+            )
+            .unwrap();
+            if boundary >= 1 {
+                fs::rename(
+                    store.staging_path(),
+                    store.session_path(checkpoint.session()),
+                )
+                .unwrap();
+                sync_directory(&store.sessions_directory).unwrap();
+            }
+            if boundary >= 2 {
+                store
+                    .write_index(vec![SessionMetadata {
+                        session: checkpoint.session().clone(),
+                        logical_revision: 1,
+                    }])
+                    .unwrap();
+            }
+            drop(store);
+            let store = DirectorySessionStore::open(&directory).unwrap();
+            assert_eq!(
+                store.load_session(checkpoint.session()).unwrap(),
+                checkpoint
+            );
+            assert!(!store.journal_path().exists());
+
+            // Update recovery reads only pending metadata, not even the body's
+            // JSON. A damaged body remains selected-session corruption.
+            let journal = json!({"session": "pending", "revision": 2});
+            atomic_write(
+                &store.staging_path(),
+                b"damaged",
+                &mut false,
+                sync_directory,
+            )
+            .unwrap();
+            atomic_write(
+                &store.journal_path(),
+                &serde_json::to_vec(&journal).unwrap(),
+                &mut false,
+                sync_directory,
+            )
+            .unwrap();
+            drop(store);
+            let store = DirectorySessionStore::open(&directory).unwrap();
+            assert_eq!(store.list_sessions(1).unwrap()[0].logical_revision, 2);
+            assert!(store.load_session(checkpoint.session()).is_err());
+
+            let journal = json!({"session": "pending", "revision": null});
+            atomic_write(
+                &store.journal_path(),
+                &serde_json::to_vec(&journal).unwrap(),
+                &mut false,
+                sync_directory,
+            )
+            .unwrap();
+            drop(store);
+            let store = DirectorySessionStore::open(&directory).unwrap();
+            assert!(store.list_sessions(1).unwrap().is_empty());
+            assert!(!store.session_path(checkpoint.session()).exists());
+            drop(store);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn directory_child_sync_failure_blocks_outer_store_until_reopened() {
+        let directory = directory("child-sync-failure");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        let checkpoint = checkpoint(1, "original");
+        store.initialize_session(&checkpoint).unwrap();
+        let result = store.update(checkpoint.session(), |child| {
+            child.commit_with_sync(child.sessions.clone(), vec![], vec![], vec![], |_| {
+                Err(store_error("injected directory sync failure"))
+            })
+        });
+        assert!(result.is_err());
+        assert!(store.list_sessions(1).is_err());
+        assert!(store.load_session(checkpoint.session()).is_err());
+        drop(store);
+        let reopened = DirectorySessionStore::open(&directory).unwrap();
+        assert_eq!(
+            reopened.load_session(checkpoint.session()).unwrap(),
+            checkpoint
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_failed_index_publication_preserves_memory_and_replays_on_reopen() {
+        let directory = directory("index-failure");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        let original = checkpoint(1, "original");
+        store.initialize_session(&original).unwrap();
+        let index_bytes = fs::read(&store.index_path).unwrap();
+        fs::remove_file(&store.index_path).unwrap();
+        fs::create_dir(&store.index_path).unwrap();
+        assert!(store.save_checkpoint(&checkpoint(2, "updated")).is_err());
+        assert_eq!(store.sessions[0].logical_revision, 1);
+        assert!(store.list_sessions(1).is_err());
+        assert!(store.journal_path().exists());
+        fs::remove_dir(&store.index_path).unwrap();
+        atomic_write(&store.index_path, &index_bytes, &mut false, sync_directory).unwrap();
+        drop(store);
+        let reopened = DirectorySessionStore::open(&directory).unwrap();
+        assert_eq!(
+            reopened.load_session(original.session()).unwrap(),
+            checkpoint(2, "updated")
+        );
+        assert_eq!(reopened.list_sessions(1).unwrap()[0].logical_revision, 2);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_capacity_can_be_released_and_case_distinct_ids_do_not_collide() {
+        let directory = directory("index-capacity");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        for index in 0..nexus_core::store::MAX_SESSIONS {
+            store
+                .initialize_session(&checkpoint_for(&format!("session-{index}"), 1, "saved"))
+                .unwrap();
+        }
+        assert!(
+            store
+                .initialize_session(&checkpoint_for("extra", 1, "saved"))
+                .is_err()
+        );
+        store
+            .delete_session(&SessionId::new("session-0").unwrap())
+            .unwrap();
+        store
+            .initialize_session(&checkpoint_for("Session-1", 1, "distinct"))
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session(&SessionId::new("session-1").unwrap())
+                .unwrap()
+                .messages()[0]
+                .text,
+            "saved"
+        );
+        assert_eq!(
+            store
+                .load_session(&SessionId::new("Session-1").unwrap())
+                .unwrap()
+                .messages()[0]
+                .text,
+            "distinct"
+        );
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_import_is_explicit_idempotent_and_preserves_backup_and_ownership() {
+        let directory = directory("legacy-import");
+        let mut legacy = FileSessionStore::open(&directory).unwrap();
+        let checkpoint = checkpoint(1, "legacy text");
+        legacy.save_checkpoint(&checkpoint).unwrap();
+        let run = RunId::new("legacy-run").unwrap();
+        legacy
+            .append_source_items(
+                checkpoint.session(),
+                &run,
+                &[ModelContextItem::user_text("legacy input").unwrap()],
+            )
+            .unwrap();
+        let intent = ToolIntentRecord {
+            run,
+            call: CallId::new("call").unwrap(),
+            tool: ToolId::new("read", M0_REVISION).unwrap(),
+            args: NormalizedArgs::new("{}").unwrap(),
+            scope: ApprovedScope::new("read").unwrap(),
+        };
+        legacy.record_intent(&intent).unwrap();
+        drop(legacy);
+        let backup = fs::read(directory.join("session-store.json")).unwrap();
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        assert!(store.list_sessions(10).unwrap().is_empty());
+        assert_eq!(store.import_legacy_sessions().unwrap(), 1);
+        assert_eq!(store.import_legacy_sessions().unwrap(), 0);
+        assert_eq!(
+            store.load_session(checkpoint.session()).unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            store.load_file_store(checkpoint.session()).unwrap().intents,
+            vec![intent]
+        );
+        assert_eq!(
+            fs::read(directory.join("session-store.json")).unwrap(),
+            backup
+        );
+        store
+            .save_checkpoint(&checkpoint_for("session-a", 2, "changed"))
+            .unwrap();
+        assert!(store.import_legacy_sessions().is_err());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_unknown_tool_ownership_fails_before_importing_any_session() {
+        let directory = directory("legacy-unknown-owner");
+        let mut legacy = FileSessionStore::open(&directory).unwrap();
+        legacy.save_checkpoint(&checkpoint(1, "legacy")).unwrap();
+        legacy
+            .record_intent(&ToolIntentRecord {
+                run: RunId::new("unknown-run").unwrap(),
+                call: CallId::new("call").unwrap(),
+                tool: ToolId::new("read", M0_REVISION).unwrap(),
+                args: NormalizedArgs::new("{}").unwrap(),
+                scope: ApprovedScope::new("read").unwrap(),
+            })
+            .unwrap();
+        drop(legacy);
+        let backup = fs::read(directory.join("session-store.json")).unwrap();
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        assert!(store.import_legacy_sessions().is_err());
+        assert!(store.list_sessions(64).unwrap().is_empty());
+        assert_eq!(
+            fs::read(directory.join("session-store.json")).unwrap(),
+            backup
+        );
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_delete_keeps_a_recoverable_journal_and_blocks_further_writes() {
+        let directory = directory("delete-failure");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        let checkpoint = checkpoint(1, "original");
+        store.initialize_session(&checkpoint).unwrap();
+        let path = store.session_path(checkpoint.session());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.delete_session(checkpoint.session()).is_err());
+        assert!(store.journal_path().exists());
+        assert!(
+            store
+                .initialize_session(&checkpoint_for("new", 1, "blocked"))
+                .is_err()
+        );
+        fs::remove_dir(path).unwrap();
+        drop(store);
+        let reopened = DirectorySessionStore::open(&directory).unwrap();
+        assert!(reopened.list_sessions(64).unwrap().is_empty());
+        assert!(!reopened.journal_path().exists());
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reopen_discards_pre_intent_staging_before_explicit_delete() {
+        let directory = directory("abandoned-stage");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        let checkpoint = checkpoint(1, "private history");
+        store.initialize_session(&checkpoint).unwrap();
+        let bytes = fs::read(store.session_path(checkpoint.session())).unwrap();
+        atomic_write(&store.staging_path(), &bytes, &mut false, sync_directory).unwrap();
+        assert!(!store.journal_path().exists());
+        drop(store);
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        assert!(!store.staging_path().exists());
+        store.delete_session(checkpoint.session()).unwrap();
+        assert_eq!(fs::read_dir(&store.sessions_directory).unwrap().count(), 0);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_store_lists_metadata_without_decoding_other_sessions_and_deletes_explicitly() {
+        let directory = directory("partitioned");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        let first = checkpoint_for("session-a", 1, "original");
+        let second = checkpoint_for("session-b", 1, "new session");
+        assert!(store.initialize_session(&first).unwrap());
+
+        // A malformed body in an unselected session must not block metadata
+        // listing or creation of another independent conversation.
+        fs::write(store.session_path(first.session()), b"not json").unwrap();
+        assert_eq!(store.list_sessions(10).unwrap().len(), 1);
+        assert!(store.initialize_session(&second).unwrap());
+        assert_eq!(store.load_session(second.session()).unwrap(), second);
+        assert!(store.load_session(first.session()).is_err());
+
+        store.delete_session(second.session()).unwrap();
+        let remaining = store.list_sessions(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session, *first.session());
+        assert!(!store.session_path(second.session()).exists());
+        drop(store);
+        let reopened = DirectorySessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.list_sessions(10).unwrap().len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn directory_store_keeps_operation_capacity_per_session() {
+        let directory = directory("per-session-capacity");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        let checkpoint_a = checkpoint_for("session-a", 1, "a");
+        let checkpoint_b = checkpoint_for("session-b", 1, "b");
+        store.initialize_session(&checkpoint_a).unwrap();
+        store.initialize_session(&checkpoint_b).unwrap();
+        let session = checkpoint_a.session();
+        for index in 0..nexus_core::store::MAX_INTENT_RECORDS {
+            let intent = ToolIntentRecord {
+                run: RunId::new(format!("run-{index}")).unwrap(),
+                call: CallId::new("call").unwrap(),
+                tool: ToolId::new("read", M0_REVISION).unwrap(),
+                args: NormalizedArgs::new("{}").unwrap(),
+                scope: ApprovedScope::new("read").unwrap(),
+            };
+            store.record_session_intent(session, &intent).unwrap();
+        }
+        let other_intent = ToolIntentRecord {
+            run: RunId::new("run-other").unwrap(),
+            call: CallId::new("call").unwrap(),
+            tool: ToolId::new("read", M0_REVISION).unwrap(),
+            args: NormalizedArgs::new("{}").unwrap(),
+            scope: ApprovedScope::new("read").unwrap(),
+        };
+        store
+            .record_session_intent(checkpoint_b.session(), &other_intent)
+            .unwrap();
+        store.delete_session(session).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -24,17 +24,16 @@ pub const STORE_FORMAT_REVISION: u32 = M0_REVISION;
 /// retained-context budget).
 pub const MAX_STORED_MESSAGES: usize = Limits::M0_TEST_RETAINED_CONTEXT_ITEMS;
 
-/// Maximum retained session checkpoints per store (M0-TEST choice; not a
-/// product default). A save of a new session beyond this bound fails
-/// explicitly; existing sessions stay writable.
+/// Maximum retained sessions in the TUI's local store. Creating a session at
+/// this limit fails explicitly; users can delete an old saved session.
 pub const MAX_SESSIONS: usize = 64;
 
-/// Maximum retained tool-intent records per store (M0-TEST choice; not a
-/// product default). Recording beyond this bound fails explicitly.
+/// Maximum retained tool-intent records per session file. Recording beyond
+/// this bound fails explicitly; deleting that session frees its capacity.
 pub const MAX_INTENT_RECORDS: usize = 256;
 
-/// Maximum retained tool-outcome records per store (M0-TEST choice; not a
-/// product default). Recording beyond this bound fails explicitly.
+/// Maximum retained tool-outcome records per session file. Recording beyond
+/// this bound fails explicitly; deleting that session frees its capacity.
 pub const MAX_OUTCOME_RECORDS: usize = 256;
 
 /// Maximum stored profile-metadata length in bytes (M0-TEST choice aligned
@@ -275,8 +274,41 @@ pub trait SessionStore {
     /// Records side-effecting intent before dispatch.
     fn record_intent(&mut self, intent: &ToolIntentRecord) -> Result<(), AgentError>;
 
+    /// Records an intent under its owning session. Session-partitioned stores
+    /// override this to keep operation limits local to one conversation.
+    fn record_session_intent(
+        &mut self,
+        _session: &SessionId,
+        intent: &ToolIntentRecord,
+    ) -> Result<(), AgentError> {
+        self.record_intent(intent)
+    }
+
     /// Records the actual outcome without rewriting the intent.
     fn record_outcome(&mut self, outcome: &ToolOutcomeRecord) -> Result<(), AgentError>;
+
+    /// Records an outcome under its owning session.
+    fn record_session_outcome(
+        &mut self,
+        _session: &SessionId,
+        outcome: &ToolOutcomeRecord,
+    ) -> Result<(), AgentError> {
+        self.record_outcome(outcome)
+    }
+
+    /// Deletes one explicitly selected conversation and its operation journal.
+    /// Implementations must not remove any other session's records.
+    fn delete_session(&mut self, _session: &SessionId) -> Result<(), AgentError> {
+        Err(store_error("session deletion is unsupported by this store"))
+    }
+
+    /// Explicitly reads and imports legacy session storage, returning the number
+    /// of sessions imported. Stores without legacy import support fail explicitly.
+    fn import_legacy_sessions(&mut self) -> Result<usize, AgentError> {
+        Err(store_error(
+            "legacy session import is unsupported by this store",
+        ))
+    }
 
     /// Appends one accepted original item. Stores that do not support source
     /// history fail explicitly rather than pretending the item was archived.

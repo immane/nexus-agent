@@ -33,6 +33,10 @@ pub enum SessionArgs {
     New,
     /// List every session with its index, label, and status.
     List,
+    /// Explicitly read the legacy session file and import its sessions.
+    Import,
+    /// Delete one explicitly selected persisted session.
+    Delete(String),
     /// Restore one explicitly selected persistent session id.
     Restore(String),
     /// Switch by 1-based index (`2`), label (`s2`), or session id.
@@ -54,6 +58,8 @@ impl SessionArgs {
             ("", _) => SessionArgs::Show,
             ("new", "") => SessionArgs::New,
             ("list", "") => SessionArgs::List,
+            ("import", "") => SessionArgs::Import,
+            ("delete", target) if !target.is_empty() => SessionArgs::Delete(target.to_owned()),
             ("restore", target) if !target.is_empty() => SessionArgs::Restore(target.to_owned()),
             ("switch", target) if !target.is_empty() => SessionArgs::Switch(target.to_owned()),
             ("help", _) => SessionArgs::Usage,
@@ -67,6 +73,8 @@ impl SessionArgs {
         ":session — show the active session\n\
          :session new — start a session and switch to it\n\
          :session list — list sessions\n\
+         :session import — explicitly read the legacy session file and import sessions\n\
+         :session delete <id> — permanently delete one saved session\n\
          :session restore <id> — restore a saved session\n\
          :session switch <n|sN|id> — switch sessions"
     }
@@ -123,7 +131,7 @@ impl SlashCommand {
          :m, :model — open the model picker\n\
          :m <id>, :model <id>, :model set <id> — select an exact configured model\n\
          :usage — show observed input/output tokens\n\
-         :s — list sessions; :session [new|list|restore <id>|switch <target>|help] — manage sessions\n\
+         :s — list sessions; :session [new|list|import|delete <id>|restore <id>|switch <target>|help] — manage sessions\n\
          :q, :quit — leave the TUI\n\
          Type : then Enter to open commands; Enter executes. @path suggestions insert a reference only."
     }
@@ -180,6 +188,16 @@ mod tests {
             SlashCommand::parse(":session list"),
             Some(SlashCommand::Session(List))
         );
+        for input in [":session import", ":session import  ", ":s import"] {
+            assert_eq!(
+                SlashCommand::parse(input),
+                Some(SlashCommand::Session(Import))
+            );
+        }
+        assert_eq!(
+            SlashCommand::parse(":session delete sess-123"),
+            Some(SlashCommand::Session(Delete("sess-123".to_owned())))
+        );
         assert_eq!(
             SlashCommand::parse(":session restore sess-123"),
             Some(SlashCommand::Session(Restore("sess-123".to_owned())))
@@ -195,6 +213,8 @@ mod tests {
         for malformed in [
             ":session bogus",
             ":session new extra",
+            ":session import extra",
+            ":session Import",
             ":session switch",
             ":session restore",
             ":session help",
