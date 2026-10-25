@@ -30,6 +30,7 @@ pub const FILE_FORMAT_REVISION: u64 = 2;
 pub const MAX_STORE_BYTES: usize = nexus_validation::MAX_DOCUMENT_BYTES;
 /// Maximum number of accepted source records retained in one store.
 pub const MAX_SOURCE_RECORDS: usize = 16_384;
+const SOURCE_PAGE_SIZE: usize = 256;
 
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -39,6 +40,79 @@ type SnapshotRecords = (
     Vec<ToolOutcomeRecord>,
     Vec<SourceRecord>,
 );
+
+/// Validated data loaded for an explicit session restore. This is history and
+/// metadata only; callers must apply current policy and start a fresh run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredSession {
+    checkpoint: SessionCheckpoint,
+    source_records: Vec<SourceRecord>,
+}
+
+impl RecoveredSession {
+    /// Returns the saved checkpoint metadata and active-view messages.
+    #[must_use]
+    pub fn checkpoint(&self) -> &SessionCheckpoint {
+        &self.checkpoint
+    }
+
+    /// Returns original records in their validated session sequence.
+    #[must_use]
+    pub fn source_records(&self) -> &[SourceRecord] {
+        &self.source_records
+    }
+
+    /// Returns original model-context items without interpreting them as
+    /// executable instructions or restoring authorization.
+    pub fn items(&self) -> impl Iterator<Item = &ModelContextItem> {
+        self.source_records.iter().map(SourceRecord::item)
+    }
+}
+
+/// Loads one explicitly selected session using bounded pages and validates
+/// its source sequence. It never scans other sessions or executes stored data.
+pub fn recover_session(
+    store: &dyn SessionStore,
+    session: &SessionId,
+) -> Result<RecoveredSession, AgentError> {
+    let checkpoint = store.load_session(session)?;
+    if checkpoint.session() != session {
+        return Err(store_error(
+            "loaded session identity does not match request",
+        ));
+    }
+
+    let mut source_records = Vec::new();
+    let mut after_sequence = 0;
+    loop {
+        let page = store.load_source_records(session, after_sequence, SOURCE_PAGE_SIZE)?;
+        if page.is_empty() {
+            break;
+        }
+        if source_records.len().saturating_add(page.len()) > MAX_SOURCE_RECORDS {
+            return Err(store_error("recovered source history exceeds its bound"));
+        }
+        for record in &page {
+            let expected = after_sequence
+                .checked_add(1)
+                .ok_or_else(|| store_error("source record sequence is exhausted"))?;
+            if record.session() != session || record.sequence() != expected {
+                return Err(store_error("source history sequence is invalid"));
+            }
+            after_sequence = record.sequence();
+        }
+        let page_is_full = page.len() == SOURCE_PAGE_SIZE;
+        source_records.extend(page);
+        if !page_is_full {
+            break;
+        }
+    }
+
+    Ok(RecoveredSession {
+        checkpoint,
+        source_records,
+    })
+}
 
 /// Persistent session store backed by `session-store.json` in a dedicated directory.
 pub struct FileSessionStore {
@@ -1025,6 +1099,40 @@ mod tests {
             "profile-a",
         )
         .expect("valid checkpoint")
+    }
+
+    #[test]
+    fn explicit_recovery_returns_validated_data_without_executing_records() {
+        let directory = directory("recover");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let checkpoint = checkpoint(1, "active view");
+        store.save_checkpoint(&checkpoint).unwrap();
+        let session = checkpoint.session().clone();
+        let run = RunId::new("run-recovered").unwrap();
+        let source = vec![
+            ModelContextItem::user_text("archived input").unwrap(),
+            ModelContextItem::assistant_text_with_reasoning(
+                "answer-item",
+                "archived answer",
+                Some("retained reasoning".to_owned()),
+            )
+            .unwrap(),
+        ];
+        for (index, item) in source.iter().cloned().enumerate() {
+            store
+                .append_source_record(
+                    &SourceRecord::new(session.clone(), index as u64 + 1, run.clone(), item)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+
+        let recovered = recover_session(&store, &session).unwrap();
+        assert_eq!(recovered.checkpoint(), &checkpoint);
+        assert_eq!(recovered.source_records().len(), 2);
+        assert_eq!(recovered.items().cloned().collect::<Vec<_>>(), source);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

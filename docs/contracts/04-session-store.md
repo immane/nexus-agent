@@ -8,14 +8,16 @@ The store persists accepted conversation and operation records. It does not deci
 
 `nexus-session` is the session-state and recovery boundary. Its intended scope
 includes original history, active-view checkpoints, record validation, and
-recovery assembly; currently only the file store is implemented. Runtime owns
+recovery assembly. It now exposes an explicit, bounded-page recovery helper
+that checks the selected checkpoint and contiguous source sequence. Runtime owns
 model calls, tool dispatch, approvals, cancellation, and run lifecycle, including
 when persistence is required. `nexus-context` retains context-selection and
 projection algorithms. Moving session state into this crate must not move
 execution control or make restoration execute stored actions.
 
 The crate rename does not change snapshot revision 2, storage filenames, or the
-caller-supplied data directory. Existing snapshots remain readable.
+caller-supplied data directory. Existing snapshots remain readable. Recovery
+assembly is a library API only; runtime commands do not yet invoke it.
 
 Semantic operations include bounded/paged session metadata listing, loading a selected session, saving a versioned checkpoint, recording tool intent, and recording tool outcome. Actual method signatures and physical layout remain open.
 
