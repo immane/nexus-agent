@@ -245,6 +245,21 @@ impl SessionStore for FileSessionStore {
         )
     }
 
+    fn initialize_session(&mut self, checkpoint: &SessionCheckpoint) -> Result<bool, AgentError> {
+        self.ensure_available()?;
+        nexus_core::store::check_format_revision(checkpoint.format_revision())?;
+        nexus_core::store::check_checkpoint_bounds(checkpoint)?;
+        if self
+            .sessions
+            .iter()
+            .any(|current| current.session() == checkpoint.session())
+        {
+            return Ok(false);
+        }
+        self.save_checkpoint(checkpoint)?;
+        Ok(true)
+    }
+
     fn record_intent(&mut self, intent: &ToolIntentRecord) -> Result<(), AgentError> {
         self.ensure_available()?;
         if let Some(current) = self
@@ -304,6 +319,13 @@ impl SessionStore for FileSessionStore {
 
     fn append_source_record(&mut self, record: &SourceRecord) -> Result<(), AgentError> {
         self.ensure_available()?;
+        if !self
+            .sessions
+            .iter()
+            .any(|checkpoint| checkpoint.session() == record.session())
+        {
+            return Err(store_error("source history session is not initialized"));
+        }
         if let Some(existing) = self.source_records.iter().find(|existing| {
             existing.session() == record.session() && existing.sequence() == record.sequence()
         }) {
@@ -352,6 +374,58 @@ impl SessionStore for FileSessionStore {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    fn last_source_sequence(&self, session: &SessionId) -> Result<u64, AgentError> {
+        self.ensure_available()?;
+        Ok(self
+            .source_records
+            .iter()
+            .filter(|record| record.session() == session)
+            .map(SourceRecord::sequence)
+            .max()
+            .unwrap_or(0))
+    }
+
+    fn append_source_items(
+        &mut self,
+        session: &SessionId,
+        run: &RunId,
+        items: &[ModelContextItem],
+    ) -> Result<u64, AgentError> {
+        self.ensure_available()?;
+        if !self
+            .sessions
+            .iter()
+            .any(|checkpoint| checkpoint.session() == session)
+        {
+            return Err(store_error("source history session is not initialized"));
+        }
+        let mut sequence = self.last_source_sequence(session)?;
+        if self.source_records.len().saturating_add(items.len()) > MAX_SOURCE_RECORDS {
+            return Err(store_error("source history capacity is exhausted"));
+        }
+        let mut records = self.source_records.clone();
+        for item in items {
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| store_error("source record sequence is exhausted"))?;
+            records.push(SourceRecord::new(
+                session.clone(),
+                sequence,
+                run.clone(),
+                item.clone(),
+            )?);
+        }
+        if !items.is_empty() {
+            self.commit(
+                self.sessions.clone(),
+                self.intents.clone(),
+                self.outcomes.clone(),
+                records,
+            )?;
+        }
+        Ok(sequence)
     }
 }
 
@@ -1136,6 +1210,55 @@ mod tests {
     }
 
     #[test]
+    fn initializes_once_and_appends_source_batches_atomically_in_order() {
+        let directory = directory("source-batch");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let checkpoint = checkpoint(1, "active view");
+        assert!(store.initialize_session(&checkpoint).unwrap());
+        assert!(!store.initialize_session(&checkpoint).unwrap());
+
+        let session = checkpoint.session().clone();
+        let run = RunId::new("run-batch").unwrap();
+        let items = vec![
+            ModelContextItem::user_text("first").unwrap(),
+            ModelContextItem::assistant_text("answer", "second").unwrap(),
+        ];
+        assert_eq!(
+            store.append_source_items(&session, &run, &items).unwrap(),
+            2
+        );
+        assert_eq!(store.last_source_sequence(&session).unwrap(), 2);
+        let records = store.load_source_records(&session, 0, 10).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence(), 1);
+        assert_eq!(records[1].sequence(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .map(SourceRecord::item)
+                .cloned()
+                .collect::<Vec<_>>(),
+            items
+        );
+
+        // The whole batch is rejected before committing when it would exceed
+        // capacity; no prefix is visible afterward.
+        let remaining = MAX_SOURCE_RECORDS - store.source_records.len();
+        let too_many = vec![items[0].clone(); remaining + 1];
+        assert!(
+            store
+                .append_source_items(&session, &run, &too_many)
+                .is_err()
+        );
+        assert_eq!(store.last_source_sequence(&session).unwrap(), 2);
+
+        drop(store);
+        let reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.last_source_sequence(&session).unwrap(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn duplicate_operations_are_idempotent_at_capacity_and_conflicts_preserve_snapshot() {
         let directory = directory("duplicates");
         let mut store = FileSessionStore::open(&directory).unwrap();
@@ -1411,6 +1534,18 @@ mod tests {
 
         let session = SessionId::new("session-a").unwrap();
         let run = RunId::new("run-a").unwrap();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    nexus_core::STORE_FORMAT_REVISION,
+                    1,
+                    Vec::new(),
+                    "profile-a",
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let call_id = CallId::new("call-a").unwrap();
         let tool_id = ToolId::new("host_read", M0_REVISION).unwrap();
         let admitted_call = ToolCall::new(

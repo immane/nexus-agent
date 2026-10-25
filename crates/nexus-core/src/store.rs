@@ -262,6 +262,14 @@ pub trait SessionStore {
     /// Saves a versioned checkpoint.
     fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError>;
 
+    /// Creates the initial checkpoint when absent. Returns `true` only when a
+    /// new session was created; existing sessions return `false` and are not
+    /// implicitly restored by this operation.
+    fn initialize_session(&mut self, checkpoint: &SessionCheckpoint) -> Result<bool, AgentError> {
+        self.save_checkpoint(checkpoint)?;
+        Ok(true)
+    }
+
     /// Records side-effecting intent before dispatch.
     fn record_intent(&mut self, intent: &ToolIntentRecord) -> Result<(), AgentError>;
 
@@ -282,6 +290,25 @@ pub trait SessionStore {
         _limit: usize,
     ) -> Result<Vec<SourceRecord>, AgentError> {
         Err(store_error("source history is unsupported by this store"))
+    }
+
+    /// Returns the newest source sequence for one selected session.
+    fn last_source_sequence(&self, _session: &SessionId) -> Result<u64, AgentError> {
+        Err(store_error("source history is unsupported by this store"))
+    }
+
+    /// Atomically appends a batch of source items in session order and returns
+    /// the final sequence. Implementations must fail rather than partially
+    /// accept a batch when the operation is interrupted.
+    fn append_source_items(
+        &mut self,
+        _session: &SessionId,
+        _run: &RunId,
+        _items: &[ModelContextItem],
+    ) -> Result<u64, AgentError> {
+        Err(store_error(
+            "atomic source history append is unsupported by this store",
+        ))
     }
 }
 
