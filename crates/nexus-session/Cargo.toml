@@ -1,5 +1,5 @@
 [package]
-name = "nexus-session-store"
+name = "nexus-session"
 version = "0.2.2-alpha"
 edition = "2024"
 

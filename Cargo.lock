@@ -304,7 +304,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-session-store"
+name = "nexus-session"
 version = "0.2.2-alpha"
 dependencies = [
  "nexus-core",

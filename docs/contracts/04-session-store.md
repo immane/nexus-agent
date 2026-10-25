@@ -1,15 +1,26 @@
 # Session Store Contract
 
-Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session-store` now has a revision-2 bounded JSON snapshot with original model-context source records, but runtime integration and restoration are not implemented. Read the [common contract](00-common.md) first.
+Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session` now has a revision-2 bounded JSON snapshot with original model-context source records, but runtime integration and restoration are not implemented. Read the [common contract](00-common.md) first.
 
 ## Scope and Operations
 
 The store persists accepted conversation and operation records. It does not decide authorization, schedule tools, or treat stored prompts as executable instructions.
 
+`nexus-session` is the session-state and recovery boundary. Its intended scope
+includes original history, active-view checkpoints, record validation, and
+recovery assembly; currently only the file store is implemented. Runtime owns
+model calls, tool dispatch, approvals, cancellation, and run lifecycle, including
+when persistence is required. `nexus-context` retains context-selection and
+projection algorithms. Moving session state into this crate must not move
+execution control or make restoration execute stored actions.
+
+The crate rename does not change snapshot revision 2, storage filenames, or the
+caller-supplied data directory. Existing snapshots remain readable.
+
 Semantic operations include bounded/paged session metadata listing, loading a selected session, saving a versioned checkpoint, recording tool intent, and recording tool outcome. Actual method signatures and physical layout remain open.
 
 `nexus-core` defines a `SessionStore` port and bounded checkpoint/operation
-types. `nexus-session-store` provides a file-backed implementation, including
+types. `nexus-session` provides a file-backed implementation, including
 append-only, paged source records for complete original model-context items.
 Production runtime wiring does not use it. The runtime's session cache is
 process-local, terminal persistence is ephemeral, and list/restore commands are
@@ -20,7 +31,7 @@ gap and the source-history/active-view boundary.
 
 Prefer a small file-backed implementation first. Versioned snapshots and a compact operation journal are candidates; a database or full event-sourcing system requires a concrete need. Do not persist every token merely because runtime events exist.
 
-The initial `nexus-session-store` snapshot uses the standard library, existing
+The initial `nexus-session` snapshot uses the standard library, existing
 `serde_json`, and existing strict JSON validation; it adds no third-party
 dependency. It caps the encoded file at 16 MiB and applies existing per-record
 and record-count limits. Its current format is revision 2 and rejects duplicate

@@ -1,9 +1,11 @@
-//! Minimal file-backed implementation of the session-store port.
+//! Session state and recovery boundary, currently providing local persistence.
 //!
-//! The store is a versioned, bounded JSON snapshot. Writes use a private
-//! temporary sibling, `sync_all`, atomic rename, and directory sync where
-//! supported. It stores the current `SessionStore` records only; it does not
-//! yet archive full provider conversation items or integrate with runtime.
+//! The file store preserves checkpoints, operation records, and original model
+//! context items in a versioned, bounded JSON snapshot. Writes use a private
+//! temporary sibling, file sync, atomic rename, and directory sync on Unix.
+//! Runtime integration, active-view coordination, and recovery assembly remain
+//! unimplemented. Model calls, tool dispatch, approvals, and cancellation belong
+//! to runtime; loading session data must never trigger execution or grant access.
 
 #![forbid(unsafe_code)]
 
@@ -1005,7 +1007,7 @@ mod tests {
     fn directory(label: &str) -> PathBuf {
         let unique = WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "nexus-session-store-{label}-{}-{unique}",
+            "nexus-session-{label}-{}-{unique}",
             std::process::id()
         ))
     }
