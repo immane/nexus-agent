@@ -821,7 +821,7 @@ pub fn tool_registrations(
     ])
 }
 
-fn resolve_docker_executable() -> Option<PathBuf> {
+pub(crate) fn resolve_docker_executable() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join("docker");

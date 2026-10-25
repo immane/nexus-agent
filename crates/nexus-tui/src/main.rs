@@ -205,15 +205,37 @@ fn load_session_config() -> io::Result<SessionConfig> {
         StartupAction::Usage => startup_usage(),
     };
     let mut session = session_config_at(resolve_path(None))?;
+    let config = user_config_snapshot(&session.user_config);
+    let (effective_gateway, effective_workload) = merge_startup_images(&args, &config);
+    let mut effective_args = args.clone();
+    effective_args.gateway_image = effective_gateway.clone();
+    effective_args.workload_image = effective_workload.clone();
     let root_resolved = resolve_tools_root(args.tools_root.clone()).is_some();
-    validate_execution_args(&args, root_resolved, cfg!(feature = "container"))?;
+    validate_execution_args(&effective_args, root_resolved, cfg!(feature = "container"))?;
     session.tools_root = resolve_tools_root(args.tools_root);
     session.demo = args.demo;
     session.strict_tools = args.strict_tools;
     session.execution = args.execution;
-    session.gateway_image = args.gateway_image;
-    session.workload_image = args.workload_image;
+    session.gateway_image = effective_gateway;
+    session.workload_image = effective_workload;
     Ok(session)
+}
+
+fn merge_startup_images(
+    args: &StartupArgs,
+    config: &UserConfig,
+) -> (Option<String>, Option<String>) {
+    if args.execution == ExecutionMode::Local {
+        return (args.gateway_image.clone(), args.workload_image.clone());
+    }
+    (
+        args.gateway_image
+            .clone()
+            .or_else(|| config.gateway_image().map(str::to_owned)),
+        args.workload_image
+            .clone()
+            .or_else(|| config.workload_image().map(str::to_owned)),
+    )
 }
 
 fn validate_execution_args(
@@ -245,7 +267,7 @@ fn validate_execution_args(
     if args.gateway_image.is_none() || args.workload_image.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "container execution requires --gateway-image and --container-image",
+            "container execution requires gateway and workload images; configure them in user config or pass --gateway-image and --container-image",
         ));
     }
     if !container_feature {
@@ -371,7 +393,7 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
             "--help" | "-h" => return StartupAction::Usage,
             "--demo" => demo = true,
             "--strict-tools" => strict_tools = true,
-            "--execution" => {
+            "--execution" | "--run" => {
                 if execution_set {
                     return StartupAction::Usage;
                 }
@@ -423,11 +445,11 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
 /// every rejection path unit-testable.
 fn startup_usage() -> ! {
     eprintln!(
-        "usage: nexus-tui [--tools-root PATH] [--strict-tools] [--demo] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--help]"
+        "usage: nexus-tui [--tools-root PATH] [--strict-tools] [--demo] [--run|--execution local|container] [--gateway-image IMAGE] [--container-image IMAGE] [--help]"
     );
     #[cfg(feature = "container")]
     eprintln!(
-        "  container: --execution container [--tools-root PATH] --gateway-image IMAGE@sha256:DIGEST --container-image IMAGE@sha256:DIGEST"
+        "  container: --run container [--tools-root PATH] (images may be set in user config; flags override individually)"
     );
     #[cfg(not(feature = "container"))]
     eprintln!("  --execution container is available only in container-enabled builds.");
@@ -1207,6 +1229,11 @@ async fn run() -> io::Result<()> {
                 }
             }
             Err(error) => {
+                if session_config.execution == ExecutionMode::Container {
+                    return Err(io::Error::other(format!(
+                        "terminal setup failed ({error}); container execution requires an interactive terminal and cannot fall back to scripted tools"
+                    )));
+                }
                 if !session_config.demo {
                     return Err(io::Error::other(format!(
                         "terminal setup failed ({error}); relaunch with --demo for the scripted transcript fallback"
@@ -1218,6 +1245,11 @@ async fn run() -> io::Result<()> {
             }
         }
     } else {
+        if session_config.execution == ExecutionMode::Container {
+            return Err(io::Error::other(
+                "container execution requires an interactive terminal; it cannot fall back to scripted tools",
+            ));
+        }
         if !session_config.demo {
             return Err(io::Error::other(
                 "no terminal attached; relaunch with --demo for the scripted transcript fallback",
@@ -3331,6 +3363,8 @@ struct InteractiveReport {
 /// registry: the first slot serves the canned submission, further slots
 /// arrive through `:session new`, and only the active slot is polled.
 async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
+    #[cfg(feature = "container")]
+    let mut session_config = session_config;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
     let session_store = if session_config.demo {
@@ -3338,14 +3372,58 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     } else {
         Some(application_session_store()?)
     };
-    let (runtime, streams, live) =
-        build_live_runtime_with_store(&session_config, session_store.clone())?;
+    #[cfg(feature = "container")]
+    let (built_runtime, startup_draft) = if session_config.execution == ExecutionMode::Container {
+        let Some((runtime, resolved_config, draft)) = prepare_live_runtime_with_progress(
+            session_config.clone(),
+            session_store.clone(),
+            &mut terminal,
+        )
+        .await?
+        else {
+            return Ok(InteractiveReport {
+                result: Ok(()),
+                unresolved_blocking: false,
+            });
+        };
+        session_config = resolved_config;
+        (Some(runtime), draft)
+    } else {
+        (
+            Some(build_live_runtime_with_store(
+                &session_config,
+                session_store.clone(),
+            )?),
+            String::new(),
+        )
+    };
+    #[cfg(not(feature = "container"))]
+    let (built_runtime, startup_draft) = (
+        Some(build_live_runtime_with_store(
+            &session_config,
+            session_store.clone(),
+        )?),
+        String::new(),
+    );
+    let Some((runtime, streams, live)) = built_runtime else {
+        return Ok(InteractiveReport {
+            result: Ok(()),
+            unresolved_blocking: false,
+        });
+    };
     let session = if session_config.demo {
         SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?
     } else {
         new_tui_session_id()?
     };
     let mut front = Frontend::with_config(session, session_config.clone());
+    for character in startup_draft.chars() {
+        if character == '\n' {
+            front.state.composer_newline();
+        } else {
+            front.state.composer_type(character);
+        }
+    }
     front.state.set_session_label("s1");
     if !session_config.demo
         && nexus_session::default_data_dir()
@@ -3416,6 +3494,246 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
         result,
         unresolved_blocking,
     })
+}
+
+#[cfg(feature = "container")]
+fn resolve_container_images(session_config: &mut SessionConfig) -> io::Result<()> {
+    let resolve = |image: Option<String>, label: &str| -> io::Result<String> {
+        let image = image.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("container mode requires {label} image; set it in user config or pass its image flag"),
+            )
+        })?;
+        nexus_container::resolve_local_image(&image).map_err(|error| {
+            io::Error::other(format!(
+                "{label} image resolution failed: {error}; check Docker on PATH, the local default context, daemon availability, and the installed image reference (no image was pulled)"
+            ))
+        })
+    };
+    session_config.gateway_image = Some(resolve(session_config.gateway_image.clone(), "gateway")?);
+    session_config.workload_image =
+        Some(resolve(session_config.workload_image.clone(), "workload")?);
+    Ok(())
+}
+
+#[cfg(feature = "container")]
+async fn prepare_live_runtime_with_progress(
+    mut session_config: SessionConfig,
+    session_store: Option<SessionStoreHandle>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> io::Result<Option<((Runtime, EventStreams, LiveHandle), SessionConfig, String)>> {
+    let prepared = prepare_container_with_progress(
+        move || {
+            resolve_container_images(&mut session_config)?;
+            let runtime = build_live_runtime_with_store(&session_config, session_store)?;
+            Ok((runtime, session_config))
+        },
+        startup_read_input,
+        |message, draft| draw_container_startup(terminal, message, draft),
+    )
+    .await?;
+    Ok(prepared.map(|((runtime, config), draft)| (runtime, config, draft)))
+}
+
+// Keep Docker and terminal I/O at the boundary so lifecycle failures can be
+// exercised with a controlled resource owner and without a real daemon or TTY.
+#[cfg(feature = "container")]
+async fn prepare_container_with_progress<T: Send + 'static>(
+    prepare: impl FnOnce() -> io::Result<T> + Send + 'static,
+    mut read_input: impl FnMut(&mut AppState) -> io::Result<bool>,
+    mut draw_progress: impl FnMut(&str, &str) -> io::Result<()>,
+) -> io::Result<Option<(T, String)>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("container-startup".to_owned())
+        .spawn(move || {
+            let _ = sender.send(prepare());
+        })
+        .map_err(io::Error::other)?;
+
+    let mut quit_requested = false;
+    let mut terminal_error = None;
+    let mut draft = AppState::new();
+    loop {
+        if terminal_error.is_none() && !quit_requested {
+            match read_input(&mut draft) {
+                Ok(quit) => quit_requested = quit,
+                Err(error) => {
+                    terminal_error = Some(error);
+                    quit_requested = true;
+                }
+            }
+        } else if terminal_error.is_none() {
+            // Continue draining input while initialization finishes; never
+            // let queued keystrokes become the first task after startup.
+            if let Err(error) = read_input(&mut draft) {
+                terminal_error = Some(error);
+            }
+        }
+
+        match receiver.try_recv() {
+            Ok(Ok(runtime)) if quit_requested || terminal_error.is_some() => {
+                worker.join().map_err(|_| {
+                    startup_error_with_terminal_context(
+                        terminal_error.take(),
+                        io::Error::other("container startup worker panicked"),
+                    )
+                })?;
+                if terminal_error.is_none()
+                    && let Err(error) = draw_progress(
+                        "Quit requested. Waiting for container startup to finish safely…",
+                        draft.composer(),
+                    )
+                {
+                    terminal_error = Some(error);
+                }
+                let cleanup = std::thread::Builder::new()
+                    .name("container-startup-cleanup".to_owned())
+                    .spawn(move || drop(runtime))
+                    .map_err(|error| {
+                        startup_error_with_terminal_context(terminal_error.take(), error)
+                    })?;
+                while !cleanup.is_finished() {
+                    if terminal_error.is_none()
+                        && let Err(error) = draw_progress(
+                            "Quit requested. Cleaning up the prepared container…",
+                            draft.composer(),
+                        )
+                    {
+                        terminal_error = Some(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if cleanup.join().is_err() {
+                    return Err(startup_error_with_terminal_context(
+                        terminal_error,
+                        io::Error::other("container startup cleanup thread panicked"),
+                    ));
+                }
+                if let Some(error) = terminal_error {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
+            Ok(result) => {
+                worker.join().map_err(|_| {
+                    startup_error_with_terminal_context(
+                        terminal_error.take(),
+                        io::Error::other("container startup worker panicked"),
+                    )
+                })?;
+                return result
+                    .map(|runtime| Some((runtime, draft.composer().to_owned())))
+                    .map_err(|error| startup_error_with_terminal_context(terminal_error, error));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let _ = worker.join();
+                return Err(startup_error_with_terminal_context(
+                    terminal_error,
+                    io::Error::other("container startup worker exited without a result"),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        let message = if quit_requested {
+            "Quit requested. Waiting for container startup to finish safely…"
+        } else {
+            "Preparing the container environment. Tasks are disabled until it is ready. Type to keep a draft; press Esc or Ctrl-C to quit."
+        };
+        if terminal_error.is_none()
+            && let Err(error) = draw_progress(message, draft.composer())
+        {
+            terminal_error = Some(error);
+            quit_requested = true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(feature = "container")]
+fn startup_error_with_terminal_context(
+    terminal_error: Option<io::Error>,
+    startup_error: io::Error,
+) -> io::Error {
+    match terminal_error {
+        Some(terminal_error) => io::Error::new(
+            startup_error.kind(),
+            format!("{startup_error}; terminal I/O also failed: {terminal_error}"),
+        ),
+        None => startup_error,
+    }
+}
+
+#[cfg(feature = "container")]
+fn startup_read_input(draft: &mut AppState) -> io::Result<bool> {
+    let mut quit = false;
+    while poll(Duration::ZERO)? {
+        match read()? {
+            Event::Key(key) => quit |= apply_startup_key(draft, key),
+            Event::Paste(text) => {
+                for character in text.chars() {
+                    if character == '\n' {
+                        draft.composer_newline();
+                    } else {
+                        draft.composer_type(character);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(quit)
+}
+
+#[cfg(feature = "container")]
+fn apply_startup_key(draft: &mut AppState, key: KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    if key.code == KeyCode::Esc
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+    {
+        return true;
+    }
+    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
+        match key.code {
+            KeyCode::Char(character) => draft.composer_type(character),
+            KeyCode::Backspace => {
+                draft.composer_backspace();
+            }
+            KeyCode::Left => draft.caret_left(),
+            KeyCode::Right => draft.caret_right(),
+            KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => draft.composer_newline(),
+            _ => {}
+        }
+    }
+    false
+}
+
+#[cfg(feature = "container")]
+fn draw_container_startup(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    message: &str,
+    draft: &str,
+) -> io::Result<()> {
+    let text = format!("{message}\n\nDraft (not submitted yet):\n{draft}");
+    terminal
+        .draw(|frame| {
+            let paragraph = ratatui::widgets::Paragraph::new(text)
+                .block(
+                    ratatui::widgets::Block::default()
+                        .title(" Container startup ")
+                        .borders(ratatui::widgets::Borders::ALL),
+                )
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(ratatui::widgets::Wrap { trim: true });
+            frame.render_widget(paragraph, frame.size());
+        })
+        .map(|_| ())
+        .map_err(io::Error::other)
 }
 
 async fn interactive_loop(
@@ -4961,6 +5279,169 @@ mod cov_main_private {
     }
 }
 
+#[cfg(all(test, feature = "container"))]
+mod container_startup_tests {
+    use super::*;
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    struct Resource {
+        cleanup_started: Option<tokio::sync::oneshot::Sender<()>>,
+        release_cleanup: std::sync::mpsc::Receiver<()>,
+        cleaned: Arc<AtomicBool>,
+    }
+
+    impl Drop for Resource {
+        fn drop(&mut self) {
+            let _ = self.cleanup_started.take().unwrap().send(());
+            self.release_cleanup
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must release cleanup");
+            self.cleaned.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_io_failures_wait_for_preparation_and_cleanup() {
+        for fail_input in [true, false] {
+            let (release_prepare, prepare_gate) = std::sync::mpsc::channel();
+            let (cleanup_started, cleanup_observed) = tokio::sync::oneshot::channel();
+            let (release_cleanup, cleanup_gate) = std::sync::mpsc::channel();
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let resource = Resource {
+                cleanup_started: Some(cleanup_started),
+                release_cleanup: cleanup_gate,
+                cleaned: Arc::clone(&cleaned),
+            };
+            let mut input_calls = 0;
+            let mut draw_calls = 0;
+            let mut startup = Box::pin(prepare_container_with_progress(
+                move || {
+                    prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(resource)
+                },
+                |_| {
+                    input_calls += 1;
+                    assert_eq!(input_calls, 1, "input stops after terminal failure");
+                    if fail_input {
+                        Err(io::Error::other("input failed"))
+                    } else {
+                        Ok(false)
+                    }
+                },
+                |_, _| {
+                    draw_calls += 1;
+                    assert_eq!(draw_calls, 1, "drawing stops after terminal failure");
+                    Err(io::Error::other("draw failed"))
+                },
+            ));
+
+            poll_fn(|cx| {
+                assert!(startup.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(!cleaned.load(Ordering::SeqCst));
+            release_prepare.send(()).unwrap();
+            tokio::select! {
+                _ = &mut startup => panic!("startup returned before cleanup completed"),
+                started = cleanup_observed => started.unwrap(),
+            }
+            poll_fn(|cx| {
+                assert!(startup.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(!cleaned.load(Ordering::SeqCst));
+            release_cleanup.send(()).unwrap();
+            let error = match startup.await {
+                Err(error) => error,
+                Ok(_) => panic!("terminal error was lost"),
+            };
+            assert_eq!(
+                error.to_string(),
+                if fail_input {
+                    "input failed"
+                } else {
+                    "draw failed"
+                }
+            );
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert_eq!(draw_calls, usize::from(!fail_input));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_draw_failure_still_waits_for_resource_drop() {
+        let (cleanup_started, cleanup_observed) = tokio::sync::oneshot::channel();
+        let (release_cleanup, cleanup_gate) = std::sync::mpsc::channel();
+        let (draw_failed, failure_observed) = tokio::sync::oneshot::channel();
+        let mut draw_failed = Some(draw_failed);
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let resource = Resource {
+            cleanup_started: Some(cleanup_started),
+            release_cleanup: cleanup_gate,
+            cleaned: Arc::clone(&cleaned),
+        };
+        let mut startup = Box::pin(prepare_container_with_progress(
+            move || Ok(resource),
+            |_| Ok(true),
+            |message, _| {
+                assert!(draw_failed.is_some(), "drawing stops after failure");
+                if message.contains("Cleaning up") {
+                    draw_failed.take().unwrap().send(()).unwrap();
+                    Err(io::Error::other("cleanup draw failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        ));
+        tokio::select! {
+            _ = &mut startup => panic!("startup returned before cleanup completed"),
+            failed = failure_observed => failed.unwrap(),
+        }
+        cleanup_observed.await.unwrap();
+        poll_fn(|cx| {
+            assert!(startup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!cleaned.load(Ordering::SeqCst));
+        release_cleanup.send(()).unwrap();
+        match startup.await {
+            Err(error) => assert_eq!(error.to_string(), "cleanup draw failed"),
+            Ok(_) => panic!("terminal error was lost"),
+        }
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn startup_failure_after_input_failure_preserves_both_errors() {
+        let (release_prepare, prepare_gate) = std::sync::mpsc::channel();
+        let mut startup = Box::pin(prepare_container_with_progress::<()>(
+            move || {
+                prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(io::Error::new(io::ErrorKind::NotFound, "image missing"))
+            },
+            |_| Err(io::Error::other("input failed")),
+            |_, _| panic!("must not draw after input failure"),
+        ));
+        poll_fn(|cx| {
+            assert!(startup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        release_prepare.send(()).unwrap();
+        let error = startup.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "image missing; terminal I/O also failed: input failed"
+        );
+    }
+}
+
 /// Coverage top-up for the paths the two modules above leave unexercised:
 /// the non-terminal fallback itself, the full `handle_key` action table, the
 /// approval decision and cancellation branches, the presentation-state
@@ -4981,6 +5462,56 @@ mod cov_main_topup {
     use nexus_tui::state::ApprovalGeometry;
     use ratatui::layout::Rect;
     use ratatui::{TerminalOptions, Viewport};
+
+    #[cfg(feature = "container")]
+    #[test]
+    fn container_startup_keeps_a_draft_and_only_escape_or_ctrl_c_quits() {
+        let mut draft = AppState::new();
+        assert!(!apply_startup_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+        ));
+        assert!(!apply_startup_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)
+        ));
+        assert!(!apply_startup_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+        assert_eq!(draft.composer(), "qu");
+        assert!(apply_startup_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        ));
+        assert!(apply_startup_key(
+            &mut draft,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ));
+    }
+
+    #[cfg(feature = "container")]
+    #[test]
+    fn container_startup_failure_keeps_terminal_io_context() {
+        let error = startup_error_with_terminal_context(
+            Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal draw failed",
+            )),
+            io::Error::new(io::ErrorKind::NotFound, "image missing"),
+        );
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "image missing; terminal I/O also failed: terminal draw failed"
+        );
+
+        let startup_only = startup_error_with_terminal_context(
+            None,
+            io::Error::new(io::ErrorKind::NotFound, "image missing"),
+        );
+        assert_eq!(startup_only.to_string(), "image missing");
+    }
 
     #[test]
     fn interactive_runtime_raises_only_the_model_turn_budget_to_64() {
@@ -7645,6 +8176,52 @@ mod cov_live_wiring {
             StartupAction::Usage => panic!("container images should parse without a root flag"),
         };
         assert!(validate_execution_args(&current_directory_default, true, true).is_ok());
+    }
+
+    #[test]
+    fn run_alias_selects_container_and_mode_flags_remain_single_use() {
+        let parsed = match parse_startup_args(&argv(&["--run", "container"])) {
+            StartupAction::Run(parsed) => parsed,
+            StartupAction::Usage => panic!("alias should parse"),
+        };
+        assert_eq!(parsed.execution, ExecutionMode::Container);
+        usage(&["--run", "container", "--execution", "container"]);
+        usage(&["--execution", "local", "--run", "container"]);
+        usage(&["--run", "container", "--run", "local"]);
+    }
+
+    #[test]
+    fn local_startup_ignores_saved_images_but_rejects_explicit_image_flags() {
+        let mut config = UserConfig::default_config();
+        config
+            .set_container_images(Some("gateway:saved".into()), Some("workload:saved".into()))
+            .expect("valid saved images");
+        let args = match parse_startup_args(&argv(&[])) {
+            StartupAction::Run(args) => args,
+            StartupAction::Usage => panic!("default startup parses"),
+        };
+        let (gateway, workload) = merge_startup_images(&args, &config);
+        assert_eq!((gateway, workload), (None, None));
+        let mut args = args;
+        args.gateway_image = Some("gateway:explicit".into());
+        assert!(validate_execution_args(&args, true, cfg!(feature = "container")).is_err());
+    }
+
+    #[test]
+    fn container_startup_merges_cli_and_saved_images() {
+        let mut config = UserConfig::default_config();
+        config
+            .set_container_images(Some("gateway:saved".into()), Some("workload:saved".into()))
+            .expect("valid saved images");
+        let mut args = match parse_startup_args(&argv(&["--execution", "container"])) {
+            StartupAction::Run(args) => args,
+            StartupAction::Usage => panic!("container startup parses"),
+        };
+        args.gateway_image = Some("gateway:cli".into());
+        assert_eq!(
+            merge_startup_images(&args, &config),
+            (Some("gateway:cli".into()), Some("workload:saved".into()))
+        );
     }
 
     #[test]

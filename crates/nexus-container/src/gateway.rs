@@ -964,7 +964,7 @@ fn valid_cidr(value: &str) -> bool {
     };
     (1..=32).contains(&prefix) && ip.to_string() == addr
 }
-fn run_bounded(
+pub(crate) fn run_bounded(
     mut command: Command,
     args: &[&str],
     timeout: Duration,
