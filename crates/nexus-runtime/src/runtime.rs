@@ -132,6 +132,19 @@ struct Shared {
     run_counter: AtomicU64,
 }
 
+/// Cloneable owner for one session store shared by multiple runtime instances.
+/// The store's own single-writer lock remains held until every clone drops.
+#[derive(Clone)]
+pub struct SessionStoreHandle(Arc<StdMutex<Box<dyn SessionStore + Send>>>);
+
+impl SessionStoreHandle {
+    /// Wraps an opened store so runtimes can share one serialized owner.
+    #[must_use]
+    pub fn new(store: Box<dyn SessionStore + Send>) -> Self {
+        Self(Arc::new(StdMutex::new(store)))
+    }
+}
+
 struct RegisteredTool {
     spec: ToolSpec,
     schema: CompiledSchema,
@@ -402,6 +415,14 @@ fn runtime_error(category: ErrorCategory, message: &'static str) -> AgentError {
         .expect("static safe runtime message builds")
 }
 
+// A terminal may be owned by a full-screen frontend. Uncoordinated writes
+// invalidate its screen buffer; retain diagnostics only for redirected stderr.
+fn diagnostic(message: std::fmt::Arguments<'_>) {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        eprintln!("{message}");
+    }
+}
+
 impl Runtime {
     /// Fallible production constructor: validates limits, provider
     /// capabilities, and every host registration (one `describe()` call per
@@ -440,7 +461,26 @@ impl Runtime {
         instructions: ModelInstructions,
         store: Box<dyn SessionStore + Send>,
     ) -> Result<(Self, EventStreams), AgentError> {
-        Self::try_new_inner(config, provider, tools, instructions, Some(store))
+        Self::try_new_inner(
+            config,
+            provider,
+            tools,
+            instructions,
+            Some(Arc::new(StdMutex::new(store))),
+        )
+    }
+
+    /// Constructs a runtime using a store handle shared with other runtimes.
+    /// Each instance retains independent run/history state while store access
+    /// is serialized through the common owner.
+    pub fn try_new_with_session_store_handle(
+        config: RuntimeConfig,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        instructions: ModelInstructions,
+        store: SessionStoreHandle,
+    ) -> Result<(Self, EventStreams), AgentError> {
+        Self::try_new_inner(config, provider, tools, instructions, Some(store.0))
     }
 
     fn try_new_inner(
@@ -448,7 +488,7 @@ impl Runtime {
         provider: Arc<dyn ProviderPort + Send + Sync>,
         tools: Vec<ToolRegistration>,
         instructions: ModelInstructions,
-        session_store: Option<Box<dyn SessionStore + Send>>,
+        session_store: Option<Arc<StdMutex<Box<dyn SessionStore + Send>>>>,
     ) -> Result<(Self, EventStreams), AgentError> {
         config.limits.validate()?;
         if config.policy.is_container() {
@@ -540,12 +580,12 @@ impl Runtime {
                 "provider declares no usable context budget",
             ));
         }
-        eprintln!(
+        diagnostic(format_args!(
             "nexus-runtime: context budget configured_items={} effective_items={} max_bytes={}",
             config.limits.retained_context_items,
             context_items_bound,
             nexus_core::provider::MAX_CONVERSATION_BYTES,
-        );
+        ));
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
@@ -560,7 +600,7 @@ impl Runtime {
             tools: registry,
             tool_order: order,
             tool_definitions,
-            session_store: session_store.map(|store| Arc::new(StdMutex::new(store))),
+            session_store,
             store_uncertain: AtomicBool::new(false),
             state: Mutex::new(State {
                 active: None,
@@ -3273,6 +3313,8 @@ impl Runtime {
         let persistence_error = active.persistence_error.clone();
         let persistence = if persistence_error.is_some() {
             PersistenceState::SaveFailed
+        } else if self.shared.session_store.is_some() {
+            PersistenceState::Saved
         } else {
             PersistenceState::Ephemeral
         };
@@ -3807,14 +3849,14 @@ fn publish_context_reduction(
     run: &RunId,
     reduction: ContextReduction,
 ) {
-    eprintln!(
+    diagnostic(format_args!(
         "nexus-runtime: context reduced: removed_items={} retained_items={} max_items={} retained_bytes={} max_bytes={}",
         reduction.removed_items,
         reduction.retained_items,
         shared.context_items_bound,
         reduction.retained_bytes,
         nexus_core::provider::MAX_CONVERSATION_BYTES,
-    );
+    ));
     let outcome = emit_control(
         shared,
         active,
@@ -9779,7 +9821,7 @@ mod cov_runtime_topup_private {
                 }
             };
             assert_eq!(finished.outcome(), RunOutcome::Completed);
-            assert_eq!(finished.persistence(), PersistenceState::Ephemeral);
+            assert_eq!(finished.persistence(), PersistenceState::Saved);
         });
         drop(runtime);
 
@@ -9910,6 +9952,82 @@ mod cov_runtime_topup_private {
         drop(runtime);
         let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
         assert_eq!(reopened.last_source_sequence(&session).unwrap(), 4);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtimes_share_one_serialized_session_store_handle() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-shared-store-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let handle = SessionStoreHandle::new(Box::new(store));
+        let (first, mut streams) = Runtime::try_new_with_session_store_handle(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(vec![stop_turn("saved")])),
+            Vec::new(),
+            ModelInstructions::default(),
+            handle.clone(),
+        )
+        .unwrap();
+        let (second, _streams) = Runtime::try_new_with_session_store_handle(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Vec::new(),
+            ModelInstructions::default(),
+            handle.clone(),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            let response = first
+                .submit(
+                    SubmitCommand::new(
+                        RequestId::new("req-shared-store").unwrap(),
+                        SessionId::new("sess-shared").unwrap(),
+                        "persist me",
+                        "profile",
+                    )
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(response.reply(), CommandReply::Accepted);
+            while let Some(event) = streams.control.recv().await {
+                if event.is_terminal() {
+                    break;
+                }
+            }
+            let listed = second
+                .handle(Command::ListSessions(
+                    ListSessionsCommand::new(RequestId::new("req-shared-list").unwrap(), 10)
+                        .unwrap(),
+                ))
+                .await
+                .0;
+            assert_eq!(listed.reply(), CommandReply::Accepted);
+            assert_eq!(listed.sessions().len(), 1);
+            assert_eq!(listed.sessions()[0].session.as_str(), "sess-shared");
+        });
+        drop(first);
+        drop(second);
+        drop(handle);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        assert_eq!(
+            reopened
+                .last_source_sequence(&SessionId::new("sess-shared").unwrap())
+                .unwrap(),
+            2
+        );
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
     }

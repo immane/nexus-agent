@@ -1,9 +1,8 @@
-//! `nexus-tui` M0-test demo: scripted fakes behind the real runtime port.
+//! Interactive TUI over the runtime command/event port.
 //!
-//! TEST-ONLY. This binary wires [`nexus_fakes`] scripted doubles through
-//! the same runtime command/event port the product TUI will use. It is never
-//! real configuration: no provider credentials, no plugins, no network, no
-//! stored sessions. A stderr banner says so on every launch.
+//! Interactive sessions use the runtime command/event port and private local
+//! session storage. The explicit `--demo` path wires scripted doubles and
+//! remains ephemeral; a stderr banner says which mode is active.
 //!
 //! Frontend loop invariants (M0-test scope, not product defaults):
 //!
@@ -35,8 +34,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind, poll, read,
@@ -46,13 +46,14 @@ use nexus_config::{
 };
 use nexus_core::{
     AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload,
-    GetSnapshotCommand, Limits, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
-    ProviderPort, RequestId, RetryGuidance, RunEvent, RunId, SessionId, ToolRegistration,
+    GetSnapshotCommand, Limits, ListSessionsCommand, ModelInstructions, ModelRequest,
+    ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
+    RestoreSessionCommand, RetryGuidance, RunEvent, RunId, SessionId, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
 use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsumer};
-use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
+use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig, SessionStoreHandle};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
     Action, AppState, CompletionItem, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate,
@@ -84,6 +85,31 @@ const DEMO_SESSION: &str = "sess-tui-m0-test";
 /// The M0 fixture default is intentionally small, but interactive coding
 /// runs need room for inspect/edit/check/retry cycles.
 const TUI_MODEL_TURNS_PER_RUN: u32 = 64;
+static SESSION_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn new_tui_session_id() -> io::Result<SessionId> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let nonce = SESSION_NONCE.fetch_add(1, Ordering::SeqCst);
+    SessionId::new(format!(
+        "sess-tui-{:x}-{nanos:x}-{nonce:x}",
+        std::process::id()
+    ))
+    .map_err(io::Error::other)
+}
+
+fn application_session_store() -> io::Result<SessionStoreHandle> {
+    let directory = nexus_session::default_data_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private local session storage is unavailable on this platform",
+        )
+    })?;
+    let store = nexus_session::LazyFileSessionStore::new(directory);
+    Ok(SessionStoreHandle::new(Box::new(store)))
+}
 
 fn tui_runtime_limits() -> Limits {
     let mut limits = Limits::m0_test();
@@ -582,14 +608,25 @@ struct SessionRegistry {
     slots: Vec<SessionSlot>,
     active: usize,
     template: SessionConfig,
+    store: Option<SessionStoreHandle>,
 }
 
 impl SessionRegistry {
+    #[cfg(test)]
     fn new(first: SessionSlot, template: SessionConfig) -> Self {
+        Self::new_with_store(first, template, None)
+    }
+
+    fn new_with_store(
+        first: SessionSlot,
+        template: SessionConfig,
+        store: Option<SessionStoreHandle>,
+    ) -> Self {
         Self {
             slots: vec![first],
             active: 0,
             template,
+            store,
         }
     }
 
@@ -629,13 +666,19 @@ impl SessionRegistry {
         let mut session_config = self.template.clone();
         session_config.active_model =
             boot_model(&user_config_snapshot(&session_config.user_config));
-        let (runtime, streams, live) = build_live_runtime(&session_config)?;
-        let session =
-            SessionId::new(format!("{DEMO_SESSION}-{number}")).map_err(io::Error::other)?;
+        let (runtime, streams, live) =
+            build_live_runtime_with_store(&session_config, self.store.clone())?;
+        let session = if self.store.is_some() {
+            new_tui_session_id()?
+        } else {
+            SessionId::new(format!("{DEMO_SESSION}-{number}")).map_err(io::Error::other)?
+        };
         let mut front = Frontend::with_config(session, session_config);
         let label = format!("s{number}");
         front.state.set_session_label(&label);
-        front.state.notice(&format!("session {label} started"));
+        front
+            .state
+            .notice(&format!("new conversation · {label} · type a task below"));
         front.attach_live(
             live,
             self.template.tools_root.as_deref(),
@@ -896,8 +939,16 @@ fn take_selection_for_run(binding: &LiveHandle, run: &RunId) -> LiveSelection {
 ///
 /// A root that cannot be canonicalized or is not a directory is an
 /// explicit startup error, never a silent fallback to scripted reads.
+#[cfg(test)]
 fn build_live_runtime(
     session_config: &SessionConfig,
+) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
+    build_live_runtime_with_store(session_config, None)
+}
+
+fn build_live_runtime_with_store(
+    session_config: &SessionConfig,
+    session_store: Option<SessionStoreHandle>,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let policy = match session_config.execution {
         ExecutionMode::Local => match &session_config.tools_root {
@@ -976,19 +1027,20 @@ fn build_live_runtime(
                 if !session_config.strict_tools {
                     let tools =
                         nexus_tools::development_tools(&canonical).map_err(io::Error::other)?;
-                    return runtime_with_tools(session_config, config, tools);
+                    return runtime_with_tools(session_config, config, tools, session_store);
                 }
                 nexus_tools::strict_tools(&canonical).map_err(io::Error::other)?
             }
         },
     };
-    runtime_with_tools(session_config, config, tools)
+    runtime_with_tools(session_config, config, tools, session_store)
 }
 
 fn runtime_with_tools(
     session_config: &SessionConfig,
     config: RuntimeConfig,
     tools: Vec<ToolRegistration>,
+    session_store: Option<SessionStoreHandle>,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let binding = Arc::new(Mutex::new(LiveSelection {
         config: user_config_snapshot(&session_config.user_config),
@@ -998,7 +1050,17 @@ fn runtime_with_tools(
         pending_run_id: None,
     }));
     let provider = Arc::new(PerRunProvider::live(Arc::clone(&binding)));
-    let (runtime, streams) = Runtime::try_new(config, provider, tools).map_err(io::Error::other)?;
+    let (runtime, streams) = match session_store {
+        Some(store) => Runtime::try_new_with_session_store_handle(
+            config,
+            provider,
+            tools,
+            ModelInstructions::default(),
+            store,
+        ),
+        None => Runtime::try_new(config, provider, tools),
+    }
+    .map_err(io::Error::other)?;
     Ok((runtime, streams, binding))
 }
 
@@ -1035,13 +1097,13 @@ fn wiring_notice(
 fn main() {
     install_panic_hook();
     eprintln!(
-        "nexus-tui dev: live wiring by default, ephemeral store. \
+        "nexus-tui dev: live wiring by default. Interactive sessions use private local history storage (not encrypted); \
           A slot whose model resolves to a configured provider with a credential \
           uses the real adapter (network egress, billable); local --tools-root enables \
            jailed file tools + sandboxed exec (writes/exec require approval). \
            --execution container is experimental and does not establish isolation. \
            Without a configured provider, runs fail as not-configured; \
-           relaunch with --demo for the scripted demo. No durable storage."
+           relaunch with --demo for the scripted ephemeral demo."
     );
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -1572,6 +1634,10 @@ impl Frontend {
                     "Create and switch to a new session".into(),
                 ),
                 ("session list".into(), "List available sessions".into()),
+                (
+                    "session restore ".into(),
+                    "Restore a saved session by ID".into(),
+                ),
                 (
                     "session switch ".into(),
                     "Switch to a session by index or ID".into(),
@@ -2395,6 +2461,14 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
             }
             false
         }
+        SessionArgs::Restore(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("restore requires the persistent interactive session store");
+            false
+        }
         SessionArgs::Switch(target) => match sessions.resolve_target(target) {
             None => {
                 sessions
@@ -2432,6 +2506,156 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
             false
         }
     }
+}
+
+async fn execute_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) {
+    match args {
+        SessionArgs::List if sessions.store.is_some() => {
+            for line in sessions.describe() {
+                sessions.active_mut().front.state.notice(&line);
+            }
+            let request = sessions.active_mut().front.next_request();
+            let reply = sessions
+                .active()
+                .runtime
+                .handle(nexus_core::Command::ListSessions(
+                    ListSessionsCommand::new(request, nexus_core::commands::MAX_LIST_LIMIT)
+                        .expect("finite session list bound is valid"),
+                ))
+                .await
+                .0;
+            if reply.reply() == CommandReply::Accepted && reply.has_sessions() {
+                if reply.sessions().is_empty() {
+                    sessions
+                        .active_mut()
+                        .front
+                        .state
+                        .notice("no saved sessions");
+                } else {
+                    for entry in reply.sessions() {
+                        if sessions
+                            .slots
+                            .iter()
+                            .any(|slot| slot.front.session == entry.session)
+                        {
+                            continue;
+                        }
+                        sessions.active_mut().front.state.notice(&format!(
+                            "saved {} (revision {})",
+                            entry.session.as_str(),
+                            entry.logical_revision
+                        ));
+                    }
+                }
+            } else {
+                sessions
+                    .active_mut()
+                    .front
+                    .state
+                    .notice("saved session listing failed");
+            }
+        }
+        SessionArgs::Restore(id) => restore_persisted_session(sessions, id).await,
+        _ => {
+            handle_session_command(sessions, args);
+        }
+    }
+}
+
+async fn restore_persisted_session(sessions: &mut SessionRegistry, id: &str) {
+    if let Some(index) = sessions.resolve_target(id) {
+        if sessions.switch(index) {
+            let label = sessions.active().label.clone();
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice(&format!("switched to already loaded session {label}"));
+        }
+        return;
+    }
+    if sessions.store.is_none() {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("persistent session storage is unavailable");
+        return;
+    }
+    if sessions.len() >= MAX_SESSIONS {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("session limit reached (16 live sessions)");
+        return;
+    }
+    let session = match SessionId::new(id) {
+        Ok(session) => session,
+        Err(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("saved session id is invalid");
+            return;
+        }
+    };
+    let config = sessions.template.clone();
+    let store = sessions.store.clone();
+    let (runtime, streams, live) = match build_live_runtime_with_store(&config, store) {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("session runtime could not be created");
+            return;
+        }
+    };
+    let request = RequestId::new(format!(
+        "req-restore-{}",
+        SESSION_NONCE.fetch_add(1, Ordering::SeqCst)
+    ));
+    let Ok(request) = request else {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("session restore request could not be created");
+        return;
+    };
+    let reply = runtime
+        .handle(nexus_core::Command::RestoreSession(RestoreSessionCommand {
+            request,
+            session: session.clone(),
+        }))
+        .await
+        .0;
+    if reply.reply() != CommandReply::Accepted {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("saved session could not be restored");
+        return;
+    }
+    let number = sessions.slots.len() + 1;
+    let label = format!("s{number}");
+    let mut front = Frontend::with_config(session, config.clone());
+    front.state.set_session_label(&label);
+    front.attach_live(live, config.tools_root.as_deref(), config.execution);
+    front.state.notice(
+        "saved history is loaded into model context; interrupted calls remain uncertain and are not replayed",
+    );
+    sessions.slots.push(SessionSlot {
+        label,
+        runtime,
+        streams,
+        front,
+    });
+    sessions.active = sessions.slots.len() - 1;
 }
 /// Applies a submit reply to the frontend. Only `Accepted` adopts the run
 /// identity and records the draft; `Busy`/rejections keep the draft and
@@ -2981,9 +3205,18 @@ struct InteractiveReport {
 async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
-    let (runtime, streams, live) = build_live_runtime(&session_config)?;
-    let session =
-        SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?;
+    let session_store = if session_config.demo {
+        None
+    } else {
+        Some(application_session_store()?)
+    };
+    let (runtime, streams, live) =
+        build_live_runtime_with_store(&session_config, session_store.clone())?;
+    let session = if session_config.demo {
+        SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?
+    } else {
+        new_tui_session_id()?
+    };
     let mut front = Frontend::with_config(session, session_config.clone());
     front.state.set_session_label("s1");
     front.attach_live(
@@ -2992,7 +3225,7 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
         session_config.execution,
     );
     let demo = session_config.demo;
-    let mut sessions = SessionRegistry::new(
+    let mut sessions = SessionRegistry::new_with_store(
         SessionSlot {
             label: "s1".to_owned(),
             runtime,
@@ -3000,6 +3233,7 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
             front,
         },
         session_config,
+        session_store,
     );
     let mut gate = RefreshGate::m0_test();
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
@@ -3119,7 +3353,7 @@ async fn interactive_loop(
                 // intents resolve after earlier ones.
                 let cmds = sessions.active_mut().front.take_session_cmds();
                 for cmd in &cmds {
-                    handle_session_command(sessions, cmd);
+                    execute_session_command(sessions, cmd).await;
                     dirty = true;
                 }
                 let slot = sessions.active_mut();
@@ -4852,6 +5086,7 @@ mod cov_main_topup {
             }],
             active: 0,
             template: defaults_config(),
+            store: None,
         }
     }
 
@@ -4907,7 +5142,7 @@ mod cov_main_topup {
         assert_eq!(active.front.session.as_str(), format!("{DEMO_SESSION}-2"));
         assert_eq!(active.front.state.session_label(), Some("s2"));
         assert!(
-            transcript(&active.front).contains("session s2 started"),
+            transcript(&active.front).contains("new conversation · s2 · type a task below"),
             "the new slot announces itself in its own history"
         );
     }
@@ -6707,6 +6942,32 @@ mod cov_main_topup {
         assert_eq!(front.focus, Focus::Viewport);
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Enter)).await);
         assert!(front.state.overlay_open(), "second Enter executes :m");
+    }
+
+    #[tokio::test]
+    async fn session_new_executes_and_dismisses_command_completion_surface() {
+        let mut sessions = registry();
+        sessions.active_mut().front.focus = Focus::Viewport;
+        for key in ":session new"
+            .chars()
+            .map(KeyCode::Char)
+            .chain([KeyCode::Enter])
+        {
+            let slot = sessions.active_mut();
+            assert!(!handle_key(&mut slot.front, &slot.runtime, press(key)).await);
+        }
+        let commands = sessions.active_mut().front.take_session_cmds();
+        assert_eq!(commands, vec![SessionArgs::New]);
+        for command in &commands {
+            execute_session_command(&mut sessions, command).await;
+        }
+
+        let active = sessions.active();
+        assert_eq!(sessions.active, 1);
+        assert_eq!(active.front.state.session_label(), Some("s2"));
+        assert!(active.front.state.command_line().is_none());
+        assert!(active.front.state.completions().is_empty());
+        assert!(transcript(&active.front).contains("new conversation · s2"));
     }
 
     #[tokio::test]

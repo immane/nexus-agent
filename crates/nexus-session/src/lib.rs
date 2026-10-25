@@ -15,6 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use nexus_core::store::StoredMessage;
 use nexus_core::{
@@ -34,6 +35,37 @@ pub const MAX_STORE_BYTES: usize = nexus_validation::MAX_DOCUMENT_BYTES;
 /// Maximum number of accepted source records retained in one store.
 pub const MAX_SOURCE_RECORDS: usize = 16_384;
 const SOURCE_PAGE_SIZE: usize = 256;
+
+/// Returns the user-local application data directory for automatic session
+/// storage, when a supported Unix home/state location is available.
+#[must_use]
+pub fn default_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .map(|home| home.join("Library/Application Support/nexus-agent/sessions"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| PathBuf::from(home).join(".local/state"))
+            })?;
+        base.is_absolute()
+            .then(|| base.join("nexus-agent/sessions"))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
 
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -126,6 +158,106 @@ pub struct FileSessionStore {
     source_records: Vec<SourceRecord>,
     write_uncertain: bool,
     _lock: File,
+}
+
+/// Defers reading the bounded snapshot until the first store operation.
+/// Applications can construct a runtime and open a fresh conversation without
+/// materializing prior session history during startup.
+pub struct LazyFileSessionStore {
+    directory: PathBuf,
+    store: Mutex<Option<FileSessionStore>>,
+}
+
+impl LazyFileSessionStore {
+    /// Creates a store handle without opening or scanning its directory.
+    #[must_use]
+    pub fn new(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: directory.into(),
+            store: Mutex::new(None),
+        }
+    }
+
+    fn lock_store(&self) -> Result<MutexGuard<'_, Option<FileSessionStore>>, AgentError> {
+        let mut guard = self
+            .store
+            .lock()
+            .map_err(|_| store_error("session store is unavailable"))?;
+        if guard.is_none() {
+            *guard = Some(FileSessionStore::open(self.directory.clone())?);
+        }
+        Ok(guard)
+    }
+}
+
+impl SessionStore for LazyFileSessionStore {
+    fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMetadata>, AgentError> {
+        self.lock_store()?.as_ref().unwrap().list_sessions(limit)
+    }
+
+    fn load_session(&self, id: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+        self.lock_store()?.as_ref().unwrap().load_session(id)
+    }
+
+    fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError> {
+        self.lock_store()?
+            .as_mut()
+            .unwrap()
+            .save_checkpoint(checkpoint)
+    }
+
+    fn initialize_session(&mut self, checkpoint: &SessionCheckpoint) -> Result<bool, AgentError> {
+        self.lock_store()?
+            .as_mut()
+            .unwrap()
+            .initialize_session(checkpoint)
+    }
+
+    fn record_intent(&mut self, intent: &ToolIntentRecord) -> Result<(), AgentError> {
+        self.lock_store()?.as_mut().unwrap().record_intent(intent)
+    }
+
+    fn record_outcome(&mut self, outcome: &ToolOutcomeRecord) -> Result<(), AgentError> {
+        self.lock_store()?.as_mut().unwrap().record_outcome(outcome)
+    }
+
+    fn append_source_record(&mut self, record: &SourceRecord) -> Result<(), AgentError> {
+        self.lock_store()?
+            .as_mut()
+            .unwrap()
+            .append_source_record(record)
+    }
+
+    fn load_source_records(
+        &self,
+        session: &SessionId,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SourceRecord>, AgentError> {
+        self.lock_store()?
+            .as_ref()
+            .unwrap()
+            .load_source_records(session, after_sequence, limit)
+    }
+
+    fn last_source_sequence(&self, session: &SessionId) -> Result<u64, AgentError> {
+        self.lock_store()?
+            .as_ref()
+            .unwrap()
+            .last_source_sequence(session)
+    }
+
+    fn append_source_items(
+        &mut self,
+        session: &SessionId,
+        run: &RunId,
+        items: &[ModelContextItem],
+    ) -> Result<u64, AgentError> {
+        self.lock_store()?
+            .as_mut()
+            .unwrap()
+            .append_source_items(session, run, items)
+    }
 }
 
 impl FileSessionStore {
@@ -1212,6 +1344,18 @@ mod tests {
         assert_eq!(recovered.checkpoint(), &checkpoint);
         assert_eq!(recovered.source_records().len(), 2);
         assert_eq!(recovered.items().cloned().collect::<Vec<_>>(), source);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn lazy_store_does_not_touch_history_until_first_operation() {
+        let directory = directory("lazy-open");
+        let store = LazyFileSessionStore::new(&directory);
+        assert!(!directory.exists());
+        assert!(store.list_sessions(8).unwrap().is_empty());
+        assert!(directory.exists());
+        assert!(!directory.join("session-store.json").exists());
         drop(store);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -1,6 +1,6 @@
 # Session Store Contract
 
-Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session` has a bounded JSON snapshot, and the runtime's opt-in store mode persists accepted source items and operation records. Explicit runtime listing/restoration commands are implemented for injected stores; application storage wiring remains opt-in and is not yet enabled. Read the [common contract](00-common.md) first.
+Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session` has a bounded JSON snapshot, and the runtime's opt-in store mode persists accepted source items and operation records. The interactive TUI now opens the private default local store, lists saved metadata, and exposes explicit restore by session ID. Server and headless application wiring remain ephemeral. Read the [common contract](00-common.md) first.
 
 ## Scope and Operations
 
@@ -31,10 +31,12 @@ Runtime exposes an opt-in constructor that initializes a checkpoint, persists
 accepted user input, complete assistant context items, and tool results, and
 writes tool intents before dispatch. Source items are committed before the run
 advances to dispatch/another model turn; write failure terminates the run.
-Application storage wiring is not implemented. Restore only populates the
-runtime's bounded history cache; unfinished calls are represented as unknown
-effects and are never replayed. Terminal persistence still reports ephemeral,
-so the application cannot yet promise restart recovery. See the
+TUI storage uses the platform default user data directory outside the project
+through a lazy store handle, so ordinary startup does not open or parse prior
+history. It is not application-encrypted. Restore only populates the runtime's
+bounded history cache; unfinished calls are represented as unknown effects and
+are never replayed. A completed run reports saved only after its source and
+operation records have passed the file store's sync-and-rename protocol. See the
 [context-management design](../design/12-context-management.md) for the current
 gap and the source-history/active-view boundary.
 

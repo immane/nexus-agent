@@ -224,9 +224,9 @@ pub(super) fn prepare_context_request(
                             .with_max_output_tokens(summary_output as u32)
                             .map_err(Terminal::failed);
                     }
-                    eprintln!(
+                    diagnostic(format_args!(
                         "nexus-runtime: summary not attempted: estimated_input_tokens={summary_input} window_tokens={window} available_output_tokens={summary_output}; preserving conversation"
-                    );
+                    ));
                 }
             }
             if policy.strategy() == ContextCompactionStrategy::Summarize {
@@ -341,9 +341,9 @@ fn commit(
         active.context_note_bytes =
             runtime_note_bytes(&active.context_note, active.instruction_bytes > 0);
     }
-    eprintln!(
+    diagnostic(format_args!(
         "nexus-runtime: automatic context compaction method={method} estimated_input_tokens={estimated}; token occupancy is estimated, not exact"
-    );
+    ));
     let run = active.run.clone();
     publish_context_reduction(shared, active, &run, reduction);
     Ok(())
@@ -419,10 +419,10 @@ pub(super) fn ingest_summary(
         ProviderEvent::TextDelta { text, .. } => bytes.saturating_add(text.len()),
         _ => bytes,
     });
-    eprintln!(
+    diagnostic(format_args!(
         "nexus-runtime: summary rejected: protocol_valid={valid} finish_reason={finish_reason:?} text_bytes={text_bytes} memory_byte_limit={}; original conversation preserved",
         nexus_context::MAX_MEMORY_BYTES,
-    );
+    ));
     Err(Terminal::limit(
         "context summary failed; original conversation preserved",
     ))

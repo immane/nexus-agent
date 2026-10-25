@@ -20,6 +20,19 @@ per package instead of linking an executable for every source file. New
 integration modules in these packages must be added to `tests/behavior.rs`;
 automatic test target discovery is disabled in their manifests.
 
+The TUI has an opt-in real-terminal rendering regression (Unix and Python 3):
+
+```sh
+cargo nextest run -j 1 -p nexus-tui session_commands_preserve_the_terminal_screen --run-ignored all --locked --offline
+```
+
+It connects stdout and stderr to the same pseudo-terminal and checks incremental
+rendering at three sizes while opening commands, creating/listing/switching
+sessions, and opening/closing help. It uses `--demo` with an empty configuration;
+it does not call live providers or open the user's session store. Runtime
+diagnostics must not write directly to a terminal owned by the TUI; redirect
+stderr to a file to retain those diagnostics without corrupting the screen.
+
 Development/test builds retain line-table debug information, debug assertions,
 overflow checks, and incremental compilation. Dependencies omit debug information.
 The test profile inherits these dev settings. Full local-variable/type debugging
