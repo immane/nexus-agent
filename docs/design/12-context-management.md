@@ -1,6 +1,6 @@
 # Context Management and Evidence-Preserving Evaluation
 
-Date: 2026-10-25.
+Date: 2026-10-25. Improvement review: 2026-10-26.
 
 Status: project-owner-confirmed priority and direction, with a proposed detailed
 design for review. This document records the requested architecture, evaluation
@@ -138,6 +138,114 @@ certainty-based removal rules. Failed, invalid, or cancelled summaries never
 partially replace the old active view. Diagnostics report planned removals,
 estimated occupancy, target, window, and output reserve; these are not tokenizer
 measurements or evidence of benchmark repair quality.
+
+### Efficiency and fidelity improvements (2026-10-26)
+
+The following recommendations prepare a focused implementation; they are not
+implemented behavior or authorization for a larger memory architecture. The
+table and recovery discussion earlier in this section describe a historical
+baseline, not the complete current workspace.
+
+#### Inspected implementation
+
+The current estimator uses `ceil(payload_bytes / 3)` plus message/tool framing,
+then applies a safety factor initially set to 1.25. Calibration can increase
+that factor when reported input demonstrates underestimation, but never lowers
+it. This is a deliberately conservative heuristic, not model tokenization.
+Systematic overestimation can therefore persist without implying that usage was
+incorrectly accumulated across calls.
+
+Archived summary selection preserves the task, the newest three complete tool
+groups, and deterministic unresolved-execution projections. Removed originals
+are rendered using Rust `Debug` text, split at UTF-8 boundaries into record
+fragments up to 16 KiB and input chunks up to 24 KiB. Summarization is serial:
+each chunk receives the preceding rolling summary (or earlier accepted memory)
+and rewrites it. The prompt targets at most 400 words; generation is separately
+capped at 4,096 tokens and accepted memory at 8,192 bytes. These are different
+limits, not interchangeable measures of summary quality.
+
+The current workspace also supplies a summary-only low-effort hint, encoded
+only for detected Ollama Chat Completions endpoints. It is not a hard reasoning
+token budget or proof of model compliance. Validated `OutputLimit` responses
+are discarded and the current chunk can be halved for bounded recovery. All
+chunks remain staged until the complete candidate passes validation. Emergency
+tool-output previews preserve head/tail excerpts and outcome metadata without
+changing archived originals; they are not a semantic summarizer.
+
+#### Recommended order and acceptance boundaries
+
+| Priority | Focused change | Validation before adoption |
+| --- | --- | --- |
+| First | Diagnose and improve request budgeting in `nexus-context`, retaining runtime construction of the complete request | Correlate raw estimate, safety-adjusted estimate, final provider input and request purpose by invocation. Cover instructions, schemas, reasoning round-trip fields, memory, framing and previews. Missing usage stays unknown; never reduce safety from a single unusually small response. |
+| Next | Try deterministic old-output reduction before paying for LLM summarization | Reuse existing projection functions. Identify recoverable read output conservatively; retain useful paths/ranges, short results and explicit omission notices. Verify fewer summary calls without losing required facts or increasing reviewed redundant exploration. |
+| Next | Preserve a compact investigation state alongside source references | Capture established facts, rejected hypotheses, unresolved questions and the next actionable step. Keep source identities and test/patch association where available. Unsupported conclusions stay unverified; later contradictory evidence must not silently disappear. |
+| Then | Reduce repeated rewriting and improve chunk boundaries | Prefer complete exchanges and content boundaries over arbitrary `Debug` fragments; handle oversized individual records explicitly. Compare bounded original excerpts or independently derived facts against rolling summaries without introducing an unbounded memory list. |
+| Later, if measured | Optimize cache reuse or summary concurrency | Measure cached-token/prefill behavior when available and end-to-end latency on the actual local backend. Do not assume parallel requests improve a single-device Ollama deployment. |
+
+Budgeting work should first reproduce the observed estimate/usage divergence,
+not assume a root cause. Consider model-matched token counting only when its
+availability, accuracy and dependency footprint are justified. If calibration
+can decrease, specify its observation window, conservative floor, outlier and
+model-change handling, and regressions for underestimation before enabling it.
+Unknown windows, hard byte/item ceilings and generation headroom still apply.
+
+For deterministic reduction, source durability alone does not prove an output
+is cheaply reproducible. A file can change and an environment can disappear.
+Keep archived evidence distinct from current filesystem state. Never suggest
+re-executing writes, external operations or unknown-effect calls to recover
+their outputs. Preserve the existing recent-group protection except for the
+explicit emergency headroom path. This recommendation changes reduction order,
+not execution authorization, archival retention or provider protocol rules.
+
+Start investigation state as a bounded internal representation rendered through
+the existing request path, not a new database, graph or planner. Ordinary
+investigation notes remain untrusted derived context, separate from exact
+execution uncertainty. Their successful parsing does not establish semantic
+truth. Existing source sequence/run/call identities are sufficient initially;
+model-facing archive retrieval and general provenance services remain deferred.
+
+Every new reduction path must retain atomic candidate acceptance, complete
+call/result pairing, protected task corrections, required provider reasoning,
+and deterministic uncertainty evidence. Failed, cancelled, oversized or
+partially generated candidates must leave accepted memory and active history
+unchanged. Retry bounds must be explicit for a chunk, a compaction and the run;
+resetting a per-chunk counter is not a global two-retry bound.
+
+#### Comparison evidence and limits
+
+- [Anthropic context engineering guidance](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+  motivates tool-result clearing, just-in-time reads and structured notes.
+  Adopt these as small extensions to current boundaries, not a requirement for
+  multi-agent orchestration or a separate retrieval service.
+- [CliffCompaction](https://arxiv.org/html/2609.26779v1) studies rule-based
+  excerpts and dropping previous compactions instead of recursively summarizing
+  them. It trades historical recall for verbatim fidelity and avoids auxiliary
+  summary calls. Its reported results do not establish benefits for local
+  Qwen3.8-27B IQ3_M, and discarding unresolved execution evidence is not an
+  acceptable adaptation for Nexus.
+- [Parallel Context Compaction](https://arxiv.org/html/2605.23296v1) studies
+  prefix-aware parallel block summaries. Its throughput gains depend on serving
+  conditions and output volume; parallelism does not uniformly reduce total
+  wall time. Its QA measurements are not coding-agent acceptance thresholds.
+
+Evaluate changes independently before combining them, keeping task/base, model,
+94,208-token window, output cap, offline workload and run limits comparable.
+Use fresh artifact directories and background execution for long benchmarks.
+The exposed Sphinx replays are debugging evidence, not blind evaluation.
+Compare task/summary request counts and final input/output usage, estimate error,
+context before/after each committed reduction, and summary latency separately
+from total run latency. Report both `summary_time / completed_model_call_time`
+and `summary_time / agent_elapsed_time` with their exact observation interval;
+do not compare an unfinished candidate against a full baseline without also
+reporting matched elapsed intervals and pending calls.
+
+Deterministic regressions should exercise negated hypotheses, user corrections,
+exact file/symbol references, test results tied to patch state, multi-chunk
+failure, missing usage, and uncertain effects. Review repeated investigation
+manually at first. Lower token usage or a smaller summary-time fraction is not
+success if repairs, evidence retention or normal completion regress. The first
+priority is useful information retained per unit of cost, not a fixed occupancy
+or an assumed industry-standard summary percentage.
 
 ### OpenCode V2 reference: separate storage from model context
 
@@ -319,7 +427,8 @@ turns, tokens, and time, including failed attempts. They must be identifiable
 separately from normal task calls.
 
 Prefer safe exchange selection and a bounded summary when configured. Failed or
-incomplete summaries preserve the previous conversation and terminate; do not
+incomplete summaries preserve the previous conversation; after applicable bounded
+recovery is exhausted, terminate. Do not
 fall back to deleting the summary's source history. Old output previews and
 then emergency latest-group previews can supply headroom without rewriting
 source records. The current emergency mechanism reduces head/tail allowance
@@ -400,12 +509,14 @@ archived-history increment above implements compact text projections for removed
 groups while retaining their complete original records in storage.
 
 Summary reliability must distinguish generation budget, requested text size,
-and the hard memory-byte ceiling. A proposed repair policy allows at most one
-additional summary attempt for output-limit or oversized-text failures, using
-the original sources rather than continuing an incomplete summary. Both attempts
+and the hard memory-byte ceiling. The current output-limit recovery supersedes
+the earlier proposed single additional attempt: halve the failing source chunk,
+allow at most two consecutive output-limit splits, and reset that counter after
+a successful chunk advances. This is not a global two-retry limit. All attempts
 consume normal turn/time/usage budgets and recheck cancellation and deadlines.
-Protocol failures are not length retries. Never truncate text into an accepted
-summary; exhausted attempts leave the old view and memory unchanged.
+Oversized-text and protocol failures do not receive this output-limit recovery.
+Never continue an incomplete summary or truncate it into accepted memory;
+exhausted attempts leave the old view and memory unchanged.
 
 Acceptance requires repeated compaction with recoverable sources, exact
 uncertainty preservation, failure/cancellation without partial publication, and
