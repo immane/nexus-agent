@@ -123,6 +123,11 @@ pub const MAX_ARGS_DEPTH: usize = 32;
 /// a product default).
 pub const MAX_ARGS_NODES: usize = 4_096;
 
+/// Maximum bytes accepted by the strict local-document parser.
+pub const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DOCUMENT_DEPTH: usize = 48;
+const MAX_DOCUMENT_NODES: usize = 200_000;
+
 /// Hard maximum argument text in bytes: the core M0 tool-argument assembly
 /// budget. [`CompiledSchema::validate`] and [`parse_object`] accept caller
 /// byte budgets only in `1..=MAX_ARG_BYTES`; an out-of-range budget is
@@ -162,6 +167,39 @@ pub fn parse_object(args: &str, max_bytes: usize) -> Result<serde_json::Value, A
         return Err(input_error("arguments must be an object"));
     }
     Ok(value)
+}
+
+/// Strict-parses a bounded local JSON document, rejecting duplicate keys,
+/// trailing data, excessive nesting, and excessive node counts.
+pub fn parse_document_object(
+    text: &str,
+    max_bytes: usize,
+) -> Result<serde_json::Value, AgentError> {
+    if max_bytes == 0 || max_bytes > MAX_DOCUMENT_BYTES {
+        return Err(input_error("document byte budget is invalid"));
+    }
+    if text.len() > max_bytes {
+        return Err(limit_error("document byte budget exhausted"));
+    }
+    let value = parse::parse_strict(text, MAX_DOCUMENT_DEPTH, MAX_DOCUMENT_NODES)
+        .map_err(parse::ParseFault::into_document_error)?;
+    if !value.is_object() {
+        return Err(input_error("document must be an object"));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    #[test]
+    fn document_parser_allows_larger_bounded_documents_but_rejects_duplicates() {
+        let large = format!(r#"{{"payload":"{}"}}"#, "x".repeat(70_000));
+        assert!(parse_document_object(&large, MAX_DOCUMENT_BYTES).is_ok());
+        assert!(parse_document_object(r#"{"a":1,"a":2}"#, MAX_DOCUMENT_BYTES).is_err());
+        assert!(parse_document_object("[]", MAX_DOCUMENT_BYTES).is_err());
+    }
 }
 
 pub(crate) fn input_error(message: &'static str) -> AgentError {

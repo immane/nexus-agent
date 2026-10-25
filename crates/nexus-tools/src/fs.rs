@@ -723,11 +723,10 @@ impl ScopedPatcher {
         Self::with_root_policy(root, false)
     }
 
-    /// Container workspaces may be backed by shared filesystems that report
-    /// Linux metadata features as unsupported. Preserve all metadata the
-    /// filesystem exposes, but allow those explicitly unsupported features.
-    #[cfg(feature = "container-worker")]
-    pub fn with_container_root(root: &Path) -> Result<Self, AgentError> {
+    /// Shared workspaces may report some Linux metadata features as
+    /// unsupported. Preserve all metadata the filesystem exposes, but allow
+    /// those explicitly unsupported features.
+    pub fn with_shared_workspace_root(root: &Path) -> Result<Self, AgentError> {
         Self::with_root_policy(root, true)
     }
 
@@ -1039,11 +1038,10 @@ impl ScopedWriter {
         Self::with_root_policy(root, false)
     }
 
-    /// Container workspaces may be backed by shared filesystems that report
-    /// Linux metadata features as unsupported. Preserve all metadata the
-    /// filesystem exposes, but allow those explicitly unsupported features.
-    #[cfg(feature = "container-worker")]
-    pub fn with_container_root(root: &Path) -> Result<Self, AgentError> {
+    /// Shared workspaces may report some Linux metadata features as
+    /// unsupported. Preserve all metadata the filesystem exposes, but allow
+    /// those explicitly unsupported features.
+    pub fn with_shared_workspace_root(root: &Path) -> Result<Self, AgentError> {
         Self::with_root_policy(root, true)
     }
 

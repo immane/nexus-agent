@@ -23,6 +23,8 @@ pub enum ExecutionStatus {
     Cancelled,
     /// The per-tool deadline elapsed with uncertain effects.
     TimedOut,
+    /// Execution was interrupted before a result could be recorded.
+    Interrupted,
 }
 
 /// What changes are known to have happened. Cancellation never implies
@@ -499,6 +501,17 @@ mod tests {
         assert_eq!(outcome.effect(), EffectState::Unknown);
         assert_eq!(outcome.evidence(), Evidence::Uncertain);
         assert!(outcome.is_truncated());
+
+        let interrupted = ToolOutcome::new(
+            ExecutionStatus::Interrupted,
+            EffectState::Unknown,
+            Evidence::Uncertain,
+            "recording ended before the outcome was known",
+            false,
+        )
+        .expect("interrupted execution retains explicit uncertainty");
+        assert_eq!(interrupted.status(), ExecutionStatus::Interrupted);
+        assert_eq!(interrupted.effect(), EffectState::Unknown);
     }
 
     #[test]

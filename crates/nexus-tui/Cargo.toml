@@ -1,6 +1,6 @@
 [package]
 name = "nexus-tui"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 edition = "2024"
 autotests = false
 
@@ -9,8 +9,9 @@ autotests = false
 low-value-tests = []
 container = [
     "nexus-runtime/container",
-    "nexus-tools/container-worker",
-    "nexus-tools/container-keeper",
+    "dep:nexus-container",
+    "nexus-container/container-worker",
+    "nexus-container/container-keeper",
 ]
 
 [[test]]
@@ -37,6 +38,7 @@ nexus-core = { path = "../nexus-core" }
 # Single-run runtime handle: the ONLY execution/policy path. The TUI calls
 # `Runtime::handle` with typed commands and never invokes providers/tools.
 nexus-runtime = { path = "../nexus-runtime" }
+nexus-session = { path = "../nexus-session" }
 # Typed user configuration: model admission order, favourites, and recents.
 # The TUI reads it once at startup (missing file -> defaults, present but
 # invalid -> explicit startup error) and writes back `recent` when a run
@@ -56,6 +58,7 @@ nexus-openai = { path = "../nexus-openai" }
 # jail (mirrors the server's `--tools real`); otherwise file tools stay
 # scripted. Reads are automatic; writes always need an approval grant.
 nexus-tools = { path = "../nexus-tools" }
+nexus-container = { path = "../nexus-container", optional = true }
 # Rationale: ratatui is the ONE terminal library for M0. Immediate-mode
 # rendering over a single crossterm backend covers the fixed composer,
 # bounded viewport, approval card, and footer with no extra fullscreen

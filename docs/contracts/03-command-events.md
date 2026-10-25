@@ -50,6 +50,9 @@ The runtime is the sole publisher of authoritative ordering; adapters report thr
 | --- | --- |
 | `RunStarted` | Accepted run identity and effective profile summary |
 | `AssistantTextDelta` | Ordered presentation fragment for an identified turn/item |
+| `ModelRequestStarted` | Complete request is ready for provider dispatch; identifies turn/purpose, runtime input estimate, configured/discovered window, output ceiling, and count of projected tool results |
+| `ModelRequestFinished` | Provider batch protocol validation result; a valid response may still be refused, fail runtime admission, or be unsuitable as a summary |
+| `ContextReduced` | A committed reduction of the active view, with a typed method and retained/removed representation counts |
 | `ToolCallPreview` | Optional, non-executable progress for a proposed call |
 | `ApprovalRequired` | Exact approval identity, safe action summary, expiry, and optional bounded canonical `session_directory` |
 | `ToolStarted` | An authorized admitted call has entered execution; carries call/tool identity and an optional bounded, policy-redacted argument preview |
@@ -57,6 +60,24 @@ The runtime is the sole publisher of authoritative ordering; adapters report thr
 | `ToolFinished` | Actual outcome and effect/evidence summary |
 | `UsageUpdated` | Available usage information, labeled provisional or final |
 | `RunFinished` | Terminal outcome and persistence state |
+
+Model request metadata is observational and does not alter scheduling or
+authorization. A summary request has purpose `Summary`; normal agent requests
+have purpose `Task`. The reported context window is the runtime's configured or
+discovered value, not proof of the provider's actual effective capacity. The
+estimated input is heuristic, and missing output ceilings remain unknown.
+
+`ModelRequestStarted`, `ModelRequestFinished`, and `ContextReduced` travel on the
+bounded control channel so caller-side collection can correlate usage and retain
+committed-reduction observations. They consume normal per-run event sequence
+numbers. `ModelRequestFinished.response_validated` reports only protocol batch
+validation; it does not report runtime admission, summary adoption, or task
+progress. Summary adoption is observed through a committed `ContextReduced`
+method of `summarize`. A finished event may be absent when the process/provider
+worker is interrupted before a batch is available. Consumers must treat this as
+incomplete observation. A reduction method describes a committed reduction, not
+every attempted compaction decision. These events are not durable history or a
+crash-recovery journal.
 
 Terminal run outcomes distinguish completed, refused, failed, cancelled, and limit reached. Completion describes the runtime lifecycle, not proof of every requested business outcome. Required persistence failure must be reported without losing already observed tool effects.
 

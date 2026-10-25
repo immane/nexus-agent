@@ -126,8 +126,8 @@ fn provisional_usage_burst_is_bounded_and_terminal_survives_resume() {
         );
         assert_eq!(
             control.len(),
-            19,
-            "one RunStarted, 17 usage records, one RunFinished: {}",
+            21,
+            "RunStarted, request/response metadata, 17 usage records, RunFinished: {}",
             control.len()
         );
         assert_eq!(

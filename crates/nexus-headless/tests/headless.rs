@@ -31,14 +31,14 @@ fn stdout_carries_only_machine_lines_and_stderr_carries_banner() {
     assert!(!stdout.contains('\x1b'), "no escape codes in stdout");
     assert!(!stdout.is_empty());
     for line in stdout.lines() {
-        assert!(line.starts_with("rev=m0-test-0 "), "{line}");
+        assert!(line.starts_with("rev=m0-test-1 "), "{line}");
     }
     assert!(
         stdout
             .lines()
             .last()
             .expect("result")
-            .starts_with("rev=m0-test-0 type=result ")
+            .starts_with("rev=m0-test-1 type=result ")
     );
 }
 

@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::container_worker_client::WorkerTransport;
+use crate::worker_client::WorkerTransport;
 
 const STDERR_LIMIT: usize = 1024;
 const PROBE_LIMIT: usize = 4096;
@@ -227,8 +227,8 @@ impl WorkerTransport for DockerExecTransport {
 
     fn pre_dispatch_failure(
         error: &Self::Error,
-    ) -> Option<crate::container_worker_client::PreDispatchFailure> {
-        use crate::container_worker_client::PreDispatchFailure;
+    ) -> Option<crate::worker_client::PreDispatchFailure> {
+        use crate::worker_client::PreDispatchFailure;
         match error {
             DockerExecError::Deadline => Some(PreDispatchFailure::Deadline),
             DockerExecError::InvalidConfiguration | DockerExecError::RequestTooLarge => {
@@ -254,10 +254,10 @@ impl WorkerTransport for DockerExecTransport {
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<u8>, Self::Error> {
-        if request.len() > crate::container_worker_protocol::MAX_REQUEST_BYTES {
+        if request.len() > crate::worker_protocol::MAX_REQUEST_BYTES {
             return Err(DockerExecError::RequestTooLarge);
         }
-        if max_response_bytes > crate::container_worker_protocol::MAX_RESPONSE_BYTES
+        if max_response_bytes > crate::worker_protocol::MAX_RESPONSE_BYTES
             || max_response_bytes.checked_add(1).is_none()
         {
             return Err(DockerExecError::InvalidConfiguration);
@@ -591,7 +591,7 @@ mod tests {
 
     #[test]
     fn rejects_remote_context_and_expired_deadline_without_exec() {
-        use crate::container_worker_client::PreDispatchFailure;
+        use crate::worker_client::PreDispatchFailure;
         assert_eq!(
             <DockerExecTransport as WorkerTransport>::pre_dispatch_failure(
                 &DockerExecError::RequestTooLarge
@@ -619,7 +619,7 @@ mod tests {
         assert!(matches!(
             t.exchange(
                 b"",
-                crate::container_worker_protocol::MAX_RESPONSE_BYTES + 1,
+                crate::worker_protocol::MAX_RESPONSE_BYTES + 1,
                 Instant::now() + Duration::from_secs(1)
             ),
             Err(DockerExecError::InvalidConfiguration)

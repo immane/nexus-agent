@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-config"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "nexus-core",
  "nexus-validation",
@@ -206,19 +206,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-container"
+version = "0.2.3-alpha"
+dependencies = [
+ "nexus-core",
+ "nexus-tools",
+ "rustix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nexus-context"
+version = "0.2.3-alpha"
+dependencies = [
+ "nexus-core",
+]
+
+[[package]]
 name = "nexus-core"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 
 [[package]]
 name = "nexus-fakes"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "nexus-core",
 ]
 
 [[package]]
 name = "nexus-headless"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "nexus-config",
  "nexus-core",
@@ -229,19 +247,22 @@ dependencies = [
 
 [[package]]
 name = "nexus-integration"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
+ "nexus-config",
  "nexus-core",
  "nexus-fakes",
  "nexus-headless",
+ "nexus-openai",
  "nexus-runtime",
  "nexus-tui",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "nexus-openai"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "nexus-config",
  "nexus-core",
@@ -253,14 +274,16 @@ dependencies = [
 
 [[package]]
 name = "nexus-permissions"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 
 [[package]]
 name = "nexus-runtime"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
+ "nexus-context",
  "nexus-core",
  "nexus-permissions",
+ "nexus-session",
  "nexus-validation",
  "serde_json",
  "tokio",
@@ -268,39 +291,51 @@ dependencies = [
 
 [[package]]
 name = "nexus-server"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "nexus-config",
+ "nexus-container",
  "nexus-core",
  "nexus-fakes",
  "nexus-openai",
  "nexus-runtime",
+ "nexus-session",
  "nexus-tools",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
+name = "nexus-session"
+version = "0.2.3-alpha"
+dependencies = [
+ "nexus-core",
+ "nexus-validation",
+ "serde_json",
+]
+
+[[package]]
 name = "nexus-tools"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "nexus-core",
  "nexus-permissions",
  "rustix",
- "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "nexus-tui"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "crossterm",
  "nexus-config",
+ "nexus-container",
  "nexus-core",
  "nexus-fakes",
  "nexus-openai",
  "nexus-runtime",
+ "nexus-session",
  "nexus-tools",
  "pulldown-cmark",
  "ratatui",
@@ -310,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-validation"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 dependencies = [
  "nexus-core",
  "serde",

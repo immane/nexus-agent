@@ -1,0 +1,32 @@
+{
+  "provider": "ollama-local",
+  "model": "qwen3-27b",
+  "context_window_tokens": 94208,
+  "gateway_image": "nexus-no-egress-gateway:pilot",
+  "tasks": {
+    "sympy__sympy-20590": {
+      "images": ["nexus-swebench-sympy-20590-observability:pilot", "nexus-swebench-sympy-20590:pilot"],
+      "exposure": "previously evaluated; regression only"
+    },
+    "astropy__astropy-12907": {
+      "images": ["nexus-swebench-astropy-12907:pilot"],
+      "exposure": "previously evaluated; regression only"
+    },
+    "django__django-11099": {
+      "images": ["nexus-swebench-django-11099:pilot"],
+      "exposure": "previously evaluated; regression only"
+    },
+    "astropy__astropy-13398": {
+      "images": ["nexus-swebench-astropy-13398-isolated:pilot"],
+      "exposure": "previously contaminated; not blind"
+    },
+    "sphinx-doc__sphinx-9461": {
+      "images": ["nexus-swebench-sphinx-9461-isolated:pilot"],
+      "exposure": "previously attempted; not blind"
+    },
+    "pytest-dev__pytest-10051": {
+      "images": ["nexus-swebench-pytest-10051-context:pilot"],
+      "exposure": "previously attempted; not blind"
+    }
+  }
+}

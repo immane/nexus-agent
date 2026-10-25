@@ -735,9 +735,10 @@ fn retained_item_pressure_evicts_the_oldest_complete_exchange() {
                 .context_note()
                 .contains("Earlier completed exchanges were omitted")
         );
-        assert!(data.iter().any(|event| matches!(
+        assert!(control.iter().any(|event| matches!(
             event.payload(),
             EventPayload::ContextReduced {
+                method: _,
                 removed_items: 2,
                 ..
             }
@@ -800,10 +801,12 @@ fn omitted_inherited_history_is_noted_in_context_and_published() {
                 .reply(),
             CommandReply::Accepted
         );
-        let (data, _, second) = common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        let (_, control, second) =
+            common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         assert_eq!(second.outcome(), RunOutcome::Completed);
         assert!(
-            data.iter()
+            control
+                .iter()
                 .any(|event| matches!(event.payload(), EventPayload::ContextReduced { .. }))
         );
 
@@ -850,10 +853,10 @@ fn cache_eviction_notice_survives_until_the_next_run() {
                 .reply(),
             CommandReply::Accepted
         );
-        let (data, _, finished) =
+        let (_, control, finished) =
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         assert_eq!(finished.outcome(), RunOutcome::Completed);
-        assert!(data.iter().any(|event| matches!(
+        assert!(control.iter().any(|event| matches!(
             event.payload(),
             EventPayload::ContextReduced { removed_items, .. } if *removed_items >= 4
         )));
@@ -899,7 +902,7 @@ fn cache_omission_notice_survives_a_failed_submit_and_reaches_the_next_submit() 
                 bed.runtime.submit(common::submit_cmd(tag)).await.reply(),
                 CommandReply::Accepted
             );
-            let (data, _, finished) =
+            let (_, control, finished) =
                 common::drain_until_finished(&mut bed.data, &mut bed.control).await;
             assert_eq!(finished.outcome(), expected);
             if tag == "notice-failed" || tag == "notice-recovered" {
@@ -914,7 +917,7 @@ fn cache_omission_notice_survives_a_failed_submit_and_reaches_the_next_submit() 
                     1,
                     "both failed and recovered submissions receive exactly one notice"
                 );
-                assert!(data.iter().any(|event| matches!(
+                assert!(control.iter().any(|event| matches!(
                     event.payload(),
                     EventPayload::ContextReduced { removed_items, retained_items, .. }
                         if *removed_items >= 4
@@ -1007,7 +1010,8 @@ fn aggregate_byte_pressure_evicts_oldest_exchanges_and_completes() {
                 .contains("Earlier completed exchanges were omitted")
         );
         assert!(
-            data.iter()
+            control
+                .iter()
                 .any(|event| matches!(event.payload(), EventPayload::ContextReduced { .. }))
         );
         assert_eq!(user_texts(last), vec!["do work".to_owned()]);

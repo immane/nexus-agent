@@ -2,16 +2,190 @@
 """Run one SWE-bench JSON task through an already-configured nexus-server."""
 
 import argparse
+import copy
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from http.client import IncompleteRead
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from context_metrics import derive_metrics, load_events
+
 RUNNER_GRACE_SECONDS = 60
+EVENT_SCHEMA_VERSION = 1
+
+
+def tool_log_text(text, byte_limit, secrets):
+    """Bound optional task content and redact known credentials before truncation."""
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"']+", "Bearer [REDACTED]", text)
+    encoded = text.encode("utf-8")
+    preview = encoded[:byte_limit].decode("utf-8", errors="ignore")
+    return json.dumps({"preview": preview, "redacted_bytes": len(encoded),
+                       "log_truncated": len(encoded) > byte_limit}, ensure_ascii=False)
+
+
+def write_json(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def event_record(event, elapsed_seconds):
+    """Keep event identity/metrics while excluding task, model, and tool text."""
+    kind = event.get("kind", "unknown")
+    detail = copy.deepcopy(event.get("detail") or {})
+    if kind == "assistant-text":
+        text = detail.pop("text", "")
+        detail["text_bytes"] = len(text.encode("utf-8"))
+    elif kind == "tool-finished":
+        outcome = detail.get("outcome") or {}
+        content = outcome.pop("content", "")
+        outcome["output_bytes"] = len(content.encode("utf-8"))
+        detail["outcome"] = outcome
+    elif kind == "tool-output":
+        preview = detail.pop("preview", "")
+        detail["preview_bytes"] = len(preview.encode("utf-8"))
+    elif kind == "tool-started":
+        detail.pop("args_preview", None)
+    elif kind == "approval-required":
+        for field in ("summary", "scope", "args_preview", "session_directory"):
+            detail.pop(field, None)
+    elif kind == "run-finished":
+        error = detail.get("error")
+        if isinstance(error, dict):
+            detail["error"] = {"category": error.get("category")}
+    return {
+        "schema_version": EVENT_SCHEMA_VERSION,
+        "at_utc": datetime.now(timezone.utc).isoformat(),
+        "seq": event.get("seq"),
+        "elapsed_seconds": round(elapsed_seconds, 6),
+        "kind": kind,
+        "detail": detail,
+    }
+
+
+def write_event_line(stream, event, elapsed_seconds):
+    stream.write(json.dumps(event_record(event, elapsed_seconds), separators=(",", ":")) + "\n")
+    stream.flush()
+
+
+def capture_event(stream, event, elapsed_seconds):
+    """Write an event if collection remains healthy; telemetry never stops a run."""
+    if stream is None:
+        return None, None
+    try:
+        write_event_line(stream, event, elapsed_seconds)
+    except OSError:
+        try:
+            stream.close()
+        except OSError:
+            pass
+        return None, "event log write failed"
+    return stream, None
+
+
+def summarize_usage_by_turn(final_usage_by_turn, request_turns, request_count=None):
+    """Latest final counters per provider turn; repeated updates replace, not add."""
+    totals = {"input": 0, "output": 0}
+    complete = (
+        bool(request_turns)
+        and request_turns.issubset(final_usage_by_turn)
+        and set(final_usage_by_turn).issubset(request_turns)
+        and (request_count is None or len(request_turns) == request_count)
+    )
+    for turn in request_turns:
+        counters = final_usage_by_turn.get(turn)
+        if counters is None:
+            complete = False
+            continue
+        for name in totals:
+            value = counters.get(name)
+            if not isinstance(value, int) or value < 0:
+                complete = False
+            else:
+                totals[name] += value
+    return totals, complete
+
+
+def complete_run_usage(final_usage_by_turn, request_turns, request_count, terminal_observed):
+    totals, turns_complete = summarize_usage_by_turn(
+        final_usage_by_turn, request_turns, request_count
+    )
+    complete = (
+        terminal_observed
+        and request_count > 0
+        and len(request_turns) == request_count
+        and turns_complete
+    )
+    return (totals if complete else None), complete
+
+
+def new_run_observation():
+    return {
+        "terminal_observed": False,
+        "outcome": None,
+        "error": None,
+        "last_tool_outcome": None,
+    }
+
+
+def observe_run_event(observation, event):
+    """Keep per-tool results separate from the enclosing run's terminal result."""
+    kind = event.get("kind")
+    detail = event.get("detail") or {}
+    if kind == "tool-finished":
+        observation["last_tool_outcome"] = detail.get("outcome")
+    elif kind == "run-finished":
+        observation["terminal_observed"] = bool(event.get("terminal"))
+        observation["outcome"] = detail.get("outcome")
+        observation["error"] = detail.get("error")
+
+
+def capture_terminal_patch(repo, base_commit, observation):
+    """Never snapshot a workspace unless the run's terminal event was observed."""
+    if not observation["terminal_observed"] or observation["outcome"] is None:
+        return None
+    return collect_patch(repo, base_commit)
+
+
+def stream_end_error(observation, collection_error):
+    if collection_error is not None:
+        return collection_error
+    if not observation["terminal_observed"]:
+        return "event stream ended before terminal event"
+    return None
+
+
+@contextmanager
+def event_stream_response(url, headers, status):
+    """Suppress stream/network interruption so the caller can persist a partial run."""
+    try:
+        stream = urlopen(Request(url, headers=headers), timeout=60)
+    except (OSError, RuntimeError):
+        status["error"] = "event stream connection failed"
+        yield ()
+        return
+    try:
+        try:
+            yield stream
+        except (OSError, RuntimeError, json.JSONDecodeError, IncompleteRead):
+            status["error"] = "event stream interrupted"
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            status["error"] = status["error"] or "event stream close failed"
 
 
 def request(base, token, path, body=None, timeout=30):
@@ -152,17 +326,33 @@ def reached_budget(elapsed, args, tool_calls, usage, usage_complete, final_usage
         return "wall-clock budget reached"
     if args.max_tool_calls is not None and tool_calls >= args.max_tool_calls:
         return "tool-call budget reached"
+    # Token limits are soft: provider Final counters arrive after work and may
+    # be absent or revised, so only observed counters can trigger cancellation.
     if args.max_input_tokens is not None:
-        if final_usage_events and not usage_complete:
-            return "provider usage incomplete; input-token budget cannot be enforced"
         if usage["input"] >= args.max_input_tokens:
             return "input-token budget reached"
     if args.max_output_tokens is not None:
-        if final_usage_events and not usage_complete:
-            return "provider usage incomplete; output-token budget cannot be enforced"
         if usage["output"] >= args.max_output_tokens:
             return "output-token budget reached"
     return None
+
+
+def context_usage_report(input_tokens, context_window_tokens, trigger_percent):
+    """Compare provider-reported input usage to a reference threshold, not runtime's estimate."""
+    window = context_window_tokens
+    if input_tokens is None or window is None:
+        return (
+            f"provider_input_tokens={input_tokens if input_tokens is not None else 'unknown'} "
+            f"context_window_tokens={window if window is not None else 'unknown'} "
+            "context_percent=unknown"
+        )
+    occupancy = 100 * input_tokens / window
+    return (
+        f"provider_input_tokens={input_tokens} context_window_tokens={window} "
+        f"context_percent={occupancy:.1f} "
+        f"provider_input_at_or_above_{trigger_percent}pct={occupancy >= trigger_percent} "
+        "(reference only; compaction uses runtime estimate)"
+    )
 
 
 def summarize_main(argv):
@@ -183,20 +373,50 @@ def main():
     parser.add_argument("--task-json", type=Path, required=True, help="one canonical SWE-bench dataset row")
     parser.add_argument("--workspace", type=Path, required=True, help="disposable checkout at task base_commit")
     parser.add_argument("--server", default="http://127.0.0.1:8471")
+    parser.add_argument("--session-id", help="reuse a prepared session (launcher verifies binding and network before submission)")
     parser.add_argument("--token-env", default="NEXUS_BENCH_SMOKE_TOKEN")
     parser.add_argument("--provider", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--context-window-tokens",
+        type=int,
+        help="known context-window size for per-turn usage diagnostics; omitted stays unknown",
+    )
+    parser.add_argument("--context-trigger-percent", type=int, default=65)
+    parser.add_argument(
+        "--context-window-mode",
+        choices=("reference-only", "runtime-budget-only", "provider-verified"),
+        default="reference-only",
+        help="how to interpret the supplied window; this runner does not configure the provider",
+    )
+    parser.add_argument("--context-window-evidence", help="operator-supplied evidence reference for provider-verified mode")
+    parser.add_argument("--model-digest", help="resolved model digest when known")
+    parser.add_argument("--nexus-revision", help="Nexus commit or dirty-tree fingerprint under test")
+    parser.add_argument("--run-label", default="debug", help="experiment label, e.g. exposed-debug or held-out")
     parser.add_argument("--max-run-seconds", type=int)
     parser.add_argument("--max-tool-calls", type=int)
     parser.add_argument("--max-input-tokens", type=int)
     parser.add_argument("--max-output-tokens", type=int)
+    parser.add_argument("--tool-log-bytes", type=int, default=0,
+                        help="optional redacted tool argument/output preview bytes per event (0 omits content)")
     parser.add_argument(
         "--approve-container-tools",
         action="store_true",
         help="approve each requested built-in container tool once; only for an isolated task workspace",
     )
     args = parser.parse_args()
+    if not 0 <= args.tool_log_bytes <= 65536:
+        parser.error("--tool-log-bytes must be in 0..65536")
+    log_secrets = [value for name, value in os.environ.items()
+                   if re.search(r"TOKEN|SECRET|PASSWORD|API_KEY|AUTH", name, re.IGNORECASE) and len(value) >= 4]
+
+    if args.context_window_tokens is not None and args.context_window_tokens <= 0:
+        parser.error("--context-window-tokens must be positive")
+    if not 1 <= args.context_trigger_percent <= 99:
+        parser.error("--context-trigger-percent must be between 1 and 99")
+    if args.context_window_mode == "provider-verified" and not args.context_window_evidence:
+        parser.error("provider-verified mode requires --context-window-evidence")
 
     for name in ("max_run_seconds", "max_tool_calls", "max_input_tokens", "max_output_tokens"):
         if getattr(args, name) is not None and getattr(args, name) <= 0:
@@ -217,51 +437,133 @@ def main():
 
     issue = build_task_prompt(instance, base_commit, row["problem_statement"])
 
-    session = request(args.server, token, "/sessions", {"provider": args.provider, "model": args.model})["session"]
+    session = args.session_id or request(args.server, token, "/sessions", {"provider": args.provider, "model": args.model})["session"]
+    run_dir = args.output_dir / "runs" / uuid.uuid4().hex
+    run_dir.mkdir(parents=True, exist_ok=False)
+    manifest = {
+        "schema_version": 1,
+        "run_id": run_dir.name,
+        "status": "starting",
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "task": {
+            "instance_id": instance,
+            "repo": row.get("repo"),
+            "base_commit": base_commit,
+            "dataset_version": row.get("version"),
+            "label": args.run_label,
+        },
+        "nexus": {"revision": args.nexus_revision},
+        "model": {
+            "provider": args.provider,
+            "name": args.model,
+            "digest": args.model_digest,
+        },
+        "context_window": {
+            "requested_tokens": args.context_window_tokens,
+            "mode": args.context_window_mode,
+            "evidence": args.context_window_evidence,
+        },
+        "context_policy": {"trigger_percent": args.context_trigger_percent},
+        "runner_limits": {
+            "max_run_seconds": args.max_run_seconds,
+            "max_tool_calls": args.max_tool_calls,
+            "max_input_tokens": args.max_input_tokens,
+            "max_output_tokens": args.max_output_tokens,
+        },
+        "tool_config": {"approve_container_tools": args.approve_container_tools,
+                        "tool_log_bytes": args.tool_log_bytes},
+        "server_run_id": None,
+        "telemetry": {"schema_version": EVENT_SCHEMA_VERSION, "status": "pending"},
+    }
+    write_json(run_dir / "manifest.json", manifest)
+    event_stream = (run_dir / "events.jsonl").open("x", encoding="utf-8")
+    telemetry_error = None
     run = request(args.server, token, f"/sessions/{session}/runs", {"input": issue})["run"]
+    manifest["server_run_id"] = run
+    manifest["status"] = "running"
+    manifest["telemetry"]["status"] = "recording"
+    try:
+        write_json(run_dir / "manifest.json", manifest)
+    except OSError:
+        telemetry_error = "manifest update failed"
+        print(f"\n[telemetry] manifest update failed: {telemetry_error}; continuing run", file=sys.stderr, flush=True)
+    print(
+        f"[run] instance={instance} provider={args.provider} model={args.model} "
+        f"context_window_tokens={args.context_window_tokens or 'unknown'} "
+        f"context_trigger_percent={args.context_trigger_percent} run={run}",
+        file=sys.stderr,
+        flush=True,
+    )
     usage = {"input": 0, "output": 0}
-    usage_complete = True
+    usage_complete = False
     final_usage_events = 0
+    final_usage_by_turn = {}
+    request_turns = set()
+    request_count = 0
+    current_turn = None
     tool_calls = 0
+    tool_started_at = {}
     approved_calls = 0
-    outcome = None
-    error = None
+    run_observation = new_run_observation()
     budget_stop_reason = None
     budget_cancelled_at = None
     model_output_started = False
     started = time.monotonic()
+    last_event_seq = None
+    event_sequence_gaps = 0
+    collection_status = {"error": None}
 
-    with urlopen(
-        Request(
-            f"{args.server}/sessions/{session}/runs/{run}/events",
-            headers={"Authorization": f"Bearer {token}"},
-        ),
-        timeout=60,
+    with event_stream_response(
+        f"{args.server}/sessions/{session}/runs/{run}/events",
+        {"Authorization": f"Bearer {token}"},
+        collection_status,
     ) as stream:
         for raw in stream:
-            if budget_stop_reason is None:
-                budget_stop_reason = reached_budget(
-                    time.monotonic() - started,
-                    args,
-                    tool_calls,
-                    usage,
-                    usage_complete,
-                    final_usage_events,
-                )
-                if budget_stop_reason is not None:
-                    budget_cancelled_at = time.monotonic()
-                    print(f"\n[budget] {budget_stop_reason}; requesting run cancellation", file=sys.stderr, flush=True)
-                    try:
-                        request(args.server, token, f"/sessions/{session}/runs/{run}/cancel", {}, timeout=30)
-                    except RuntimeError as cancel_error:
-                        print(f"[budget] cancellation request returned: {cancel_error}", file=sys.stderr, flush=True)
-            elif budget_cancelled_at is not None and time.monotonic() - budget_cancelled_at > RUNNER_GRACE_SECONDS:
-                raise TimeoutError("run did not reach a terminal state within the cancellation grace period")
+            if (
+                budget_cancelled_at is not None
+                and time.monotonic() - budget_cancelled_at > RUNNER_GRACE_SECONDS
+            ):
+                collection_status["error"] = "cancellation grace period expired before terminal event"
+                break
             if not raw.startswith(b"data: "):
                 continue
             event = json.loads(raw[6:])
+            event_stream, capture_error = capture_event(
+                event_stream, event, time.monotonic() - started
+            )
+            if capture_error:
+                telemetry_error = telemetry_error or capture_error
+                print(f"\n[telemetry] JSONL write failed: {telemetry_error}; continuing run", file=sys.stderr, flush=True)
+            seq = event.get("seq")
+            if isinstance(seq, int):
+                if last_event_seq is None and seq != 0:
+                    event_sequence_gaps += max(1, seq)
+                elif last_event_seq is not None and seq != last_event_seq + 1:
+                    event_sequence_gaps += max(1, seq - last_event_seq - 1)
+                last_event_seq = seq
             detail = event.get("detail") or {}
             kind = event.get("kind")
+            if kind not in ("assistant-text", "tool-output"):
+                # Structured metadata excludes model/tool text and approval scope.
+                print("\n[event] " + json.dumps(event_record(event, time.monotonic() - started)),
+                      file=sys.stderr, flush=True)
+            if args.tool_log_bytes:
+                text = None
+                if kind == "tool-started":
+                    text = detail.get("args_preview")
+                elif kind == "tool-finished":
+                    text = (detail.get("outcome") or {}).get("content")
+                elif kind == "tool-output":
+                    text = detail.get("preview")
+                if isinstance(text, str) and text:
+                    print(f"\n[tool-content] kind={kind} call={detail.get('call')} "
+                          + tool_log_text(text, args.tool_log_bytes, log_secrets), file=sys.stderr, flush=True)
+            observe_run_event(run_observation, event)
+            if kind == "model-request-started":
+                request_count += 1
+                current_turn = detail.get("turn")
+                if current_turn is not None:
+                    request_turns.add(current_turn)
             if kind == "assistant-text":
                 text = detail.get("text", "")
                 if text:
@@ -272,20 +574,84 @@ def main():
                     sys.stdout.flush()
             elif kind == "tool-started":
                 tool_calls += 1
+                tool_started_at[detail.get("call")] = time.monotonic()
+                print(
+                    f"\n[tool] started call={detail.get('call')} tool={detail.get('tool')} "
+                    f"revision={detail.get('revision')}; arguments omitted",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif kind == "tool-finished":
+                tool_outcome = detail.get("outcome") or {}
+                content = tool_outcome.get("content") or ""
+                call = detail.get("call")
+                tool_started = tool_started_at.pop(call, None)
+                tool_duration = (
+                    "unknown"
+                    if tool_started is None
+                    else f"{time.monotonic() - tool_started:.3f}"
+                )
+                print(
+                    f"\n[tool] finished call={call} elapsed_seconds={tool_duration} "
+                    f"status={tool_outcome.get('status')} effect={tool_outcome.get('effect')} "
+                    f"evidence={tool_outcome.get('evidence')} output_bytes={len(content.encode('utf-8'))} "
+                    f"truncated={tool_outcome.get('truncated')}; output omitted",
+                    file=sys.stderr,
+                    flush=True,
+                )
             elif kind == "usage" and detail.get("finality") == "Final":
                 final_usage_events += 1
-                for name in ("input", "output"):
-                    value = detail.get(name)
-                    if value is None:
-                        usage_complete = False
-                    else:
-                        usage[name] += value
+                input_tokens = detail.get("input")
+                output_tokens = detail.get("output")
+                if current_turn is not None:
+                    final_usage_by_turn[current_turn] = {
+                        "input": input_tokens,
+                        "output": output_tokens,
+                    }
+                usage, usage_complete = summarize_usage_by_turn(
+                    final_usage_by_turn, request_turns, request_count
+                )
+                context_report = context_usage_report(
+                    input_tokens,
+                    args.context_window_tokens,
+                    args.context_trigger_percent,
+                )
+                print(
+                    f"\n[model] usage turn={final_usage_events} elapsed_seconds={time.monotonic() - started:.3f} "
+                    f"{context_report} output_tokens={output_tokens if output_tokens is not None else 'unknown'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif kind == "model-request-started":
+                print(
+                    f"\n[model] request turn={detail.get('turn')} purpose={detail.get('purpose')} "
+                    f"estimated_input_tokens={detail.get('estimated_input_tokens')} "
+                    f"window_tokens={detail.get('context_window_tokens')} "
+                    f"max_output_tokens={detail.get('max_output_tokens')} "
+                    f"projected_tool_outputs={detail.get('projected_tool_outputs')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif kind == "model-request-finished":
+                print(
+                    f"\n[model] response turn={detail.get('turn')} "
+                    f"protocol_validated={detail.get('response_validated')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif kind == "context-reduced":
+                print(
+                    f"\n[context] reduced method={detail.get('method')} removed_items={detail.get('removed_items')} "
+                    f"retained_items={detail.get('retained_items')} "
+                    f"retained_bytes={detail.get('retained_bytes')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             elif kind == "approval-required":
                 if args.approve_container_tools:
                     approved_calls += 1
                     print(
-                        f"\n[approval] granting once: scope={detail.get('scope')} "
-                        f"args={detail.get('args_preview')}",
+                        f"\n[approval] granting once: call={detail.get('call')}; content omitted",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -305,34 +671,92 @@ def main():
                     body,
                 )
             elif kind == "run-finished":
-                outcome = detail.get("outcome")
-                error = detail.get("error")
+                print(
+                    f"\n[run] finished outcome={run_observation['outcome']} "
+                    f"error={run_observation['error']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             if event.get("terminal"):
                 break
+            if budget_stop_reason is None:
+                budget_stop_reason = reached_budget(
+                    time.monotonic() - started,
+                    args,
+                    tool_calls,
+                    usage,
+                    usage_complete,
+                    final_usage_events,
+                )
+                if budget_stop_reason is not None:
+                    budget_cancelled_at = time.monotonic()
+                    print(
+                        f"\n[budget] {budget_stop_reason}; requesting run cancellation "
+                        "(provider usage budgets are soft limits based on reported counters)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    try:
+                        request(args.server, token, f"/sessions/{session}/runs/{run}/cancel", {}, timeout=30)
+                    except RuntimeError as cancel_error:
+                        print(f"[budget] cancellation request returned: {cancel_error}", file=sys.stderr, flush=True)
 
-    patch = collect_patch(repo, base_commit)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    prediction = {
-        "instance_id": instance,
-        "model_name_or_path": f"{args.provider}/{args.model}",
-        "model_patch": patch,
-    }
-    (args.output_dir / f"{instance}.prediction.jsonl").write_text(
-        json.dumps(prediction) + "\n"
+    if event_stream is not None:
+        try:
+            event_stream.close()
+        except OSError:
+            telemetry_error = telemetry_error or "event log close failed"
+    event_stream_error = stream_end_error(
+        run_observation, collection_status["error"]
     )
+    cancel_after_stream_loss = None
+    if event_stream_error is not None and not run_observation["terminal_observed"]:
+        try:
+            request(args.server, token, f"/sessions/{session}/runs/{run}/cancel", {}, timeout=30)
+            cancel_after_stream_loss = "requested"
+        except RuntimeError:
+            cancel_after_stream_loss = "request-failed; runtime state remains unknown"
+    patch = capture_terminal_patch(repo, base_commit, run_observation)
+    outcome = run_observation["outcome"]
+    error = run_observation["error"]
+    reported_usage, usage_complete = complete_run_usage(
+        final_usage_by_turn,
+        request_turns,
+        request_count,
+        run_observation["terminal_observed"],
+    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    prediction = None
+    if patch is not None:
+        prediction = {
+            "instance_id": instance,
+            "model_name_or_path": f"{args.provider}/{args.model}",
+            "model_patch": patch,
+        }
+        (args.output_dir / f"{instance}.prediction.jsonl").write_text(
+            json.dumps(prediction) + "\n"
+        )
     result = {
         "instance_id": instance,
         "run": run,
         "outcome": outcome,
+        "terminal_observed": run_observation["terminal_observed"],
         "error": error,
         "tool_calls": tool_calls,
         "approved_calls": approved_calls,
         "final_usage_events": final_usage_events,
-        "usage": usage if usage_complete and final_usage_events else None,
-        "usage_note": "sum of provider-reported Final usage events; null means unavailable/incomplete",
+        "usage": reported_usage,
+        "usage_note": "latest provider-reported Final counters per request turn; null means unavailable/incomplete",
         "duration_seconds": round(time.monotonic() - started, 3),
-        "patch_bytes": len(patch.encode()),
+        "patch_bytes": len(patch.encode()) if patch is not None else None,
+        "patch_captured_after_terminal": run_observation["terminal_observed"] and patch is not None,
         "budget_stop_reason": budget_stop_reason,
+        "telemetry_error": telemetry_error,
+        "event_stream_error": event_stream_error,
+        "cancel_after_stream_loss": cancel_after_stream_loss,
+        "event_sequence_gaps": event_sequence_gaps,
+        "context_window_tokens": args.context_window_tokens,
+        "context_trigger_percent_reference": args.context_trigger_percent,
         "budget": {
             "max_run_seconds": args.max_run_seconds,
             "max_tool_calls": args.max_tool_calls,
@@ -343,8 +767,28 @@ def main():
     (args.output_dir / f"{instance}.result.json").write_text(
         json.dumps(result, indent=2) + "\n"
     )
+    write_json(run_dir / "result.json", result)
+    if prediction is not None:
+        (run_dir / "prediction.jsonl").write_text(json.dumps(prediction) + "\n")
+    manifest["status"] = "terminal" if run_observation["terminal_observed"] else "incomplete"
+    manifest["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+    manifest["duration_seconds"] = result["duration_seconds"]
+    manifest["telemetry"] = {
+        "schema_version": EVENT_SCHEMA_VERSION,
+        "status": "failed" if telemetry_error else "complete" if run_observation["terminal_observed"] and event_stream_error is None else "incomplete",
+        "error": telemetry_error,
+        "event_sequence_gaps": event_sequence_gaps,
+        "last_event_seq": last_event_seq,
+    }
+    write_json(run_dir / "manifest.json", manifest)
+    metrics = derive_metrics(
+        load_events(run_dir / "events.jsonl", allow_incomplete_tail=telemetry_error is not None),
+        manifest,
+        result,
+    )
+    write_json(run_dir / "metrics.json", metrics)
     print(json.dumps(result, indent=2))
-    return 0 if outcome == "completed" and patch else 1
+    return 0 if run_observation["terminal_observed"] and outcome == "completed" and patch else 1
 
 
 if __name__ == "__main__":

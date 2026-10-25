@@ -9,6 +9,7 @@
 pub mod approval;
 pub mod commands;
 pub mod content;
+pub mod context;
 pub mod error;
 pub mod execution;
 pub mod ids;
@@ -21,14 +22,18 @@ pub mod tool;
 pub use approval::{ApprovalBinding, ApprovedScope, NormalizedArgs};
 pub use commands::{
     ApprovalNotice, ApproveCommand, AssistantText, CancelCommand, Command, CommandResponse,
-    DenyCommand, EventPayload, GetSnapshotCommand, ListSessionsCommand, OutcomeSummary,
-    RestoreSessionCommand, RunEvent, RunLifecycle, Snapshot, SubmitCommand, ToolFinishedInfo,
-    ToolProgress, ToolStartedInfo,
+    ContextReductionMethod, DenyCommand, EventPayload, GetSnapshotCommand, ListSessionsCommand,
+    ModelRequestPurpose, OutcomeSummary, RestoreSessionCommand, RunEvent, RunLifecycle, Snapshot,
+    SubmitCommand, ToolFinishedInfo, ToolProgress, ToolStartedInfo,
 };
 pub use content::{
     AssistantTurn, CallCandidate, CompletedTurn, ContentBlock, ContinuationData,
     MAX_CONTINUATION_BYTES, MAX_ITEM_KEY_LEN, MAX_PROVIDER_REF_LEN, TextContent, ToolCall,
     ToolResult, TurnCompleteness,
+};
+pub use context::{
+    ContextCompactionStrategy, ContextManagementPolicy, ContextManagementSettings, ContextWindow,
+    ContextWindowSource,
 };
 pub use error::{AgentError, CorrelationData, ErrorBuildError, ErrorCategory, RetryGuidance};
 pub use execution::{CancellationToken, Deadline};
@@ -45,10 +50,11 @@ pub use provider::{
     MAX_CONVERSATION_BYTES, MAX_CONVERSATION_ITEMS, MAX_INSTRUCTIONS_BYTES,
     MAX_TOOL_DEFINITION_BYTES, MAX_TOOL_DEFINITIONS, ModelContextItem, ModelInstructions,
     ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, ProviderRef,
+    ReasoningEffort,
 };
 pub use store::{
-    STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, ToolIntentRecord,
-    ToolOutcomeRecord,
+    STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, SourceRecord,
+    ToolIntentRecord, ToolOutcomeRecord,
 };
 pub use tool::{ToolAccess, ToolContext, ToolPort, ToolRegistration, ToolSpec};
 

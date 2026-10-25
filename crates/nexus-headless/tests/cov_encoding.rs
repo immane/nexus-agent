@@ -25,7 +25,7 @@ const TEXT_SAMPLES: [&str; 12] = [
     "a=b c",
     "%25 already escaped",
     "%2",
-    "rev=m0-test-0 type=result",
+    "rev=m0-test-1 type=result",
     "\u{1b}[31mred\u{1b}[0m",
     "\u{0}\u{7f}",
     "Ω≈ç√∫˜µ≤≥÷",
@@ -130,7 +130,7 @@ fn unreserved_ascii_is_an_exact_identity() {
     assert_eq!(sanitize(UNRESERVED), UNRESERVED);
     assert_eq!(sanitize("run-1_item.key~0"), "run-1_item.key~0");
     assert_eq!(sanitize("host_read"), "host_read");
-    assert_eq!(sanitize("m0-test-0"), "m0-test-0");
+    assert_eq!(sanitize("m0-test-1"), "m0-test-1");
     assert_eq!(sanitize("~-_."), "~-_.");
 
     let mut expected_escapes = 0usize;

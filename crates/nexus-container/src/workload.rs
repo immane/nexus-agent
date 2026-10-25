@@ -373,7 +373,7 @@ fn is_protected_workspace(workspace: &Path, home: Option<&Path>) -> bool {
 struct Workload<R: Runner> {
     runner: R,
     config: Config,
-    ownership: Option<Arc<crate::container_ownership::OwnedRecord>>,
+    ownership: Option<Arc<crate::ownership::OwnedRecord>>,
     id: Option<String>,
     state: State,
     cleanup_attempted: bool,
@@ -388,7 +388,7 @@ impl<R: Runner> Workload<R> {
     fn new_with_ownership(
         runner: R,
         config: Config,
-        ownership: Option<Arc<crate::container_ownership::OwnedRecord>>,
+        ownership: Option<Arc<crate::ownership::OwnedRecord>>,
     ) -> Self {
         Self {
             runner,
@@ -717,12 +717,9 @@ pub(crate) struct ContainerWorkloadSession {
     resources: Arc<Mutex<LifecycleResources>>,
     slot: Option<LifecycleSlot>,
     quarantined: bool,
-    pub(crate) files: crate::container_file_tools::ContainerFileTools<
-        crate::container_worker_transport::DockerExecTransport,
-    >,
-    pub(crate) exec: crate::container_exec::ContainerExecTool<
-        crate::container_worker_transport::DockerExecTransport,
-    >,
+    pub(crate) files:
+        crate::file_tools::ContainerFileTools<crate::worker_transport::DockerExecTransport>,
+    pub(crate) exec: crate::exec::ContainerExecTool<crate::worker_transport::DockerExecTransport>,
 }
 
 #[derive(Clone, Copy)]
@@ -777,17 +774,17 @@ fn lock_container_session(
 /// Prepares one gateway/workload pair and returns host-registered container
 /// tools. Every port retains the shared owner; dropping the final registration
 /// closes the workload before the gateway, or quarantines uncertain resources.
-pub fn container_tool_registrations(
+pub fn tool_registrations(
     workspace: &Path,
     gateway_image: &str,
     workload_image: &str,
-) -> Result<Vec<ToolRegistration>, crate::container::ContainerError> {
-    crate::container::validate_image_reference(gateway_image)?;
-    crate::container::validate_image_reference(workload_image)?;
+) -> Result<Vec<ToolRegistration>, crate::gateway::ContainerError> {
+    crate::gateway::validate_image_reference(gateway_image)?;
+    crate::gateway::validate_image_reference(workload_image)?;
     let docker = resolve_docker_executable()
-        .ok_or(crate::container::ContainerError::InvalidDockerExecutable)?;
-    let blocked_cidrs = crate::container::discover_host_ipv4_cidrs()?;
-    let gateway = crate::container::ContainerEnvironment::prepare(
+        .ok_or(crate::gateway::ContainerError::InvalidDockerExecutable)?;
+    let blocked_cidrs = crate::gateway::discover_host_ipv4_cidrs()?;
+    let gateway = crate::gateway::ContainerEnvironment::prepare(
         workspace,
         &docker,
         gateway_image,
@@ -797,10 +794,10 @@ pub fn container_tool_registrations(
         .identity()
         .name()
         .strip_prefix("nexus-gw-")
-        .ok_or(crate::container::ContainerError::DockerFailure)?
+        .ok_or(crate::gateway::ContainerError::DockerFailure)?
         .to_owned();
     let session = ContainerWorkloadSession::prepare(gateway, workspace, workload_image, &nonce)
-        .map_err(crate::container::ContainerError::WorkloadPreparation)?;
+        .map_err(crate::gateway::ContainerError::WorkloadPreparation)?;
     let owner = Arc::new(Mutex::new(session));
     let registration = |kind, access| {
         let port: Arc<dyn ToolPort + Send + Sync> = Arc::new(OwnedContainerPort {
@@ -851,7 +848,7 @@ fn resolve_docker_executable() -> Option<PathBuf> {
 
 impl ContainerWorkloadSession {
     pub(crate) fn prepare(
-        gateway: crate::container::ContainerEnvironment,
+        gateway: crate::gateway::ContainerEnvironment,
         workspace: &Path,
         image: &str,
         nonce: &str,
@@ -902,24 +899,21 @@ impl ContainerWorkloadSession {
             }
             return Err("workload identity");
         };
-        let transport = match crate::container_worker_transport::DockerExecTransport::new(
-            docker,
-            id,
-            trusted_config,
-        ) {
-            Ok(transport) => transport,
-            Err(_) => {
-                if workload.close().is_err() {
-                    retain_quarantined(
-                        workload,
-                        gateway,
-                        resolver_file,
-                        slot.take().expect("reserved lifecycle slot"),
-                    );
+        let transport =
+            match crate::worker_transport::DockerExecTransport::new(docker, id, trusted_config) {
+                Ok(transport) => transport,
+                Err(_) => {
+                    if workload.close().is_err() {
+                        retain_quarantined(
+                            workload,
+                            gateway,
+                            resolver_file,
+                            slot.take().expect("reserved lifecycle slot"),
+                        );
+                    }
+                    return Err("worker transport");
                 }
-                return Err("worker transport");
-            }
-        };
+            };
         let workload = Arc::new(Mutex::new(workload));
         let cleanup_workload = Arc::clone(&workload);
         let resources = Arc::new(Mutex::new(LifecycleResources {
@@ -933,8 +927,8 @@ impl ContainerWorkloadSession {
                 quarantine_resources(&cleanup_resources);
             }
         });
-        let files = crate::container_file_tools::container_file_tools_with_handler(
-            crate::container_worker_client::ContainerWorkerClient::new(transport),
+        let files = crate::file_tools::container_file_tools_with_handler(
+            crate::worker_client::ContainerWorkerClient::new(transport),
             Some(poison_handler),
         );
         let exec = files.exec_adapter();
@@ -1005,7 +999,7 @@ fn lock_workload(
 }
 
 struct LifecycleResources {
-    gateway: Option<crate::container::ContainerEnvironment>,
+    gateway: Option<crate::gateway::ContainerEnvironment>,
     resolver_file: ResolverConfigFile,
 }
 
@@ -1045,7 +1039,7 @@ struct QuarantinedEnvironment {
 
 fn retain_quarantined(
     workload: Workload<DockerRunner>,
-    mut gateway: crate::container::ContainerEnvironment,
+    mut gateway: crate::gateway::ContainerEnvironment,
     mut resolver_file: ResolverConfigFile,
     slot: LifecycleSlot,
 ) {
@@ -1154,7 +1148,7 @@ fn valid_nonce(n: &str) -> bool {
     (16..=64).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_hexdigit())
 }
 fn valid_image(image: &str) -> bool {
-    crate::container::validate_image_reference(image).is_ok()
+    crate::gateway::validate_image_reference(image).is_ok()
 }
 
 #[cfg(test)]

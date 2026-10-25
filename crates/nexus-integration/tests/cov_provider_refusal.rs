@@ -436,7 +436,7 @@ fn refusal_after_partial_text_keeps_the_text_without_retaining_the_turn() {
         fragments.sort_by_key(|(seq, _, _)| *seq);
         assert_eq!(
             fragments,
-            vec![(1, "item-0", "I cannot"), (2, "item-1", " help with that"),],
+            vec![(3, "item-0", "I cannot"), (4, "item-1", " help with that"),],
             "refused text is published, coalesced per item, in order"
         );
 

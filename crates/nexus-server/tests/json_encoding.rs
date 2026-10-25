@@ -789,6 +789,7 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
         ),
         (
             EventPayload::ContextReduced {
+                method: nexus_core::ContextReductionMethod::Truncate,
                 removed_items: 3,
                 retained_items: 8,
                 item_limit: 16,
@@ -796,6 +797,31 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
                 byte_limit: 1024,
             },
             "context-reduced",
+            false,
+        ),
+        (
+            EventPayload::ModelRequestStarted {
+                turn: turn(),
+                purpose: nexus_core::ModelRequestPurpose::Summary,
+                estimated_input_tokens: Some(123),
+                raw_estimated_input_tokens: Some(100),
+                estimate_scale_millis: 1250,
+                context_window_tokens: Some(65_536),
+                context_trigger_percent: 65,
+                context_target_percent: 10,
+                compaction_strategy: nexus_core::ContextCompactionStrategy::Summarize,
+                max_output_tokens: Some(2048),
+                projected_tool_outputs: 3,
+            },
+            "model-request-started",
+            false,
+        ),
+        (
+            EventPayload::ModelRequestFinished {
+                turn: turn(),
+                response_validated: false,
+            },
+            "model-request-finished",
             false,
         ),
         (
@@ -867,14 +893,20 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
             assert_eq!(
                 encoded["detail"],
                 json!({
-                    "removed_items": 3,
-                    "retained_items": 8,
-                    "item_limit": 16,
-                    "retained_bytes": 512,
-                    "byte_limit": 1024,
-                    "summarized": false,
-                })
+                        "removed_items": 3,
+                        "retained_items": 8,
+                        "item_limit": 16,
+                "retained_bytes": 512,
+                "byte_limit": 1024,
+                "method": "truncate",
+                "summarized": false,
+                    })
             );
+        }
+        if kind == "model-request-started" {
+            assert_eq!(encoded["detail"]["estimated_input_tokens"], 123);
+            assert_eq!(encoded["detail"]["raw_estimated_input_tokens"], 100);
+            assert_eq!(encoded["detail"]["estimate_scale_millis"], 1250);
         }
         assert_eq!(
             field_count(&encoded),
@@ -890,6 +922,8 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
             "run-started",
             "assistant-text",
             "context-reduced",
+            "model-request-started",
+            "model-request-finished",
             "tool-call-preview",
             "approval-required",
             "tool-started",
@@ -898,7 +932,7 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
             "usage",
             "run-finished",
         ],
-        "all ten payload kinds are covered"
+        "all twelve payload kinds are covered"
     );
 }
 

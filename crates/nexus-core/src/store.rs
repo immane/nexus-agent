@@ -14,6 +14,7 @@ use crate::error::{AgentError, ErrorCategory, RetryGuidance};
 use crate::ids::{CallId, M0_REVISION, RunId, SessionId, ToolId};
 use crate::limits::Limits;
 use crate::outcomes::{EffectState, Evidence, ExecutionStatus};
+use crate::provider::ModelContextItem;
 
 /// Stored-format revision for M0. Exact equality; any mismatch is an
 /// explicit failure with no migration or guessing.
@@ -23,17 +24,16 @@ pub const STORE_FORMAT_REVISION: u32 = M0_REVISION;
 /// retained-context budget).
 pub const MAX_STORED_MESSAGES: usize = Limits::M0_TEST_RETAINED_CONTEXT_ITEMS;
 
-/// Maximum retained session checkpoints per store (M0-TEST choice; not a
-/// product default). A save of a new session beyond this bound fails
-/// explicitly; existing sessions stay writable.
+/// Maximum retained sessions in the TUI's local store. Creating a session at
+/// this limit fails explicitly; users can delete an old saved session.
 pub const MAX_SESSIONS: usize = 64;
 
-/// Maximum retained tool-intent records per store (M0-TEST choice; not a
-/// product default). Recording beyond this bound fails explicitly.
+/// Maximum retained tool-intent records per session file. Recording beyond
+/// this bound fails explicitly; deleting that session frees its capacity.
 pub const MAX_INTENT_RECORDS: usize = 256;
 
-/// Maximum retained tool-outcome records per store (M0-TEST choice; not a
-/// product default). Recording beyond this bound fails explicitly.
+/// Maximum retained tool-outcome records per session file. Recording beyond
+/// this bound fails explicitly; deleting that session frees its capacity.
 pub const MAX_OUTCOME_RECORDS: usize = 256;
 
 /// Maximum stored profile-metadata length in bytes (M0-TEST choice aligned
@@ -183,6 +183,60 @@ pub struct ToolOutcomeRecord {
     pub truncated: bool,
 }
 
+/// One accepted original model-context item in session order. The record is
+/// archival data only; loading it never dispatches a tool or grants access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRecord {
+    session: SessionId,
+    sequence: u64,
+    run: RunId,
+    item: ModelContextItem,
+}
+
+impl SourceRecord {
+    /// Creates a source record with a positive, session-scoped sequence number.
+    pub fn new(
+        session: SessionId,
+        sequence: u64,
+        run: RunId,
+        item: ModelContextItem,
+    ) -> Result<Self, AgentError> {
+        if sequence == 0 {
+            return Err(store_error("source record sequence must be positive"));
+        }
+        Ok(Self {
+            session,
+            sequence,
+            run,
+            item,
+        })
+    }
+
+    /// Returns the owning session.
+    #[must_use]
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// Returns the sequence position within the session.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the owning run.
+    #[must_use]
+    pub fn run(&self) -> &RunId {
+        &self.run
+    }
+
+    /// Returns the accepted original model-context item.
+    #[must_use]
+    pub fn item(&self) -> &ModelContextItem {
+        &self.item
+    }
+}
+
 /// Bounded session-metadata lookup result. Listing never loads full
 /// conversation contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,11 +261,89 @@ pub trait SessionStore {
     /// Saves a versioned checkpoint.
     fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError>;
 
+    /// Creates the initial checkpoint when absent. Returns `true` only when a
+    /// new session was created; existing sessions return `false` and are not
+    /// implicitly restored by this operation. Stores that do not support
+    /// create-if-absent semantics fail without saving a checkpoint.
+    fn initialize_session(&mut self, _checkpoint: &SessionCheckpoint) -> Result<bool, AgentError> {
+        Err(store_error(
+            "session initialization is unsupported by this store",
+        ))
+    }
+
     /// Records side-effecting intent before dispatch.
     fn record_intent(&mut self, intent: &ToolIntentRecord) -> Result<(), AgentError>;
 
+    /// Records an intent under its owning session. Session-partitioned stores
+    /// override this to keep operation limits local to one conversation.
+    fn record_session_intent(
+        &mut self,
+        _session: &SessionId,
+        intent: &ToolIntentRecord,
+    ) -> Result<(), AgentError> {
+        self.record_intent(intent)
+    }
+
     /// Records the actual outcome without rewriting the intent.
     fn record_outcome(&mut self, outcome: &ToolOutcomeRecord) -> Result<(), AgentError>;
+
+    /// Records an outcome under its owning session.
+    fn record_session_outcome(
+        &mut self,
+        _session: &SessionId,
+        outcome: &ToolOutcomeRecord,
+    ) -> Result<(), AgentError> {
+        self.record_outcome(outcome)
+    }
+
+    /// Deletes one explicitly selected conversation and its operation journal.
+    /// Implementations must not remove any other session's records.
+    fn delete_session(&mut self, _session: &SessionId) -> Result<(), AgentError> {
+        Err(store_error("session deletion is unsupported by this store"))
+    }
+
+    /// Explicitly reads and imports legacy session storage, returning the number
+    /// of sessions imported. Stores without legacy import support fail explicitly.
+    fn import_legacy_sessions(&mut self) -> Result<usize, AgentError> {
+        Err(store_error(
+            "legacy session import is unsupported by this store",
+        ))
+    }
+
+    /// Appends one accepted original item. Stores that do not support source
+    /// history fail explicitly rather than pretending the item was archived.
+    fn append_source_record(&mut self, _record: &SourceRecord) -> Result<(), AgentError> {
+        Err(store_error("source history is unsupported by this store"))
+    }
+
+    /// Loads at most `limit` source records after the exclusive sequence cursor.
+    fn load_source_records(
+        &self,
+        _session: &SessionId,
+        _after_sequence: u64,
+        _limit: usize,
+    ) -> Result<Vec<SourceRecord>, AgentError> {
+        Err(store_error("source history is unsupported by this store"))
+    }
+
+    /// Returns the newest source sequence for one selected session.
+    fn last_source_sequence(&self, _session: &SessionId) -> Result<u64, AgentError> {
+        Err(store_error("source history is unsupported by this store"))
+    }
+
+    /// Atomically appends a batch of source items in session order and returns
+    /// the final sequence. Implementations must fail rather than partially
+    /// accept a batch when the operation is interrupted.
+    fn append_source_items(
+        &mut self,
+        _session: &SessionId,
+        _run: &RunId,
+        _items: &[ModelContextItem],
+    ) -> Result<u64, AgentError> {
+        Err(store_error(
+            "atomic source history append is unsupported by this store",
+        ))
+    }
 }
 
 fn store_error(message: &'static str) -> AgentError {
@@ -253,6 +385,50 @@ mod tests {
             }],
             profile,
         )
+    }
+
+    #[test]
+    fn default_initialization_fails_without_saving_checkpoint() {
+        struct SaveTrackingStore {
+            saves: usize,
+        }
+
+        impl SessionStore for SaveTrackingStore {
+            fn list_sessions(&self, _limit: usize) -> Result<Vec<SessionMetadata>, AgentError> {
+                unreachable!("initialization must not list sessions")
+            }
+
+            fn load_session(&self, _id: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+                unreachable!("initialization must not load sessions")
+            }
+
+            fn save_checkpoint(
+                &mut self,
+                _checkpoint: &SessionCheckpoint,
+            ) -> Result<(), AgentError> {
+                self.saves += 1;
+                Ok(())
+            }
+
+            fn record_intent(&mut self, _intent: &ToolIntentRecord) -> Result<(), AgentError> {
+                unreachable!("initialization must not record intents")
+            }
+
+            fn record_outcome(&mut self, _outcome: &ToolOutcomeRecord) -> Result<(), AgentError> {
+                unreachable!("initialization must not record outcomes")
+            }
+        }
+
+        let mut store = SaveTrackingStore { saves: 0 };
+        let checkpoint = checkpoint(STORE_FORMAT_REVISION).unwrap();
+        let error = store.initialize_session(&checkpoint).unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(
+            error.message(),
+            "session initialization is unsupported by this store"
+        );
+        assert_eq!(store.saves, 0);
     }
 
     #[test]

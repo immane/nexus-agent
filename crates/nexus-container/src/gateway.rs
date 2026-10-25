@@ -381,6 +381,7 @@ fn parse_darwin_networks(ifconfig: &str, routes: &str) -> Result<Vec<String>, Co
     Ok(set.into_iter().collect())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn is_darwin_mac_address(value: &str) -> bool {
     let octets: Vec<_> = value.split(':').collect();
     octets.len() == 6
@@ -389,6 +390,7 @@ fn is_darwin_mac_address(value: &str) -> bool {
         })
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn expand_darwin_ipv4(value: &str) -> Result<String, ContainerError> {
     let octets: Vec<_> = value.split('.').collect();
     if octets.is_empty() || octets.len() > 4 {
@@ -415,6 +417,7 @@ fn expand_darwin_ipv4(value: &str) -> Result<String, ContainerError> {
         .join("."))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn parse_darwin_route_destination(value: &str) -> Result<(String, u8), ContainerError> {
     let parts: Vec<_> = value.split('.').collect();
     if parts.is_empty() || parts.len() > 4 {
@@ -480,7 +483,7 @@ pub struct ContainerEnvironment {
     docker: PathBuf,
     docker_config: Option<PathBuf>,
     identity: GatewayIdentity,
-    ownership: Option<std::sync::Arc<crate::container_ownership::OwnedRecord>>,
+    ownership: Option<std::sync::Arc<crate::ownership::OwnedRecord>>,
     container_id: Option<String>,
     healthy: bool,
     deadline: Instant,
@@ -547,19 +550,17 @@ impl ContainerEnvironment {
             .strip_prefix("nexus-gw-")
             .ok_or(ContainerError::DockerFailure)?;
         let store =
-            crate::container_ownership::OwnershipStore::process_default().map_err(|error| {
-                match error {
-                    crate::container_ownership::OwnershipError::StorageUnavailable => {
-                        ContainerError::DockerFailure
-                    }
-                    crate::container_ownership::OwnershipError::UnresolvedOwnership => {
-                        ContainerError::OwnershipUnresolved
-                    }
+            crate::ownership::OwnershipStore::process_default().map_err(|error| match error {
+                crate::ownership::OwnershipError::StorageUnavailable => {
+                    ContainerError::DockerFailure
+                }
+                crate::ownership::OwnershipError::UnresolvedOwnership => {
+                    ContainerError::OwnershipUnresolved
                 }
             })?;
         env.ownership = Some(
             store
-                .create_record(crate::container_ownership::OwnershipRecord {
+                .create_record(crate::ownership::OwnershipRecord {
                     nonce: nonce.to_owned(),
                     gateway_name: owner.clone(),
                     gateway_id: None,
@@ -666,9 +667,7 @@ impl ContainerEnvironment {
         self.docker_config.as_deref()
     }
 
-    pub(crate) fn ownership_record(
-        &self,
-    ) -> Option<std::sync::Arc<crate::container_ownership::OwnedRecord>> {
+    pub(crate) fn ownership_record(&self) -> Option<std::sync::Arc<crate::ownership::OwnedRecord>> {
         self.ownership.as_ref().map(std::sync::Arc::clone)
     }
 
@@ -1147,7 +1146,7 @@ mod tests {
     #[test]
     fn bounded_command_zero_timeout_does_not_spawn() {
         let marker = std::env::temp_dir().join(format!(
-            "nexus-tools-container-marker-{}-{}",
+            "nexus-container-marker-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

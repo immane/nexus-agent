@@ -1,0 +1,9 @@
+[package]
+name = "nexus-session"
+version = "0.2.3-alpha"
+edition = "2024"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-validation = { path = "../nexus-validation" }
+serde_json = "1"

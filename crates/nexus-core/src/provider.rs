@@ -39,6 +39,23 @@ pub const MAX_TOOL_DEFINITIONS: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as u
 /// Sized to admit sixteen maximum-length specs with headroom.
 pub const MAX_TOOL_DEFINITION_BYTES: usize = 2_097_152;
 
+/// Provider-defined reasoning effort hint for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// Prefer shorter reasoning where the selected provider/model supports it.
+    Low,
+}
+
+impl ReasoningEffort {
+    /// Returns the interoperable wire label used by compatible providers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+        }
+    }
+}
+
 /// Named credential reference resolved only for the selected integration
 /// when needed. Never a secret value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +445,9 @@ impl ModelInstructions {
 /// budget, enabled tools, and compatible continuation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
+    context_management: crate::ContextManagementSettings,
+    max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
     run: RunId,
     turn: TurnId,
     profile: String,
@@ -461,6 +481,9 @@ impl ModelRequest {
             return Err(port_error("model request enables too many tools"));
         }
         Ok(Self {
+            context_management: crate::ContextManagementSettings::default(),
+            max_output_tokens: None,
+            reasoning_effort: None,
             run,
             turn,
             profile,
@@ -472,6 +495,50 @@ impl ModelRequest {
             conversation: Vec::new(),
             tool_definitions: Vec::new(),
         })
+    }
+
+    /// Carries the run's context configuration without enabling compaction or
+    /// adding protocol-specific fields to the provider's wire request.
+    #[must_use]
+    pub fn with_context_management(mut self, settings: crate::ContextManagementSettings) -> Self {
+        self.context_management = settings;
+        self
+    }
+
+    /// Returns context policy metadata, not measured occupancy or execution status.
+    #[must_use]
+    pub fn context_management(&self) -> crate::ContextManagementSettings {
+        self.context_management
+    }
+
+    /// Sets an independent generation-token ceiling. The output byte budget
+    /// still bounds accepted response content; neither limit replaces the other.
+    pub fn with_max_output_tokens(mut self, tokens: u32) -> Result<Self, AgentError> {
+        if tokens == 0 {
+            return Err(port_error("model output token budget must be positive"));
+        }
+        self.max_output_tokens = Some(tokens);
+        Ok(self)
+    }
+
+    /// Explicit generation-token ceiling, or the adapter's legacy default.
+    #[must_use]
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
+    /// Sets a provider-defined reasoning-effort hint. Adapters may encode it
+    /// only where the selected endpoint documents support for the hint.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Returns the optional provider-defined reasoning-effort hint.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
     }
 
     /// Returns the owning run.
@@ -826,6 +893,13 @@ pub trait ProviderPort {
     /// Describes known capabilities without network discovery.
     fn capabilities(&self) -> ProviderCapabilities;
 
+    /// Returns local context settings for the next run without network I/O.
+    /// The runtime snapshots them at admission so model switches cannot change
+    /// an active run's policy. Unknown windows remain unknown by default.
+    fn context_management(&self) -> crate::ContextManagementSettings {
+        crate::ContextManagementSettings::default()
+    }
+
     /// Performs one model turn and returns normalized events ending in
     /// exactly one terminal event.
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent>;
@@ -956,6 +1030,16 @@ mod tests {
             1024,
         )
         .expect("valid request builds")
+    }
+
+    #[test]
+    fn token_output_budget_is_positive_and_independent_of_response_bytes() {
+        assert_eq!(request().max_output_tokens(), None);
+        assert!(request().with_max_output_tokens(0).is_err());
+        let bounded = request().with_max_output_tokens(32_768).unwrap();
+        assert_eq!(bounded.output_budget_bytes(), 1024);
+        assert_eq!(bounded.max_output_tokens(), Some(32_768));
+        assert_eq!(bounded.clone().max_output_tokens(), Some(32_768));
     }
 
     #[test]
@@ -1358,6 +1442,27 @@ mod tests {
     }
 
     struct MinimalProvider;
+
+    #[test]
+    fn context_configuration_is_optional_request_metadata() {
+        use crate::{ContextManagementSettings, ContextWindow, ContextWindowSource};
+        assert_eq!(
+            MinimalProvider.context_management(),
+            ContextManagementSettings::default()
+        );
+        assert_eq!(
+            request().context_management(),
+            ContextManagementSettings::default()
+        );
+        let settings = ContextManagementSettings {
+            window: Some(ContextWindow::new(94_208, ContextWindowSource::Configured).unwrap()),
+            ..Default::default()
+        };
+        let request = request().with_context_management(settings);
+        assert_eq!(request.clone().context_management(), settings);
+        assert_eq!(request.rendered_instructions(), None);
+        assert!(request.conversation().is_empty());
+    }
 
     impl ProviderPort for MinimalProvider {
         fn capabilities(&self) -> ProviderCapabilities {

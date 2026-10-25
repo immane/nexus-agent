@@ -125,6 +125,7 @@ pub fn event_json(event: &RunEvent) -> Value {
             json!({ "turn": fragment.turn.as_str(), "item": fragment.item_key, "text": fragment.text }),
         ),
         EventPayload::ContextReduced {
+            method,
             removed_items,
             retained_items,
             item_limit,
@@ -134,12 +135,54 @@ pub fn event_json(event: &RunEvent) -> Value {
             "context-reduced",
             json!({
                 "removed_items": removed_items,
+                "method": method.as_str(),
                 "retained_items": retained_items,
                 "item_limit": item_limit,
                 "retained_bytes": retained_bytes,
                 "byte_limit": byte_limit,
                 "summarized": false,
             }),
+        ),
+        EventPayload::ModelRequestStarted {
+            turn,
+            purpose,
+            estimated_input_tokens,
+            raw_estimated_input_tokens,
+            estimate_scale_millis,
+            context_window_tokens,
+            context_trigger_percent,
+            context_target_percent,
+            compaction_strategy,
+            max_output_tokens,
+            projected_tool_outputs,
+        } => (
+            "model-request-started",
+            json!({
+                "turn": turn.as_str(),
+                "purpose": match purpose {
+                    nexus_core::ModelRequestPurpose::Task => "task",
+                    nexus_core::ModelRequestPurpose::Summary => "summary",
+                },
+                "estimated_input_tokens": estimated_input_tokens,
+                "raw_estimated_input_tokens": raw_estimated_input_tokens,
+                "estimate_scale_millis": estimate_scale_millis,
+                "context_window_tokens": context_window_tokens,
+                "context_trigger_percent": context_trigger_percent,
+                "context_target_percent": context_target_percent,
+                "compaction_strategy": match compaction_strategy {
+                    nexus_core::ContextCompactionStrategy::Summarize => "summarize",
+                    nexus_core::ContextCompactionStrategy::Truncate => "truncate",
+                },
+                "max_output_tokens": max_output_tokens,
+                "projected_tool_outputs": projected_tool_outputs,
+            }),
+        ),
+        EventPayload::ModelRequestFinished {
+            turn,
+            response_validated,
+        } => (
+            "model-request-finished",
+            json!({ "turn": turn.as_str(), "response_validated": response_validated }),
         ),
         EventPayload::ToolCallPreview { item_key } => {
             ("tool-call-preview", json!({ "item": item_key }))

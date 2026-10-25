@@ -20,8 +20,7 @@
 //!   next valid submit;
 //! - a provider-reported cancellation ends the run as `Cancelled`, an
 //!   incompatible continuation state fails the run instead of being applied,
-//!   and an `OutputLimit` turn is a `LimitReached` limit outcome, never a
-//!   success;
+//!   and repeated `OutputLimit` turns terminate after one fresh request;
 //! - a control consumer that disconnects mid-run is classified, never
 //!   silently dropped: an approval-required call is cancelled before any
 //!   dispatch, a dispatch already authorized still runs and records its actual
@@ -60,19 +59,25 @@ const POLL: Duration = Duration::from_millis(5);
 /// Scripted provider double: pops one complete event batch per call and
 /// reports a caller-chosen capability set.
 struct ScriptedProvider {
+    context_management: StdMutex<nexus_core::ContextManagementSettings>,
+    requested_context_management: StdMutex<Vec<nexus_core::ContextManagementSettings>>,
     calls: AtomicUsize,
     capabilities: ProviderCapabilities,
     script: StdMutex<VecDeque<Vec<ProviderEvent>>>,
     continuations: StdMutex<Vec<Option<ContinuationData>>>,
+    requests: StdMutex<Vec<ModelRequest>>,
 }
 
 impl ScriptedProvider {
     fn new(capabilities: ProviderCapabilities, script: Vec<Vec<ProviderEvent>>) -> Self {
         Self {
+            context_management: StdMutex::new(nexus_core::ContextManagementSettings::default()),
+            requested_context_management: StdMutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
             capabilities,
             script: StdMutex::new(script.into()),
             continuations: StdMutex::new(Vec::new()),
+            requests: StdMutex::new(Vec::new()),
         }
     }
 
@@ -107,11 +112,20 @@ impl ScriptedProvider {
 }
 
 impl ProviderPort for ScriptedProvider {
+    fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        *self.context_management.lock().unwrap()
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
     }
 
     fn stream(&self, request: &ModelRequest, _context: &ProviderContext) -> Vec<ProviderEvent> {
+        self.requests.lock().unwrap().push(request.clone());
+        self.requested_context_management
+            .lock()
+            .unwrap()
+            .push(request.context_management());
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.continuations
             .lock()
@@ -695,10 +709,60 @@ fn continuation_state_is_applied_only_when_it_matches_the_adapter_and_profile() 
 }
 
 #[test]
-fn an_output_limit_turn_is_a_limit_outcome_and_never_a_success() {
+fn context_settings_are_snapshotted_per_run_without_enabling_compaction() {
+    use nexus_core::{ContextManagementSettings, ContextWindow, ContextWindowSource};
     let mut bed = make_bed(
         config(Limits::m0_test(), Policy::m0_test(), false),
-        vec![terminal_turn(FinishReason::OutputLimit, None)],
+        vec![stop_turn("first"), stop_turn("second")],
+    );
+    let configured = ContextManagementSettings {
+        window: Some(ContextWindow::new(94_208, ContextWindowSource::Configured).unwrap()),
+        ..Default::default()
+    };
+    *bed.provider.context_management.lock().unwrap() = configured;
+    test_rt().block_on(async {
+        assert_eq!(
+            bed.runtime
+                .submit(submit_cmd("context-first"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        // Admission already captured the window; a later model switch cannot
+        // mutate an in-flight run, even before its first provider call.
+        *bed.provider.context_management.lock().unwrap() = ContextManagementSettings::default();
+        let (data, _, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(
+            !data
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ContextReduced { .. }))
+        );
+        assert_eq!(
+            bed.runtime
+                .submit(submit_cmd("context-second"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (_, _, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+    });
+    assert_eq!(
+        *bed.provider.requested_context_management.lock().unwrap(),
+        vec![configured, ContextManagementSettings::default()]
+    );
+}
+
+#[test]
+fn repeated_output_limit_turns_stop_after_one_fresh_request() {
+    let mut bed = make_bed(
+        config(Limits::m0_test(), Policy::m0_test(), false),
+        vec![
+            terminal_turn(FinishReason::OutputLimit, None),
+            terminal_turn(FinishReason::OutputLimit, None),
+            stop_turn("unreachable"),
+        ],
     );
     let rt = test_rt();
     rt.block_on(async {
@@ -718,7 +782,7 @@ fn an_output_limit_turn_is_a_limit_outcome_and_never_a_success() {
         assert_eq!(error.category(), ErrorCategory::ResourceLimit);
         assert_eq!(error.message(), "model output limit reached");
         assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
-        assert_eq!(bed.provider.call_count(), 1, "the run stops at the limit");
+        assert_eq!(bed.provider.call_count(), 2, "only one recovery is allowed");
         assert_eq!(terminal_count(&control), 1);
         assert!(recorded_outcomes(&control).is_empty());
 
@@ -736,6 +800,128 @@ fn an_output_limit_turn_is_a_limit_outcome_and_never_a_success() {
             RunLifecycle::Finalized(RunOutcome::LimitReached)
         );
     });
+}
+
+#[test]
+fn output_limit_recovery_discards_partial_response_and_all_candidates() {
+    let mut truncated = vec![
+        ProviderEvent::TextDelta {
+            item_key: "partial-text".into(),
+            text: "unfinished response that must not be replayed".into(),
+        },
+        ProviderEvent::ReasoningDelta {
+            text: "private unfinished reasoning must not be replayed".into(),
+        },
+        ProviderEvent::ToolCallDelta {
+            item_key: "unfinished-call".into(),
+            assembled_bytes: 37,
+        },
+        ProviderEvent::ToolCallReady(candidate(
+            "candidate",
+            "candidate-ref",
+            "host_write",
+            "{\"partial\":",
+        )),
+        ProviderEvent::ToolCallReady(candidate("complete", "complete-ref", "host_read", "{}")),
+    ];
+    truncated.extend(terminal_turn(FinishReason::OutputLimit, None));
+    let mut bed = make_bed(
+        config(Limits::m0_test(), Policy::m0_test(), true),
+        vec![truncated, stop_turn("fresh actionable answer")],
+    );
+    test_rt().block_on(async {
+        assert_eq!(
+            bed.runtime
+                .submit(submit_cmd("recover-output"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (_, control, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert_eq!(terminal_count(&control), 1);
+        assert!(recorded_outcomes(&control).is_empty());
+        assert!(
+            !control
+                .iter()
+                .any(|event| matches!(event.payload(), EventPayload::ApprovalRequired(_)))
+        );
+    });
+    assert_eq!(bed.provider.call_count(), 2);
+    assert_eq!(bed.read.execution_count(), 0);
+    assert_eq!(bed.write.execution_count(), 0);
+    let requests = bed.provider.requests.lock().unwrap();
+    assert_eq!(
+        requests[1].conversation(),
+        requests[0].conversation(),
+        "none of the truncated response becomes model context"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.continuation().is_none())
+    );
+}
+
+#[test]
+fn output_limit_recovery_requires_an_available_model_turn() {
+    let mut limits = Limits::m0_test();
+    limits.max_model_turns_per_run = 1;
+    let mut bed = make_bed(
+        config(limits, Policy::m0_test(), false),
+        vec![
+            terminal_turn(FinishReason::OutputLimit, None),
+            stop_turn("unreachable"),
+        ],
+    );
+    test_rt().block_on(async {
+        bed.runtime.submit(submit_cmd("output-turn-budget")).await;
+        let (_, _, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+    });
+    assert_eq!(bed.provider.call_count(), 1);
+}
+
+#[test]
+fn output_limit_with_opaque_continuation_is_not_retried() {
+    for compatible in [true, false] {
+        let continuation = ContinuationData::new(
+            if compatible {
+                nexus_core::DEFAULT_ADAPTER_IDENTITY
+            } else {
+                "wrong-adapter"
+            },
+            "test-profile",
+            vec![1, 2, 3],
+        )
+        .unwrap();
+        let mut bed = make_bed(
+            config(Limits::m0_test(), Policy::m0_test(), false),
+            vec![
+                terminal_turn(FinishReason::OutputLimit, Some(continuation)),
+                stop_turn("unreachable"),
+            ],
+        );
+        test_rt().block_on(async {
+            bed.runtime.submit(submit_cmd("output-opaque")).await;
+            let (_, _, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(
+                finished.outcome(),
+                if compatible {
+                    RunOutcome::LimitReached
+                } else {
+                    RunOutcome::Failed
+                }
+            );
+            if !compatible {
+                assert_eq!(
+                    finished.error().unwrap().category(),
+                    ErrorCategory::UnsupportedCapability
+                );
+            }
+        });
+        assert_eq!(bed.provider.call_count(), 1);
+    }
 }
 
 #[test]

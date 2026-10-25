@@ -6,6 +6,7 @@ mod http_parser;
 mod json_encoding;
 mod provider_sessions;
 mod server_config;
+mod session_store;
 mod support;
 mod tools_real;
 mod web_flow;

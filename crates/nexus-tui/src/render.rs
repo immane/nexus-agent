@@ -638,6 +638,11 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
     ));
     lines.push(help_row(":session list", "List local sessions"));
     lines.push(help_row(
+        ":session import",
+        "Explicitly read and import the legacy session file",
+    ));
+    lines.push(help_row(":session delete <id>", "Delete a saved session"));
+    lines.push(help_row(
         ":session switch <target>",
         "Switch by index, label, or ID",
     ));
@@ -2926,7 +2931,7 @@ mod cov_render_private {
             rows.iter().any(|row| row.contains("example-model")),
             "active model is included: {rows:?}"
         );
-        state.scroll_help(18);
+        state.scroll_help(20);
         let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
         assert!(
             rows.iter().any(|row| row.contains("CONVERSATION VIEWPORT")),

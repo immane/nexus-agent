@@ -8,10 +8,27 @@ import unittest
 
 from run_nexus_swe_task import (
     build_task_prompt,
+    context_usage_report,
     reached_budget,
     summarize_result,
     validate_container_git_checkout,
+    tool_log_text,
 )
+
+
+class ToolLogTests(unittest.TestCase):
+    def test_redacts_known_credentials_and_bearer_headers_before_truncation(self):
+        import json
+        value = json.loads(tool_log_text("token=secret-value Authorization: Bearer other-secret", 200, ["secret-value"]))
+        self.assertNotIn("secret-value", value["preview"])
+        self.assertNotIn("other-secret", value["preview"])
+        self.assertIn("[REDACTED]", value["preview"])
+
+    def test_utf8_preview_is_byte_bounded_and_marks_log_truncation(self):
+        import json
+        value = json.loads(tool_log_text("工具 output", 4, []))
+        self.assertLessEqual(len(value["preview"].encode()), 4)
+        self.assertTrue(value["log_truncated"])
 
 
 class SummaryTests(unittest.TestCase):
@@ -81,6 +98,31 @@ class BudgetTests(unittest.TestCase):
             reached_budget(1, args, 150, {"input": 0, "output": 0}, True, 1),
             "tool-call budget reached",
         )
+
+    def test_token_budget_uses_known_reported_counters_as_soft_limit(self):
+        args = Namespace(
+            max_run_seconds=None,
+            max_tool_calls=None,
+            max_input_tokens=100,
+            max_output_tokens=50,
+        )
+        self.assertIsNone(reached_budget(1, args, 0, {"input": 90, "output": 1}, False, 0))
+        self.assertEqual(
+            reached_budget(1, args, 0, {"input": 100, "output": 1}, False, 0),
+            "input-token budget reached",
+        )
+
+
+class ContextUsageLogTests(unittest.TestCase):
+    def test_reports_provider_usage_against_known_window(self):
+        report = context_usage_report(61_236, 94_208, 65)
+        self.assertIn("provider_input_tokens=61236", report)
+        self.assertIn("context_percent=65.0", report)
+        self.assertIn("provider_input_at_or_above_65pct=True", report)
+
+    def test_unknown_usage_or_window_stays_unknown(self):
+        self.assertIn("context_percent=unknown", context_usage_report(None, 94_208, 65))
+        self.assertIn("context_window_tokens=unknown", context_usage_report(100, None, 65))
 
 
 class ContainerGitCheckoutTests(unittest.TestCase):

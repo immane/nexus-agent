@@ -49,13 +49,13 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
-    ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelRequest,
-    ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunId,
-    SessionId, SubmitCommand, ToolRegistration,
+    ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelInstructions,
+    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
+    RunId, SessionId, SubmitCommand, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::transport::{OrderedEventConsumer, is_control_payload};
-use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
+use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig, SessionStoreHandle};
 use nexus_tools::ScopedReader;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -399,6 +399,7 @@ pub struct Server {
     config_path: Option<PathBuf>,
     /// Finite runtime limits applied to sessions created after startup.
     limits: Limits,
+    session_store: Option<SessionStoreHandle>,
     /// Accepted run id to the model id it was submitted with. Entries are
     /// consumed by the completion watcher, a terminal SSE event, a subsequent
     /// run, or safe idle reclamation; admission caps retained entries.
@@ -471,11 +472,19 @@ impl Server {
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             limits: Limits::m0_test(),
+            session_store: None,
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
             auth_token: None,
         }
+    }
+
+    /// Installs one shared store for subsequently created session runtimes.
+    /// Startup-only; existing runtimes are unchanged. Without this opt-in,
+    /// source history and tool operations remain ephemeral.
+    pub fn set_session_store(&mut self, store: SessionStoreHandle) {
+        self.session_store = Some(store);
     }
 
     /// Installs the tool wiring for sessions created after this call.
@@ -593,16 +602,26 @@ impl Server {
                 root,
                 gateway_image,
                 workload_image,
-            } => nexus_tools::container_tool_registrations(root, gateway_image, workload_image)
-                .map_err(|error| {
+            } => nexus_container::tool_registrations(root, gateway_image, workload_image).map_err(
+                |error| {
                     // ContainerError contains fixed host-side diagnostics only,
                     // never Docker output, environment values, or credentials.
                     eprintln!("container environment preparation failed: {error}");
                     SessionError::new(503, "container environment is unavailable")
-                })?,
+                },
+            )?,
         };
-        let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)
-            .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
+        let (runtime, streams): (Runtime, EventStreams) = match &self.session_store {
+            Some(store) => Runtime::try_new_with_session_store_handle(
+                config,
+                provider,
+                tools,
+                ModelInstructions::default(),
+                store.clone(),
+            ),
+            None => Runtime::try_new(config, provider, tools),
+        }
+        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
         let entry = Arc::new(Session {
             session,
             provider: bound_provider,
@@ -638,7 +657,7 @@ impl Server {
         let profile = {
             let config = self.config.lock().expect("config lockable");
             let profile = config.provider(id).ok_or_else(unknown_provider)?.clone();
-            match model {
+            let (profile, vendor) = match model {
                 None => (profile, None),
                 Some(name) => {
                     let entry = config
@@ -652,13 +671,25 @@ impl Server {
                     }
                     (profile, Some(entry.name.clone()))
                 }
-            }
+            };
+            let context_management = config.context_management_for(id, model).map_err(|_| {
+                SessionError::new(400, "selected model context configuration is invalid")
+            })?;
+            (profile, vendor, context_management)
         };
-        let (profile, vendor) = profile;
+        let (profile, vendor, context_management) = profile;
         let vendor = vendor.unwrap_or(profile.default_model.clone());
         resolve_credential(&profile.credential)
             .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
+            .map(|adapter| {
+                let adapter = adapter.with_context_management(context_management);
+                if adapter.is_ollama_endpoint() {
+                    adapter.discover_context_management()
+                } else {
+                    adapter
+                }
+            })
             .map_err(|_| SessionError::new(400, "selected provider is invalid"))
     }
 
@@ -1615,12 +1646,35 @@ fn selection_mismatch() -> Response {
 /// Builds a runtime reply body with its HTTP status.
 fn command_reply(reply: nexus_core::CommandResponse) -> Response {
     let status = crate::json::reply_status(reply.reply());
-    let body = match reply.run() {
+    let mut body = match reply.run() {
         Some(run) => {
             serde_json::json!({ "reply": crate::json::reply_name(reply.reply()), "run": run.as_str() })
         }
         None => serde_json::json!({ "reply": crate::json::reply_name(reply.reply()) }),
     };
+    if let Some(object) = body.as_object_mut() {
+        if reply.has_sessions() {
+            object.insert(
+                "sessions".to_owned(),
+                serde_json::json!(
+                    reply
+                        .sessions()
+                        .iter()
+                        .map(|entry| serde_json::json!({
+                            "session": entry.session.as_str(),
+                            "logical_revision": entry.logical_revision,
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        if let Some(session) = reply.restored_session() {
+            object.insert(
+                "restored_session".to_owned(),
+                serde_json::json!(session.as_str()),
+            );
+        }
+    }
     json_response(status, &body_json(body))
 }
 
@@ -1638,6 +1692,128 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    #[test]
+    fn shared_session_store_retains_original_sources_from_every_server_runtime() {
+        use nexus_core::{
+            EventPayload, ModelContextItem, PersistenceState, RunOutcome, SessionStore,
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-server-original-sources-{}",
+            std::process::id()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut server = Server::new(executor.handle().clone());
+        server.set_session_store(SessionStoreHandle::new(Box::new(store)));
+        let mut expected = Vec::new();
+        for input in [
+            "first original input\n  keep whitespace",
+            "second original input",
+        ] {
+            let token = server.create_session().unwrap();
+            let session = server.sessions.lock().unwrap()[&token].clone();
+            let runtime = session.runtime.lock().unwrap();
+            let mut control = session.control.lock().unwrap();
+            executor.block_on(async {
+                let response = runtime
+                    .submit(
+                        SubmitCommand::new(
+                            RequestId::new("request-original-sources").unwrap(),
+                            session.session.clone(),
+                            input,
+                            WEB_PROFILE,
+                        )
+                        .unwrap(),
+                    )
+                    .await;
+                assert_eq!(response.reply(), CommandReply::Accepted);
+                let run = response.run().unwrap().clone();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let event = control.recv().await.unwrap();
+                        match event.payload() {
+                            EventPayload::ApprovalRequired(notice) => {
+                                let response = runtime
+                                    .approve(ApproveCommand {
+                                        request: RequestId::new("request-approve-original")
+                                            .unwrap(),
+                                        approval: notice.approval.clone(),
+                                        run: run.clone(),
+                                        call: notice.call.clone(),
+                                    })
+                                    .await;
+                                assert_eq!(response.reply(), CommandReply::Accepted);
+                            }
+                            EventPayload::RunFinished(finished) => {
+                                assert_eq!(finished.outcome(), RunOutcome::Completed);
+                                assert_eq!(finished.persistence(), PersistenceState::Saved);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("demo run finishes");
+            });
+            expected.push((session.session.clone(), input));
+        }
+        drop(server);
+        // Workers release their shared store owner before the executor stops.
+        drop(executor);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        for (session, input) in expected {
+            let records = reopened.load_source_records(&session, 0, 100).unwrap();
+            assert_eq!(
+                records[0].item(),
+                &ModelContextItem::user_text(input).unwrap()
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| matches!(record.item(), ModelContextItem::ToolResult { .. }))
+            );
+            assert!(records.iter().any(|record| matches!(
+                record.item(), ModelContextItem::AssistantText { text, .. } if text.as_str() == "done"
+            )));
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn command_reply_serializes_metadata_and_restored_identity_without_history() {
+        let session = SessionId::new("session-listed").unwrap();
+        let listed = nexus_core::CommandResponse::new(
+            nexus_core::RequestId::new("request-list").unwrap(),
+            nexus_core::CommandReply::Accepted,
+            None,
+        )
+        .with_sessions(vec![nexus_core::SessionMetadata {
+            session: session.clone(),
+            logical_revision: 7,
+        }]);
+        let body: Value = serde_json::from_slice(&command_reply(listed).body).unwrap();
+        assert_eq!(body["sessions"][0]["session"], "session-listed");
+        assert_eq!(body["sessions"][0]["logical_revision"], 7);
+        assert!(body.get("history").is_none());
+
+        let restored = nexus_core::CommandResponse::new(
+            nexus_core::RequestId::new("request-restore").unwrap(),
+            nexus_core::CommandReply::Accepted,
+            None,
+        )
+        .with_restored_session(session);
+        let body: Value = serde_json::from_slice(&command_reply(restored).body).unwrap();
+        assert_eq!(body["restored_session"], "session-listed");
+        assert!(body.get("history").is_none());
+    }
 
     fn delivery_event(seq: u64, terminal: bool, text: &str) -> nexus_core::RunEvent {
         let payload = if terminal {
@@ -2092,6 +2268,56 @@ mod tests {
         match resolve_selection(Some("gated"), Some("gated-fast"), &submit_body(None, None)) {
             Ok(model) => assert_eq!(model.as_deref(), Some("gated-fast")),
             Err(response) => panic!("omitted fields use the binding: {}", response.status),
+        }
+    }
+
+    /// Context configuration is local metadata for every supported protocol.
+    #[test]
+    fn selected_context_settings_reach_all_protocol_adapters_without_network_io() {
+        use nexus_core::{ContextWindowSource, ProviderPort};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        for protocol in ["chat_completions", "openai_responses", "anthropic_messages"] {
+            let config = UserConfig::from_json(
+                &serde_json::json!({
+                    "revision": 2,
+                    "context_management": {"trigger_percent": 70},
+                    "providers": [{
+                        "id": "configured", "display_name": "Configured", "adapter": "direct",
+                        "protocol": protocol, "endpoint": "http://127.0.0.1:1/v1",
+                        "credential": {"env": "PATH"}, "default_model": "default",
+                        "context_window_tokens": 94_208
+                    }],
+                    "models": [{
+                        "id": "other", "provider": "configured", "name": "other",
+                        "context_window_tokens": 32_768,
+                        "context_management": {"trigger_percent": 60, "target_percent": 5}
+                    }], "favourites": [], "recent": []
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut server = Server::new(runtime.handle().clone());
+            server.set_config(config, None);
+            let defaults = server
+                .select_provider("configured", None)
+                .unwrap_or_else(|_| panic!("configured default adapter must resolve"))
+                .context_management();
+            assert_eq!(defaults.policy.trigger_percent(), 70);
+            assert_eq!(defaults.window.unwrap().tokens(), 94_208);
+            let selected = server
+                .select_provider("configured", Some("other"))
+                .unwrap_or_else(|_| panic!("configured selected adapter must resolve"))
+                .context_management();
+            assert_eq!(selected.policy.trigger_percent(), 60);
+            assert_eq!(selected.policy.target_percent(), 5);
+            assert_eq!(selected.window.unwrap().tokens(), 32_768);
+            assert_eq!(
+                selected.window.unwrap().source(),
+                ContextWindowSource::Configured
+            );
         }
     }
 

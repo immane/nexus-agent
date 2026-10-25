@@ -29,6 +29,8 @@ const MAX_SSE_RECORD_BYTES: usize = MAX_RESPONSE_BYTES;
 pub const MAX_MODEL_LEN: usize = 128;
 /// Socket connect timeout. Reads use the remaining run deadline.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONTEXT_METADATA_BYTES: usize = 256 * 1024;
 /// Maximum response head (status line plus headers) in bytes. Anything
 /// larger fails instead of accumulating unboundedly while the head is still
 /// incomplete.
@@ -126,6 +128,7 @@ fn status_error(status: u16) -> ProviderEvent {
 /// `openssl s_client` TLS bridge. The profile selects Chat Completions,
 /// Responses, or Anthropic Messages; see [`OpenAiProvider::from_profile`].
 pub struct OpenAiProvider {
+    context_management: nexus_core::ContextManagementSettings,
     host: String,
     port: u16,
     base_path: String,
@@ -263,6 +266,7 @@ impl OpenAiProvider {
             ));
         }
         Ok(Self {
+            context_management: nexus_core::ContextManagementSettings::default(),
             host,
             port,
             base_path: base_path.trim_end_matches('/').to_owned(),
@@ -290,6 +294,69 @@ impl OpenAiProvider {
             model,
             profile.protocol,
         )
+    }
+
+    /// Binds validated host settings. This does not perform discovery or enable
+    /// token counting or automatic compaction for any protocol.
+    #[must_use]
+    pub fn with_context_management(
+        mut self,
+        settings: nexus_core::ContextManagementSettings,
+    ) -> Self {
+        self.context_management = settings;
+        self
+    }
+
+    /// Best-effort Ollama model metadata discovery. Explicit configuration
+    /// wins; unsupported endpoints, malformed metadata, and transient failures
+    /// leave the window unknown. This is a bounded, read-only `/api/show`
+    /// request to the already-configured origin, not model-name inference.
+    #[must_use]
+    pub fn discover_context_management(mut self) -> Self {
+        if self.context_management.window.is_some()
+            || self.protocol != ProtocolKind::ChatCompletions
+        {
+            return self;
+        }
+        if let Some(tokens) = self.discover_ollama_context_window()
+            && let Ok(window) = nexus_core::ContextWindow::new(
+                tokens,
+                nexus_core::ContextWindowSource::ModelMetadata,
+            )
+        {
+            self.context_management.window = Some(window);
+        }
+        self
+    }
+
+    /// Conservative frontend hint for when to invoke automatic Ollama
+    /// discovery without probing unrelated Chat Completions APIs.
+    #[must_use]
+    pub fn is_ollama_endpoint(&self) -> bool {
+        self.protocol == ProtocolKind::ChatCompletions
+            && (self.port == 11_434 || self.host.to_ascii_lowercase().contains("ollama"))
+    }
+
+    fn discover_ollama_context_window(&self) -> Option<u32> {
+        let token = nexus_config::resolve_credential(&self.credential).ok()?;
+        if token.bytes().any(|byte| byte.is_ascii_control()) {
+            return None;
+        }
+        let api_prefix = self
+            .base_path
+            .strip_suffix("/v1")
+            .unwrap_or(&self.base_path);
+        let path = format!("{api_prefix}/api/show");
+        let body = serde_json::to_vec(&json!({ "model": self.model })).ok()?;
+        let address = join_host_port(&self.host, self.port);
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nhost: {address}\r\ncontent-type: application/json\r\naccept: application/json\r\nauthorization: Bearer {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut request = head.into_bytes();
+        request.extend_from_slice(&body);
+        let response = read_context_metadata_response(self, &request)?;
+        parse_ollama_context_window(&response)
     }
 
     /// Returns the vendor model string sent on the wire.
@@ -348,8 +415,13 @@ impl OpenAiProvider {
             "messages": messages,
             "stream": true,
             "stream_options": {"include_usage": true},
-            "max_tokens": request.output_budget_bytes().div_ceil(4).max(1),
+            "max_tokens": output_token_limit(request),
         });
+        if self.is_ollama_endpoint()
+            && let Some(effort) = request.reasoning_effort()
+        {
+            body["reasoning_effort"] = Value::String(effort.as_str().to_owned());
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = Value::String("auto".to_owned());
@@ -548,6 +620,13 @@ fn protocol_path(protocol: ProtocolKind, base_path: &str) -> &'static str {
     }
 }
 
+fn output_token_limit(request: &ModelRequest) -> usize {
+    request.max_output_tokens().map_or_else(
+        || request.output_budget_bytes().div_ceil(4).max(1),
+        |tokens| tokens as usize,
+    )
+}
+
 fn protocol_request_body(
     protocol: ProtocolKind,
     model: &str,
@@ -566,7 +645,7 @@ fn protocol_request_body(
             Ok((spec, schema))
         })
         .collect::<Result<Vec<_>, ProviderEvent>>()?;
-    let max_tokens = request.output_budget_bytes().div_ceil(4).max(1);
+    let max_tokens = output_token_limit(request);
     match protocol {
         ProtocolKind::ChatCompletions => unreachable!("handled by the chat request encoder"),
         ProtocolKind::OpenAiResponses => {
@@ -742,6 +821,107 @@ fn connect_plain(host: &str, port: u16) -> Result<TcpStream, ProviderEvent> {
             addresses.find_map(|address| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).ok())
         })
         .ok_or_else(|| retryable_provider_error(ErrorCategory::Protocol, "provider is unreachable"))
+}
+
+/// Sends one tightly bounded metadata request using the provider's configured
+/// origin. Discovery is deliberately not retried and never changes run state.
+fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> Option<Vec<u8>> {
+    // The request is already assembled and bounded. Split at the HTTP header
+    // terminator so the verified TLS helper can write the exact wire bytes.
+    let boundary = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")? + 4;
+    let (request_head, request_body) = request.split_at(boundary);
+    let deadline = Instant::now().checked_add(CONTEXT_DISCOVERY_TIMEOUT)?;
+    let context = ProviderContext::new(Duration::ZERO, false, None);
+    let mut response = Vec::new();
+    if provider.use_tls {
+        let mut source =
+            spawn_tls(&provider.host, provider.port, request_head, request_body).ok()?;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match source
+                .next_chunk(
+                    remaining.min(Duration::from_millis(100)),
+                    Some(deadline),
+                    &context,
+                )
+                .ok()?
+            {
+                Some(chunk) => {
+                    response.extend_from_slice(&chunk);
+                    if response.len() > MAX_CONTEXT_METADATA_BYTES {
+                        return None;
+                    }
+                }
+                None => break,
+            }
+        }
+    } else {
+        let address = join_host_port(&provider.host, provider.port);
+        let mut stream = address.to_socket_addrs().ok()?.find_map(|address| {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            (!timeout.is_zero())
+                .then(|| TcpStream::connect_timeout(&address, timeout))
+                .and_then(Result::ok)
+        })?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .ok()?;
+        stream.write_all(request).ok()?;
+        let mut buffer = [0u8; 8192];
+        while Instant::now() < deadline {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    response.extend_from_slice(&buffer[..read]);
+                    if response.len() > MAX_CONTEXT_METADATA_BYTES {
+                        return None;
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        || error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return None,
+            }
+        }
+    }
+    let boundary = response.windows(4).position(|bytes| bytes == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&response[..boundary]).ok()?;
+    if !head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .starts_with('2')
+    {
+        return None;
+    }
+    let body = decode_body(head, &response[boundary + 4..]);
+    (body.len() <= MAX_CONTEXT_METADATA_BYTES).then_some(body)
+}
+
+/// Reads the positive context limit exposed by Ollama's model-details API.
+/// A configured `num_ctx` parameter takes precedence over architecture max.
+fn parse_ollama_context_window(response: &[u8]) -> Option<u32> {
+    let value: Value = serde_json::from_slice(response).ok()?;
+    if let Some(parameters) = value.get("parameters").and_then(Value::as_str) {
+        for line in parameters.lines() {
+            let mut fields = line.split_whitespace();
+            if fields.next() == Some("num_ctx")
+                && let Some(tokens) = fields.next().and_then(|value| value.parse::<u32>().ok())
+                && tokens > 0
+            {
+                return Some(tokens);
+            }
+        }
+    }
+    value
+        .get("model_info")?
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.as_str() == "context_length" || key.ends_with(".context_length"))
+        .and_then(|(_, value)| value.as_u64())
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
 }
 
 /// Spawns the verified-TLS helper, writes one request into its encrypted
@@ -2694,6 +2874,10 @@ fn events_for_json(body: &[u8]) -> Vec<ProviderEvent> {
 }
 
 impl ProviderPort for OpenAiProvider {
+    fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        self.context_management
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             text: true,
@@ -2750,6 +2934,58 @@ impl ProviderPort for OpenAiProvider {
             )];
         }
         self.stream_with_sink_impl(&body, context, sink)
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::OpenAiProvider;
+    use nexus_config::CredentialRef;
+    use nexus_core::{ModelContextItem, ModelRequest, ReasoningEffort, RunId, TurnId};
+
+    fn request(with_effort: bool) -> ModelRequest {
+        let request = ModelRequest::new(
+            RunId::new("reasoning-effort-run").unwrap(),
+            TurnId::new("reasoning-effort-turn").unwrap(),
+            "summary",
+            Vec::new(),
+            None,
+            8192,
+        )
+        .unwrap()
+        .with_conversation(vec![
+            ModelContextItem::user_text("Summarize history").unwrap(),
+        ])
+        .unwrap();
+        if with_effort {
+            request.with_reasoning_effort(ReasoningEffort::Low)
+        } else {
+            request
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_only_to_ollama_chat_completions() {
+        let credential = CredentialRef::env_var("TEST_TOKEN").unwrap();
+        let ollama = OpenAiProvider::new(
+            "http://ollama:11434/v1",
+            credential.clone(),
+            "qwen3.8-27b-iq3m-92k:latest",
+        )
+        .unwrap();
+        let body = ollama.request_body(&request(true)).unwrap();
+        assert_eq!(body["reasoning_effort"], "low");
+
+        let ordinary = OpenAiProvider::new(
+            "http://127.0.0.1:43210/v1",
+            credential,
+            "generic-compatible-model",
+        )
+        .unwrap();
+        let body = ordinary.request_body(&request(true)).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+        let body = ollama.request_body(&request(false)).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
     }
 }
 

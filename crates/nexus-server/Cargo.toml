@@ -1,6 +1,6 @@
 [package]
 name = "nexus-server"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 edition = "2024"
 autotests = false
 
@@ -8,8 +8,9 @@ autotests = false
 default = []
 container = [
     "nexus-runtime/container",
-    "nexus-tools/container-worker",
-    "nexus-tools/container-keeper",
+    "dep:nexus-container",
+    "nexus-container/container-worker",
+    "nexus-container/container-keeper",
 ]
 
 [[test]]
@@ -23,6 +24,8 @@ path = "tests/behavior.rs"
 nexus-core = { path = "../nexus-core" }
 # Single-active-run execution loop shared with the TUI and headless paths.
 nexus-runtime = { path = "../nexus-runtime" }
+# Optional private source-history and operation persistence, selected at startup.
+nexus-session = { path = "../nexus-session" }
 # User configuration: path resolution, strict load, atomic save, redacted
 # summary, and credential references (never values) for submit gating.
 nexus-config = { path = "../nexus-config" }
@@ -35,6 +38,7 @@ nexus-openai = { path = "../nexus-openai" }
 # Real root-jailed file reader for opt-in `--tools real` sessions.
 # Mutations stay scripted; reads that escape the jail are denied.
 nexus-tools = { path = "../nexus-tools" }
+nexus-container = { path = "../nexus-container", optional = true }
 # JSON for the HTTP API only: request parsing and event/snapshot encoding.
 # No HTTP framework is used; the transport is hand-rolled std I/O.
 serde_json = "1"

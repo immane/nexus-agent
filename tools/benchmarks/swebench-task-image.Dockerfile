@@ -13,10 +13,12 @@ ENV RUSTUP_TOOLCHAIN=1.99.0-x86_64-unknown-linux-musl
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked \
-    -p nexus-tools --features container-worker,container-keeper \
+    -p nexus-container --features container-worker,container-keeper \
     --bin container-worker --bin container-keeper
 
 FROM ${TASK_IMAGE}
+RUN rm -rf /testbed
+WORKDIR /workspace
 COPY --from=build /src/target/release/container-worker /usr/local/bin/container-worker
 COPY --from=build /src/target/release/container-keeper /usr/local/bin/nexus-keeper
 ENV PATH="/opt/miniconda3/envs/testbed/bin:${PATH}" \

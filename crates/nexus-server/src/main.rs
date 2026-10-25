@@ -31,10 +31,13 @@ const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--session-store DIRECTORY] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
+    eprintln!(
+        "  --session-store opts into private original-source and tool-operation records in a dedicated directory; no session restore API."
+    );
     eprintln!(
         "  --benchmark-pilot opts into finite 500-turn/24-hour limits; intended only for isolated benchmark runs."
     );
@@ -72,6 +75,7 @@ enum CliAction {
         workload_image: Option<String>,
         auth_token_env: Option<String>,
         benchmark_pilot: bool,
+        session_store: Option<String>,
     },
     /// Print usage and exit 2.
     Usage,
@@ -95,11 +99,23 @@ fn parse_args(argv: &[String]) -> CliAction {
     let mut workload_image = None;
     let mut auth_token_env = None;
     let mut benchmark_pilot = false;
+    let mut session_store = None;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return CliAction::Usage,
             "--strict-tools" => strict_tools = true,
+            "--session-store" => {
+                if session_store.is_some() {
+                    return CliAction::Usage;
+                }
+                session_store = match args.next() {
+                    Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                        Some(value.clone())
+                    }
+                    _ => return CliAction::Usage,
+                };
+            }
             "--benchmark-pilot" => {
                 if benchmark_pilot {
                     return CliAction::Usage;
@@ -188,6 +204,7 @@ fn parse_args(argv: &[String]) -> CliAction {
         workload_image,
         auth_token_env,
         benchmark_pilot,
+        session_store,
     }
 }
 
@@ -232,6 +249,7 @@ fn main() {
         workload_image,
         auth_token_env,
         benchmark_pilot,
+        session_store,
     ) = match parse_args(&argv) {
         CliAction::Run {
             port,
@@ -244,6 +262,7 @@ fn main() {
             workload_image,
             auth_token_env,
             benchmark_pilot,
+            session_store,
         } => (
             port,
             config,
@@ -255,6 +274,7 @@ fn main() {
             workload_image,
             auth_token_env,
             benchmark_pilot,
+            session_store,
         ),
         CliAction::Usage => usage(),
     };
@@ -271,7 +291,7 @@ fn main() {
     if execution == ExecutionMode::Container {
         for image in [gateway_image.as_deref(), workload_image.as_deref()] {
             if let Some(image) = image
-                && nexus_tools::container::validate_image_reference(image).is_err()
+                && nexus_container::validate_image_reference(image).is_err()
             {
                 eprintln!("nexus-server: container images must use immutable sha256 digests");
                 std::process::exit(2);
@@ -300,6 +320,13 @@ fn main() {
         }
         None => None,
     };
+    let session_store = session_store.map(|directory| {
+        let store = nexus_session::FileSessionStore::open(directory).unwrap_or_else(|_| {
+            eprintln!("nexus-server: cannot open session store");
+            std::process::exit(1);
+        });
+        nexus_runtime::SessionStoreHandle::new(Box::new(store))
+    });
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
         eprintln!("nexus-server: cannot bind 127.0.0.1:{port} ({error})");
         std::process::exit(1);
@@ -312,6 +339,9 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
+    if let Some(store) = session_store {
+        server.set_session_store(store);
+    }
     if benchmark_pilot {
         let mut limits = Limits::m0_test();
         limits.max_model_turns_per_run = BENCHMARK_MAX_MODEL_TURNS;
@@ -603,7 +633,7 @@ mod cov_main_args {
         ));
         usage(&["--execution", "container"]);
         #[cfg(feature = "container")]
-        assert!(nexus_tools::container::validate_image_reference("gateway:latest").is_err());
+        assert!(nexus_container::validate_image_reference("gateway:latest").is_err());
         usage(&[
             "--tools",
             "real",
@@ -672,6 +702,26 @@ mod cov_main_args {
         ));
         usage(&["--auth-token-env"]);
         usage(&["--auth-token-env", ""]);
+    }
+
+    #[test]
+    fn session_store_is_explicit_and_preserves_the_directory() {
+        assert!(matches!(
+            parse_args(&argv(&[])),
+            CliAction::Run {
+                session_store: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["--session-store", "run/private session-store", "--port", "9401"])),
+            CliAction::Run { session_store: Some(directory), port: 9401, .. }
+                if directory == "run/private session-store"
+        ));
+        usage(&["--session-store"]);
+        usage(&["--session-store", ""]);
+        usage(&["--session-store", "--port", "9401"]);
+        usage(&["--session-store", "first", "--session-store", "second"]);
     }
 
     /// `--port N` is the only way to move the listener off the default, so a

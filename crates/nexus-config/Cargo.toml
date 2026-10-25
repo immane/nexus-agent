@@ -1,10 +1,10 @@
 [package]
 name = "nexus-config"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 edition = "2024"
 
 [dependencies]
-# Core domain errors only; the config model is its own typed layer.
+# Validated domain context-management types; config owns their JSON format.
 nexus-core = { path = "../nexus-core" }
 # Strict argument-text parsing reused for the config file: duplicate keys
 # never last-win, and byte/depth/node budgets bound the document.

@@ -195,7 +195,7 @@ fn assert_stdout_hygiene(lines: &[String]) {
     assert!(!lines.is_empty(), "stdout records exist");
     for line in lines {
         assert!(
-            line.starts_with("rev=m0-test-0 "),
+            line.starts_with("rev=m0-test-1 "),
             "every stdout record carries the revision: {line}"
         );
         assert!(!line.contains('\x1b'), "no escape codes: {line}");
@@ -209,5 +209,5 @@ fn assert_stdout_hygiene(lines: &[String]) {
             assert!(field.contains('='), "key=value fields only: {line}");
         }
     }
-    assert_eq!(nexus_headless::OUTPUT_REV, "m0-test-0");
+    assert_eq!(nexus_headless::OUTPUT_REV, "m0-test-1");
 }

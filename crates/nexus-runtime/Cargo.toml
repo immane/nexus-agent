@@ -1,6 +1,6 @@
 [package]
 name = "nexus-runtime"
-version = "0.2.2-alpha"
+version = "0.2.3-alpha"
 edition = "2024"
 
 [features]
@@ -12,9 +12,12 @@ nexus-permissions = { path = "../nexus-permissions" }
 # Core domain types plus the synchronous provider/tool ports (P2). All
 # behavior (lifecycle, policy, events) lives in this crate.
 nexus-core = { path = "../nexus-core" }
+# Pure context estimation, selection, and derived-memory projection.
+nexus-context = { path = "../nexus-context" }
 # Closed M0 tool-schema/argument validator (lock section 4). Schemas compile
 # once at registration; admitted arguments validate through it.
 nexus-validation = { path = "../nexus-validation" }
+nexus-session = { path = "../nexus-session" }
 # JSON parsing for the policy boundary only: exact bounded argument previews
 # and object checks. No schema framework is added here.
 serde_json = "1"

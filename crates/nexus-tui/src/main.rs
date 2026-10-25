@@ -1,9 +1,8 @@
-//! `nexus-tui` M0-test demo: scripted fakes behind the real runtime port.
+//! Interactive TUI over the runtime command/event port.
 //!
-//! TEST-ONLY. This binary wires [`nexus_fakes`] scripted doubles through
-//! the same runtime command/event port the product TUI will use. It is never
-//! real configuration: no provider credentials, no plugins, no network, no
-//! stored sessions. A stderr banner says so on every launch.
+//! Interactive sessions use the runtime command/event port and private local
+//! session storage. The explicit `--demo` path wires scripted doubles and
+//! remains ephemeral; a stderr banner says which mode is active.
 //!
 //! Frontend loop invariants (M0-test scope, not product defaults):
 //!
@@ -35,8 +34,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind, poll, read,
@@ -46,13 +46,14 @@ use nexus_config::{
 };
 use nexus_core::{
     AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload,
-    GetSnapshotCommand, Limits, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
-    ProviderPort, RequestId, RetryGuidance, RunEvent, RunId, SessionId, ToolRegistration,
+    GetSnapshotCommand, Limits, ListSessionsCommand, ModelInstructions, ModelRequest,
+    ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
+    RestoreSessionCommand, RetryGuidance, RunEvent, RunId, SessionId, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
 use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsumer};
-use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
+use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig, SessionStoreHandle};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
     Action, AppState, CompletionItem, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate,
@@ -84,6 +85,31 @@ const DEMO_SESSION: &str = "sess-tui-m0-test";
 /// The M0 fixture default is intentionally small, but interactive coding
 /// runs need room for inspect/edit/check/retry cycles.
 const TUI_MODEL_TURNS_PER_RUN: u32 = 64;
+static SESSION_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn new_tui_session_id() -> io::Result<SessionId> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let nonce = SESSION_NONCE.fetch_add(1, Ordering::SeqCst);
+    SessionId::new(format!(
+        "sess-tui-{:x}-{nanos:x}-{nonce:x}",
+        std::process::id()
+    ))
+    .map_err(io::Error::other)
+}
+
+fn application_session_store() -> io::Result<SessionStoreHandle> {
+    let directory = nexus_session::default_data_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private local session storage is unavailable on this platform",
+        )
+    })?;
+    let store = nexus_session::DirectorySessionStore::open(directory).map_err(io::Error::other)?;
+    Ok(SessionStoreHandle::new(Box::new(store)))
+}
 
 fn tui_runtime_limits() -> Limits {
     let mut limits = Limits::m0_test();
@@ -516,8 +542,18 @@ fn resolve_live_adapter(
             "provider credential is unavailable",
         );
     }
+    let Ok(context_management) = selection
+        .config
+        .context_management_for(&entry.provider, Some(model_id))
+    else {
+        return LiveResolve::Failed(
+            ErrorCategory::InvalidInput,
+            "selected model context configuration is invalid",
+        );
+    };
     match OpenAiProvider::from_profile(profile, &entry.name) {
         Ok(adapter) => {
+            let adapter = adapter.with_context_management(context_management);
             let capabilities = adapter.capabilities();
             match admit_adapter(adapter, &capabilities) {
                 Ok(adapter) => LiveResolve::Live(adapter),
@@ -572,14 +608,27 @@ struct SessionRegistry {
     slots: Vec<SessionSlot>,
     active: usize,
     template: SessionConfig,
+    store: Option<SessionStoreHandle>,
+    maintenance: Option<(SessionId, tokio::sync::oneshot::Receiver<String>)>,
 }
 
 impl SessionRegistry {
+    #[cfg(test)]
     fn new(first: SessionSlot, template: SessionConfig) -> Self {
+        Self::new_with_store(first, template, None)
+    }
+
+    fn new_with_store(
+        first: SessionSlot,
+        template: SessionConfig,
+        store: Option<SessionStoreHandle>,
+    ) -> Self {
         Self {
             slots: vec![first],
             active: 0,
             template,
+            store,
+            maintenance: None,
         }
     }
 
@@ -591,6 +640,29 @@ impl SessionRegistry {
     /// Mutably borrows the active slot.
     fn active_mut(&mut self) -> &mut SessionSlot {
         &mut self.slots[self.active]
+    }
+
+    /// Poll disk work without delaying input/rendering. Worker failure does not
+    /// imply rollback; recovery must happen before retrying an uncertain write.
+    fn poll_maintenance(&mut self) -> bool {
+        let Some((_, receiver)) = self.maintenance.as_mut() else {
+            return false;
+        };
+        let message = match receiver.try_recv() {
+            Ok(message) => message,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) =>
+                "session maintenance worker failed; restart the TUI to reconcile storage; do not blindly retry".to_owned(),
+        };
+        let (origin, _) = self.maintenance.take().expect("pending operation");
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.front.session == origin)
+        {
+            slot.front.state.notice(&message);
+        }
+        true
     }
 
     /// Counts live slots.
@@ -619,13 +691,19 @@ impl SessionRegistry {
         let mut session_config = self.template.clone();
         session_config.active_model =
             boot_model(&user_config_snapshot(&session_config.user_config));
-        let (runtime, streams, live) = build_live_runtime(&session_config)?;
-        let session =
-            SessionId::new(format!("{DEMO_SESSION}-{number}")).map_err(io::Error::other)?;
+        let (runtime, streams, live) =
+            build_live_runtime_with_store(&session_config, self.store.clone())?;
+        let session = if self.store.is_some() {
+            new_tui_session_id()?
+        } else {
+            SessionId::new(format!("{DEMO_SESSION}-{number}")).map_err(io::Error::other)?
+        };
         let mut front = Frontend::with_config(session, session_config);
         let label = format!("s{number}");
         front.state.set_session_label(&label);
-        front.state.notice(&format!("session {label} started"));
+        front
+            .state
+            .notice(&format!("new conversation · {label} · type a task below"));
         front.attach_live(
             live,
             self.template.tools_root.as_deref(),
@@ -692,6 +770,7 @@ impl SessionRegistry {
 struct PerRunProvider {
     capabilities: ProviderCapabilities,
     binding: LiveHandle,
+    discovered_context: Mutex<HashMap<String, nexus_core::ContextWindow>>,
     current: Mutex<PerRunState>,
 }
 
@@ -725,6 +804,7 @@ impl PerRunProvider {
         Self {
             capabilities: tui_provider_capabilities(),
             binding,
+            discovered_context: Mutex::new(HashMap::new()),
             current: Mutex::new(PerRunState {
                 run: None,
                 provider: ActiveProvider::Fake(FakeProvider::demo_two_turn()),
@@ -736,6 +816,69 @@ impl PerRunProvider {
 impl ProviderPort for PerRunProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
+    }
+
+    fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        let selection_info = {
+            let binding = self.binding.lock().expect("live selection lockable");
+            let selection = binding.pending_run.as_deref().unwrap_or(&binding);
+            let Some(model_id) = selection.active_model.as_deref() else {
+                return nexus_core::ContextManagementSettings::default();
+            };
+            let Some(entry) = selection.config.model(model_id) else {
+                return nexus_core::ContextManagementSettings::default();
+            };
+            // Invalid selections fail explicitly when resolving the live adapter;
+            // no window or policy is inferred for an unavailable model.
+            let settings = selection
+                .config
+                .context_management_for(&entry.provider, Some(model_id))
+                .unwrap_or_default();
+            let Some(profile) = selection.config.provider(&entry.provider) else {
+                return settings;
+            };
+            (
+                settings,
+                format!("{}:{}:{}", entry.provider, entry.id, entry.name),
+                profile.clone(),
+                entry.name.clone(),
+            )
+        };
+        let (mut settings, cache_key, profile, model_name) = selection_info;
+        if settings.window.is_some() {
+            return settings;
+        }
+        if let Some(window) = self
+            .discovered_context
+            .lock()
+            .expect("discovered context lockable")
+            .get(&cache_key)
+            .copied()
+        {
+            settings.window = Some(window);
+            return settings;
+        }
+        let Ok(adapter) = OpenAiProvider::from_profile(&profile, &model_name) else {
+            return settings;
+        };
+        let adapter = adapter.with_context_management(settings);
+        if let Some(window) = adapter
+            .is_ollama_endpoint()
+            .then(|| {
+                adapter
+                    .discover_context_management()
+                    .context_management()
+                    .window
+            })
+            .flatten()
+        {
+            self.discovered_context
+                .lock()
+                .expect("discovered context lockable")
+                .insert(cache_key, window);
+            settings.window = Some(window);
+        }
+        settings
     }
 
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
@@ -821,8 +964,16 @@ fn take_selection_for_run(binding: &LiveHandle, run: &RunId) -> LiveSelection {
 ///
 /// A root that cannot be canonicalized or is not a directory is an
 /// explicit startup error, never a silent fallback to scripted reads.
+#[cfg(test)]
 fn build_live_runtime(
     session_config: &SessionConfig,
+) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
+    build_live_runtime_with_store(session_config, None)
+}
+
+fn build_live_runtime_with_store(
+    session_config: &SessionConfig,
+    session_store: Option<SessionStoreHandle>,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let policy = match session_config.execution {
         ExecutionMode::Local => match &session_config.tools_root {
@@ -872,7 +1023,7 @@ fn build_live_runtime(
                 let workload_image = session_config.workload_image.as_deref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "workload image is missing")
                 })?;
-                nexus_tools::container_tool_registrations(root, gateway_image, workload_image)
+                nexus_container::tool_registrations(root, gateway_image, workload_image)
                     .map_err(io::Error::other)?
             }
             #[cfg(not(feature = "container"))]
@@ -901,19 +1052,20 @@ fn build_live_runtime(
                 if !session_config.strict_tools {
                     let tools =
                         nexus_tools::development_tools(&canonical).map_err(io::Error::other)?;
-                    return runtime_with_tools(session_config, config, tools);
+                    return runtime_with_tools(session_config, config, tools, session_store);
                 }
                 nexus_tools::strict_tools(&canonical).map_err(io::Error::other)?
             }
         },
     };
-    runtime_with_tools(session_config, config, tools)
+    runtime_with_tools(session_config, config, tools, session_store)
 }
 
 fn runtime_with_tools(
     session_config: &SessionConfig,
     config: RuntimeConfig,
     tools: Vec<ToolRegistration>,
+    session_store: Option<SessionStoreHandle>,
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let binding = Arc::new(Mutex::new(LiveSelection {
         config: user_config_snapshot(&session_config.user_config),
@@ -923,7 +1075,17 @@ fn runtime_with_tools(
         pending_run_id: None,
     }));
     let provider = Arc::new(PerRunProvider::live(Arc::clone(&binding)));
-    let (runtime, streams) = Runtime::try_new(config, provider, tools).map_err(io::Error::other)?;
+    let (runtime, streams) = match session_store {
+        Some(store) => Runtime::try_new_with_session_store_handle(
+            config,
+            provider,
+            tools,
+            ModelInstructions::default(),
+            store,
+        ),
+        None => Runtime::try_new(config, provider, tools),
+    }
+    .map_err(io::Error::other)?;
     Ok((runtime, streams, binding))
 }
 
@@ -960,13 +1122,13 @@ fn wiring_notice(
 fn main() {
     install_panic_hook();
     eprintln!(
-        "nexus-tui dev: live wiring by default, ephemeral store. \
+        "nexus-tui dev: live wiring by default. Interactive sessions use private local history storage (not encrypted); \
           A slot whose model resolves to a configured provider with a credential \
           uses the real adapter (network egress, billable); local --tools-root enables \
            jailed file tools + sandboxed exec (writes/exec require approval). \
            --execution container is experimental and does not establish isolation. \
            Without a configured provider, runs fail as not-configured; \
-           relaunch with --demo for the scripted demo. No durable storage."
+           relaunch with --demo for the scripted ephemeral demo."
     );
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -1183,6 +1345,7 @@ struct Frontend {
     /// the batch, where runtimes can be built. At most one push per Enter
     /// keypress, drained every tick, so the queue stays tiny.
     pending_session_cmds: Vec<SessionArgs>,
+    storage_busy: bool,
     /// Stable tool-card identity; committed on release, never on a drag.
     pointer_press: Option<usize>,
     /// First `g` in a viewport `gg` jump is waiting for its second key.
@@ -1209,6 +1372,7 @@ impl Frontend {
             live: None,
             execution: ExecutionMode::Local,
             pending_session_cmds: Vec::new(),
+            storage_busy: false,
             pointer_press: None,
             g_pending: false,
         }
@@ -1497,6 +1661,18 @@ impl Frontend {
                     "Create and switch to a new session".into(),
                 ),
                 ("session list".into(), "List available sessions".into()),
+                (
+                    "session import".into(),
+                    "Explicitly read and import the legacy session file".into(),
+                ),
+                (
+                    "session delete ".into(),
+                    "Delete an old saved session".into(),
+                ),
+                (
+                    "session restore ".into(),
+                    "Restore a saved session by ID".into(),
+                ),
                 (
                     "session switch ".into(),
                     "Switch to a session by index or ID".into(),
@@ -2320,6 +2496,30 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
             }
             false
         }
+        SessionArgs::Import => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("import requires the persistent interactive session store");
+            false
+        }
+        SessionArgs::Restore(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("restore requires the persistent interactive session store");
+            false
+        }
+        SessionArgs::Delete(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("delete requires the persistent interactive session store");
+            false
+        }
         SessionArgs::Switch(target) => match sessions.resolve_target(target) {
             None => {
                 sessions
@@ -2357,6 +2557,229 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
             false
         }
     }
+}
+
+async fn execute_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) {
+    sessions.poll_maintenance();
+    if sessions.maintenance.is_some()
+        && matches!(
+            args,
+            SessionArgs::Import
+                | SessionArgs::Delete(_)
+                | SessionArgs::List
+                | SessionArgs::Restore(_)
+        )
+    {
+        sessions.active_mut().front.state.notice("session maintenance is still running; no additional storage command was started; quitting does not roll it back");
+        return;
+    }
+    match args {
+        SessionArgs::Import if sessions.store.is_some() => {
+            let store = sessions.store.as_ref().expect("guarded above").clone();
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("explicitly reading the legacy session file to import saved sessions in background; quitting does not roll it back");
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            sessions.maintenance = Some((sessions.active().front.session.clone(), receiver));
+            tokio::task::spawn_blocking(move || {
+                let message = match store.import_legacy_sessions() {
+                    Ok(count) => format!(
+                        "imported {count} legacy sessions; use :session list, then :session restore <id>"
+                    ),
+                    Err(error) => format!(
+                        "legacy session import failed: {error}; it may be partially complete; restart the TUI to reconcile storage before retrying"
+                    ),
+                };
+                let _ = sender.send(message);
+            });
+        }
+        SessionArgs::Delete(id) if sessions.store.is_some() => {
+            let active = sessions
+                .slots
+                .iter()
+                .any(|slot| slot.front.session.as_str() == id);
+            if active {
+                sessions.active_mut().front.state.notice(
+                    "cannot delete a session open in this TUI; restart the TUI before deleting it",
+                );
+                return;
+            }
+            let session = match SessionId::new(id.clone()) {
+                Ok(session) => session,
+                Err(_) => {
+                    sessions
+                        .active_mut()
+                        .front
+                        .state
+                        .notice("invalid session id");
+                    return;
+                }
+            };
+            let store = sessions.store.as_ref().expect("guarded above").clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            sessions.maintenance = Some((sessions.active().front.session.clone(), receiver));
+            sessions.active_mut().front.state.notice(
+                "deleting saved session in background; quitting does not roll back this operation",
+            );
+            let id = id.clone();
+            tokio::task::spawn_blocking(move || {
+                let message = match store.delete_session(&session) {
+                    Ok(()) => format!("deleted saved session {id}"),
+                    Err(error) => format!(
+                        "could not delete saved session {id}: {error}; restart the TUI to reconcile storage before retrying"
+                    ),
+                };
+                let _ = sender.send(message);
+            });
+        }
+        SessionArgs::List if sessions.store.is_some() => {
+            for line in sessions.describe() {
+                sessions.active_mut().front.state.notice(&line);
+            }
+            let request = sessions.active_mut().front.next_request();
+            let reply = sessions
+                .active()
+                .runtime
+                .handle(nexus_core::Command::ListSessions(
+                    ListSessionsCommand::new(request, nexus_core::commands::MAX_LIST_LIMIT)
+                        .expect("finite session list bound is valid"),
+                ))
+                .await
+                .0;
+            if reply.reply() == CommandReply::Accepted && reply.has_sessions() {
+                if reply.sessions().is_empty() {
+                    sessions
+                        .active_mut()
+                        .front
+                        .state
+                        .notice("no saved sessions");
+                } else {
+                    for entry in reply.sessions() {
+                        if sessions
+                            .slots
+                            .iter()
+                            .any(|slot| slot.front.session == entry.session)
+                        {
+                            continue;
+                        }
+                        sessions.active_mut().front.state.notice(&format!(
+                            "saved {} (revision {})",
+                            entry.session.as_str(),
+                            entry.logical_revision
+                        ));
+                    }
+                }
+            } else {
+                sessions
+                    .active_mut()
+                    .front
+                    .state
+                    .notice("saved session listing failed");
+            }
+        }
+        SessionArgs::Restore(id) => restore_persisted_session(sessions, id).await,
+        _ => {
+            handle_session_command(sessions, args);
+        }
+    }
+}
+
+async fn restore_persisted_session(sessions: &mut SessionRegistry, id: &str) {
+    if let Some(index) = sessions.resolve_target(id) {
+        if sessions.switch(index) {
+            let label = sessions.active().label.clone();
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice(&format!("switched to already loaded session {label}"));
+        }
+        return;
+    }
+    if sessions.store.is_none() {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("persistent session storage is unavailable");
+        return;
+    }
+    if sessions.len() >= MAX_SESSIONS {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("session limit reached (16 live sessions)");
+        return;
+    }
+    let session = match SessionId::new(id) {
+        Ok(session) => session,
+        Err(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("saved session id is invalid");
+            return;
+        }
+    };
+    let config = sessions.template.clone();
+    let store = sessions.store.clone();
+    let (runtime, streams, live) = match build_live_runtime_with_store(&config, store) {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("session runtime could not be created");
+            return;
+        }
+    };
+    let request = RequestId::new(format!(
+        "req-restore-{}",
+        SESSION_NONCE.fetch_add(1, Ordering::SeqCst)
+    ));
+    let Ok(request) = request else {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("session restore request could not be created");
+        return;
+    };
+    let reply = runtime
+        .handle(nexus_core::Command::RestoreSession(RestoreSessionCommand {
+            request,
+            session: session.clone(),
+        }))
+        .await
+        .0;
+    if reply.reply() != CommandReply::Accepted {
+        sessions
+            .active_mut()
+            .front
+            .state
+            .notice("saved session could not be restored");
+        return;
+    }
+    let number = sessions.slots.len() + 1;
+    let label = format!("s{number}");
+    let mut front = Frontend::with_config(session, config.clone());
+    front.state.set_session_label(&label);
+    front.attach_live(live, config.tools_root.as_deref(), config.execution);
+    front.state.notice(
+        "saved history is loaded into model context; interrupted calls remain uncertain and are not replayed",
+    );
+    sessions.slots.push(SessionSlot {
+        label,
+        runtime,
+        streams,
+        front,
+    });
+    sessions.active = sessions.slots.len() - 1;
 }
 /// Applies a submit reply to the frontend. Only `Accepted` adopts the run
 /// identity and records the draft; `Busy`/rejections keep the draft and
@@ -2661,6 +3084,10 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
     };
     match action {
         Action::Submit => {
+            if front.storage_busy {
+                front.state.notice("session maintenance is still running; draft preserved; submit after it completes");
+                return false;
+            }
             if front.state.composer().trim().is_empty() {
                 return false;
             }
@@ -2906,18 +3333,35 @@ struct InteractiveReport {
 async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
-    let (runtime, streams, live) = build_live_runtime(&session_config)?;
-    let session =
-        SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?;
+    let session_store = if session_config.demo {
+        None
+    } else {
+        Some(application_session_store()?)
+    };
+    let (runtime, streams, live) =
+        build_live_runtime_with_store(&session_config, session_store.clone())?;
+    let session = if session_config.demo {
+        SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?
+    } else {
+        new_tui_session_id()?
+    };
     let mut front = Frontend::with_config(session, session_config.clone());
     front.state.set_session_label("s1");
+    if !session_config.demo
+        && nexus_session::default_data_dir()
+            .is_some_and(|directory| directory.join("session-store.json").exists())
+    {
+        front.state.notice(
+            "legacy session file detected (not read); :session import explicitly reads it to import saved sessions",
+        );
+    }
     front.attach_live(
         live,
         session_config.tools_root.as_deref(),
         session_config.execution,
     );
     let demo = session_config.demo;
-    let mut sessions = SessionRegistry::new(
+    let mut sessions = SessionRegistry::new_with_store(
         SessionSlot {
             label: "s1".to_owned(),
             runtime,
@@ -2925,6 +3369,7 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
             front,
         },
         session_config,
+        session_store,
     );
     let mut gate = RefreshGate::m0_test();
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
@@ -2958,7 +3403,8 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     // Quit, terminal, and error exits all pass through here: every slot
     // with no terminal outcome cancels and reconciles within a bounded
     // window before the terminal is restored.
-    let mut unresolved_blocking = false;
+    sessions.poll_maintenance();
+    let mut unresolved_blocking = sessions.maintenance.is_some();
     for slot in &mut sessions.slots {
         if !slot.front.merger.is_finalized() {
             unresolved_blocking |=
@@ -3020,8 +3466,11 @@ async fn interactive_loop(
                 dirty = true;
             }
             LoopStep::Tick => {
+                dirty |= sessions.poll_maintenance();
+                let storage_busy = sessions.maintenance.is_some();
                 let batch = {
                     let slot = sessions.active_mut();
+                    slot.front.storage_busy = storage_busy;
                     handle_key_batch(
                         &mut slot.front,
                         &slot.runtime,
@@ -3044,7 +3493,7 @@ async fn interactive_loop(
                 // intents resolve after earlier ones.
                 let cmds = sessions.active_mut().front.take_session_cmds();
                 for cmd in &cmds {
-                    handle_session_command(sessions, cmd);
+                    execute_session_command(sessions, cmd).await;
                     dirty = true;
                 }
                 let slot = sessions.active_mut();
@@ -4777,6 +5226,8 @@ mod cov_main_topup {
             }],
             active: 0,
             template: defaults_config(),
+            store: None,
+            maintenance: None,
         }
     }
 
@@ -4785,6 +5236,344 @@ mod cov_main_topup {
         let template = defaults_config();
         let first = slot("s1", "sess-test-1", &template);
         SessionRegistry::new(first, template)
+    }
+
+    fn session_store_test_directory() -> std::path::PathBuf {
+        let nonce = SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "nexus-tui-session-commands-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn saved_checkpoint(id: &str) -> nexus_core::SessionCheckpoint {
+        nexus_core::SessionCheckpoint::new(
+            SessionId::new(id).expect("valid saved session id"),
+            nexus_core::STORE_FORMAT_REVISION,
+            1,
+            vec![nexus_core::store::StoredMessage {
+                source: "user".to_owned(),
+                text: "saved conversation".to_owned(),
+                complete: true,
+            }],
+            DEMO_PROFILE,
+        )
+        .expect("valid saved checkpoint")
+    }
+
+    async fn finish_maintenance(sessions: &mut SessionRegistry) {
+        assert!(sessions.maintenance.is_some(), "operation started");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sessions.poll_maintenance() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("maintenance finishes");
+    }
+
+    struct BlockedMaintenanceStore {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl BlockedMaintenanceStore {
+        fn wait(&mut self) -> Result<(), nexus_core::AgentError> {
+            self.started
+                .take()
+                .expect("only one worker")
+                .send(())
+                .unwrap();
+            let _ = self.release.recv();
+            Err(nexus_core::AgentError::new(
+                nexus_core::ErrorCategory::StorageFailure,
+                "injected publication is uncertain; reopen required",
+                nexus_core::RetryGuidance::DoNotRetry,
+            )
+            .unwrap())
+        }
+    }
+
+    impl nexus_core::SessionStore for BlockedMaintenanceStore {
+        fn import_legacy_sessions(&mut self) -> Result<usize, nexus_core::AgentError> {
+            self.wait().map(|()| 0)
+        }
+        fn delete_session(&mut self, _: &SessionId) -> Result<(), nexus_core::AgentError> {
+            self.wait()
+        }
+        fn list_sessions(
+            &self,
+            _: usize,
+        ) -> Result<Vec<nexus_core::SessionMetadata>, nexus_core::AgentError> {
+            panic!("listing must not wait behind maintenance")
+        }
+        fn load_session(
+            &self,
+            _: &SessionId,
+        ) -> Result<nexus_core::SessionCheckpoint, nexus_core::AgentError> {
+            panic!("restore must not wait behind maintenance")
+        }
+        fn save_checkpoint(
+            &mut self,
+            _: &nexus_core::SessionCheckpoint,
+        ) -> Result<(), nexus_core::AgentError> {
+            unreachable!("maintenance test does not submit work")
+        }
+        fn record_intent(
+            &mut self,
+            _: &nexus_core::ToolIntentRecord,
+        ) -> Result<(), nexus_core::AgentError> {
+            unreachable!("maintenance test does not dispatch tools")
+        }
+        fn record_outcome(
+            &mut self,
+            _: &nexus_core::ToolOutcomeRecord,
+        ) -> Result<(), nexus_core::AgentError> {
+            unreachable!("maintenance test does not dispatch tools")
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_maintenance_keeps_input_responsive_and_reports_errors_to_origin() {
+        for command in [
+            SessionArgs::Import,
+            SessionArgs::Delete("sess-old".to_owned()),
+        ] {
+            let mut sessions = registry();
+            let (started, receiver) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            sessions.store = Some(SessionStoreHandle::new(Box::new(BlockedMaintenanceStore {
+                started: Some(started),
+                release: blocked,
+            })));
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                execute_session_command(&mut sessions, &command),
+            )
+            .await
+            .expect("command must return before disk finishes");
+            tokio::time::timeout(Duration::from_secs(1), receiver)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!sessions.poll_maintenance(), "worker remains blocked");
+            for duplicate in [
+                command.clone(),
+                SessionArgs::List,
+                SessionArgs::Restore("sess-old".into()),
+            ] {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    execute_session_command(&mut sessions, &duplicate),
+                )
+                .await
+                .expect("no command waits behind the store lock");
+            }
+            assert!(
+                transcript(&sessions.active().front)
+                    .contains("no additional storage command was started")
+            );
+
+            // Input still reaches the real key-batch handler while the store
+            // worker is blocked, including the normal desktop quit sequence.
+            let current = sessions.active_mut();
+            current.front.storage_busy = true;
+            current.front.focus = Focus::Composer;
+            current.front.state.composer_type('x');
+            assert!(!handle_key(&mut current.front, &current.runtime, press(KeyCode::Enter)).await);
+            assert_eq!(current.front.state.composer(), "x");
+            assert!(transcript(&current.front).contains("draft preserved"));
+            current.front.focus = Focus::Viewport;
+            let mut keys = [
+                press(KeyCode::Char(':')),
+                press(KeyCode::Char('q')),
+                press(KeyCode::Enter),
+            ]
+            .into_iter();
+            let batch = tokio::time::timeout(
+                Duration::from_secs(1),
+                handle_key_batch(
+                    &mut current.front,
+                    &current.runtime,
+                    || Ok(keys.next().map(Input::Key)),
+                    MAX_KEYS_PER_TICK,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(batch.quit);
+            assert!(
+                sessions.maintenance.is_some(),
+                "quit does not imply rollback"
+            );
+
+            let second = slot("s2", "sess-test-2", &sessions.template);
+            sessions.slots.push(second);
+            sessions.active = 1;
+            release.send(()).unwrap();
+            finish_maintenance(&mut sessions).await;
+            assert!(!transcript(&sessions.active().front).contains("injected publication"));
+            let notices = transcript(&sessions.slots[0].front);
+            assert!(notices.contains("injected publication is uncertain; reopen required"));
+            assert!(notices.contains("restart the TUI to reconcile storage before retrying"));
+            assert!(!notices.contains("deleted saved session sess-old"));
+        }
+    }
+
+    #[test]
+    fn maintenance_worker_disconnect_reports_uncertainty_without_success() {
+        let mut sessions = registry();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sessions.maintenance = Some((sessions.active().front.session.clone(), receiver));
+        drop(sender);
+        assert!(sessions.poll_maintenance());
+        assert!(sessions.maintenance.is_none());
+        let notices = transcript(&sessions.active().front);
+        assert!(notices.contains("worker failed"));
+        assert!(notices.contains("do not blindly retry"));
+    }
+
+    #[tokio::test]
+    async fn session_import_command_imports_legacy_history_without_opening_a_slot() {
+        use nexus_core::SessionStore;
+
+        let directory = session_store_test_directory();
+        let checkpoint = saved_checkpoint("sess-legacy");
+        let mut legacy = nexus_session::FileSessionStore::open(&directory).expect("legacy opens");
+        legacy
+            .save_checkpoint(&checkpoint)
+            .expect("save legacy history");
+        drop(legacy);
+        let backup = std::fs::read(directory.join("session-store.json")).expect("read backup");
+        let store = nexus_session::DirectorySessionStore::open(&directory).expect("store opens");
+        assert!(
+            store
+                .list_sessions(10)
+                .expect("list saved sessions")
+                .is_empty()
+        );
+        let mut sessions = registry();
+        sessions.store = Some(SessionStoreHandle::new(Box::new(store)));
+
+        execute_session_command(&mut sessions, &SessionArgs::Import).await;
+        finish_maintenance(&mut sessions).await;
+
+        let notices = transcript(&sessions.active().front);
+        assert!(notices.contains("explicitly reading the legacy session file"));
+        assert!(notices.contains("imported 1 legacy sessions"));
+        assert_eq!(sessions.len(), 1, "import does not restore a live session");
+        assert_eq!(sessions.active, 0);
+        execute_session_command(&mut sessions, &SessionArgs::Import).await;
+        finish_maintenance(&mut sessions).await;
+        assert!(transcript(&sessions.active().front).contains("imported 0 legacy sessions"));
+        drop(sessions);
+
+        let store = nexus_session::DirectorySessionStore::open(&directory).expect("store reopens");
+        assert_eq!(
+            store
+                .load_session(checkpoint.session())
+                .expect("import persisted"),
+            checkpoint
+        );
+        assert_eq!(
+            std::fs::read(directory.join("session-store.json")).expect("backup remains"),
+            backup
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[tokio::test]
+    async fn session_delete_command_refuses_active_and_background_live_slots() {
+        use nexus_core::SessionStore;
+
+        let directory = session_store_test_directory();
+        let mut sessions = registry();
+        sessions
+            .slots
+            .push(slot("s2", "sess-test-2", &sessions.template));
+        let checkpoints = [
+            saved_checkpoint("sess-test-1"),
+            saved_checkpoint("sess-test-2"),
+        ];
+        let mut store =
+            nexus_session::DirectorySessionStore::open(&directory).expect("store opens");
+        for checkpoint in &checkpoints {
+            store
+                .initialize_session(checkpoint)
+                .expect("save live history");
+        }
+        sessions.store = Some(SessionStoreHandle::new(Box::new(store)));
+
+        for checkpoint in &checkpoints {
+            execute_session_command(
+                &mut sessions,
+                &SessionArgs::Delete(checkpoint.session().as_str().to_owned()),
+            )
+            .await;
+        }
+
+        let notices = transcript(&sessions.active().front);
+        assert_eq!(
+            notices
+                .matches("cannot delete a session open in this TUI")
+                .count(),
+            2
+        );
+        assert!(!notices.contains("deleted saved session"));
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.active, 0);
+        drop(sessions);
+
+        let store = nexus_session::DirectorySessionStore::open(&directory).expect("store reopens");
+        for checkpoint in checkpoints {
+            assert_eq!(
+                store
+                    .load_session(checkpoint.session())
+                    .expect("live history retained"),
+                checkpoint
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[tokio::test]
+    async fn session_delete_command_removes_an_old_saved_session_only() {
+        use nexus_core::SessionStore;
+
+        let directory = session_store_test_directory();
+        let live = saved_checkpoint("sess-test-1");
+        let old = saved_checkpoint("sess-old");
+        let mut store =
+            nexus_session::DirectorySessionStore::open(&directory).expect("store opens");
+        store.initialize_session(&live).expect("save live history");
+        store.initialize_session(&old).expect("save old history");
+        let mut sessions = registry();
+        sessions.store = Some(SessionStoreHandle::new(Box::new(store)));
+
+        execute_session_command(&mut sessions, &SessionArgs::Delete("sess-old".to_owned())).await;
+        finish_maintenance(&mut sessions).await;
+
+        assert!(transcript(&sessions.active().front).contains("deleted saved session sess-old"));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.active, 0);
+        drop(sessions);
+
+        let store = nexus_session::DirectorySessionStore::open(&directory).expect("store reopens");
+        let saved = store.list_sessions(10).expect("list remaining sessions");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(&saved[0].session, live.session());
+        assert!(store.load_session(old.session()).is_err());
+        assert_eq!(
+            store
+                .load_session(live.session())
+                .expect("live history retained"),
+            live
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test store");
     }
 
     #[test]
@@ -4832,7 +5621,7 @@ mod cov_main_topup {
         assert_eq!(active.front.session.as_str(), format!("{DEMO_SESSION}-2"));
         assert_eq!(active.front.state.session_label(), Some("s2"));
         assert!(
-            transcript(&active.front).contains("session s2 started"),
+            transcript(&active.front).contains("new conversation · s2 · type a task below"),
             "the new slot announces itself in its own history"
         );
     }
@@ -6635,6 +7424,32 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
+    async fn session_new_executes_and_dismisses_command_completion_surface() {
+        let mut sessions = registry();
+        sessions.active_mut().front.focus = Focus::Viewport;
+        for key in ":session new"
+            .chars()
+            .map(KeyCode::Char)
+            .chain([KeyCode::Enter])
+        {
+            let slot = sessions.active_mut();
+            assert!(!handle_key(&mut slot.front, &slot.runtime, press(key)).await);
+        }
+        let commands = sessions.active_mut().front.take_session_cmds();
+        assert_eq!(commands, vec![SessionArgs::New]);
+        for command in &commands {
+            execute_session_command(&mut sessions, command).await;
+        }
+
+        let active = sessions.active();
+        assert_eq!(sessions.active, 1);
+        assert_eq!(active.front.state.session_label(), Some("s2"));
+        assert!(active.front.state.command_line().is_none());
+        assert!(active.front.state.completions().is_empty());
+        assert!(transcript(&active.front).contains("new conversation · s2"));
+    }
+
+    #[tokio::test]
     async fn escape_closes_suggestions_without_changing_focus_or_input() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
@@ -6900,6 +7715,46 @@ mod cov_live_wiring {
             pending_run: None,
             pending_run_id: None,
         }
+    }
+
+    #[test]
+    fn context_settings_follow_the_pending_model_snapshot() {
+        let mut selected = selection_with(Some("m0"));
+        selected.config = UserConfig::from_json(
+            r#"{
+            "revision": 2,
+            "providers": [{
+                "id": "demo-provider", "display_name": "Demo", "adapter": "direct",
+                "protocol": "chat_completions", "endpoint": "https://example.invalid",
+                "credential": {"env": "NEXUS_TUI_TEST_KEY"}, "default_model": "demo-model"
+            }],
+            "models": [{"id": "m0", "provider": "demo-provider", "name": "demo-model",
+                "context_window_tokens": 94208, "context_management": {"target_percent": 5}}],
+            "favourites": [], "recent": []
+        }"#,
+        )
+        .unwrap();
+        let expected = selected
+            .config
+            .context_management_for("demo-provider", Some("m0"))
+            .unwrap();
+        let LiveResolve::Live(adapter) =
+            resolve_live_adapter(&selected, |_| Some("secret".to_owned()))
+        else {
+            panic!("configured adapter must resolve without network I/O");
+        };
+        assert_eq!(adapter.context_management(), expected);
+        let mut latest = selected.clone();
+        latest.active_model = None;
+        latest.pending_run = Some(Box::new(selected));
+        let binding = Arc::new(Mutex::new(latest));
+        let provider = PerRunProvider::live(binding.clone());
+        assert_eq!(provider.context_management(), expected);
+        binding.lock().unwrap().pending_run = None;
+        assert_eq!(
+            provider.context_management(),
+            nexus_core::ContextManagementSettings::default()
+        );
     }
 
     #[test]

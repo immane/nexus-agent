@@ -48,6 +48,15 @@ impl ParseFault {
             Self::NodeBudgetExceeded => limit_error("schema node budget exhausted"),
         }
     }
+
+    pub(crate) fn into_document_error(self) -> AgentError {
+        match self {
+            Self::Malformed => input_error("document is not valid JSON"),
+            Self::DuplicateKey => input_error("document contains a duplicate object key"),
+            Self::DepthExceeded => limit_error("document depth budget exhausted"),
+            Self::NodeBudgetExceeded => limit_error("document node budget exhausted"),
+        }
+    }
 }
 
 #[derive(Clone)]

@@ -1,5 +1,10 @@
 # Agent benchmark options for Nexus
 
+For the Context Management development workflow, metric definitions, artifact
+storage, and 92K -> 64K -> 32K comparison matrix, see the
+[context management design](../design/12-context-management.md). That design
+separates proposed measurement capabilities from the current experimental runner.
+
 Research date: 2026-10-24. This is a recommendation for choosing and preparing
 an evaluation, not a claim that Nexus has benchmark support or has been scored.
 Benchmark versions, hosted services, and CLI syntax change; pin a dataset/task
@@ -251,6 +256,27 @@ Keep one row per attempt, including failures:
 | Artifacts | Patch, evaluator result, and redacted logs; never credentials |
 
 ## Local pilot status (2026-10-24)
+
+### Summary-request debugging (2026-10-25)
+
+The `context-summaryfix-rerun-20261025` debug replay completed one summary
+(1,366 output tokens), then rejected another after it used its 4,096-token
+output allowance. The runtime preserved the original conversation and stopped;
+this is not a successful task completion. Increasing the allowance alone did
+not establish summary reliability. Summary requests now use isolated summarizer
+instructions instead of coding-agent/environment instructions and end with an
+explicit request to summarize, rather than the original task description.
+Rejection diagnostics include protocol validity, finish reason, text bytes,
+and the memory byte ceiling; truncated summaries remain ineligible for adoption.
+The subsequent `context-summaryfix-v2-20261025` replay completed and the official
+SWE-bench 5.0.2 evaluator resolved `sympy__sympy-20590` (1/1; `test_immutable`
+and all 21 PASS_TO_PASS tests passed). That run made 38 task-model calls but
+triggered no context reduction, so it validates task completion and scoring, not
+the live summary request or compaction behavior. The selected task was already
+exposed in prior runs and is not blind evidence. Reviewed artifacts are indexed
+in [the evidence README](evidence/README.md).
+
+### Earlier pilot observations
 
 One SWE-bench Lite task, `sympy__sympy-20590`, was used to validate the path;
 this is not a leaderboard score:
@@ -582,6 +608,51 @@ Validate with deterministic regressions and an explicitly budgeted local-model
 long-task comparison before enabling it by default. This is future work, not a
 change to the current eviction behavior or authorization for a live model run.
 
+### Contaminated Astropy challenge attempt (2026-10-24)
+
+A single run of SWE-bench Verified task `astropy__astropy-13398` was stopped
+after the agent log showed it had found and begun reconstructing the upstream
+solution before completing the task. This is **contaminated and invalid**; it
+has no agent score and must not be counted. The separate gold-patch preflight
+resolved successfully, but only validated the evaluator environment.
+
+The confirmed leak was the task checkout: it had been cloned from an older local
+Astropy workspace whose `origin/main` refs included commits beyond the task's
+base revision, including the solution. Public egress was also not independently
+verified as blocked, so additional exposure cannot be ruled out. The run was
+stopped before a patch was produced or official agent evaluation was run; final
+usage is unknown/incomplete. Only the two containers owned by this run were
+removed. Logs and the run manifest remain under
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-astropy-13398-unbounded-20261024/`.
+
+Do not reuse this task as a blind sample. Before another challenge run, create a
+workspace with a fresh, minimal Git object/ref set anchored at the task base,
+audit refs and reachable commits for future fixes, remove upstream remotes, and
+restrict task egress before starting the model.
+
+### Exposed Sphinx task attempts (2026-10-24)
+
+The separate SWE-bench Verified task `sphinx-doc__sphinx-9461` was submitted in
+two attempts. Attempt 1 ended after provider HTTP 500 errors (17 tool calls,
+633.374 seconds); attempt 2 was an explicitly non-blind retry after the issue
+statement had already been sent to the same model. Attempt 2 ended with
+`ResourceLimit: model output limit reached` (41 tool calls, 819.489 seconds) and
+an empty prediction. The official evaluator completed successfully and
+classified it as an empty patch: 1 submitted, 0 completed/resolved/unresolved,
+0 infrastructure failures, and 0 unstopped containers. The task image remains
+as a cache entry. Neither attempt is a task score, and this task must not be
+reused as a blind sample. The report and manifest are retained under
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-sphinx-9461-isolated-20261024/`.
+
+Although the pilot's dedicated gateway probe confirmed denied public TCP egress,
+the task log also reported no network access and its server emitted a warning
+that isolation was unvalidated on native Linux. This does not meet the owner's
+requirement for network-capable task Docker environments. Resolve and verify the
+intended task-network policy on the actual execution platform before another
+agent run; successful image-build networking is not evidence of task-container
+network access. The `model output limit reached` result alone does not establish
+whether input context or generation output was the limiting factor.
+
 For a one-task run, first make a disposable checkout at the dataset row's
 `base_commit`, then build that task's adapter image with its immutable registry
 digest:
@@ -607,6 +678,31 @@ workspace directory is mounted into the container. For example:
 git clone --no-hardlinks --no-checkout SOURCE_REPO CHECKOUT
 git -C CHECKOUT checkout --detach BASE_COMMIT
 ```
+
+For locally built images, pass the immutable image ID printed by
+`docker image inspect IMAGE --format '{{.Id}}'` (the `sha256:...` value) to
+`--gateway-image` and `--container-image`. Do not append that image ID to a tag
+as `TAG@sha256:...`: locally built images commonly have no `RepoDigests`, so
+Docker rejects that reference as missing even though the tagged image exists.
+
+Before starting the server, verify that the process launching it actually has
+both the bearer-token variable named by `--auth-token-env` (default
+`NEXUS_BENCH_SMOKE_TOKEN`) and the selected provider credential variable
+referenced by `config.json`. On macOS, non-interactive zsh/agent shells do not
+necessarily source `.zshrc`; exporting a variable in a separate interactive
+terminal does not make it available here. Check presence without printing the
+value, for example:
+
+```sh
+test -n "${NEXUS_BENCH_SMOKE_TOKEN:-}" && echo bearer-token-present
+test -n "${OLLAMA_API_KEY:-}" && echo provider-credential-present
+```
+
+Replace `OLLAMA_API_KEY` with the `credential.env` name for the selected
+provider. If either variable is absent, explicitly load it into the server
+launch process from the approved secret source; do not put credentials in
+command arguments or benchmark artifacts. The runner does not launch the
+server or recover credentials from the user's interactive shell.
 
 The runner checks that `.git`, the common Git directory, and object storage are
 self-contained before creating a provider session, so a broken host-only

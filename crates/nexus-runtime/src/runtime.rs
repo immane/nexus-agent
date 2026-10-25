@@ -1,8 +1,8 @@
 //! Single-active-run execution loop: lifecycle, policy, ordered events.
 //!
 //! M0 scope: one active run (a second `Submit` gets an explicit `Busy`
-//! reply), declared-order sequential tool dispatch, ephemeral persistence,
-//! no session-store I/O. Core ports stay synchronous; this crate adapts them
+//! reply), declared-order sequential tool dispatch, and opt-in durable tool
+//! operation records. Core ports stay synchronous; this crate adapts them
 //! at its boundary with the blocking pool, never leaking async types into
 //! `nexus-core`.
 //!
@@ -29,18 +29,28 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use nexus_context::CONTEXT_NOTICE_ITEM_KEY;
+use nexus_context::{
+    CONTEXT_NOTICE_TEXT, ContextBounds, TokenEstimator, context_calls_are_paired,
+    history_exchange_effects_certain, is_context_notice, is_retained_evidence, memory_bytes,
+    project_bounded_history,
+};
 use nexus_core::commands::{EventSequence, MAX_TEXT_FRAGMENT_BYTES};
 use nexus_core::{
     AgentError, ApprovalBinding, ApprovalId, ApprovalNotice, ApproveCommand, AssistantText,
     CallCandidate, CallId, CancelCommand, CancellationToken, Command, CommandReply,
     CommandResponse, ContinuationData, DenyCommand, EffectState, ErrorCategory, EventPayload,
-    Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits, ModelContextItem,
-    ModelInstructions, ModelRequest, OutcomeSummary, PersistenceState, ProviderContext,
-    ProviderEvent, ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId,
-    RunLifecycle, RunOutcome, SessionId, Snapshot, SubmitCommand, ToolAccess, ToolCall,
-    ToolContext, ToolFinishedInfo, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
-    ToolStartedInfo, TurnId, Usage, UsageFinality,
+    Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits,
+    ListSessionsCommand, ModelContextItem, ModelInstructions, ModelRequest, OutcomeSummary,
+    PersistenceState, ProviderContext, ProviderEvent, ProviderPort, RequestId,
+    RestoreSessionCommand, RetryGuidance, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome,
+    STORE_FORMAT_REVISION, SessionCheckpoint, SessionId, SessionStore, Snapshot, SubmitCommand,
+    ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId, ToolIntentRecord, ToolOutcome,
+    ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec, ToolStartedInfo, TurnId, Usage,
+    UsageFinality,
 };
+use nexus_session::recover_session;
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -48,8 +58,10 @@ use tokio::task::JoinHandle;
 
 use crate::policy::Policy;
 use crate::transport::EventStreams;
+mod context_compaction;
 #[cfg(test)]
 use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY};
+use context_compaction::{PendingCompaction, prepare_context_request};
 
 /// Single-run lifecycle states (design 02-execution baseline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +115,9 @@ struct Shared {
     tools: HashMap<String, RegisteredTool>,
     tool_order: Vec<String>,
     tool_definitions: Vec<ToolSpec>,
+    session_store: Option<Arc<StdMutex<Box<dyn SessionStore + Send>>>>,
+    /// An interrupted write must be reconciled by reopening, never retried.
+    store_uncertain: AtomicBool,
     state: Mutex<State>,
     data_tx: mpsc::Sender<RunEvent>,
     control_tx: mpsc::Sender<RunEvent>,
@@ -118,6 +133,35 @@ struct Shared {
     run_counter: AtomicU64,
 }
 
+/// Cloneable owner for one session store shared by multiple runtime instances.
+/// The store's own single-writer lock remains held until every clone drops.
+#[derive(Clone)]
+pub struct SessionStoreHandle(Arc<StdMutex<Box<dyn SessionStore + Send>>>);
+
+impl SessionStoreHandle {
+    /// Wraps an opened store so runtimes can share one serialized owner.
+    #[must_use]
+    pub fn new(store: Box<dyn SessionStore + Send>) -> Self {
+        Self(Arc::new(StdMutex::new(store)))
+    }
+
+    /// Deletes one explicitly selected persisted conversation.
+    pub fn delete_session(&self, session: &SessionId) -> Result<(), AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .delete_session(session)
+    }
+
+    /// Explicitly reads and imports legacy sessions through the shared store.
+    pub fn import_legacy_sessions(&self) -> Result<usize, AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .import_legacy_sessions()
+    }
+}
+
 struct RegisteredTool {
     spec: ToolSpec,
     schema: CompiledSchema,
@@ -127,6 +171,7 @@ struct RegisteredTool {
 
 struct State {
     active: Option<ActiveRun>,
+    restore_busy: bool,
     last: Option<FinishedRun>,
     /// Whole completed exchanges, globally bounded by the context budgets.
     history: VecDeque<RetainedExchange>,
@@ -139,6 +184,8 @@ struct State {
     /// Once uncertain evidence cannot be retained within the finite cache,
     /// refuse further model work rather than silently authorizing blind retries.
     history_safety_exhausted: bool,
+    /// Sessions initialized or explicitly loaded through this runtime's store.
+    durable_sessions: HashSet<SessionId>,
     /// Workers whose termination is not yet established. A non-empty list
     /// blocks new runs and further dispatch; at most one entry exists in the
     /// sequential M0 baseline.
@@ -148,6 +195,7 @@ struct State {
 struct RetainedExchange {
     session: SessionId,
     items: Vec<ModelContextItem>,
+    derived_memory: Option<String>,
 }
 
 struct HistoryOmission {
@@ -220,6 +268,11 @@ const CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES: usize = 65_536;
 const MAX_HISTORY_OMISSION_SESSIONS: usize = 128;
 
 struct ActiveRun {
+    context_management: nexus_core::ContextManagementSettings,
+    derived_memory: Option<String>,
+    pending_compaction: Option<PendingCompaction>,
+    input_estimate: u64,
+    token_estimator: TokenEstimator,
     instruction_bytes: usize,
     context_note: String,
     context_note_bytes: usize,
@@ -245,9 +298,14 @@ struct ActiveRun {
     approval_seq: u64,
     turns_used: u32,
     calls_used: u32,
+    /// One fresh task request may replace a truncated response, never resume it.
+    output_limit_recovery_used: bool,
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
+    /// Index of the first context item not yet committed to source history.
+    source_cursor: usize,
     history_len: usize,
+    inherited_history: bool,
     initial_context_reduction: Option<ContextReduction>,
     pending_omission_items: usize,
     queue: VecDeque<QueuedCall>,
@@ -270,6 +328,7 @@ struct ActiveRun {
     force_terminal: Option<RunOutcome>,
     terminal: Option<RunOutcome>,
     terminal_error: Option<AgentError>,
+    persistence_error: Option<AgentError>,
     delivery_closed: bool,
     finished_sent: bool,
 }
@@ -292,13 +351,11 @@ struct Terminal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ContextReduction {
+    method: nexus_core::ContextReductionMethod,
     removed_items: usize,
     retained_items: usize,
     retained_bytes: usize,
 }
-
-const CONTEXT_NOTICE_ITEM_KEY: &str = "nexus-context-note";
-const CONTEXT_NOTICE_TEXT: &str = "Nexus context note: Earlier completed exchanges were omitted to fit the context budget. They were not summarized. Re-check earlier facts before relying on them.";
 
 impl Terminal {
     fn completed() -> Self {
@@ -377,6 +434,14 @@ fn runtime_error(category: ErrorCategory, message: &'static str) -> AgentError {
         .expect("static safe runtime message builds")
 }
 
+// A terminal may be owned by a full-screen frontend. Uncoordinated writes
+// invalidate its screen buffer; retain diagnostics only for redirected stderr.
+fn diagnostic(message: std::fmt::Arguments<'_>) {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        eprintln!("{message}");
+    }
+}
+
 impl Runtime {
     /// Fallible production constructor: validates limits, provider
     /// capabilities, and every host registration (one `describe()` call per
@@ -399,6 +464,50 @@ impl Runtime {
         provider: Arc<dyn ProviderPort + Send + Sync>,
         tools: Vec<ToolRegistration>,
         instructions: ModelInstructions,
+    ) -> Result<(Self, EventStreams), AgentError> {
+        Self::try_new_inner(config, provider, tools, instructions, None)
+    }
+
+    /// Constructs a runtime with an explicit session store. Tool intents are
+    /// durably recorded before dispatch and observed outcomes and accepted
+    /// source items are recorded afterward. Restore commands and terminal
+    /// checkpoints are not yet wired; terminal persistence therefore remains
+    /// `Ephemeral` unless a required write failed.
+    pub fn try_new_with_session_store(
+        config: RuntimeConfig,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        instructions: ModelInstructions,
+        store: Box<dyn SessionStore + Send>,
+    ) -> Result<(Self, EventStreams), AgentError> {
+        Self::try_new_inner(
+            config,
+            provider,
+            tools,
+            instructions,
+            Some(Arc::new(StdMutex::new(store))),
+        )
+    }
+
+    /// Constructs a runtime using a store handle shared with other runtimes.
+    /// Each instance retains independent run/history state while store access
+    /// is serialized through the common owner.
+    pub fn try_new_with_session_store_handle(
+        config: RuntimeConfig,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        instructions: ModelInstructions,
+        store: SessionStoreHandle,
+    ) -> Result<(Self, EventStreams), AgentError> {
+        Self::try_new_inner(config, provider, tools, instructions, Some(store.0))
+    }
+
+    fn try_new_inner(
+        config: RuntimeConfig,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        instructions: ModelInstructions,
+        session_store: Option<Arc<StdMutex<Box<dyn SessionStore + Send>>>>,
     ) -> Result<(Self, EventStreams), AgentError> {
         config.limits.validate()?;
         if config.policy.is_container() {
@@ -490,12 +599,12 @@ impl Runtime {
                 "provider declares no usable context budget",
             ));
         }
-        eprintln!(
+        diagnostic(format_args!(
             "nexus-runtime: context budget configured_items={} effective_items={} max_bytes={}",
             config.limits.retained_context_items,
             context_items_bound,
             nexus_core::provider::MAX_CONVERSATION_BYTES,
-        );
+        ));
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
@@ -510,13 +619,17 @@ impl Runtime {
             tools: registry,
             tool_order: order,
             tool_definitions,
+            session_store,
+            store_uncertain: AtomicBool::new(false),
             state: Mutex::new(State {
                 active: None,
+                restore_busy: false,
                 last: None,
                 history: VecDeque::new(),
                 history_omissions: Vec::new(),
                 history_omission_fallback_items: 0,
                 history_safety_exhausted: false,
+                durable_sessions: HashSet::new(),
                 quarantine: Vec::new(),
             }),
             data_tx,
@@ -551,8 +664,8 @@ impl Runtime {
             .expect("test-only runtime wiring must be valid; use Runtime::try_new in production")
     }
 
-    /// Handles one typed frontend command. `ListSessions`/`RestoreSession`
-    /// have no store in M0 and are explicitly rejected.
+    /// Handles one typed frontend command, including explicit bounded history
+    /// listing and restoration when a store has been injected.
     pub async fn handle(&self, command: Command) -> (CommandResponse, Option<Snapshot>) {
         match command {
             Command::Submit(command) => (self.submit(command).await, None),
@@ -563,15 +676,128 @@ impl Runtime {
             }
             Command::Deny(command) => (self.deny(command).await, None),
             Command::GetSnapshot(command) => self.get_snapshot(command).await,
-            Command::ListSessions(command) => (
-                CommandResponse::new(command.request.clone(), CommandReply::Rejected, None),
-                None,
-            ),
-            Command::RestoreSession(command) => (
-                CommandResponse::new(command.request.clone(), CommandReply::Rejected, None),
-                None,
-            ),
+            Command::ListSessions(command) => (self.list_sessions(command).await, None),
+            Command::RestoreSession(command) => (self.restore_session(command).await, None),
         }
+    }
+
+    async fn list_sessions(&self, command: ListSessionsCommand) -> CommandResponse {
+        if command.validate().is_err() || self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        }
+        let Some(store) = self.shared.session_store.clone() else {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        let limit = command.limit;
+        let result = tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.list_sessions(limit)
+        })
+        .await;
+        match result {
+            Ok(Ok(sessions)) if sessions.len() <= limit => {
+                CommandResponse::new(command.request, CommandReply::Accepted, None)
+                    .with_sessions(sessions)
+            }
+            _ => CommandResponse::new(command.request, CommandReply::Rejected, None),
+        }
+    }
+
+    async fn restore_session(&self, command: RestoreSessionCommand) -> CommandResponse {
+        let runtime = self.clone();
+        let request = command.request.clone();
+        tokio::spawn(async move { runtime.restore_session_inner(command).await })
+            .await
+            .unwrap_or_else(|_| CommandResponse::new(request, CommandReply::Rejected, None))
+    }
+
+    async fn restore_session_inner(&self, command: RestoreSessionCommand) -> CommandResponse {
+        let Some(store) = self.shared.session_store.clone() else {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        }
+        {
+            let mut state = self.shared.state.lock().await;
+            if state.active.is_some()
+                || state.restore_busy
+                || !state.quarantine.is_empty()
+                || self.shared.outbox_events.load(Ordering::SeqCst) != 0
+            {
+                return CommandResponse::new(command.request, CommandReply::Busy, None);
+            }
+            state.restore_busy = true;
+        }
+
+        let session = command.session.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            recover_session(store.as_ref(), &session)
+        })
+        .await;
+        let recovered = match recovered {
+            Ok(Ok(recovered)) => recovered,
+            _ => {
+                self.shared.state.lock().await.restore_busy = false;
+                return CommandResponse::new(command.request, CommandReply::Rejected, None);
+            }
+        };
+        let items = match restore_items(recovered.items().cloned().collect()) {
+            Ok(items) => items,
+            Err(()) => {
+                self.shared.state.lock().await.restore_busy = false;
+                return CommandResponse::new(command.request, CommandReply::Rejected, None);
+            }
+        };
+        let Some((items, omitted_items)) =
+            bounded_restored_history(items, self.shared.context_items_bound)
+        else {
+            self.shared.state.lock().await.restore_busy = false;
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        let mut state = self.shared.state.lock().await;
+        if state.active.is_some() {
+            state.restore_busy = false;
+            return CommandResponse::new(command.request, CommandReply::Busy, None);
+        }
+        let discarded: Vec<_> = state
+            .history
+            .iter()
+            .filter(|exchange| exchange.session != command.session)
+            .map(|exchange| (exchange.session.clone(), exchange.items.len()))
+            .collect();
+        state.history.clear();
+        state
+            .history_omissions
+            .retain(|omission| omission.session != command.session);
+        for (session, removed) in discarded {
+            mark_history_omitted(&mut state, session, removed);
+        }
+        for exchange in split_history_exchanges(&items) {
+            state.history.push_back(RetainedExchange {
+                session: command.session.clone(),
+                items: exchange,
+                derived_memory: None,
+            });
+        }
+        if omitted_items > 0 {
+            mark_history_omitted(&mut state, command.session.clone(), omitted_items);
+        }
+        state.durable_sessions.insert(command.session.clone());
+        state.restore_busy = false;
+        CommandResponse::new(command.request, CommandReply::Accepted, None)
+            .with_restored_session(command.session)
     }
 
     /// Accepts a new run or rejects explicitly. A second submit while a run
@@ -580,6 +806,9 @@ impl Runtime {
     /// the retained ownership.
     pub async fn submit(&self, command: SubmitCommand) -> CommandResponse {
         if command.validate().is_err() {
+            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+        }
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
             return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
         }
         let run_n = self.shared.run_counter.fetch_add(1, Ordering::SeqCst);
@@ -599,6 +828,9 @@ impl Runtime {
                 CommandReply::Busy,
                 Some(active.run.clone()),
             );
+        }
+        if state.restore_busy {
+            return CommandResponse::new(command.request.clone(), CommandReply::Busy, None);
         }
         if let Some(quarantined) = state.quarantine.first() {
             return CommandResponse::new(
@@ -636,6 +868,12 @@ impl Runtime {
         let history_omitted = history_omitted_items > 0;
         let history_len = conversation.len();
         conversation.push(user_item);
+        let source_cursor = conversation.len();
+        let already_initialized = state.durable_sessions.contains(&command.session);
+        let source_input = conversation
+            .last()
+            .expect("the user item was appended")
+            .clone();
         let context_note = if history_omitted {
             CONTEXT_NOTICE_TEXT.to_owned()
         } else {
@@ -644,13 +882,25 @@ impl Runtime {
         let context_note_bytes =
             runtime_note_bytes(&context_note, self.shared.instructions.payload_bytes() > 0);
         let initial_context_reduction = history_omitted.then(|| ContextReduction {
+            method: nexus_core::ContextReductionMethod::InitialHistoryOmission,
             removed_items: history_omitted_items,
             retained_items: conversation.len(),
             retained_bytes: conversation_bytes(&conversation)
                 .saturating_add(self.shared.instructions.payload_bytes())
                 .saturating_add(context_note_bytes),
         });
+        let derived_memory = state
+            .history
+            .iter()
+            .rev()
+            .filter(|exchange| exchange.session == command.session)
+            .find_map(|exchange| exchange.derived_memory.clone());
         state.active = Some(ActiveRun {
+            context_management: self.shared.provider.context_management(),
+            derived_memory,
+            pending_compaction: None,
+            input_estimate: 0,
+            token_estimator: TokenEstimator::default(),
             instruction_bytes: self.shared.instructions.payload_bytes(),
             context_note,
             context_note_bytes,
@@ -671,9 +921,12 @@ impl Runtime {
             approval_seq: 0,
             turns_used: 0,
             calls_used: 0,
+            output_limit_recovery_used: false,
             continuation: None,
             conversation,
+            source_cursor,
             history_len,
+            inherited_history: history_len > 0,
             initial_context_reduction,
             pending_omission_items: history_omitted_items,
             queue: VecDeque::new(),
@@ -693,10 +946,61 @@ impl Runtime {
             force_terminal: None,
             terminal: None,
             terminal_error: None,
+            persistence_error: None,
             delivery_closed: false,
             finished_sent: false,
         });
         drop(state);
+        // A caller abandoning its reply must not abandon the reserved slot or
+        // detach the storage worker. Admission stays owned by the runtime.
+        let admitting = self.clone();
+        let request = command.request.clone();
+        tokio::spawn(async move {
+            admitting
+                .complete_admission(command, run, source_input, already_initialized)
+                .await
+        })
+        .await
+        .unwrap_or_else(|_| CommandResponse::new(request, CommandReply::Rejected, None))
+    }
+
+    async fn complete_admission(
+        &self,
+        command: SubmitCommand,
+        run: RunId,
+        source_input: ModelContextItem,
+        already_initialized: bool,
+    ) -> CommandResponse {
+        // Reserve the active slot before I/O, but never hold the state lock
+        // while waiting for the blocking store. Concurrent commands stay live.
+        if let Err(_error) = self
+            .persist_session_input(
+                &command.session,
+                &command.profile,
+                &run,
+                &source_input,
+                already_initialized,
+            )
+            .await
+        {
+            let mut state = self.shared.state.lock().await;
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.run == run)
+            {
+                state.active = None;
+            }
+            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+        }
+        if self.shared.session_store.is_some() {
+            self.shared
+                .state
+                .lock()
+                .await
+                .durable_sessions
+                .insert(command.session.clone());
+        }
         let driver = self.clone();
         let run_for_task = run.clone();
         // The supervisor owns the driver's join handle so a panic or an
@@ -1038,8 +1342,17 @@ impl Runtime {
             if StdInstant::now() >= active.deadline {
                 return Err(Terminal::limit("run duration exhausted"));
             }
+            if self
+                .shared
+                .limits
+                .check_model_turns(active.turns_used)
+                .is_err()
+            {
+                return Err(Terminal::limit("model turn budget exhausted"));
+            }
             let compacted = compact_context(active, self.shared.context_items_bound)?;
             let initial = active.initial_context_reduction.take();
+            let combined_reduction = compacted.is_some() && initial.is_some();
             let mut reduction = match (compacted, initial) {
                 (Some(mut compacted), Some(initial)) => {
                     compacted.removed_items = compacted
@@ -1051,10 +1364,18 @@ impl Runtime {
                 (None, None) => None,
             };
             if let Some(reduction) = reduction.as_mut() {
+                if combined_reduction {
+                    reduction.method = nexus_core::ContextReductionMethod::Combined;
+                }
                 reduction.retained_items = active.conversation.len();
+                reduction.retained_items += usize::from(active.derived_memory.is_some());
                 reduction.retained_bytes = conversation_bytes(&active.conversation)
                     .saturating_add(active.instruction_bytes)
-                    .saturating_add(active.context_note_bytes);
+                    .saturating_add(active.context_note_bytes)
+                    .saturating_add(context_compaction::projection_overhead(
+                        active,
+                        &active.context_note,
+                    ));
             }
             if let Some(reduction) = reduction {
                 publish_context_reduction(&self.shared, active, run, reduction);
@@ -1066,34 +1387,67 @@ impl Runtime {
                 self.shared.incarnation, active.run_n
             ))
             .map_err(|_| Terminal::failed_internal("turn identity is invalid"))?;
-            let enabled: Vec<ToolId> = self
-                .shared
-                .tool_order
+            let request = prepare_context_request(&self.shared, active, &turn)?;
+            let purpose = if active.pending_compaction.is_some() {
+                nexus_core::ModelRequestPurpose::Summary
+            } else {
+                nexus_core::ModelRequestPurpose::Task
+            };
+            let source_results: HashMap<CallId, &str> = active
+                .conversation
                 .iter()
-                .filter_map(|name| {
-                    self.shared
-                        .tools
-                        .get(name)
-                        .map(|tool| tool.spec.id().clone())
+                .filter_map(|item| match item {
+                    ModelContextItem::ToolResult { call, outcome, .. } => {
+                        Some((call.clone(), outcome.content()))
+                    }
+                    _ => None,
                 })
                 .collect();
-            let request = ModelRequest::new(
-                active.run.clone(),
-                turn.clone(),
-                active.profile.clone(),
-                enabled,
-                active.continuation.clone(),
-                self.shared.effective_output_budget,
-            )
-            .map_err(|_| Terminal::limit("model request budget is invalid"))?
-            .with_instructions(self.shared.instructions.clone())
-            .map_err(|_| Terminal::limit("model instructions exceed their budget"))?
-            .with_context_note(active.context_note.clone())
-            .map_err(|_| Terminal::limit("model context note exceeds its budget"))?
-            .with_conversation(active.conversation.clone())
-            .map_err(|_| Terminal::limit("model conversation exceeds its budget"))?
-            .with_tool_definitions(self.shared.tool_definitions.clone())
-            .map_err(|_| Terminal::limit("model tool definitions exceed their budget"))?;
+            let projected_tool_outputs = request
+                .conversation()
+                .iter()
+                .filter(|item| match item {
+                    ModelContextItem::ToolResult { call, outcome, .. } => {
+                        source_results.get(call).is_some_and(|source| {
+                            *source != outcome.content()
+                                && outcome.content().contains("Nexus model-context projection")
+                        })
+                    }
+                    _ => false,
+                })
+                .count();
+            let window = active
+                .context_management
+                .window
+                .map(|window| window.tokens());
+            let max_output_tokens = request.max_output_tokens();
+            let raw_estimated_input_tokens = Some(active.token_estimator.raw_estimate(&request));
+            let estimated_input_tokens = Some(active.token_estimator.estimate(&request));
+            let outcome = emit_control(
+                &self.shared,
+                active,
+                run,
+                EventPayload::ModelRequestStarted {
+                    turn: turn.clone(),
+                    purpose,
+                    estimated_input_tokens,
+                    raw_estimated_input_tokens,
+                    estimate_scale_millis: active.token_estimator.scale_millis(),
+                    context_window_tokens: window,
+                    context_trigger_percent: active.context_management.policy.trigger_percent(),
+                    context_target_percent: active.context_management.policy.target_percent(),
+                    compaction_strategy: active.context_management.policy.strategy(),
+                    max_output_tokens,
+                    projected_tool_outputs,
+                },
+            );
+            apply_control_outcome(active, outcome);
+            if let Some(outcome) = active.terminal {
+                return Err(Terminal {
+                    outcome,
+                    error: active.terminal_error.clone(),
+                });
+            }
             let context = ProviderContext::new(active.started.elapsed(), active.cancelled, None)
                 .with_control(active.token.clone(), active.deadline);
             (request, context, turn, active.deadline)
@@ -1173,11 +1527,40 @@ impl Runtime {
         };
         match joined {
             Some(Ok(events)) => {
+                let mut effective_limits = self.shared.limits;
+                effective_limits.max_tool_output_bytes = self.shared.effective_output_budget;
+                let response_validated =
+                    crate::protocol::validate_batch(&events, &effective_limits).is_ok();
+                self.publish_model_request_finished(run, &turn, response_validated)
+                    .await;
                 // The join can become ready after the deadline while the
                 // deadline branch is also ready. Because the join branch is
                 // biased, do not accept the provider batch without checking
                 // the invocation's live control state again.
                 if let Err(error) = context.check_active() {
+                    let mut state = self.shared.state.lock().await;
+                    if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+                        && active.pending_compaction.is_some()
+                    {
+                        context_compaction::record_summary_usage(
+                            &self.shared,
+                            active,
+                            run,
+                            &events,
+                            &mut prefix,
+                        );
+                        if let Some(outcome) = active.terminal {
+                            return Err(Terminal {
+                                outcome,
+                                error: active.terminal_error.clone(),
+                            });
+                        }
+                        if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                            return Err(Terminal::limit(
+                                "summary provider stream exceeded its bound",
+                            ));
+                        }
+                    }
                     return Err(match error.category() {
                         ErrorCategory::Cancelled => Terminal::cancelled_with(error),
                         ErrorCategory::Timeout => {
@@ -1191,16 +1574,44 @@ impl Runtime {
                 // publishes before the authoritative batch ingests.
                 self.drain_stream(run, &turn, &mut stream_rx, &stream_bytes, &mut prefix)
                     .await;
-                if stream_overflow.load(Ordering::SeqCst) {
-                    return Err(Terminal::limit(
-                        "provisional provider stream exceeded its bound",
-                    ));
+                self.check_completed_stream_limits(
+                    run,
+                    &events,
+                    &mut prefix,
+                    stream_overflow.load(Ordering::SeqCst),
+                )
+                .await?;
+                let result = self
+                    .ingest_model_batch(run, &turn, events, &mut prefix)
+                    .await;
+                if let Err(error) = self.persist_pending_source(run).await {
+                    let mut state = self.shared.state.lock().await;
+                    if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+                    {
+                        active.persistence_error = Some(error.clone());
+                    }
+                    return Err(Terminal::failed(error));
                 }
-                if prefix.exceeded {
-                    return Err(Terminal::limit("provisional output budget exhausted"));
+                if matches!(&result, Ok(RunState::ValidatingTools)) {
+                    let reduction = {
+                        let mut state = self.shared.state.lock().await;
+                        let Some(active) =
+                            state.active.as_mut().filter(|active| &active.run == run)
+                        else {
+                            return Err(Terminal::cancelled());
+                        };
+                        compact_context(active, self.shared.context_items_bound)?
+                    };
+                    if let Some(reduction) = reduction {
+                        let mut state = self.shared.state.lock().await;
+                        if let Some(active) =
+                            state.active.as_mut().filter(|active| &active.run == run)
+                        {
+                            publish_context_reduction(&self.shared, active, run, reduction);
+                        }
+                    }
                 }
-                self.ingest_model_batch(run, &turn, events, &mut prefix)
-                    .await
+                result
             }
             Some(Err(join)) => {
                 let message = if join.is_panic() {
@@ -1261,6 +1672,58 @@ impl Runtime {
         }
     }
 
+    async fn publish_model_request_finished(
+        &self,
+        run: &RunId,
+        turn: &TurnId,
+        response_validated: bool,
+    ) {
+        let mut state = self.shared.state.lock().await;
+        if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+            let outcome = emit_control(
+                &self.shared,
+                active,
+                run,
+                EventPayload::ModelRequestFinished {
+                    turn: turn.clone(),
+                    response_validated,
+                },
+            );
+            apply_control_outcome(active, outcome);
+        }
+    }
+
+    /// Account an available summary batch even when draining its provisional
+    /// prefixes exhausted a stream bound. Limit handling never commits memory.
+    async fn check_completed_stream_limits(
+        &self,
+        run: &RunId,
+        events: &[ProviderEvent],
+        prefix: &mut StreamedPrefix,
+        overflow: bool,
+    ) -> Result<(), Terminal> {
+        let message = if overflow {
+            "provisional provider stream exceeded its bound"
+        } else if prefix.exceeded {
+            "provisional output budget exhausted"
+        } else {
+            return Ok(());
+        };
+        let mut state = self.shared.state.lock().await;
+        if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+            && active.pending_compaction.is_some()
+        {
+            context_compaction::record_summary_usage(&self.shared, active, run, events, prefix);
+            if let Some(outcome) = active.terminal {
+                return Err(Terminal {
+                    outcome,
+                    error: active.terminal_error.clone(),
+                });
+            }
+        }
+        Err(Terminal::limit(message))
+    }
+
     /// Publishes one provisional provider event while its turn is still in
     /// flight. Only presentation-safe prefixes publish here: text fragments
     /// (flushed at once so the frontend updates now, not at the terminal),
@@ -1315,8 +1778,10 @@ impl Runtime {
                     .entry(item_key.clone())
                     .or_default()
                     .push_str(&text);
-                buffer_text_fragments(&self.shared, active, run, turn, &item_key, &text);
-                flush_text(&self.shared, active);
+                if active.pending_compaction.is_none() {
+                    buffer_text_fragments(&self.shared, active, run, turn, &item_key, &text);
+                    flush_text(&self.shared, active);
+                }
             }
             ProviderEvent::ToolCallDelta { item_key, .. } => {
                 if !record_identity(prefix, item_key.len()) {
@@ -1326,12 +1791,14 @@ impl Runtime {
                     return;
                 }
                 prefix.preview_keys.insert(item_key.clone());
-                emit_data(
-                    &self.shared,
-                    active,
-                    run,
-                    EventPayload::ToolCallPreview { item_key },
-                );
+                if active.pending_compaction.is_none() {
+                    emit_data(
+                        &self.shared,
+                        active,
+                        run,
+                        EventPayload::ToolCallPreview { item_key },
+                    );
+                }
             }
             ProviderEvent::Usage(usage) => {
                 if usage.finality() == UsageFinality::Provisional {
@@ -1379,6 +1846,20 @@ impl Runtime {
         events: Vec<ProviderEvent>,
         prefix: &mut StreamedPrefix,
     ) -> Result<RunState, Terminal> {
+        {
+            let mut state = self.shared.state.lock().await;
+            if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+                && active.pending_compaction.is_some()
+            {
+                return context_compaction::ingest_summary(
+                    &self.shared,
+                    active,
+                    run,
+                    events,
+                    prefix,
+                );
+            }
+        }
         // Full-turn atomic validation: duplicate references, partial/final
         // disagreement, and finish-reason conflicts fail before any
         // admission, identity consumption, or queue mutation. An honestly
@@ -1428,6 +1909,7 @@ impl Runtime {
             _ => None,
         };
         let successful_turn = terminal.as_ref().is_some_and(Result::is_ok);
+        context_compaction::calibrate_estimate(active, &events);
         let mut streamed_index = 0;
         let mut usage_prefix_matches = true;
         let mut unmatched_usage = prefix.usage_prefix.clone();
@@ -1587,15 +2069,77 @@ impl Runtime {
             }
             Ok(finished) => {
                 active.turns_used += 1;
-                if let Some(continuation) = finished.continuation().cloned() {
+                let continuation_compatible = finished.continuation().is_none_or(|continuation| {
                     let adapter = self.shared.provider.adapter_identity();
                     let scope = self.shared.provider.continuation_scope(&active.profile);
-                    if !continuation.is_compatible_with(adapter, &scope) {
+                    continuation.is_compatible_with(adapter, &scope)
+                });
+                if finished.reason() == FinishReason::OutputLimit {
+                    let recovery_attempted = !active.output_limit_recovery_used
+                        && active.continuation.is_none()
+                        && finished.continuation().is_none()
+                        && continuation_compatible
+                        && !active.cancelled
+                        && !active.token.is_cancelled()
+                        && StdInstant::now() < active.deadline
+                        && self
+                            .shared
+                            .limits
+                            .check_model_turns(active.turns_used)
+                            .is_ok();
+                    let mut argument_progress = HashMap::<&str, usize>::new();
+                    for event in &events {
+                        if let ProviderEvent::ToolCallDelta {
+                            item_key,
+                            assembled_bytes,
+                        } = event
+                        {
+                            let bytes = argument_progress.entry(item_key).or_default();
+                            *bytes = (*bytes).max(*assembled_bytes);
+                        }
+                    }
+                    let argument_progress_bytes = argument_progress
+                        .values()
+                        .fold(0usize, |sum, bytes| sum.saturating_add(*bytes));
+                    diagnostic(format_args!(
+                        "model output limit: turn={} text_bytes={} reasoning_bytes={} candidate_count={} argument_progress_bytes={} recovery_attempted={}",
+                        turn.as_str(),
+                        text_items
+                            .iter()
+                            .fold(0usize, |sum, (_, text)| sum.saturating_add(text.len())),
+                        reasoning.len(),
+                        candidates.len(),
+                        argument_progress_bytes,
+                        recovery_attempted,
+                    ));
+                    if !continuation_compatible {
                         return Err(Terminal::failed(runtime_error(
                             ErrorCategory::UnsupportedCapability,
                             "provider continuation is incompatible with this profile",
                         )));
                     }
+                    if active.cancelled || active.token.is_cancelled() {
+                        return Err(Terminal::cancelled());
+                    }
+                    if StdInstant::now() >= active.deadline {
+                        return Err(Terminal::limit("run duration exhausted"));
+                    }
+                    if recovery_attempted {
+                        // Drop the entire response: no candidate identity is allocated,
+                        // and no text, reasoning, arguments, or opaque state is replayed.
+                        // Request projection owns the bounded host recovery instruction.
+                        active.output_limit_recovery_used = true;
+                        return Ok(RunState::CallingModel);
+                    }
+                    return Err(Terminal::limit("model output limit reached"));
+                }
+                if !continuation_compatible {
+                    return Err(Terminal::failed(runtime_error(
+                        ErrorCategory::UnsupportedCapability,
+                        "provider continuation is incompatible with this profile",
+                    )));
+                }
+                if let Some(continuation) = finished.continuation().cloned() {
                     active.continuation = Some(continuation);
                 }
                 match finished.reason() {
@@ -1612,7 +2156,9 @@ impl Runtime {
                         Err(Terminal::completed())
                     }
                     FinishReason::Refusal => Err(Terminal::refused()),
-                    FinishReason::OutputLimit => Err(Terminal::limit("model output limit reached")),
+                    FinishReason::OutputLimit => {
+                        unreachable!("output limit handled before continuation adoption")
+                    }
                     FinishReason::Incomplete => Err(Terminal::failed(runtime_error(
                         ErrorCategory::Protocol,
                         "model turn ended incomplete",
@@ -1632,11 +2178,6 @@ impl Runtime {
                             candidates,
                             if has_text { "" } else { &reasoning },
                         )?;
-                        if let Some(reduction) =
-                            compact_context(active, self.shared.context_items_bound)?
-                        {
-                            publish_context_reduction(&self.shared, active, run, reduction);
-                        }
                         Ok(RunState::ValidatingTools)
                     }
                 }
@@ -2193,10 +2734,128 @@ impl Runtime {
                 self.shared.effective_output_budget,
                 tool_deadline.saturating_duration_since(active.started),
                 false,
-                scope,
+                scope.clone(),
             )
             .map_err(|_| Terminal::failed_internal("tool context is invalid"))?
             .with_control(active.token.clone(), tool_deadline);
+            let intent = ToolIntentRecord {
+                run: call.run().clone(),
+                call: call.call().clone(),
+                tool: call.tool().clone(),
+                args: call.args().clone(),
+                scope,
+            };
+            let tool = registered.port.clone();
+            let wake = active.wake.clone();
+            let token = active.token.clone();
+            (
+                active.session.clone(),
+                call,
+                tool,
+                context,
+                tool_deadline,
+                wake,
+                token,
+                intent,
+            )
+        };
+        let (session, call, tool, context, tool_deadline, wake, token, intent) = setup;
+        let call_id = call.call().clone();
+        if let Err(error) = self.persist_tool_intent(&session, intent.clone()).await {
+            let mut state = self.shared.state.lock().await;
+            if let Some(active) = state.active.as_mut()
+                && &active.run == run
+            {
+                active.persistence_error = Some(error.clone());
+                if active.terminal.is_none() {
+                    active.terminal = Some(RunOutcome::Failed);
+                    active.terminal_error = Some(error);
+                }
+                active.outcome_slot = Some((
+                    call_id,
+                    ToolOutcome::new(
+                        ExecutionStatus::Failed,
+                        EffectState::NotStarted,
+                        Evidence::HostObserved,
+                        "tool intent could not be persisted",
+                        false,
+                    )
+                    .expect("bounded not-started persistence outcome builds"),
+                ));
+                return Ok(RunState::RecordingResult);
+            }
+            return Err(Terminal::cancelled());
+        }
+
+        // Persistence may block long enough for cancellation, deadline, or a
+        // scoped approval to change. Revalidate all dispatch authority after
+        // the durable intent and immediately before marking the call started.
+        {
+            let mut state = self.shared.state.lock().await;
+            let Some(active) = state.active.as_mut() else {
+                return Err(Terminal::cancelled());
+            };
+            if &active.run != run {
+                return Err(Terminal::cancelled());
+            }
+            if active.cancelled || active.token.is_cancelled() {
+                active.outcome_slot =
+                    Some((call_id, cancelled_outcome("cancelled before dispatch")));
+                active.force_terminal = Some(RunOutcome::Cancelled);
+                return Ok(RunState::RecordingResult);
+            }
+            if StdInstant::now() >= active.deadline {
+                active.outcome_slot = Some((
+                    call_id,
+                    timeout_outcome("run deadline passed before dispatch"),
+                ));
+                active.force_terminal = Some(RunOutcome::LimitReached);
+                return Ok(RunState::RecordingResult);
+            }
+            let Some(current) = active.current.as_ref() else {
+                return Ok(RunState::ValidatingTools);
+            };
+            let authorization = if let Some(binding) = current.binding.as_ref() {
+                binding
+                    .check_valid_for_dispatch(
+                        call.run(),
+                        call.call(),
+                        call.tool(),
+                        call.args(),
+                        self.shared.policy.revision(),
+                        active.started.elapsed(),
+                    )
+                    .ok()
+                    .map(|()| binding.scope().clone())
+            } else {
+                let Some(registered) = self.shared.tools.get(call.tool().name()) else {
+                    active.outcome_slot = Some((
+                        call_id,
+                        denied_outcome("tool registration changed before dispatch"),
+                    ));
+                    return Ok(RunState::RecordingResult);
+                };
+                self.shared
+                    .policy
+                    .authorize_with_directories(
+                        &call,
+                        self.shared
+                            .session_directories
+                            .lock()
+                            .expect("session permissions lock")
+                            .get(&active.session)
+                            .map_or(&[], Vec::as_slice),
+                        registered.access,
+                    )
+                    .ok()
+            };
+            if authorization.as_ref() != Some(&intent.scope) {
+                active.outcome_slot = Some((
+                    call_id,
+                    denied_outcome("dispatch authority changed during persistence"),
+                ));
+                return Ok(RunState::RecordingResult);
+            }
             let delivery = emit_control(
                 &self.shared,
                 active,
@@ -2214,13 +2873,7 @@ impl Runtime {
             if let Some(current) = active.current.as_mut() {
                 current.dispatched = true;
             }
-            let tool = registered.port.clone();
-            let wake = active.wake.clone();
-            let token = active.token.clone();
-            (call, tool, context, tool_deadline, wake, token)
-        };
-        let (call, tool, context, tool_deadline, wake, token) = setup;
-        let call_id = call.call().clone();
+        }
         let mut handle = tokio::task::spawn_blocking(move || tool.execute(&call, &context));
         let mut cancelled_first = false;
         let joined = loop {
@@ -2287,12 +2940,48 @@ impl Runtime {
     }
 
     async fn on_recording(&self, run: &RunId) -> Result<RunState, Terminal> {
+        let pending_record = {
+            let state = self.shared.state.lock().await;
+            state
+                .active
+                .as_ref()
+                .filter(|active| &active.run == run)
+                .and_then(|active| {
+                    active
+                        .outcome_slot
+                        .as_ref()
+                        .map(|(call, outcome)| {
+                            let outcome = bound_outcome(&self.shared, outcome.clone());
+                            ToolOutcomeRecord {
+                                run: active.run.clone(),
+                                call: call.clone(),
+                                status: outcome.status(),
+                                effect: outcome.effect(),
+                                evidence: outcome.evidence(),
+                                truncated: outcome.is_truncated(),
+                            }
+                        })
+                        .map(|record| (active.session.clone(), record))
+                })
+        };
+        let persistence_error = if let Some((session, record)) = pending_record {
+            self.persist_tool_outcome(&session, record).await.err()
+        } else {
+            None
+        };
         let mut state = self.shared.state.lock().await;
         let Some(active) = state.active.as_mut() else {
             return Err(Terminal::cancelled());
         };
         if &active.run != run {
             return Err(Terminal::cancelled());
+        }
+        if let Some(error) = persistence_error {
+            active.persistence_error = Some(error.clone());
+            if active.terminal.is_none() {
+                active.terminal = Some(RunOutcome::Failed);
+                active.terminal_error = Some(error);
+            }
         }
         let Some((call, outcome)) = active.outcome_slot.take() else {
             return Ok(RunState::ValidatingTools);
@@ -2325,13 +3014,33 @@ impl Runtime {
             EventPayload::ToolFinished(ToolFinishedInfo { call, outcome }),
         );
         apply_required_control_outcome(active, delivery);
-        if let Some(outcome) = active.force_terminal.take() {
+        let forced_terminal = active.force_terminal.take();
+        if let Some(outcome) = forced_terminal {
             active.terminal = Some(outcome);
+        }
+        drop(state);
+        if let Err(error) = self.persist_pending_source(run).await {
+            let mut state = self.shared.state.lock().await;
+            if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+                active.persistence_error = Some(error.clone());
+                if active.terminal.is_none() {
+                    active.terminal = Some(RunOutcome::Failed);
+                    active.terminal_error = Some(error);
+                }
+            }
+            return Ok(RunState::Finished);
+        }
+        let mut state = self.shared.state.lock().await;
+        let Some(active) = state.active.as_mut().filter(|active| &active.run == run) else {
+            return Err(Terminal::cancelled());
+        };
+        if active.terminal.is_some() {
             return Ok(RunState::Finished);
         }
         if let Some(reduction) = compact_context(active, self.shared.context_items_bound)? {
             publish_context_reduction(&self.shared, active, run, reduction);
         }
+        active.source_cursor = active.conversation.len();
         if active.queue.is_empty() {
             Ok(RunState::Preparing)
         } else {
@@ -2346,6 +3055,254 @@ impl Runtime {
         {
             active.phase = phase;
         }
+    }
+
+    async fn persist_tool_intent(
+        &self,
+        session: &SessionId,
+        intent: ToolIntentRecord,
+    ) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
+        let run = intent.run.clone();
+        let session = session.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.record_session_intent(&session, &intent)
+        });
+        self.await_store(&run, worker).await
+    }
+
+    async fn persist_tool_outcome(
+        &self,
+        session: &SessionId,
+        outcome: ToolOutcomeRecord,
+    ) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
+        let run = outcome.run.clone();
+        let session = session.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.record_session_outcome(&session, &outcome)
+        });
+        self.await_store(&run, worker).await
+    }
+
+    async fn persist_session_input(
+        &self,
+        session: &SessionId,
+        profile: &str,
+        run: &RunId,
+        item: &ModelContextItem,
+        already_initialized: bool,
+    ) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
+        let owner = run.clone();
+        let session = session.clone();
+        let profile = profile.to_owned();
+        let run = run.clone();
+        let item = item.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            let checkpoint = SessionCheckpoint::new(
+                session.clone(),
+                STORE_FORMAT_REVISION,
+                0,
+                Vec::<nexus_core::store::StoredMessage>::new(),
+                profile,
+            )?;
+            let created = store.initialize_session(&checkpoint)?;
+            if !created && !already_initialized {
+                let existing = store.load_session(&session)?;
+                if !existing.messages().is_empty() || store.last_source_sequence(&session)? > 0 {
+                    return Err(runtime_error(
+                        ErrorCategory::StorageFailure,
+                        "session history must be explicitly restored before submitting",
+                    ));
+                }
+            }
+            store.append_source_items(&session, &run, &[item])?;
+            Ok(())
+        });
+        self.await_store(&owner, worker).await
+    }
+
+    /// Commits every newly accepted context item before the runtime advances
+    /// to another phase. Source history is append-only even when the active
+    /// model context is later compacted.
+    async fn persist_pending_source(&self, run: &RunId) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
+        let (session, items, cursor) = {
+            let state = self.shared.state.lock().await;
+            let Some(active) = state.active.as_ref().filter(|active| &active.run == run) else {
+                return Err(runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "active session disappeared before source history commit",
+                ));
+            };
+            if active.source_cursor > active.conversation.len() {
+                return Err(runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "active source history cursor is invalid",
+                ));
+            }
+            (
+                active.session.clone(),
+                active.conversation[active.source_cursor..].to_vec(),
+                active.source_cursor,
+            )
+        };
+        if items.is_empty() {
+            return Ok(());
+        }
+        let store_session = session.clone();
+        let store_run = run.clone();
+        let store_items = items.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.append_source_items(&store_session, &store_run, &store_items)
+        });
+        self.await_store(run, worker).await?;
+
+        let mut state = self.shared.state.lock().await;
+        let Some(active) = state.active.as_mut().filter(|active| &active.run == run) else {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "active session changed after source history commit",
+            ));
+        };
+        if active.source_cursor != cursor {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "active source history cursor changed during commit",
+            ));
+        }
+        active.source_cursor = cursor.saturating_add(items.len());
+        Ok(())
+    }
+
+    /// Blocking writes cannot be preempted. Stop waiting at live cancellation
+    /// or the run deadline, retain the worker, and refuse further store use
+    /// until the host reopens/reconciles it.
+    async fn await_store<T: Send + 'static>(
+        &self,
+        run: &RunId,
+        mut worker: JoinHandle<Result<T, AgentError>>,
+    ) -> Result<T, AgentError> {
+        let control = {
+            let state = self.shared.state.lock().await;
+            state
+                .active
+                .as_ref()
+                .filter(|active| &active.run == run)
+                .map(|active| (active.token.clone(), active.wake.clone(), active.deadline))
+        };
+        let mut interrupted = RunOutcome::Cancelled;
+        if let Some((token, wake, deadline)) = control {
+            loop {
+                if token.is_cancelled() {
+                    break;
+                }
+                if StdInstant::now() >= deadline {
+                    interrupted = RunOutcome::LimitReached;
+                    break;
+                }
+                tokio::select! {
+                    result = &mut worker => {
+                        return match result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                self.shared.store_uncertain.store(true, Ordering::SeqCst);
+                                Err(runtime_error(ErrorCategory::StorageFailure, "session store worker failed; reopen required"))
+                            }
+                        };
+                    }
+                    () = wake.notified() => {}
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                }
+            }
+        }
+        let error = runtime_error(
+            ErrorCategory::StorageFailure,
+            "session store write interrupted; reopen required",
+        );
+        self.shared.store_uncertain.store(true, Ordering::SeqCst);
+        {
+            let mut state = self.shared.state.lock().await;
+            state.quarantine.push(QuarantineMeta {
+                run: run.clone(),
+                call: None,
+            });
+            if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+                active.persistence_error = Some(error.clone());
+                if active.terminal.is_none() {
+                    active.terminal = Some(interrupted);
+                }
+            }
+        }
+        let shared = self.shared.clone();
+        let run = run.clone();
+        tokio::spawn(async move {
+            let _ = worker.await;
+            shared
+                .state
+                .lock()
+                .await
+                .quarantine
+                .retain(|meta| !(meta.run == run && meta.call.is_none()));
+        });
+        Err(error)
     }
 
     async fn set_terminal(&self, run: &RunId, outcome: RunOutcome, error: Option<AgentError>) {
@@ -2463,8 +3420,16 @@ impl Runtime {
                 );
             }
         }
-        let finished = RunFinished::new(outcome, PersistenceState::Ephemeral, None)
-            .expect("ephemeral terminal record builds");
+        let persistence_error = active.persistence_error.clone();
+        let persistence = if persistence_error.is_some() {
+            PersistenceState::SaveFailed
+        } else if self.shared.session_store.is_some() {
+            PersistenceState::Saved
+        } else {
+            PersistenceState::Ephemeral
+        };
+        let finished = RunFinished::new(outcome, persistence, persistence_error)
+            .expect("terminal persistence record builds");
         let finished = match error.clone() {
             Some(error) => finished.with_error(error),
             None => finished,
@@ -2508,8 +3473,11 @@ impl Runtime {
                     && (outcome.effect() == EffectState::Unknown
                         || outcome.evidence() == Evidence::Uncertain))
             });
-        let preserve_uncertain_exchange =
-            has_uncertain_outcome && (has_uncertain_result || unrecorded_current_call);
+        let has_projected_evidence = active.conversation[active.history_len..]
+            .iter()
+            .any(is_retained_evidence);
+        let preserve_uncertain_exchange = has_projected_evidence
+            || (has_uncertain_outcome && (has_uncertain_result || unrecorded_current_call));
         if unrecorded_current_call {
             // The tool may have been dispatched, but no result was recorded;
             // there is no complete exchange to carry forward safely.
@@ -2520,7 +3488,11 @@ impl Runtime {
         // The exception is a narrowly retained exchange containing an
         // uncertain tool effect: it is required evidence against blind retry.
         if outcome == RunOutcome::Completed || preserve_uncertain_exchange {
-            let mut items = active.conversation[active.history_len..].to_vec();
+            let mut items = if outcome == RunOutcome::Completed {
+                active.conversation.clone()
+            } else {
+                active.conversation[active.history_len..].to_vec()
+            };
             if outcome != RunOutcome::Completed {
                 let complete_dispatched_calls: HashSet<CallId> = items
                     .iter()
@@ -2541,7 +3513,7 @@ impl Runtime {
                     ModelContextItem::ToolResult { call, .. } => {
                         complete_dispatched_calls.contains(call)
                     }
-                    _ => is_context_notice(item),
+                    _ => is_context_notice(item) || is_retained_evidence(item),
                 });
                 if history_exchange_effects_certain(&items) {
                     // The terminal summary says the effect was uncertain but
@@ -2549,32 +3521,69 @@ impl Runtime {
                     state.history_safety_exhausted = true;
                 }
             }
+            // The completed request can contain inherited exchanges plus the
+            // new answer. Admit the current exchange as before, then let the
+            // cache's whole-exchange eviction enforce its aggregate ceiling.
+            // Checking the entire projected transcript here would silently
+            // keep stale history whenever appending an answer crosses the cap.
+            let current_items = if outcome == RunOutcome::Completed {
+                &items[active.history_len..]
+            } else {
+                &items
+            };
             if !context_calls_are_paired(&items) {
                 // Never cache orphan results or incomplete calls, including
                 // defensive terminal paths that bypass normal recording.
                 state.history_safety_exhausted = true;
-            } else if items.len() <= self.shared.context_items_bound
-                && conversation_bytes(&items) <= nexus_core::provider::MAX_CONVERSATION_BYTES
+            } else if current_items.len() <= self.shared.context_items_bound
+                && conversation_bytes(current_items) <= nexus_core::provider::MAX_CONVERSATION_BYTES
             {
                 if outcome == RunOutcome::Completed && active.pending_omission_items > 0 {
                     state
                         .history_omissions
                         .retain(|omission| omission.session != active.session);
                 }
-                state.history.push_back(RetainedExchange {
-                    session: active.session.clone(),
-                    items,
-                });
+                if outcome == RunOutcome::Completed && active.inherited_history {
+                    // Commit the selected projection, not the original cache:
+                    // omitted summary sources must not reappear next submit.
+                    state
+                        .history
+                        .retain(|exchange| exchange.session != active.session);
+                }
+                let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
+                for item in items {
+                    if exchanges.is_empty() || matches!(item, ModelContextItem::UserText(_)) {
+                        exchanges.push(Vec::new());
+                    }
+                    exchanges.last_mut().expect("exchange exists").push(item);
+                }
+                let last = exchanges.len().saturating_sub(1);
+                for (index, items) in exchanges.into_iter().enumerate() {
+                    state.history.push_back(RetainedExchange {
+                        session: active.session.clone(),
+                        items,
+                        derived_memory: if outcome == RunOutcome::Completed && index == last {
+                            active.derived_memory.clone()
+                        } else {
+                            None
+                        },
+                    });
+                }
                 while state
                     .history
                     .iter()
-                    .map(|exchange| exchange.items.len())
+                    .map(|exchange| {
+                        exchange.items.len() + usize::from(exchange.derived_memory.is_some())
+                    })
                     .sum::<usize>()
                     > self.shared.context_items_bound
                     || state
                         .history
                         .iter()
-                        .map(|exchange| conversation_bytes(&exchange.items))
+                        .map(|exchange| {
+                            conversation_bytes(&exchange.items)
+                                .saturating_add(memory_bytes(exchange.derived_memory.as_deref()))
+                        })
                         .sum::<usize>()
                         > nexus_core::provider::MAX_CONVERSATION_BYTES
                 {
@@ -2604,7 +3613,26 @@ impl Runtime {
                     }
                 }
             } else {
-                mark_history_omitted(&mut state, active.session.clone(), items.len());
+                let omitted_items = if outcome == RunOutcome::Completed && active.inherited_history
+                {
+                    // Cache rejection must not resurrect source exchanges
+                    // removed from this completed run's selected projection.
+                    // Keep uncertain effects even when their replacement
+                    // cannot be admitted into the finite cache.
+                    let mut removed_items = current_items.len();
+                    state.history.retain(|exchange| {
+                        let remove = exchange.session == active.session
+                            && history_exchange_effects_certain(&exchange.items);
+                        if remove {
+                            removed_items = removed_items.saturating_add(exchange.items.len());
+                        }
+                        !remove
+                    });
+                    removed_items
+                } else {
+                    items.len()
+                };
+                mark_history_omitted(&mut state, active.session.clone(), omitted_items);
                 if preserve_uncertain_exchange || !history_exchange_effects_certain(&items) {
                     state.history_safety_exhausted = true;
                 }
@@ -2761,13 +3789,18 @@ fn compact_context(
 ) -> Result<Option<ContextReduction>, Terminal> {
     // Stage reductions so a context that ultimately cannot fit is not left
     // partially altered before its explicit limit terminal.
-    let mut items = active.conversation.clone();
-    let mut history_len = active.history_len;
-    let mut bytes = conversation_bytes(&items)
+    let items = &active.conversation;
+    let memory_items = usize::from(active.derived_memory.is_some());
+    let item_bound = bound.saturating_sub(memory_items);
+    let bytes = conversation_bytes(items)
         .saturating_add(active.instruction_bytes)
-        .saturating_add(active.context_note_bytes);
+        .saturating_add(active.context_note_bytes)
+        .saturating_add(context_compaction::projection_overhead(
+            active,
+            &active.context_note,
+        ));
     let notice_count = items.iter().filter(|item| is_context_notice(item)).count();
-    if items.len() <= bound
+    if items.len() <= item_bound
         && bytes <= nexus_core::provider::MAX_CONVERSATION_BYTES
         && notice_count <= 1
     {
@@ -2779,110 +3812,139 @@ fn compact_context(
         return Err(context_limit(active, bound));
     }
 
-    let mut removed_items = notice_count;
-    // Remove legacy in-history notices before choosing exchanges. New omission
-    // notices live outside history, so they cannot consume retained-item slots
-    // or become part of a later cached exchange.
-    let historical_notices = items[..history_len]
-        .iter()
-        .filter(|item| is_context_notice(item))
-        .count();
-    items.retain(|item| !is_context_notice(item));
-    history_len -= historical_notices;
-    if !matches!(items.get(history_len), Some(ModelContextItem::UserText(_))) {
-        return Err(context_limit(active, bound));
-    }
     let note = if active.context_note.is_empty() {
         CONTEXT_NOTICE_TEXT
     } else {
         active.context_note.as_str()
     };
     let note_bytes = runtime_note_bytes(note, active.instruction_bytes > 0);
-    bytes = conversation_bytes(&items)
-        .saturating_add(active.instruction_bytes)
-        .saturating_add(note_bytes);
-    while items.len() > bound || bytes > nexus_core::provider::MAX_CONVERSATION_BYTES {
-        let (start, end) = if history_len > 0 {
-            let end = items[..history_len]
-                .iter()
-                .enumerate()
-                .skip(1)
-                .find_map(|(index, item)| {
-                    matches!(item, ModelContextItem::UserText(_)).then_some(index)
-                })
-                .unwrap_or(history_len);
-            if !history_exchange_effects_certain(&items[..end]) {
-                // Historical tool evidence is still needed to avoid an
-                // unsafe blind retry. Never discard it to satisfy this run's
-                // smaller context budget.
-                return Err(context_limit(active, bound));
-            }
-            (0, end)
-        } else {
-            let Some(range) = oldest_removable_exchange(&items) else {
-                return Err(context_limit(active, bound));
-            };
-            range
-        };
+    let reserved_bytes = active
+        .instruction_bytes
+        .saturating_add(note_bytes)
+        .saturating_add(context_compaction::projection_overhead(active, note));
+    let projection = project_bounded_history(
+        items,
+        active.history_len,
+        ContextBounds {
+            max_items: bound,
+            max_bytes: nexus_core::provider::MAX_CONVERSATION_BYTES,
+            reserved_items: memory_items,
+            reserved_bytes,
+        },
+    )
+    .ok_or_else(|| context_limit(active, bound))?;
 
-        let range_bytes = conversation_bytes(&items[start..end]);
-        bytes = bytes.saturating_sub(range_bytes);
-        let count_removed = end - start;
-        items.drain(start..end);
-        if start == 0 {
-            history_len -= end;
-        }
-        removed_items = removed_items.saturating_add(count_removed);
-    }
-
-    active.conversation = items;
-    active.history_len = history_len;
-    if removed_items > 0 {
+    active.conversation = projection.items;
+    // All original items have been archived before any context projection.
+    // The cursor is an index in this new view, not the archival sequence.
+    active.source_cursor = active.conversation.len();
+    active.history_len = projection.history_len;
+    if projection.removed_items > 0 {
         active.context_note = note.to_owned();
         active.context_note_bytes = note_bytes;
     }
     Ok(Some(ContextReduction {
-        removed_items,
-        retained_items: active.conversation.len(),
-        retained_bytes: bytes,
+        method: nexus_core::ContextReductionMethod::BoundedHistory,
+        removed_items: projection.removed_items,
+        retained_items: active.conversation.len() + memory_items,
+        retained_bytes: projection.retained_bytes,
     }))
-}
-
-fn history_exchange_effects_certain(items: &[ModelContextItem]) -> bool {
-    items.iter().all(|item| match item {
-        ModelContextItem::ToolResult { outcome, .. } => {
-            outcome.effect() != EffectState::Unknown && outcome.evidence() != Evidence::Uncertain
-        }
-        _ => true,
-    })
-}
-
-fn context_calls_are_paired(items: &[ModelContextItem]) -> bool {
-    let mut seen = HashSet::new();
-    let mut pending = HashSet::new();
-    for item in items {
-        match item {
-            ModelContextItem::AssistantCall { call, .. } => {
-                if !seen.insert(call.call()) || !pending.insert(call.call()) {
-                    return false;
-                }
-            }
-            ModelContextItem::AssistantDeniedCall { call, .. } => {
-                if !seen.insert(call) || !pending.insert(call) {
-                    return false;
-                }
-            }
-            ModelContextItem::ToolResult { call, .. } if !pending.remove(call) => return false,
-            _ => {}
-        }
-    }
-    pending.is_empty()
 }
 
 #[cfg(test)]
 fn context_notice_item() -> Result<ModelContextItem, Terminal> {
     ModelContextItem::assistant_text(CONTEXT_NOTICE_ITEM_KEY, CONTEXT_NOTICE_TEXT)
         .map_err(Terminal::failed)
+}
+
+fn restore_items(source: Vec<ModelContextItem>) -> Result<Vec<ModelContextItem>, ()> {
+    let mut results = HashSet::new();
+    for item in &source {
+        if let ModelContextItem::ToolResult { call, .. } = item {
+            results.insert(call.clone());
+        }
+    }
+    let mut restored = Vec::with_capacity(source.len());
+    for item in source {
+        match &item {
+            ModelContextItem::AssistantCall {
+                item_key,
+                provider_ref,
+                call,
+                ..
+            } if !results.contains(call.call()) => {
+                let call_id = call.call().clone();
+                let item_key = item_key.as_str().to_owned();
+                let provider_ref = provider_ref.as_str().to_owned();
+                let tool = call.tool().clone();
+                let uncertain = ToolOutcome::new(
+                    ExecutionStatus::Interrupted,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "Session ended before this tool call recorded an outcome; effects are unknown.",
+                    false,
+                )
+                .map_err(|_| ())?;
+                restored.push(item);
+                restored.push(
+                    ModelContextItem::tool_result(call_id, item_key, provider_ref, tool, uncertain)
+                        .map_err(|_| ())?,
+                );
+            }
+            _ => restored.push(item),
+        }
+    }
+    if !context_calls_are_paired(&restored)
+        || restored
+            .first()
+            .is_some_and(|item| !matches!(item, ModelContextItem::UserText(_)))
+    {
+        return Err(());
+    }
+    Ok(restored)
+}
+
+fn bounded_restored_history(
+    mut items: Vec<ModelContextItem>,
+    max_items: usize,
+) -> Option<(Vec<ModelContextItem>, usize)> {
+    if items.is_empty() {
+        return Some((items, 0));
+    }
+    let original_len = items.len();
+    // The projection API selects inherited exchanges before a current user
+    // turn. A temporary sentinel provides that boundary and is removed before
+    // anything is installed into runtime state.
+    items.push(ModelContextItem::user_text("restore-boundary").ok()?);
+    let projection = project_bounded_history(
+        &items,
+        original_len,
+        ContextBounds {
+            max_items,
+            max_bytes: nexus_core::provider::MAX_CONVERSATION_BYTES,
+            reserved_items: 0,
+            reserved_bytes: 0,
+        },
+    )?;
+    let mut retained = projection.items;
+    if !matches!(retained.pop(), Some(ModelContextItem::UserText(_))) {
+        return None;
+    }
+    let removed = original_len.saturating_sub(retained.len());
+    Some((retained, removed))
+}
+
+fn split_history_exchanges(items: &[ModelContextItem]) -> Vec<Vec<ModelContextItem>> {
+    let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
+    for item in items {
+        if matches!(item, ModelContextItem::UserText(_)) {
+            exchanges.push(Vec::new());
+        }
+        if let Some(exchange) = exchanges.last_mut() {
+            exchange.push(item.clone());
+        }
+    }
+    exchanges
 }
 
 fn runtime_note_bytes(note: &str, has_host_instructions: bool) -> usize {
@@ -2894,34 +3956,26 @@ fn runtime_note_bytes(note: &str, has_host_instructions: bool) -> usize {
         .saturating_add(usize::from(has_host_instructions) * 2)
 }
 
-fn is_context_notice(item: &ModelContextItem) -> bool {
-    matches!(
-        item,
-        ModelContextItem::AssistantText { item_key, text, .. }
-            if item_key.as_str() == CONTEXT_NOTICE_ITEM_KEY
-                && text.as_str() == CONTEXT_NOTICE_TEXT
-    )
-}
-
 fn publish_context_reduction(
     shared: &Arc<Shared>,
     active: &mut ActiveRun,
     run: &RunId,
     reduction: ContextReduction,
 ) {
-    eprintln!(
+    diagnostic(format_args!(
         "nexus-runtime: context reduced: removed_items={} retained_items={} max_items={} retained_bytes={} max_bytes={}",
         reduction.removed_items,
         reduction.retained_items,
         shared.context_items_bound,
         reduction.retained_bytes,
         nexus_core::provider::MAX_CONVERSATION_BYTES,
-    );
-    emit_data(
+    ));
+    let outcome = emit_control(
         shared,
         active,
         run,
         EventPayload::ContextReduced {
+            method: reduction.method,
             removed_items: reduction.removed_items,
             retained_items: reduction.retained_items,
             item_limit: shared.context_items_bound,
@@ -2929,67 +3983,7 @@ fn publish_context_reduction(
             byte_limit: nexus_core::provider::MAX_CONVERSATION_BYTES,
         },
     );
-}
-
-/// Calls for a turn precede its results (including denied proposals). Only a
-/// complete exchange with conclusive effects may be evicted. Protect the
-/// current task and any runtime-authored context notice.
-fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, usize)> {
-    if !matches!(items.first(), Some(ModelContextItem::UserText(_))) {
-        return None;
-    }
-    let start = if items.get(1).is_some_and(is_context_notice) {
-        2
-    } else {
-        1
-    };
-    let mut pending = HashSet::new();
-    let mut effects_certain = true;
-    let mut first_end = None;
-    for (index, item) in items.iter().enumerate().skip(start) {
-        match item {
-            ModelContextItem::AssistantCall { call, .. } => {
-                if !pending.insert(call.call()) {
-                    return None;
-                }
-                if pending.len() == 1 {
-                    effects_certain = true;
-                }
-            }
-            ModelContextItem::AssistantDeniedCall { call, .. } => {
-                if !pending.insert(call) {
-                    return None;
-                }
-                if pending.len() == 1 {
-                    effects_certain = true;
-                }
-            }
-            ModelContextItem::ToolResult { call, outcome, .. } => {
-                if !pending.remove(call) {
-                    return None;
-                }
-                effects_certain &= outcome.effect() != EffectState::Unknown
-                    && outcome.evidence() != Evidence::Uncertain
-                    && !matches!(
-                        outcome.status(),
-                        ExecutionStatus::Cancelled | ExecutionStatus::TimedOut
-                    );
-                if pending.is_empty() {
-                    if !effects_certain {
-                        // Keep evidence needed to avoid a blind retry.
-                        return None;
-                    }
-                    if let Some(end) = first_end {
-                        return Some((start, end));
-                    }
-                    first_end = Some(index + 1);
-                }
-            }
-            ModelContextItem::UserText(_) => return None,
-            _ => {}
-        }
-    }
-    None
+    apply_control_outcome(active, outcome);
 }
 
 fn context_limit(active: &ActiveRun, bound: usize) -> Terminal {
@@ -3189,12 +4183,15 @@ fn control_event_bytes(event: &RunEvent) -> usize {
             text.turn.as_str().len() + text.item_key.len() + text.text.len()
         }
         EventPayload::ContextReduced {
+            method,
             removed_items: _,
             retained_items: _,
             item_limit: _,
             retained_bytes: _,
             byte_limit: _,
-        } => 5 * std::mem::size_of::<usize>(),
+        } => method.as_str().len() + 5 * std::mem::size_of::<usize>(),
+        EventPayload::ModelRequestStarted { turn, .. } => turn.as_str().len() + 64,
+        EventPayload::ModelRequestFinished { turn, .. } => turn.as_str().len() + 16,
         EventPayload::ToolCallPreview { item_key } => item_key.len(),
         EventPayload::ApprovalRequired(notice) => {
             notice.approval.as_str().len()
@@ -4469,7 +5466,7 @@ mod tests {
                 CommandReply::StaleOrUnknownTarget
             );
             let (events, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
-            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert_eq!(finished.outcome(), RunOutcome::Completed, "{finished:?}");
             assert!(
                 !events
                     .control
@@ -5984,7 +6981,7 @@ mod cov_runtime_private {
         }
     }
 
-    fn shared_with_data() -> (Arc<Shared>, mpsc::Receiver<RunEvent>) {
+    pub(super) fn shared_with_data() -> (Arc<Shared>, mpsc::Receiver<RunEvent>) {
         let (runtime, streams) = Runtime::new(
             RuntimeConfig {
                 limits: Limits::m0_test(),
@@ -5997,8 +6994,26 @@ mod cov_runtime_private {
         (runtime.shared, streams.data)
     }
 
+    pub(super) fn shared_with_control() -> (Arc<Shared>, mpsc::Receiver<RunEvent>) {
+        let (runtime, streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        (runtime.shared, streams.control)
+    }
+
     fn active_for(run: &RunId) -> ActiveRun {
         ActiveRun {
+            context_management: nexus_core::ContextManagementSettings::default(),
+            derived_memory: None,
+            pending_compaction: None,
+            input_estimate: 0,
+            token_estimator: TokenEstimator::default(),
             instruction_bytes: 0,
             context_note: String::new(),
             context_note_bytes: 0,
@@ -6019,9 +7034,12 @@ mod cov_runtime_private {
             approval_seq: 0,
             turns_used: 0,
             calls_used: 0,
+            output_limit_recovery_used: false,
             continuation: None,
             conversation: Vec::new(),
+            source_cursor: 0,
             history_len: 0,
+            inherited_history: false,
             initial_context_reduction: None,
             pending_omission_items: 0,
             queue: VecDeque::new(),
@@ -6041,12 +7059,17 @@ mod cov_runtime_private {
             force_terminal: None,
             terminal: None,
             terminal_error: None,
+            persistence_error: None,
             delivery_closed: false,
             finished_sent: false,
         }
     }
 
-    fn context_exchange(run: &RunId, n: usize, output_bytes: usize) -> Vec<ModelContextItem> {
+    pub(super) fn context_exchange(
+        run: &RunId,
+        n: usize,
+        output_bytes: usize,
+    ) -> Vec<ModelContextItem> {
         let call = ToolCall::new(
             run.clone(),
             TurnId::new(format!("turn-{n}")).expect("valid turn"),
@@ -6076,7 +7099,7 @@ mod cov_runtime_private {
         ]
     }
 
-    fn context_run() -> ActiveRun {
+    pub(super) fn context_run() -> ActiveRun {
         let mut active = active_for(&RunId::new("run-context").expect("valid run"));
         active
             .conversation
@@ -6405,6 +7428,7 @@ mod cov_runtime_private {
                 .push_back(RetainedExchange {
                     session: session.clone(),
                     items: previous.conversation,
+                    derived_memory: None,
                 });
             let response = runtime
                 .submit(
@@ -6472,6 +7496,7 @@ mod cov_runtime_private {
                 state.history.push_back(RetainedExchange {
                     session: active.session.clone(),
                     items: active.conversation.clone(),
+                    derived_memory: None,
                 });
                 state.active = Some(active);
             }
@@ -6501,11 +7526,13 @@ mod cov_runtime_private {
     fn history_omission_markers_are_bounded_with_a_global_fallback() {
         let mut state = State {
             active: None,
+            restore_busy: false,
             last: None,
             history: VecDeque::new(),
             history_omissions: Vec::new(),
             history_omission_fallback_items: 0,
             history_safety_exhausted: false,
+            durable_sessions: HashSet::new(),
             quarantine: Vec::new(),
         };
         for index in 0..=MAX_HISTORY_OMISSION_SESSIONS {
@@ -6580,6 +7607,46 @@ mod cov_runtime_private {
                 "a completed cached exchange carries the notice forward"
             );
         });
+    }
+
+    #[test]
+    fn failed_run_preserves_projected_uncertainty_without_native_tool_records() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (runtime, _streams) = Runtime::new(
+                    RuntimeConfig {
+                        limits: Limits::m0_test(),
+                        policy: Policy::m0_test(),
+                        has_approval_handler: false,
+                    },
+                    Arc::new(NoopProvider),
+                    Vec::new(),
+                );
+                let mut active = context_run();
+                let evidence = ModelContextItem::assistant_text(
+                    nexus_context::EVIDENCE_KEY,
+                    format!(
+                        "{}call=old-call effect=Unknown",
+                        nexus_context::EVIDENCE_LABEL
+                    ),
+                )
+                .unwrap();
+                active.conversation.push(evidence.clone());
+                active.conversation.push(
+                    ModelContextItem::assistant_text("partial", "uncommitted analysis").unwrap(),
+                );
+                let run = active.run.clone();
+                runtime.shared.state.lock().await.active = Some(active);
+                runtime.finish_run(&run, RunOutcome::Failed, None).await;
+                let state = runtime.shared.state.lock().await;
+                assert!(!state.history_safety_exhausted);
+                let retained = &state.history.back().expect("retained evidence").items;
+                assert_eq!(retained.len(), 2);
+                assert_eq!(retained[1], evidence);
+            });
     }
 
     #[test]
@@ -7690,6 +8757,11 @@ mod cov_runtime_topup_private {
     fn active_for(run: &RunId) -> ActiveRun {
         let now = StdInstant::now();
         ActiveRun {
+            context_management: nexus_core::ContextManagementSettings::default(),
+            derived_memory: None,
+            pending_compaction: None,
+            input_estimate: 0,
+            token_estimator: TokenEstimator::default(),
             instruction_bytes: 0,
             context_note: String::new(),
             context_note_bytes: 0,
@@ -7710,9 +8782,12 @@ mod cov_runtime_topup_private {
             approval_seq: 0,
             turns_used: 0,
             calls_used: 0,
+            output_limit_recovery_used: false,
             continuation: None,
             conversation: Vec::new(),
+            source_cursor: 0,
             history_len: 0,
+            inherited_history: false,
             initial_context_reduction: None,
             pending_omission_items: 0,
             queue: VecDeque::new(),
@@ -7732,6 +8807,7 @@ mod cov_runtime_topup_private {
             force_terminal: None,
             terminal: None,
             terminal_error: None,
+            persistence_error: None,
             delivery_closed: false,
             finished_sent: false,
         }
@@ -7782,6 +8858,243 @@ mod cov_runtime_topup_private {
         assert_eq!(error.category(), ErrorCategory::ResourceLimit);
         assert_eq!(error.message(), message);
         assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    fn output_limit_turn() -> Vec<ProviderEvent> {
+        vec![ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
+            FinishReason::OutputLimit,
+            Usage::new(Some(3), Some(4), UsageFinality::Final),
+            None,
+        ))]
+    }
+
+    #[test]
+    fn output_limit_recovery_never_allocates_calls_or_replays_partial_context() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("output-limit-discard");
+        test_rt().block_on(async {
+            let active = active_for(&run);
+            let conversation = active.conversation.clone();
+            install(&bed, active).await;
+            let mut events = vec![
+                ProviderEvent::TextDelta {
+                    item_key: "partial".into(),
+                    text: "unfinished".into(),
+                },
+                ProviderEvent::ReasoningDelta {
+                    text: "private unfinished reasoning".into(),
+                },
+                ProviderEvent::ToolCallDelta {
+                    item_key: "partial-call".into(),
+                    assembled_bytes: 9,
+                },
+                ProviderEvent::ToolCallReady(
+                    CallCandidate::new("candidate", "ref", "host_read", "{\"partial\":").unwrap(),
+                ),
+            ];
+            events.extend(output_limit_turn());
+            assert!(matches!(
+                bed.runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("truncated"),
+                        events,
+                        &mut StreamedPrefix::default()
+                    )
+                    .await,
+                Ok(RunState::CallingModel)
+            ));
+            let state = bed.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert!(active.output_limit_recovery_used);
+            assert_eq!(active.turns_used, 1);
+            assert_eq!(active.call_seq, 0);
+            assert_eq!(active.calls_used, 0);
+            assert!(active.queue.is_empty());
+            assert!(active.current.is_none());
+            assert!(active.pending.is_empty());
+            assert_eq!(active.conversation, conversation);
+            assert_eq!(active.source_cursor, 0);
+            assert!(active.context_note.is_empty());
+            assert!(active.continuation.is_none());
+            assert_eq!(
+                active.last_usage,
+                Some(Usage::new(Some(3), Some(4), UsageFinality::Final))
+            );
+            assert_eq!(bed.read.execution_count(), 0);
+        });
+    }
+
+    #[test]
+    fn output_limit_recovery_respects_opaque_state_turn_budget_and_controls() {
+        for guard in [
+            "opaque",
+            "response-opaque",
+            "incompatible",
+            "used",
+            "turns",
+            "cancelled",
+            "deadline",
+        ] {
+            let limits = Limits::m0_test();
+            let bed = make_bed(limits, true, Vec::new(), None, None);
+            let run = run_id("output-limit-guard");
+            let mut active = active_for(&run);
+            match guard {
+                "opaque" => {
+                    active.continuation = Some(
+                        ContinuationData::new(
+                            nexus_core::DEFAULT_ADAPTER_IDENTITY,
+                            "cov-profile",
+                            vec![1, 2],
+                        )
+                        .unwrap(),
+                    )
+                }
+                "used" => active.output_limit_recovery_used = true,
+                "turns" => active.turns_used = limits.max_model_turns_per_run - 1,
+                "cancelled" => active.token.cancel(),
+                "deadline" => active.deadline = StdInstant::now() - Duration::from_secs(1),
+                "response-opaque" | "incompatible" => {}
+                _ => unreachable!(),
+            }
+            let continuation = active.continuation.clone();
+            test_rt().block_on(async {
+                install(&bed, active).await;
+                let events = if matches!(guard, "response-opaque" | "incompatible") {
+                    vec![ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
+                        FinishReason::OutputLimit,
+                        Usage::new(Some(3), Some(4), UsageFinality::Final),
+                        Some(
+                            ContinuationData::new(
+                                if guard == "incompatible" {
+                                    "wrong-adapter"
+                                } else {
+                                    nexus_core::DEFAULT_ADAPTER_IDENTITY
+                                },
+                                "cov-profile",
+                                vec![3, 4],
+                            )
+                            .unwrap(),
+                        ),
+                    ))]
+                } else {
+                    output_limit_turn()
+                };
+                let result = bed
+                    .runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("guard"),
+                        events,
+                        &mut StreamedPrefix::default(),
+                    )
+                    .await;
+                match guard {
+                    "cancelled" => assert_cancelled(result),
+                    "deadline" => assert_limit(result, "run duration exhausted"),
+                    "incompatible" => {
+                        let Err(terminal) = result else {
+                            panic!("incompatible continuation must fail");
+                        };
+                        assert_eq!(terminal.outcome, RunOutcome::Failed);
+                        assert_eq!(
+                            terminal.error.unwrap().category(),
+                            ErrorCategory::UnsupportedCapability
+                        );
+                    }
+                    _ => assert_limit(result, "model output limit reached"),
+                }
+                assert_eq!(
+                    inspect(&bed, |active| active.continuation.clone()).await,
+                    Some(continuation)
+                );
+                assert_eq!(inspect(&bed, |active| active.calls_used).await, Some(0));
+                assert_eq!(bed.provider.call_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn recovered_output_limit_rechecks_controls_before_next_request() {
+        for cancel in [true, false] {
+            let bed = make_bed(
+                Limits::m0_test(),
+                true,
+                vec![stop_turn("unreachable")],
+                None,
+                None,
+            );
+            let run = run_id("output-limit-next-request");
+            test_rt().block_on(async {
+                install(&bed, active_for(&run)).await;
+                assert!(matches!(
+                    bed.runtime
+                        .ingest_model_batch(
+                            &run,
+                            &turn_id("recovery"),
+                            output_limit_turn(),
+                            &mut StreamedPrefix::default()
+                        )
+                        .await,
+                    Ok(RunState::CallingModel)
+                ));
+                {
+                    let mut state = bed.shared.state.lock().await;
+                    let active = state.active.as_mut().unwrap();
+                    if cancel {
+                        active.token.cancel();
+                    } else {
+                        active.deadline = StdInstant::now() - Duration::from_secs(1);
+                    }
+                }
+                let result = bed.runtime.on_calling_model(&run).await;
+                if cancel {
+                    assert_cancelled(result);
+                } else {
+                    assert_limit(result, "run duration exhausted");
+                }
+                assert_eq!(bed.provider.call_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn invalid_output_limit_batch_does_not_enable_recovery() {
+        let mut limits = Limits::m0_test();
+        limits.max_arg_assembly_bytes = 8;
+        let bed = make_bed(limits, true, Vec::new(), None, None);
+        let run = run_id("invalid-output-limit");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            let mut events = vec![ProviderEvent::ToolCallDelta {
+                item_key: "oversized".into(),
+                assembled_bytes: 9,
+            }];
+            events.extend(output_limit_turn());
+            let result = bed
+                .runtime
+                .ingest_model_batch(
+                    &run,
+                    &turn_id("invalid"),
+                    events,
+                    &mut StreamedPrefix::default(),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(Terminal {
+                    outcome: RunOutcome::Failed,
+                    ..
+                })
+            ));
+            assert_eq!(
+                inspect(&bed, |active| active.output_limit_recovery_used).await,
+                Some(false)
+            );
+            assert_eq!(inspect(&bed, |active| active.turns_used).await, Some(0));
+            assert_eq!(bed.provider.call_count(), 0);
+        });
     }
 
     #[test]
@@ -8134,6 +9447,22 @@ mod cov_runtime_topup_private {
                 "the batch after the stray wake is ingested, not dropped"
             );
             assert!(bed.data.try_recv().is_err());
+            let model_request = bed
+                .control
+                .try_recv()
+                .expect("request metadata is published before provider dispatch");
+            assert!(matches!(
+                model_request.payload(),
+                EventPayload::ModelRequestStarted { .. }
+            ));
+            let response = bed
+                .control
+                .try_recv()
+                .expect("response validation metadata follows the provider batch");
+            assert!(matches!(
+                response.payload(),
+                EventPayload::ModelRequestFinished { response_validated: true, .. }
+            ));
             let usage = bed
                 .control
                 .try_recv()
@@ -8143,8 +9472,8 @@ mod cov_runtime_topup_private {
             assert_eq!(
                 inspect(&bed, |active| (active.next_seq, active.last_seq, active.data_dropped))
                     .await,
-                Some((2, Some(1), false)),
-                "the one text delta and the one usage update hold sequences 0 and 1: \
+                Some((4, Some(3), false)),
+                "request metadata, one text delta, usage, and response metadata hold sequences 0..3: \
                  a stray wake consumes none and drops nothing"
             );
             assert_eq!(
@@ -8779,5 +10108,1057 @@ mod cov_runtime_topup_private {
                 Some(true)
             );
         });
+    }
+
+    #[test]
+    fn session_store_records_intent_before_dispatch_and_actual_outcome_afterward() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-store-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let run = run_id("persistent-tool");
+        let mut active = active_for(&run);
+        let checkpoint = SessionCheckpoint::new(
+            active.session.clone(),
+            STORE_FORMAT_REVISION,
+            0,
+            Vec::new(),
+            active.profile.clone(),
+        )
+        .unwrap();
+        store.initialize_session(&checkpoint).unwrap();
+        // This fixture starts after model admission; its context is outside
+        // this operation-record-focused test.
+        active.source_cursor = 1;
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        let call = read_call(&run, call_id("persistent-tool"));
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(read.execution_count(), 1);
+            assert!(matches!(
+                runtime.on_recording(&run).await,
+                Ok(RunState::Preparing)
+            ));
+        });
+        drop(runtime);
+
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let snapshot = std::fs::read_to_string(directory.join("session-store.json")).unwrap();
+        assert!(snapshot.contains("run-persistent-tool"));
+        assert!(snapshot.contains("call-persistent-tool"));
+        assert!(snapshot.contains("succeeded"));
+        assert!(snapshot.contains("known_applied"));
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_persists_user_and_completed_assistant_source_items() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-history-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![stop_turn("durable answer")]));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            Vec::new(),
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+
+        let command = SubmitCommand::new(
+            RequestId::new("req-durable-history").unwrap(),
+            SessionId::new("sess-1").unwrap(),
+            "do work",
+            "test-profile",
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            assert_eq!(
+                runtime.submit(command).await.reply(),
+                CommandReply::Accepted
+            );
+            let finished = loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    break finished.clone();
+                }
+            };
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert_eq!(finished.persistence(), PersistenceState::Saved);
+        });
+        drop(runtime);
+
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let session = SessionId::new("sess-1").unwrap();
+        let records = reopened.load_source_records(&session, 0, 10).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].item(),
+            &ModelContextItem::user_text("do work").unwrap()
+        );
+        assert_eq!(
+            records[1].item(),
+            &ModelContextItem::assistant_text("item-0", "durable answer").unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_list_and_restore_load_bounded_history_without_execution() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-restore-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let session = SessionId::new("sess-recover").unwrap();
+        let old_run = run_id("interrupted");
+        let call = read_call(&old_run, call_id("unfinished"));
+        let source = vec![
+            ModelContextItem::user_text("perform a read").unwrap(),
+            ModelContextItem::assistant_call("item-call", "provider-ref", call.clone()).unwrap(),
+        ];
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    STORE_FORMAT_REVISION,
+                    0,
+                    Vec::new(),
+                    "old-profile",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_source_items(&session, &old_run, &source)
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![stop_turn("continued")]));
+        let tool = Arc::new(ScriptedTool::new("host_read", None));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider.clone(),
+            vec![ToolRegistration::read(tool.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            let listed = runtime
+                .handle(Command::ListSessions(
+                    ListSessionsCommand::new(RequestId::new("req-list-recovered").unwrap(), 4)
+                        .unwrap(),
+                ))
+                .await
+                .0;
+            assert_eq!(listed.reply(), CommandReply::Accepted);
+            assert!(listed.has_sessions());
+            assert_eq!(listed.sessions().len(), 1);
+            assert_eq!(listed.sessions()[0].session, session);
+            assert_eq!(provider.call_count(), 0);
+
+            let restored = runtime
+                .handle(Command::RestoreSession(RestoreSessionCommand {
+                    request: RequestId::new("req-restore-recovered").unwrap(),
+                    session: session.clone(),
+                }))
+                .await
+                .0;
+            assert_eq!(restored.reply(), CommandReply::Accepted);
+            assert_eq!(restored.restored_session(), Some(&session));
+            assert_eq!(provider.call_count(), 0, "restore must not call the model");
+            assert_eq!(tool.execution_count(), 0, "restore must not execute tools");
+            {
+                let state = runtime.shared.state.lock().await;
+                assert_eq!(state.history.len(), 1);
+                let restored_items = &state.history.front().unwrap().items;
+                assert_eq!(restored_items.len(), 3);
+                assert!(matches!(
+                    restored_items[1],
+                    ModelContextItem::AssistantCall { .. }
+                ));
+                assert!(matches!(
+                    &restored_items[2],
+                    ModelContextItem::ToolResult { outcome, .. }
+                        if outcome.status() == ExecutionStatus::Interrupted
+                            && outcome.effect() == EffectState::Unknown
+                            && outcome.evidence() == Evidence::Uncertain
+                ));
+            }
+
+            let submitted = runtime
+                .submit(
+                    SubmitCommand::new(
+                        RequestId::new("req-continue-recovered").unwrap(),
+                        session.clone(),
+                        "continue safely",
+                        "current-profile",
+                    )
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(submitted.reply(), CommandReply::Accepted);
+            while let Some(event) = streams.control.recv().await {
+                if event.is_terminal() {
+                    break;
+                }
+            }
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(tool.execution_count(), 0, "old call is never replayed");
+        });
+        drop(runtime);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.last_source_sequence(&session).unwrap(), 4);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtimes_share_one_serialized_session_store_handle() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-shared-store-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let handle = SessionStoreHandle::new(Box::new(store));
+        let (first, mut streams) = Runtime::try_new_with_session_store_handle(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(vec![stop_turn("saved")])),
+            Vec::new(),
+            ModelInstructions::default(),
+            handle.clone(),
+        )
+        .unwrap();
+        let (second, _streams) = Runtime::try_new_with_session_store_handle(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Vec::new(),
+            ModelInstructions::default(),
+            handle.clone(),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            let response = first
+                .submit(
+                    SubmitCommand::new(
+                        RequestId::new("req-shared-store").unwrap(),
+                        SessionId::new("sess-shared").unwrap(),
+                        "persist me",
+                        "profile",
+                    )
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(response.reply(), CommandReply::Accepted);
+            while let Some(event) = streams.control.recv().await {
+                if event.is_terminal() {
+                    break;
+                }
+            }
+            let listed = second
+                .handle(Command::ListSessions(
+                    ListSessionsCommand::new(RequestId::new("req-shared-list").unwrap(), 10)
+                        .unwrap(),
+                ))
+                .await
+                .0;
+            assert_eq!(listed.reply(), CommandReply::Accepted);
+            assert_eq!(listed.sessions().len(), 1);
+            assert_eq!(listed.sessions()[0].session.as_str(), "sess-shared");
+        });
+        drop(first);
+        drop(second);
+        drop(handle);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        assert_eq!(
+            reopened
+                .last_source_sequence(&SessionId::new("sess-shared").unwrap())
+                .unwrap(),
+            2
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stored_source_survives_summary_truncation_and_hard_context_projection() {
+        for mode in 0..3 {
+            let directory = std::env::temp_dir().join(format!(
+                "nexus-runtime-store-compaction-{}-{}",
+                std::process::id(),
+                next_incarnation()
+            ));
+            let run = run_id("store-compaction");
+            let mut active = active_for(&run);
+            active.conversation = vec![
+                ModelContextItem::user_text("old task").unwrap(),
+                ModelContextItem::assistant_text("old-answer", "old source history ".repeat(400))
+                    .unwrap(),
+                ModelContextItem::user_text("current task").unwrap(),
+            ];
+            active.history_len = 2;
+            active.inherited_history = true;
+            active.source_cursor = active.conversation.len();
+            let original = active.conversation.clone();
+            let session = active.session.clone();
+            let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+            store
+                .initialize_session(
+                    &SessionCheckpoint::new(
+                        session.clone(),
+                        STORE_FORMAT_REVISION,
+                        0,
+                        Vec::new(),
+                        "profile",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            store
+                .append_source_items(&session, &run, &original)
+                .unwrap();
+            let provider = Arc::new(ScriptedProvider::new(if mode == 0 {
+                vec![stop_turn("Earlier task facts."), stop_turn("new answer")]
+            } else {
+                vec![stop_turn("new answer")]
+            }));
+            let (runtime, _streams) = Runtime::try_new_with_session_store(
+                RuntimeConfig {
+                    limits: Limits::m0_test(),
+                    policy: Policy::m0_test(),
+                    has_approval_handler: true,
+                },
+                provider,
+                Vec::new(),
+                ModelInstructions::default(),
+                Box::new(store),
+            )
+            .unwrap();
+            if mode < 2 {
+                active.context_management.window = Some(
+                    nexus_core::ContextWindow::new(
+                        if mode == 0 { 16_384 } else { 4096 },
+                        nexus_core::ContextWindowSource::Configured,
+                    )
+                    .unwrap(),
+                );
+                active.context_management.policy = nexus_core::ContextManagementPolicy::new(
+                    if mode == 0 { 20 } else { 65 },
+                    10,
+                    if mode == 0 {
+                        nexus_core::ContextCompactionStrategy::Summarize
+                    } else {
+                        nexus_core::ContextCompactionStrategy::Truncate
+                    },
+                )
+                .unwrap();
+            } else {
+                assert!(compact_context(&mut active, 2).is_ok());
+            }
+            test_rt().block_on(async {
+                runtime.shared.state.lock().await.active = Some(active);
+                if mode == 0 {
+                    assert!(matches!(
+                        runtime.on_calling_model(&run).await,
+                        Ok(RunState::CallingModel)
+                    ));
+                }
+                assert!(matches!(
+                    runtime.on_calling_model(&run).await,
+                    Err(Terminal {
+                        outcome: RunOutcome::Completed,
+                        ..
+                    })
+                ));
+                assert!(
+                    runtime
+                        .shared
+                        .state
+                        .lock()
+                        .await
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .persistence_error
+                        .is_none()
+                );
+            });
+            drop(runtime);
+            let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+            let records = reopened.load_source_records(&session, 0, 10).unwrap();
+            assert_eq!(records.len(), 4, "mode {mode}");
+            assert_eq!(
+                records[..3]
+                    .iter()
+                    .map(|record| record.item().clone())
+                    .collect::<Vec<_>>(),
+                original
+            );
+            assert_eq!(
+                records[3].item(),
+                &ModelContextItem::assistant_text("item-0", "new answer").unwrap()
+            );
+            drop(reopened);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn stored_unknown_exec_groups_are_summarized_without_changing_archived_sources() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-store-unknown-summary-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let run = run_id("stored-unknown-summary");
+        let mut active = active_for(&run);
+        active.conversation = vec![ModelContextItem::user_text("continue safely").unwrap()];
+        let mut groups = Vec::new();
+        for n in 0..5 {
+            let old = n < 2;
+            let call = ToolCall::new(
+                run.clone(),
+                turn_id(&format!("stored-exec-{n}")),
+                call_id(&format!("stored-exec-{n}")),
+                tool_id("host_exec"),
+                NormalizedArgs::new(format!(r#"{{"command":"perform-operation-{n}"}}"#)).unwrap(),
+            );
+            let item = format!("stored-exec-item-{n}");
+            let reference = format!("stored-exec-reference-{n}");
+            let group = vec![
+                ModelContextItem::assistant_reasoning(
+                    format!("original reasoning {n}; ").repeat(if old { 400 } else { 1 }),
+                )
+                .unwrap(),
+                ModelContextItem::assistant_call(&item, &reference, call.clone()).unwrap(),
+                ModelContextItem::tool_result(
+                    call.call().clone(),
+                    item,
+                    reference,
+                    call.tool().clone(),
+                    ToolOutcome::new(
+                        if old {
+                            ExecutionStatus::TimedOut
+                        } else {
+                            ExecutionStatus::Succeeded
+                        },
+                        if old {
+                            EffectState::Unknown
+                        } else {
+                            EffectState::KnownApplied
+                        },
+                        if old {
+                            Evidence::Uncertain
+                        } else {
+                            Evidence::HostObserved
+                        },
+                        format!("original output {n}; ").repeat(if old { 800 } else { 4 }),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ];
+            active.conversation.extend(group.clone());
+            groups.push(group);
+        }
+        active.source_cursor = active.conversation.len();
+        active.context_management.window = Some(
+            nexus_core::ContextWindow::new(32768, nexus_core::ContextWindowSource::Configured)
+                .unwrap(),
+        );
+        active.context_management.policy = nexus_core::ContextManagementPolicy::new(
+            50,
+            10,
+            nexus_core::ContextCompactionStrategy::Summarize,
+        )
+        .unwrap();
+        let original = active.conversation.clone();
+        let recent = groups[2..].concat();
+        let session = active.session.clone();
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    STORE_FORMAT_REVISION,
+                    0,
+                    Vec::new(),
+                    "profile",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_source_items(&session, &run, &original)
+            .unwrap();
+        // Intentionally omit uncertainty from the model's summary: retained
+        // execution evidence must be host-derived, not dependent on this text.
+        let summary = "Earlier operations were attempted.";
+        let provider = Arc::new(ScriptedProvider::new(
+            (0..3)
+                .map(|_| stop_turn(summary))
+                .chain(std::iter::once(stop_turn("new answer")))
+                .collect(),
+        ));
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider.clone(),
+            Vec::new(),
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            loop {
+                assert!(matches!(
+                    runtime.on_calling_model(&run).await,
+                    Ok(RunState::CallingModel)
+                ));
+                let pending = runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .pending_compaction
+                    .is_some();
+                if !pending {
+                    break;
+                }
+                assert!(
+                    provider.call_count() < 16,
+                    "summary is bounded by turn budget"
+                );
+            }
+            assert!(provider.call_count() > 1);
+            {
+                let mut state = runtime.shared.state.lock().await;
+                let active = state.active.as_mut().unwrap();
+                assert_eq!(active.derived_memory.as_deref(), Some(summary));
+                assert_eq!(active.conversation[0], original[0]);
+                assert_eq!(
+                    &active.conversation[active.conversation.len() - recent.len()..],
+                    recent.as_slice(),
+                    "the newest three completed groups, including reasoning, stay verbatim"
+                );
+                assert!(active.conversation.iter().all(|item| !matches!(
+                    item,
+                    ModelContextItem::AssistantCall { call, .. }
+                        if call.call() == &call_id("stored-exec-0")
+                            || call.call() == &call_id("stored-exec-1")
+                )));
+                let evidence = active
+                    .conversation
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item,
+                            ModelContextItem::AssistantText { text, .. }
+                                if text.as_str().contains("Unknown")
+                                    && text.as_str().contains("do not blindly retry")
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(evidence.len(), 2);
+                for n in 0..2 {
+                    assert!(evidence.iter().any(|item| matches!(
+                        item,
+                        ModelContextItem::AssistantText { text, .. }
+                            if text.as_str().contains(&format!("stored-exec-{n}"))
+                                && text.as_str().contains("host_exec")
+                                && text.as_str().contains(&format!("perform-operation-{n}"))
+                                && text.as_str().contains("TimedOut")
+                                && text.as_str().contains("Uncertain")
+                    )));
+                }
+                let request = prepare_context_request(
+                    &runtime.shared,
+                    active,
+                    &turn_id("after-stored-summary"),
+                )
+                .unwrap_or_else(|terminal| panic!("request failed: {:?}", terminal.error));
+                for item in &evidence {
+                    assert!(request.conversation().contains(item));
+                }
+                assert_eq!(
+                    &request.conversation()[request.conversation().len() - recent.len()..],
+                    recent.as_slice()
+                );
+                assert!(active.pending_compaction.is_none());
+                assert!(active.persistence_error.is_none());
+                assert_eq!(active.source_cursor, active.conversation.len());
+            }
+            assert!(matches!(
+                runtime.on_calling_model(&run).await,
+                Err(Terminal {
+                    outcome: RunOutcome::Completed,
+                    ..
+                })
+            ));
+            assert!(provider.call_count() > 2);
+            assert!(
+                runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .persistence_error
+                    .is_none()
+            );
+        });
+        drop(runtime);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let records = reopened.load_source_records(&session, 0, 100).unwrap();
+        assert_eq!(records.len(), original.len() + 1);
+        assert_eq!(
+            records[..original.len()]
+                .iter()
+                .map(|record| record.item().clone())
+                .collect::<Vec<_>>(),
+            original,
+            "reopening preserves exact calls, large reasoning and full uncertain outputs"
+        );
+        assert_eq!(
+            records.last().unwrap().item(),
+            &ModelContextItem::assistant_text("item-0", "new answer").unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_store_worker_is_owned_and_does_not_block_runtime_state() {
+        for cancel in [true, false] {
+            let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+            let run = run_id("blocked-store");
+            let mut active = active_for(&run);
+            let (gate, mut handle) = gate();
+            test_rt().block_on(async {
+                if !cancel {
+                    active.deadline = StdInstant::now() + Duration::from_millis(100);
+                }
+                let token = active.token.clone();
+                let wake = active.wake.clone();
+                install(&bed, active).await;
+                let worker = tokio::task::spawn_blocking(move || {
+                    gate.wait();
+                    Ok::<(), AgentError>(())
+                });
+                handle.entered.recv().await.unwrap();
+                if cancel {
+                    token.cancel();
+                    wake.notify_one();
+                }
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    bed.runtime.await_store(&run, worker),
+                )
+                .await
+                .unwrap();
+                assert!(result.is_err());
+                {
+                    let state = bed.shared.state.lock().await;
+                    assert_eq!(state.quarantine.len(), 1);
+                    let active = state.active.as_ref().unwrap();
+                    assert_eq!(
+                        active.terminal,
+                        Some(if cancel {
+                            RunOutcome::Cancelled
+                        } else {
+                            RunOutcome::LimitReached
+                        })
+                    );
+                    assert!(active.persistence_error.is_some());
+                }
+                assert!(bed.shared.store_uncertain.load(Ordering::SeqCst));
+                handle.release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !bed.shared.state.lock().await.quarantine.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    bed.shared.store_uncertain.load(Ordering::SeqCst),
+                    "late completion does not make an interrupted write safe to retry"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn blocked_input_save_reserves_admission_without_holding_state_lock() {
+        struct AdmissionStore(Gate);
+        impl SessionStore for AdmissionStore {
+            fn list_sessions(
+                &self,
+                _: usize,
+            ) -> Result<Vec<nexus_core::SessionMetadata>, AgentError> {
+                Ok(Vec::new())
+            }
+            fn load_session(&self, _: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+                Err(runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session not found",
+                ))
+            }
+            fn save_checkpoint(&mut self, _: &SessionCheckpoint) -> Result<(), AgentError> {
+                Ok(())
+            }
+            fn initialize_session(&mut self, _: &SessionCheckpoint) -> Result<bool, AgentError> {
+                self.0.wait();
+                Ok(true)
+            }
+            fn append_source_items(
+                &mut self,
+                _: &SessionId,
+                _: &RunId,
+                _: &[ModelContextItem],
+            ) -> Result<u64, AgentError> {
+                Ok(1)
+            }
+            fn record_intent(&mut self, _: &ToolIntentRecord) -> Result<(), AgentError> {
+                Ok(())
+            }
+            fn record_outcome(&mut self, _: &ToolOutcomeRecord) -> Result<(), AgentError> {
+                Ok(())
+            }
+        }
+        let (gate, mut gate_handle) = gate();
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Vec::new(),
+            ModelInstructions::default(),
+            Box::new(AdmissionStore(gate)),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            let submitter = runtime.clone();
+            let command = SubmitCommand::new(
+                RequestId::new("req-admission").unwrap(),
+                session_id(),
+                "input",
+                "profile",
+            )
+            .unwrap();
+            let duplicate = command.clone();
+            let submitting = tokio::spawn(async move { submitter.submit(command).await });
+            tokio::time::timeout(Duration::from_secs(1), gate_handle.entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let busy = tokio::time::timeout(Duration::from_secs(1), runtime.submit(duplicate))
+                .await
+                .unwrap();
+            assert_eq!(busy.reply(), CommandReply::Busy);
+            let run = busy.run().unwrap().clone();
+            let cancelled = tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.cancel(CancelCommand {
+                    request: RequestId::new("req-cancel-admission").unwrap(),
+                    run,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cancelled.reply(), CommandReply::Accepted);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), submitting)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .reply(),
+                CommandReply::Rejected
+            );
+            assert!(runtime.shared.state.lock().await.active.is_none());
+            assert!(runtime.shared.store_uncertain.load(Ordering::SeqCst));
+            gate_handle.release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !runtime.shared.state.lock().await.quarantine.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn runtime_persists_tool_call_and_result_before_continuing() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-tool-history-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            {
+                let mut events = vec![ProviderEvent::ToolCallReady(
+                    CallCandidate::new(
+                        "item-call",
+                        "provider-ref",
+                        "host_read",
+                        r#"{"path":"src"}"#,
+                    )
+                    .unwrap(),
+                )];
+                events.push(ProviderEvent::TurnFinished(TurnFinished::new(
+                    FinishReason::ToolCalls,
+                    Usage::new(None, None, UsageFinality::Final),
+                    None,
+                )));
+                events
+            },
+            stop_turn("finished after read"),
+        ]));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        let command = SubmitCommand::new(
+            RequestId::new("req-durable-tool-history").unwrap(),
+            SessionId::new("sess-1").unwrap(),
+            "read something",
+            "test-profile",
+        )
+        .unwrap();
+
+        test_rt().block_on(async {
+            assert_eq!(
+                runtime.submit(command).await.reply(),
+                CommandReply::Accepted
+            );
+            let finished = loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    break finished.clone();
+                }
+            };
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+        });
+        assert_eq!(read.execution_count(), 1);
+        drop(runtime);
+
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let session = SessionId::new("sess-1").unwrap();
+        let records = reopened.load_source_records(&session, 0, 10).unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(matches!(
+            records[1].item(),
+            ModelContextItem::AssistantCall { .. }
+        ));
+        assert!(matches!(
+            records[2].item(),
+            ModelContextItem::ToolResult { .. }
+        ));
+        assert_eq!(
+            records[3].item(),
+            &ModelContextItem::assistant_text("item-0", "finished after read").unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_store_intent_failure_prevents_tool_dispatch() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-store-failure-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, "block store directory creation").unwrap();
+        let run = run_id("persistent-intent-failure");
+        let call = read_call(&run, call_id("persistent-intent-failure"));
+        let mut active = active_for(&run);
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(read.execution_count(), 0);
+            assert!(
+                runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .persistence_error
+                    .is_some()
+            );
+        });
+        drop(runtime);
+        std::fs::remove_file(directory).unwrap();
+    }
+
+    #[test]
+    fn session_store_outcome_failure_preserves_observation_and_marks_save_failed() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-outcome-failure-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let run = run_id("persistent-outcome-failure");
+        let mut active = active_for(&run);
+        let checkpoint = SessionCheckpoint::new(
+            active.session.clone(),
+            STORE_FORMAT_REVISION,
+            0,
+            Vec::new(),
+            active.profile.clone(),
+        )
+        .unwrap();
+        store.initialize_session(&checkpoint).unwrap();
+        active.source_cursor = 1;
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+
+        let call = read_call(&run, call_id("persistent-outcome-failure"));
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(read.execution_count(), 1);
+
+            std::fs::remove_dir_all(&directory).unwrap();
+            std::fs::write(&directory, "block store directory creation").unwrap();
+            assert!(matches!(
+                runtime.on_recording(&run).await,
+                Ok(RunState::Finished)
+            ));
+            let state = runtime.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert_eq!(active.terminal, Some(RunOutcome::Failed));
+            assert!(active.persistence_error.is_some());
+            assert_eq!(active.outcomes.len(), 1);
+            assert_eq!(active.outcomes[0].effect, EffectState::KnownApplied);
+            let terminal_error = active.terminal_error.clone();
+            drop(state);
+            runtime
+                .finish_run(&run, RunOutcome::Failed, terminal_error)
+                .await;
+            let finished = loop {
+                let event = streams
+                    .control
+                    .recv()
+                    .await
+                    .expect("terminal control event is delivered");
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    break finished.clone();
+                }
+            };
+            assert_eq!(finished.persistence(), PersistenceState::SaveFailed);
+            assert!(finished.persistence_error().is_some());
+        });
+        drop(runtime);
+        std::fs::remove_file(directory).unwrap();
     }
 }

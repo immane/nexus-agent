@@ -3,7 +3,7 @@
 ## Status snapshot
 
 - See `git status` and `git log` for the current worktree and revision.
-- Implementation stage: **0.2.2-alpha**, built on the M0 runtime:
+- Implementation stage: **0.2.3-alpha**, built on the M0 runtime:
   Chat Completions, OpenAI Responses, and Anthropic Messages adapters
   (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
@@ -103,8 +103,10 @@ the full optional suite is documented in [Testing](docs/testing.md).
 | `crates/nexus-core` | Domain types, errors, limits, ports. Dependency-free |
 | `crates/nexus-validation` | Closed M0 JSON/schema validator for tool arguments |
 | `crates/nexus-config` | Revision-2 provider/protocol/model/mode config, favourites/recents, revision-1 migration, file persistence |
+| `crates/nexus-context` | Pure context estimation/calibration, safe reduction planning, and untrusted memory projection; no provider/tool I/O |
 | `crates/nexus-fakes` | Scripted deterministic provider/tool/store doubles (test-only) |
 | `crates/nexus-tools` | Real file tools and sandboxed `host_exec`: `host_read`/`host_list`/`host_search`/`host_write`/`host_patch` plus mandatory-OS-sandbox `argv` execution; development adapters accept exact canonical runtime scopes |
+| `crates/nexus-container` | Opt-in container gateway/workload lifecycle, Docker worker transport, container tool composition, and worker/keeper binaries; depends on `nexus-tools` for filesystem executors |
 | `crates/nexus-permissions` | Shared canonical project/temp/protected-path rules for runtime policy and real adapters; session grants stay runtime-owned and non-persistent |
 | `crates/nexus-openai` | Streaming Chat Completions, Responses, and Messages adapters over HTTP/HTTPS |
 | `crates/nexus-runtime` | Single-active-run loop: policy, cancellation, quarantine, ordered events |
@@ -196,6 +198,87 @@ cycles `build`, read-only `plan`, and custom modes; `default_mode` initializes
 the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
 `:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
 command.
+
+### Automatic context management
+
+All three provider protocols accept the same optional configuration fields.
+At the document root, `context_management` defaults to:
+
+```json
+{
+  "trigger_percent": 65,
+  "target_percent": 10,
+  "strategy": "summarize"
+}
+```
+
+Percentages are integers and must satisfy
+`0 < target_percent < trigger_percent < 100`; `target_percent: 5` is supported.
+The other strategy value is `"truncate"`. A model entry may supply its own
+`context_management` object, replacing the global policy. Omitted fields in
+that object use the built-in defaults, not individual global fields.
+
+A model entry may set `context_window_tokens`, for example `94208` for a
+92 × 1024-token window. A provider may set the same field for its
+`default_model` only; selecting another model does not inherit that limit.
+Explicit model limits take precedence. Missing windows remain unknown;
+zero, explicit null, and invalid types are rejected.
+
+TUI/server pass these settings through the provider interface; the runtime
+snapshots them at admission. A known window enables automatic reduction before
+model requests. `summarize` uses an additional tool-free model turn to replace
+eligible completed history with derived memory; `truncate` removes eligible
+history without an extra model call. The target is best-effort: current tasks,
+recent exchanges, and evidence of uncertain tool effects take precedence over
+the requested percentage. Required instructions and tool definitions also
+consume the window, so a 5% target may not be reachable.
+Uncertain execution records remain intact, but do not block removal of later
+safe, paired exchanges or separate completed tasks. If safe history reduction
+still leaves window pressure, the model-only request view shortens older tool
+output bodies to a UTF-8-safe head/tail preview (up to 2 KiB plus an explicit
+omission notice). Call identities/arguments, status, effects, evidence, and
+provider-required reasoning remain unchanged; the latest complete tool group
+is normally not shortened. If that still leaves less than the normal generation
+reserve, the request view also shortens the latest complete tool group's output
+bodies as an emergency fallback, with the same metadata and omission markers.
+Emergency previews shrink from 2 KiB down to 128 bytes of head/tail text per
+result as needed; the omission notice is additional to that budget.
+Projected output is marked truncated, and unknown effects
+remain unresolved, never permission to retry. The source records are not
+rewritten by this projection. Unknown windows and opaque provider continuations
+do not enable it. If the retained evidence still exhausts the window, the run
+stops rather than silently discarding it.
+
+Input occupancy is an estimate, not a tokenizer-exact measurement or cumulative
+run usage. It includes instructions, runtime notes, conversation/reasoning, and
+tool schemas. Output tokens have a separate ceiling from response/tool bytes;
+runtime reserves generation headroom rather than always requesting the legacy
+byte-derived token limit. Normal turns reserve up to one quarter of the window,
+capped at 16,384 output tokens; internal summaries are capped at 2,048 output
+tokens and 8 KiB of retained text. A single generation can still reach its
+output limit.
+
+The initial input estimate has a 25% safety margin, increased when final
+per-request provider input usage shows underestimation. Summary calls consume
+model turns, usage, and run time like normal requests; their text is internal
+derived memory, not a new user-facing answer or execution evidence. If a safe
+summary cannot fit, fails validation, or leaves too little budget for continuing,
+the runtime may fall back to safe truncation with an explicit omission notice.
+Cancellation, deadline expiry, and exhausted limits do not authorize another
+model call. Memory is bounded and session-local, not durable storage.
+
+Window provenance distinguishes configured, provider-reported, and
+model-metadata values. Configured `context_window_tokens` always wins. For
+Ollama endpoints (port `11434` or a hostname containing `ollama`), the adapter
+makes one bounded, best-effort read-only Ollama `/api/show` request when no
+window is configured:
+it prefers the model's `num_ctx` parameter, then falls back to an architecture
+`context_length` field. This does not load a model or change Ollama settings.
+Other protocols/providers, unsupported metadata, and discovery failures leave
+the window unknown; no model-name inference is used. The discovered value is
+cached for that selected model in the TUI process but is not written to config.
+Unknown windows retain byte/item protections and do not claim token occupancy.
+No live benchmark runs are started by this feature.
 
 ## Test a real LLM (local Ollama, end to end)
 

@@ -216,6 +216,9 @@ pub struct CommandResponse {
     request: RequestId,
     reply: CommandReply,
     run: Option<RunId>,
+    sessions: Vec<crate::SessionMetadata>,
+    has_sessions: bool,
+    restored_session: Option<crate::SessionId>,
 }
 
 impl CommandResponse {
@@ -226,7 +229,31 @@ impl CommandResponse {
             request,
             reply,
             run,
+            sessions: Vec::new(),
+            has_sessions: false,
+            restored_session: None,
         }
+    }
+
+    /// Attaches bounded metadata returned by an explicit session listing.
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: Vec<crate::SessionMetadata>) -> Self {
+        self.sessions = sessions;
+        self.has_sessions = true;
+        self
+    }
+
+    /// Returns whether this response carries a listing, including an empty one.
+    #[must_use]
+    pub fn has_sessions(&self) -> bool {
+        self.has_sessions
+    }
+
+    /// Marks the session whose history was explicitly restored.
+    #[must_use]
+    pub fn with_restored_session(mut self, session: crate::SessionId) -> Self {
+        self.restored_session = Some(session);
+        self
     }
 
     /// Returns the correlation identity.
@@ -245,6 +272,18 @@ impl CommandResponse {
     #[must_use]
     pub fn run(&self) -> Option<&RunId> {
         self.run.as_ref()
+    }
+
+    /// Returns session metadata for a list command; never includes history.
+    #[must_use]
+    pub fn sessions(&self) -> &[crate::SessionMetadata] {
+        &self.sessions
+    }
+
+    /// Returns the restored session identity, if this response restored one.
+    #[must_use]
+    pub fn restored_session(&self) -> Option<&crate::SessionId> {
+        self.restored_session.as_ref()
     }
 }
 
@@ -469,6 +508,48 @@ pub struct ToolFinishedInfo {
     pub outcome: ToolOutcome,
 }
 
+/// Why the runtime is invoking the provider. This is observational metadata;
+/// it does not change scheduling or provider semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRequestPurpose {
+    /// Normal task reasoning or tool-selection request.
+    Task,
+    /// Tool-free context summarization request.
+    Summary,
+}
+
+/// Mechanism that produced a committed context reduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextReductionMethod {
+    /// Safe completed-history selection imposed by representation bounds.
+    BoundedHistory,
+    /// One or more reductions were combined before the next request.
+    Combined,
+    /// Initial history was omitted before the run became active.
+    InitialHistoryOmission,
+    /// A summary was accepted and committed.
+    Summarize,
+    /// Deterministic truncation was committed without a summary.
+    Truncate,
+    /// Summary failed validation or fit and deterministic truncation committed.
+    SummaryFailed,
+}
+
+impl ContextReductionMethod {
+    /// Stable machine-readable name for event consumers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BoundedHistory => "bounded-history",
+            Self::Combined => "combined",
+            Self::InitialHistoryOmission => "initial-history-omission",
+            Self::Summarize => "summarize",
+            Self::Truncate => "truncate",
+            Self::SummaryFailed => "summary-failed",
+        }
+    }
+}
+
 /// Typed run-event payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPayload {
@@ -479,9 +560,12 @@ pub enum EventPayload {
     },
     /// Ordered presentation fragment.
     AssistantTextDelta(AssistantText),
-    /// Runtime omitted older completed exchanges from model context to fit its
-    /// validated context budget. This is not a summary of the omitted content.
+    /// Runtime committed a reduced active context view. The typed method says
+    /// whether the change summarized, truncated, or bounded history; it never
+    /// makes derived content authoritative execution evidence.
     ContextReduced {
+        /// Committed reduction mechanism.
+        method: ContextReductionMethod,
         /// Number of transcript items omitted in this reduction.
         removed_items: usize,
         /// Number of context items retained after the reduction.
@@ -492,6 +576,40 @@ pub enum EventPayload {
         retained_bytes: usize,
         /// Aggregate byte limit.
         byte_limit: usize,
+    },
+    /// A complete provider request is about to be dispatched. Usage events
+    /// following it belong to this turn until the next request-start event.
+    ModelRequestStarted {
+        /// Provider turn identity, usable to correlate this request's usage.
+        turn: TurnId,
+        /// Normal task request or tool-free summary request.
+        purpose: ModelRequestPurpose,
+        /// Runtime heuristic for the fully assembled request, if available.
+        estimated_input_tokens: Option<u64>,
+        /// Unscaled tokenizer-independent estimate used by calibration.
+        raw_estimated_input_tokens: Option<u64>,
+        /// Safety multiplier applied to the raw estimate, in thousandths.
+        estimate_scale_millis: u64,
+        /// Explicit/discovered model window, if known.
+        context_window_tokens: Option<u32>,
+        /// Runtime context-compaction trigger percentage.
+        context_trigger_percent: u8,
+        /// Runtime context-compaction target percentage.
+        context_target_percent: u8,
+        /// Runtime compaction strategy.
+        compaction_strategy: crate::ContextCompactionStrategy,
+        /// Maximum generation tokens reserved for this invocation.
+        max_output_tokens: Option<u32>,
+        /// Tool result bodies projected to previews in this request view.
+        projected_tool_outputs: usize,
+    },
+    /// The runtime finished protocol validation for this provider batch.
+    /// This does not mean a summary was adopted or that task progress occurred.
+    ModelRequestFinished {
+        /// Provider turn identity matching `ModelRequestStarted`.
+        turn: TurnId,
+        /// Whether the provider batch passed protocol validation.
+        response_validated: bool,
     },
     /// Non-executable proposed-call progress.
     ToolCallPreview {
@@ -520,7 +638,9 @@ impl EventPayload {
     pub fn validate(&self) -> Result<(), AgentError> {
         match self {
             Self::AssistantTextDelta(text) => text.validate(),
-            Self::ContextReduced { .. } => Ok(()),
+            Self::ContextReduced { .. }
+            | Self::ModelRequestStarted { .. }
+            | Self::ModelRequestFinished { .. } => Ok(()),
             Self::ToolCallPreview { item_key } => {
                 if item_key.is_empty() || item_key.len() > crate::content::MAX_ITEM_KEY_LEN {
                     return Err(command_error("tool call preview is invalid"));
@@ -1089,6 +1209,9 @@ mod cov_commands_private {
             request: RequestId::new("req-1").expect("valid"),
             reply: CommandReply::Accepted,
             run: None,
+            sessions: Vec::new(),
+            has_sessions: false,
+            restored_session: None,
         };
         assert_eq!(response.request().as_str(), "req-1");
         assert_eq!(response.reply(), CommandReply::Accepted);

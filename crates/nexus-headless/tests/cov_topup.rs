@@ -29,7 +29,7 @@ use nexus_headless::{
 
 /// The unstable revision a parser must exact-match, written out literally so a
 /// silent bump of `OUTPUT_REV` fails here instead of following the drift.
-const WIRE_REV: &str = "m0-test-0";
+const WIRE_REV: &str = "m0-test-1";
 
 /// The three task routings the composition root recognises: completed,
 /// headless denial, and provider refusal.

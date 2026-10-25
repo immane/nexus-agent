@@ -12,7 +12,7 @@ use std::{
 use nexus_core::{EffectState, Evidence, ExecutionStatus, ToolOutcome};
 use serde_json::Value;
 
-use crate::container_worker_protocol::{
+use crate::worker_protocol::{
     MAX_ARGUMENT_BYTES, MAX_OUTPUT_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION,
     parse_unique, valid_arguments, validate_workspace_paths,
 };
@@ -238,6 +238,7 @@ fn decode_response<E>(bytes: &[u8], output_limit: usize) -> Result<ToolOutcome, 
         Some("Denied") => ExecutionStatus::Denied,
         Some("Cancelled") => ExecutionStatus::Cancelled,
         Some("TimedOut") => ExecutionStatus::TimedOut,
+        Some("Interrupted") => ExecutionStatus::Interrupted,
         _ => return Err(ClientError::InvalidResponse),
     };
     let effect = match result.get("effect").and_then(Value::as_str) {
@@ -434,6 +435,7 @@ mod tests {
             ("Failed", "Unknown", false),
             ("Cancelled", "Unknown", false),
             ("TimedOut", "Unknown", false),
+            ("Interrupted", "Unknown", false),
             ("Succeeded", "KnownApplied", true),
         ] {
             let bytes = frame(&format!(

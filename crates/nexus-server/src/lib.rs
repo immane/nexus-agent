@@ -4,7 +4,7 @@
 //! TUI uses over plain HTTP/1.1 on loopback, with server-sent events for the
 //! live stream. It is never real configuration: the demo wiring uses
 //! scripted [`nexus_fakes`] doubles (no provider credentials, no network
-//! egress beyond loopback, no stored sessions), and the server binds
+//! egress beyond loopback, ephemeral sessions by default), and the server binds
 //! `127.0.0.1` only. Real tools and configured providers require a bearer
 //! credential; only the test-only fake demo may run unauthenticated. The
 //! credential holder can submit, approve, and cancel. Do not expose this
@@ -25,6 +25,15 @@
 //! Cross-run SSE retention is bounded to 4,096 events / 1 MiB plus one
 //! 2 MiB overflow reserve per session; saturated streams close with a
 //! backpressure comment and run admission returns `409` until drained.
+//!
+//! `--session-store DIRECTORY` explicitly opens a private [`nexus_session::FileSessionStore`]
+//! before listening; failure aborts startup without falling back to memory.
+//! [`Server::set_session_store`] attaches one shared [`nexus_runtime::SessionStoreHandle`]
+//! to all subsequently created runtimes. This retains original accepted source
+//! items and tool-operation records (including their full contents), not just
+//! summaries. Use a dedicated private directory, for example
+//! `nexus-server --session-store run/session-store`. Omit the option to preserve
+//! memory-only behavior. This does not add session listing or restore HTTP APIs.
 //!
 //! # Protocol (v1, unstable, test-only)
 //!

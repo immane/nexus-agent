@@ -1,0 +1,31 @@
+{
+  "instance_id": "sympy__sympy-20590",
+  "run": "r46c2a890c1f031c3-1",
+  "outcome": "completed",
+  "terminal_observed": true,
+  "error": null,
+  "tool_calls": 47,
+  "approved_calls": 0,
+  "final_usage_events": 38,
+  "usage": {
+    "input": 491626,
+    "output": 21991
+  },
+  "usage_note": "latest provider-reported Final counters per request turn; null means unavailable/incomplete",
+  "duration_seconds": 850.76,
+  "patch_bytes": 1131,
+  "patch_captured_after_terminal": true,
+  "budget_stop_reason": null,
+  "telemetry_error": null,
+  "event_stream_error": null,
+  "cancel_after_stream_loss": null,
+  "event_sequence_gaps": 0,
+  "context_window_tokens": 94208,
+  "context_trigger_percent_reference": 65,
+  "budget": {
+    "max_run_seconds": null,
+    "max_tool_calls": null,
+    "max_input_tokens": null,
+    "max_output_tokens": null
+  }
+}

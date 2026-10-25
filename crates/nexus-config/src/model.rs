@@ -6,6 +6,10 @@
 //! never silently repaired: removing a provider or model that is still
 //! referenced fails explicitly instead of cascading.
 
+use nexus_core::{
+    ContextCompactionStrategy, ContextManagementPolicy, ContextManagementSettings, ContextWindow,
+    ContextWindowSource,
+};
 use serde_json::{Map, Value};
 
 use crate::store::{ConfigError, invalid};
@@ -211,6 +215,8 @@ pub struct ProviderProfile {
     pub credential: CredentialRef,
     /// Default model name for this provider.
     pub default_model: String,
+    /// Configured context limit of the default model, not all provider models.
+    pub context_window_tokens: Option<u32>,
 }
 
 impl ProviderProfile {
@@ -252,6 +258,7 @@ impl ProviderProfile {
             endpoint,
             credential,
             default_model: default_model.into(),
+            context_window_tokens: None,
         };
         profile.validate()?;
         Ok(profile)
@@ -276,6 +283,7 @@ impl ProviderProfile {
         if self.default_model.is_empty() || self.default_model.len() > MAX_MODEL_NAME_LEN {
             return Err(invalid("model name is invalid"));
         }
+        configured_window(self.context_window_tokens)?;
         Ok(())
     }
 }
@@ -289,6 +297,12 @@ pub struct ModelEntry {
     pub provider: String,
     /// Vendor model name.
     pub name: String,
+    /// Configured context limit for this model.
+    pub context_window_tokens: Option<u32>,
+    /// Optional positive task-generation cap, below any known context window.
+    pub max_output_tokens: Option<u32>,
+    /// Optional policy override; omitted fields in JSON use core defaults.
+    pub context_management: Option<ContextManagementPolicy>,
 }
 
 impl ModelEntry {
@@ -303,6 +317,9 @@ impl ModelEntry {
             id: id.into(),
             provider: provider.into(),
             name: name.into(),
+            context_window_tokens: None,
+            context_management: None,
+            max_output_tokens: None,
         };
         entry.validate()?;
         Ok(entry)
@@ -315,6 +332,11 @@ impl ModelEntry {
         if self.name.is_empty() || self.name.len() > MAX_MODEL_NAME_LEN {
             return Err(invalid("model name is invalid"));
         }
+        context_settings(
+            self.context_management.unwrap_or_default(),
+            self.context_window_tokens,
+            self.max_output_tokens,
+        )?;
         Ok(())
     }
 }
@@ -396,6 +418,7 @@ pub struct UserConfig {
     recent: Vec<String>,
     modes: Vec<AgentMode>,
     default_mode: Option<String>,
+    context_management: ContextManagementPolicy,
 }
 
 impl UserConfig {
@@ -410,6 +433,7 @@ impl UserConfig {
             recent: Vec::new(),
             modes: Vec::new(),
             default_mode: None,
+            context_management: ContextManagementPolicy::default(),
         }
     }
 
@@ -423,6 +447,51 @@ impl UserConfig {
     #[must_use]
     pub fn models(&self) -> &[ModelEntry] {
         &self.models
+    }
+
+    /// Returns the global context-management policy. This is configuration
+    /// only; it does not perform automatic compaction.
+    #[must_use]
+    pub fn context_management(&self) -> ContextManagementPolicy {
+        self.context_management
+    }
+
+    /// Replaces the global policy with a validated core policy.
+    pub fn set_context_management(&mut self, policy: ContextManagementPolicy) {
+        self.context_management = policy;
+    }
+
+    /// Resolves configured settings for a provider and optional model entry id.
+    /// A provider window applies only to its default model. No discovery or
+    /// model-name inference is performed for other models.
+    pub fn context_management_for(
+        &self,
+        provider_id: &str,
+        model_id: Option<&str>,
+    ) -> Result<ContextManagementSettings, ConfigError> {
+        check_id("provider id", provider_id)?;
+        let profile = self
+            .provider(provider_id)
+            .ok_or(invalid("provider is unknown"))?;
+        let (policy, tokens, max_output_tokens) = if let Some(id) = model_id {
+            check_id("model id", id)?;
+            let entry = self.model(id).ok_or(invalid("model is unknown"))?;
+            if entry.provider != provider_id {
+                return Err(invalid("model does not belong to provider"));
+            }
+            (
+                entry.context_management.unwrap_or(self.context_management),
+                entry.context_window_tokens.or_else(|| {
+                    (entry.name == profile.default_model)
+                        .then_some(profile.context_window_tokens)
+                        .flatten()
+                }),
+                entry.max_output_tokens,
+            )
+        } else {
+            (self.context_management, profile.context_window_tokens, None)
+        };
+        context_settings(policy, tokens, max_output_tokens)
     }
 
     /// Returns favourite model ids in admission order.
@@ -544,9 +613,19 @@ impl UserConfig {
     /// Admits a model entry: unique id, bounded count, provider must exist.
     pub fn add_model(&mut self, entry: ModelEntry) -> Result<(), ConfigError> {
         entry.validate()?;
-        if self.provider(&entry.provider).is_none() {
-            return Err(invalid("model provider is unknown"));
-        }
+        let profile = self
+            .provider(&entry.provider)
+            .ok_or(invalid("model provider is unknown"))?;
+        let tokens = entry.context_window_tokens.or_else(|| {
+            (entry.name == profile.default_model)
+                .then_some(profile.context_window_tokens)
+                .flatten()
+        });
+        context_settings(
+            entry.context_management.unwrap_or(self.context_management),
+            tokens,
+            entry.max_output_tokens,
+        )?;
         if self.models.iter().any(|existing| existing.id == entry.id) {
             return Err(invalid("model id is already registered"));
         }
@@ -656,6 +735,13 @@ impl UserConfig {
                 Value::String(default_mode.clone()),
             );
         }
+        // Preserve existing canonical documents when the policy is unchanged.
+        if self.context_management != ContextManagementPolicy::default() {
+            document.insert(
+                "context_management".to_owned(),
+                policy_json(self.context_management),
+            );
+        }
         Value::Object(document).to_string()
     }
 
@@ -676,6 +762,7 @@ impl UserConfig {
                 "recent",
                 "modes",
                 "default_mode",
+                "context_management",
             ],
         )?;
         let revision = document
@@ -686,6 +773,9 @@ impl UserConfig {
             return Err(ConfigError::unsupported());
         }
         let mut config = Self::default_config();
+        if let Some(policy) = document.get("context_management") {
+            config.set_context_management(parse_policy(policy)?);
+        }
         for provider in object_array(document, "providers")? {
             config.add_provider(parse_provider(provider, revision)?)?;
         }
@@ -764,6 +854,9 @@ fn provider_json(profile: &ProviderProfile) -> Value {
         "default_model".to_owned(),
         Value::String(profile.default_model.clone()),
     );
+    if let Some(tokens) = profile.context_window_tokens {
+        object.insert("context_window_tokens".to_owned(), Value::from(tokens));
+    }
     Value::Object(object)
 }
 
@@ -773,6 +866,15 @@ fn model_json(entry: &ModelEntry) -> Value {
     object.insert("id".to_owned(), Value::String(entry.id.clone()));
     object.insert("provider".to_owned(), Value::String(entry.provider.clone()));
     object.insert("name".to_owned(), Value::String(entry.name.clone()));
+    if let Some(tokens) = entry.context_window_tokens {
+        object.insert("context_window_tokens".to_owned(), Value::from(tokens));
+    }
+    if let Some(policy) = entry.context_management {
+        object.insert("context_management".to_owned(), policy_json(policy));
+    }
+    if let Some(tokens) = entry.max_output_tokens {
+        object.insert("max_output_tokens".to_owned(), Value::from(tokens));
+    }
     Value::Object(object)
 }
 
@@ -867,6 +969,7 @@ fn parse_provider(
             "endpoint",
             "credential",
             "default_model",
+            "context_window_tokens",
         ],
     )?;
     let credential = object
@@ -892,7 +995,7 @@ fn parse_provider(
     } else {
         ProtocolKind::parse(require_str(object, "protocol")?)?
     };
-    ProviderProfile::new_with_protocol(
+    let mut profile = ProviderProfile::new_with_protocol(
         require_str(object, "id")?.to_owned(),
         require_str(object, "display_name")?.to_owned(),
         AdapterKind::parse(require_str(object, "adapter")?)?,
@@ -900,17 +1003,129 @@ fn parse_provider(
         endpoint,
         CredentialRef::env_var(var.to_owned())?,
         require_str(object, "default_model")?.to_owned(),
-    )
+    )?;
+    profile.context_window_tokens = parse_window_tokens(object)?;
+    profile.validate()?;
+    Ok(profile)
 }
 
 /// Parses one model object with known fields only.
 fn parse_model(object: &Map<String, Value>) -> Result<ModelEntry, ConfigError> {
-    reject_unknown(object, &["id", "provider", "name"])?;
-    ModelEntry::new(
+    reject_unknown(
+        object,
+        &[
+            "id",
+            "provider",
+            "name",
+            "context_window_tokens",
+            "context_management",
+            "max_output_tokens",
+        ],
+    )?;
+    let mut entry = ModelEntry::new(
         require_str(object, "id")?.to_owned(),
         require_str(object, "provider")?.to_owned(),
         require_str(object, "name")?.to_owned(),
+    )?;
+    entry.context_window_tokens = parse_window_tokens(object)?;
+    entry.max_output_tokens = object
+        .get("max_output_tokens")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|tokens| u32::try_from(tokens).ok())
+                .filter(|tokens| *tokens > 0)
+                .ok_or(invalid("max output tokens is invalid"))
+        })
+        .transpose()?;
+    entry.context_management = object
+        .get("context_management")
+        .map(parse_policy)
+        .transpose()?;
+    entry.validate()?;
+    Ok(entry)
+}
+
+/// Validates resolved settings, including any inherited default-model window.
+fn context_settings(
+    policy: ContextManagementPolicy,
+    tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> Result<ContextManagementSettings, ConfigError> {
+    let settings = ContextManagementSettings {
+        policy,
+        window: configured_window(tokens)?,
+        max_output_tokens,
+    };
+    settings
+        .validate()
+        .map_err(|_| invalid("max output tokens is invalid for context window"))?;
+    Ok(settings)
+}
+
+/// Creates a configured window through the domain validation boundary.
+fn configured_window(tokens: Option<u32>) -> Result<Option<ContextWindow>, ConfigError> {
+    tokens
+        .map(|tokens| {
+            ContextWindow::new(tokens, ContextWindowSource::Configured)
+                .map_err(|_| invalid("context window is invalid"))
+        })
+        .transpose()
+}
+
+/// Missing limits are unknown; explicit null and non-positive/non-integer
+/// values are errors rather than silently becoming unknown.
+fn parse_window_tokens(object: &Map<String, Value>) -> Result<Option<u32>, ConfigError> {
+    object
+        .get("context_window_tokens")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|tokens| u32::try_from(tokens).ok())
+                .filter(|tokens| *tokens > 0)
+                .ok_or(invalid("context window is invalid"))
+        })
+        .transpose()
+}
+
+/// Parses a partial policy using core defaults, never an inherited policy.
+fn parse_policy(value: &Value) -> Result<ContextManagementPolicy, ConfigError> {
+    let object = value
+        .as_object()
+        .ok_or(invalid("context policy is invalid"))?;
+    reject_unknown(object, &["trigger_percent", "target_percent", "strategy"])?;
+    let defaults = ContextManagementPolicy::default();
+    let percent = |field: &str, default: u8| -> Result<u8, ConfigError> {
+        object.get(field).map_or(Ok(default), |value| {
+            value
+                .as_u64()
+                .and_then(|number| u8::try_from(number).ok())
+                .ok_or(invalid("context policy is invalid"))
+        })
+    };
+    let strategy = match object.get("strategy") {
+        None => defaults.strategy(),
+        Some(Value::String(name)) if name == "summarize" => ContextCompactionStrategy::Summarize,
+        Some(Value::String(name)) if name == "truncate" => ContextCompactionStrategy::Truncate,
+        Some(_) => return Err(invalid("context policy strategy is invalid")),
+    };
+    ContextManagementPolicy::new(
+        percent("trigger_percent", defaults.trigger_percent())?,
+        percent("target_percent", defaults.target_percent())?,
+        strategy,
     )
+    .map_err(|_| invalid("context policy is invalid"))
+}
+
+fn policy_json(policy: ContextManagementPolicy) -> Value {
+    serde_json::json!({
+        "trigger_percent": policy.trigger_percent(),
+        "target_percent": policy.target_percent(),
+        "strategy": match policy.strategy() {
+            ContextCompactionStrategy::Summarize => "summarize",
+            ContextCompactionStrategy::Truncate => "truncate",
+        },
+    })
 }
 
 /// Parses one custom mode object with known fields only.
