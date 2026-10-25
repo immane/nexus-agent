@@ -658,6 +658,7 @@ fn mac_development_profile(
             sbpl_quote(&path.to_string_lossy())
         ));
     }
+    profile.push_str("(allow file-write* (literal \"/dev/null\"))\n");
     for path in policy.protected() {
         profile.push_str(&format!(
             "(deny file-read* file-write* (subpath \"{}\"))\n",
