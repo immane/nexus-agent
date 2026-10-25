@@ -264,10 +264,12 @@ pub trait SessionStore {
 
     /// Creates the initial checkpoint when absent. Returns `true` only when a
     /// new session was created; existing sessions return `false` and are not
-    /// implicitly restored by this operation.
-    fn initialize_session(&mut self, checkpoint: &SessionCheckpoint) -> Result<bool, AgentError> {
-        self.save_checkpoint(checkpoint)?;
-        Ok(true)
+    /// implicitly restored by this operation. Stores that do not support
+    /// create-if-absent semantics fail without saving a checkpoint.
+    fn initialize_session(&mut self, _checkpoint: &SessionCheckpoint) -> Result<bool, AgentError> {
+        Err(store_error(
+            "session initialization is unsupported by this store",
+        ))
     }
 
     /// Records side-effecting intent before dispatch.
@@ -351,6 +353,50 @@ mod tests {
             }],
             profile,
         )
+    }
+
+    #[test]
+    fn default_initialization_fails_without_saving_checkpoint() {
+        struct SaveTrackingStore {
+            saves: usize,
+        }
+
+        impl SessionStore for SaveTrackingStore {
+            fn list_sessions(&self, _limit: usize) -> Result<Vec<SessionMetadata>, AgentError> {
+                unreachable!("initialization must not list sessions")
+            }
+
+            fn load_session(&self, _id: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+                unreachable!("initialization must not load sessions")
+            }
+
+            fn save_checkpoint(
+                &mut self,
+                _checkpoint: &SessionCheckpoint,
+            ) -> Result<(), AgentError> {
+                self.saves += 1;
+                Ok(())
+            }
+
+            fn record_intent(&mut self, _intent: &ToolIntentRecord) -> Result<(), AgentError> {
+                unreachable!("initialization must not record intents")
+            }
+
+            fn record_outcome(&mut self, _outcome: &ToolOutcomeRecord) -> Result<(), AgentError> {
+                unreachable!("initialization must not record outcomes")
+            }
+        }
+
+        let mut store = SaveTrackingStore { saves: 0 };
+        let checkpoint = checkpoint(STORE_FORMAT_REVISION).unwrap();
+        let error = store.initialize_session(&checkpoint).unwrap_err();
+        assert_eq!(error.category(), ErrorCategory::InvalidInput);
+        assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+        assert_eq!(
+            error.message(),
+            "session initialization is unsupported by this store"
+        );
+        assert_eq!(store.saves, 0);
     }
 
     #[test]

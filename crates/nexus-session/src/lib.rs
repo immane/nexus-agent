@@ -169,6 +169,8 @@ impl FileSessionStore {
     ) -> Result<(), AgentError> {
         self.ensure_available()?;
         let bytes = encode(&sessions, &intents, &outcomes, &source_records)?;
+        // Every published snapshot must satisfy the same bounds as reopening it.
+        decode(&bytes)?;
         atomic_write(&self.path, &bytes, &mut self.write_uncertain, sync)?;
         self.sessions = sessions;
         self.intents = intents;
@@ -1255,6 +1257,61 @@ mod tests {
         drop(store);
         let reopened = FileSessionStore::open(&directory).unwrap();
         assert_eq!(reopened.last_source_sequence(&session).unwrap(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_batch_exceeding_parser_nodes_preserves_previous_snapshot() {
+        let directory = directory("source-node-bound");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let checkpoint = checkpoint(1, "active view");
+        store.initialize_session(&checkpoint).unwrap();
+        let session = checkpoint.session().clone();
+        let run = RunId::new("run-batch").unwrap();
+        let seed = ModelContextItem::user_text("retained source").unwrap();
+        store.append_source_items(&session, &run, &[seed]).unwrap();
+        let original = fs::read(&store.path).unwrap();
+        let original_records = store.load_source_records(&session, 0, 10).unwrap();
+
+        let item = ModelContextItem::tool_result(
+            CallId::new("call-a").unwrap(),
+            "item-result",
+            "provider-call-a",
+            ToolId::new("host_read", M0_REVISION).unwrap(),
+            ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::Unknown,
+                Evidence::Uncertain,
+                "result",
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let items = vec![item; 13_000];
+        let mut records = original_records.clone();
+        for (index, item) in items.iter().enumerate() {
+            records.push(
+                SourceRecord::new(session.clone(), index as u64 + 2, run.clone(), item.clone())
+                    .unwrap(),
+            );
+        }
+        assert!(records.len() < MAX_SOURCE_RECORDS);
+        let candidate = encode(&store.sessions, &store.intents, &store.outcomes, &records).unwrap();
+        assert!(candidate.len() < MAX_STORE_BYTES);
+        assert!(decode(&candidate).is_err());
+
+        assert!(store.append_source_items(&session, &run, &items).is_err());
+        assert_eq!(fs::read(&store.path).unwrap(), original);
+        assert_eq!(store.load_session(&session).unwrap(), checkpoint);
+        assert_eq!(store.last_source_sequence(&session).unwrap(), 1);
+        assert_eq!(store.source_records, original_records);
+        drop(store);
+
+        let reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.load_session(&session).unwrap(), checkpoint);
+        assert_eq!(reopened.source_records, original_records);
+        drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }
 

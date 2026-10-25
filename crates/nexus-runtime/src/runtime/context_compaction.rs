@@ -330,6 +330,7 @@ fn commit(
             .saturating_add(projected.context_note_bytes()),
     };
     active.conversation = stage.items;
+    active.source_cursor = active.conversation.len();
     active.history_len = stage.history_len;
     // A truncate fallback must retain any earlier derived memory.
     if let Some(memory) = memory {

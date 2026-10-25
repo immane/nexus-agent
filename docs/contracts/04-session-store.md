@@ -61,6 +61,15 @@ retroactively confirm durability of the failed write. Re-recording an identical
 intent or outcome for the same run/call is idempotent, including at capacity;
 conflicting records and inconsistent denied outcomes are rejected before writing.
 
+Before publication, encoded snapshots are checked against the same complete
+validation and parser limits used on reopen, including the JSON node budget.
+The runtime bounds store-worker waits by live cancellation and the run deadline.
+Interrupted workers remain owned until termination; further store-backed runs
+are refused until the host reopens and reconciles the store, even if the worker
+later succeeds. Input admission reserves the run slot without holding the runtime
+state lock during storage I/O. A cancelled input save returns a rejected submit;
+it may still have published data and must not be blindly retried.
+
 ## Records
 
 | Record | Required information |

@@ -113,6 +113,8 @@ struct Shared {
     tool_order: Vec<String>,
     tool_definitions: Vec<ToolSpec>,
     session_store: Option<Arc<StdMutex<Box<dyn SessionStore + Send>>>>,
+    /// An interrupted write must be reconciled by reopening, never retried.
+    store_uncertain: AtomicBool,
     state: Mutex<State>,
     data_tx: mpsc::Sender<RunEvent>,
     control_tx: mpsc::Sender<RunEvent>,
@@ -424,10 +426,10 @@ impl Runtime {
     }
 
     /// Constructs a runtime with an explicit session store. Tool intents are
-    /// durably recorded before dispatch and observed outcomes are recorded
-    /// afterward. Original conversation persistence and restore commands are
-    /// not yet wired; terminal persistence therefore remains `Ephemeral` unless
-    /// an operation-record write failed.
+    /// durably recorded before dispatch and observed outcomes and accepted
+    /// source items are recorded afterward. Restore commands and terminal
+    /// checkpoints are not yet wired; terminal persistence therefore remains
+    /// `Ephemeral` unless a required write failed.
     pub fn try_new_with_session_store(
         config: RuntimeConfig,
         provider: Arc<dyn ProviderPort + Send + Sync>,
@@ -556,6 +558,7 @@ impl Runtime {
             tool_order: order,
             tool_definitions,
             session_store: session_store.map(|store| Arc::new(StdMutex::new(store))),
+            store_uncertain: AtomicBool::new(false),
             state: Mutex::new(State {
                 active: None,
                 last: None,
@@ -629,6 +632,9 @@ impl Runtime {
         if command.validate().is_err() {
             return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
         }
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+        }
         let run_n = self.shared.run_counter.fetch_add(1, Ordering::SeqCst);
         let run = RunId::new(format!("r{:x}-{run_n}", self.shared.incarnation))
             .expect("counter id is valid");
@@ -684,30 +690,11 @@ impl Runtime {
         let history_len = conversation.len();
         conversation.push(user_item);
         let source_cursor = conversation.len();
-        if self.shared.session_store.is_some() {
-            let already_initialized = state.durable_sessions.contains(&command.session);
-            match self
-                .persist_session_input(
-                    &command.session,
-                    &command.profile,
-                    &run,
-                    conversation.last().expect("the user item was appended"),
-                    already_initialized,
-                )
-                .await
-            {
-                Ok(()) => {
-                    state.durable_sessions.insert(command.session.clone());
-                }
-                Err(_) => {
-                    return CommandResponse::new(
-                        command.request.clone(),
-                        CommandReply::Rejected,
-                        None,
-                    );
-                }
-            }
-        }
+        let already_initialized = state.durable_sessions.contains(&command.session);
+        let source_input = conversation
+            .last()
+            .expect("the user item was appended")
+            .clone();
         let context_note = if history_omitted {
             CONTEXT_NOTICE_TEXT.to_owned()
         } else {
@@ -784,6 +771,56 @@ impl Runtime {
             finished_sent: false,
         });
         drop(state);
+        // A caller abandoning its reply must not abandon the reserved slot or
+        // detach the storage worker. Admission stays owned by the runtime.
+        let admitting = self.clone();
+        let request = command.request.clone();
+        tokio::spawn(async move {
+            admitting
+                .complete_admission(command, run, source_input, already_initialized)
+                .await
+        })
+        .await
+        .unwrap_or_else(|_| CommandResponse::new(request, CommandReply::Rejected, None))
+    }
+
+    async fn complete_admission(
+        &self,
+        command: SubmitCommand,
+        run: RunId,
+        source_input: ModelContextItem,
+        already_initialized: bool,
+    ) -> CommandResponse {
+        // Reserve the active slot before I/O, but never hold the state lock
+        // while waiting for the blocking store. Concurrent commands stay live.
+        if let Err(_error) = self
+            .persist_session_input(
+                &command.session,
+                &command.profile,
+                &run,
+                &source_input,
+                already_initialized,
+            )
+            .await
+        {
+            let mut state = self.shared.state.lock().await;
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.run == run)
+            {
+                state.active = None;
+            }
+            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+        }
+        if self.shared.session_store.is_some() {
+            self.shared
+                .state
+                .lock()
+                .await
+                .durable_sessions
+                .insert(command.session.clone());
+        }
         let driver = self.clone();
         let run_for_task = run.clone();
         // The supervisor owns the driver's join handle so a panic or an
@@ -1382,7 +1419,6 @@ impl Runtime {
                         };
                         compact_context(active, self.shared.context_items_bound)?
                     };
-                    self.reset_source_cursor_after_compaction(run).await;
                     if let Some(reduction) = reduction {
                         let mut state = self.shared.state.lock().await;
                         if let Some(active) =
@@ -2475,8 +2511,10 @@ impl Runtime {
                 && &active.run == run
             {
                 active.persistence_error = Some(error.clone());
-                active.terminal = Some(RunOutcome::Failed);
-                active.terminal_error = Some(error);
+                if active.terminal.is_none() {
+                    active.terminal = Some(RunOutcome::Failed);
+                    active.terminal_error = Some(error);
+                }
                 active.outcome_slot = Some((
                     call_id,
                     ToolOutcome::new(
@@ -2763,7 +2801,14 @@ impl Runtime {
         let Some(store) = self.shared.session_store.clone() else {
             return Ok(());
         };
-        tokio::task::spawn_blocking(move || {
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
+        let run = intent.run.clone();
+        let worker = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().map_err(|_| {
                 runtime_error(
                     ErrorCategory::StorageFailure,
@@ -2771,16 +2816,22 @@ impl Runtime {
                 )
             })?;
             store.record_intent(&intent)
-        })
-        .await
-        .map_err(|_| runtime_error(ErrorCategory::StorageFailure, "session store worker failed"))?
+        });
+        self.await_store(&run, worker).await
     }
 
     async fn persist_tool_outcome(&self, outcome: ToolOutcomeRecord) -> Result<(), AgentError> {
         let Some(store) = self.shared.session_store.clone() else {
             return Ok(());
         };
-        tokio::task::spawn_blocking(move || {
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
+        let run = outcome.run.clone();
+        let worker = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().map_err(|_| {
                 runtime_error(
                     ErrorCategory::StorageFailure,
@@ -2788,9 +2839,8 @@ impl Runtime {
                 )
             })?;
             store.record_outcome(&outcome)
-        })
-        .await
-        .map_err(|_| runtime_error(ErrorCategory::StorageFailure, "session store worker failed"))?
+        });
+        self.await_store(&run, worker).await
     }
 
     async fn persist_session_input(
@@ -2804,11 +2854,18 @@ impl Runtime {
         let Some(store) = self.shared.session_store.clone() else {
             return Ok(());
         };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
+        let owner = run.clone();
         let session = session.clone();
         let profile = profile.to_owned();
         let run = run.clone();
         let item = item.clone();
-        tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().map_err(|_| {
                 runtime_error(
                     ErrorCategory::StorageFailure,
@@ -2834,9 +2891,8 @@ impl Runtime {
             }
             store.append_source_items(&session, &run, &[item])?;
             Ok(())
-        })
-        .await
-        .map_err(|_| runtime_error(ErrorCategory::StorageFailure, "session store worker failed"))?
+        });
+        self.await_store(&owner, worker).await
     }
 
     /// Commits every newly accepted context item before the runtime advances
@@ -2846,6 +2902,12 @@ impl Runtime {
         let Some(store) = self.shared.session_store.clone() else {
             return Ok(());
         };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "session store requires reconciliation",
+            ));
+        }
         let (session, items, cursor) = {
             let state = self.shared.state.lock().await;
             let Some(active) = state.active.as_ref().filter(|active| &active.run == run) else {
@@ -2872,7 +2934,7 @@ impl Runtime {
         let store_session = session.clone();
         let store_run = run.clone();
         let store_items = items.clone();
-        tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             let mut store = store.lock().map_err(|_| {
                 runtime_error(
                     ErrorCategory::StorageFailure,
@@ -2880,11 +2942,8 @@ impl Runtime {
                 )
             })?;
             store.append_source_items(&store_session, &store_run, &store_items)
-        })
-        .await
-        .map_err(|_| {
-            runtime_error(ErrorCategory::StorageFailure, "session store worker failed")
-        })??;
+        });
+        self.await_store(run, worker).await?;
 
         let mut state = self.shared.state.lock().await;
         let Some(active) = state.active.as_mut().filter(|active| &active.run == run) else {
@@ -2903,11 +2962,77 @@ impl Runtime {
         Ok(())
     }
 
-    async fn reset_source_cursor_after_compaction(&self, run: &RunId) {
-        let mut state = self.shared.state.lock().await;
-        if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
-            active.source_cursor = active.conversation.len();
+    /// Blocking writes cannot be preempted. Stop waiting at live cancellation
+    /// or the run deadline, retain the worker, and refuse further store use
+    /// until the host reopens/reconciles it.
+    async fn await_store<T: Send + 'static>(
+        &self,
+        run: &RunId,
+        mut worker: JoinHandle<Result<T, AgentError>>,
+    ) -> Result<T, AgentError> {
+        let control = {
+            let state = self.shared.state.lock().await;
+            state
+                .active
+                .as_ref()
+                .filter(|active| &active.run == run)
+                .map(|active| (active.token.clone(), active.wake.clone(), active.deadline))
+        };
+        let mut interrupted = RunOutcome::Cancelled;
+        if let Some((token, wake, deadline)) = control {
+            loop {
+                if token.is_cancelled() {
+                    break;
+                }
+                if StdInstant::now() >= deadline {
+                    interrupted = RunOutcome::LimitReached;
+                    break;
+                }
+                tokio::select! {
+                    result = &mut worker => {
+                        return match result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                self.shared.store_uncertain.store(true, Ordering::SeqCst);
+                                Err(runtime_error(ErrorCategory::StorageFailure, "session store worker failed; reopen required"))
+                            }
+                        };
+                    }
+                    () = wake.notified() => {}
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                }
+            }
         }
+        let error = runtime_error(
+            ErrorCategory::StorageFailure,
+            "session store write interrupted; reopen required",
+        );
+        self.shared.store_uncertain.store(true, Ordering::SeqCst);
+        {
+            let mut state = self.shared.state.lock().await;
+            state.quarantine.push(QuarantineMeta {
+                run: run.clone(),
+                call: None,
+            });
+            if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+                active.persistence_error = Some(error.clone());
+                if active.terminal.is_none() {
+                    active.terminal = Some(interrupted);
+                }
+            }
+        }
+        let shared = self.shared.clone();
+        let run = run.clone();
+        tokio::spawn(async move {
+            let _ = worker.await;
+            shared
+                .state
+                .lock()
+                .await
+                .quarantine
+                .retain(|meta| !(meta.run == run && meta.call.is_none()));
+        });
+        Err(error)
     }
 
     async fn set_terminal(&self, run: &RunId, outcome: RunOutcome, error: Option<AgentError>) {
@@ -3435,6 +3560,9 @@ fn compact_context(
     .ok_or_else(|| context_limit(active, bound))?;
 
     active.conversation = projection.items;
+    // All original items have been archived before any context projection.
+    // The cursor is an index in this new view, not the archival sequence.
+    active.source_cursor = active.conversation.len();
     active.history_len = projection.history_len;
     if projection.removed_items > 0 {
         active.context_note = note.to_owned();
@@ -9458,6 +9586,292 @@ mod cov_runtime_topup_private {
         );
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stored_source_survives_summary_truncation_and_hard_context_projection() {
+        for mode in 0..3 {
+            let directory = std::env::temp_dir().join(format!(
+                "nexus-runtime-store-compaction-{}-{}",
+                std::process::id(),
+                next_incarnation()
+            ));
+            let run = run_id("store-compaction");
+            let mut active = active_for(&run);
+            active.conversation = vec![
+                ModelContextItem::user_text("old task").unwrap(),
+                ModelContextItem::assistant_text("old-answer", "old source history ".repeat(400))
+                    .unwrap(),
+                ModelContextItem::user_text("current task").unwrap(),
+            ];
+            active.history_len = 2;
+            active.inherited_history = true;
+            active.source_cursor = active.conversation.len();
+            let original = active.conversation.clone();
+            let session = active.session.clone();
+            let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+            store
+                .initialize_session(
+                    &SessionCheckpoint::new(
+                        session.clone(),
+                        STORE_FORMAT_REVISION,
+                        0,
+                        Vec::new(),
+                        "profile",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            store
+                .append_source_items(&session, &run, &original)
+                .unwrap();
+            let provider = Arc::new(ScriptedProvider::new(if mode == 0 {
+                vec![stop_turn("Earlier task facts."), stop_turn("new answer")]
+            } else {
+                vec![stop_turn("new answer")]
+            }));
+            let (runtime, _streams) = Runtime::try_new_with_session_store(
+                RuntimeConfig {
+                    limits: Limits::m0_test(),
+                    policy: Policy::m0_test(),
+                    has_approval_handler: true,
+                },
+                provider,
+                Vec::new(),
+                ModelInstructions::default(),
+                Box::new(store),
+            )
+            .unwrap();
+            if mode < 2 {
+                active.context_management.window = Some(
+                    nexus_core::ContextWindow::new(
+                        4096,
+                        nexus_core::ContextWindowSource::Configured,
+                    )
+                    .unwrap(),
+                );
+                active.context_management.policy = nexus_core::ContextManagementPolicy::new(
+                    65,
+                    10,
+                    if mode == 0 {
+                        nexus_core::ContextCompactionStrategy::Summarize
+                    } else {
+                        nexus_core::ContextCompactionStrategy::Truncate
+                    },
+                )
+                .unwrap();
+            } else {
+                assert!(compact_context(&mut active, 2).is_ok());
+            }
+            test_rt().block_on(async {
+                runtime.shared.state.lock().await.active = Some(active);
+                if mode == 0 {
+                    assert!(matches!(
+                        runtime.on_calling_model(&run).await,
+                        Ok(RunState::CallingModel)
+                    ));
+                }
+                assert!(matches!(
+                    runtime.on_calling_model(&run).await,
+                    Err(Terminal {
+                        outcome: RunOutcome::Completed,
+                        ..
+                    })
+                ));
+                assert!(
+                    runtime
+                        .shared
+                        .state
+                        .lock()
+                        .await
+                        .active
+                        .as_ref()
+                        .unwrap()
+                        .persistence_error
+                        .is_none()
+                );
+            });
+            drop(runtime);
+            let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+            let records = reopened.load_source_records(&session, 0, 10).unwrap();
+            assert_eq!(records.len(), 4, "mode {mode}");
+            assert_eq!(
+                records[..3]
+                    .iter()
+                    .map(|record| record.item().clone())
+                    .collect::<Vec<_>>(),
+                original
+            );
+            assert_eq!(
+                records[3].item(),
+                &ModelContextItem::assistant_text("item-0", "new answer").unwrap()
+            );
+            drop(reopened);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_store_worker_is_owned_and_does_not_block_runtime_state() {
+        for cancel in [true, false] {
+            let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+            let run = run_id("blocked-store");
+            let mut active = active_for(&run);
+            let (gate, mut handle) = gate();
+            test_rt().block_on(async {
+                if !cancel {
+                    active.deadline = StdInstant::now() + Duration::from_millis(100);
+                }
+                let token = active.token.clone();
+                let wake = active.wake.clone();
+                install(&bed, active).await;
+                let worker = tokio::task::spawn_blocking(move || {
+                    gate.wait();
+                    Ok::<(), AgentError>(())
+                });
+                handle.entered.recv().await.unwrap();
+                if cancel {
+                    token.cancel();
+                    wake.notify_one();
+                }
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    bed.runtime.await_store(&run, worker),
+                )
+                .await
+                .unwrap();
+                assert!(result.is_err());
+                {
+                    let state = bed.shared.state.lock().await;
+                    assert_eq!(state.quarantine.len(), 1);
+                    let active = state.active.as_ref().unwrap();
+                    assert_eq!(
+                        active.terminal,
+                        Some(if cancel {
+                            RunOutcome::Cancelled
+                        } else {
+                            RunOutcome::LimitReached
+                        })
+                    );
+                    assert!(active.persistence_error.is_some());
+                }
+                assert!(bed.shared.store_uncertain.load(Ordering::SeqCst));
+                handle.release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while !bed.shared.state.lock().await.quarantine.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    bed.shared.store_uncertain.load(Ordering::SeqCst),
+                    "late completion does not make an interrupted write safe to retry"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn blocked_input_save_reserves_admission_without_holding_state_lock() {
+        struct AdmissionStore(Gate);
+        impl SessionStore for AdmissionStore {
+            fn list_sessions(
+                &self,
+                _: usize,
+            ) -> Result<Vec<nexus_core::SessionMetadata>, AgentError> {
+                Ok(Vec::new())
+            }
+            fn load_session(&self, _: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+                Err(runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session not found",
+                ))
+            }
+            fn save_checkpoint(&mut self, _: &SessionCheckpoint) -> Result<(), AgentError> {
+                Ok(())
+            }
+            fn initialize_session(&mut self, _: &SessionCheckpoint) -> Result<bool, AgentError> {
+                self.0.wait();
+                Ok(true)
+            }
+            fn append_source_items(
+                &mut self,
+                _: &SessionId,
+                _: &RunId,
+                _: &[ModelContextItem],
+            ) -> Result<u64, AgentError> {
+                Ok(1)
+            }
+            fn record_intent(&mut self, _: &ToolIntentRecord) -> Result<(), AgentError> {
+                Ok(())
+            }
+            fn record_outcome(&mut self, _: &ToolOutcomeRecord) -> Result<(), AgentError> {
+                Ok(())
+            }
+        }
+        let (gate, mut gate_handle) = gate();
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Vec::new(),
+            ModelInstructions::default(),
+            Box::new(AdmissionStore(gate)),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            let submitter = runtime.clone();
+            let command = SubmitCommand::new(
+                RequestId::new("req-admission").unwrap(),
+                session_id(),
+                "input",
+                "profile",
+            )
+            .unwrap();
+            let duplicate = command.clone();
+            let submitting = tokio::spawn(async move { submitter.submit(command).await });
+            tokio::time::timeout(Duration::from_secs(1), gate_handle.entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let busy = tokio::time::timeout(Duration::from_secs(1), runtime.submit(duplicate))
+                .await
+                .unwrap();
+            assert_eq!(busy.reply(), CommandReply::Busy);
+            let run = busy.run().unwrap().clone();
+            let cancelled = tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.cancel(CancelCommand {
+                    request: RequestId::new("req-cancel-admission").unwrap(),
+                    run,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cancelled.reply(), CommandReply::Accepted);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), submitting)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .reply(),
+                CommandReply::Rejected
+            );
+            assert!(runtime.shared.state.lock().await.active.is_none());
+            assert!(runtime.shared.store_uncertain.load(Ordering::SeqCst));
+            gate_handle.release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !runtime.shared.state.lock().await.quarantine.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
     }
 
     #[test]
