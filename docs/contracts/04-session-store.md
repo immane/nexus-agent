@@ -1,6 +1,6 @@
 # Session Store Contract
 
-Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session` now has a revision-2 bounded JSON snapshot with original model-context source records, but runtime integration and restoration are not implemented. Read the [common contract](00-common.md) first.
+Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session` has a revision-2 bounded JSON snapshot, and the runtime's opt-in store mode now persists accepted source items and operation records. Host wiring and restoration commands are not implemented. Read the [common contract](00-common.md) first.
 
 ## Scope and Operations
 
@@ -24,12 +24,13 @@ Semantic operations include bounded/paged session metadata listing, loading a se
 `nexus-core` defines a `SessionStore` port and bounded checkpoint/operation
 types. `nexus-session` provides a file-backed implementation, including
 append-only, paged source records for complete original model-context items.
-Runtime exposes an opt-in constructor that writes tool intents before dispatch
-and records outcomes afterward, but hosts do not yet wire that constructor.
-Automatic source-history writes and application restore commands are not
-implemented. The runtime's session cache remains process-local and terminal
-persistence reports ephemeral. Thus the store can preserve source history when
-called directly, but the application cannot yet promise full source recovery. See the
+Runtime exposes an opt-in constructor that initializes a checkpoint, persists
+accepted user input, complete assistant context items, and tool results, and
+writes tool intents before dispatch. Source items are committed before the run
+advances to dispatch/another model turn; write failure terminates the run.
+Host wiring and application restore/list commands are not implemented. The
+runtime's session cache remains process-local and terminal persistence reports
+ephemeral, so the application cannot yet promise restart recovery. See the
 [context-management design](../design/12-context-management.md) for the current
 gap and the source-history/active-view boundary.
 

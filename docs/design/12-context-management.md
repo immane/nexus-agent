@@ -82,8 +82,10 @@ evidence receives special retention, with fail-closed behavior when it cannot
 be carried forward safely.
 
 The runtime has an opt-in `try_new_with_session_store` constructor that
-durably writes tool intents before dispatch and records observed operation
-outcomes afterward. Host applications do not yet use it. The file-backed
+initializes the selected session, appends accepted user input and complete
+original context items in batches, durably writes tool intents before dispatch,
+and records observed operation outcomes afterward. Host applications do not
+yet use it; explicit list/restore commands remain unwired. The file-backed
 implementation has versioned source records for complete original
 `ModelContextItem` values, including tool content and execution uncertainty,
 alongside the existing checkpoint and operation records. However, the runtime

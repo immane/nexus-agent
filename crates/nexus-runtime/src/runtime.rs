@@ -43,10 +43,10 @@ use nexus_core::{
     Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits, ModelContextItem,
     ModelInstructions, ModelRequest, OutcomeSummary, PersistenceState, ProviderContext,
     ProviderEvent, ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId,
-    RunLifecycle, RunOutcome, SessionId, SessionStore, Snapshot, SubmitCommand, ToolAccess,
-    ToolCall, ToolContext, ToolFinishedInfo, ToolId, ToolIntentRecord, ToolOutcome,
-    ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec, ToolStartedInfo, TurnId, Usage,
-    UsageFinality,
+    RunLifecycle, RunOutcome, STORE_FORMAT_REVISION, SessionCheckpoint, SessionId, SessionStore,
+    Snapshot, SubmitCommand, ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId,
+    ToolIntentRecord, ToolOutcome, ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec,
+    ToolStartedInfo, TurnId, Usage, UsageFinality,
 };
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
@@ -149,6 +149,8 @@ struct State {
     /// Once uncertain evidence cannot be retained within the finite cache,
     /// refuse further model work rather than silently authorizing blind retries.
     history_safety_exhausted: bool,
+    /// Sessions initialized or explicitly loaded through this runtime's store.
+    durable_sessions: HashSet<SessionId>,
     /// Workers whose termination is not yet established. A non-empty list
     /// blocks new runs and further dispatch; at most one entry exists in the
     /// sequential M0 baseline.
@@ -263,6 +265,8 @@ struct ActiveRun {
     calls_used: u32,
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
+    /// Index of the first context item not yet committed to source history.
+    source_cursor: usize,
     history_len: usize,
     inherited_history: bool,
     initial_context_reduction: Option<ContextReduction>,
@@ -559,6 +563,7 @@ impl Runtime {
                 history_omissions: Vec::new(),
                 history_omission_fallback_items: 0,
                 history_safety_exhausted: false,
+                durable_sessions: HashSet::new(),
                 quarantine: Vec::new(),
             }),
             data_tx,
@@ -678,6 +683,31 @@ impl Runtime {
         let history_omitted = history_omitted_items > 0;
         let history_len = conversation.len();
         conversation.push(user_item);
+        let source_cursor = conversation.len();
+        if self.shared.session_store.is_some() {
+            let already_initialized = state.durable_sessions.contains(&command.session);
+            match self
+                .persist_session_input(
+                    &command.session,
+                    &command.profile,
+                    &run,
+                    conversation.last().expect("the user item was appended"),
+                    already_initialized,
+                )
+                .await
+            {
+                Ok(()) => {
+                    state.durable_sessions.insert(command.session.clone());
+                }
+                Err(_) => {
+                    return CommandResponse::new(
+                        command.request.clone(),
+                        CommandReply::Rejected,
+                        None,
+                    );
+                }
+            }
+        }
         let context_note = if history_omitted {
             CONTEXT_NOTICE_TEXT.to_owned()
         } else {
@@ -727,6 +757,7 @@ impl Runtime {
             calls_used: 0,
             continuation: None,
             conversation,
+            source_cursor,
             history_len,
             inherited_history: history_len > 0,
             initial_context_reduction,
@@ -1330,8 +1361,38 @@ impl Runtime {
                     stream_overflow.load(Ordering::SeqCst),
                 )
                 .await?;
-                self.ingest_model_batch(run, &turn, events, &mut prefix)
-                    .await
+                let result = self
+                    .ingest_model_batch(run, &turn, events, &mut prefix)
+                    .await;
+                if let Err(error) = self.persist_pending_source(run).await {
+                    let mut state = self.shared.state.lock().await;
+                    if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
+                    {
+                        active.persistence_error = Some(error.clone());
+                    }
+                    return Err(Terminal::failed(error));
+                }
+                if matches!(&result, Ok(RunState::ValidatingTools)) {
+                    let reduction = {
+                        let mut state = self.shared.state.lock().await;
+                        let Some(active) =
+                            state.active.as_mut().filter(|active| &active.run == run)
+                        else {
+                            return Err(Terminal::cancelled());
+                        };
+                        compact_context(active, self.shared.context_items_bound)?
+                    };
+                    self.reset_source_cursor_after_compaction(run).await;
+                    if let Some(reduction) = reduction {
+                        let mut state = self.shared.state.lock().await;
+                        if let Some(active) =
+                            state.active.as_mut().filter(|active| &active.run == run)
+                        {
+                            publish_context_reduction(&self.shared, active, run, reduction);
+                        }
+                    }
+                }
+                result
             }
             Some(Err(join)) => {
                 let message = if join.is_panic() {
@@ -1834,11 +1895,6 @@ impl Runtime {
                             candidates,
                             if has_text { "" } else { &reasoning },
                         )?;
-                        if let Some(reduction) =
-                            compact_context(active, self.shared.context_items_bound)?
-                        {
-                            publish_context_reduction(&self.shared, active, run, reduction);
-                        }
                         Ok(RunState::ValidatingTools)
                     }
                 }
@@ -2660,13 +2716,33 @@ impl Runtime {
             EventPayload::ToolFinished(ToolFinishedInfo { call, outcome }),
         );
         apply_required_control_outcome(active, delivery);
-        if let Some(outcome) = active.force_terminal.take() {
+        let forced_terminal = active.force_terminal.take();
+        if let Some(outcome) = forced_terminal {
             active.terminal = Some(outcome);
+        }
+        drop(state);
+        if let Err(error) = self.persist_pending_source(run).await {
+            let mut state = self.shared.state.lock().await;
+            if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+                active.persistence_error = Some(error.clone());
+                if active.terminal.is_none() {
+                    active.terminal = Some(RunOutcome::Failed);
+                    active.terminal_error = Some(error);
+                }
+            }
+            return Ok(RunState::Finished);
+        }
+        let mut state = self.shared.state.lock().await;
+        let Some(active) = state.active.as_mut().filter(|active| &active.run == run) else {
+            return Err(Terminal::cancelled());
+        };
+        if active.terminal.is_some() {
             return Ok(RunState::Finished);
         }
         if let Some(reduction) = compact_context(active, self.shared.context_items_bound)? {
             publish_context_reduction(&self.shared, active, run, reduction);
         }
+        active.source_cursor = active.conversation.len();
         if active.queue.is_empty() {
             Ok(RunState::Preparing)
         } else {
@@ -2715,6 +2791,123 @@ impl Runtime {
         })
         .await
         .map_err(|_| runtime_error(ErrorCategory::StorageFailure, "session store worker failed"))?
+    }
+
+    async fn persist_session_input(
+        &self,
+        session: &SessionId,
+        profile: &str,
+        run: &RunId,
+        item: &ModelContextItem,
+        already_initialized: bool,
+    ) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        let session = session.clone();
+        let profile = profile.to_owned();
+        let run = run.clone();
+        let item = item.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            let checkpoint = SessionCheckpoint::new(
+                session.clone(),
+                STORE_FORMAT_REVISION,
+                0,
+                Vec::<nexus_core::store::StoredMessage>::new(),
+                profile,
+            )?;
+            let created = store.initialize_session(&checkpoint)?;
+            if !created && !already_initialized {
+                let existing = store.load_session(&session)?;
+                if !existing.messages().is_empty() || store.last_source_sequence(&session)? > 0 {
+                    return Err(runtime_error(
+                        ErrorCategory::StorageFailure,
+                        "session history must be explicitly restored before submitting",
+                    ));
+                }
+            }
+            store.append_source_items(&session, &run, &[item])?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| runtime_error(ErrorCategory::StorageFailure, "session store worker failed"))?
+    }
+
+    /// Commits every newly accepted context item before the runtime advances
+    /// to another phase. Source history is append-only even when the active
+    /// model context is later compacted.
+    async fn persist_pending_source(&self, run: &RunId) -> Result<(), AgentError> {
+        let Some(store) = self.shared.session_store.clone() else {
+            return Ok(());
+        };
+        let (session, items, cursor) = {
+            let state = self.shared.state.lock().await;
+            let Some(active) = state.active.as_ref().filter(|active| &active.run == run) else {
+                return Err(runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "active session disappeared before source history commit",
+                ));
+            };
+            if active.source_cursor > active.conversation.len() {
+                return Err(runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "active source history cursor is invalid",
+                ));
+            }
+            (
+                active.session.clone(),
+                active.conversation[active.source_cursor..].to_vec(),
+                active.source_cursor,
+            )
+        };
+        if items.is_empty() {
+            return Ok(());
+        }
+        let store_session = session.clone();
+        let store_run = run.clone();
+        let store_items = items.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.append_source_items(&store_session, &store_run, &store_items)
+        })
+        .await
+        .map_err(|_| {
+            runtime_error(ErrorCategory::StorageFailure, "session store worker failed")
+        })??;
+
+        let mut state = self.shared.state.lock().await;
+        let Some(active) = state.active.as_mut().filter(|active| &active.run == run) else {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "active session changed after source history commit",
+            ));
+        };
+        if active.source_cursor != cursor {
+            return Err(runtime_error(
+                ErrorCategory::StorageFailure,
+                "active source history cursor changed during commit",
+            ));
+        }
+        active.source_cursor = cursor.saturating_add(items.len());
+        Ok(())
+    }
+
+    async fn reset_source_cursor_after_compaction(&self, run: &RunId) {
+        let mut state = self.shared.state.lock().await;
+        if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+            active.source_cursor = active.conversation.len();
+        }
     }
 
     async fn set_terminal(&self, run: &RunId, outcome: RunOutcome, error: Option<AgentError>) {
@@ -4780,7 +4973,7 @@ mod tests {
                 CommandReply::StaleOrUnknownTarget
             );
             let (events, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
-            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert_eq!(finished.outcome(), RunOutcome::Completed, "{finished:?}");
             assert!(
                 !events
                     .control
@@ -6350,6 +6543,7 @@ mod cov_runtime_private {
             calls_used: 0,
             continuation: None,
             conversation: Vec::new(),
+            source_cursor: 0,
             history_len: 0,
             inherited_history: false,
             initial_context_reduction: None,
@@ -6843,6 +7037,7 @@ mod cov_runtime_private {
             history_omissions: Vec::new(),
             history_omission_fallback_items: 0,
             history_safety_exhausted: false,
+            durable_sessions: HashSet::new(),
             quarantine: Vec::new(),
         };
         for index in 0..=MAX_HISTORY_OMISSION_SESSIONS {
@@ -8054,6 +8249,7 @@ mod cov_runtime_topup_private {
             calls_used: 0,
             continuation: None,
             conversation: Vec::new(),
+            source_cursor: 0,
             history_len: 0,
             inherited_history: false,
             initial_context_reduction: None,
@@ -9148,9 +9344,23 @@ mod cov_runtime_topup_private {
             std::process::id(),
             next_incarnation()
         ));
-        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
         let provider = Arc::new(ScriptedProvider::new(Vec::new()));
         let read = Arc::new(ScriptedTool::new("host_read", None));
+        let run = run_id("persistent-tool");
+        let mut active = active_for(&run);
+        let checkpoint = SessionCheckpoint::new(
+            active.session.clone(),
+            STORE_FORMAT_REVISION,
+            0,
+            Vec::new(),
+            active.profile.clone(),
+        )
+        .unwrap();
+        store.initialize_session(&checkpoint).unwrap();
+        // This fixture starts after model admission; its context is outside
+        // this operation-record-focused test.
+        active.source_cursor = 1;
         let (runtime, _streams) = Runtime::try_new_with_session_store(
             RuntimeConfig {
                 limits: Limits::m0_test(),
@@ -9163,9 +9373,7 @@ mod cov_runtime_topup_private {
             Box::new(store),
         )
         .unwrap();
-        let run = run_id("persistent-tool");
         let call = read_call(&run, call_id("persistent-tool"));
-        let mut active = active_for(&run);
         active.current = Some(current_call(&call, None));
         test_rt().block_on(async {
             runtime.shared.state.lock().await.active = Some(active);
@@ -9187,6 +9395,152 @@ mod cov_runtime_topup_private {
         assert!(snapshot.contains("call-persistent-tool"));
         assert!(snapshot.contains("succeeded"));
         assert!(snapshot.contains("known_applied"));
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_persists_user_and_completed_assistant_source_items() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-history-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![stop_turn("durable answer")]));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            Vec::new(),
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+
+        let command = SubmitCommand::new(
+            RequestId::new("req-durable-history").unwrap(),
+            SessionId::new("sess-1").unwrap(),
+            "do work",
+            "test-profile",
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            assert_eq!(
+                runtime.submit(command).await.reply(),
+                CommandReply::Accepted
+            );
+            let finished = loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    break finished.clone();
+                }
+            };
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert_eq!(finished.persistence(), PersistenceState::Ephemeral);
+        });
+        drop(runtime);
+
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let session = SessionId::new("sess-1").unwrap();
+        let records = reopened.load_source_records(&session, 0, 10).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].item(),
+            &ModelContextItem::user_text("do work").unwrap()
+        );
+        assert_eq!(
+            records[1].item(),
+            &ModelContextItem::assistant_text("item-0", "durable answer").unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_persists_tool_call_and_result_before_continuing() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-session-tool-history-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            {
+                let mut events = vec![ProviderEvent::ToolCallReady(
+                    CallCandidate::new(
+                        "item-call",
+                        "provider-ref",
+                        "host_read",
+                        r#"{"path":"src"}"#,
+                    )
+                    .unwrap(),
+                )];
+                events.push(ProviderEvent::TurnFinished(TurnFinished::new(
+                    FinishReason::ToolCalls,
+                    Usage::new(None, None, UsageFinality::Final),
+                    None,
+                )));
+                events
+            },
+            stop_turn("finished after read"),
+        ]));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        let command = SubmitCommand::new(
+            RequestId::new("req-durable-tool-history").unwrap(),
+            SessionId::new("sess-1").unwrap(),
+            "read something",
+            "test-profile",
+        )
+        .unwrap();
+
+        test_rt().block_on(async {
+            assert_eq!(
+                runtime.submit(command).await.reply(),
+                CommandReply::Accepted
+            );
+            let finished = loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    break finished.clone();
+                }
+            };
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+        });
+        assert_eq!(read.execution_count(), 1);
+        drop(runtime);
+
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let session = SessionId::new("sess-1").unwrap();
+        let records = reopened.load_source_records(&session, 0, 10).unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(matches!(
+            records[1].item(),
+            ModelContextItem::AssistantCall { .. }
+        ));
+        assert!(matches!(
+            records[2].item(),
+            ModelContextItem::ToolResult { .. }
+        ));
+        assert_eq!(
+            records[3].item(),
+            &ModelContextItem::assistant_text("item-0", "finished after read").unwrap()
+        );
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -9251,9 +9605,21 @@ mod cov_runtime_topup_private {
             std::process::id(),
             next_incarnation()
         ));
-        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
         let provider = Arc::new(ScriptedProvider::new(Vec::new()));
         let read = Arc::new(ScriptedTool::new("host_read", None));
+        let run = run_id("persistent-outcome-failure");
+        let mut active = active_for(&run);
+        let checkpoint = SessionCheckpoint::new(
+            active.session.clone(),
+            STORE_FORMAT_REVISION,
+            0,
+            Vec::new(),
+            active.profile.clone(),
+        )
+        .unwrap();
+        store.initialize_session(&checkpoint).unwrap();
+        active.source_cursor = 1;
         let (runtime, mut streams) = Runtime::try_new_with_session_store(
             RuntimeConfig {
                 limits: Limits::m0_test(),
@@ -9267,9 +9633,7 @@ mod cov_runtime_topup_private {
         )
         .unwrap();
 
-        let run = run_id("persistent-outcome-failure");
         let call = read_call(&run, call_id("persistent-outcome-failure"));
-        let mut active = active_for(&run);
         active.current = Some(current_call(&call, None));
         test_rt().block_on(async {
             runtime.shared.state.lock().await.active = Some(active);
@@ -9283,7 +9647,7 @@ mod cov_runtime_topup_private {
             std::fs::write(&directory, "block store directory creation").unwrap();
             assert!(matches!(
                 runtime.on_recording(&run).await,
-                Ok(RunState::Preparing)
+                Ok(RunState::Finished)
             ));
             let state = runtime.shared.state.lock().await;
             let active = state.active.as_ref().unwrap();
