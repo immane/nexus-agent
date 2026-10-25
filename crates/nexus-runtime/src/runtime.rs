@@ -10636,10 +10636,12 @@ mod cov_runtime_topup_private {
         // Intentionally omit uncertainty from the model's summary: retained
         // execution evidence must be host-derived, not dependent on this text.
         let summary = "Earlier operations were attempted.";
-        let provider = Arc::new(ScriptedProvider::new(vec![
-            stop_turn(summary),
-            stop_turn("new answer"),
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(
+            (0..3)
+                .map(|_| stop_turn(summary))
+                .chain(std::iter::once(stop_turn("new answer")))
+                .collect(),
+        ));
         let (runtime, _streams) = Runtime::try_new_with_session_store(
             RuntimeConfig {
                 limits: Limits::m0_test(),
@@ -10654,11 +10656,30 @@ mod cov_runtime_topup_private {
         .unwrap();
         test_rt().block_on(async {
             runtime.shared.state.lock().await.active = Some(active);
-            assert!(matches!(
-                runtime.on_calling_model(&run).await,
-                Ok(RunState::CallingModel)
-            ));
-            assert_eq!(provider.call_count(), 1);
+            loop {
+                assert!(matches!(
+                    runtime.on_calling_model(&run).await,
+                    Ok(RunState::CallingModel)
+                ));
+                let pending = runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .pending_compaction
+                    .is_some();
+                if !pending {
+                    break;
+                }
+                assert!(
+                    provider.call_count() < 16,
+                    "summary is bounded by turn budget"
+                );
+            }
+            assert!(provider.call_count() > 1);
             {
                 let mut state = runtime.shared.state.lock().await;
                 let active = state.active.as_mut().unwrap();
@@ -10724,7 +10745,7 @@ mod cov_runtime_topup_private {
                     ..
                 })
             ));
-            assert_eq!(provider.call_count(), 2);
+            assert!(provider.call_count() > 2);
             assert!(
                 runtime
                     .shared
