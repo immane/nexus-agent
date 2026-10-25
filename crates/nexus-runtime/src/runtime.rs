@@ -40,14 +40,16 @@ use nexus_core::{
     AgentError, ApprovalBinding, ApprovalId, ApprovalNotice, ApproveCommand, AssistantText,
     CallCandidate, CallId, CancelCommand, CancellationToken, Command, CommandReply,
     CommandResponse, ContinuationData, DenyCommand, EffectState, ErrorCategory, EventPayload,
-    Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits, ModelContextItem,
-    ModelInstructions, ModelRequest, OutcomeSummary, PersistenceState, ProviderContext,
-    ProviderEvent, ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId,
-    RunLifecycle, RunOutcome, STORE_FORMAT_REVISION, SessionCheckpoint, SessionId, SessionStore,
-    Snapshot, SubmitCommand, ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId,
-    ToolIntentRecord, ToolOutcome, ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec,
-    ToolStartedInfo, TurnId, Usage, UsageFinality,
+    Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits,
+    ListSessionsCommand, ModelContextItem, ModelInstructions, ModelRequest, OutcomeSummary,
+    PersistenceState, ProviderContext, ProviderEvent, ProviderPort, RequestId,
+    RestoreSessionCommand, RetryGuidance, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome,
+    STORE_FORMAT_REVISION, SessionCheckpoint, SessionId, SessionStore, Snapshot, SubmitCommand,
+    ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId, ToolIntentRecord, ToolOutcome,
+    ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec, ToolStartedInfo, TurnId, Usage,
+    UsageFinality,
 };
+use nexus_session::recover_session;
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -139,6 +141,7 @@ struct RegisteredTool {
 
 struct State {
     active: Option<ActiveRun>,
+    restore_busy: bool,
     last: Option<FinishedRun>,
     /// Whole completed exchanges, globally bounded by the context budgets.
     history: VecDeque<RetainedExchange>,
@@ -561,6 +564,7 @@ impl Runtime {
             store_uncertain: AtomicBool::new(false),
             state: Mutex::new(State {
                 active: None,
+                restore_busy: false,
                 last: None,
                 history: VecDeque::new(),
                 history_omissions: Vec::new(),
@@ -601,8 +605,8 @@ impl Runtime {
             .expect("test-only runtime wiring must be valid; use Runtime::try_new in production")
     }
 
-    /// Handles one typed frontend command. `ListSessions`/`RestoreSession`
-    /// have no store in M0 and are explicitly rejected.
+    /// Handles one typed frontend command, including explicit bounded history
+    /// listing and restoration when a store has been injected.
     pub async fn handle(&self, command: Command) -> (CommandResponse, Option<Snapshot>) {
         match command {
             Command::Submit(command) => (self.submit(command).await, None),
@@ -613,15 +617,128 @@ impl Runtime {
             }
             Command::Deny(command) => (self.deny(command).await, None),
             Command::GetSnapshot(command) => self.get_snapshot(command).await,
-            Command::ListSessions(command) => (
-                CommandResponse::new(command.request.clone(), CommandReply::Rejected, None),
-                None,
-            ),
-            Command::RestoreSession(command) => (
-                CommandResponse::new(command.request.clone(), CommandReply::Rejected, None),
-                None,
-            ),
+            Command::ListSessions(command) => (self.list_sessions(command).await, None),
+            Command::RestoreSession(command) => (self.restore_session(command).await, None),
         }
+    }
+
+    async fn list_sessions(&self, command: ListSessionsCommand) -> CommandResponse {
+        if command.validate().is_err() || self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        }
+        let Some(store) = self.shared.session_store.clone() else {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        let limit = command.limit;
+        let result = tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            store.list_sessions(limit)
+        })
+        .await;
+        match result {
+            Ok(Ok(sessions)) if sessions.len() <= limit => {
+                CommandResponse::new(command.request, CommandReply::Accepted, None)
+                    .with_sessions(sessions)
+            }
+            _ => CommandResponse::new(command.request, CommandReply::Rejected, None),
+        }
+    }
+
+    async fn restore_session(&self, command: RestoreSessionCommand) -> CommandResponse {
+        let runtime = self.clone();
+        let request = command.request.clone();
+        tokio::spawn(async move { runtime.restore_session_inner(command).await })
+            .await
+            .unwrap_or_else(|_| CommandResponse::new(request, CommandReply::Rejected, None))
+    }
+
+    async fn restore_session_inner(&self, command: RestoreSessionCommand) -> CommandResponse {
+        let Some(store) = self.shared.session_store.clone() else {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        if self.shared.store_uncertain.load(Ordering::SeqCst) {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        }
+        {
+            let mut state = self.shared.state.lock().await;
+            if state.active.is_some()
+                || state.restore_busy
+                || !state.quarantine.is_empty()
+                || self.shared.outbox_events.load(Ordering::SeqCst) != 0
+            {
+                return CommandResponse::new(command.request, CommandReply::Busy, None);
+            }
+            state.restore_busy = true;
+        }
+
+        let session = command.session.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| {
+                runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store is unavailable",
+                )
+            })?;
+            recover_session(store.as_ref(), &session)
+        })
+        .await;
+        let recovered = match recovered {
+            Ok(Ok(recovered)) => recovered,
+            _ => {
+                self.shared.state.lock().await.restore_busy = false;
+                return CommandResponse::new(command.request, CommandReply::Rejected, None);
+            }
+        };
+        let items = match restore_items(recovered.items().cloned().collect()) {
+            Ok(items) => items,
+            Err(()) => {
+                self.shared.state.lock().await.restore_busy = false;
+                return CommandResponse::new(command.request, CommandReply::Rejected, None);
+            }
+        };
+        let Some((items, omitted_items)) =
+            bounded_restored_history(items, self.shared.context_items_bound)
+        else {
+            self.shared.state.lock().await.restore_busy = false;
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        let mut state = self.shared.state.lock().await;
+        if state.active.is_some() {
+            state.restore_busy = false;
+            return CommandResponse::new(command.request, CommandReply::Busy, None);
+        }
+        let discarded: Vec<_> = state
+            .history
+            .iter()
+            .filter(|exchange| exchange.session != command.session)
+            .map(|exchange| (exchange.session.clone(), exchange.items.len()))
+            .collect();
+        state.history.clear();
+        state
+            .history_omissions
+            .retain(|omission| omission.session != command.session);
+        for (session, removed) in discarded {
+            mark_history_omitted(&mut state, session, removed);
+        }
+        for exchange in split_history_exchanges(&items) {
+            state.history.push_back(RetainedExchange {
+                session: command.session.clone(),
+                items: exchange,
+                derived_memory: None,
+            });
+        }
+        if omitted_items > 0 {
+            mark_history_omitted(&mut state, command.session.clone(), omitted_items);
+        }
+        state.durable_sessions.insert(command.session.clone());
+        state.restore_busy = false;
+        CommandResponse::new(command.request, CommandReply::Accepted, None)
+            .with_restored_session(command.session)
     }
 
     /// Accepts a new run or rejects explicitly. A second submit while a run
@@ -652,6 +769,9 @@ impl Runtime {
                 CommandReply::Busy,
                 Some(active.run.clone()),
             );
+        }
+        if state.restore_busy {
+            return CommandResponse::new(command.request.clone(), CommandReply::Busy, None);
         }
         if let Some(quarantined) = state.quarantine.first() {
             return CommandResponse::new(
@@ -3580,6 +3700,96 @@ fn compact_context(
 fn context_notice_item() -> Result<ModelContextItem, Terminal> {
     ModelContextItem::assistant_text(CONTEXT_NOTICE_ITEM_KEY, CONTEXT_NOTICE_TEXT)
         .map_err(Terminal::failed)
+}
+
+fn restore_items(source: Vec<ModelContextItem>) -> Result<Vec<ModelContextItem>, ()> {
+    let mut results = HashSet::new();
+    for item in &source {
+        if let ModelContextItem::ToolResult { call, .. } = item {
+            results.insert(call.clone());
+        }
+    }
+    let mut restored = Vec::with_capacity(source.len());
+    for item in source {
+        match &item {
+            ModelContextItem::AssistantCall {
+                item_key,
+                provider_ref,
+                call,
+                ..
+            } if !results.contains(call.call()) => {
+                let call_id = call.call().clone();
+                let item_key = item_key.as_str().to_owned();
+                let provider_ref = provider_ref.as_str().to_owned();
+                let tool = call.tool().clone();
+                let uncertain = ToolOutcome::new(
+                    ExecutionStatus::Interrupted,
+                    EffectState::Unknown,
+                    Evidence::Uncertain,
+                    "Session ended before this tool call recorded an outcome; effects are unknown.",
+                    false,
+                )
+                .map_err(|_| ())?;
+                restored.push(item);
+                restored.push(
+                    ModelContextItem::tool_result(call_id, item_key, provider_ref, tool, uncertain)
+                        .map_err(|_| ())?,
+                );
+            }
+            _ => restored.push(item),
+        }
+    }
+    if !context_calls_are_paired(&restored)
+        || restored
+            .first()
+            .is_some_and(|item| !matches!(item, ModelContextItem::UserText(_)))
+    {
+        return Err(());
+    }
+    Ok(restored)
+}
+
+fn bounded_restored_history(
+    mut items: Vec<ModelContextItem>,
+    max_items: usize,
+) -> Option<(Vec<ModelContextItem>, usize)> {
+    if items.is_empty() {
+        return Some((items, 0));
+    }
+    let original_len = items.len();
+    // The projection API selects inherited exchanges before a current user
+    // turn. A temporary sentinel provides that boundary and is removed before
+    // anything is installed into runtime state.
+    items.push(ModelContextItem::user_text("restore-boundary").ok()?);
+    let projection = project_bounded_history(
+        &items,
+        original_len,
+        ContextBounds {
+            max_items,
+            max_bytes: nexus_core::provider::MAX_CONVERSATION_BYTES,
+            reserved_items: 0,
+            reserved_bytes: 0,
+        },
+    )?;
+    let mut retained = projection.items;
+    if !matches!(retained.pop(), Some(ModelContextItem::UserText(_))) {
+        return None;
+    }
+    let removed = original_len.saturating_sub(retained.len());
+    Some((retained, removed))
+}
+
+fn split_history_exchanges(items: &[ModelContextItem]) -> Vec<Vec<ModelContextItem>> {
+    let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
+    for item in items {
+        if matches!(item, ModelContextItem::UserText(_)) {
+            exchanges.push(Vec::new());
+        }
+        if let Some(exchange) = exchanges.last_mut() {
+            exchange.push(item.clone());
+        }
+    }
+    exchanges
 }
 
 fn runtime_note_bytes(note: &str, has_host_instructions: bool) -> usize {
@@ -7160,6 +7370,7 @@ mod cov_runtime_private {
     fn history_omission_markers_are_bounded_with_a_global_fallback() {
         let mut state = State {
             active: None,
+            restore_busy: false,
             last: None,
             history: VecDeque::new(),
             history_omissions: Vec::new(),
@@ -9584,6 +9795,121 @@ mod cov_runtime_topup_private {
             records[1].item(),
             &ModelContextItem::assistant_text("item-0", "durable answer").unwrap()
         );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_list_and_restore_load_bounded_history_without_execution() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-restore-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let session = SessionId::new("sess-recover").unwrap();
+        let old_run = run_id("interrupted");
+        let call = read_call(&old_run, call_id("unfinished"));
+        let source = vec![
+            ModelContextItem::user_text("perform a read").unwrap(),
+            ModelContextItem::assistant_call("item-call", "provider-ref", call.clone()).unwrap(),
+        ];
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    STORE_FORMAT_REVISION,
+                    0,
+                    Vec::new(),
+                    "old-profile",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_source_items(&session, &old_run, &source)
+            .unwrap();
+
+        let provider = Arc::new(ScriptedProvider::new(vec![stop_turn("continued")]));
+        let tool = Arc::new(ScriptedTool::new("host_read", None));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider.clone(),
+            vec![ToolRegistration::read(tool.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            let listed = runtime
+                .handle(Command::ListSessions(
+                    ListSessionsCommand::new(RequestId::new("req-list-recovered").unwrap(), 4)
+                        .unwrap(),
+                ))
+                .await
+                .0;
+            assert_eq!(listed.reply(), CommandReply::Accepted);
+            assert!(listed.has_sessions());
+            assert_eq!(listed.sessions().len(), 1);
+            assert_eq!(listed.sessions()[0].session, session);
+            assert_eq!(provider.call_count(), 0);
+
+            let restored = runtime
+                .handle(Command::RestoreSession(RestoreSessionCommand {
+                    request: RequestId::new("req-restore-recovered").unwrap(),
+                    session: session.clone(),
+                }))
+                .await
+                .0;
+            assert_eq!(restored.reply(), CommandReply::Accepted);
+            assert_eq!(restored.restored_session(), Some(&session));
+            assert_eq!(provider.call_count(), 0, "restore must not call the model");
+            assert_eq!(tool.execution_count(), 0, "restore must not execute tools");
+            {
+                let state = runtime.shared.state.lock().await;
+                assert_eq!(state.history.len(), 1);
+                let restored_items = &state.history.front().unwrap().items;
+                assert_eq!(restored_items.len(), 3);
+                assert!(matches!(
+                    restored_items[1],
+                    ModelContextItem::AssistantCall { .. }
+                ));
+                assert!(matches!(
+                    &restored_items[2],
+                    ModelContextItem::ToolResult { outcome, .. }
+                        if outcome.status() == ExecutionStatus::Interrupted
+                            && outcome.effect() == EffectState::Unknown
+                            && outcome.evidence() == Evidence::Uncertain
+                ));
+            }
+
+            let submitted = runtime
+                .submit(
+                    SubmitCommand::new(
+                        RequestId::new("req-continue-recovered").unwrap(),
+                        session.clone(),
+                        "continue safely",
+                        "current-profile",
+                    )
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(submitted.reply(), CommandReply::Accepted);
+            while let Some(event) = streams.control.recv().await {
+                if event.is_terminal() {
+                    break;
+                }
+            }
+            assert_eq!(provider.call_count(), 1);
+            assert_eq!(tool.execution_count(), 0, "old call is never replayed");
+        });
+        drop(runtime);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.last_source_sequence(&session).unwrap(), 4);
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();
     }

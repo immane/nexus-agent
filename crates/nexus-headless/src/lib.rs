@@ -1010,6 +1010,7 @@ fn execution_name(status: nexus_core::ExecutionStatus) -> &'static str {
         nexus_core::ExecutionStatus::Denied => "denied",
         nexus_core::ExecutionStatus::Cancelled => "cancelled",
         nexus_core::ExecutionStatus::TimedOut => "timed-out",
+        nexus_core::ExecutionStatus::Interrupted => "interrupted",
     }
 }
 
@@ -2283,6 +2284,7 @@ mod cov_topup_private {
             (ExecutionStatus::Denied, "denied"),
             (ExecutionStatus::Cancelled, "cancelled"),
             (ExecutionStatus::TimedOut, "timed-out"),
+            (ExecutionStatus::Interrupted, "interrupted"),
         ] {
             assert_eq!(execution_name(status), name, "status {status:?}");
         }
@@ -2326,11 +2328,12 @@ mod cov_topup_private {
             line.ends_with("kind=tool-finished call=c1-0 status=failed effect=unknown evidence=uncertain truncated=true content-len=23 content=tool%20reported%20a%20failure"),
             "{line}"
         );
-        // Cancelled and timed-out share the same effect/evidence honesty: the
+        // Interrupted, cancelled and timed-out share the same effect/evidence honesty: the
         // runtime cannot know whether the effect landed.
         for (status, name) in [
             (ExecutionStatus::Cancelled, "cancelled"),
             (ExecutionStatus::TimedOut, "timed-out"),
+            (ExecutionStatus::Interrupted, "interrupted"),
         ] {
             let outcome = ToolOutcome::new(
                 status,

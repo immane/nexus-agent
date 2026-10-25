@@ -216,6 +216,9 @@ pub struct CommandResponse {
     request: RequestId,
     reply: CommandReply,
     run: Option<RunId>,
+    sessions: Vec<crate::SessionMetadata>,
+    has_sessions: bool,
+    restored_session: Option<crate::SessionId>,
 }
 
 impl CommandResponse {
@@ -226,7 +229,31 @@ impl CommandResponse {
             request,
             reply,
             run,
+            sessions: Vec::new(),
+            has_sessions: false,
+            restored_session: None,
         }
+    }
+
+    /// Attaches bounded metadata returned by an explicit session listing.
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: Vec<crate::SessionMetadata>) -> Self {
+        self.sessions = sessions;
+        self.has_sessions = true;
+        self
+    }
+
+    /// Returns whether this response carries a listing, including an empty one.
+    #[must_use]
+    pub fn has_sessions(&self) -> bool {
+        self.has_sessions
+    }
+
+    /// Marks the session whose history was explicitly restored.
+    #[must_use]
+    pub fn with_restored_session(mut self, session: crate::SessionId) -> Self {
+        self.restored_session = Some(session);
+        self
     }
 
     /// Returns the correlation identity.
@@ -245,6 +272,18 @@ impl CommandResponse {
     #[must_use]
     pub fn run(&self) -> Option<&RunId> {
         self.run.as_ref()
+    }
+
+    /// Returns session metadata for a list command; never includes history.
+    #[must_use]
+    pub fn sessions(&self) -> &[crate::SessionMetadata] {
+        &self.sessions
+    }
+
+    /// Returns the restored session identity, if this response restored one.
+    #[must_use]
+    pub fn restored_session(&self) -> Option<&crate::SessionId> {
+        self.restored_session.as_ref()
     }
 }
 
@@ -1166,6 +1205,9 @@ mod cov_commands_private {
             request: RequestId::new("req-1").expect("valid"),
             reply: CommandReply::Accepted,
             run: None,
+            sessions: Vec::new(),
+            has_sessions: false,
+            restored_session: None,
         };
         assert_eq!(response.request().as_str(), "req-1");
         assert_eq!(response.reply(), CommandReply::Accepted);

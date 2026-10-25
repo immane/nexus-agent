@@ -1628,12 +1628,35 @@ fn selection_mismatch() -> Response {
 /// Builds a runtime reply body with its HTTP status.
 fn command_reply(reply: nexus_core::CommandResponse) -> Response {
     let status = crate::json::reply_status(reply.reply());
-    let body = match reply.run() {
+    let mut body = match reply.run() {
         Some(run) => {
             serde_json::json!({ "reply": crate::json::reply_name(reply.reply()), "run": run.as_str() })
         }
         None => serde_json::json!({ "reply": crate::json::reply_name(reply.reply()) }),
     };
+    if let Some(object) = body.as_object_mut() {
+        if reply.has_sessions() {
+            object.insert(
+                "sessions".to_owned(),
+                serde_json::json!(
+                    reply
+                        .sessions()
+                        .iter()
+                        .map(|entry| serde_json::json!({
+                            "session": entry.session.as_str(),
+                            "logical_revision": entry.logical_revision,
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
+        if let Some(session) = reply.restored_session() {
+            object.insert(
+                "restored_session".to_owned(),
+                serde_json::json!(session.as_str()),
+            );
+        }
+    }
     json_response(status, &body_json(body))
 }
 
@@ -1651,6 +1674,34 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    #[test]
+    fn command_reply_serializes_metadata_and_restored_identity_without_history() {
+        let session = SessionId::new("session-listed").unwrap();
+        let listed = nexus_core::CommandResponse::new(
+            nexus_core::RequestId::new("request-list").unwrap(),
+            nexus_core::CommandReply::Accepted,
+            None,
+        )
+        .with_sessions(vec![nexus_core::SessionMetadata {
+            session: session.clone(),
+            logical_revision: 7,
+        }]);
+        let body: Value = serde_json::from_slice(&command_reply(listed).body).unwrap();
+        assert_eq!(body["sessions"][0]["session"], "session-listed");
+        assert_eq!(body["sessions"][0]["logical_revision"], 7);
+        assert!(body.get("history").is_none());
+
+        let restored = nexus_core::CommandResponse::new(
+            nexus_core::RequestId::new("request-restore").unwrap(),
+            nexus_core::CommandReply::Accepted,
+            None,
+        )
+        .with_restored_session(session);
+        let body: Value = serde_json::from_slice(&command_reply(restored).body).unwrap();
+        assert_eq!(body["restored_session"], "session-listed");
+        assert!(body.get("history").is_none());
+    }
 
     fn delivery_event(seq: u64, terminal: bool, text: &str) -> nexus_core::RunEvent {
         let payload = if terminal {

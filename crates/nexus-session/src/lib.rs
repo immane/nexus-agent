@@ -3,9 +3,10 @@
 //! The file store preserves checkpoints, operation records, and original model
 //! context items in a versioned, bounded JSON snapshot. Writes use a private
 //! temporary sibling, file sync, atomic rename, and directory sync on Unix.
-//! Runtime integration, active-view coordination, and recovery assembly remain
-//! unimplemented. Model calls, tool dispatch, approvals, and cancellation belong
-//! to runtime; loading session data must never trigger execution or grant access.
+//! Runtime integration is opt-in through an injected store. The bounded recovery
+//! API validates selected history without interpreting it as executable work.
+//! Model calls, tool dispatch, approvals, and cancellation belong to runtime;
+//! loading session data must never trigger execution or grant access.
 
 #![forbid(unsafe_code)]
 
@@ -24,8 +25,10 @@ use nexus_core::{
 };
 use serde_json::{Value, json};
 
-/// Current on-disk format revision. Mismatches fail closed; no guessing or migration.
-pub const FILE_FORMAT_REVISION: u64 = 2;
+/// Current on-disk format revision. Revision 2 remains readable; all writes use
+/// this revision, and other mismatches fail closed without guessing.
+pub const FILE_FORMAT_REVISION: u64 = 3;
+const PREVIOUS_FILE_FORMAT_REVISION: u64 = 2;
 /// Maximum encoded store size.
 pub const MAX_STORE_BYTES: usize = nexus_validation::MAX_DOCUMENT_BYTES;
 /// Maximum number of accepted source records retained in one store.
@@ -470,7 +473,7 @@ fn decode(bytes: &[u8]) -> Result<SnapshotRecords, AgentError> {
         ],
     )?;
     let revision = number(field(&root, "revision")?)?;
-    if revision != FILE_FORMAT_REVISION {
+    if revision != FILE_FORMAT_REVISION && revision != PREVIOUS_FILE_FORMAT_REVISION {
         return Err(store_error("session store format revision is unsupported"));
     }
     let sessions = bounded_array(field(&root, "sessions")?, nexus_core::store::MAX_SESSIONS)?
@@ -949,6 +952,7 @@ fn status_name(status: ExecutionStatus) -> &'static str {
         ExecutionStatus::Denied => "denied",
         ExecutionStatus::Cancelled => "cancelled",
         ExecutionStatus::TimedOut => "timed_out",
+        ExecutionStatus::Interrupted => "interrupted",
     }
 }
 
@@ -959,6 +963,7 @@ fn parse_status(value: String) -> Result<ExecutionStatus, AgentError> {
         "denied" => Ok(ExecutionStatus::Denied),
         "cancelled" => Ok(ExecutionStatus::Cancelled),
         "timed_out" => Ok(ExecutionStatus::TimedOut),
+        "interrupted" => Ok(ExecutionStatus::Interrupted),
         _ => Err(store_error("session store outcome is invalid")),
     }
 }
@@ -1548,6 +1553,53 @@ mod tests {
         )
         .expect("unsupported snapshot written");
         assert!(FileSessionStore::open(&directory).is_err());
+        fs::remove_dir_all(directory).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn revision_two_snapshots_remain_readable_and_new_status_round_trips() {
+        let directory = directory("revision-two");
+        let session = SessionId::new("session-a").expect("valid session");
+        let run = RunId::new("run-a").expect("valid run");
+        let mut store = FileSessionStore::open(&directory).expect("store opens");
+        store
+            .initialize_session(&checkpoint(0, "seed"))
+            .expect("checkpoint initializes");
+        drop(store);
+
+        let path = directory.join("session-store.json");
+        let v3 = fs::read_to_string(&path).expect("snapshot reads");
+        let v2 = v3.replacen("\"revision\":3", "\"revision\":2", 1);
+        fs::write(&path, v2).expect("legacy revision snapshot written");
+        let mut store = FileSessionStore::open(&directory).expect("revision 2 remains readable");
+        let interrupted = ToolOutcome::new(
+            ExecutionStatus::Interrupted,
+            EffectState::Unknown,
+            Evidence::Uncertain,
+            "record interrupted",
+            false,
+        )
+        .expect("interrupted outcome builds");
+        let item = ModelContextItem::tool_result(
+            CallId::new("call-a").expect("valid call"),
+            "item-a",
+            "ref-a",
+            ToolId::new("host_read", M0_REVISION).expect("valid tool"),
+            interrupted,
+        )
+        .expect("tool result builds");
+        store
+            .append_source_items(&session, &run, std::slice::from_ref(&item))
+            .expect("revision 3 write succeeds");
+        drop(store);
+
+        let reopened = FileSessionStore::open(&directory).expect("revision 3 reopens");
+        assert_eq!(
+            reopened.load_source_records(&session, 0, 1).unwrap()[0].item(),
+            &item
+        );
+        let saved = fs::read_to_string(&path).expect("new snapshot reads");
+        assert!(saved.contains("\"revision\":3"));
         fs::remove_dir_all(directory).expect("test directory cleanup");
     }
 

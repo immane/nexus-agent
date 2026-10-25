@@ -228,7 +228,9 @@ pub fn history_exchange_effects_certain(items: &[ModelContextItem]) -> bool {
                 && outcome.evidence() != Evidence::Uncertain
                 && !matches!(
                     outcome.status(),
-                    ExecutionStatus::Cancelled | ExecutionStatus::TimedOut
+                    ExecutionStatus::Cancelled
+                        | ExecutionStatus::TimedOut
+                        | ExecutionStatus::Interrupted
                 )
         }
         _ => true,

@@ -17,6 +17,7 @@ nexus-context = { path = "../nexus-context" }
 # Closed M0 tool-schema/argument validator (lock section 4). Schemas compile
 # once at registration; admitted arguments validate through it.
 nexus-validation = { path = "../nexus-validation" }
+nexus-session = { path = "../nexus-session" }
 # JSON parsing for the policy boundary only: exact bounded argument previews
 # and object checks. No schema framework is added here.
 serde_json = "1"
@@ -26,6 +27,3 @@ serde_json = "1"
 # notification), `macros` (`select!` for responsive waits only). No
 # net/io/fs/full features, no second runtime.
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
-
-[dev-dependencies]
-nexus-session = { path = "../nexus-session" }

@@ -1,6 +1,6 @@
 # Session Store Contract
 
-Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session` has a revision-2 bounded JSON snapshot, and the runtime's opt-in store mode now persists accepted source items and operation records. Host wiring and restoration commands are not implemented. Read the [common contract](00-common.md) first.
+Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session` has a bounded JSON snapshot, and the runtime's opt-in store mode persists accepted source items and operation records. Explicit runtime listing/restoration commands are implemented for injected stores; application storage wiring remains opt-in and is not yet enabled. Read the [common contract](00-common.md) first.
 
 ## Scope and Operations
 
@@ -15,9 +15,12 @@ when persistence is required. `nexus-context` retains context-selection and
 projection algorithms. Moving session state into this crate must not move
 execution control or make restoration execute stored actions.
 
-The crate rename does not change snapshot revision 2, storage filenames, or the
-caller-supplied data directory. Existing snapshots remain readable. Recovery
-assembly is a library API only; runtime commands do not yet invoke it.
+The crate rename does not change storage filenames or the caller-supplied data
+directory. Snapshot revision 3 adds an explicit interrupted execution status;
+revision-2 snapshots remain readable and are rewritten as revision 3 on their
+next successful write. Runtime
+commands invoke bounded metadata listing and selected-session recovery only
+when a store was explicitly injected.
 
 Semantic operations include bounded/paged session metadata listing, loading a selected session, saving a versioned checkpoint, recording tool intent, and recording tool outcome. Actual method signatures and physical layout remain open.
 
@@ -28,9 +31,10 @@ Runtime exposes an opt-in constructor that initializes a checkpoint, persists
 accepted user input, complete assistant context items, and tool results, and
 writes tool intents before dispatch. Source items are committed before the run
 advances to dispatch/another model turn; write failure terminates the run.
-Host wiring and application restore/list commands are not implemented. The
-runtime's session cache remains process-local and terminal persistence reports
-ephemeral, so the application cannot yet promise restart recovery. See the
+Application storage wiring is not implemented. Restore only populates the
+runtime's bounded history cache; unfinished calls are represented as unknown
+effects and are never replayed. Terminal persistence still reports ephemeral,
+so the application cannot yet promise restart recovery. See the
 [context-management design](../design/12-context-management.md) for the current
 gap and the source-history/active-view boundary.
 
@@ -39,7 +43,7 @@ Prefer a small file-backed implementation first. Versioned snapshots and a compa
 The initial `nexus-session` snapshot uses the standard library, existing
 `serde_json`, and existing strict JSON validation; it adds no third-party
 dependency. It caps the encoded file at 16 MiB and applies existing per-record
-and record-count limits. Its current format is revision 2 and rejects duplicate
+and record-count limits. Its current format is revision 3 and rejects duplicate
 keys, unknown fields, and unsupported revisions. This format is an initial
 implementation detail, not yet the complete session format promised by this
 contract.
