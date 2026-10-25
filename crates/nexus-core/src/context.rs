@@ -115,6 +115,33 @@ pub struct ContextManagementSettings {
     pub policy: ContextManagementPolicy,
     /// Known window, or `None` when no limit has been established.
     pub window: Option<ContextWindow>,
+    /// Optional task-generation cap; omission preserves provider defaults.
+    pub max_output_tokens: Option<u32>,
+}
+
+impl ContextManagementSettings {
+    /// Rejects zero caps and caps that leave no input space in a known window.
+    pub fn validate(&self) -> Result<(), AgentError> {
+        if let Some(cap) = self.max_output_tokens {
+            if cap == 0 {
+                return Err(invalid("max output tokens must be positive"));
+            }
+            if self.window.is_some_and(|window| cap >= window.tokens()) {
+                return Err(invalid(
+                    "max output tokens must be smaller than context window",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserves at least the legacy headroom and any explicit generation cap.
+    #[must_use]
+    pub fn output_reserve_tokens(&self, window: u64) -> u64 {
+        (window / 4)
+            .clamp(1, 16_384)
+            .max(u64::from(self.max_output_tokens.unwrap_or(0)))
+    }
 }
 
 fn invalid(message: &'static str) -> AgentError {
@@ -134,12 +161,46 @@ mod tests {
     fn defaults_do_not_invent_a_window() {
         let settings = ContextManagementSettings::default();
         assert_eq!(settings.window, None);
+        assert_eq!(settings.max_output_tokens, None);
         assert_eq!(settings.policy.trigger_percent(), 65);
         assert_eq!(settings.policy.target_percent(), 10);
         assert_eq!(
             settings.policy.strategy(),
             ContextCompactionStrategy::Summarize
         );
+    }
+
+    #[test]
+    fn output_reserve_preserves_defaults_and_covers_explicit_cap() {
+        let mut settings = ContextManagementSettings::default();
+        for (window, reserve) in [(0, 1), (3, 1), (32_768, 8_192), (131_072, 16_384)] {
+            assert_eq!(settings.output_reserve_tokens(window), reserve);
+        }
+        settings.max_output_tokens = Some(32_768);
+        assert_eq!(settings.output_reserve_tokens(131_072), 32_768);
+        settings.max_output_tokens = Some(1);
+        assert_eq!(settings.output_reserve_tokens(131_072), 16_384);
+    }
+
+    #[test]
+    fn output_cap_validation_requires_positive_cap_below_known_window() {
+        let mut settings = ContextManagementSettings::default();
+        assert!(settings.validate().is_ok());
+        settings.max_output_tokens = Some(0);
+        assert!(settings.validate().is_err());
+        settings.max_output_tokens = Some(u32::MAX);
+        assert!(
+            settings.validate().is_ok(),
+            "unknown windows impose no limit"
+        );
+        settings.window =
+            Some(ContextWindow::new(65_536, ContextWindowSource::Configured).unwrap());
+        for cap in [65_536, 65_537, u32::MAX] {
+            settings.max_output_tokens = Some(cap);
+            assert!(settings.validate().is_err());
+        }
+        settings.max_output_tokens = Some(32_768);
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

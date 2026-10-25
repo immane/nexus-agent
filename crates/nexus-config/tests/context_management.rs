@@ -56,6 +56,15 @@ fn legacy_documents_and_constructors_keep_default_settings() {
             ContextCompactionStrategy::Summarize
         );
         assert!(settings.window.is_none());
+        assert_eq!(settings.max_output_tokens, None);
+        assert_eq!(settings.output_reserve_tokens(131_072), 16_384);
+        assert_eq!(
+            config
+                .context_management_for("acme", Some("default"))
+                .unwrap()
+                .max_output_tokens,
+            None
+        );
         let encoded: Value = serde_json::from_str(&config.to_json()).unwrap();
         assert!(encoded.get("context_management").is_none());
         assert!(
@@ -65,6 +74,7 @@ fn legacy_documents_and_constructors_keep_default_settings() {
         );
         assert!(encoded["models"][0].get("context_window_tokens").is_none());
         assert!(encoded["models"][0].get("context_management").is_none());
+        assert!(encoded["models"][0].get("max_output_tokens").is_none());
         assert_eq!(parse(&encoded), config);
     }
     let profile = ProviderProfile::new(
@@ -80,6 +90,112 @@ fn legacy_documents_and_constructors_keep_default_settings() {
     let entry = ModelEntry::new("default", "acme", "default-model").unwrap();
     assert!(entry.context_window_tokens.is_none());
     assert!(entry.context_management.is_none());
+    assert!(entry.max_output_tokens.is_none());
+}
+
+#[test]
+fn output_caps_round_trip_and_resolve_only_for_selected_models() {
+    let mut doc = document();
+    doc["providers"][0]["context_window_tokens"] = json!(100_000);
+    doc["models"][0]["max_output_tokens"] = json!(32_768);
+    doc["models"][1]["max_output_tokens"] = json!(u32::MAX);
+    let config = parse(&doc);
+    let settings = config
+        .context_management_for("acme", Some("default"))
+        .unwrap();
+    assert_eq!(settings.max_output_tokens, Some(32_768));
+    assert_eq!(settings.window.unwrap().tokens(), 100_000);
+    assert_eq!(settings.output_reserve_tokens(100_000), 32_768);
+    let other = config
+        .context_management_for("acme", Some("other"))
+        .unwrap();
+    assert_eq!(other.max_output_tokens, Some(u32::MAX));
+    assert!(other.window.is_none(), "provider window must not leak");
+    assert_eq!(
+        config
+            .context_management_for("acme", None)
+            .unwrap()
+            .max_output_tokens,
+        None,
+        "selecting a provider alone must not inherit a model-entry cap"
+    );
+    let encoded: Value = serde_json::from_str(&config.to_json()).unwrap();
+    assert_eq!(encoded["models"][0]["max_output_tokens"], json!(32_768));
+    assert_eq!(parse(&encoded), config);
+
+    // An explicit model window takes precedence over the provider default.
+    doc["providers"][0]["context_window_tokens"] = json!(16_384);
+    doc["models"][0]["context_window_tokens"] = json!(65_536);
+    assert_eq!(
+        parse(&doc)
+            .context_management_for("acme", Some("default"))
+            .unwrap()
+            .max_output_tokens,
+        Some(32_768)
+    );
+}
+
+#[test]
+fn output_caps_reject_null_zero_wrong_types_and_overflow() {
+    for value in [
+        json!(null),
+        json!(0),
+        json!(-1),
+        json!(1.0),
+        json!("32768"),
+        json!(true),
+        json!([]),
+        json!({}),
+        json!(4_294_967_296_u64),
+    ] {
+        let mut doc = document();
+        doc["models"][0]["max_output_tokens"] = value.clone();
+        assert_eq!(
+            UserConfig::from_json(&doc.to_string()).unwrap_err().kind(),
+            ConfigErrorKind::Invalid,
+            "{value}"
+        );
+    }
+    for scope in ["providers", "context_management"] {
+        let mut doc = document();
+        if scope == "providers" {
+            doc[scope][0]["max_output_tokens"] = json!(32_768);
+        } else {
+            doc[scope] = json!({"max_output_tokens": 32_768});
+        }
+        assert!(UserConfig::from_json(&doc.to_string()).is_err());
+    }
+    let mut doc = document();
+    doc["models"][0]["max_output_tokens"] = json!(1);
+    assert_eq!(parse(&doc).models()[0].max_output_tokens, Some(1));
+}
+
+#[test]
+fn output_caps_must_leave_input_space_in_explicit_or_inherited_windows() {
+    for scope in ["providers", "models"] {
+        for cap in [32_768, 32_769] {
+            let mut doc = document();
+            doc[scope][0]["context_window_tokens"] = json!(32_768);
+            doc["models"][0]["max_output_tokens"] = json!(cap);
+            assert_eq!(
+                UserConfig::from_json(&doc.to_string()).unwrap_err().kind(),
+                ConfigErrorKind::Invalid,
+                "{scope}: {cap}"
+            );
+        }
+    }
+    let mut config = parse(&document());
+    let mut entry = ModelEntry::new("invalid", "acme", "model").unwrap();
+    entry.max_output_tokens = Some(0);
+    assert!(entry.validate().is_err());
+    assert!(config.add_model(entry.clone()).is_err());
+    entry.context_window_tokens = Some(32_768);
+    entry.max_output_tokens = Some(32_768);
+    assert!(entry.validate().is_err());
+    assert!(config.add_model(entry.clone()).is_err());
+    entry.max_output_tokens = Some(32_767);
+    assert!(entry.validate().is_ok());
+    assert!(config.add_model(entry).is_ok());
 }
 
 #[test]
@@ -309,6 +425,11 @@ fn duplicate_context_fields_are_rejected() {
     let text = document().to_string().replace(
         "\"default_model\":\"default-model\"",
         "\"default_model\":\"default-model\",\"context_window_tokens\":1,\"context_window_tokens\":2",
+    );
+    assert!(UserConfig::from_json(&text).is_err());
+    let text = document().to_string().replace(
+        "\"name\":\"default-model\"",
+        "\"name\":\"default-model\",\"max_output_tokens\":1,\"max_output_tokens\":2",
     );
     assert!(UserConfig::from_json(&text).is_err());
 }

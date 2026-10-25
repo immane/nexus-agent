@@ -299,6 +299,8 @@ pub struct ModelEntry {
     pub name: String,
     /// Configured context limit for this model.
     pub context_window_tokens: Option<u32>,
+    /// Optional positive task-generation cap, below any known context window.
+    pub max_output_tokens: Option<u32>,
     /// Optional policy override; omitted fields in JSON use core defaults.
     pub context_management: Option<ContextManagementPolicy>,
 }
@@ -317,6 +319,7 @@ impl ModelEntry {
             name: name.into(),
             context_window_tokens: None,
             context_management: None,
+            max_output_tokens: None,
         };
         entry.validate()?;
         Ok(entry)
@@ -329,7 +332,11 @@ impl ModelEntry {
         if self.name.is_empty() || self.name.len() > MAX_MODEL_NAME_LEN {
             return Err(invalid("model name is invalid"));
         }
-        configured_window(self.context_window_tokens)?;
+        context_settings(
+            self.context_management.unwrap_or_default(),
+            self.context_window_tokens,
+            self.max_output_tokens,
+        )?;
         Ok(())
     }
 }
@@ -466,7 +473,7 @@ impl UserConfig {
         let profile = self
             .provider(provider_id)
             .ok_or(invalid("provider is unknown"))?;
-        let (policy, tokens) = if let Some(id) = model_id {
+        let (policy, tokens, max_output_tokens) = if let Some(id) = model_id {
             check_id("model id", id)?;
             let entry = self.model(id).ok_or(invalid("model is unknown"))?;
             if entry.provider != provider_id {
@@ -479,14 +486,12 @@ impl UserConfig {
                         .then_some(profile.context_window_tokens)
                         .flatten()
                 }),
+                entry.max_output_tokens,
             )
         } else {
-            (self.context_management, profile.context_window_tokens)
+            (self.context_management, profile.context_window_tokens, None)
         };
-        Ok(ContextManagementSettings {
-            policy,
-            window: configured_window(tokens)?,
-        })
+        context_settings(policy, tokens, max_output_tokens)
     }
 
     /// Returns favourite model ids in admission order.
@@ -608,9 +613,19 @@ impl UserConfig {
     /// Admits a model entry: unique id, bounded count, provider must exist.
     pub fn add_model(&mut self, entry: ModelEntry) -> Result<(), ConfigError> {
         entry.validate()?;
-        if self.provider(&entry.provider).is_none() {
-            return Err(invalid("model provider is unknown"));
-        }
+        let profile = self
+            .provider(&entry.provider)
+            .ok_or(invalid("model provider is unknown"))?;
+        let tokens = entry.context_window_tokens.or_else(|| {
+            (entry.name == profile.default_model)
+                .then_some(profile.context_window_tokens)
+                .flatten()
+        });
+        context_settings(
+            entry.context_management.unwrap_or(self.context_management),
+            tokens,
+            entry.max_output_tokens,
+        )?;
         if self.models.iter().any(|existing| existing.id == entry.id) {
             return Err(invalid("model id is already registered"));
         }
@@ -857,6 +872,9 @@ fn model_json(entry: &ModelEntry) -> Value {
     if let Some(policy) = entry.context_management {
         object.insert("context_management".to_owned(), policy_json(policy));
     }
+    if let Some(tokens) = entry.max_output_tokens {
+        object.insert("max_output_tokens".to_owned(), Value::from(tokens));
+    }
     Value::Object(object)
 }
 
@@ -1001,6 +1019,7 @@ fn parse_model(object: &Map<String, Value>) -> Result<ModelEntry, ConfigError> {
             "name",
             "context_window_tokens",
             "context_management",
+            "max_output_tokens",
         ],
     )?;
     let mut entry = ModelEntry::new(
@@ -1009,12 +1028,39 @@ fn parse_model(object: &Map<String, Value>) -> Result<ModelEntry, ConfigError> {
         require_str(object, "name")?.to_owned(),
     )?;
     entry.context_window_tokens = parse_window_tokens(object)?;
+    entry.max_output_tokens = object
+        .get("max_output_tokens")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|tokens| u32::try_from(tokens).ok())
+                .filter(|tokens| *tokens > 0)
+                .ok_or(invalid("max output tokens is invalid"))
+        })
+        .transpose()?;
     entry.context_management = object
         .get("context_management")
         .map(parse_policy)
         .transpose()?;
     entry.validate()?;
     Ok(entry)
+}
+
+/// Validates resolved settings, including any inherited default-model window.
+fn context_settings(
+    policy: ContextManagementPolicy,
+    tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> Result<ContextManagementSettings, ConfigError> {
+    let settings = ContextManagementSettings {
+        policy,
+        window: configured_window(tokens)?,
+        max_output_tokens,
+    };
+    settings
+        .validate()
+        .map_err(|_| invalid("max output tokens is invalid for context window"))?;
+    Ok(settings)
 }
 
 /// Creates a configured window through the domain validation boundary.

@@ -53,6 +53,10 @@
 //! the policy with their own `context_management` object. Providers and models
 //! may set a positive `context_window_tokens` (`u32`); the provider limit is
 //! only for its `default_model`, never a blanket limit for all its models.
+//! Model entries alone may set `max_output_tokens` to a positive `u32`, strictly
+//! below their resolved context window when known. This task-generation cap also
+//! raises output headroom above the legacy reserve when necessary; omission
+//! leaves the generation cap unset and preserves the legacy reserve.
 //! [`UserConfig::context_management_for`] resolves these settings without
 //! discovery, token estimation, or automatic compaction. Absent optional fields
 //! preserve existing behavior and canonical output; explicit null is invalid.
