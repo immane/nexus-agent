@@ -51,14 +51,15 @@ invariants now without implementing their most general possible representation.
 
 ## 2. Current Implementation and Gaps
 
-Baseline inspected: context fixes through `40155e9`. Later implementation must
+Baseline inspected: context fixes through `06b5bea`. Later implementation must
 recheck these locations rather than assume this snapshot remains current.
 
 | Existing component | Reusable behavior | Remaining distinction |
 | --- | --- | --- |
 | `crates/nexus-context/src/lib.rs` | Pure estimation/calibration, paired-exchange selection, bounded history projection, summary validation, UTF-8-safe tool-output previews | Selection and derived representations are not an independent source-history store |
-| `crates/nexus-runtime/src/runtime/context_compaction.rs` | Request construction, staged summarization, validation/commit, truncation fallback, emergency previews | Consolidate ownership and expose structured decisions rather than scattered diagnostics |
+| `crates/nexus-runtime/src/runtime/context_compaction.rs` | Request construction, isolated tool-free summarization, validation/commit, generation headroom checks, emergency previews | Summary failure preserves the previous conversation and terminates; full source/view separation remains unimplemented |
 | `crates/nexus-runtime/src/runtime.rs` | Agent loop, accepted results, cancellation, usage, active conversation, bounded session cache | Both hard-limit projection and compaction replace active conversation; the cache can evict records |
+| `crates/nexus-session-store/src/lib.rs` | Revision-2 bounded JSON snapshot for checkpoints, operation records, and ordered original `ModelContextItem` source history; private Unix directory/file, atomic replacement, and OS single-writer lock | Not wired to runtime; active-view checkpoint and source-history lifecycle are not yet coordinated |
 | `nexus-core` request/result types | Call identities, status/effect/evidence, provider continuation, settings | Reuse domain facts; do not add algorithm-specific memory types to the core |
 | `tools/benchmarks/run_nexus_swe_task.py` | Tool/usage/reduction logs, result metadata, prediction export, evaluator separation | Structured event retention, complete compaction classification, and comparable derived metrics are not yet present |
 
@@ -70,6 +71,65 @@ compaction as preserving every original interaction indefinitely.
 Existing safeguards include unknown windows staying unknown, explicit settings
 overriding discovery, provider-usage calibration, and disabling incompatible
 history rewriting with opaque continuations. Retain them.
+
+### Session recovery boundary at this baseline
+
+The runtime's `State.history` is an in-memory, bounded cache of completed
+exchanges and adopted derived memory. It can supply context to a later run in
+the same session and process; it is not durable original history. Failed or
+cancelled runs do not commit ordinary partial conversation. Uncertain execution
+evidence receives special retention, with fail-closed behavior when it cannot
+be carried forward safely.
+
+Production runtime wiring does not use `SessionStore`. The file-backed
+implementation now has versioned source records for complete original
+`ModelContextItem` values, including tool content and execution uncertainty,
+alongside the existing checkpoint and operation records. However, the runtime
+does not write or load these records; `ListSessions` and `RestoreSession` are
+still rejected, and terminal records report `PersistenceState::Ephemeral`.
+Restarting the runtime therefore cannot restore its sessions. The source port
+also does not yet preserve all provider continuation state or coordinate the
+active-view lifecycle. Benchmark logs are inspection artifacts, not a supported
+session recovery format.
+
+### Observed summary limitation
+
+The exposed `pytest-dev__pytest-10051` summary-fix-v2 replay used
+`ollama-local/qwen3-27b`, a 94,208-token reference-only window and a 65% trigger.
+Two LLM summaries succeeded; the third ended at the 4,096-token output limit
+and produced 14,917 bytes, exceeding the 8,192-byte memory ceiling. The run
+stopped without a patch and preserved the previous conversation. These are
+debugging observations, not a blind benchmark or validated provider window.
+
+Successful summaries also left large exchanges pinned by `effect=Unknown`.
+Summary completion, reduced request occupancy, and reaching the target are
+separate outcomes. Increasing generation limits alone does not address either
+the summary byte limit or the retained-history growth.
+
+### OpenCode V2 reference: separate storage from model context
+
+Official documentation reviewed on 2026-10-25 describes these boundaries:
+
+| Concern | Documented OpenCode V2 behavior | Relevance to Nexus |
+| --- | --- | --- |
+| Session ownership | A background service owns sessions; TUI/web clients connect to it | A frontend's lifetime need not determine stored history's lifetime; a background service is not required for the Nexus storage change |
+| Local persistence | The default database is `~/.local/share/opencode/opencode.db`, overridable with `OPENCODE_DB` | Persist outside the project; do not copy another application's path or require its database choice |
+| Active context | Summary compaction replaces older context while keeping approximately 15,000 recent tokens by default; earlier messages remain stored | Archive retention and request selection must have different lifecycles |
+| Native compaction | Supported OpenAI Responses deployments can return opaque encrypted checkpoints with provider/model restrictions | Keep provider-independent text summaries; do not assume native compression is available for Qwen |
+| File rollback | Best-effort snapshots use a separate internal Git object database | Session restoration is not filesystem rollback or reversal of external effects |
+
+A drop from roughly 200K tokens to roughly 20K is compatible with a summary
+plus recent context and fixed instructions. It is not proof of lossless
+compression, a universal 50% trigger, or the mechanism used by a particular
+session. The documentation does not establish transaction boundaries, per-write
+crash durability, or exactly-once tool execution; those require implementation
+inspection and tests. Experimental background summaries held only in memory are
+also distinct from committed session history.
+
+References: [service and storage](https://opencode.ai/v2/docs/troubleshooting/),
+[session API](https://opencode.ai/v2/docs/api/),
+[compaction](https://opencode.ai/v2/docs/compaction/), and
+[file snapshots](https://opencode.ai/v2/docs/snapshots/).
 
 ## 3. Ownership and Minimum Architecture
 
@@ -225,8 +285,9 @@ require dispatching an already oversized request. Summary calls consume model
 turns, tokens, and time, including failed attempts. They must be identifiable
 separately from normal task calls.
 
-Prefer safe exchange selection and a bounded summary when configured; if that
-fails, validate a deterministic fallback separately. Old output previews and
+Prefer safe exchange selection and a bounded summary when configured. Failed or
+incomplete summaries preserve the previous conversation and terminate; do not
+fall back to deleting the summary's source history. Old output previews and
 then emergency latest-group previews can supply headroom without rewriting
 source records. The current emergency mechanism reduces head/tail allowance
 from 2 KiB to 128 bytes per result, with the omission notice additional. Reuse
@@ -268,6 +329,57 @@ outcome recording under the session contract. A storage error after effects
 must not trigger re-execution. Restoring history never replays tools, resumes
 an interrupted run automatically, or restores old approval grants. Do not claim
 crash durability based on buffered writes or tests of an in-memory double.
+
+### Confirmed implementation direction (2026-10-25)
+
+The project owner selected local persistent history for this increment, rather
+than a runtime-only in-memory archive. The first version uses current-user-only
+filesystem access without application-level encryption. Require private
+directories and Unix files created with mode `0600`; other platforms need an
+explicit equivalent protection boundary, not a claim that Unix modes apply
+everywhere. Conversation, reasoning, arguments, results, and snapshots can be
+sensitive even when configured credentials are excluded.
+
+Keep the implementation and dependency footprint minimal. Prefer the standard
+library, existing workspace dependencies, and concrete functions over new
+frameworks or generic storage abstractions. Start with small file-backed records;
+do not introduce a database engine, ORM, event-sourcing framework, vector store,
+or encryption library without a demonstrated requirement. Any new dependency
+must justify why existing capabilities are insufficient, including its transitive
+dependency and maintenance cost. Minimal size must not weaken validation,
+private access, durability, or uncertain-execution guarantees.
+
+Use the existing session-storage responsibility for original records and
+bounded inspection/recovery. Validate stored inputs on load. Specify format
+revision, write/flush and atomic-publication protocol, writer conflicts, quotas,
+and retention before claiming crash recovery. No storage failure may silently
+enable ephemeral operation or permit compaction to discard unarchived sources.
+
+The intended active request is current instructions and task/corrections, an
+adopted summary with a covered source boundary, unresolved execution facts, and
+recent complete exchanges. Once original sources are recoverable, represent old
+uncertain execution with accurate call identities, status/effect/evidence,
+arguments or recoverable references, and a no-blind-retry constraint. Do not pin
+unrelated long reasoning or repeated file bodies merely because they share an
+exchange with an uncertain call. Preserve protocol-required groups and reasoning;
+unsupported rewriting still fails explicitly. This projection is proposed, not
+implemented at the inspected baseline.
+
+Summary reliability must distinguish generation budget, requested text size,
+and the hard memory-byte ceiling. A proposed repair policy allows at most one
+additional summary attempt for output-limit or oversized-text failures, using
+the original sources rather than continuing an incomplete summary. Both attempts
+consume normal turn/time/usage budgets and recheck cancellation and deadlines.
+Protocol failures are not length retries. Never truncate text into an accepted
+summary; exhausted attempts leave the old view and memory unchanged.
+
+Acceptance requires repeated compaction with recoverable sources, exact
+uncertainty preservation, failure/cancellation without partial publication, and
+measured request-size changes. A summary success or an official task resolution
+alone does not establish these properties. Keep provider usage distinct from
+runtime estimates and do not pursue a fixed 5% occupancy at the expense of
+protected content. Persistence and execution changes span multiple components;
+implement and verify them incrementally before another exposed Pytest replay.
 
 ## 7. Path to the Compiler-Inspired Evidence System
 

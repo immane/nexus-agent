@@ -1,6 +1,6 @@
 # Session Store Contract
 
-Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). No storage implementation or on-disk format exists. Read the [common contract](00-common.md) first.
+Status: Draft contract, revision `draft-1`. Automatic local saves and manual restoration are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). `nexus-session-store` now has a revision-2 bounded JSON snapshot with original model-context source records, but runtime integration and restoration are not implemented. Read the [common contract](00-common.md) first.
 
 ## Scope and Operations
 
@@ -8,7 +8,42 @@ The store persists accepted conversation and operation records. It does not deci
 
 Semantic operations include bounded/paged session metadata listing, loading a selected session, saving a versioned checkpoint, recording tool intent, and recording tool outcome. Actual method signatures and physical layout remain open.
 
+`nexus-core` defines a `SessionStore` port and bounded checkpoint/operation
+types. `nexus-session-store` provides a file-backed implementation, including
+append-only, paged source records for complete original model-context items.
+Production runtime wiring does not use it. The runtime's session cache is
+process-local, terminal persistence is ephemeral, and list/restore commands are
+rejected. Thus the store can preserve source history when called directly, but
+the application cannot yet promise full source recovery. See the
+[context-management design](../design/12-context-management.md) for the current
+gap and the source-history/active-view boundary.
+
 Prefer a small file-backed implementation first. Versioned snapshots and a compact operation journal are candidates; a database or full event-sourcing system requires a concrete need. Do not persist every token merely because runtime events exist.
+
+The initial `nexus-session-store` snapshot uses the standard library, existing
+`serde_json`, and existing strict JSON validation; it adds no third-party
+dependency. It caps the encoded file at 16 MiB and applies existing per-record
+and record-count limits. Its current format is revision 2 and rejects duplicate
+keys, unknown fields, and unsupported revisions. This format is an initial
+implementation detail, not yet the complete session format promised by this
+contract.
+
+The adapter is Unix-only until a private-directory and file-ACL implementation
+is available for other platforms. The caller supplies a
+dedicated directory; the adapter creates it with mode `0700` or rejects an
+existing directory with group/other permissions. It creates snapshot and
+temporary files with mode `0600`, flushes the temporary file, atomically renames
+it, and syncs the directory. An OS file lock rejects a second writer for the
+same directory and is released when the store handle/process closes. A failure
+after rename can mean publication occurred but
+durability could not be confirmed; callers must not blindly repeat external
+effects to repair such a storage error.
+After a post-rename directory-sync failure, the adapter rejects further reads
+and writes until reopened, so stale in-memory state cannot overwrite the
+published snapshot. Reopening reconciles the visible snapshot, but does not
+retroactively confirm durability of the failed write. Re-recording an identical
+intent or outcome for the same run/call is idempotent, including at capacity;
+conflicting records and inconsistent denied outcomes are rejected before writing.
 
 ## Records
 
@@ -31,6 +66,20 @@ Start a new conversation. Metadata listing and restoration occur only on explici
 Restoration loads history, not execution. It MUST NOT replay tools, restart interrupted tasks, or restore old per-call grants. It uses the current explicit profile/policy and validates compatibility before continuation. A later run receives a fresh identity.
 
 Host-managed persistence under the selected storage policy does not require a model-tool approval for each checkpoint, and grants no arbitrary filesystem access. The physical data directory and format remain implementation choices.
+
+On 2026-10-25, the project owner confirmed local persistent history for the next
+implementation increment, rather than a runtime-only archive. Initial protection
+is current-user-only filesystem access, without application-level encryption:
+private storage directories and Unix files created with mode `0600`. Equivalent
+protection on other platforms must be specified and verified separately. Do not
+claim encryption or persist configured credentials. User/tool content may still
+contain sensitive data; document that limitation and the retention policy.
+
+Compaction changes the model-facing view, not original retained records. A
+storage failure must prevent publishing a reduction that depends on recovering
+unarchived sources. Persisting conversation, rebuilding model context, and
+reconciling interrupted execution are separate operations; restoring a session
+does not imply filesystem rollback or exactly-once execution.
 
 ## Modes and Durability
 
