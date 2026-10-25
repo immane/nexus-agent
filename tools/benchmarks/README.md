@@ -15,6 +15,10 @@ python3 tools/benchmarks/swebench.py run sympy__sympy-20590
 
 # Exercise the same preparation and cleanup without invoking the model.
 python3 tools/benchmarks/swebench.py run sympy__sympy-20590 --prepare-only
+
+# Experiment with a larger per-request task generation cap, without changing
+# the user's shared configuration. Context preparation reserves matching space.
+python3 tools/benchmarks/swebench.py run sphinx-doc__sphinx-9461 --model-output-tokens 32768
 ```
 
 `run` explicitly authorizes one live-model attempt. It never retries the whole
@@ -42,6 +46,7 @@ metadata paths, not repositories or arbitrary model artifacts.
 | Model turns | Server's `--benchmark-pilot`: 500 |
 | Tool calls / wall time | 4,096 / 86,400 seconds; lower with `--max-tool-calls`, `--max-run-seconds` |
 | Token caps | None; provider final usage accounting is recorded, not a hard spend cap |
+| Per-request output | Model config `max_output_tokens`, or legacy window-based default. `--model-output-tokens` writes a private run-local config; this is not a cumulative run token budget |
 | Context window reference | 94,208 tokens from local profile; reference-only, not a tokenizer or provider configuration |
 | Approval | Existing container policy; runner denies any approval request by default |
 | Output | Server and runner stdout/stderr stream to the terminal **and** their log files, including partial model output; no separate `tail` required |
@@ -88,6 +93,15 @@ Each invocation creates a unique `<work-root>/run-<task>-<UTC>-<nonce>` director
 - `state/`: isolated container ownership records; never shared with other servers.
 - `server.log`, `model-output.log`, `artifacts/`: diagnostics, result/prediction,
   per-run event log, manifest and derived metrics from the existing runner.
+- `session-store/`: private, complete original interaction records, including
+  reasoning, tool arguments and results. The launcher explicitly enables this
+  archive so old unknown-effect exchanges can be summarized without losing
+  their source evidence. Compact uncertainty facts and the latest three complete
+  tool groups remain in active context. This archive is not redacted; treat it
+  as sensitive even when bounded console previews have been redacted.
+- `model-config.json`, when overriding task output tokens: private effective
+  configuration used by this run; the original user config is not changed.
+  Both configuration hashes and the selected cap are recorded in `launch.json`.
 - `launcher-events.jsonl`: UTC-timestamped checkout, server, session, network,
   runner and cleanup stages. Structured runner events also carry UTC and elapsed
   timestamps, identities, tool status/duration/size/truncation, request budgets,

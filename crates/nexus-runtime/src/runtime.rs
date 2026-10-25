@@ -33,7 +33,8 @@ use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use nexus_context::CONTEXT_NOTICE_ITEM_KEY;
 use nexus_context::{
     CONTEXT_NOTICE_TEXT, ContextBounds, TokenEstimator, context_calls_are_paired,
-    history_exchange_effects_certain, is_context_notice, memory_bytes, project_bounded_history,
+    history_exchange_effects_certain, is_context_notice, is_retained_evidence, memory_bytes,
+    project_bounded_history,
 };
 use nexus_core::commands::{EventSequence, MAX_TEXT_FRAGMENT_BYTES};
 use nexus_core::{
@@ -297,6 +298,8 @@ struct ActiveRun {
     approval_seq: u64,
     turns_used: u32,
     calls_used: u32,
+    /// One fresh task request may replace a truncated response, never resume it.
+    output_limit_recovery_used: bool,
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
     /// Index of the first context item not yet committed to source history.
@@ -918,6 +921,7 @@ impl Runtime {
             approval_seq: 0,
             turns_used: 0,
             calls_used: 0,
+            output_limit_recovery_used: false,
             continuation: None,
             conversation,
             source_cursor,
@@ -2062,15 +2066,77 @@ impl Runtime {
             }
             Ok(finished) => {
                 active.turns_used += 1;
-                if let Some(continuation) = finished.continuation().cloned() {
+                let continuation_compatible = finished.continuation().is_none_or(|continuation| {
                     let adapter = self.shared.provider.adapter_identity();
                     let scope = self.shared.provider.continuation_scope(&active.profile);
-                    if !continuation.is_compatible_with(adapter, &scope) {
+                    continuation.is_compatible_with(adapter, &scope)
+                });
+                if finished.reason() == FinishReason::OutputLimit {
+                    let recovery_attempted = !active.output_limit_recovery_used
+                        && active.continuation.is_none()
+                        && finished.continuation().is_none()
+                        && continuation_compatible
+                        && !active.cancelled
+                        && !active.token.is_cancelled()
+                        && StdInstant::now() < active.deadline
+                        && self
+                            .shared
+                            .limits
+                            .check_model_turns(active.turns_used)
+                            .is_ok();
+                    let mut argument_progress = HashMap::<&str, usize>::new();
+                    for event in &events {
+                        if let ProviderEvent::ToolCallDelta {
+                            item_key,
+                            assembled_bytes,
+                        } = event
+                        {
+                            let bytes = argument_progress.entry(item_key).or_default();
+                            *bytes = (*bytes).max(*assembled_bytes);
+                        }
+                    }
+                    let argument_progress_bytes = argument_progress
+                        .values()
+                        .fold(0usize, |sum, bytes| sum.saturating_add(*bytes));
+                    diagnostic(format_args!(
+                        "model output limit: turn={} text_bytes={} reasoning_bytes={} candidate_count={} argument_progress_bytes={} recovery_attempted={}",
+                        turn.as_str(),
+                        text_items
+                            .iter()
+                            .fold(0usize, |sum, (_, text)| sum.saturating_add(text.len())),
+                        reasoning.len(),
+                        candidates.len(),
+                        argument_progress_bytes,
+                        recovery_attempted,
+                    ));
+                    if !continuation_compatible {
                         return Err(Terminal::failed(runtime_error(
                             ErrorCategory::UnsupportedCapability,
                             "provider continuation is incompatible with this profile",
                         )));
                     }
+                    if active.cancelled || active.token.is_cancelled() {
+                        return Err(Terminal::cancelled());
+                    }
+                    if StdInstant::now() >= active.deadline {
+                        return Err(Terminal::limit("run duration exhausted"));
+                    }
+                    if recovery_attempted {
+                        // Drop the entire response: no candidate identity is allocated,
+                        // and no text, reasoning, arguments, or opaque state is replayed.
+                        // Request projection owns the bounded host recovery instruction.
+                        active.output_limit_recovery_used = true;
+                        return Ok(RunState::CallingModel);
+                    }
+                    return Err(Terminal::limit("model output limit reached"));
+                }
+                if !continuation_compatible {
+                    return Err(Terminal::failed(runtime_error(
+                        ErrorCategory::UnsupportedCapability,
+                        "provider continuation is incompatible with this profile",
+                    )));
+                }
+                if let Some(continuation) = finished.continuation().cloned() {
                     active.continuation = Some(continuation);
                 }
                 match finished.reason() {
@@ -2087,7 +2153,9 @@ impl Runtime {
                         Err(Terminal::completed())
                     }
                     FinishReason::Refusal => Err(Terminal::refused()),
-                    FinishReason::OutputLimit => Err(Terminal::limit("model output limit reached")),
+                    FinishReason::OutputLimit => {
+                        unreachable!("output limit handled before continuation adoption")
+                    }
                     FinishReason::Incomplete => Err(Terminal::failed(runtime_error(
                         ErrorCategory::Protocol,
                         "model turn ended incomplete",
@@ -3402,8 +3470,11 @@ impl Runtime {
                     && (outcome.effect() == EffectState::Unknown
                         || outcome.evidence() == Evidence::Uncertain))
             });
-        let preserve_uncertain_exchange =
-            has_uncertain_outcome && (has_uncertain_result || unrecorded_current_call);
+        let has_projected_evidence = active.conversation[active.history_len..]
+            .iter()
+            .any(is_retained_evidence);
+        let preserve_uncertain_exchange = has_projected_evidence
+            || (has_uncertain_outcome && (has_uncertain_result || unrecorded_current_call));
         if unrecorded_current_call {
             // The tool may have been dispatched, but no result was recorded;
             // there is no complete exchange to carry forward safely.
@@ -3439,7 +3510,7 @@ impl Runtime {
                     ModelContextItem::ToolResult { call, .. } => {
                         complete_dispatched_calls.contains(call)
                     }
-                    _ => is_context_notice(item),
+                    _ => is_context_notice(item) || is_retained_evidence(item),
                 });
                 if history_exchange_effects_certain(&items) {
                     // The terminal summary says the effect was uncertain but
@@ -6960,6 +7031,7 @@ mod cov_runtime_private {
             approval_seq: 0,
             turns_used: 0,
             calls_used: 0,
+            output_limit_recovery_used: false,
             continuation: None,
             conversation: Vec::new(),
             source_cursor: 0,
@@ -7532,6 +7604,46 @@ mod cov_runtime_private {
                 "a completed cached exchange carries the notice forward"
             );
         });
+    }
+
+    #[test]
+    fn failed_run_preserves_projected_uncertainty_without_native_tool_records() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (runtime, _streams) = Runtime::new(
+                    RuntimeConfig {
+                        limits: Limits::m0_test(),
+                        policy: Policy::m0_test(),
+                        has_approval_handler: false,
+                    },
+                    Arc::new(NoopProvider),
+                    Vec::new(),
+                );
+                let mut active = context_run();
+                let evidence = ModelContextItem::assistant_text(
+                    nexus_context::EVIDENCE_KEY,
+                    format!(
+                        "{}call=old-call effect=Unknown",
+                        nexus_context::EVIDENCE_LABEL
+                    ),
+                )
+                .unwrap();
+                active.conversation.push(evidence.clone());
+                active.conversation.push(
+                    ModelContextItem::assistant_text("partial", "uncommitted analysis").unwrap(),
+                );
+                let run = active.run.clone();
+                runtime.shared.state.lock().await.active = Some(active);
+                runtime.finish_run(&run, RunOutcome::Failed, None).await;
+                let state = runtime.shared.state.lock().await;
+                assert!(!state.history_safety_exhausted);
+                let retained = &state.history.back().expect("retained evidence").items;
+                assert_eq!(retained.len(), 2);
+                assert_eq!(retained[1], evidence);
+            });
     }
 
     #[test]
@@ -8667,6 +8779,7 @@ mod cov_runtime_topup_private {
             approval_seq: 0,
             turns_used: 0,
             calls_used: 0,
+            output_limit_recovery_used: false,
             continuation: None,
             conversation: Vec::new(),
             source_cursor: 0,
@@ -8742,6 +8855,243 @@ mod cov_runtime_topup_private {
         assert_eq!(error.category(), ErrorCategory::ResourceLimit);
         assert_eq!(error.message(), message);
         assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
+    }
+
+    fn output_limit_turn() -> Vec<ProviderEvent> {
+        vec![ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
+            FinishReason::OutputLimit,
+            Usage::new(Some(3), Some(4), UsageFinality::Final),
+            None,
+        ))]
+    }
+
+    #[test]
+    fn output_limit_recovery_never_allocates_calls_or_replays_partial_context() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("output-limit-discard");
+        test_rt().block_on(async {
+            let active = active_for(&run);
+            let conversation = active.conversation.clone();
+            install(&bed, active).await;
+            let mut events = vec![
+                ProviderEvent::TextDelta {
+                    item_key: "partial".into(),
+                    text: "unfinished".into(),
+                },
+                ProviderEvent::ReasoningDelta {
+                    text: "private unfinished reasoning".into(),
+                },
+                ProviderEvent::ToolCallDelta {
+                    item_key: "partial-call".into(),
+                    assembled_bytes: 9,
+                },
+                ProviderEvent::ToolCallReady(
+                    CallCandidate::new("candidate", "ref", "host_read", "{\"partial\":").unwrap(),
+                ),
+            ];
+            events.extend(output_limit_turn());
+            assert!(matches!(
+                bed.runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("truncated"),
+                        events,
+                        &mut StreamedPrefix::default()
+                    )
+                    .await,
+                Ok(RunState::CallingModel)
+            ));
+            let state = bed.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert!(active.output_limit_recovery_used);
+            assert_eq!(active.turns_used, 1);
+            assert_eq!(active.call_seq, 0);
+            assert_eq!(active.calls_used, 0);
+            assert!(active.queue.is_empty());
+            assert!(active.current.is_none());
+            assert!(active.pending.is_empty());
+            assert_eq!(active.conversation, conversation);
+            assert_eq!(active.source_cursor, 0);
+            assert!(active.context_note.is_empty());
+            assert!(active.continuation.is_none());
+            assert_eq!(
+                active.last_usage,
+                Some(Usage::new(Some(3), Some(4), UsageFinality::Final))
+            );
+            assert_eq!(bed.read.execution_count(), 0);
+        });
+    }
+
+    #[test]
+    fn output_limit_recovery_respects_opaque_state_turn_budget_and_controls() {
+        for guard in [
+            "opaque",
+            "response-opaque",
+            "incompatible",
+            "used",
+            "turns",
+            "cancelled",
+            "deadline",
+        ] {
+            let limits = Limits::m0_test();
+            let bed = make_bed(limits, true, Vec::new(), None, None);
+            let run = run_id("output-limit-guard");
+            let mut active = active_for(&run);
+            match guard {
+                "opaque" => {
+                    active.continuation = Some(
+                        ContinuationData::new(
+                            nexus_core::DEFAULT_ADAPTER_IDENTITY,
+                            "cov-profile",
+                            vec![1, 2],
+                        )
+                        .unwrap(),
+                    )
+                }
+                "used" => active.output_limit_recovery_used = true,
+                "turns" => active.turns_used = limits.max_model_turns_per_run - 1,
+                "cancelled" => active.token.cancel(),
+                "deadline" => active.deadline = StdInstant::now() - Duration::from_secs(1),
+                "response-opaque" | "incompatible" => {}
+                _ => unreachable!(),
+            }
+            let continuation = active.continuation.clone();
+            test_rt().block_on(async {
+                install(&bed, active).await;
+                let events = if matches!(guard, "response-opaque" | "incompatible") {
+                    vec![ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
+                        FinishReason::OutputLimit,
+                        Usage::new(Some(3), Some(4), UsageFinality::Final),
+                        Some(
+                            ContinuationData::new(
+                                if guard == "incompatible" {
+                                    "wrong-adapter"
+                                } else {
+                                    nexus_core::DEFAULT_ADAPTER_IDENTITY
+                                },
+                                "cov-profile",
+                                vec![3, 4],
+                            )
+                            .unwrap(),
+                        ),
+                    ))]
+                } else {
+                    output_limit_turn()
+                };
+                let result = bed
+                    .runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("guard"),
+                        events,
+                        &mut StreamedPrefix::default(),
+                    )
+                    .await;
+                match guard {
+                    "cancelled" => assert_cancelled(result),
+                    "deadline" => assert_limit(result, "run duration exhausted"),
+                    "incompatible" => {
+                        let Err(terminal) = result else {
+                            panic!("incompatible continuation must fail");
+                        };
+                        assert_eq!(terminal.outcome, RunOutcome::Failed);
+                        assert_eq!(
+                            terminal.error.unwrap().category(),
+                            ErrorCategory::UnsupportedCapability
+                        );
+                    }
+                    _ => assert_limit(result, "model output limit reached"),
+                }
+                assert_eq!(
+                    inspect(&bed, |active| active.continuation.clone()).await,
+                    Some(continuation)
+                );
+                assert_eq!(inspect(&bed, |active| active.calls_used).await, Some(0));
+                assert_eq!(bed.provider.call_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn recovered_output_limit_rechecks_controls_before_next_request() {
+        for cancel in [true, false] {
+            let bed = make_bed(
+                Limits::m0_test(),
+                true,
+                vec![stop_turn("unreachable")],
+                None,
+                None,
+            );
+            let run = run_id("output-limit-next-request");
+            test_rt().block_on(async {
+                install(&bed, active_for(&run)).await;
+                assert!(matches!(
+                    bed.runtime
+                        .ingest_model_batch(
+                            &run,
+                            &turn_id("recovery"),
+                            output_limit_turn(),
+                            &mut StreamedPrefix::default()
+                        )
+                        .await,
+                    Ok(RunState::CallingModel)
+                ));
+                {
+                    let mut state = bed.shared.state.lock().await;
+                    let active = state.active.as_mut().unwrap();
+                    if cancel {
+                        active.token.cancel();
+                    } else {
+                        active.deadline = StdInstant::now() - Duration::from_secs(1);
+                    }
+                }
+                let result = bed.runtime.on_calling_model(&run).await;
+                if cancel {
+                    assert_cancelled(result);
+                } else {
+                    assert_limit(result, "run duration exhausted");
+                }
+                assert_eq!(bed.provider.call_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn invalid_output_limit_batch_does_not_enable_recovery() {
+        let mut limits = Limits::m0_test();
+        limits.max_arg_assembly_bytes = 8;
+        let bed = make_bed(limits, true, Vec::new(), None, None);
+        let run = run_id("invalid-output-limit");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            let mut events = vec![ProviderEvent::ToolCallDelta {
+                item_key: "oversized".into(),
+                assembled_bytes: 9,
+            }];
+            events.extend(output_limit_turn());
+            let result = bed
+                .runtime
+                .ingest_model_batch(
+                    &run,
+                    &turn_id("invalid"),
+                    events,
+                    &mut StreamedPrefix::default(),
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(Terminal {
+                    outcome: RunOutcome::Failed,
+                    ..
+                })
+            ));
+            assert_eq!(
+                inspect(&bed, |active| active.output_limit_recovery_used).await,
+                Some(false)
+            );
+            assert_eq!(inspect(&bed, |active| active.turns_used).await, Some(0));
+            assert_eq!(bed.provider.call_count(), 0);
+        });
     }
 
     #[test]
@@ -10192,6 +10542,220 @@ mod cov_runtime_topup_private {
             drop(reopened);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn stored_unknown_exec_groups_are_summarized_without_changing_archived_sources() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-store-unknown-summary-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let run = run_id("stored-unknown-summary");
+        let mut active = active_for(&run);
+        active.conversation = vec![ModelContextItem::user_text("continue safely").unwrap()];
+        let mut groups = Vec::new();
+        for n in 0..5 {
+            let old = n < 2;
+            let call = ToolCall::new(
+                run.clone(),
+                turn_id(&format!("stored-exec-{n}")),
+                call_id(&format!("stored-exec-{n}")),
+                tool_id("host_exec"),
+                NormalizedArgs::new(format!(r#"{{"command":"perform-operation-{n}"}}"#)).unwrap(),
+            );
+            let item = format!("stored-exec-item-{n}");
+            let reference = format!("stored-exec-reference-{n}");
+            let group = vec![
+                ModelContextItem::assistant_reasoning(
+                    format!("original reasoning {n}; ").repeat(if old { 400 } else { 1 }),
+                )
+                .unwrap(),
+                ModelContextItem::assistant_call(&item, &reference, call.clone()).unwrap(),
+                ModelContextItem::tool_result(
+                    call.call().clone(),
+                    item,
+                    reference,
+                    call.tool().clone(),
+                    ToolOutcome::new(
+                        if old {
+                            ExecutionStatus::TimedOut
+                        } else {
+                            ExecutionStatus::Succeeded
+                        },
+                        if old {
+                            EffectState::Unknown
+                        } else {
+                            EffectState::KnownApplied
+                        },
+                        if old {
+                            Evidence::Uncertain
+                        } else {
+                            Evidence::HostObserved
+                        },
+                        format!("original output {n}; ").repeat(if old { 800 } else { 4 }),
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            ];
+            active.conversation.extend(group.clone());
+            groups.push(group);
+        }
+        active.source_cursor = active.conversation.len();
+        active.context_management.window = Some(
+            nexus_core::ContextWindow::new(32768, nexus_core::ContextWindowSource::Configured)
+                .unwrap(),
+        );
+        active.context_management.policy = nexus_core::ContextManagementPolicy::new(
+            50,
+            10,
+            nexus_core::ContextCompactionStrategy::Summarize,
+        )
+        .unwrap();
+        let original = active.conversation.clone();
+        let recent = groups[2..].concat();
+        let session = active.session.clone();
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    STORE_FORMAT_REVISION,
+                    0,
+                    Vec::new(),
+                    "profile",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_source_items(&session, &run, &original)
+            .unwrap();
+        // Intentionally omit uncertainty from the model's summary: retained
+        // execution evidence must be host-derived, not dependent on this text.
+        let summary = "Earlier operations were attempted.";
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            stop_turn(summary),
+            stop_turn("new answer"),
+        ]));
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider.clone(),
+            Vec::new(),
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_calling_model(&run).await,
+                Ok(RunState::CallingModel)
+            ));
+            assert_eq!(provider.call_count(), 1);
+            {
+                let mut state = runtime.shared.state.lock().await;
+                let active = state.active.as_mut().unwrap();
+                assert_eq!(active.derived_memory.as_deref(), Some(summary));
+                assert_eq!(active.conversation[0], original[0]);
+                assert_eq!(
+                    &active.conversation[active.conversation.len() - recent.len()..],
+                    recent.as_slice(),
+                    "the newest three completed groups, including reasoning, stay verbatim"
+                );
+                assert!(active.conversation.iter().all(|item| !matches!(
+                    item,
+                    ModelContextItem::AssistantCall { call, .. }
+                        if call.call() == &call_id("stored-exec-0")
+                            || call.call() == &call_id("stored-exec-1")
+                )));
+                let evidence = active
+                    .conversation
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item,
+                            ModelContextItem::AssistantText { text, .. }
+                                if text.as_str().contains("Unknown")
+                                    && text.as_str().contains("do not blindly retry")
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(evidence.len(), 2);
+                for n in 0..2 {
+                    assert!(evidence.iter().any(|item| matches!(
+                        item,
+                        ModelContextItem::AssistantText { text, .. }
+                            if text.as_str().contains(&format!("stored-exec-{n}"))
+                                && text.as_str().contains("host_exec")
+                                && text.as_str().contains(&format!("perform-operation-{n}"))
+                                && text.as_str().contains("TimedOut")
+                                && text.as_str().contains("Uncertain")
+                    )));
+                }
+                let request = prepare_context_request(
+                    &runtime.shared,
+                    active,
+                    &turn_id("after-stored-summary"),
+                )
+                .unwrap_or_else(|terminal| panic!("request failed: {:?}", terminal.error));
+                for item in &evidence {
+                    assert!(request.conversation().contains(item));
+                }
+                assert_eq!(
+                    &request.conversation()[request.conversation().len() - recent.len()..],
+                    recent.as_slice()
+                );
+                assert!(active.pending_compaction.is_none());
+                assert!(active.persistence_error.is_none());
+                assert_eq!(active.source_cursor, active.conversation.len());
+            }
+            assert!(matches!(
+                runtime.on_calling_model(&run).await,
+                Err(Terminal {
+                    outcome: RunOutcome::Completed,
+                    ..
+                })
+            ));
+            assert_eq!(provider.call_count(), 2);
+            assert!(
+                runtime
+                    .shared
+                    .state
+                    .lock()
+                    .await
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .persistence_error
+                    .is_none()
+            );
+        });
+        drop(runtime);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let records = reopened.load_source_records(&session, 0, 100).unwrap();
+        assert_eq!(records.len(), original.len() + 1);
+        assert_eq!(
+            records[..original.len()]
+                .iter()
+                .map(|record| record.item().clone())
+                .collect::<Vec<_>>(),
+            original,
+            "reopening preserves exact calls, large reasoning and full uncertain outputs"
+        );
+        assert_eq!(
+            records.last().unwrap().item(),
+            &ModelContextItem::assistant_text("item-0", "new answer").unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

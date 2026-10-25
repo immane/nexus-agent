@@ -42,6 +42,24 @@ encode it as `max_tokens`; Responses encodes it as `max_output_tokens`. Without
 an explicit ceiling, adapters retain the legacy byte-derived default. A token
 ceiling does not disable response-byte validation or imply a successful finish.
 
+Model configuration may set a positive `max_output_tokens`. The runtime carries
+that task-generation ceiling in its per-run settings, including when the context
+window is unknown. For known windows, generation headroom is at least the larger
+of the configured cap and the legacy window-based reserve; compaction and summary
+adoption use that same headroom. A cap at or above the known window is invalid.
+Summary generation remains independently capped at 4,096 tokens. These are local
+request budgets, not proof of the model's actual serving limits.
+
+A validated task response ending in `OutputLimit` is incomplete, not a successful
+answer or permission to execute any included tool candidates. The runtime may
+make at most one fresh, concise task request within the same run, using only the
+previously accepted conversation. Both attempts consume normal turn/time/usage
+budgets. Cancellation, exhaustion, or opaque continuation prevents recovery;
+another output-limited response terminates the run. Partial text, reasoning, and
+arguments are not replayed or restored as accepted conversation. Diagnostics
+record payload sizes and discarded-candidate counts, not raw reasoning. Existing
+source-history storage does not archive rejected partial provider payloads.
+
 `nexus_context::estimated_input_tokens` includes instruction/note payloads,
 conversation and reasoning, call/result metadata, tool definitions, and framing
 allowances. Its three-UTF-8-bytes-per-token heuristic is not a tokenizer or an

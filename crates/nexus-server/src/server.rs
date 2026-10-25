@@ -49,13 +49,13 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
-    ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelRequest,
-    ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId, RunId,
-    SessionId, SubmitCommand, ToolRegistration,
+    ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelInstructions,
+    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
+    RunId, SessionId, SubmitCommand, ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::transport::{OrderedEventConsumer, is_control_payload};
-use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
+use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig, SessionStoreHandle};
 use nexus_tools::ScopedReader;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -399,6 +399,7 @@ pub struct Server {
     config_path: Option<PathBuf>,
     /// Finite runtime limits applied to sessions created after startup.
     limits: Limits,
+    session_store: Option<SessionStoreHandle>,
     /// Accepted run id to the model id it was submitted with. Entries are
     /// consumed by the completion watcher, a terminal SSE event, a subsequent
     /// run, or safe idle reclamation; admission caps retained entries.
@@ -471,11 +472,19 @@ impl Server {
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             limits: Limits::m0_test(),
+            session_store: None,
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
             auth_token: None,
         }
+    }
+
+    /// Installs one shared store for subsequently created session runtimes.
+    /// Startup-only; existing runtimes are unchanged. Without this opt-in,
+    /// source history and tool operations remain ephemeral.
+    pub fn set_session_store(&mut self, store: SessionStoreHandle) {
+        self.session_store = Some(store);
     }
 
     /// Installs the tool wiring for sessions created after this call.
@@ -602,8 +611,17 @@ impl Server {
                 },
             )?,
         };
-        let (runtime, streams): (Runtime, EventStreams) = Runtime::try_new(config, provider, tools)
-            .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
+        let (runtime, streams): (Runtime, EventStreams) = match &self.session_store {
+            Some(store) => Runtime::try_new_with_session_store_handle(
+                config,
+                provider,
+                tools,
+                ModelInstructions::default(),
+                store.clone(),
+            ),
+            None => Runtime::try_new(config, provider, tools),
+        }
+        .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
         let entry = Arc::new(Session {
             session,
             provider: bound_provider,
@@ -1674,6 +1692,100 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    #[test]
+    fn shared_session_store_retains_original_sources_from_every_server_runtime() {
+        use nexus_core::{
+            EventPayload, ModelContextItem, PersistenceState, RunOutcome, SessionStore,
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-server-original-sources-{}",
+            std::process::id()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut server = Server::new(executor.handle().clone());
+        server.set_session_store(SessionStoreHandle::new(Box::new(store)));
+        let mut expected = Vec::new();
+        for input in [
+            "first original input\n  keep whitespace",
+            "second original input",
+        ] {
+            let token = server.create_session().unwrap();
+            let session = server.sessions.lock().unwrap()[&token].clone();
+            let runtime = session.runtime.lock().unwrap();
+            let mut control = session.control.lock().unwrap();
+            executor.block_on(async {
+                let response = runtime
+                    .submit(
+                        SubmitCommand::new(
+                            RequestId::new("request-original-sources").unwrap(),
+                            session.session.clone(),
+                            input,
+                            WEB_PROFILE,
+                        )
+                        .unwrap(),
+                    )
+                    .await;
+                assert_eq!(response.reply(), CommandReply::Accepted);
+                let run = response.run().unwrap().clone();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let event = control.recv().await.unwrap();
+                        match event.payload() {
+                            EventPayload::ApprovalRequired(notice) => {
+                                let response = runtime
+                                    .approve(ApproveCommand {
+                                        request: RequestId::new("request-approve-original")
+                                            .unwrap(),
+                                        approval: notice.approval.clone(),
+                                        run: run.clone(),
+                                        call: notice.call.clone(),
+                                    })
+                                    .await;
+                                assert_eq!(response.reply(), CommandReply::Accepted);
+                            }
+                            EventPayload::RunFinished(finished) => {
+                                assert_eq!(finished.outcome(), RunOutcome::Completed);
+                                assert_eq!(finished.persistence(), PersistenceState::Saved);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("demo run finishes");
+            });
+            expected.push((session.session.clone(), input));
+        }
+        drop(server);
+        // Workers release their shared store owner before the executor stops.
+        drop(executor);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        for (session, input) in expected {
+            let records = reopened.load_source_records(&session, 0, 100).unwrap();
+            assert_eq!(
+                records[0].item(),
+                &ModelContextItem::user_text(input).unwrap()
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|record| matches!(record.item(), ModelContextItem::ToolResult { .. }))
+            );
+            assert!(records.iter().any(|record| matches!(
+                record.item(), ModelContextItem::AssistantText { text, .. } if text.as_str() == "done"
+            )));
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn command_reply_serializes_metadata_and_restored_identity_without_history() {

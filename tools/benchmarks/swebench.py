@@ -245,6 +245,13 @@ def launch(args, profiles, task):
         raise RuntimeError("server missing; use --build")
     run = args.work_root / ("run-" + args.task + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
     run.mkdir(mode=0o700, parents=True, exist_ok=False)
+    server_config = args.config.resolve()
+    if args.model_output_tokens is not None:
+        # Never rewrite the user's shared model configuration for an experiment.
+        model["max_output_tokens"] = args.model_output_tokens
+        server_config = run / "model-config.json"
+        write_json(server_config, config)
+        server_config.chmod(0o600)
     workspace = run / "workspace"
     workspace.mkdir()
     env["XDG_STATE_HOME"] = str(run / "state")
@@ -266,6 +273,8 @@ def launch(args, profiles, task):
                 "gateway_image": gateway["Id"], "workload_image": workload["Id"],
                 "workload_architecture": workload["Architecture"], "provider": provider_id, "model": model_id,
                 "endpoint": provider["endpoint"], "config_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
+                "effective_config_sha256": hashlib.sha256(server_config.read_bytes()).hexdigest(),
+                "model_output_tokens": model.get("max_output_tokens"),
                 "limits": {"model_turns": 500, "tool_calls": args.max_tool_calls, "run_seconds": args.max_run_seconds,
                            "input_tokens": None, "output_tokens": None}, "evaluation": "not-run"}
     write_json(run / "launch.json", manifest)
@@ -293,7 +302,8 @@ def launch(args, profiles, task):
             listener.bind(("127.0.0.1", args.port))
             port = listener.getsockname()[1]
         url = f"http://127.0.0.1:{port}"
-        argv = [str(server), "--port", str(port), "--config", str(args.config.resolve()),
+        argv = [str(server), "--port", str(port), "--config", str(server_config),
+                "--session-store", str((run / "session-store").resolve()),
                 "--tools", "real", "--tools-root", str(workspace.resolve()), "--execution", "container",
                 "--gateway-image", gateway["Id"], "--container-image", workload["Id"],
                 "--benchmark-pilot", "--auth-token-env", "NEXUS_BENCH_LAUNCH_TOKEN"]
@@ -403,6 +413,8 @@ def main():
     parser.add_argument("--config", type=Path, default=Path.home() / ".config/nexus-agent/config.json")
     parser.add_argument("--provider")
     parser.add_argument("--model")
+    parser.add_argument("--model-output-tokens", type=int,
+                        help="per-request task output cap; creates a private run-local model config")
     parser.add_argument("--gateway-image")
     parser.add_argument("--container-image")
     parser.add_argument("--port", type=int, default=0, help="0 selects a free loopback port")
@@ -417,6 +429,8 @@ def main():
         parser.error("budgets must be positive and port must be in 0..65535")
     if not 0 <= args.tool_log_bytes <= 65536:
         parser.error("--tool-log-bytes must be in 0..65536")
+    if args.model_output_tokens is not None and not 1 <= args.model_output_tokens <= 2**32 - 1:
+        parser.error("--model-output-tokens must be in 1..4294967295")
     args.work_root = args.work_root.resolve()
     profiles = json.loads(args.profiles.read_text())
     tasks = available_tasks(args.work_root, profiles)

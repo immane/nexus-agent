@@ -110,6 +110,35 @@ Summary completion, reduced request occupancy, and reaching the target are
 separate outcomes. Increasing generation limits alone does not address either
 the summary byte limit or the retained-history growth.
 
+### Archived-history summary increment
+
+For persistent runs whose accepted sources have all been saved, summarization
+may replace old complete exchanges even when their outcomes have unknown effects.
+The current task and the newest three complete tool-call groups remain verbatim
+in the summary candidate; parallel calls and their results count as one group.
+Earlier ordinary discussion and verbose reasoning go into rolling, untrusted
+LLM memory rather than permanently occupying the active request.
+
+Uncertain execution retains a separate deterministic context projection with
+original identities, arguments, status/effect/evidence, truncation metadata, a
+bounded output preview, and a no-blind-retry warning. These records are not LLM
+interpretations or tool authorization; full original records remain in the
+session store. Later summary passes and ordinary eviction must not discard the
+unresolved projections. This is not a general semantic evidence classifier.
+
+The planner budgets replacement memory as well as retained context. Summary
+acceptance checks the complete candidate including generation reserve before
+commit. The target remains a soft goal: protected task/recent exchanges and
+execution facts may exceed it. Emergency output previews can still shorten
+recent tool bodies if needed to preserve generation headroom; they do not
+rewrite source history. If protected context still cannot fit, fail explicitly.
+
+Ephemeral runs, incomplete source saves, and plain truncation retain the previous
+certainty-based removal rules. Failed, invalid, or cancelled summaries never
+partially replace the old active view. Diagnostics report planned removals,
+estimated occupancy, target, window, and output reserve; these are not tokenizer
+measurements or evidence of benchmark repair quality.
+
 ### OpenCode V2 reference: separate storage from model context
 
 Official documentation reviewed on 2026-10-25 describes these boundaries:
@@ -365,9 +394,10 @@ recent complete exchanges. Once original sources are recoverable, represent old
 uncertain execution with accurate call identities, status/effect/evidence,
 arguments or recoverable references, and a no-blind-retry constraint. Do not pin
 unrelated long reasoning or repeated file bodies merely because they share an
-exchange with an uncertain call. Preserve protocol-required groups and reasoning;
-unsupported rewriting still fails explicitly. This projection is proposed, not
-implemented at the inspected baseline.
+exchange with an uncertain call. Preserve protocol-required groups and reasoning
+for retained native calls; unsupported rewriting still fails explicitly. The
+archived-history increment above implements compact text projections for removed
+groups while retaining their complete original records in storage.
 
 Summary reliability must distinguish generation budget, requested text size,
 and the hard memory-byte ceiling. A proposed repair policy allows at most one

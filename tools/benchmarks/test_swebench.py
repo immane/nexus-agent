@@ -199,5 +199,52 @@ class OutputTests(unittest.TestCase):
             self.assertEqual(errors, [])
 
 
+class ArchiveLaunchTests(unittest.TestCase):
+    def test_launcher_uses_a_run_local_archive_outside_the_workload_mount(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = root / "target/release/nexus-server"
+            server.parent.mkdir(parents=True)
+            server.write_bytes(b"fixture")
+            config = root / "config.json"
+            config.write_text(json.dumps({
+                "providers": [{"id": "ollama-local", "endpoint": "http://127.0.0.1:11434/v1",
+                               "credential": {"env": "OLLAMA_API_KEY"}}],
+                "models": [{"id": "local-model", "provider": "ollama-local"}],
+            }))
+            profiles = {"provider": "ollama-local", "model": "local-model", "gateway_image": "gateway"}
+            profile_path = root / "profiles.json"
+            profile_path.write_text(json.dumps(profiles))
+            args = SimpleNamespace(
+                config=config, profiles=profile_path, model=None, provider=None,
+                model_output_tokens=32768,
+                gateway_image=None, container_image=None, build=False,
+                work_root=root / "runs", task=row()["instance_id"], port=0,
+                max_tool_calls=4096, max_run_seconds=86400,
+            )
+            task = {"row": row(), "image": "workload", "source": "fixture", "exposure": "exposed"}
+            with patch.object(swebench, "REPO", root), \
+                    patch.object(swebench, "check_model"), \
+                    patch.object(swebench, "inspect_image", return_value={"Id": "fixture", "Architecture": "arm64"}), \
+                    patch.object(swebench, "command", return_value=row()["base_commit"]), \
+                    patch.object(swebench.socket, "socket") as socket, \
+                    patch.object(swebench, "logged_process", side_effect=RuntimeError("stop-before-server")) as spawn, \
+                    patch.object(swebench.sys, "stdout", io.StringIO()):
+                socket.return_value.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 12345)
+                with self.assertRaisesRegex(RuntimeError, "stop-before-server"):
+                    swebench.launch(args, profiles, task)
+            run = next(args.work_root.iterdir())
+            argv = spawn.call_args.args[0]
+            archive = Path(argv[argv.index("--session-store") + 1])
+            self.assertEqual(archive, (run / "session-store").resolve())
+            self.assertNotIn("workspace", archive.parts)
+            self.assertEqual(json.loads((run / "launch.json").read_text())["server_argv"], argv)
+            effective = Path(argv[argv.index("--config") + 1])
+            self.assertEqual(effective, run / "model-config.json")
+            self.assertEqual(json.loads(effective.read_text())["models"][0]["max_output_tokens"], 32768)
+            self.assertNotIn("max_output_tokens", json.loads(config.read_text())["models"][0])
+            self.assertEqual(effective.stat().st_mode & 0o777, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()

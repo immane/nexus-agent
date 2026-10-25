@@ -299,6 +299,7 @@ dependencies = [
  "nexus-fakes",
  "nexus-openai",
  "nexus-runtime",
+ "nexus-session",
  "nexus-tools",
  "serde_json",
  "tokio",
