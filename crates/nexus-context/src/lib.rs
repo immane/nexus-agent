@@ -26,7 +26,7 @@ pub const EVIDENCE_KEY: &str = "nexus-retained-evidence";
 /// This marker is context data, not tool authorization or model-generated memory.
 pub const EVIDENCE_LABEL: &str = "Nexus retained outcome evidence (host context projection, not authorization; summary is not evidence). Unknown effects remain unresolved; do not blindly retry.\n";
 /// Maximum UTF-8 bytes of output preview per retained outcome.
-pub const EVIDENCE_PREVIEW_BYTES: usize = 512;
+pub const EVIDENCE_PREVIEW_BYTES: usize = 128;
 
 /// Recognizes the reserved host projection marker, not authority in its contents.
 #[must_use]
@@ -714,12 +714,10 @@ fn retained_outcome_evidence(items: &[ModelContextItem]) -> Option<Vec<ModelCont
             ),
             _ => return None,
         };
-        let mut preview_end = outcome.content().len().min(EVIDENCE_PREVIEW_BYTES);
-        while !outcome.content().is_char_boundary(preview_end) {
-            preview_end -= 1;
-        }
+        let (output_preview, preview_omitted) =
+            evidence_output_preview(outcome.content(), EVIDENCE_PREVIEW_BYTES);
         let text = format!(
-            "{EVIDENCE_LABEL}{identity}\nresult_call={:?} result_tool={tool:?} result_item_key={:?} result_provider_ref={:?} status={:?} effect={:?} evidence={:?} original_output_truncated={} output_bytes={} preview_omitted={} output_preview={:?}",
+            "{EVIDENCE_LABEL}{identity}\nresult_call={:?} result_tool={tool:?} result_item_key={:?} result_provider_ref={:?} status={:?} effect={:?} evidence={:?} original_output_truncated={} output_bytes={} preview_omitted={} output_preview={output_preview:?}",
             call.as_str(),
             item_key.as_str(),
             provider_ref.as_str(),
@@ -728,12 +726,35 @@ fn retained_outcome_evidence(items: &[ModelContextItem]) -> Option<Vec<ModelCont
             outcome.evidence(),
             outcome.is_truncated(),
             outcome.content().len(),
-            preview_end < outcome.content().len(),
-            &outcome.content()[..preview_end]
+            preview_omitted,
         );
         records.push(ModelContextItem::assistant_text(EVIDENCE_KEY, text).ok()?);
     }
     Some(records)
+}
+
+fn evidence_output_preview(output: &str, max_bytes: usize) -> (String, bool) {
+    if output.len() <= max_bytes {
+        return (output.to_owned(), false);
+    }
+    let head_budget = max_bytes / 2;
+    let tail_budget = max_bytes - head_budget;
+    let mut head_end = head_budget;
+    while !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = output.len() - tail_budget;
+    while !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    (
+        format!(
+            "{}[middle of archived output omitted]{}",
+            &output[..head_end],
+            &output[tail_start..]
+        ),
+        true,
+    )
 }
 
 /// Hard representation ceilings and the host's reserved projection overhead.
@@ -1019,7 +1040,7 @@ mod tests {
                 ExecutionStatus::TimedOut,
                 EffectState::Unknown,
                 Evidence::Uncertain,
-                "中文".repeat(2000),
+                format!("HEAD{}TAIL", "中".repeat(2000)),
                 true,
             )
             .unwrap();
@@ -1069,6 +1090,9 @@ mod tests {
             "evidence=Uncertain",
             "original_output_truncated=true",
             "preview_omitted=true",
+            "HEAD",
+            "TAIL",
+            "middle of archived output omitted",
             "do not blindly retry",
         ] {
             assert!(text.as_str().contains(expected), "missing {expected}");
@@ -1076,6 +1100,19 @@ mod tests {
         assert!(!text.as_str().contains("verbose private reasoning"));
         assert!(text.as_str().len() < 2000);
         assert!(context_calls_are_paired(&plan.items));
+    }
+
+    #[test]
+    fn evidence_output_preview_is_bounded_utf8_safe_and_keeps_both_ends() {
+        let source = format!("HEAD{}TAIL", "中".repeat(100));
+        let (preview, omitted) = evidence_output_preview(&source, 16);
+        assert!(omitted);
+        assert!(preview.starts_with("HEAD中"));
+        assert!(preview.ends_with("中TAIL"));
+        assert!(preview.len() <= 16 + "[middle of archived output omitted]".len());
+        let (whole, omitted) = evidence_output_preview("短", 16);
+        assert!(!omitted);
+        assert_eq!(whole, "短");
     }
 
     #[test]

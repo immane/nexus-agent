@@ -270,8 +270,22 @@ whose projected input plus output reserve remains over the configured window.
 The latter has a specific `LimitReached` message and reports estimated input,
 output reserve, and window; it preserves the original active conversation and
 does not adopt the candidate summary. These figures remain estimates, not
-provider-reported occupancy. This diagnostic change does not yet reduce the
-protected-context floor or alter provider reasoning replay.
+provider-reported occupancy. This diagnostic change does not alter provider
+reasoning replay.
+
+Uncertain-outcome projections now retain at most 128 bytes of tool output as
+UTF-8-safe head/tail excerpts, with an explicit middle-omitted marker and the
+original output length/truncation state. The full archived source record remains
+unchanged. This reduces repeated result text in active context; it does not
+remove call identity, arguments, uncertainty, or authorization boundaries.
+
+Before issuing a summary request, the runtime now evaluates a lower-bound
+projection with no derived summary text and the existing bounded tool-output
+previews. If that candidate still exceeds the configured input-plus-output or
+item budget, it returns a protected-context limit without spending a summary
+turn. This is a best-effort estimate, not provider tokenization; the original
+conversation remains unchanged. It avoids futile summarization but does not
+make an irreducible oversized recent item fit.
 
 The estimator uses `ceil(payload_bytes / 3)` plus message/tool framing. It starts
 with a 1.25 safety multiplier and now exposes the raw estimate, adjusted estimate

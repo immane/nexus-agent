@@ -415,6 +415,26 @@ pub(super) fn prepare_context_request(
             plan.removed.len(),
             plan.items.len(),
         ));
+        if policy.strategy() == ContextCompactionStrategy::Summarize && !plan.removed.is_empty() {
+            let minimum = normal_request_with_memory(shared, active, turn, &plan.items, None)?;
+            let minimum = if estimate(active, &minimum).saturating_add(output) > window {
+                preview_request_for_headroom(active, minimum, window, output)?
+            } else {
+                minimum
+            };
+            let minimum_input = estimate(active, &minimum);
+            if minimum.conversation().len() > shared.context_items_bound
+                || minimum_input.saturating_add(output) > window
+            {
+                diagnostic(format_args!(
+                    "nexus-runtime: protected context floor exceeds budget estimated_input_tokens={minimum_input} output_reserve_tokens={output} window_tokens={window} retained_items={}; summary call skipped",
+                    minimum.conversation().len(),
+                ));
+                return Err(Terminal::limit(
+                    "protected context cannot fit the configured input and output budget; summary call skipped",
+                ));
+            }
+        }
         let mut stage = PendingCompaction {
             items: plan.items,
             history_len: plan.history_len,
@@ -1211,6 +1231,44 @@ mod tests {
     }
 
     #[test]
+    fn protected_context_floor_uses_output_previews_before_skipping_summary() {
+        let (shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        active.context_management.window =
+            Some(ContextWindow::new(8192, ContextWindowSource::Configured).unwrap());
+        for n in 0..3 {
+            active.conversation.extend(context_exchange(
+                &active.run,
+                n,
+                if n == 2 { 20_000 } else { 5000 },
+            ));
+        }
+        let original = active.conversation.clone();
+
+        let request = prepare(&shared, &mut active);
+
+        assert!(active.pending_compaction.is_some());
+        assert_eq!(active.turns_used, 1, "summary request was dispatched");
+        assert_eq!(active.conversation, original, "source context stays intact");
+        assert!(matches!(
+            request.conversation().last(),
+            Some(ModelContextItem::UserText(text)) if text.as_str() == SUMMARY_REQUEST
+        ));
+
+        let stage = active.pending_compaction.as_ref().unwrap();
+        let minimum = normal_request_with_memory(&shared, &active, &turn(), &stage.items, None)
+            .unwrap_or_else(|_| panic!("minimum protected projection"));
+        assert!(estimate(&active, &minimum) + reserve(8192) > 8192);
+        let previewed = preview_request_for_headroom(&active, minimum, 8192, reserve(8192))
+            .unwrap_or_else(|_| panic!("protected projection with output previews"));
+        assert!(estimate(&active, &previewed) + reserve(8192) <= 8192);
+        assert!(previewed.conversation().iter().any(|item| matches!(
+            item,
+            ModelContextItem::ToolResult { outcome, .. } if outcome.is_truncated()
+        )));
+    }
+
+    #[test]
     fn summary_candidate_must_leave_generation_headroom_before_commit() {
         let (shared, _data) = shared_with_data();
         let mut active = loaded_history(ContextCompactionStrategy::Summarize);
@@ -1247,6 +1305,29 @@ mod tests {
         );
         assert_eq!(active.conversation, original);
         assert!(active.derived_memory.is_none());
+    }
+
+    #[test]
+    fn protected_context_floor_skips_summary_when_no_summary_can_fit() {
+        let (shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        active.conversation[2] = ModelContextItem::user_text("critical task ".repeat(1200))
+            .expect("bounded current task");
+        let original = active.conversation.clone();
+
+        let terminal = prepare_context_request(&shared, &mut active, &turn())
+            .expect_err("protected context cannot fit even without derived summary memory");
+
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        assert_eq!(
+            terminal.error.as_ref().map(AgentError::message),
+            Some(
+                "protected context cannot fit the configured input and output budget; summary call skipped"
+            )
+        );
+        assert_eq!(active.conversation, original);
+        assert!(active.pending_compaction.is_none());
+        assert_eq!(active.turns_used, 0, "do not spend a summary request");
     }
 
     #[test]
