@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from http.client import IncompleteRead
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -20,6 +21,18 @@ from context_metrics import derive_metrics, load_events
 
 RUNNER_GRACE_SECONDS = 60
 EVENT_SCHEMA_VERSION = 1
+
+
+def tool_log_text(text, byte_limit, secrets):
+    """Bound optional task content and redact known credentials before truncation."""
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"']+", "Bearer [REDACTED]", text)
+    encoded = text.encode("utf-8")
+    preview = encoded[:byte_limit].decode("utf-8", errors="ignore")
+    return json.dumps({"preview": preview, "redacted_bytes": len(encoded),
+                       "log_truncated": len(encoded) > byte_limit}, ensure_ascii=False)
 
 
 def write_json(path, value):
@@ -54,6 +67,7 @@ def event_record(event, elapsed_seconds):
             detail["error"] = {"category": error.get("category")}
     return {
         "schema_version": EVENT_SCHEMA_VERSION,
+        "at_utc": datetime.now(timezone.utc).isoformat(),
         "seq": event.get("seq"),
         "elapsed_seconds": round(elapsed_seconds, 6),
         "kind": kind,
@@ -359,6 +373,7 @@ def main():
     parser.add_argument("--task-json", type=Path, required=True, help="one canonical SWE-bench dataset row")
     parser.add_argument("--workspace", type=Path, required=True, help="disposable checkout at task base_commit")
     parser.add_argument("--server", default="http://127.0.0.1:8471")
+    parser.add_argument("--session-id", help="reuse a prepared session (launcher verifies binding and network before submission)")
     parser.add_argument("--token-env", default="NEXUS_BENCH_SMOKE_TOKEN")
     parser.add_argument("--provider", required=True)
     parser.add_argument("--model", required=True)
@@ -383,12 +398,18 @@ def main():
     parser.add_argument("--max-tool-calls", type=int)
     parser.add_argument("--max-input-tokens", type=int)
     parser.add_argument("--max-output-tokens", type=int)
+    parser.add_argument("--tool-log-bytes", type=int, default=0,
+                        help="optional redacted tool argument/output preview bytes per event (0 omits content)")
     parser.add_argument(
         "--approve-container-tools",
         action="store_true",
         help="approve each requested built-in container tool once; only for an isolated task workspace",
     )
     args = parser.parse_args()
+    if not 0 <= args.tool_log_bytes <= 65536:
+        parser.error("--tool-log-bytes must be in 0..65536")
+    log_secrets = [value for name, value in os.environ.items()
+                   if re.search(r"TOKEN|SECRET|PASSWORD|API_KEY|AUTH", name, re.IGNORECASE) and len(value) >= 4]
 
     if args.context_window_tokens is not None and args.context_window_tokens <= 0:
         parser.error("--context-window-tokens must be positive")
@@ -416,7 +437,7 @@ def main():
 
     issue = build_task_prompt(instance, base_commit, row["problem_statement"])
 
-    session = request(args.server, token, "/sessions", {"provider": args.provider, "model": args.model})["session"]
+    session = args.session_id or request(args.server, token, "/sessions", {"provider": args.provider, "model": args.model})["session"]
     run_dir = args.output_dir / "runs" / uuid.uuid4().hex
     run_dir.mkdir(parents=True, exist_ok=False)
     manifest = {
@@ -449,7 +470,8 @@ def main():
             "max_input_tokens": args.max_input_tokens,
             "max_output_tokens": args.max_output_tokens,
         },
-        "tool_config": {"approve_container_tools": args.approve_container_tools},
+        "tool_config": {"approve_container_tools": args.approve_container_tools,
+                        "tool_log_bytes": args.tool_log_bytes},
         "server_run_id": None,
         "telemetry": {"schema_version": EVENT_SCHEMA_VERSION, "status": "pending"},
     }
@@ -521,6 +543,21 @@ def main():
                 last_event_seq = seq
             detail = event.get("detail") or {}
             kind = event.get("kind")
+            if kind not in ("assistant-text", "tool-output"):
+                # Structured metadata excludes model/tool text and approval scope.
+                print("\n[event] " + json.dumps(event_record(event, time.monotonic() - started)),
+                      file=sys.stderr, flush=True)
+            if args.tool_log_bytes:
+                text = None
+                if kind == "tool-started":
+                    text = detail.get("args_preview")
+                elif kind == "tool-finished":
+                    text = (detail.get("outcome") or {}).get("content")
+                elif kind == "tool-output":
+                    text = detail.get("preview")
+                if isinstance(text, str) and text:
+                    print(f"\n[tool-content] kind={kind} call={detail.get('call')} "
+                          + tool_log_text(text, args.tool_log_bytes, log_secrets), file=sys.stderr, flush=True)
             observe_run_event(run_observation, event)
             if kind == "model-request-started":
                 request_count += 1
@@ -614,8 +651,7 @@ def main():
                 if args.approve_container_tools:
                     approved_calls += 1
                     print(
-                        f"\n[approval] granting once: scope={detail.get('scope')} "
-                        f"args={detail.get('args_preview')}",
+                        f"\n[approval] granting once: call={detail.get('call')}; content omitted",
                         file=sys.stderr,
                         flush=True,
                     )

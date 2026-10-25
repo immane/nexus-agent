@@ -12,7 +12,23 @@ from run_nexus_swe_task import (
     reached_budget,
     summarize_result,
     validate_container_git_checkout,
+    tool_log_text,
 )
+
+
+class ToolLogTests(unittest.TestCase):
+    def test_redacts_known_credentials_and_bearer_headers_before_truncation(self):
+        import json
+        value = json.loads(tool_log_text("token=secret-value Authorization: Bearer other-secret", 200, ["secret-value"]))
+        self.assertNotIn("secret-value", value["preview"])
+        self.assertNotIn("other-secret", value["preview"])
+        self.assertIn("[REDACTED]", value["preview"])
+
+    def test_utf8_preview_is_byte_bounded_and_marks_log_truncation(self):
+        import json
+        value = json.loads(tool_log_text("工具 output", 4, []))
+        self.assertLessEqual(len(value["preview"].encode()), 4)
+        self.assertTrue(value["log_truncated"])
 
 
 class SummaryTests(unittest.TestCase):
