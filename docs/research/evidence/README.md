@@ -10,10 +10,12 @@ paths; this directory contains deliberately reviewed evidence only.
 | [SymPy unbounded](nexus-qwen-sympy-20590-unbounded-20261024/report.json) | Limit reached | Resolved | 1 passed | 21 passed |
 | [Astropy](nexus-qwen-astropy-context-observation-20261024-retry/report.json) | Limit reached: model output limit | Resolved | 2 passed | 13 passed |
 | [Django](nexus-qwen-django-context-observation-20261024/report.json) | Completed | Resolved | 3 passed | 19 passed |
+| [SymPy summary-fix v2](nexus-qwen-sympy-20590-context-summaryfix-v2-20261025/report.json) | Completed | Resolved | 1 passed | 21 passed |
 
-The archived SymPy run is the earlier unbounded pilot, not the later context-note
-rerun summarized in the README. Its two previously tracked artifacts were moved
-here without changing their contents.
+The unbounded SymPy row is the earlier exposed-task pilot. The summary-fix v2
+row is another exposed-task replay, not blind benchmark evidence. Its official
+tests passed, but the agent run triggered no context reduction, so it does not
+validate the live summarization path.
 
 ## Artifact mapping
 
@@ -28,6 +30,11 @@ The Astropy and Django directories also contain:
   usage, and configured runner budgets.
 - `evaluation-summary.json`: the official aggregate report, copied without
   content changes from its model/run-named report file.
+
+The SymPy summary-fix v2 directory contains the same four artifacts. It used
+SWE-bench evaluator 5.0.2; the report records the new `test_immutable` as
+FAIL_TO_PASS and all 21 PASS_TO_PASS tests as successful. The archived
+`patch.diff` was checked byte-for-byte against the submitted prediction.
 
 Astropy's directory uses the successful evaluator retry's run ID; its
 `result.json` describes the single actual agent execution, not a second model

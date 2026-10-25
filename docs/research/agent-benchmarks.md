@@ -257,6 +257,27 @@ Keep one row per attempt, including failures:
 
 ## Local pilot status (2026-10-24)
 
+### Summary-request debugging (2026-10-25)
+
+The `context-summaryfix-rerun-20261025` debug replay completed one summary
+(1,366 output tokens), then rejected another after it used its 4,096-token
+output allowance. The runtime preserved the original conversation and stopped;
+this is not a successful task completion. Increasing the allowance alone did
+not establish summary reliability. Summary requests now use isolated summarizer
+instructions instead of coding-agent/environment instructions and end with an
+explicit request to summarize, rather than the original task description.
+Rejection diagnostics include protocol validity, finish reason, text bytes,
+and the memory byte ceiling; truncated summaries remain ineligible for adoption.
+The subsequent `context-summaryfix-v2-20261025` replay completed and the official
+SWE-bench 5.0.2 evaluator resolved `sympy__sympy-20590` (1/1; `test_immutable`
+and all 21 PASS_TO_PASS tests passed). That run made 38 task-model calls but
+triggered no context reduction, so it validates task completion and scoring, not
+the live summary request or compaction behavior. The selected task was already
+exposed in prior runs and is not blind evidence. Reviewed artifacts are indexed
+in [the evidence README](evidence/README.md).
+
+### Earlier pilot observations
+
 One SWE-bench Lite task, `sympy__sympy-20590`, was used to validate the path;
 this is not a leaderboard score:
 
@@ -657,6 +678,31 @@ workspace directory is mounted into the container. For example:
 git clone --no-hardlinks --no-checkout SOURCE_REPO CHECKOUT
 git -C CHECKOUT checkout --detach BASE_COMMIT
 ```
+
+For locally built images, pass the immutable image ID printed by
+`docker image inspect IMAGE --format '{{.Id}}'` (the `sha256:...` value) to
+`--gateway-image` and `--container-image`. Do not append that image ID to a tag
+as `TAG@sha256:...`: locally built images commonly have no `RepoDigests`, so
+Docker rejects that reference as missing even though the tagged image exists.
+
+Before starting the server, verify that the process launching it actually has
+both the bearer-token variable named by `--auth-token-env` (default
+`NEXUS_BENCH_SMOKE_TOKEN`) and the selected provider credential variable
+referenced by `config.json`. On macOS, non-interactive zsh/agent shells do not
+necessarily source `.zshrc`; exporting a variable in a separate interactive
+terminal does not make it available here. Check presence without printing the
+value, for example:
+
+```sh
+test -n "${NEXUS_BENCH_SMOKE_TOKEN:-}" && echo bearer-token-present
+test -n "${OLLAMA_API_KEY:-}" && echo provider-credential-present
+```
+
+Replace `OLLAMA_API_KEY` with the `credential.env` name for the selected
+provider. If either variable is absent, explicitly load it into the server
+launch process from the approved secret source; do not put credentials in
+command arguments or benchmark artifacts. The runner does not launch the
+server or recover credentials from the user's interactive shell.
 
 The runner checks that `.git`, the common Git directory, and object storage are
 self-contained before creating a provider session, so a broken host-only

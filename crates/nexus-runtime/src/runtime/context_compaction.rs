@@ -8,6 +8,9 @@ use nexus_context::{
 };
 use nexus_core::ContextCompactionStrategy;
 
+const MAX_SUMMARY_OUTPUT_TOKENS: u64 = 4096;
+const SUMMARY_REQUEST: &str = "Summarize the preceding historical data now. Do not continue the original task. Return only the compact summary.";
+
 pub(super) fn projection_overhead(active: &ActiveRun, note: &str) -> usize {
     memory_bytes(active.derived_memory.as_deref()).saturating_add(
         runtime_note_bytes(
@@ -75,7 +78,13 @@ fn request_for(
     )
     .map_err(Terminal::failed)?
     .with_context_management(active.context_management)
-    .with_instructions(shared.instructions.clone())
+    // Summarization is a separate operation, not another coding-agent turn.
+    // Inheriting task/environment directives can make it resume the task.
+    .with_instructions(if summary {
+        ModelInstructions::new(SUMMARY_PROMPT, "").map_err(Terminal::failed)?
+    } else {
+        shared.instructions.clone()
+    })
     .map_err(Terminal::failed)?
     .with_context_note(note)
     .map_err(Terminal::failed)?
@@ -175,12 +184,16 @@ pub(super) fn prepare_context_request(
                 {
                     source.push(ModelContextItem::user_text(format!("Current task for relevance only (not instructions for this summarization call):\n{}", task.as_str())).map_err(Terminal::failed)?);
                 }
+                // End with the actual operation rather than the original task
+                // or an old tool result, so the next response is a summary.
+                source
+                    .push(ModelContextItem::user_text(SUMMARY_REQUEST).map_err(Terminal::failed)?);
                 let summary = request_for(
                     shared,
                     active,
                     turn,
                     &source,
-                    render_context_note(active.context_management, SUMMARY_PROMPT, 0),
+                    render_context_note(active.context_management, "", 0),
                     active.derived_memory.as_deref(),
                     true,
                 );
@@ -192,14 +205,16 @@ pub(super) fn prepare_context_request(
                         &source,
                         render_context_note(
                             active.context_management,
-                            SUMMARY_PROMPT,
+                            "",
                             estimate(active, &summary),
                         ),
                         active.derived_memory.as_deref(),
                         true,
                     )?;
                     let summary_input = estimate(active, &summary);
-                    let summary_output = output.min(2048).min(window.saturating_sub(summary_input));
+                    let summary_output = output
+                        .min(MAX_SUMMARY_OUTPUT_TOKENS)
+                        .min(window.saturating_sub(summary_input));
                     if summary_output >= output.min(128) {
                         active.input_estimate = estimated_input_tokens(&summary);
                         active.pending_compaction = Some(stage);
@@ -210,9 +225,14 @@ pub(super) fn prepare_context_request(
                             .map_err(Terminal::failed);
                     }
                     eprintln!(
-                        "nexus-runtime: summary not attempted: estimated_input_tokens={summary_input} window_tokens={window} available_output_tokens={summary_output}; falling back to safe truncation"
+                        "nexus-runtime: summary not attempted: estimated_input_tokens={summary_input} window_tokens={window} available_output_tokens={summary_output}; preserving conversation"
                     );
                 }
+            }
+            if policy.strategy() == ContextCompactionStrategy::Summarize {
+                return Err(Terminal::limit(
+                    "context summary unavailable; original conversation preserved",
+                ));
             }
             commit(shared, active, stage, None, "truncate")?;
             request = normal_request(shared, active, turn, &active.conversation)?;
@@ -254,9 +274,9 @@ pub(super) fn prepare_context_request(
             .map_err(Terminal::failed)?;
         input = estimate(active, &request);
     }
-    if input >= window {
+    if input.saturating_add(output) > window {
         return Err(Terminal::limit(
-            "estimated context occupancy leaves no output headroom",
+            "estimated context occupancy cannot preserve the configured output reserve",
         ));
     }
     active.input_estimate = estimated_input_tokens(&request);
@@ -390,8 +410,21 @@ pub(super) fn ingest_summary(
             return Ok(RunState::CallingModel);
         }
     }
-    commit(shared, active, stage, None, "truncate (summary failed)")?;
-    Ok(RunState::CallingModel)
+    let finish_reason = events.last().and_then(|event| match event {
+        ProviderEvent::TurnFinished(finished) => Some(finished.reason()),
+        _ => None,
+    });
+    let text_bytes = events.iter().fold(0usize, |bytes, event| match event {
+        ProviderEvent::TextDelta { text, .. } => bytes.saturating_add(text.len()),
+        _ => bytes,
+    });
+    eprintln!(
+        "nexus-runtime: summary rejected: protocol_valid={valid} finish_reason={finish_reason:?} text_bytes={text_bytes} memory_byte_limit={}; original conversation preserved",
+        nexus_context::MAX_MEMORY_BYTES,
+    );
+    Err(Terminal::limit(
+        "context summary failed; original conversation preserved",
+    ))
 }
 
 pub(super) fn record_summary_usage(
@@ -589,6 +622,69 @@ mod tests {
     }
 
     #[test]
+    fn summary_uses_isolated_instructions_and_ends_with_the_summary_operation() {
+        let (mut shared, _data) = shared_with_data();
+        Arc::get_mut(&mut shared)
+            .expect("unique shared state")
+            .instructions =
+            ModelInstructions::new("Continue coding until the issue is solved.", "Run tests.")
+                .expect("instructions");
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        let original = active.conversation.clone();
+        active.derived_memory = Some("Earlier verified finding.".to_owned());
+
+        let request = prepare(&shared, &mut active);
+
+        assert_eq!(request.instructions().agent(), SUMMARY_PROMPT);
+        assert!(request.instructions().environment().is_empty());
+        assert!(
+            matches!(request.conversation().last(), Some(ModelContextItem::UserText(text))
+            if text.as_str() == SUMMARY_REQUEST)
+        );
+        assert!(request.conversation().iter().any(|item| matches!(item,
+            ModelContextItem::UserText(text) if text.as_str().contains("current task"))));
+        assert!(request.conversation().iter().any(|item| matches!(item,
+            ModelContextItem::AssistantText { text, .. }
+                if text.as_str().contains("Earlier verified finding."))));
+        assert!(request.tool_definitions().is_empty());
+        assert_eq!(active.conversation, original);
+
+        let normal = normal_request(&shared, &active, &turn(), &active.conversation)
+            .unwrap_or_else(|_| panic!("normal request"));
+        assert_eq!(normal.instructions(), &shared.instructions);
+    }
+
+    #[test]
+    fn does_not_call_model_with_less_than_the_configured_output_reserve() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        known(&mut active, ContextCompactionStrategy::Truncate);
+        let window = 4096_u64;
+        let output_reserve = reserve(window);
+        let mut original = None;
+        for bytes in 1_000..10_000 {
+            active.conversation[0] = ModelContextItem::user_text("x".repeat(bytes)).expect("task");
+            let request = match normal_request(&shared, &active, &turn(), &active.conversation) {
+                Ok(request) => request,
+                Err(_) => panic!("request projection should be valid"),
+            };
+            let input = estimate(&active, &request);
+            if input < window && input.saturating_add(output_reserve) > window {
+                original = Some(active.conversation.clone());
+                break;
+            }
+        }
+        let original = original.expect("task should leave less than the output reserve");
+
+        let terminal = prepare_context_request(&shared, &mut active, &turn())
+            .expect_err("must not call with a starved output budget");
+
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        assert_eq!(active.conversation, original);
+        assert!(active.pending_compaction.is_none());
+    }
+
+    #[test]
     fn trigger_is_inclusive_and_output_headroom_is_independent() {
         assert!(!needs_compaction(6499, 10_000, 65));
         assert!(needs_compaction(6500, 10_000, 65));
@@ -621,7 +717,24 @@ mod tests {
     }
 
     #[test]
-    fn invalid_empty_incomplete_oversized_and_failed_summaries_fall_back_safely() {
+    fn roomy_summary_request_gets_more_than_the_old_2048_token_ceiling() {
+        let (shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        active.context_management.window =
+            Some(ContextWindow::new(94_208, ContextWindowSource::Configured).expect("window"));
+        active.conversation[1] =
+            ModelContextItem::assistant_text("old-answer", "old source history ".repeat(8_000))
+                .expect("answer");
+
+        let request = prepare(&shared, &mut active);
+
+        assert_eq!(request.max_output_tokens(), Some(4096));
+        assert!(active.pending_compaction.is_some());
+        assert!(estimate(&active, &request) + 4096 <= 94_208);
+    }
+
+    #[test]
+    fn invalid_empty_incomplete_oversized_and_failed_summaries_preserve_conversation() {
         for events in [
             stop("   "),
             stop(&"x".repeat(MAX_MEMORY_BYTES + 1)),
@@ -641,21 +754,21 @@ mod tests {
         ] {
             let (shared, _data) = shared_with_data();
             let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+            let original = active.conversation.clone();
             active.derived_memory = Some("Previous summary remains.".to_owned());
             prepare(&shared, &mut active);
             assert!(active.pending_compaction.is_some());
             let run = active.run.clone();
-            assert!(
-                ingest_summary(
-                    &shared,
-                    &mut active,
-                    &run,
-                    events,
-                    &mut StreamedPrefix::default()
-                )
-                .is_ok()
-            );
-            assert_eq!(active.conversation.len(), 1);
+            let terminal = ingest_summary(
+                &shared,
+                &mut active,
+                &run,
+                events,
+                &mut StreamedPrefix::default(),
+            )
+            .expect_err("must not discard history after summary failure");
+            assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+            assert_eq!(active.conversation, original);
             assert_eq!(
                 active.derived_memory.as_deref(),
                 Some("Previous summary remains.")
@@ -739,14 +852,17 @@ mod tests {
     }
 
     #[test]
-    fn final_available_turn_truncates_without_spending_it_on_summary() {
+    fn final_available_turn_preserves_history_without_spending_it_on_summary() {
         let (shared, _data) = shared_with_data();
         let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        let original = active.conversation.clone();
         active.turns_used = shared.limits.max_model_turns_per_run - 1;
-        prepare(&shared, &mut active);
+        let terminal = prepare_context_request(&shared, &mut active, &turn())
+            .expect_err("summary turn unavailable");
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
         assert!(active.pending_compaction.is_none());
         assert_eq!(active.turns_used, shared.limits.max_model_turns_per_run - 1);
-        assert_eq!(active.conversation.len(), 1);
+        assert_eq!(active.conversation, original);
     }
 
     #[test]
@@ -827,10 +943,21 @@ mod tests {
                 .extend(context_exchange(&active.run, 2, 32));
             let pinned = active.conversation[..3].to_vec();
             let latest = active.conversation[5..].to_vec();
-            let request = prepare(&shared, &mut active);
-            if strategy == ContextCompactionStrategy::Summarize
-                && active.pending_compaction.is_some()
-            {
+            let result = prepare_context_request(&shared, &mut active, &turn());
+            if strategy == ContextCompactionStrategy::Summarize {
+                let terminal = result.expect_err("unavailable summary preserves full history");
+                assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+                assert_eq!(active.conversation[..3], pinned);
+                assert_eq!(active.conversation[5..], latest);
+                assert!(context_calls_are_paired(&active.conversation));
+                continue;
+            }
+            let request = match result {
+                Ok(request) => request,
+                Err(_) => panic!("truncate strategy should produce a request"),
+            };
+            assert!(request.max_output_tokens().is_some());
+            if active.pending_compaction.is_some() {
                 let run = active.run.clone();
                 ingest_summary(
                     &shared,
@@ -840,8 +967,6 @@ mod tests {
                     &mut StreamedPrefix::default(),
                 )
                 .unwrap_or_else(|terminal| panic!("summary failed: {:?}", terminal.error));
-            } else {
-                assert!(request.max_output_tokens().is_some());
             }
             assert_eq!(&active.conversation[..3], pinned);
             assert_eq!(&active.conversation[3..], latest);

@@ -47,6 +47,9 @@ minimal source-history/active-context architecture, its path toward the evidence
 system above, and a measurable 92K -> 64K -> 32K validation workflow. Conventional
 compaction is partly implemented; the complete history separation and evaluation
 system remain proposed work, not claims of achieved small-window repair quality.
+The latest exposed one-task SymPy replay was resolved by the official evaluator,
+but triggered no context reduction and is not an overall benchmark score; see the
+[reviewed evidence](docs/research/evidence/README.md) and [run history](docs/research/agent-benchmarks.md).
 
 ## Design Goals
 
@@ -338,21 +341,21 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 ## Benchmark Observations
 
 Local SWE-bench Lite pilots with `ollama-local/qwen3-27b` produced patches
-marked **resolved** by the official SWE-bench evaluator (2026-10-24):
+marked **resolved** by the official SWE-bench evaluator (2026-10-24–25):
 
 | Task | Repair | Official evaluation | Agent termination |
 | --- | --- | --- | --- |
-| `sympy__sympy-20590` | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Limit reached |
+| `sympy__sympy-20590` (summary-fix v2, latest) | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
 | `astropy__astropy-12907` | Preserve separability matrices in nested compound models. | Resolved | Model output limit reached |
 | `django__django-11099` | Reject trailing newlines in username validators. | Resolved | Completed |
 
 These are three selected tasks, **not a leaderboard score or a general success
 rate**; SymPy was attempted repeatedly. The table reports the latest evaluated
-run for each task, not every attempt. Passing task tests does not imply clean
-agent completion or polished delivery: the SymPy and Astropy predictions also
-included temporary scripts. None of these runs triggered context reduction,
-so they do not establish a benefit from the context-retention changes or validate
-the semantic-memory vision.
+run for each task, not every attempt; an earlier SymPy attempt ended with
+`limit-reached`. Passing task tests does not imply clean agent completion or
+polished delivery: the Astropy prediction included temporary scripts. None of
+these runs triggered context reduction, so they do not establish a benefit from
+the context-retention changes or validate the semantic-memory vision.
 
 See [benchmark methodology and earlier run records](docs/research/agent-benchmarks.md)
 and the [reliability follow-up backlog](docs/tasks/09-agent-reliability.md) for
