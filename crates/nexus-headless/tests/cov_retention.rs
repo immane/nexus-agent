@@ -205,6 +205,8 @@ fn documented_tail(kind: &str) -> Option<&'static [&'static str]> {
         "model-request" => &[
             "purpose",
             "estimated-input",
+            "raw-estimated-input",
+            "estimate-scale-millis",
             "window",
             "trigger",
             "target",

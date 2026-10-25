@@ -501,6 +501,8 @@ mod cov_transport_private {
                     turn: turn.clone(),
                     purpose: nexus_core::ModelRequestPurpose::Task,
                     estimated_input_tokens: Some(123),
+                    raw_estimated_input_tokens: Some(100),
+                    estimate_scale_millis: 1250,
                     context_window_tokens: Some(94_208),
                     context_trigger_percent: 65,
                     context_target_percent: 10,

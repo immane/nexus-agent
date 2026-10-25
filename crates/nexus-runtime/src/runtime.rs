@@ -1421,6 +1421,7 @@ impl Runtime {
                 .window
                 .map(|window| window.tokens());
             let max_output_tokens = request.max_output_tokens();
+            let raw_estimated_input_tokens = Some(active.token_estimator.raw_estimate(&request));
             let estimated_input_tokens = Some(active.token_estimator.estimate(&request));
             let outcome = emit_control(
                 &self.shared,
@@ -1430,6 +1431,8 @@ impl Runtime {
                     turn: turn.clone(),
                     purpose,
                     estimated_input_tokens,
+                    raw_estimated_input_tokens,
+                    estimate_scale_millis: active.token_estimator.scale_millis(),
                     context_window_tokens: window,
                     context_trigger_percent: active.context_management.policy.trigger_percent(),
                     context_target_percent: active.context_management.policy.target_percent(),
@@ -10478,13 +10481,13 @@ mod cov_runtime_topup_private {
             if mode < 2 {
                 active.context_management.window = Some(
                     nexus_core::ContextWindow::new(
-                        4096,
+                        if mode == 0 { 16_384 } else { 4096 },
                         nexus_core::ContextWindowSource::Configured,
                     )
                     .unwrap(),
                 );
                 active.context_management.policy = nexus_core::ContextManagementPolicy::new(
-                    65,
+                    if mode == 0 { 20 } else { 65 },
                     10,
                     if mode == 0 {
                         nexus_core::ContextCompactionStrategy::Summarize

@@ -50,6 +50,20 @@ adoption use that same headroom. A cap at or above the known window is invalid.
 Summary generation remains independently capped at 4,096 tokens. These are local
 request budgets, not proof of the model's actual serving limits.
 
+Summary requests also carry an optional `ReasoningEffort::Low` hint. The
+OpenAI-compatible adapter sends `reasoning_effort: "low"` only to detected
+Ollama Chat Completions endpoints; other endpoint types do not receive the
+field. This is a provider-defined effort preference, not a hard reasoning-token
+budget or a guarantee that the model will spend fewer tokens.
+
+When a validated summary turn ends with `OutputLimit`, the runtime discards all
+partial output and may split that source chunk in half and retry it, at most
+twice per chunk (three attempts total). Each attempt consumes normal run
+turn/time/usage budgets. Accepted earlier chunk summaries remain staged; neither
+they nor any partial retry output replace active history until the complete
+summary passes request-headroom validation. Exhausted retries preserve the
+original conversation and terminate compaction.
+
 A validated task response ending in `OutputLimit` is incomplete, not a successful
 answer or permission to execute any included tool candidates. The runtime may
 make at most one fresh, concise task request within the same run, using only the

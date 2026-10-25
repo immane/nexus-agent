@@ -804,6 +804,8 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
                 turn: turn(),
                 purpose: nexus_core::ModelRequestPurpose::Summary,
                 estimated_input_tokens: Some(123),
+                raw_estimated_input_tokens: Some(100),
+                estimate_scale_millis: 1250,
                 context_window_tokens: Some(65_536),
                 context_trigger_percent: 65,
                 context_target_percent: 10,
@@ -900,6 +902,11 @@ fn every_payload_kind_has_a_distinct_name_and_only_run_finished_is_terminal() {
                 "summarized": false,
                     })
             );
+        }
+        if kind == "model-request-started" {
+            assert_eq!(encoded["detail"]["estimated_input_tokens"], 123);
+            assert_eq!(encoded["detail"]["raw_estimated_input_tokens"], 100);
+            assert_eq!(encoded["detail"]["estimate_scale_millis"], 1250);
         }
         assert_eq!(
             field_count(&encoded),

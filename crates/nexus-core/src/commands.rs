@@ -586,6 +586,10 @@ pub enum EventPayload {
         purpose: ModelRequestPurpose,
         /// Runtime heuristic for the fully assembled request, if available.
         estimated_input_tokens: Option<u64>,
+        /// Unscaled tokenizer-independent estimate used by calibration.
+        raw_estimated_input_tokens: Option<u64>,
+        /// Safety multiplier applied to the raw estimate, in thousandths.
+        estimate_scale_millis: u64,
         /// Explicit/discovered model window, if known.
         context_window_tokens: Option<u32>,
         /// Runtime context-compaction trigger percentage.

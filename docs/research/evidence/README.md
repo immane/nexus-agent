@@ -1,9 +1,9 @@
 # Reviewed benchmark evidence
 
-Selected original artifacts from the 2026-10-24 local SWE-bench Lite pilots.
-These are small, selected experiments, not a leaderboard score. The original
-runner/server logs and generated evaluator output remain local under ignored
-paths; this directory contains deliberately reviewed evidence only.
+Selected original artifacts from local SWE-bench Lite pilots. These are small,
+selected experiments, not a leaderboard score. The original runner/server logs
+and generated evaluator output remain local under ignored paths; this directory
+contains deliberately reviewed evidence only.
 
 **Model configuration for the results below:** Qwen3.8-27B with **IQ3_M
 quantization** and a configured **92K context window (94,208 tokens, input plus
@@ -17,11 +17,22 @@ account for these differences when comparing other evaluations.
 | [Astropy](nexus-qwen-astropy-context-observation-20261024-retry/report.json) | 2026-10-24 | 13m 39s | Limit reached: model output limit | Resolved | 2 passed | 13 passed |
 | [Django](nexus-qwen-django-context-observation-20261024/report.json) | 2026-10-24 | 34m 02s | Completed | Resolved | 3 passed | 19 passed |
 | [SymPy summary-fix v2](nexus-qwen-sympy-20590-context-summaryfix-v2-20261025/report.json) | 2026-10-25 | 14m 11s | Completed | Resolved | 1 passed | 21 passed |
+| Astropy context-retention run (artifacts local) | 2026-10-25 | 13m 13s | Completed | Resolved | Not recorded | Not recorded |
 
 The unbounded SymPy row is the earlier exposed-task pilot. The summary-fix v2
 row is another exposed-task replay, not blind benchmark evidence. Its official
 tests passed, but the agent run triggered no context reduction, so it does not
 validate the live summarization path.
+
+The Astropy context-retention run is also an exposed-task replay, not blind
+benchmark evidence. It completed one context reduction; the official SWE-bench
+5.0.2 evaluator resolved the task with no infrastructure failures or evaluator
+errors. Its generated report and run logs remain under the ignored benchmark
+artifacts at
+`/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/run-astropy__astropy-12907-20261025T175536Z-b4200e8c/official-evaluation/context-state-v1-20261026/`.
+This single result does not show that investigation repetition decreased or
+that context-retention changes caused the repair. FAIL_TO_PASS and PASS_TO_PASS
+counts were not captured in the aggregate evaluator report.
 
 ## Artifact mapping
 

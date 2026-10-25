@@ -50,6 +50,7 @@ pub use provider::{
     MAX_CONVERSATION_BYTES, MAX_CONVERSATION_ITEMS, MAX_INSTRUCTIONS_BYTES,
     MAX_TOOL_DEFINITION_BYTES, MAX_TOOL_DEFINITIONS, ModelContextItem, ModelInstructions,
     ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, ProviderRef,
+    ReasoningEffort,
 };
 pub use store::{
     STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, SourceRecord,

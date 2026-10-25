@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.2--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.3--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent designed around very fast startup, a minimal core, and a native terminal interface. Broader capabilities belong in replaceable tools and plugins, not an ever-growing engine.
 
@@ -16,7 +16,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.3-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only and external plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.3-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only by default; the server can optionally persist source and tool-operation records, but no session restore API is provided. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -47,9 +47,16 @@ minimal source-history/active-context architecture, its path toward the evidence
 system above, and a measurable 92K -> 64K -> 32K validation workflow. Conventional
 compaction is partly implemented; the complete history separation and evaluation
 system remain proposed work, not claims of achieved small-window repair quality.
-The latest exposed one-task SymPy replay was resolved by the official evaluator,
-but triggered no context reduction and is not an overall benchmark score; see the
-[reviewed evidence](docs/research/evidence/README.md) and [run history](docs/research/agent-benchmarks.md).
+The current implementation includes adaptive request-estimate calibration and
+telemetry, plus summaries prompted to retain investigation state (`Established`,
+`Ruled out`, `Open`, `Next`). Those summaries remain untrusted model-generated
+text, not verified facts; see the implementation notes in the design document.
+The exposed one-task Astropy context-retention replay completed one context
+reduction and was resolved by the official evaluator. This single result does
+not establish reduced repeated investigation or causation, and is not an overall
+benchmark score. The separate SymPy replay triggered no reduction. See the
+[reviewed evidence](docs/research/evidence/README.md) and
+[run history](docs/research/agent-benchmarks.md).
 
 ## Design Goals
 
@@ -65,37 +72,37 @@ but triggered no context reduction and is not an overall benchmark score; see th
 
 The startup target includes local configuration and interface initialization, but not model responses or optional plugin readiness. It is a goal for documented reference environments, **not a measured result or a guarantee on arbitrary hardware**. See the [performance design](docs/design/05-performance.md).
 
-### Historical executable sizes
+### Executable size measurements
 
-Previously recorded optimized, unstripped Cargo release binaries on **macOS arm64** (`cargo build -p nexus-headless -p nexus-tui --release --locked --offline`); these have **not been re-measured for 0.2.3-alpha**:
+Re-measured on **2026-10-25 UTC**, **macOS arm64** (`rustc 1.99.0`), from
+worktree based on revision `d5bd6e5` with local uncommitted changes. Sizes are
+Mach-O executable file lengths, not compressed downloads or installed-package
+sizes:
 
-| Executable | File size |
+| Executable / profile | File size |
 | --- | ---: |
-| `nexus-headless` | 1,674,336 bytes (1.60 MiB) |
-| `nexus-tui` | 3,480,752 bytes (3.32 MiB) |
-| Both binaries | 5,155,088 bytes (4.92 MiB) |
+| `nexus-headless`, default Cargo release | 2,108,976 bytes (2.01 MiB) |
+| `nexus-tui`, default Cargo release | 4,512,288 bytes (4.30 MiB) |
+| Headless + TUI total | 6,621,264 bytes (6.31 MiB) |
+| `nexus-server --features container`, default Cargo release | 3,803,264 bytes (3.63 MiB) |
+| Same server binary, copied and stripped with `strip -x` | 3,067,072 bytes (2.93 MiB) |
+| Server, `opt-level = "s"`, LTO, one codegen unit, symbols stripped | 1,797,680 bytes (1.71 MiB) |
+| Server, `opt-level = "z"`, LTO, one codegen unit, symbols stripped | 1,422,352 bytes (1.36 MiB) |
 
-These are platform- and build-profile-specific file sizes, not compressed download sizes or cross-platform guarantees. We will continue working to keep Nexus Agent lightweight and fast; the 100 ms first-interactive startup target remains a goal, and measurements for it are still pending.
-
-### Current server size measurements
-
-Measured on **macOS arm64** for `nexus-server --features container` (Mach-O):
-
-| Release profile | File size |
-| --- | ---: |
-| Default Cargo release | 3,116,512 bytes (2.97 MiB) |
-| Default release, copied and stripped with `strip -x` | 2,537,160 bytes (2.42 MiB) |
-| `opt-level = "s"`, LTO, one codegen unit, symbols stripped | 1,499,664 bytes (1.43 MiB) |
-| `opt-level = "z"`, LTO, one codegen unit, symbols stripped | 1,206,112 bytes (1.15 MiB) |
-
-The optimized variants were comparison builds only; repository build profiles were not changed. They compiled successfully, but runtime performance and the full test suite were not measured for these profiles. `opt-level = "z"` is the smallest measured build, not yet a production default. Sizes are platform-specific executable file sizes, not download or installed-package sizes.
+The headless/TUI sizes use the default release profile without container
+features. The server comparison builds used Cargo command-line profile overrides;
+repository profiles were not changed. `opt-level = "z"` is the smallest measured
+binary, not a production default: runtime performance and tests were not
+measured for these size-oriented profiles. These measurements describe a local
+development worktree, not a published release. The 100 ms first-interactive
+startup target remains a goal; startup measurements are still pending.
 
 ## Architecture
 
 The first diagram shows the host's in-process core, runtime, frontend, and
 adapters; built-in tools do not pay an IPC cost. `nexus-session` has an
 initial file-backed store implementation, and runtime offers opt-in durable
-tool-operation recording; application-level session history and restore are not yet wired;
+source-history and tool-operation recording; application-level restore is not wired;
 external plugins are also not implemented. Provider TLS and sandboxed commands
 can launch helper processes.
 
@@ -251,7 +258,7 @@ Accepted in [Decision 01](docs/design/decisions/01-first-release-defaults.md); d
 | --- | --- |
 | Permissions | Development mode by default: project/temp operations are automatic, external file access needs approval (allow once or a session-only directory grant); `--strict-tools` keeps project-jailed reads with confirmation for mutations and exec. |
 | Frontend | Grok Build-style full-screen Rust TUI plus a headless entry point over the same runtime. |
-| Sessions | Target: save automatically outside the project; restore history only on explicit request. Current history is memory-only. |
+| Sessions | Target: save automatically outside the project; restore history only on explicit request. TUI/default history is memory-only; the server has an opt-in file store for source and tool-operation records, without restore APIs. |
 | Authentication | API configuration with external credential references; browser login deferred. |
 | API relay | Relay is a provider plugin; support existing services first and keep local execution optional. |
 
@@ -354,16 +361,18 @@ comparisons should account for quantization, context budget, and agent harness.
 | Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
 | --- | --- | ---: | --- | --- | --- |
 | `sympy__sympy-20590` (summary-fix v2, latest) | 2026-10-25 | 14m 11s | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
-| `astropy__astropy-12907` | 2026-10-24 | 13m 39s | Preserve separability matrices in nested compound models. | Resolved | Model output limit reached |
+| `astropy__astropy-12907` (context-retention run) | 2026-10-25 | 13m 13s | Preserve separability matrices in nested compound models. | Resolved | Completed |
 | `django__django-11099` | 2026-10-24 | 34m 02s | Reject trailing newlines in username validators. | Resolved | Completed |
 
 These are three selected tasks, **not a leaderboard score or a general success
 rate**; SymPy was attempted repeatedly. The table reports the latest evaluated
 run for each task, not every attempt; an earlier SymPy attempt ended with
-`limit-reached`. Passing task tests does not imply clean agent completion or
-polished delivery: the Astropy prediction included temporary scripts. None of
-these runs triggered context reduction, so they do not establish a benefit from
-the context-retention changes or validate the semantic-memory vision.
+`limit-reached`. The Astropy context-retention run completed one context
+reduction and was resolved by the official evaluator; this single exposed-task
+run does not establish that the changes reduced repeated investigation or
+caused the successful repair, nor does it validate the semantic-memory vision.
+The earlier Astropy prediction included temporary scripts; the context-retention
+prediction did not.
 
 Agent wall time is the runner's recorded task duration, excluding the separate
 official evaluator run. Dates are the pilot run dates (UTC).
@@ -380,7 +389,7 @@ remaining work on convergence, verification, result recording, and cleanup.
 - [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
 - [x] Implement the shared runtime, live TUI, loopback HTTP/SSE server, scripted headless runner, file read/list/search/write/patch, and sandboxed exec.
 - [x] Implement Chat Completions, OpenAI Responses, and Anthropic Messages adapters with explicit protocol configuration and offline regression fixtures.
-- [x] Add bounded host instructions with native protocol mapping and runtime history projection that protects tool-call pairing and uncertain-effect evidence. Conversation history remains memory-only; semantic memory and durable recovery are not implemented. See the [provider contract](docs/contracts/01-provider.md).
+- [x] Add bounded host instructions with native protocol mapping and runtime history projection that protects tool-call pairing and uncertain-effect evidence. Conversation history remains memory-only by default; the server can opt into file-backed source and tool-operation records with `--session-store DIRECTORY`, but session restore is not implemented. Semantic IR and durable recovery are not implemented. See the [provider contract](docs/contracts/01-provider.md) and [server session-store notes](crates/nexus-server/src/lib.rs).
 - [x] Implement M4 consolidation slices: shared ordered-event consumption, tool composition, and current provider capability handling. The default-feature workspace suite has recorded passing macOS evidence; see [migration status](docs/tasks/08-architecture-migration.md) and [Testing](docs/testing.md).
 - [x] Add an opt-in container worker/gateway/workload path with runtime authorization and TUI/server selection. It is not a validated isolation boundary: native Linux host/LAN, metadata, IPv6/DNS, and public-egress checks remain outstanding. Image build and keeper-only smoke test are not isolation evidence.
 - [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.

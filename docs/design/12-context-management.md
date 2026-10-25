@@ -148,12 +148,14 @@ baseline, not the complete current workspace.
 
 #### Inspected implementation
 
-The current estimator uses `ceil(payload_bytes / 3)` plus message/tool framing,
-then applies a safety factor initially set to 1.25. Calibration can increase
-that factor when reported input demonstrates underestimation, but never lowers
-it. This is a deliberately conservative heuristic, not model tokenization.
-Systematic overestimation can therefore persist without implying that usage was
-incorrectly accumulated across calls.
+The estimator uses `ceil(payload_bytes / 3)` plus message/tool framing. It starts
+with a 1.25 safety multiplier and now exposes the raw estimate, adjusted estimate
+and multiplier on each request-start event. Provider usage remains correlated to
+that request by its turn ID. After a full 16-observation per-run window, the
+multiplier can decrease using the upper-quartile recent ratio plus a 20% margin,
+with a floor of 1.0; demonstrated underestimation can raise it immediately. This
+is a bounded adaptive heuristic, not model tokenization or a guarantee against
+outliers. Missing usage is not treated as zero.
 
 Archived summary selection preserves the task, the newest three complete tool
 groups, and deterministic unresolved-execution projections. Removed originals
@@ -163,6 +165,12 @@ each chunk receives the preceding rolling summary (or earlier accepted memory)
 and rewrites it. The prompt targets at most 400 words; generation is separately
 capped at 4,096 tokens and accepted memory at 8,192 bytes. These are different
 limits, not interchangeable measures of summary quality.
+
+The summary prompt now asks for a bounded investigation state with `Established`,
+`Ruled out`, `Open`, and `Next` sections, preserving source references, corrections,
+constraints, and patch/test-state caveats. This remains model-generated untrusted
+memory, not a parser-verified fact store; evaluation must verify that it reduces
+repeated exploration rather than merely producing the requested headings.
 
 The current workspace also supplies a summary-only low-effort hint, encoded
 only for detected Ollama Chat Completions endpoints. It is not a hard reasoning

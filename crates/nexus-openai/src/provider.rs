@@ -417,6 +417,11 @@ impl OpenAiProvider {
             "stream_options": {"include_usage": true},
             "max_tokens": output_token_limit(request),
         });
+        if self.is_ollama_endpoint()
+            && let Some(effort) = request.reasoning_effort()
+        {
+            body["reasoning_effort"] = Value::String(effort.as_str().to_owned());
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = Value::String("auto".to_owned());
@@ -2929,6 +2934,58 @@ impl ProviderPort for OpenAiProvider {
             )];
         }
         self.stream_with_sink_impl(&body, context, sink)
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::OpenAiProvider;
+    use nexus_config::CredentialRef;
+    use nexus_core::{ModelContextItem, ModelRequest, ReasoningEffort, RunId, TurnId};
+
+    fn request(with_effort: bool) -> ModelRequest {
+        let request = ModelRequest::new(
+            RunId::new("reasoning-effort-run").unwrap(),
+            TurnId::new("reasoning-effort-turn").unwrap(),
+            "summary",
+            Vec::new(),
+            None,
+            8192,
+        )
+        .unwrap()
+        .with_conversation(vec![
+            ModelContextItem::user_text("Summarize history").unwrap(),
+        ])
+        .unwrap();
+        if with_effort {
+            request.with_reasoning_effort(ReasoningEffort::Low)
+        } else {
+            request
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_only_to_ollama_chat_completions() {
+        let credential = CredentialRef::env_var("TEST_TOKEN").unwrap();
+        let ollama = OpenAiProvider::new(
+            "http://ollama:11434/v1",
+            credential.clone(),
+            "qwen3.8-27b-iq3m-92k:latest",
+        )
+        .unwrap();
+        let body = ollama.request_body(&request(true)).unwrap();
+        assert_eq!(body["reasoning_effort"], "low");
+
+        let ordinary = OpenAiProvider::new(
+            "http://127.0.0.1:43210/v1",
+            credential,
+            "generic-compatible-model",
+        )
+        .unwrap();
+        let body = ordinary.request_body(&request(true)).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+        let body = ollama.request_body(&request(false)).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
     }
 }
 

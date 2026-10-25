@@ -62,6 +62,8 @@ const REQUIRED_KEYS: &[(&str, &[&str])] = &[
         &[
             "purpose",
             "estimated-input",
+            "raw-estimated-input",
+            "estimate-scale-millis",
             "window",
             "max-output",
             "projected-tool-outputs",

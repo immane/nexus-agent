@@ -39,6 +39,23 @@ pub const MAX_TOOL_DEFINITIONS: usize = Limits::M0_TEST_TOOL_CALLS_PER_TURN as u
 /// Sized to admit sixteen maximum-length specs with headroom.
 pub const MAX_TOOL_DEFINITION_BYTES: usize = 2_097_152;
 
+/// Provider-defined reasoning effort hint for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// Prefer shorter reasoning where the selected provider/model supports it.
+    Low,
+}
+
+impl ReasoningEffort {
+    /// Returns the interoperable wire label used by compatible providers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+        }
+    }
+}
+
 /// Named credential reference resolved only for the selected integration
 /// when needed. Never a secret value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,6 +447,7 @@ impl ModelInstructions {
 pub struct ModelRequest {
     context_management: crate::ContextManagementSettings,
     max_output_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
     run: RunId,
     turn: TurnId,
     profile: String,
@@ -465,6 +483,7 @@ impl ModelRequest {
         Ok(Self {
             context_management: crate::ContextManagementSettings::default(),
             max_output_tokens: None,
+            reasoning_effort: None,
             run,
             turn,
             profile,
@@ -506,6 +525,20 @@ impl ModelRequest {
     #[must_use]
     pub fn max_output_tokens(&self) -> Option<u32> {
         self.max_output_tokens
+    }
+
+    /// Sets a provider-defined reasoning-effort hint. Adapters may encode it
+    /// only where the selected endpoint documents support for the hint.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Returns the optional provider-defined reasoning-effort hint.
+    #[must_use]
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
     }
 
     /// Returns the owning run.
