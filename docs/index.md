@@ -98,6 +98,11 @@ interfaces remain proposed; this link is not a claim of completed implementation
 | [11 - Optional container execution](design/11-container-execution.md) | Internal prototype status, target backend architecture, isolation gates, lifecycle, and acceptance | Partial feature-gated tools prototype; no runtime/frontend integration; isolation unvalidated |
 | [12 - Context management](design/12-context-management.md) | Source history, transactional compaction, evidence-system evolution, benchmark metrics, and shrinking-window validation | Owner-confirmed priority/direction; detailed design proposed; partial existing implementation |
 
+The context-management design also records the exposed Sphinx endurance-run
+findings and a staged follow-up proposal for bounded context and stagnation
+recovery. These are investigation results and proposed work, not implemented
+behavior.
+
 ## Contracts
 
 | Document | Purpose | Status |
