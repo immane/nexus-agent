@@ -22,9 +22,9 @@ pub mod tool;
 pub use approval::{ApprovalBinding, ApprovedScope, NormalizedArgs};
 pub use commands::{
     ApprovalNotice, ApproveCommand, AssistantText, CancelCommand, Command, CommandResponse,
-    DenyCommand, EventPayload, GetSnapshotCommand, ListSessionsCommand, OutcomeSummary,
-    RestoreSessionCommand, RunEvent, RunLifecycle, Snapshot, SubmitCommand, ToolFinishedInfo,
-    ToolProgress, ToolStartedInfo,
+    ContextReductionMethod, DenyCommand, EventPayload, GetSnapshotCommand, ListSessionsCommand,
+    ModelRequestPurpose, OutcomeSummary, RestoreSessionCommand, RunEvent, RunLifecycle, Snapshot,
+    SubmitCommand, ToolFinishedInfo, ToolProgress, ToolStartedInfo,
 };
 pub use content::{
     AssistantTurn, CallCandidate, CompletedTurn, ContentBlock, ContinuationData,

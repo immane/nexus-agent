@@ -298,6 +298,11 @@ fn commit(
     }
     let estimated = estimate(active, &projected);
     let reduction = ContextReduction {
+        method: match method {
+            "summarize" => nexus_core::ContextReductionMethod::Summarize,
+            "truncate" => nexus_core::ContextReductionMethod::Truncate,
+            _ => nexus_core::ContextReductionMethod::SummaryFailed,
+        },
         removed_items: stage.removed,
         retained_items: projected.conversation().len(),
         retained_bytes: conversation_bytes(projected.conversation())
@@ -429,7 +434,9 @@ pub(super) fn record_summary_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::cov_runtime_private::{context_exchange, context_run, shared_with_data};
+    use crate::runtime::cov_runtime_private::{
+        context_exchange, context_run, shared_with_control, shared_with_data,
+    };
     use nexus_context::{MAX_MEMORY_BYTES, MEMORY_LABEL};
     use nexus_core::{ContextManagementPolicy, ContextWindow, ContextWindowSource, TurnFinished};
 
@@ -492,7 +499,7 @@ mod tests {
 
     #[test]
     fn threshold_stages_summary_without_mutating_history_and_valid_stop_commits() {
-        let (shared, mut data) = shared_with_data();
+        let (shared, mut data) = shared_with_control();
         let mut active = loaded_history(ContextCompactionStrategy::Summarize);
         let original = active.conversation.clone();
         let request = prepare(&shared, &mut active);
@@ -537,6 +544,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event.payload(),
             EventPayload::ContextReduced {
+                method: nexus_core::ContextReductionMethod::Summarize,
                 removed_items: 2,
                 ..
             }
@@ -839,6 +847,61 @@ mod tests {
             assert_eq!(&active.conversation[3..], latest);
             assert!(context_calls_are_paired(&active.conversation));
             assert!(prepare(&shared, &mut active).max_output_tokens().is_some());
+        }
+    }
+
+    #[test]
+    fn synthetic_context_pressure_covers_92k_64k_and_32k_runtime_windows() {
+        for window in [94_208_u32, 65_536, 32_768] {
+            let (shared, _data) = shared_with_data();
+            let mut active = context_run();
+            known(&mut active, ContextCompactionStrategy::Truncate);
+            active.context_management.window =
+                Some(ContextWindow::new(window, ContextWindowSource::Configured).expect("window"));
+            let output_bytes = window as usize * 2 / 3;
+            let mut calls = Vec::new();
+            let mut results = Vec::new();
+            for n in 0..3 {
+                let mut exchange = context_exchange(&active.run, n, output_bytes);
+                if let ModelContextItem::ToolResult { outcome, .. } = &mut exchange[1] {
+                    *outcome = ToolOutcome::new(
+                        ExecutionStatus::Succeeded,
+                        EffectState::Unknown,
+                        Evidence::HostObserved,
+                        "x".repeat(output_bytes),
+                        false,
+                    )
+                    .unwrap();
+                }
+                results.push(exchange.pop().expect("tool result"));
+                calls.extend(exchange);
+            }
+            active.conversation.extend(calls);
+            active.conversation.extend(results);
+            let original = active.conversation.clone();
+            let request = prepare(&shared, &mut active);
+            assert_eq!(
+                active.conversation, original,
+                "{window}: source stays unchanged"
+            );
+            assert!(context_calls_are_paired(request.conversation()), "{window}");
+            assert!(
+                estimate(&active, &request) + reserve(u64::from(window)) <= u64::from(window),
+                "{window}: projected request retains the standard output reserve"
+            );
+            assert!(
+                request
+                    .conversation()
+                    .iter()
+                    .filter(|item| matches!(
+                        item,
+                        ModelContextItem::ToolResult { outcome, .. }
+                            if outcome.content().contains("Nexus model-context projection")
+                    ))
+                    .count()
+                    >= 3,
+                "{window}: the oversized latest group receives bounded model-only previews"
+            );
         }
     }
 
@@ -1490,10 +1553,39 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event.payload(),
             EventPayload::ContextReduced {
+                method: nexus_core::ContextReductionMethod::Summarize,
                 removed_items: 2,
                 ..
             }
         )));
+        let purposes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.payload() {
+                EventPayload::ModelRequestStarted { purpose, .. } => Some(*purpose),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            purposes,
+            [
+                nexus_core::ModelRequestPurpose::Summary,
+                nexus_core::ModelRequestPurpose::Task,
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.payload(),
+                    EventPayload::ModelRequestFinished {
+                        response_validated: true,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "both the summary and task response were accepted"
+        );
         submit_and_finish(&runtime, &mut streams, "session-a", "followup-task").await;
         submit_and_finish(&runtime, &mut streams, "session-b", "other-task").await;
         let requests = provider.requests.lock().expect("requests");

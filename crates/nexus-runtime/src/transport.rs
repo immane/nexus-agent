@@ -36,9 +36,12 @@ pub fn is_control_payload(payload: &EventPayload) -> bool {
     matches!(
         payload,
         EventPayload::RunStarted { .. }
+            | EventPayload::ContextReduced { .. }
             | EventPayload::ApprovalRequired(_)
             | EventPayload::ToolStarted(_)
             | EventPayload::ToolFinished(_)
+            | EventPayload::ModelRequestStarted { .. }
+            | EventPayload::ModelRequestFinished { .. }
             | EventPayload::UsageUpdated(_)
             | EventPayload::RunFinished(_)
     )
@@ -477,17 +480,40 @@ mod cov_transport_private {
             (
                 "AssistantTextDelta",
                 EventPayload::AssistantTextDelta(
-                    AssistantText::new(turn, "item-0", "delta").expect("valid fragment builds"),
+                    AssistantText::new(turn.clone(), "item-0", "delta")
+                        .expect("valid fragment builds"),
                 ),
             ),
             (
                 "ContextReduced",
                 EventPayload::ContextReduced {
+                    method: nexus_core::ContextReductionMethod::Truncate,
                     removed_items: 2,
                     retained_items: 4,
                     item_limit: 8,
                     retained_bytes: 128,
                     byte_limit: 1024,
+                },
+            ),
+            (
+                "ModelRequestStarted",
+                EventPayload::ModelRequestStarted {
+                    turn: turn.clone(),
+                    purpose: nexus_core::ModelRequestPurpose::Task,
+                    estimated_input_tokens: Some(123),
+                    context_window_tokens: Some(94_208),
+                    context_trigger_percent: 65,
+                    context_target_percent: 10,
+                    compaction_strategy: nexus_core::ContextCompactionStrategy::Truncate,
+                    max_output_tokens: Some(2048),
+                    projected_tool_outputs: 1,
+                },
+            ),
+            (
+                "ModelRequestFinished",
+                EventPayload::ModelRequestFinished {
+                    turn: turn.clone(),
+                    response_validated: true,
                 },
             ),
             (
@@ -540,7 +566,7 @@ mod cov_transport_private {
     #[test]
     fn control_classification_covers_every_payload_variant() {
         let payloads = all_payloads();
-        assert_eq!(payloads.len(), 10, "one fixture per EventPayload variant");
+        assert_eq!(payloads.len(), 12, "one fixture per EventPayload variant");
 
         let mut control = Vec::new();
         let mut data = Vec::new();
@@ -550,13 +576,15 @@ mod cov_transport_private {
             // explicit channel decision rather than a silent fallthrough.
             let expected = match payload {
                 EventPayload::RunStarted { .. }
+                | EventPayload::ContextReduced { .. }
                 | EventPayload::ApprovalRequired(_)
                 | EventPayload::ToolStarted(_)
                 | EventPayload::ToolFinished(_)
+                | EventPayload::ModelRequestStarted { .. }
+                | EventPayload::ModelRequestFinished { .. }
                 | EventPayload::UsageUpdated(_)
                 | EventPayload::RunFinished(_) => true,
                 EventPayload::AssistantTextDelta(_)
-                | EventPayload::ContextReduced { .. }
                 | EventPayload::ToolCallPreview { .. }
                 | EventPayload::ToolOutput(_) => false,
             };
@@ -568,12 +596,15 @@ mod cov_transport_private {
             }
         }
 
-        // Approvals, outcomes, usage, and the terminal travel on control;
-        // text deltas, context notices, previews, and progress travel on data.
+        // Request lifecycle, committed reductions, approvals, outcomes, usage,
+        // and terminal travel on control; text, previews, and progress use data.
         assert_eq!(
             control,
             [
                 "RunStarted",
+                "ContextReduced",
+                "ModelRequestStarted",
+                "ModelRequestFinished",
                 "ApprovalRequired",
                 "ToolStarted",
                 "ToolFinished",
@@ -583,12 +614,7 @@ mod cov_transport_private {
         );
         assert_eq!(
             data,
-            [
-                "AssistantTextDelta",
-                "ContextReduced",
-                "ToolCallPreview",
-                "ToolOutput"
-            ]
+            ["AssistantTextDelta", "ToolCallPreview", "ToolOutput"]
         );
     }
 

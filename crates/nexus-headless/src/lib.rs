@@ -8,9 +8,9 @@
 //! exits. No approval handler is configured, so confirmation-required calls
 //! exercise the denial path (denied, never executed, never hung).
 //!
-//! Output contract (unstable test-only revision `m0-test-0`, see
+//! Output contract (unstable test-only revision `m0-test-1`, see
 //! [`OUTPUT_REV`]): stdout carries ONLY machine-readable event/result lines,
-//! one record per line, each starting with `rev=m0-test-0 `. Fields are
+//! one record per line, each starting with `rev=m0-test-1 `. Fields are
 //! space-separated `key=value` pairs. Every value is percent-encoded over
 //! its UTF-8 bytes (see [`sanitize`]): bytes outside the RFC 3986
 //! unreserved set `A-Za-z0-9-._~` become `%XX` with uppercase hex, so no
@@ -22,9 +22,9 @@
 //! formatting is used. Event lines are sorted by per-run sequence before
 //! printing. Diagnostics and [`FAKE_BANNER`] go to stderr only.
 //!
-//! Report retention separates mandatory control records (`RunStarted`,
-//! approvals, tool lifecycle, usage, terminal) from presentation data (text,
-//! previews, progress). Mandatory records are never dropped because
+//! Report retention separates mandatory control records (`RunStarted`, model
+//! request lifecycle, committed context reductions, approvals, tool lifecycle,
+//! usage, terminal) from presentation data (text, previews, progress). Mandatory records are never dropped because
 //! presentation filled the budget: presentation lines are bounded by
 //! [`MAX_REPORT_EVENTS`] and the exact encoded bytes left under
 //! [`MAX_REPORT_BYTES`], and the oldest presentation lines are evicted first
@@ -79,11 +79,11 @@ use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsum
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 
 /// Unstable test-only output revision. Parsers must exact-match this.
-pub const OUTPUT_REV: &str = "m0-test-0";
+pub const OUTPUT_REV: &str = "m0-test-1";
 
 /// Self-identifying banner, printed to stderr (never stdout). A missing real
 /// configuration must never look like a real successful task.
-pub const FAKE_BANNER: &str = "nexus-headless: FAKE TEST-ONLY wiring rev m0-test-0 (scripted FakeProvider + FakeTool, ephemeral, NO approval handler; confirmation-required calls are denied). This is never a real task run.";
+pub const FAKE_BANNER: &str = "nexus-headless: FAKE TEST-ONLY wiring rev m0-test-1 (scripted FakeProvider + FakeTool, ephemeral, NO approval handler; confirmation-required calls are denied). This is never a real task run.";
 
 /// Usage hint for stderr diagnostics.
 pub const USAGE: &str = "usage: nexus-headless [--mode plan|build|<custom>] <task>; prefix with 'deny:' to exercise headless denial, 'refuse:' for refusal";
@@ -604,6 +604,9 @@ fn is_mandatory(payload: &EventPayload) -> bool {
     matches!(
         payload,
         EventPayload::RunStarted { .. }
+            | EventPayload::ContextReduced { .. }
+            | EventPayload::ModelRequestStarted { .. }
+            | EventPayload::ModelRequestFinished { .. }
             | EventPayload::ApprovalRequired(_)
             | EventPayload::ToolStarted(_)
             | EventPayload::ToolFinished(_)
@@ -885,14 +888,38 @@ fn format_event(event: &RunEvent) -> String {
             sanitize(&text.text),
         ),
         EventPayload::ContextReduced {
+            method,
             removed_items,
             retained_items,
             item_limit,
             retained_bytes,
             byte_limit,
         } => format!(
-            "{head}context-reduced removed-items={removed_items} retained-items={retained_items} item-limit={item_limit} retained-bytes={retained_bytes} byte-limit={byte_limit}"
+            "{head}context-reduced method={} removed-items={removed_items} retained-items={retained_items} item-limit={item_limit} retained-bytes={retained_bytes} byte-limit={byte_limit}",
+            method.as_str()
         ),
+        EventPayload::ModelRequestStarted {
+            turn: _,
+            purpose,
+            estimated_input_tokens,
+            context_window_tokens,
+            context_trigger_percent,
+            context_target_percent,
+            compaction_strategy,
+            max_output_tokens,
+            projected_tool_outputs,
+        } => format!(
+            "{head}model-request purpose={purpose:?} estimated-input={} window={} trigger={context_trigger_percent} target={context_target_percent} strategy={compaction_strategy:?} max-output={} projected-tool-outputs={projected_tool_outputs}",
+            estimated_input_tokens.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+            context_window_tokens.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+            max_output_tokens.map_or_else(|| "unknown".to_owned(), |n| n.to_string()),
+        ),
+        EventPayload::ModelRequestFinished {
+            turn: _,
+            response_validated,
+        } => {
+            format!("{head}model-response response-validated={response_validated}")
+        }
         EventPayload::ToolCallPreview { item_key } => {
             format!("{head}preview item={}", sanitize(item_key))
         }
@@ -1019,7 +1046,7 @@ mod tests {
         assert!(!lines.is_empty());
         for line in lines {
             assert!(
-                line.starts_with("rev=m0-test-0 "),
+                line.starts_with("rev=m0-test-1 "),
                 "every stdout line carries the rev: {line}"
             );
             assert!(!line.contains('\x1b'), "no escape codes: {line}");
@@ -1525,7 +1552,7 @@ mod tests {
 
     #[test]
     fn broken_pipe_write_surfaces_as_error_not_panic() {
-        let lines = vec!["rev=m0-test-0 type=result outcome=completed".to_owned()];
+        let lines = vec!["rev=m0-test-1 type=result outcome=completed".to_owned()];
         let error =
             write_report_lines(&mut ClosedPipe, &lines).expect_err("broken pipe is an error");
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
@@ -2028,7 +2055,7 @@ mod cov_topup_private {
         );
         assert_eq!(
             consumer.retention.mandatory[2].line,
-            "rev=m0-test-0 type=event seq=3 run=run-1 kind=run-finished outcome=completed persistence=ephemeral error=none error-correlation=none"
+            "rev=m0-test-1 type=event seq=3 run=run-1 kind=run-finished outcome=completed persistence=ephemeral error=none error-correlation=none"
         );
     }
 
@@ -2170,7 +2197,7 @@ mod cov_topup_private {
         ));
         assert_eq!(
             preview,
-            "rev=m0-test-0 type=event seq=1 run=run-1 kind=preview item=item-1"
+            "rev=m0-test-1 type=event seq=1 run=run-1 kind=preview item=item-1"
         );
 
         let progress = ToolProgress::new(
@@ -2182,7 +2209,7 @@ mod cov_topup_private {
         let output = format_event(&event(2, EventPayload::ToolOutput(progress)));
         assert_eq!(
             output,
-            "rev=m0-test-0 type=event seq=2 run=run-1 kind=tool-output call=c1-0 truncated=true preview-len=13"
+            "rev=m0-test-1 type=event seq=2 run=run-1 kind=tool-output call=c1-0 truncated=true preview-len=13"
         );
         // The raw preview text is never emitted, only its decoded length.
         assert!(!output.contains("half"));
@@ -2198,7 +2225,7 @@ mod cov_topup_private {
         ));
         assert_eq!(
             provisional,
-            "rev=m0-test-0 type=event seq=1 run=run-1 kind=usage input=12 output=7 finality=provisional"
+            "rev=m0-test-1 type=event seq=1 run=run-1 kind=usage input=12 output=7 finality=provisional"
         );
 
         let final_usage = format_event(&event(
@@ -2207,7 +2234,7 @@ mod cov_topup_private {
         ));
         assert_eq!(
             final_usage,
-            "rev=m0-test-0 type=event seq=2 run=run-1 kind=usage input=unknown output=unknown finality=final"
+            "rev=m0-test-1 type=event seq=2 run=run-1 kind=usage input=unknown output=unknown finality=final"
         );
     }
 

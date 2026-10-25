@@ -307,6 +307,7 @@ struct Terminal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ContextReduction {
+    method: nexus_core::ContextReductionMethod,
     removed_items: usize,
     retained_items: usize,
     retained_bytes: usize,
@@ -656,6 +657,7 @@ impl Runtime {
         let context_note_bytes =
             runtime_note_bytes(&context_note, self.shared.instructions.payload_bytes() > 0);
         let initial_context_reduction = history_omitted.then(|| ContextReduction {
+            method: nexus_core::ContextReductionMethod::InitialHistoryOmission,
             removed_items: history_omitted_items,
             retained_items: conversation.len(),
             retained_bytes: conversation_bytes(&conversation)
@@ -1072,6 +1074,7 @@ impl Runtime {
             }
             let compacted = compact_context(active, self.shared.context_items_bound)?;
             let initial = active.initial_context_reduction.take();
+            let combined_reduction = compacted.is_some() && initial.is_some();
             let mut reduction = match (compacted, initial) {
                 (Some(mut compacted), Some(initial)) => {
                     compacted.removed_items = compacted
@@ -1083,6 +1086,9 @@ impl Runtime {
                 (None, None) => None,
             };
             if let Some(reduction) = reduction.as_mut() {
+                if combined_reduction {
+                    reduction.method = nexus_core::ContextReductionMethod::Combined;
+                }
                 reduction.retained_items = active.conversation.len();
                 reduction.retained_items += usize::from(active.derived_memory.is_some());
                 reduction.retained_bytes = conversation_bytes(&active.conversation)
@@ -1104,6 +1110,63 @@ impl Runtime {
             ))
             .map_err(|_| Terminal::failed_internal("turn identity is invalid"))?;
             let request = prepare_context_request(&self.shared, active, &turn)?;
+            let purpose = if active.pending_compaction.is_some() {
+                nexus_core::ModelRequestPurpose::Summary
+            } else {
+                nexus_core::ModelRequestPurpose::Task
+            };
+            let source_results: HashMap<CallId, &str> = active
+                .conversation
+                .iter()
+                .filter_map(|item| match item {
+                    ModelContextItem::ToolResult { call, outcome, .. } => {
+                        Some((call.clone(), outcome.content()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let projected_tool_outputs = request
+                .conversation()
+                .iter()
+                .filter(|item| match item {
+                    ModelContextItem::ToolResult { call, outcome, .. } => {
+                        source_results.get(call).is_some_and(|source| {
+                            *source != outcome.content()
+                                && outcome.content().contains("Nexus model-context projection")
+                        })
+                    }
+                    _ => false,
+                })
+                .count();
+            let window = active
+                .context_management
+                .window
+                .map(|window| window.tokens());
+            let max_output_tokens = request.max_output_tokens();
+            let estimated_input_tokens = Some(active.token_estimator.estimate(&request));
+            let outcome = emit_control(
+                &self.shared,
+                active,
+                run,
+                EventPayload::ModelRequestStarted {
+                    turn: turn.clone(),
+                    purpose,
+                    estimated_input_tokens,
+                    context_window_tokens: window,
+                    context_trigger_percent: active.context_management.policy.trigger_percent(),
+                    context_target_percent: active.context_management.policy.target_percent(),
+                    compaction_strategy: active.context_management.policy.strategy(),
+                    max_output_tokens,
+                    projected_tool_outputs,
+                },
+            );
+            apply_control_outcome(active, outcome);
+            if let Some(outcome) = active.terminal {
+                return Err(Terminal {
+                    outcome,
+                    error: active.terminal_error.clone(),
+                });
+            }
             let context = ProviderContext::new(active.started.elapsed(), active.cancelled, None)
                 .with_control(active.token.clone(), active.deadline);
             (request, context, turn, active.deadline)
@@ -1183,6 +1246,12 @@ impl Runtime {
         };
         match joined {
             Some(Ok(events)) => {
+                let mut effective_limits = self.shared.limits;
+                effective_limits.max_tool_output_bytes = self.shared.effective_output_budget;
+                let response_validated =
+                    crate::protocol::validate_batch(&events, &effective_limits).is_ok();
+                self.publish_model_request_finished(run, &turn, response_validated)
+                    .await;
                 // The join can become ready after the deadline while the
                 // deadline branch is also ready. Because the join branch is
                 // biased, do not accept the provider batch without checking
@@ -1290,6 +1359,27 @@ impl Runtime {
                     ))
                 }
             }
+        }
+    }
+
+    async fn publish_model_request_finished(
+        &self,
+        run: &RunId,
+        turn: &TurnId,
+        response_validated: bool,
+    ) {
+        let mut state = self.shared.state.lock().await;
+        if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+            let outcome = emit_control(
+                &self.shared,
+                active,
+                run,
+                EventPayload::ModelRequestFinished {
+                    turn: turn.clone(),
+                    response_validated,
+                },
+            );
+            apply_control_outcome(active, outcome);
         }
     }
 
@@ -2955,6 +3045,7 @@ fn compact_context(
         active.context_note_bytes = note_bytes;
     }
     Ok(Some(ContextReduction {
+        method: nexus_core::ContextReductionMethod::BoundedHistory,
         removed_items: projection.removed_items,
         retained_items: active.conversation.len() + memory_items,
         retained_bytes: projection.retained_bytes,
@@ -2990,11 +3081,12 @@ fn publish_context_reduction(
         reduction.retained_bytes,
         nexus_core::provider::MAX_CONVERSATION_BYTES,
     );
-    emit_data(
+    let outcome = emit_control(
         shared,
         active,
         run,
         EventPayload::ContextReduced {
+            method: reduction.method,
             removed_items: reduction.removed_items,
             retained_items: reduction.retained_items,
             item_limit: shared.context_items_bound,
@@ -3002,6 +3094,7 @@ fn publish_context_reduction(
             byte_limit: nexus_core::provider::MAX_CONVERSATION_BYTES,
         },
     );
+    apply_control_outcome(active, outcome);
 }
 
 fn context_limit(active: &ActiveRun, bound: usize) -> Terminal {
@@ -3201,12 +3294,15 @@ fn control_event_bytes(event: &RunEvent) -> usize {
             text.turn.as_str().len() + text.item_key.len() + text.text.len()
         }
         EventPayload::ContextReduced {
+            method,
             removed_items: _,
             retained_items: _,
             item_limit: _,
             retained_bytes: _,
             byte_limit: _,
-        } => 5 * std::mem::size_of::<usize>(),
+        } => method.as_str().len() + 5 * std::mem::size_of::<usize>(),
+        EventPayload::ModelRequestStarted { turn, .. } => turn.as_str().len() + 64,
+        EventPayload::ModelRequestFinished { turn, .. } => turn.as_str().len() + 16,
         EventPayload::ToolCallPreview { item_key } => item_key.len(),
         EventPayload::ApprovalRequired(notice) => {
             notice.approval.as_str().len()
@@ -6009,6 +6105,19 @@ mod cov_runtime_private {
         (runtime.shared, streams.data)
     }
 
+    pub(super) fn shared_with_control() -> (Arc<Shared>, mpsc::Receiver<RunEvent>) {
+        let (runtime, streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        (runtime.shared, streams.control)
+    }
+
     fn active_for(run: &RunId) -> ActiveRun {
         ActiveRun {
             context_management: nexus_core::ContextManagementSettings::default(),
@@ -8164,6 +8273,22 @@ mod cov_runtime_topup_private {
                 "the batch after the stray wake is ingested, not dropped"
             );
             assert!(bed.data.try_recv().is_err());
+            let model_request = bed
+                .control
+                .try_recv()
+                .expect("request metadata is published before provider dispatch");
+            assert!(matches!(
+                model_request.payload(),
+                EventPayload::ModelRequestStarted { .. }
+            ));
+            let response = bed
+                .control
+                .try_recv()
+                .expect("response validation metadata follows the provider batch");
+            assert!(matches!(
+                response.payload(),
+                EventPayload::ModelRequestFinished { response_validated: true, .. }
+            ));
             let usage = bed
                 .control
                 .try_recv()
@@ -8173,8 +8298,8 @@ mod cov_runtime_topup_private {
             assert_eq!(
                 inspect(&bed, |active| (active.next_seq, active.last_seq, active.data_dropped))
                     .await,
-                Some((2, Some(1), false)),
-                "the one text delta and the one usage update hold sequences 0 and 1: \
+                Some((4, Some(3), false)),
+                "request metadata, one text delta, usage, and response metadata hold sequences 0..3: \
                  a stray wake consumes none and drops nothing"
             );
             assert_eq!(

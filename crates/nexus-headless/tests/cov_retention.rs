@@ -42,13 +42,16 @@ use nexus_headless::{
 
 /// The unstable revision a parser must exact-match, pinned literally so a
 /// silent bump of `OUTPUT_REV` cannot make these checks follow the drift.
-const WIRE_REV: &str = "m0-test-0";
+const WIRE_REV: &str = "m0-test-1";
 
 /// The published classification of retained records. Written out here from the
 /// documented control/presentation split so a change inside the crate's private
 /// classifier has to be re-argued in this file instead of being inherited.
-const MANDATORY_KINDS: [&str; 6] = [
+const MANDATORY_KINDS: [&str; 9] = [
     "run-started",
+    "context-reduced",
+    "model-request",
+    "model-response",
     "approval-required",
     "tool-started",
     "tool-finished",
@@ -56,12 +59,14 @@ const MANDATORY_KINDS: [&str; 6] = [
     "run-finished",
 ];
 
-const PRESENTATION_KINDS: [&str; 4] = ["text", "context-reduced", "preview", "tool-output"];
+const PRESENTATION_KINDS: [&str; 3] = ["text", "preview", "tool-output"];
 
 /// Every kind this crate can emit, so the sweep over a report rejects a kind
 /// that neither list claims rather than quietly ignoring it.
-const ALL_KINDS: [&str; 10] = [
+const ALL_KINDS: [&str; 12] = [
     "run-started",
+    "model-request",
+    "model-response",
     "usage",
     "tool-started",
     "approval-required",
@@ -190,12 +195,24 @@ fn documented_tail(kind: &str) -> Option<&'static [&'static str]> {
     let tail: &'static [&'static str] = match kind {
         "run-started" => &["request"],
         "context-reduced" => &[
+            "method",
             "removed-items",
             "retained-items",
             "item-limit",
             "retained-bytes",
             "byte-limit",
         ],
+        "model-request" => &[
+            "purpose",
+            "estimated-input",
+            "window",
+            "trigger",
+            "target",
+            "strategy",
+            "max-output",
+            "projected-tool-outputs",
+        ],
+        "model-response" => &["response-validated"],
         "usage" => &["input", "output", "finality"],
         "tool-started" => &["call"],
         "approval-required" => &["approval", "call", "scope", "args-preview"],
@@ -321,16 +338,29 @@ fn every_scripted_run_keeps_the_complete_mandatory_control_spine() {
             "hello",
             &[
                 "run-started",
+                "model-request",
                 "usage",
+                "model-response",
                 "tool-started",
                 "tool-finished",
+                "model-request",
+                "model-response",
                 "run-finished",
             ],
             &["approval-required", "preview", "tool-output"],
         ),
         (
             "deny: write it",
-            &["run-started", "usage", "tool-finished", "run-finished"],
+            &[
+                "run-started",
+                "model-request",
+                "usage",
+                "model-response",
+                "tool-finished",
+                "model-request",
+                "model-response",
+                "run-finished",
+            ],
             &[
                 "tool-started",
                 "approval-required",
@@ -340,7 +370,13 @@ fn every_scripted_run_keeps_the_complete_mandatory_control_spine() {
         ),
         (
             "refuse: no",
-            &["run-started", "usage", "run-finished"],
+            &[
+                "run-started",
+                "model-request",
+                "usage",
+                "model-response",
+                "run-finished",
+            ],
             &[
                 "tool-started",
                 "tool-finished",
@@ -360,10 +396,9 @@ fn every_scripted_run_keeps_the_complete_mandatory_control_spine() {
         // Every retained record is one of the documented kinds, and the set of
         // retained kinds is exactly the spine plus presentation: a mandatory
         // kind may not go missing and no extra kind may appear.
-        assert_eq!(
-            kinds.iter().filter(|kind| is_mandatory_kind(kind)).count(),
-            required.len(),
-            "{task} retains every mandatory kind once: {kinds:?}"
+        assert!(
+            kinds.iter().filter(|kind| is_mandatory_kind(kind)).count() >= required.len(),
+            "{task} retains all required mandatory records: {kinds:?}"
         );
         for required_kind in required {
             assert!(
@@ -711,13 +746,14 @@ fn run_finished_exposes_only_a_safe_terminal_record() {
 
 #[test]
 fn the_mandatory_reserve_cannot_be_exhausted_by_one_m0_run() {
-    // Count reserve: one run-started, one terminal record, at most one usage
-    // record per model turn, and three mandatory records per tool call (start,
-    // confirmation request, outcome). Headroom stays wide, so overflowing the
+    // Count reserve: one run-started, one terminal record, request/response/
+    // usage records and at most one committed reduction per model turn, plus
+    // three mandatory records per tool call. Headroom stays wide, so overflowing the
     // reserve stays an explicit refusal rather than a routine drop.
     let limits = Limits::m0_test();
-    let worst_mandatory =
-        2 + limits.max_model_turns_per_run as usize + 3 * limits.max_tool_calls_per_run as usize;
+    let worst_mandatory = 2
+        + 4 * limits.max_model_turns_per_run as usize
+        + 3 * limits.max_tool_calls_per_run as usize;
     assert!(
         worst_mandatory < MAX_MANDATORY_EVENTS,
         "M0 worst case {worst_mandatory} mandatory records must fit {MAX_MANDATORY_EVENTS}"

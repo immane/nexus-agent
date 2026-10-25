@@ -31,6 +31,24 @@ Logical responsibilities do not imply five crates, five traits, or a new
 framework. Do not add a planner, reviewer, sub-agent orchestration, graph/vector
 database, Semantic IR implementation, or LoRA training in this work.
 
+### Near-term delivery boundary
+
+Deliver three small capabilities before expanding the architecture:
+
+- **Trustworthy observation:** correlate requests and usage, report committed
+  reductions and missing observations honestly, and retain caller-side JSONL.
+- **Simple source/view separation:** preserve accepted original records through
+  the existing session-storage boundary while keeping a replaceable active view.
+- **One request-preparation path:** reuse existing budget, summary, truncation,
+  and preview functions; validate a candidate before replacing active state.
+
+Do not make the complete evidence model or all eight benchmark metrics a gate
+for these capabilities. General artifact identities/provenance, paginated
+retrieval, independent view checkpoints, multi-revision concurrency control,
+automatic redundant-work analysis, and intermediate patch evaluation are
+deferred until a demonstrated workload needs them. Preserve correctness
+invariants now without implementing their most general possible representation.
+
 ## 2. Current Implementation and Gaps
 
 Baseline inspected: context fixes through `40155e9`. Later implementation must
@@ -78,6 +96,14 @@ interactions, tool intents/results, and run termination facts under stable
 record IDs. Associate records with session/run/call identities and ordered
 revisions. Record uncertainty explicitly; a failed run can still have effects.
 
+Initially, session-scoped sequence positions plus existing run/call identities
+can identify source records; a new global identity or revision subsystem is not
+required. A sequential file-backed history and a bounded active context are
+sufficient. Random-access indexes, paging, lazy materialization, and independent
+active-view checkpoints are later optimizations, not prerequisites. Until then,
+use explicit supported history/materialization limits rather than promising
+unbounded history loading.
+
 Store the bounded result actually supplied by a tool, including its truncation
 flag. This does not imply capturing unlimited raw stdout or recovering bytes
 already omitted during tool collection. Reject or explicitly reference content
@@ -95,8 +121,12 @@ leave required recovery evidence pointing to silently missing content.
 ### Context Manager and Builder
 
 The runtime owns active source references, protected records, recent exchanges,
-derived artifacts with provenance, preview choices, and any pending candidate.
+derived summaries, preview choices, and any pending candidate.
 An active view may omit source records without destroying them.
+
+Start with concrete fields and functions, not a general artifact container or
+strategy interface. A summary needs its text and covered source boundary;
+arbitrary provenance graphs and composable derived representations are deferred.
 
 Keep the builder as functions inside this responsibility initially. It combines
 protected instructions, original task and subsequent corrections, marked
@@ -139,14 +169,15 @@ a general pass registry or strategy service until a concrete replacement needs i
 
 ## 4. Record and Derived-View Invariants
 
-Maintain a minimal distinction between:
+Maintain these logical distinctions; the table is not a requirement to create
+four generic record types in the initial implementation:
 
 | Information | Meaning |
 | --- | --- |
 | Original record | What the host accepted or observed, with stable identity |
-| Derived artifact | Summary/interpretation with identity, source IDs/ranges, source revision, and derivation metadata |
+| Derived artifact | Initially summary text plus its covered source boundary; independent identity, source revisions, and richer derivation metadata are deferred |
 | Active view | Ordered source references and derived replacements used to construct a request |
-| Candidate | Uncommitted replacement based on a particular source/view revision |
+| Candidate | Uncommitted replacement built from the current source/view state |
 
 A text summary is the first derived representation, not the permanent data
 model of all memory. Future structured artifacts can render to the same model
@@ -177,11 +208,17 @@ accept user input -> record source -> prepare complete request -> budget check
 Compaction flow:
 
 ```text
-snapshot source/view revision -> select replaceable ranges
+capture current source/view state -> select replaceable ranges
   -> deterministic candidate or tool-free summary call
   -> build full candidate request -> validate invariants and budgets
-  -> recheck revision/cancellation/deadline -> commit active view atomically
+  -> recheck state ownership/cancellation/deadline -> replace active view atomically
 ```
+
+Here, transactional means that an invalid or abandoned candidate cannot partially
+replace active state. It does not require a database transaction, MVCC, or
+multiple checkpoint generations. Preserve the current single-active-run
+ownership model; add an explicit revision check only where state can actually
+change while a candidate is being prepared.
 
 The summary input and output require their own budgets; summarization cannot
 require dispatching an already oversized request. Summary calls consume model
@@ -214,9 +251,11 @@ local session saves outside the project and explicit restoration. This design
 does not replace that requirement with default ephemeral history.
 
 Reuse the [session store boundary](../contracts/04-session-store.md); prefer a
-small file-backed implementation, not a separate context database. Keep source
-history and active-view checkpoints distinct logically even if stored together.
-Bound resident materialization and load archived ranges on demand.
+small file-backed implementation, not a separate context database. Session/runtime
+owns durability, tool-intent recording, and restoration; Context Management
+must not introduce a second journal or tool-recovery protocol. Keep source
+history distinct from the active view, but defer independent view checkpoints
+and on-demand range loading until simple bounded loading is insufficient.
 
 An explicitly selected ephemeral mode or staged test implementation may use an
 in-memory archive with a declared quota. It must disclose no crash recovery,
@@ -291,11 +330,22 @@ and runner limits, tool/image revisions, evaluator revision, platform, and
 whether the task is exposed/debug or unexposed evaluation. Unknown facts remain
 unknown. Separate agent workload and evaluator configuration and timing.
 
+This is the eventual reproducibility envelope, not a requirement to automate
+every field before useful comparisons. Initially pin the task/base, model,
+runtime window and policy, execution limits, and candidate/baseline identity;
+declare unavailable provenance explicitly rather than building a general
+experiment-management platform.
+
 Events carry schema version, run identity, sequence, monotonic elapsed time,
 model invocation ID/purpose (`task` or `summary`), tool call IDs, compaction ID,
 and relevant source/view revision. Record budget decisions, estimates, final
 usage, summary attempts/results, committed reductions, output previews,
 tool outcomes, patch snapshots, and termination classification.
+
+For initial delivery, use existing run/turn/call identities and observation
+sequence numbers. Separate compaction IDs, source/view revisions, detailed
+decision traces, and patch-snapshot events are only needed when their consumers
+are implemented; the paragraph above describes eventual coverage.
 
 Expose missing runtime facts through bounded structured events and let the
 caller write them; do not add routine runtime stderr logging. Associate usage
@@ -333,6 +383,18 @@ and paired baseline/candidate differences, not only aggregate means. Count
 compression oscillation and repeated investigation as diagnostics. A run that
 fails earlier can use fewer tokens; compare resource use alongside success and
 termination, including resource use per resolved case where meaningful.
+
+### Initial measurement subset
+
+The eight definitions above remain the long-term evaluation vocabulary, not an
+implementation checklist that blocks source/view separation. Initially compare
+final evaluator outcome, normal completion, reported token cost, peak input,
+and observed committed reductions, with explicit coverage. Inspect recovery
+manually on a small sample and label accepted-response observations as such.
+Automatic progress attribution, environment-aware redundant-call analysis,
+intermediate patch snapshots/evaluation, and cross-run statistical reporting are
+deferred. Unknown advanced metrics must remain unknown, not estimated from tool
+counts or patch existence.
 
 ## 10. Shrinking-Window Validation: 92K -> 64K -> 32K
 
@@ -382,8 +444,9 @@ Only expand after the short lane passes, under an explicitly chosen run budget.
 Use unexposed tasks for later generalization checks; do not report exposed replay
 results as blind benchmark scores.
 
-Compare all eight metrics at every tier, including compaction recovery, cost of
-summaries, repeated work, and normal completion. Watch for repeated compression
+Initially compare the measurement subset at the tiers under investigation;
+complete all-eight-metric matrices are a later evaluation capability, not a
+routine development gate. Watch for repeated compression
 with no progress and smaller windows increasing total tokens through rework.
 Use repeated trials when making model-quality claims, show paired task outcomes,
 and disclose small-sample uncertainty rather than inventing significance.
@@ -396,32 +459,89 @@ choose thresholds to label a regression successful.
 
 ## 11. Development Workflow and Delivery Phases
 
-Every meaningful context change follows: deterministic regressions, bounded
-synthetic probes, paired fixed-task runs when warranted, independent evaluation,
-and a recorded baseline/candidate conclusion. Routine documentation changes do
-not trigger live benchmarks. Follow [testing guidance](../testing.md) and never
-run concurrent Cargo commands against the same target directory.
+Use risk-proportional validation. Ordinary fixes require affected deterministic
+regressions; changes to selection, compression policy, or request preparation
+also warrant bounded synthetic probes. Use paired fixed-task live runs and
+independent final-patch evaluation when assessing repair quality or cost. Do not
+require all eight metrics, all three windows, or live SWE runs for every change.
+Routine documentation changes do not trigger application tests or live
+benchmarks. Follow [testing guidance](../testing.md) and never run concurrent
+Cargo commands against the same target directory.
 
-**Phase A — Measurement foundation.** Add versioned caller-side JSONL collection,
-offline metric derivation, fixture tests, run provenance, and explicit missing-data
-handling. Preserve existing prediction/evaluator separation. This makes later
-architecture changes measurable without waiting for advanced metrics.
+**Phase A — Measurement foundation (partially implemented).** Runtime events now
+expose model request start/protocol-validation metadata and a typed method for
+committed context reductions. The SWE caller writes per-run manifest/event JSONL
+and derives offline metrics; event capture omits assistant text, tool bodies,
+progress previews, and approval argument previews. Unit fixtures cover
+sanitization, usage accounting, sequence gaps, completion, reductions, and
+recovery association. Preserve existing prediction/evaluator separation.
 
-**Phase B — Source/view separation.** Establish stable source IDs, bounded reads,
-archive capacity semantics, and active-view checkpoints. Integrate with accepted
-session persistence, or clearly label temporary ephemeral validation. Source
-preservation and failure behavior are gates before claiming the new architecture.
+Finish this phase as a minimal trustworthy observer, not a complete evaluation
+platform. Protocol validation and summary adoption are separate observations;
+Final usage is reconciled by request turn, with later counters replacing earlier
+ones. Telemetry-write failures disable further writes without interrupting the
+run, while SSE interruption (including an incomplete HTTP read) produces
+incomplete artifacts and never treats an in-progress workspace patch as a final
+result. Runner terminal observations and collection errors are persisted in
+`result.json` and used by both online and offline metric derivation. Offline
+replay tolerates an incomplete final JSONL record only when a telemetry error
+was recorded. Committed reductions use the
+bounded control channel; control-capacity exhaustion is a resource-limit failure
+and makes reduction coverage incomplete. Avoid expanding frontend presentation
+or public event fields solely to complete speculative metrics.
+
+The initial implementation is deliberately incomplete: it counts committed
+reduction events rather than every attempted decision; an event's projected
+tool-output value is an occurrence count over requests, not unique source calls;
+recovery means a subsequent provider batch passed protocol validation, not that
+a summary was adopted or task progress was made. First-valid-patch evaluation, repeated-call review, automated sweeps
+of the synthetic stress lane, a caller-driven live-provider pressure harness, and
+cross-run comparison reports remain future Phase A work. A deterministic runtime
+regression now checks oversized parallel results at the exact 94,208, 65,536,
+and 32,768 token budget tiers; it does not establish provider-reported occupancy
+or task success. The initial observer makes later architecture changes
+measurable; it does not yet implement all eight metrics or the complete
+evaluation system.
+
+Run the offline analyzer on one completed benchmark artifact set with:
+
+```sh
+python3 tools/benchmarks/context_metrics.py \
+  --events /path/to/run/events.jsonl \
+  --manifest /path/to/run/manifest.json \
+  --result /path/to/run/result.json \
+  --output /path/to/run/metrics.json
+```
+
+An optional `--evaluation` takes the normalized result from
+`run_nexus_swe_task.py summarize`; it never calls the evaluator or model.
+
+**Phase B — Simple source/view separation.** Preserve original accepted history
+using existing identities and ordered source positions, a replaceable active
+view, and explicit capacity limits. Integrate with accepted session persistence,
+or clearly label temporary ephemeral validation. Do not require a generic
+History Store API, indexed range retrieval, independent view checkpoints, or
+general derived artifacts. Source preservation and failure behavior are gates
+before claiming the new architecture.
 
 **Phase C — Unified transactional preparation.** Reuse the existing budget,
 summary, truncation, and preview code behind one lifecycle; validate complete
-requests and revision-safe commits. Keep tool execution and policy untouched.
+requests and atomically replace active state under existing ownership. Add
+revision machinery only for demonstrated interleaving. Keep tool execution and
+policy untouched.
 
-**Phase D — Recovery and comparison.** Add source inspection, structured decision
-coverage, paired reports, and optional candidate snapshot evaluation. Exercise
-storage failures and incomplete runs without replaying effects.
+**Deferred extensions — Evidence and advanced evaluation.** After the small
+source/view and preparation path demonstrates a concrete limitation, consider
+richer source inspection, artifact provenance, paging/checkpoint optimization,
+progress attribution, redundant-call review, and optional patch snapshot
+evaluation. These are independent extensions, not prerequisites for window
+validation. Storage-failure and interruption safety remain required whenever
+the relevant persistence or lifecycle behavior is implemented.
 
-**Phase E — Window progression.** Run the fixed synthetic and SWE matrices at
-92K, 64K, then 32K. Classify regressions and change one major variable at a time.
+**Window progression — Incremental validation.** Run fixed synthetic probes and
+small paired SWE samples at 92K, 64K, then 32K as warranted; this can proceed
+without the deferred extensions. Classify regressions and change one major
+variable at a time.
 Implement future representations only after evidence shows a limitation that
 conventional mechanisms cannot adequately address.
 
@@ -442,9 +562,10 @@ do not prove long-task correctness. Raw artifacts were local, not repository
 test fixtures, and availability must be checked before reproducing a claim.
 
 Implementation review still must settle file format/durability, quotas and
-retention, safe source-read exposure, event schemas, duplicate-call state
-fingerprinting, snapshot frequency, recovery observation horizons, trial counts,
-and numeric comparison tolerances. Resolve these at their actual boundaries;
+retention, minimal source access, event semantics, and numeric comparison
+tolerances when needed. Duplicate-call state fingerprinting, snapshot frequency,
+advanced recovery horizons, and broader trial/reporting automation are deferred
+choices, not current delivery blockers. Resolve these at their actual boundaries;
 do not introduce a generic database, plugin system, or semantic-memory framework
 merely to leave room for later work.
 

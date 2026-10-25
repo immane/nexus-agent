@@ -223,11 +223,11 @@ fn data_drops_consume_no_sequence_numbers() {
         );
         assert_eq!(dropped, 176, "the exact drop count for this flood");
 
-        // The control path stays uncrowded: `RunStarted`, two provisional
-        // usage records, the merged final usage record, and the terminal.
+        // The control path stays uncrowded: `RunStarted`, request/response
+        // metadata, two provisional usage records, final usage, and terminal.
         assert_eq!(
             control.len(),
-            5,
+            7,
             "the light control load is delivered whole: {control:?}"
         );
 
@@ -235,7 +235,10 @@ fn data_drops_consume_no_sequence_numbers() {
         // terminal sequence is the delivered count minus one. Had a dropped
         // fragment consumed a number, the terminal would exceed this.
         let terminal = control.last().expect("control events");
-        assert!(terminal.is_terminal(), "the terminal closes the control stream");
+        assert!(
+            terminal.is_terminal(),
+            "the terminal closes the control stream"
+        );
         let delivered = data.len() + control.len();
         assert_eq!(
             terminal.seq() as usize,
@@ -244,12 +247,12 @@ fn data_drops_consume_no_sequence_numbers() {
         );
         assert_eq!(
             terminal.seq() as usize,
-            DATA_CAPACITY + 4,
+            DATA_CAPACITY + 6,
             "{dropped} dropped fragments consumed zero sequence numbers"
         );
 
         // Presentation occupies one contiguous sequence block directly after
-        // `RunStarted` and the first usage record.
+        // `RunStarted`, model request metadata, and the first usage record.
         let max_data_seq = data
             .iter()
             .map(nexus_core::RunEvent::seq)
@@ -257,7 +260,7 @@ fn data_drops_consume_no_sequence_numbers() {
             .expect("presentation events");
         assert_eq!(
             max_data_seq as usize,
-            DATA_CAPACITY + 1,
+            DATA_CAPACITY + 3,
             "delivered fragments form one contiguous block"
         );
 
@@ -270,7 +273,7 @@ fn data_drops_consume_no_sequence_numbers() {
         assert_eq!(
             after.len(),
             3,
-            "the second usage record, the merged final usage record, and the terminal follow the drop window"
+            "the second usage record, final usage, and terminal follow the data-drop window"
         );
         assert_eq!(
             after[0].seq(),
@@ -341,8 +344,8 @@ fn provisional_usage_burst_is_bounded_and_terminal_survives_resume() {
 
         assert_eq!(
             control.len(),
-            19,
-            "RunStarted, 16 bounded usage updates, final usage, and terminal"
+            21,
+            "RunStarted, request/response metadata, 16 usage updates, and terminal"
         );
         assert_eq!(
             common::count_payload(&data, &control, |payload| matches!(
@@ -492,11 +495,11 @@ fn terminal_survives_data_saturation_while_usage_stays_bounded() {
             "only presentation traffic was delivered"
         );
 
-        // Control: RunStarted, at most 16 provisional usage updates, final
-        // usage, the tool outcome pair, and the terminal.
+        // Control: RunStarted, request/response metadata, at most 16 provisional
+        // usage updates, final usage, the tool outcome pair, and the terminal.
         assert_eq!(
             control.len(),
-            21,
+            25,
             "usage updates are bounded while tool outcomes and terminal survive"
         );
         let provisional_records: Vec<u64> = control
@@ -578,8 +581,8 @@ fn terminal_survives_data_saturation_while_usage_stays_bounded() {
             .collect();
         assert_eq!(
             after_drop.len(),
-            4,
-            "final usage, tool outcome pair, and terminal follow the data-drop window"
+            6,
+            "request metadata, final usage, tool outcome pair, and terminal follow the data-drop window"
         );
         assert_eq!(
             after_drop[0].seq(),

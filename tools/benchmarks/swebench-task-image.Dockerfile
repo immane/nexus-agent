@@ -17,6 +17,8 @@ RUN cargo build --release --locked \
     --bin container-worker --bin container-keeper
 
 FROM ${TASK_IMAGE}
+RUN rm -rf /testbed
+WORKDIR /workspace
 COPY --from=build /src/target/release/container-worker /usr/local/bin/container-worker
 COPY --from=build /src/target/release/container-keeper /usr/local/bin/nexus-keeper
 ENV PATH="/opt/miniconda3/envs/testbed/bin:${PATH}" \

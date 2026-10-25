@@ -1182,6 +1182,8 @@ impl AppState {
                     "context reduced: replaced or omitted {removed_items} earlier items; re-check earlier facts before relying on them"
                 ));
             }
+            EventPayload::ModelRequestStarted { .. } => {}
+            EventPayload::ModelRequestFinished { .. } => {}
             EventPayload::ToolCallPreview { item_key } => {
                 self.push_tool_with_fold(
                     format!("preview {item_key}"),
@@ -3110,6 +3112,7 @@ mod tests {
             run,
             1,
             EventPayload::ContextReduced {
+                method: nexus_core::ContextReductionMethod::Truncate,
                 removed_items: 4,
                 retained_items: 3,
                 item_limit: 256,

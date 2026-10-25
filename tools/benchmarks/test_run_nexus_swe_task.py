@@ -8,6 +8,7 @@ import unittest
 
 from run_nexus_swe_task import (
     build_task_prompt,
+    context_usage_report,
     reached_budget,
     summarize_result,
     validate_container_git_checkout,
@@ -81,6 +82,31 @@ class BudgetTests(unittest.TestCase):
             reached_budget(1, args, 150, {"input": 0, "output": 0}, True, 1),
             "tool-call budget reached",
         )
+
+    def test_token_budget_uses_known_reported_counters_as_soft_limit(self):
+        args = Namespace(
+            max_run_seconds=None,
+            max_tool_calls=None,
+            max_input_tokens=100,
+            max_output_tokens=50,
+        )
+        self.assertIsNone(reached_budget(1, args, 0, {"input": 90, "output": 1}, False, 0))
+        self.assertEqual(
+            reached_budget(1, args, 0, {"input": 100, "output": 1}, False, 0),
+            "input-token budget reached",
+        )
+
+
+class ContextUsageLogTests(unittest.TestCase):
+    def test_reports_provider_usage_against_known_window(self):
+        report = context_usage_report(61_236, 94_208, 65)
+        self.assertIn("provider_input_tokens=61236", report)
+        self.assertIn("context_percent=65.0", report)
+        self.assertIn("provider_input_at_or_above_65pct=True", report)
+
+    def test_unknown_usage_or_window_stays_unknown(self):
+        self.assertIn("context_percent=unknown", context_usage_report(None, 94_208, 65))
+        self.assertIn("context_window_tokens=unknown", context_usage_report(100, None, 65))
 
 
 class ContainerGitCheckoutTests(unittest.TestCase):
