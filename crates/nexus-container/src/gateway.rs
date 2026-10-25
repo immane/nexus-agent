@@ -381,6 +381,7 @@ fn parse_darwin_networks(ifconfig: &str, routes: &str) -> Result<Vec<String>, Co
     Ok(set.into_iter().collect())
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn is_darwin_mac_address(value: &str) -> bool {
     let octets: Vec<_> = value.split(':').collect();
     octets.len() == 6
@@ -389,6 +390,7 @@ fn is_darwin_mac_address(value: &str) -> bool {
         })
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn expand_darwin_ipv4(value: &str) -> Result<String, ContainerError> {
     let octets: Vec<_> = value.split('.').collect();
     if octets.is_empty() || octets.len() > 4 {
@@ -415,6 +417,7 @@ fn expand_darwin_ipv4(value: &str) -> Result<String, ContainerError> {
         .join("."))
 }
 
+#[cfg(any(test, target_os = "macos"))]
 fn parse_darwin_route_destination(value: &str) -> Result<(String, u8), ContainerError> {
     let parts: Vec<_> = value.split('.').collect();
     if parts.is_empty() || parts.len() > 4 {

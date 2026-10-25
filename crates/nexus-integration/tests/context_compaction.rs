@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use nexus_config::{CredentialRef, ProtocolKind};
 use nexus_core::{
-    CommandReply, ContextManagementSettings, ContextWindow, ContextWindowSource, EventPayload,
-    Limits, RequestId, RunOutcome, SessionId, SubmitCommand,
+    CommandReply, ContextCompactionStrategy, ContextManagementPolicy, ContextManagementSettings,
+    ContextWindow, ContextWindowSource, EventPayload, Limits, RequestId, RunOutcome, SessionId,
+    SubmitCommand,
 };
 use nexus_openai::OpenAiProvider;
 use nexus_runtime::{Policy, Runtime, RuntimeConfig};
@@ -109,7 +110,11 @@ fn summarized_history_continues_through_every_protocol() {
         )
         .unwrap()
         .with_context_management(ContextManagementSettings {
-            window: Some(ContextWindow::new(8_192, ContextWindowSource::Configured).unwrap()),
+            // Trigger after three history-building answers while leaving enough
+            // headroom for one summary request in every protocol encoding.
+            window: Some(ContextWindow::new(12_288, ContextWindowSource::Configured).unwrap()),
+            policy: ContextManagementPolicy::new(55, 10, ContextCompactionStrategy::Summarize)
+                .unwrap(),
             ..Default::default()
         });
         let executor = tokio::runtime::Builder::new_current_thread()

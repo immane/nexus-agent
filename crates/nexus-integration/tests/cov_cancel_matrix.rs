@@ -656,9 +656,14 @@ fn duplicate_cancel_is_accepted_repeatedly_but_dispatches_once() {
 fn cancel_after_terminal_is_already_finalized_and_unknown_run_is_stale() {
     let rt = common::test_rt();
     rt.block_on(async {
-        let mut bed = common::make_bed(
-            vec![stop_turn("first"), stop_turn("second")],
+        let mut bed = common::make_bed_with_tools(
+            vec![
+                stop_turn("first"),
+                tool_turn(vec![common::candidate("host_read", r#"{"path":"src"}"#)]),
+            ],
             common::quick_config(),
+            FakeTool::gated("host_read"),
+            FakeTool::mutation(),
         );
         let response = bed.runtime.submit(common::submit_cmd("finalized")).await;
         assert_eq!(response.reply(), CommandReply::Accepted);
@@ -718,6 +723,9 @@ fn cancel_after_terminal_is_already_finalized_and_unknown_run_is_stale() {
         let next_run = next.run().cloned().expect("second run issued");
         assert_ne!(next_run, run, "run identities never alias");
 
+        let gate = bed.read_tool.gate().expect("gated tool exposes its gate");
+        wait_until("second run enters tool execution", || gate.is_entered()).await;
+
         // The retired run stays known while the new run is live: the runtime
         // retains the last finalized run, so the answer is still finalized
         // rather than stale.
@@ -735,6 +743,7 @@ fn cancel_after_terminal_is_already_finalized_and_unknown_run_is_stale() {
             CommandReply::Accepted,
             "the live run is still cancellable while the retired one is finalized"
         );
+        gate.release();
         let (_, _, next_finished) =
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         assert_eq!(
