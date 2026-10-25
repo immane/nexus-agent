@@ -5,12 +5,18 @@ These are small, selected experiments, not a leaderboard score. The original
 runner/server logs and generated evaluator output remain local under ignored
 paths; this directory contains deliberately reviewed evidence only.
 
-| Run | Agent outcome | Official result | FAIL_TO_PASS | PASS_TO_PASS |
-| --- | --- | --- | --- | --- |
-| [SymPy unbounded](nexus-qwen-sympy-20590-unbounded-20261024/report.json) | Limit reached | Resolved | 1 passed | 21 passed |
-| [Astropy](nexus-qwen-astropy-context-observation-20261024-retry/report.json) | Limit reached: model output limit | Resolved | 2 passed | 13 passed |
-| [Django](nexus-qwen-django-context-observation-20261024/report.json) | Completed | Resolved | 3 passed | 19 passed |
-| [SymPy summary-fix v2](nexus-qwen-sympy-20590-context-summaryfix-v2-20261025/report.json) | Completed | Resolved | 1 passed | 21 passed |
+**Model configuration for the results below:** Qwen3.8-27B with **IQ3_M
+quantization** and a configured **92K context window (94,208 tokens, input plus
+output)**, served through Ollama. The Nexus selection `ollama-local/qwen3-27b`
+maps to `qwen3.8-27b-iq3m-92k:latest`. These are not BF16 or 128K-context results;
+account for these differences when comparing other evaluations.
+
+| Run | Test date (UTC) | Agent wall time | Agent outcome | Official result | FAIL_TO_PASS | PASS_TO_PASS |
+| --- | --- | ---: | --- | --- | --- | --- |
+| [SymPy unbounded](nexus-qwen-sympy-20590-unbounded-20261024/report.json) | 2026-10-24 | Not recorded | Limit reached | Resolved | 1 passed | 21 passed |
+| [Astropy](nexus-qwen-astropy-context-observation-20261024-retry/report.json) | 2026-10-24 | 13m 39s | Limit reached: model output limit | Resolved | 2 passed | 13 passed |
+| [Django](nexus-qwen-django-context-observation-20261024/report.json) | 2026-10-24 | 34m 02s | Completed | Resolved | 3 passed | 19 passed |
+| [SymPy summary-fix v2](nexus-qwen-sympy-20590-context-summaryfix-v2-20261025/report.json) | 2026-10-25 | 14m 11s | Completed | Resolved | 1 passed | 21 passed |
 
 The unbounded SymPy row is the earlier exposed-task pilot. The summary-fix v2
 row is another exposed-task replay, not blind benchmark evidence. Its official
@@ -71,6 +77,21 @@ with an empty patch, which the official evaluator classified as empty-patch
 (not an infrastructure failure). The issue was exposed to the model, so this
 task is not a blind sample. Its attempt-2 report and finalized manifest are at
 `/Volumes/Nayuki/Development/Rust/nexus-benchmark-work/pilot-sphinx-9461-isolated-20261024/`.
+
+Subsequent exposed Sphinx replays on 2026-10-25 (not blind evaluation runs):
+
+| Run | Agent wall time | Outcome |
+| --- | ---: | --- |
+| `run-sphinx-...T075030Z` | 20m 17s | Output limit; no patch |
+| `run-sphinx-...T082835Z` | 1m 58s | Summary failed; no patch |
+| `run-sphinx-...T083345Z` | 5m 43s | Summary unavailable; no patch |
+| `run-sphinx-...T085510Z` | 60m 30s | Interrupted; no patch |
+| `run-sphinx-...T150703Z` | 1h 04m 50s | Summary request hit output limit; no patch |
+
+Durations are agent-run wall time, not evaluator time; these exposed replays
+were not official resolved evaluations. The final replay successfully completed
+multiple bounded summary chunks, then stopped when a later summary response hit
+the configured 4,096-token summary output cap.
 
 See [benchmark methodology and run history](../agent-benchmarks.md) and the
 [reliability follow-up](../../tasks/09-agent-reliability.md).

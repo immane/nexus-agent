@@ -345,11 +345,17 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 Local SWE-bench Lite pilots with `ollama-local/qwen3-27b` produced patches
 marked **resolved** by the official SWE-bench evaluator (2026-10-24–25):
 
-| Task | Repair | Official evaluation | Agent termination |
-| --- | --- | --- | --- |
-| `sympy__sympy-20590` (summary-fix v2, latest) | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
-| `astropy__astropy-12907` | Preserve separability matrices in nested compound models. | Resolved | Model output limit reached |
-| `django__django-11099` | Reject trailing newlines in username validators. | Resolved | Completed |
+**Model configuration:** Qwen3.8-27B, **IQ3_M quantization**, with a configured
+**92K context window (94,208 tokens, input plus output)**, served through Ollama
+as `qwen3.8-27b-iq3m-92k:latest`. The selection ID above is an alias, not a
+different model. These results are not BF16 or 128K-context measurements;
+comparisons should account for quantization, context budget, and agent harness.
+
+| Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
+| --- | --- | ---: | --- | --- | --- |
+| `sympy__sympy-20590` (summary-fix v2, latest) | 2026-10-25 | 14m 11s | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
+| `astropy__astropy-12907` | 2026-10-24 | 13m 39s | Preserve separability matrices in nested compound models. | Resolved | Model output limit reached |
+| `django__django-11099` | 2026-10-24 | 34m 02s | Reject trailing newlines in username validators. | Resolved | Completed |
 
 These are three selected tasks, **not a leaderboard score or a general success
 rate**; SymPy was attempted repeatedly. The table reports the latest evaluated
@@ -358,6 +364,9 @@ run for each task, not every attempt; an earlier SymPy attempt ended with
 polished delivery: the Astropy prediction included temporary scripts. None of
 these runs triggered context reduction, so they do not establish a benefit from
 the context-retention changes or validate the semantic-memory vision.
+
+Agent wall time is the runner's recorded task duration, excluding the separate
+official evaluator run. Dates are the pilot run dates (UTC).
 
 See [benchmark methodology and earlier run records](docs/research/agent-benchmarks.md)
 and the [reliability follow-up backlog](docs/tasks/09-agent-reliability.md) for

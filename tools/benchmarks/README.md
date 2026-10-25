@@ -28,6 +28,12 @@ exposure and **must not be reported as blind evaluation samples**.
 
 ## Environment and defaults
 
+**Local pilot comparison baseline:** Qwen3.8-27B, **IQ3_M quantization**, and a
+configured **92K context window (94,208 tokens, input plus output)** through
+Ollama (`qwen3.8-27b-iq3m-92k:latest`), not BF16 or 128K context. This describes
+the local pilot setup, not a launcher requirement or a guarantee for overridden
+models; use each run's recorded configuration when comparing results.
+
 `local_profiles.json` records the reusable local selection, not secrets or
 absolute machine paths. Change profiles or pass CLI overrides for another host.
 The launcher reads dataset metadata from the sibling `../nexus-benchmark-work`
