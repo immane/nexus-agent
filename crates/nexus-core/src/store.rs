@@ -14,6 +14,7 @@ use crate::error::{AgentError, ErrorCategory, RetryGuidance};
 use crate::ids::{CallId, M0_REVISION, RunId, SessionId, ToolId};
 use crate::limits::Limits;
 use crate::outcomes::{EffectState, Evidence, ExecutionStatus};
+use crate::provider::ModelContextItem;
 
 /// Stored-format revision for M0. Exact equality; any mismatch is an
 /// explicit failure with no migration or guessing.
@@ -183,6 +184,60 @@ pub struct ToolOutcomeRecord {
     pub truncated: bool,
 }
 
+/// One accepted original model-context item in session order. The record is
+/// archival data only; loading it never dispatches a tool or grants access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRecord {
+    session: SessionId,
+    sequence: u64,
+    run: RunId,
+    item: ModelContextItem,
+}
+
+impl SourceRecord {
+    /// Creates a source record with a positive, session-scoped sequence number.
+    pub fn new(
+        session: SessionId,
+        sequence: u64,
+        run: RunId,
+        item: ModelContextItem,
+    ) -> Result<Self, AgentError> {
+        if sequence == 0 {
+            return Err(store_error("source record sequence must be positive"));
+        }
+        Ok(Self {
+            session,
+            sequence,
+            run,
+            item,
+        })
+    }
+
+    /// Returns the owning session.
+    #[must_use]
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// Returns the sequence position within the session.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the owning run.
+    #[must_use]
+    pub fn run(&self) -> &RunId {
+        &self.run
+    }
+
+    /// Returns the accepted original model-context item.
+    #[must_use]
+    pub fn item(&self) -> &ModelContextItem {
+        &self.item
+    }
+}
+
 /// Bounded session-metadata lookup result. Listing never loads full
 /// conversation contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +267,22 @@ pub trait SessionStore {
 
     /// Records the actual outcome without rewriting the intent.
     fn record_outcome(&mut self, outcome: &ToolOutcomeRecord) -> Result<(), AgentError>;
+
+    /// Appends one accepted original item. Stores that do not support source
+    /// history fail explicitly rather than pretending the item was archived.
+    fn append_source_record(&mut self, _record: &SourceRecord) -> Result<(), AgentError> {
+        Err(store_error("source history is unsupported by this store"))
+    }
+
+    /// Loads at most `limit` source records after the exclusive sequence cursor.
+    fn load_source_records(
+        &self,
+        _session: &SessionId,
+        _after_sequence: u64,
+        _limit: usize,
+    ) -> Result<Vec<SourceRecord>, AgentError> {
+        Err(store_error("source history is unsupported by this store"))
+    }
 }
 
 fn store_error(message: &'static str) -> AgentError {

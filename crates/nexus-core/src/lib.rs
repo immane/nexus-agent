@@ -52,8 +52,8 @@ pub use provider::{
     ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, ProviderRef,
 };
 pub use store::{
-    STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, ToolIntentRecord,
-    ToolOutcomeRecord,
+    STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, SourceRecord,
+    ToolIntentRecord, ToolOutcomeRecord,
 };
 pub use tool::{ToolAccess, ToolContext, ToolPort, ToolRegistration, ToolSpec};
 

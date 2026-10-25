@@ -304,6 +304,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-session-store"
+version = "0.2.2-alpha"
+dependencies = [
+ "nexus-core",
+ "nexus-validation",
+ "serde_json",
+]
+
+[[package]]
 name = "nexus-tools"
 version = "0.2.2-alpha"
 dependencies = [
