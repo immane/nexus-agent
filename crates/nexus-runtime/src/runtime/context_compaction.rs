@@ -371,6 +371,12 @@ pub(super) fn prepare_context_request(
     {
         return next_summary_request(shared, active, turn);
     }
+    if let Some(repeated) = nexus_context::repeated_action_run(&active.conversation) {
+        diagnostic(format_args!(
+            "nexus-runtime: candidate low-information action repetition repeated_actions={repeated} window_calls={} reason=identical_resolved_tool_revision_arguments_and_outcome; state_change_not_observed; no_automatic_recovery",
+            nexus_context::STAGNATION_WINDOW_CALLS,
+        ));
+    }
     let mut request = normal_request(shared, active, turn, &active.conversation)?;
     let Some(window) = active.context_management.window else {
         active.input_estimate = estimated_input_tokens(&request);
@@ -540,7 +546,22 @@ fn commit(
     if projected.conversation().len() > shared.context_items_bound {
         return Err(context_limit(active, shared.context_items_bound));
     }
+    let before = normal_request_with_memory(
+        shared,
+        active,
+        &turn,
+        &active.conversation,
+        active.derived_memory.as_deref(),
+    )?;
+    let before_estimated = estimate(active, &before);
     let estimated = estimate(active, &projected);
+    let window = active.context_management.window.map(|window| {
+        let window = u64::from(window.tokens());
+        (
+            window,
+            active.context_management.output_reserve_tokens(window),
+        )
+    });
     let reduction = ContextReduction {
         method: match method {
             "summarize" => nexus_core::ContextReductionMethod::Summarize,
@@ -568,6 +589,13 @@ fn commit(
     diagnostic(format_args!(
         "nexus-runtime: automatic context compaction method={method} estimated_input_tokens={estimated}; token occupancy is estimated, not exact"
     ));
+    if method == "summarize" {
+        let (window, reserve) = window.unwrap_or((0, 0));
+        diagnostic(format_args!(
+            "nexus-runtime: summary compaction outcome before_estimated_input_tokens={before_estimated} after_estimated_input_tokens={estimated} estimated_savings_tokens={} output_reserve_tokens={reserve} window_tokens={window} measurement=heuristic_not_provider_usage",
+            i128::from(before_estimated) - i128::from(estimated),
+        ));
+    }
     let run = active.run.clone();
     publish_context_reduction(shared, active, &run, reduction);
     Ok(())
@@ -953,6 +981,68 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload(), EventPayload::AssistantTextDelta(_)))
         );
+    }
+
+    #[test]
+    fn accepted_summary_above_soft_trigger_does_not_repeat_when_no_old_group_remains() {
+        let (mut shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        active.context_management.window =
+            Some(ContextWindow::new(8192, ContextWindowSource::Configured).expect("window"));
+        active.context_management.policy =
+            ContextManagementPolicy::new(20, 10, ContextCompactionStrategy::Summarize)
+                .expect("policy");
+        active.conversation[1] =
+            ModelContextItem::assistant_text("old-answer", "old source history ".repeat(500))
+                .expect("answer");
+        active.source_cursor = active.conversation.len();
+        let incarnation = shared.incarnation;
+        Arc::get_mut(&mut shared)
+            .expect("fixture has unique shared owner")
+            .session_store = Some(Arc::new(StdMutex::new(Box::new(
+            nexus_session::FileSessionStore::open(std::env::temp_dir().join(format!(
+                "nexus-runtime-context-compaction-{}-{}",
+                std::process::id(),
+                incarnation,
+            )))
+            .expect("persistent session store"),
+        ))));
+        assert!(shared.session_store.is_some(), "archived requires a store");
+        assert_eq!(active.source_cursor, active.conversation.len());
+        assert!(active.persistence_error.is_none());
+        assert!(!shared.store_uncertain.load(Ordering::SeqCst));
+
+        prepare(&shared, &mut active);
+        let run = active.run.clone();
+        let summary = "useful retained summary ".repeat(300);
+        while active.pending_compaction.is_some() {
+            ingest_summary(
+                &shared,
+                &mut active,
+                &run,
+                stop(&summary),
+                &mut StreamedPrefix::default(),
+            )
+            .unwrap_or_else(|terminal| panic!("summary failed: {:?}", terminal.error));
+            if active.pending_compaction.is_some() {
+                prepare(&shared, &mut active);
+            }
+        }
+
+        let after = normal_request(&shared, &active, &turn(), &active.conversation)
+            .unwrap_or_else(|_| panic!("post-summary request"));
+        let after_input = estimate(&active, &after);
+        assert!(
+            after_input >= 8192 * 20 / 100,
+            "fixture must remain above soft trigger"
+        );
+        assert!(after_input + reserve(8192) <= 8192);
+        assert_eq!(active.turns_used, 1);
+        assert!(active.pending_compaction.is_none());
+
+        let _task_request = prepare(&shared, &mut active);
+        assert_eq!(active.turns_used, 1, "no immediate second summary call");
+        assert!(active.pending_compaction.is_none());
     }
 
     #[test]

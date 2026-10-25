@@ -287,6 +287,30 @@ turn. This is a best-effort estimate, not provider tokenization; the original
 conversation remains unchanged. It avoids futile summarization but does not
 make an irreducible oversized recent item fit.
 
+The runtime also emits an advisory low-information repetition diagnostic for a
+run of at least three identical, completed tool actions (tool revision,
+normalized arguments, and observed outcome) among the latest eight actions.
+Only correctly ordered, single-call/result pairs are considered. User messages,
+denied, parallel, unpaired, malformed, unknown, or uncertain records break the
+candidate sequence. It records only counts and the comparison reason, not
+arguments or outputs. This is telemetry—not proof that the environment was
+unchanged, and it neither blocks calls nor triggers an automatic review.
+Repository/environment change detection and bounded review remain future work.
+
+Summary commits now report the estimated request occupancy immediately before
+and after commit, their signed estimated token savings, the configured
+generation reserve, and the window. These are runtime estimator heuristics, not
+provider-reported input usage. A valid candidate is accepted when it fits the
+complete input-plus-reserve budget; it need not reach the soft target or produce
+a minimum savings amount. For archived history under the Summarize strategy,
+remaining above the soft trigger alone does not immediately schedule another
+summary; exceeding the hard input-plus-reserve budget still enters reduction
+and protected-floor checks. Non-archived runs retain their existing
+certainty-based selection and may attempt reduction again on a later request.
+There is no savings-based retry guard: no evidence currently demonstrates an
+unbounded invalid-summary payment loop, and accepted summaries are not rejected
+solely for low estimated savings.
+
 The estimator uses `ceil(payload_bytes / 3)` plus message/tool framing. It starts
 with a 1.25 safety multiplier and now exposes the raw estimate, adjusted estimate
 and multiplier on each request-start event. Provider usage remains correlated to
