@@ -81,6 +81,15 @@ checks. A second empty response fails with `Protocol`, not a misleading resource
 limit. Other invalid summaries retain their existing fail-closed behavior; no
 partial rolling summary is committed and no unbudgeted original request is sent.
 
+Task requests and isolated summary requests now have separate run-local token
+calibration windows. Summary request sizing and request-start telemetry use the
+summary estimator; compaction triggers and projected task budgets use the task
+estimator. Only protocol-valid summary batches can update calibration, while
+usage accounting still records rejected calls. The conservative estimator floor,
+configured trigger, and output reserves are unchanged: estimates remain heuristics,
+not exact tokenizer measurements, and a high estimate/usage ratio alone is not
+evidence that safety margins should be lowered.
+
 ### Session recovery boundary at this baseline
 
 The runtime's `State.history` is an in-memory, bounded cache of completed

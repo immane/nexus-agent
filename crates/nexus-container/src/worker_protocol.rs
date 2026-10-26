@@ -119,8 +119,11 @@ pub(crate) fn valid_arguments(operation: &str, value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
     };
+    if operation == "host_read" {
+        return nexus_tools::fs::valid_read_arguments(value);
+    }
     let fields: &[(&str, bool)] = match operation {
-        "host_read" | "host_list" => &[("path", true)],
+        "host_list" => &[("path", true)],
         "host_search" => &[("path", true), ("query", true)],
         "host_write" => &[("path", true), ("content", true)],
         "host_patch" => &[("path", true), ("old_text", true), ("new_text", true)],

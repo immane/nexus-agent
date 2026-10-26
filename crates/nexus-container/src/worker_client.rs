@@ -329,6 +329,7 @@ mod tests {
         );
         for (op, args) in [
             ("host_read", json!({"path":"a"})),
+            ("host_read", json!({"path":"a","offset":8192,"limit":16384})),
             ("host_list", json!({"path":"a"})),
             ("host_search", json!({"path":"a","query":"q"})),
             ("host_write", json!({"path":"a","content":"x"})),
@@ -339,6 +340,29 @@ mod tests {
         ] {
             assert!(encode_request::<io::Error>(op, &args, 10).is_ok(), "{op}");
         }
+    }
+
+    #[test]
+    fn read_page_cursor_survives_the_client_transport() {
+        let content = "[more; next_offset=8196]\n界a";
+        let mut client = ContainerWorkerClient::new(Fake {
+            response: frame(&json!({"status":"Succeeded","effect":"KnownNotApplied","content":content,"truncated":true}).to_string()),
+            ..Fake::default()
+        });
+        let args = json!({"path":"a","offset":8192,"limit":4});
+        let outcome = client
+            .execute(
+                "host_read",
+                &args,
+                4096,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(outcome.content(), content);
+        assert!(outcome.is_truncated());
+        let request: Value = serde_json::from_slice(&client.transport.request).unwrap();
+        assert_eq!(request["arguments"], args);
+        assert_eq!(client.transport.calls, 1);
     }
 
     #[test]

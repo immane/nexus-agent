@@ -110,9 +110,9 @@ fn summary_request(
     ];
     let note = |tokens| render_context_note(active.context_management, "", tokens);
     let request = request_for(shared, active, turn, &items, note(0), memory, true)?;
-    let estimated = estimate(active, &request);
+    let estimated = active.summary_token_estimator.estimate(&request);
     let request = request_for(shared, active, turn, &items, note(estimated), memory, true)?;
-    let estimated = estimate(active, &request);
+    let estimated = active.summary_token_estimator.estimate(&request);
     let Some(window) = active.context_management.window else {
         return request
             .with_max_output_tokens(MAX_SUMMARY_OUTPUT_TOKENS as u32)
@@ -207,6 +207,10 @@ fn estimate(active: &ActiveRun, request: &ModelRequest) -> u64 {
 }
 
 pub(super) fn calibrate_estimate(active: &mut ActiveRun, events: &[ProviderEvent]) {
+    observe_estimate(&mut active.token_estimator, active.input_estimate, events);
+}
+
+fn observe_estimate(estimator: &mut TokenEstimator, raw_estimate: u64, events: &[ProviderEvent]) {
     // Usage is per invocation, not cumulative occupancy. Never lower the safety
     // margin based on one sparse response, or treat missing counters as zero.
     let actual = events.iter().rev().find_map(|event| match event {
@@ -216,9 +220,7 @@ pub(super) fn calibrate_estimate(active: &mut ActiveRun, events: &[ProviderEvent
         }
         _ => None,
     });
-    active
-        .token_estimator
-        .observe(active.input_estimate, actual);
+    estimator.observe(raw_estimate, actual);
 }
 
 fn request_for(
@@ -611,7 +613,6 @@ pub(super) fn ingest_summary(
     events: Vec<ProviderEvent>,
     prefix: &mut StreamedPrefix,
 ) -> Result<RunState, Terminal> {
-    calibrate_estimate(active, &events);
     record_summary_usage(shared, active, run, &events, prefix);
     if active.terminal.is_some() {
         return Ok(RunState::Finished);
@@ -629,6 +630,16 @@ pub(super) fn ingest_summary(
     let mut limits = shared.limits;
     limits.max_tool_output_bytes = shared.effective_output_budget;
     let valid = crate::protocol::validate_batch(&events, &limits).is_ok();
+    if valid {
+        // Summary requests omit task tools/instructions and serialize different
+        // material. Do not let their usage recalibrate task occupancy, or let
+        // a malformed provider batch influence either request budget.
+        observe_estimate(
+            &mut active.summary_token_estimator,
+            active.input_estimate,
+            &events,
+        );
+    }
     if let Some(ProviderEvent::Failed(error)) = events.last() {
         // These causes are not permission to launch another invocation.
         if error.category() == ErrorCategory::Cancelled {
@@ -1547,6 +1558,83 @@ mod tests {
             );
             assert_eq!(active.turns_used, 1);
         }
+    }
+
+    #[test]
+    fn malformed_summary_usage_is_accounted_but_cannot_recalibrate_budgets() {
+        let (shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        prepare(&shared, &mut active);
+        let original = active.conversation.clone();
+        let task_scale = active.token_estimator.scale_millis();
+        let summary_scale = active.summary_token_estimator.scale_millis();
+        let run = active.run.clone();
+        let terminal = ingest_summary(
+            &shared,
+            &mut active,
+            &run,
+            vec![ProviderEvent::Usage(Usage::new(
+                Some(500_000),
+                Some(20),
+                UsageFinality::Final,
+            ))],
+            &mut StreamedPrefix::default(),
+        )
+        .expect_err("unterminated batch cannot provide a summary");
+        assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+        assert_eq!(
+            active.last_usage.as_ref().and_then(Usage::input_tokens),
+            Some(500_000)
+        );
+        assert_eq!(active.token_estimator.scale_millis(), task_scale);
+        assert_eq!(active.summary_token_estimator.scale_millis(), summary_scale);
+        assert_eq!(active.conversation, original);
+    }
+
+    #[test]
+    fn summary_and_task_calibration_are_isolated_for_observation_and_requests() {
+        let (shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        roomy_summary_budget(&mut active);
+        prepare(&shared, &mut active);
+        let run = active.run.clone();
+        let initial_task_scale = active.token_estimator.scale_millis();
+        let raw = active.input_estimate;
+        ingest_summary(
+            &shared,
+            &mut active,
+            &run,
+            vec![ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::Stop,
+                Usage::new(Some(raw * 2), Some(219), UsageFinality::Final),
+                None,
+            ))],
+            &mut StreamedPrefix::default(),
+        )
+        .unwrap_or_else(|terminal| panic!("empty summary retry failed: {:?}", terminal.error));
+        assert!(active.summary_token_estimator.scale_millis() > initial_task_scale);
+        assert_eq!(active.token_estimator.scale_millis(), initial_task_scale);
+        let retry = prepare(&shared, &mut active);
+        assert_eq!(active.input_estimate, estimated_input_tokens(&retry));
+        assert!(active.summary_token_estimator.estimate(&retry) > estimate(&active, &retry));
+        assert!(
+            active.summary_token_estimator.estimate(&retry)
+                + u64::from(retry.max_output_tokens().unwrap())
+                <= 16_384
+        );
+
+        let summary_scale = active.summary_token_estimator.scale_millis();
+        active.input_estimate = 100;
+        calibrate_estimate(
+            &mut active,
+            &[ProviderEvent::Usage(Usage::new(
+                Some(300),
+                Some(10),
+                UsageFinality::Final,
+            ))],
+        );
+        assert!(active.token_estimator.scale_millis() > initial_task_scale);
+        assert_eq!(active.summary_token_estimator.scale_millis(), summary_scale);
     }
 
     #[test]
