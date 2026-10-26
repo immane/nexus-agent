@@ -16,9 +16,11 @@ use crate::session::ContainerSession;
 use crate::worker_transport::{DockerExecError, DockerExecTransport};
 
 const TOOL: &str = "host_exec";
-const REVISION: u32 = M0_REVISION + 1;
+const REVISION: u32 = M0_REVISION + 2;
 const LIMIT: usize = 65_536;
-const SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}},"required":["argv"],"additionalProperties":false}"#;
+const MAX_ARGUMENT_BYTES: usize = 32 * 1024;
+const SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"shell_command":{"type":"string","minLength":1,"maxLength":32757}},"minProperties":1,"maxProperties":1,"additionalProperties":false}"#;
+const DESCRIPTION: &str = "Run argv directly or shell_command via /bin/bash -c in the existing container at /workspace. Both use the same container boundary, deadline, cancellation, and output limit. No TTY; results may be uncertain if the Docker CLI is interrupted.";
 
 pub(crate) struct ContainerExecTool<T = DockerExecTransport> {
     session: Arc<ContainerSession<T>>,
@@ -60,9 +62,10 @@ impl<T: ExecTransport> ContainerExecTool<T> {
             session: Arc::new(ContainerSession::new(transport)),
             spec: ToolSpec::new(
                 ToolId::new(TOOL, REVISION).expect("static tool id"),
-                "Run one argv directly in the existing container at /workspace, without a shell unless explicitly requested in argv. No TTY; results may be uncertain if the Docker CLI is interrupted.",
+                DESCRIPTION,
                 SCHEMA,
-            ).expect("static tool spec"),
+            )
+            .expect("static tool spec"),
         }
     }
 
@@ -72,9 +75,10 @@ impl<T: ExecTransport> ContainerExecTool<T> {
             session,
             spec: ToolSpec::new(
                 ToolId::new(TOOL, REVISION).expect("static tool id"),
-                "Run one argv directly in the existing container at /workspace, without a shell unless explicitly requested in argv. No TTY; results may be uncertain if the Docker CLI is interrupted.",
+                DESCRIPTION,
                 SCHEMA,
-            ).expect("static tool spec"),
+            )
+            .expect("static tool spec"),
         }
     }
 
@@ -92,29 +96,39 @@ impl<T: ExecTransport> ContainerExecTool<T> {
         active(context)?;
         let value: serde_json::Value =
             serde_json::from_str(call.args().as_str()).map_err(|_| OutcomeFailure::Invalid)?;
-        if !value
-            .as_object()
-            .is_some_and(|o| o.len() == 1 && o.contains_key("argv"))
-        {
+        let object = value.as_object().ok_or(OutcomeFailure::Invalid)?;
+        if object.len() != 1 {
             return Err(OutcomeFailure::Invalid);
         }
-        let args = value
-            .get("argv")
-            .and_then(serde_json::Value::as_array)
-            .filter(|a| !a.is_empty() && a.len() <= 256)
-            .ok_or(OutcomeFailure::Invalid)?;
-        let mut argv = Vec::with_capacity(args.len());
-        let mut bytes = 0usize;
-        for arg in args {
-            let s = arg
+        let argv = if let Some(args) = object.get("argv") {
+            let args = args
+                .as_array()
+                .filter(|a| !a.is_empty() && a.len() <= 256)
+                .ok_or(OutcomeFailure::Invalid)?;
+            let mut argv = Vec::with_capacity(args.len());
+            for arg in args {
+                let s = arg
+                    .as_str()
+                    .filter(|s| !s.is_empty() && !s.contains('\0'))
+                    .ok_or(OutcomeFailure::Invalid)?;
+                argv.push(s);
+            }
+            argv
+        } else if let Some(command) = object.get("shell_command") {
+            let command = command
                 .as_str()
                 .filter(|s| !s.is_empty() && !s.contains('\0'))
                 .ok_or(OutcomeFailure::Invalid)?;
-            bytes = bytes
-                .checked_add(s.len())
-                .filter(|n| *n <= 32 * 1024)
-                .ok_or(OutcomeFailure::Invalid)?;
-            argv.push(s);
+            vec!["/bin/bash", "-c", command]
+        } else {
+            return Err(OutcomeFailure::Invalid);
+        };
+        if argv
+            .iter()
+            .try_fold(0usize, |total, arg| total.checked_add(arg.len()))
+            .is_none_or(|total| total > MAX_ARGUMENT_BYTES)
+        {
+            return Err(OutcomeFailure::Invalid);
         }
         let deadline = context.deadline().ok_or(OutcomeFailure::TimedOut)?;
         let mut session = loop {
@@ -225,7 +239,7 @@ impl<T: ExecTransport> ToolPort for ContainerExecTool<T> {
                 ExecutionStatus::Failed,
                 EffectState::NotStarted,
                 Evidence::HostObserved,
-                "argv is invalid",
+                "container command is invalid",
                 false,
             ),
             Err(OutcomeFailure::Cancelled) => ToolOutcome::new(
@@ -340,6 +354,30 @@ mod tests {
             NormalizedArgs::new(args).unwrap(),
         )
     }
+
+    #[test]
+    fn registered_schema_compiles_and_requires_exactly_one_command_form() {
+        let schema = nexus_validation::CompiledSchema::compile(SCHEMA).unwrap();
+        let budget = nexus_core::Limits::M0_TEST_ARG_ASSEMBLY_BYTES;
+        for args in [
+            r#"{"argv":["printf","hello"]}"#,
+            r#"{"shell_command":"printf hello | cat"}"#,
+        ] {
+            assert!(schema.validate(args, budget).is_ok(), "{args}");
+        }
+        for args in [
+            r#"{}"#,
+            r#"{"argv":["true"],"shell_command":"true"}"#,
+            r#"{"unknown":"true"}"#,
+            r#"{"shell_command":"true","extra":true}"#,
+            r#"{"argv":[]}"#,
+            r#"{"shell_command":""}"#,
+            r#"{"shell_command":null}"#,
+        ] {
+            assert!(schema.validate(args, budget).is_err(), "{args}");
+        }
+    }
+
     #[test]
     fn descriptors_argv_and_completed_nonzero_status_are_truthful() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -368,7 +406,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
     #[test]
-    fn invalid_scope_and_argv_do_not_dispatch_and_uncertain_failure_poisons() {
+    fn invalid_scope_and_commands_do_not_dispatch_and_uncertain_failure_poisons() {
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let tool = ContainerExecTool::with_transport(Fake {
@@ -380,6 +418,17 @@ mod tests {
         for (args, scope) in [
             (r#"{"argv":[]}"#, "/workspace"),
             (r#"{"argv":["x\u0000y"]}"#, "/workspace"),
+            (r#"{"shell_command":""}"#, "/workspace"),
+            (r#"{"shell_command":"x\u0000y"}"#, "/workspace"),
+            (r#"{"argv":["x"],"shell_command":"y"}"#, "/workspace"),
+            (r#"{"shell_command":"x","extra":true}"#, "/workspace"),
+            (
+                &format!(
+                    r#"{{"shell_command":"{}"}}"#,
+                    "x".repeat(MAX_ARGUMENT_BYTES)
+                ),
+                "/workspace",
+            ),
             (r#"{"argv":["x"],"write_dir":"/tmp"}"#, "/workspace"),
             (r#"{"argv":["x"]}"#, "/workspace/sub"),
         ] {
@@ -409,6 +458,27 @@ mod tests {
             .effect(),
             EffectState::NotStarted
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shell_command_is_explicitly_dispatched_to_bash_inside_the_container() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tool = ContainerExecTool::with_transport(Fake {
+            calls: calls.clone(),
+            fail: false,
+            invalid_before_dispatch: false,
+            seen: seen.clone(),
+        });
+        let command = "pytest -q tests | head -60";
+        let output = tool.execute(
+            &call(&serde_json::json!({"shell_command": command}).to_string()),
+            &ctx("/workspace", Instant::now() + Duration::from_secs(1)),
+        );
+        assert_eq!(*seen.lock().unwrap(), ["/bin/bash", "-c", command]);
+        assert_eq!(output.status(), ExecutionStatus::Failed);
+        assert_eq!(output.effect(), EffectState::Unknown);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

@@ -245,6 +245,28 @@ class ArchiveLaunchTests(unittest.TestCase):
             self.assertNotIn("max_output_tokens", json.loads(config.read_text())["models"][0])
             self.assertEqual(effective.stat().st_mode & 0o777, 0o600)
 
+    def test_public_provider_requires_explicit_hosted_inference_opt_in(self):
+        provider = {"id": "deepseek", "endpoint": "https://api.deepseek.com",
+                    "credential": {"env": "DEEPSEEK_API_KEY"}}
+        model = {"id": "deepseek-flash", "name": "deepseek-flash", "provider": "deepseek"}
+        args = SimpleNamespace(provider="deepseek", model="deepseek-flash", allow_hosted_inference=False)
+        env = {"DEEPSEEK_API_KEY": "test-secret"}
+        with patch.object(swebench, "check_model") as check:
+            with self.assertRaisesRegex(RuntimeError, "refuses public model endpoints"):
+                swebench.validate_model_endpoint(provider, model, args, env)
+            check.assert_not_called()
+
+    def test_public_provider_is_allowed_only_with_explicit_opt_in(self):
+        provider = {"id": "deepseek", "endpoint": "https://api.deepseek.com",
+                    "credential": {"env": "DEEPSEEK_API_KEY"}}
+        model = {"id": "deepseek-flash", "name": "deepseek-flash", "provider": "deepseek"}
+        args = SimpleNamespace(provider="deepseek", model="deepseek-flash", allow_hosted_inference=True)
+        env = {"DEEPSEEK_API_KEY": "test-secret"}
+        with patch.object(swebench, "check_model") as check:
+            result = swebench.validate_model_endpoint(provider, model, args, env)
+        self.assertEqual(result, ("DEEPSEEK_API_KEY", "api.deepseek.com"))
+        check.assert_called_once_with(provider, model, env)
+
 
 if __name__ == "__main__":
     unittest.main()

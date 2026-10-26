@@ -77,6 +77,15 @@ cargo run -p nexus-server --features container --locked --offline -- \
 
 These are experimental startup options, not a supported secure deployment
 recipe. Images must already be available locally; startup does not pull them.
+In container mode, `host_exec` accepts exactly one of `argv` (direct execution,
+no shell parsing) or `shell_command` (run as `/bin/bash -c` inside the workload).
+For example, use `{"shell_command":"pytest -q tests | head -60"}` for a pipeline;
+prefix the command with `set -o pipefail;` when the pipeline should fail if an
+earlier stage fails. Shell commands keep the same workspace, container
+authorization, deadline, cancellation and output limits as `argv`; they do not
+add host access. Each call starts a new shell, so shell state is not carried
+between calls. This does not change host development-mode `host_exec`, which
+remains argv-only behind its mandatory OS sandbox.
 
 ## Everyday commands
 

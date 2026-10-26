@@ -29,3 +29,6 @@ nexus-tools = { path = "../nexus-tools" }
 serde = "1"
 serde_json = "1"
 rustix = { version = "1.1.5", features = ["event", "fs", "process"] }
+
+[dev-dependencies]
+nexus-validation = { path = "../nexus-validation" }

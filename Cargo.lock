@@ -211,6 +211,7 @@ version = "0.2.3-alpha"
 dependencies = [
  "nexus-core",
  "nexus-tools",
+ "nexus-validation",
  "rustix",
  "serde",
  "serde_json",
