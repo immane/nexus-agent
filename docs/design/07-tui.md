@@ -50,6 +50,15 @@ Cancellation must remain available while output streams or an approval is pendin
 
 Start a new conversation by default. Automatic saves use the configured local store outside the project. Listing or selecting previous sessions is explicit and bounded; restoration never reruns old tools or restores their grants.
 
+`Ctrl+S`, `:s`, and bare `:session` open a searchable session dialog combining
+live slots and saved sessions. Arrow keys select, Enter switches or restores, and
+Esc dismisses without changing the conversation. Live switching preserves each
+slot's draft. Restoring also displays the runtime's bounded history projection
+(user and assistant text plus folded tool results), with an explicit notice when
+older context items were omitted. Saved reasoning and authorization are not
+restored into the UI. `:session show` reports the active session; explicit
+ID-based commands remain available.
+
 Batch stream updates, cache layout where useful, and process visible entries rather than reparsing all history. Bound retained text, output, and caches; report presentation truncation separately from accepted conversation records. Render untrusted content without allowing terminal control-sequence injection.
 
 ## Implemented Tool-output Inspection

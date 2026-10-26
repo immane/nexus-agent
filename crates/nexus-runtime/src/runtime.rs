@@ -798,6 +798,7 @@ impl Runtime {
         state.restore_busy = false;
         CommandResponse::new(command.request, CommandReply::Accepted, None)
             .with_restored_session(command.session)
+            .with_restored_history(items, omitted_items)
     }
 
     /// Accepts a new run or rejects explicitly. A second submit while a run
@@ -10362,6 +10363,13 @@ mod cov_runtime_topup_private {
                 .0;
             assert_eq!(restored.reply(), CommandReply::Accepted);
             assert_eq!(restored.restored_session(), Some(&session));
+            assert!(restored.restored_history().starts_with(&source));
+            assert!(matches!(
+                restored.restored_history().last(),
+                Some(ModelContextItem::ToolResult { outcome, .. })
+                    if outcome.effect() == EffectState::Unknown
+            ));
+            assert_eq!(restored.restored_omitted_items(), 0);
             assert_eq!(provider.call_count(), 0, "restore must not call the model");
             assert_eq!(tool.execution_count(), 0, "restore must not execute tools");
             {

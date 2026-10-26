@@ -2493,6 +2493,15 @@ const MAX_SESSIONS: usize = 16;
 /// inline and keep every session alive).
 fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) -> bool {
     match args {
+        SessionArgs::Pick => {
+            let choices = live_session_choices(sessions);
+            sessions
+                .active_mut()
+                .front
+                .state
+                .open_session_picker(choices);
+            false
+        }
         SessionArgs::Show => {
             let line = {
                 let active = sessions.active();
@@ -2597,6 +2606,28 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
     }
 }
 
+fn live_session_choices(sessions: &SessionRegistry) -> Vec<nexus_tui::state::SessionChoice> {
+    sessions
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| nexus_tui::state::SessionChoice {
+            id: slot.front.session.as_str().to_owned(),
+            label: format!(
+                "{}{} · {}",
+                slot.label,
+                if index == sessions.active {
+                    " [active]"
+                } else {
+                    ""
+                },
+                slot.front.state.status()
+            ),
+            saved: false,
+        })
+        .collect()
+}
+
 async fn execute_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) {
     sessions.poll_maintenance();
     if sessions.maintenance.is_some()
@@ -2606,12 +2637,54 @@ async fn execute_session_command(sessions: &mut SessionRegistry, args: &SessionA
                 | SessionArgs::Delete(_)
                 | SessionArgs::List
                 | SessionArgs::Restore(_)
+                | SessionArgs::Pick
         )
     {
         sessions.active_mut().front.state.notice("session maintenance is still running; no additional storage command was started; quitting does not roll it back");
         return;
     }
     match args {
+        SessionArgs::Pick => {
+            let mut choices = live_session_choices(sessions);
+            if sessions.store.is_some() {
+                let request = sessions.active_mut().front.next_request();
+                let reply = sessions
+                    .active()
+                    .runtime
+                    .handle(nexus_core::Command::ListSessions(
+                        ListSessionsCommand::new(request, nexus_core::commands::MAX_LIST_LIMIT)
+                            .expect("finite session list bound is valid"),
+                    ))
+                    .await
+                    .0;
+                if reply.reply() == CommandReply::Accepted && reply.has_sessions() {
+                    for entry in reply.sessions() {
+                        if choices
+                            .iter()
+                            .any(|choice| choice.id == entry.session.as_str())
+                        {
+                            continue;
+                        }
+                        choices.push(nexus_tui::state::SessionChoice {
+                            id: entry.session.as_str().to_owned(),
+                            label: format!("saved · revision {}", entry.logical_revision),
+                            saved: true,
+                        });
+                    }
+                } else {
+                    sessions
+                        .active_mut()
+                        .front
+                        .state
+                        .notice("saved session listing failed; showing live sessions only");
+                }
+            }
+            sessions
+                .active_mut()
+                .front
+                .state
+                .open_session_picker(choices);
+        }
         SessionArgs::Import if sessions.store.is_some() => {
             let store = sessions.store.as_ref().expect("guarded above").clone();
             sessions
@@ -2807,7 +2880,16 @@ async fn restore_persisted_session(sessions: &mut SessionRegistry, id: &str) {
     let label = format!("s{number}");
     let mut front = Frontend::with_config(session, config.clone());
     front.state.set_session_label(&label);
+    front
+        .state
+        .record_restored_history(reply.restored_history());
     front.attach_live(live, config.tools_root.as_deref(), config.execution);
+    if reply.restored_omitted_items() > 0 {
+        front.state.notice(&format!(
+            "restored recent history; {} older context items omitted",
+            reply.restored_omitted_items()
+        ));
+    }
     front.state.notice(
         "saved history is loaded into model context; interrupted calls remain uncertain and are not replayed",
     );
@@ -2874,6 +2956,23 @@ fn handle_overlay_key(front: &mut Frontend, key: KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Esc => front.state.dismiss_overlay(),
+        KeyCode::Enter if front.state.session_picker_open() => {
+            let matches = front.state.picker_matches();
+            let choice = front
+                .state
+                .picker_confirm(matches.len())
+                .and_then(|cursor| matches.get(cursor))
+                .and_then(|index| front.state.session_choices().get(*index))
+                .cloned();
+            front.state.dismiss_overlay();
+            if let Some(choice) = choice {
+                front.pending_session_cmds.push(if choice.saved {
+                    SessionArgs::Restore(choice.id)
+                } else {
+                    SessionArgs::Switch(choice.id)
+                });
+            }
+        }
         KeyCode::Enter => confirm_model_picker(front),
         KeyCode::Up => move_picker(front, -1),
         KeyCode::Down => move_picker(front, 1),
@@ -3019,6 +3118,16 @@ async fn handle_key_with_runtime(
     runtime: Option<&Runtime>,
     key: KeyEvent,
 ) -> bool {
+    if key.kind == KeyEventKind::Press
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        && key.code == crossterm::event::KeyCode::Char('s')
+        && !front.state.overlay_open()
+    {
+        front.pending_session_cmds.push(SessionArgs::Pick);
+        return false;
+    }
     if !front.state.colon_pending()
         && !front.state.overlay_open()
         && let Some(quit) = handle_vim_viewport_key(front, key)
@@ -5835,6 +5944,44 @@ mod cov_main_topup {
         SessionRegistry::new(first, template)
     }
 
+    #[tokio::test]
+    async fn session_picker_shortcut_filters_and_switches_without_losing_drafts() {
+        let mut sessions = registry();
+        sessions.active_mut().front.state.composer_type('a');
+        let index = sessions.create().unwrap();
+        sessions.switch(index);
+        sessions.active_mut().front.state.composer_type('b');
+        let key = KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let slot = sessions.active_mut();
+        assert!(!handle_key_with_runtime(&mut slot.front, Some(&slot.runtime), key).await);
+        assert_eq!(
+            slot.front.pending_session_cmds.pop(),
+            Some(SessionArgs::Pick)
+        );
+        execute_session_command(&mut sessions, &SessionArgs::Pick).await;
+        let front = &mut sessions.active_mut().front;
+        assert!(front.state.session_picker_open());
+        assert_eq!(front.state.session_choices().len(), 2);
+        front.state.picker_push('1');
+        assert_eq!(front.state.picker_matches(), vec![0]);
+        handle_overlay_key(
+            front,
+            KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        let command = front.pending_session_cmds.pop().unwrap();
+        assert_eq!(command, SessionArgs::Switch("sess-test-1".to_owned()));
+        execute_session_command(&mut sessions, &command).await;
+        assert_eq!(sessions.active, 0);
+        assert_eq!(sessions.active().front.state.composer(), "a");
+        assert_eq!(sessions.slots[1].front.state.composer(), "b");
+    }
+
     fn session_store_test_directory() -> std::path::PathBuf {
         let nonce = SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -5856,6 +6003,60 @@ mod cov_main_topup {
             DEMO_PROFILE,
         )
         .expect("valid saved checkpoint")
+    }
+
+    #[tokio::test]
+    async fn session_picker_restores_saved_history_and_deduplicates_live_sessions() {
+        use nexus_core::SessionStore;
+
+        let directory = session_store_test_directory();
+        let mut store = nexus_session::DirectorySessionStore::open(&directory).unwrap();
+        let checkpoint = saved_checkpoint("sess-saved-picker");
+        store.initialize_session(&checkpoint).unwrap();
+        store
+            .append_source_items(
+                checkpoint.session(),
+                &RunId::new("run-saved-picker").unwrap(),
+                &[
+                    nexus_core::provider::ModelContextItem::user_text("saved conversation")
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+        let store = SessionStoreHandle::new(Box::new(store));
+        let mut sessions = registry();
+        let (runtime, streams, _) =
+            build_live_runtime_with_store(&sessions.template, Some(store.clone())).unwrap();
+        sessions.slots[0].runtime = runtime;
+        sessions.slots[0].streams = streams;
+        sessions.store = Some(store);
+        execute_session_command(&mut sessions, &SessionArgs::Pick).await;
+        let front = &mut sessions.active_mut().front;
+        assert_eq!(front.state.session_choices().len(), 2);
+        for character in "saved-picker".chars() {
+            front.state.picker_push(character);
+        }
+        handle_overlay_key(
+            front,
+            KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        let command = front.pending_session_cmds.pop().unwrap();
+        assert_eq!(
+            command,
+            SessionArgs::Restore("sess-saved-picker".to_owned())
+        );
+        execute_session_command(&mut sessions, &command).await;
+        assert_eq!(sessions.active().front.session, *checkpoint.session());
+        assert!(transcript(&sessions.active().front).contains("saved conversation"));
+        execute_session_command(&mut sessions, &SessionArgs::Pick).await;
+        let choices = sessions.active().front.state.session_choices();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().all(|choice| !choice.saved));
+        drop(sessions);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     async fn finish_maintenance(sessions: &mut SessionRegistry) {
