@@ -110,9 +110,10 @@ class SuiteTests(unittest.TestCase):
                                      "images": {"derived": {"id": "sha256:expected"},
                                                 "build_source_sha256": swe_suite.build_source_sha256()}}}}))
             args = SimpleNamespace(work_root=root, profiles=None, suite=suite_path, build=False,
-                                   action="prepare", config=root / "config.json", provider=None,
-                                   model=None, model_output_tokens=None, max_run_seconds=None,
-                                   max_tool_calls=None, tool_log_bytes=None)
+                                    action="prepare", config=root / "config.json", provider=None,
+                                    model=None, model_output_tokens=None, max_run_seconds=None,
+                                    max_tool_calls=None, tool_log_bytes=None,
+                                    allow_hosted_inference=False)
             launcher_exit = 0
 
             def launch(argv, log):
@@ -120,6 +121,8 @@ class SuiteTests(unittest.TestCase):
                     self.assertIn("--prepare-only", argv)
                 else:
                     self.assertNotIn("--prepare-only", argv)
+                    if args.allow_hosted_inference:
+                        self.assertIn("--allow-hosted-inference", argv)
                 self.assertIn("--verify-task-environment", argv)
                 run = log.parent / "run-fixture"
                 run.mkdir()
@@ -144,6 +147,7 @@ class SuiteTests(unittest.TestCase):
             self.assertNotIn("patch", json.loads(copied.read_text()))
             self.assertNotIn("test_patch", json.loads(copied.read_text()))
             args.action = "run"
+            args.allow_hosted_inference = True
             launcher_exit = 1
             with patch.object(swebench, "available_tasks", return_value={INSTANCE: {"row": row, "image": "adapter"}}), \
                     patch.object(swebench, "inspect_image", return_value={"Id": "sha256:expected"}), \

@@ -171,11 +171,11 @@ impl Policy {
 
     /// Whether a host registration revision is allowed by this policy.
     /// Container `host_exec` has a distinct argument contract and therefore
-    /// deliberately uses the next revision; all other registrations remain
-    /// on the M0 revision.
+    /// deliberately uses its own revision; all other registrations remain on
+    /// the M0 revision.
     pub fn accepts_tool_revision(&self, name: &str, revision: u32) -> bool {
         if self.container && name == "host_exec" {
-            revision == M0_REVISION + 1
+            revision == M0_REVISION + 2
         } else {
             revision == self.revision
         }
@@ -302,7 +302,7 @@ impl Policy {
     ) -> Result<(), AgentError> {
         self.validate()?;
         let expected_revision = if call.tool().name() == "host_exec" {
-            M0_REVISION + 1
+            M0_REVISION + 2
         } else {
             M0_REVISION
         };
@@ -828,11 +828,12 @@ mod tests {
         let policy = Policy::container();
         assert!(policy.validate().is_ok());
         assert!(policy.accepts_tool_revision("host_read", M0_REVISION));
-        assert!(policy.accepts_tool_revision("host_exec", M0_REVISION + 1));
+        assert!(policy.accepts_tool_revision("host_exec", M0_REVISION + 2));
         assert!(!policy.accepts_tool_revision("host_exec", M0_REVISION));
+        assert!(!policy.accepts_tool_revision("host_exec", M0_REVISION + 1));
         assert!(!policy.accepts_tool_revision("host_write", M0_REVISION + 1));
 
-        let exec = call("host_exec", M0_REVISION + 1, r#"{"argv":["true"]}"#);
+        let exec = call("host_exec", M0_REVISION + 2, r#"{"argv":["true"]}"#);
         assert_eq!(
             policy
                 .authorize_with_directories(&exec, &[], ToolAccess::Process)

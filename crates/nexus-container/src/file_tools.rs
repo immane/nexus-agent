@@ -367,7 +367,7 @@ mod tests {
             nexus_core::RunId::new("run").unwrap(),
             nexus_core::TurnId::new("turn").unwrap(),
             nexus_core::CallId::new("call").unwrap(),
-            ToolId::new("host_exec", M0_REVISION + 1).unwrap(),
+            ToolId::new("host_exec", M0_REVISION + 2).unwrap(),
             nexus_core::NormalizedArgs::new(r#"{"argv":["x"]}"#).unwrap(),
         )
     }

@@ -349,12 +349,18 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 
 ## Benchmark Observations
 
-Local SWE-bench Lite pilots with `ollama-local/qwen3-27b` were scored by the
-official SWE-bench evaluator (2026-10-24–26). **Three selected runs resolved and
-one completed run did not**; agent completion is tracked separately from official
-resolution:
+Results are grouped by inference environment, with separate tables and counts.
+Agent completion is not official resolution. These selected diagnostic runs are
+**not a leaderboard score, a general success rate, or a controlled model
+comparison**. Agent wall time excludes the separate official evaluator run;
+dates are UTC.
 
-**Model configuration:** Qwen3.8-27B, **IQ3_M quantization**, with a configured
+### Local inference: Qwen3.8-27B via Ollama
+
+The `ollama-local/qwen3-27b` pilot has four scored task runs: **three resolved
+and one did not**. Interrupted attempts remain unscored.
+
+**Inference environment:** Qwen3.8-27B, **IQ3_M quantization**, with a configured
 **92K context window (94,208 tokens, input plus output)**, served through Ollama
 as `qwen3.8-27b-iq3m-92k:latest`. The selection ID above is an alias, not a
 different model. These results are not BF16 or 128K-context measurements;
@@ -363,9 +369,10 @@ comparisons should account for quantization, context budget, and agent harness.
 | Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
 | --- | --- | ---: | --- | --- | --- |
 | `sympy__sympy-20590` (summary-fix v2, latest) | 2026-10-25 | 14m 11s | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
-| `astropy__astropy-12907` (context-retention run) | 2026-10-25 | 13m 13s | Preserve separability matrices in nested compound models. | Resolved | Completed |
+| `astropy__astropy-12907` (correctness regression rerun) | 2026-10-26 | 14m 36s | Preserve separability matrices in nested compound models. | Resolved | Completed |
 | `django__django-11099` | 2026-10-24 | 34m 02s | Reject trailing newlines in username validators. | Resolved | Completed |
 | `pallets__flask-4992` (harness validation) | 2026-10-26 | 1h 09m 00s | Pass `open()` keyword arguments through `Config.from_file`. | **Unresolved** | Completed |
+| `pylint-dev__pylint-6506` (background attempt 2) | 2026-10-26 | 2h 09m 33s | No patch produced. | Not scored (Ollama server crashed under load; confirmed) | Interrupted |
 
 The Flask run produced a patch that applied cleanly and kept all 19
 `PASS_TO_PASS` tests passing. It failed `test_config_from_file_toml` because the
@@ -377,18 +384,17 @@ inferred. Its 1,969-byte patch had no missing hunks; the agent verified its own
 `mode="rb"` example, cleaned up temporary files, and declared completion without
 checking the parameter name the hidden test expects.
 
-These are four selected task runs, **not a leaderboard score or a general success
-rate**; SymPy was attempted repeatedly. The table reports the latest evaluated
-run for each task, not every attempt; an earlier SymPy attempt ended with
-`limit-reached`. The Astropy context-retention run completed one context
-reduction and was resolved by the official evaluator; this single exposed-task
+SymPy was attempted repeatedly. The table reports the latest evaluated run for
+each scored task and the latest Pylint interruption, not every attempt; an
+earlier SymPy attempt ended with `limit-reached`. The Astropy context-retention
+run completed one context reduction and was resolved by the official evaluator;
+this single exposed-task
 run does not establish that the changes reduced repeated investigation or
 caused the successful repair, nor does it validate the semantic-memory vision.
 The earlier Astropy prediction included temporary scripts; the context-retention
-prediction did not.
-
-Agent wall time is the runner's recorded task duration, excluding the separate
-official evaluator run. Dates are the pilot run dates (UTC).
+and correctness-regression predictions did not. The 2026-10-26 Astropy rerun
+again resolved officially (FAIL_TO_PASS 2/2, PASS_TO_PASS 13/13); it is a
+correctness regression check, not a performance comparison.
 
 The Flask harness-validation run also exercised the recent context and tooling
 changes: bounded 8 KiB paged reads (16 KiB maximum) kept file reads near 31 KB
@@ -402,13 +408,71 @@ as a `Protocol` failure once recovery is exhausted. These changes improve
 execution continuity, **not** repair accuracy: the completed Flask run still did
 not resolve.
 
+Pylint has two interrupted attempts, neither with a terminal result or prediction.
+The first was a foreground invocation interrupted after about an hour, during
+its 82nd model request; its exact owned containers were verified and cleaned up.
+The persisted session store retains source/tool records but cannot restore the
+in-memory active runtime, so that attempt could not be resumed. The second was
+background-launched and ran for 2h 09m 33s before the Ollama server crashed under
+excessive load. Neither attempt was officially evaluated.
+
+### Hosted inference: DeepSeek V4.1 Flash
+
+These hosted runs used the configured model ID `deepseek-flash` after the local
+Ollama endpoint was unavailable. They are not included in the Qwen pilot table
+or its counts.
+
+**Inference environment:** DeepSeek's hosted API at `https://api.deepseek.com`,
+selected as `deepseek/deepseek-flash`. Unlike the local Qwen profile, these runs
+had no configured context-window reference; quantization and serving hardware
+were not recorded. They used prepared task images in the offline container
+workload. The Sphinx launch reused the existing release server (`--no-build`),
+so it does not validate the newly added `shell_command` interface; the Pylint
+run built the release server from current source.
+
+| Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
+| --- | --- | ---: | --- | --- | --- |
+| `sphinx-doc__sphinx-8595` | 2026-10-26 | 1m 46s | Treat `__all__ = []` as explicitly empty rather than falling back to all members. | Resolved | Completed |
+| `pylint-dev__pylint-6506` | 2026-10-26 | 2m 21s | Report unrecognized CLI options through argparse usage errors instead of a traceback. | Resolved | Completed |
+| `pallets__flask-4992` | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
+
+Sphinx used 47 model requests and 59 tool calls (940,165 input and 11,286 output
+tokens); Pylint used 38 model requests and 42 tool calls (810,483 input and
+13,832 output tokens); Flask used 14 model requests and 19 tool calls (107,329
+input and 5,992 output tokens). These are provider-reported token counts.
+Hosted inference was explicitly authorized; the runner had no cumulative token
+or spend cap. The credential was loaded from the owner-only `deepseek.env` for
+each background process only; the shared provider configuration was not changed.
+Evidence:
+[run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/batch.json),
+[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/sphinx-doc__sphinx-8595/run-sphinx-doc__sphinx-8595-20261026T221257Z-41b36a30/launch.json),
+and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-a2e3d22059dc44dbb0a73868956ce902/official/sphinx-doc__sphinx-8595-prediction-20261026T221511.628724Z-11b56200b2ec48449c56d853aaa9cdee/evaluation.json).
+Pylint evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/batch.json),
+[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T222755Z-6400a8c7/launch.json),
+and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e3f0859627cc436d8e5cce6b6ebd4e6e/official/pylint-dev__pylint-6506-prediction-20261026T223040.009489Z-c6f8b6e5bf0e4f9695dd3c38b2f39522/evaluation.json).
+Flask evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/batch.json),
+[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/pallets__flask-4992/run-pallets__flask-4992-20261026T223312Z-adfc89ce/launch.json),
+and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-d10c7f09e7d2402c819bc9c6815fb01c/official/pallets__flask-4992-prediction-20261026T223451.689810Z-528bce98331c42308f5dd8e74fa79f51/evaluation.json).
+
+### Shared evaluation workflow and suite progress
+
 A repeatable ten-task diagnostic suite, fixed to dataset revision
 `b0dde1093fe417d83b7184254edf8199c1f0dff5` and SWE-bench evaluator `5.0.2`, lives
 in `tools/benchmarks/swe_suite.json`. Preparation, sequential batches, official
 scoring, and offline summaries are separate explicit steps that never invoke a
-model implicitly. Only the Flask task has been exercised end to end so far; the
-other nine tasks have prepared images and offline environment checks, not live
-results.
+model implicitly. Of the ten suite tasks, Flask has completed local-Qwen and
+hosted-DeepSeek scored runs; Sphinx and Pylint have separately recorded
+DeepSeek V4.1 Flash scored runs. Pylint also has two earlier local-Qwen
+interrupted, unscored attempts; the remaining seven tasks have prepared images
+and offline environment checks but no live model result.
+
+**Mandatory benchmark operation rule:** SWE-bench model runs must always be
+started and supervised as background jobs. Never run them as foreground,
+blocking tool executions. Confirm the background process is alive before
+continuing other work, preserve its logs and artifacts, and resume reporting
+from the same session when it completes. If interrupted, record the attempt as
+incomplete and do not silently retry or claim a score. The historical Pylint
+foreground interruption is recorded above.
 
 See [benchmark methodology and earlier run records](docs/research/agent-benchmarks.md)
 and the [reliability follow-up backlog](docs/tasks/09-agent-reliability.md) for

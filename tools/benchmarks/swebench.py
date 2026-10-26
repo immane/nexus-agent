@@ -101,9 +101,27 @@ def check_model(provider, model, env):
         with build_opener(ProxyHandler({})).open(req, timeout=8) as response:
             models = json.load(response)
         if not any(entry.get("id") == model["name"] for entry in models.get("data", [])):
-            raise RuntimeError("configured wire model is not listed by local endpoint")
+            raise RuntimeError("configured wire model is not listed by the model endpoint")
     except (OSError, ValueError) as error:
-        raise RuntimeError("local model endpoint preflight failed; no inference started") from error
+        raise RuntimeError("model endpoint preflight failed; no inference started") from error
+
+
+def validate_model_endpoint(provider, model, args, env):
+    endpoint = urlsplit(provider.get("endpoint", ""))
+    if endpoint.scheme not in ("http", "https") or not endpoint.hostname or endpoint.username or endpoint.password:
+        raise RuntimeError("explicit credential-free model endpoint required")
+    try:
+        address = ipaddress.ip_address(endpoint.hostname)
+        local = address.is_private or (address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10"))
+    except ValueError:
+        local = endpoint.hostname == "localhost"
+    if not local and not getattr(args, "allow_hosted_inference", False):
+        raise RuntimeError("local benchmark launcher refuses public model endpoints")
+    credential = provider["credential"]["env"]
+    if not env.get(credential) and provider["id"] != "ollama-local":
+        raise RuntimeError(f"missing provider credential environment variable: {credential}")
+    check_model(provider, model, env)
+    return credential, endpoint.hostname
 
 
 def available_tasks(root, profiles):
@@ -242,27 +260,13 @@ def launch(args, profiles, task):
     model = next((m for m in config["models"] if m["id"] == model_id and m["provider"] == provider_id), None)
     if provider is None or model is None:
         raise RuntimeError("provider/model binding missing from selected config")
-    endpoint = urlsplit(provider.get("endpoint", ""))
-    if endpoint.scheme not in ("http", "https") or not endpoint.hostname or endpoint.username or endpoint.password:
-        raise RuntimeError("explicit credential-free model endpoint required")
-    # This launcher is for the local pilot; cloud runs require a separate budget/authorization.
-    try:
-        address = ipaddress.ip_address(endpoint.hostname)
-        local = address.is_private or (address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10"))
-    except ValueError:
-        local = endpoint.hostname == "localhost"
-    if not local:
-        raise RuntimeError("local benchmark launcher refuses public model endpoints")
     env = os.environ.copy()
-    credential = provider["credential"]["env"]
     # Probe unauthenticated Ollama before adding the server's compatibility
     # placeholder. Other providers must have their real credential explicitly set.
-    if not env.get(credential) and provider_id != "ollama-local":
-        raise RuntimeError(f"missing provider credential environment variable: {credential}")
-    check_model(provider, model, env)
+    credential, endpoint_host = validate_model_endpoint(provider, model, args, env)
     if not env.get(credential):
         env[credential] = "dummy"  # Local Ollama credential gate only; never a real secret.
-    bypass = ",".join(filter(None, [env.get("NO_PROXY"), endpoint.hostname, "127.0.0.1", "localhost"]))
+    bypass = ",".join(filter(None, [env.get("NO_PROXY"), endpoint_host, "127.0.0.1", "localhost"]))
     env.update(NO_PROXY=bypass, no_proxy=bypass)
     row = agent_task(task["row"])
     gateway = inspect_image(args.gateway_image or profiles["gateway_image"])
@@ -447,6 +451,8 @@ def main():
     parser.add_argument("--model")
     parser.add_argument("--model-output-tokens", type=int,
                         help="per-request task output cap; creates a private run-local model config")
+    parser.add_argument("--allow-hosted-inference", action="store_true",
+                        help="explicitly allow a public model endpoint; inference may incur uncapped provider costs")
     parser.add_argument("--gateway-image")
     parser.add_argument("--container-image")
     parser.add_argument("--port", type=int, default=0, help="0 selects a free loopback port")

@@ -187,7 +187,7 @@ Container-specific runtime authorization is implemented for trusted host-registe
 | Agent mode / tool | Container policy |
 | --- | --- |
 | Build: valid built-in workspace reads and mutations | Automatic |
-| Build: valid built-in argv exec in the environment | Automatic, including an explicitly requested `/bin/sh -lc` argv |
+| Build: valid built-in exec in the environment | Automatic, including `argv` and explicit `shell_command` forms |
 | Plan/read-only: built-in reads/list/search | Automatic |
 | Plan/read-only: mutation/process/unclassified | Denied without prompting, unchanged |
 | Unknown tools or external executors | Not registered by this backend; deny rather than blanket auto-approve |
@@ -245,7 +245,7 @@ The tools use a shared session/transport and bounded Docker CLI path for file op
 
 For file tools, invoke the fixed Linux worker through non-TTY `docker exec` and send a single length-bounded JSON request on stdin. The worker executes one supported operation and returns one versioned, bounded JSON response. Include protocol version, operation, normalized arguments, and output allowance; keep lifecycle/scope authority on the host. Reject duplicate keys, trailing messages, invalid UTF-8, oversized frames, unknown operations, and unsupported versions. Content goes over stdin, not shell interpolation or command-line arguments. Drain stdout/stderr concurrently while retaining only bounded output. Protocol violations fail the call and invalidate the environment when integrity is uncertain.
 
-Exec passes the validated argv array through the CLI's argument boundary with fixed container/user/workdir flags; never join it into a shell command. An explicit shell argv is permitted in build mode. Preserve `/workspace` as working directory per call; shell `cd` or exported variables do not mutate subsequent calls. Files and container-local home persist during a healthy session. Match existing stdout/stderr/output budgets and safe diagnostics. Model-produced IDs or paths never select a Docker resource.
+Exec accepts exactly one of a validated `argv` array or an explicit `shell_command`. Direct `argv` is passed through the Docker CLI argument boundary; `shell_command` is passed as the single script argument to `/bin/bash -c` inside the workload. The host always invokes the trusted Docker executable with fixed container/workdir flags and never interprets model command text. Both forms use the same `/workspace` authorization, existing container/network boundary, deadline, cancellation, and output limits. Shell `cd` or exported variables do not mutate subsequent calls. Files and container-local home persist during a healthy session. Match existing stdout/stderr/output budgets and safe diagnostics. Model-produced IDs or paths never select a Docker resource.
 
 The shared session poisons itself on uncertain worker/exec transport outcomes and invokes the lifecycle cleanup/quarantine handler. Cancellation is observed by the Docker transport and interrupts its local CLI; killing that CLI still does not establish termination of its remote/container process. The runtime quarantines uncertain tool work and does not replay an interrupted command.
 

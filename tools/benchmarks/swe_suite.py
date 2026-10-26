@@ -219,7 +219,9 @@ def execute_batch(args, suite, tasks):
     batch = {"schema_version": 1, "suite": suite["name"], "action": args.action,
              "suite_sha256": hashlib.sha256(args.suite.read_bytes()).hexdigest(),
              "profile_sha256": hashlib.sha256(profiles_path.read_bytes()).hexdigest(),
-             "limits": limits, "status": "running", "tasks": [
+             "limits": limits, "provider_override": args.provider, "model_override": args.model,
+             "hosted_inference_allowed": bool(getattr(args, "allow_hosted_inference", False)),
+             "status": "running", "tasks": [
                  {**task, "classification": "unstarted"} for task in tasks]}
     save_batch(batch_path, batch)
     print(f"Batch: {batch_path}", flush=True)
@@ -245,6 +247,8 @@ def execute_batch(args, suite, tasks):
             for name in ("provider", "model", "model_output_tokens"):
                 if getattr(args, name) is not None:
                     argv += ["--" + name.replace("_", "-"), str(getattr(args, name))]
+            if getattr(args, "allow_hosted_inference", False):
+                argv.append("--allow-hosted-inference")
             if args.action == "prepare":
                 argv.append("--prepare-only")
             entry["argv"] = argv
@@ -285,6 +289,8 @@ def main():
     parser.add_argument("--provider")
     parser.add_argument("--model")
     parser.add_argument("--model-output-tokens", type=int)
+    parser.add_argument("--allow-hosted-inference", action="store_true",
+                        help="explicitly allow a public model endpoint; inference may incur uncapped provider costs")
     for name in ("max-run-seconds", "max-tool-calls", "tool-log-bytes"):
         parser.add_argument("--" + name, type=int)
     parser.add_argument("--build", action=argparse.BooleanOptionalAction, default=True)
@@ -292,6 +298,8 @@ def main():
     parser.add_argument("--mode", choices=("gold", "empty", "prediction"), default="gold",
                         help="explicit official evaluation mode; defaults to oracle preflight")
     args = parser.parse_args()
+    if args.allow_hosted_inference and args.action != "run":
+        parser.error("--allow-hosted-inference is only valid for run")
     if args.action == "summarize":
         if args.batch is None:
             parser.error("summarize requires --batch")
