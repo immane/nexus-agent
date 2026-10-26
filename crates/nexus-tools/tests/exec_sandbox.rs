@@ -216,6 +216,26 @@ fn development_python_runs_with_stdlib_temp_files_and_protected_credentials() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn development_sandbox_allows_dev_null_but_not_other_device_writes() {
+    let root = TempRoot::new();
+    let executor = SandboxedExecutor::development(&root.0).unwrap();
+    assert!(executor.sandbox_available());
+    let context = context_with_scope("exec:workspace");
+
+    let null = executor.execute(&call(r#"{"argv":["/usr/bin/tee","/dev/null"]}"#), &context);
+    assert_eq!(
+        null.status(),
+        ExecutionStatus::Succeeded,
+        "{}",
+        null.content()
+    );
+
+    let zero = executor.execute(&call(r#"{"argv":["/usr/bin/tee","/dev/zero"]}"#), &context);
+    assert_eq!(zero.status(), ExecutionStatus::Failed, "{}", zero.content());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn development_external_writes_require_a_bound_declared_directory() {
     let root = TempRoot::new();
     let executor = SandboxedExecutor::development(&root.0).unwrap();

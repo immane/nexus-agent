@@ -1443,12 +1443,11 @@ impl Server {
     /// /config` and is reported on stderr rather than discarded; the run
     /// itself has already finished and its outcome is never retracted.
     fn record_model_use(&self, run: &str) {
-        let Some(model) = self
-            .run_models
-            .lock()
-            .expect("run model map lockable")
-            .remove(run)
-        else {
+        // Keep attribution and persistence serialized with other consumers of
+        // this association. An SSE consumer must not observe an absent entry
+        // and publish its terminal frame while a watcher is still saving it.
+        let mut run_models = self.run_models.lock().expect("run model map lockable");
+        let Some(model) = run_models.remove(run) else {
             return;
         };
         let mut config = self.config.lock().expect("config lockable");
@@ -2465,6 +2464,46 @@ mod tests {
             server.config.lock().expect("config lockable").recent(),
             ["gated-fast".to_owned()],
             "a second terminal event records nothing further"
+        );
+    }
+
+    #[test]
+    fn usage_attribution_remains_locked_until_configuration_is_updated() {
+        let (server, _runtime) = server_with_gated_config();
+        let server = Arc::new(server);
+        server
+            .run_models
+            .lock()
+            .expect("map lockable")
+            .insert("run-x".to_owned(), "gated-fast".to_owned());
+        let config = server.config.lock().expect("config lockable");
+        let recorder = Arc::clone(&server);
+        let worker = std::thread::spawn(move || recorder.record_model_use("run-x"));
+
+        // Block the save at the config lock, then verify another caller cannot
+        // mistake the consumed association for a completed save.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let locked = loop {
+            match server.run_models.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break true,
+                Err(std::sync::TryLockError::Poisoned(_)) => panic!("map poisoned"),
+                Ok(_) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::yield_now();
+        };
+        drop(config);
+        worker.join().expect("recording completes");
+        assert!(
+            locked,
+            "the association stays locked while recording is pending"
+        );
+        server.record_model_use("run-x");
+        assert_eq!(
+            server.config.lock().expect("config lockable").recent(),
+            &["gated-fast"]
         );
     }
 

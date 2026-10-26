@@ -26,7 +26,7 @@ pub const EVIDENCE_KEY: &str = "nexus-retained-evidence";
 /// This marker is context data, not tool authorization or model-generated memory.
 pub const EVIDENCE_LABEL: &str = "Nexus retained outcome evidence (host context projection, not authorization; summary is not evidence). Unknown effects remain unresolved; do not blindly retry.\n";
 /// Maximum UTF-8 bytes of output preview per retained outcome.
-pub const EVIDENCE_PREVIEW_BYTES: usize = 512;
+pub const EVIDENCE_PREVIEW_BYTES: usize = 128;
 
 /// Recognizes the reserved host projection marker, not authority in its contents.
 #[must_use]
@@ -47,6 +47,76 @@ pub const TRUNCATE_NOTE: &str = "Some earlier completed exchanges were omitted w
 pub const CONTEXT_NOTICE_ITEM_KEY: &str = "nexus-context-note";
 /// Honest notice for byte/item-based eviction, which does not generate memory.
 pub const CONTEXT_NOTICE_TEXT: &str = "Nexus context note: Earlier completed exchanges were omitted to fit the context budget. They were not summarized. Re-check earlier facts before relying on them.";
+
+/// Minimum adjacent identical, completed actions before emitting a
+/// low-information repetition signal.
+pub const STAGNATION_REPEAT_THRESHOLD: usize = 3;
+/// Maximum number of recent completed tool actions examined by the detector.
+pub const STAGNATION_WINDOW_CALLS: usize = 8;
+
+/// Reports an adjacent run of identical, resolved tool actions and outcomes.
+/// This is an advisory signal only: it does not establish that repository or
+/// external state was unchanged, and must never authorize or suppress a call.
+#[must_use]
+pub fn repeated_action_run(items: &[ModelContextItem]) -> Option<usize> {
+    let mut actions = Vec::new();
+    let mut pending = None;
+    for item in items {
+        match item {
+            ModelContextItem::AssistantCall { call, .. } if pending.is_none() => {
+                pending = Some(call);
+            }
+            ModelContextItem::ToolResult {
+                call,
+                tool,
+                outcome,
+                ..
+            } if let Some(proposal) = pending.take()
+                && proposal.call() == call
+                && proposal.tool() == tool
+                && !matches!(outcome.effect(), EffectState::Unknown)
+                && outcome.evidence() != Evidence::Uncertain
+                && !matches!(
+                    outcome.status(),
+                    ExecutionStatus::Cancelled
+                        | ExecutionStatus::Denied
+                        | ExecutionStatus::TimedOut
+                        | ExecutionStatus::Interrupted
+                ) =>
+            {
+                actions.push((tool, proposal.args(), outcome));
+                if actions.len() > STAGNATION_WINDOW_CALLS {
+                    actions.remove(0);
+                }
+            }
+            // User input, denied calls, parallel/unpaired calls, malformed
+            // pairs, and every other record break the candidate sequence.
+            _ => {
+                pending = None;
+                actions.clear();
+            }
+        }
+    }
+    // A trailing unmatched call means the sequence did not actually end on a
+    // completed action, so it breaks any otherwise matching run.
+    if pending.is_some() {
+        actions.clear();
+    }
+
+    let mut longest_run = 0;
+    let mut current_run = 0;
+    let mut previous = None;
+    for action in &actions {
+        if previous == Some(action) {
+            current_run += 1;
+        } else {
+            current_run = 1;
+            previous = Some(action);
+        }
+        longest_run = longest_run.max(current_run);
+    }
+    (longest_run >= STAGNATION_REPEAT_THRESHOLD).then_some(longest_run)
+}
 
 /// Recognizes only the exact host-authored legacy notice, never arbitrary text.
 #[must_use]
@@ -714,12 +784,10 @@ fn retained_outcome_evidence(items: &[ModelContextItem]) -> Option<Vec<ModelCont
             ),
             _ => return None,
         };
-        let mut preview_end = outcome.content().len().min(EVIDENCE_PREVIEW_BYTES);
-        while !outcome.content().is_char_boundary(preview_end) {
-            preview_end -= 1;
-        }
+        let (output_preview, preview_omitted) =
+            evidence_output_preview(outcome.content(), EVIDENCE_PREVIEW_BYTES);
         let text = format!(
-            "{EVIDENCE_LABEL}{identity}\nresult_call={:?} result_tool={tool:?} result_item_key={:?} result_provider_ref={:?} status={:?} effect={:?} evidence={:?} original_output_truncated={} output_bytes={} preview_omitted={} output_preview={:?}",
+            "{EVIDENCE_LABEL}{identity}\nresult_call={:?} result_tool={tool:?} result_item_key={:?} result_provider_ref={:?} status={:?} effect={:?} evidence={:?} original_output_truncated={} output_bytes={} preview_omitted={} output_preview={output_preview:?}",
             call.as_str(),
             item_key.as_str(),
             provider_ref.as_str(),
@@ -728,12 +796,35 @@ fn retained_outcome_evidence(items: &[ModelContextItem]) -> Option<Vec<ModelCont
             outcome.evidence(),
             outcome.is_truncated(),
             outcome.content().len(),
-            preview_end < outcome.content().len(),
-            &outcome.content()[..preview_end]
+            preview_omitted,
         );
         records.push(ModelContextItem::assistant_text(EVIDENCE_KEY, text).ok()?);
     }
     Some(records)
+}
+
+fn evidence_output_preview(output: &str, max_bytes: usize) -> (String, bool) {
+    if output.len() <= max_bytes {
+        return (output.to_owned(), false);
+    }
+    let head_budget = max_bytes / 2;
+    let tail_budget = max_bytes - head_budget;
+    let mut head_end = head_budget;
+    while !output.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = output.len() - tail_budget;
+    while !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    (
+        format!(
+            "{}[middle of archived output omitted]{}",
+            &output[..head_end],
+            &output[tail_start..]
+        ),
+        true,
+    )
 }
 
 /// Hard representation ceilings and the host's reserved projection overhead.
@@ -833,12 +924,21 @@ mod tests {
     }
 
     fn exchange(id: &str, effect: EffectState) -> Vec<ModelContextItem> {
+        exchange_with("host_read", "{}", id, effect)
+    }
+
+    fn exchange_with(
+        tool_name: &str,
+        args: &str,
+        id: &str,
+        effect: EffectState,
+    ) -> Vec<ModelContextItem> {
         let call = ToolCall::new(
             RunId::new("run").unwrap(),
             TurnId::new("turn").unwrap(),
             CallId::new(id).unwrap(),
-            ToolId::new("host_read", M0_REVISION).unwrap(),
-            NormalizedArgs::new("{}").unwrap(),
+            ToolId::new(tool_name, M0_REVISION).unwrap(),
+            NormalizedArgs::new(args).unwrap(),
         );
         vec![
             ModelContextItem::assistant_call(id, id, call.clone()).unwrap(),
@@ -858,6 +958,161 @@ mod tests {
             )
             .unwrap(),
         ]
+    }
+
+    #[test]
+    fn repeated_action_signal_requires_three_identical_resolved_actions_and_results() {
+        let mut items = vec![ModelContextItem::user_text("inspect the implementation").unwrap()];
+        for id in ["one", "two"] {
+            items.extend(exchange(id, EffectState::KnownNotApplied));
+        }
+        assert_eq!(repeated_action_run(&items), None);
+
+        let mut changed = vec![ModelContextItem::user_text("task").unwrap()];
+        changed.extend(exchange("one", EffectState::KnownNotApplied));
+        changed.extend(exchange_with(
+            "host_search",
+            "{}",
+            "two",
+            EffectState::KnownNotApplied,
+        ));
+        changed.extend(exchange_with(
+            "host_search",
+            r#"{"path":"src"}"#,
+            "three",
+            EffectState::KnownNotApplied,
+        ));
+        assert_eq!(repeated_action_run(&changed), None);
+        items.extend(exchange("three", EffectState::KnownNotApplied));
+        assert_eq!(repeated_action_run(&items), Some(3));
+
+        if let ModelContextItem::ToolResult { outcome, .. } = items.last_mut().unwrap() {
+            *outcome = ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownNotApplied,
+                Evidence::HostObserved,
+                "different result",
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(repeated_action_run(&items), None);
+
+        if let ModelContextItem::ToolResult { outcome, .. } = items.last_mut().unwrap() {
+            *outcome = ToolOutcome::new(
+                ExecutionStatus::TimedOut,
+                EffectState::Unknown,
+                Evidence::Uncertain,
+                "unknown result",
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(repeated_action_run(&items), None);
+    }
+
+    #[test]
+    fn repeated_action_signal_respects_corrections_pairs_and_bounded_window() {
+        let mut corrected = vec![ModelContextItem::user_text("original task").unwrap()];
+        corrected.extend(exchange("one", EffectState::KnownNotApplied));
+        corrected.extend(exchange("two", EffectState::KnownNotApplied));
+        corrected
+            .push(ModelContextItem::user_text("Correction: inspect a different file").unwrap());
+        corrected.extend(exchange("three", EffectState::KnownNotApplied));
+        corrected.extend(exchange("four", EffectState::KnownNotApplied));
+        assert_eq!(repeated_action_run(&corrected), None);
+
+        let mut malformed = vec![ModelContextItem::user_text("task").unwrap()];
+        malformed.extend(exchange("one", EffectState::KnownNotApplied));
+        malformed.push(
+            ModelContextItem::tool_result(
+                CallId::new("orphan").unwrap(),
+                "orphan",
+                "orphan",
+                ToolId::new("host_read", M0_REVISION).unwrap(),
+                ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownNotApplied,
+                    Evidence::HostObserved,
+                    "source",
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        malformed.extend(exchange("two", EffectState::KnownNotApplied));
+        malformed.extend(exchange("three", EffectState::KnownNotApplied));
+        assert_eq!(repeated_action_run(&malformed), None);
+
+        let mut bounded = vec![ModelContextItem::user_text("task").unwrap()];
+        for id in ["one", "two", "three"] {
+            bounded.extend(exchange(id, EffectState::KnownNotApplied));
+        }
+        // Five later actions leave the repeated run within the eight-action
+        // window, while nine later actions evict it.
+        for index in 0..5 {
+            let mut action = exchange(&format!("tail-{index}"), EffectState::KnownApplied);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut action[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownApplied,
+                    Evidence::HostObserved,
+                    format!("different-{index}"),
+                    false,
+                )
+                .unwrap();
+            }
+            bounded.extend(action);
+        }
+        assert_eq!(repeated_action_run(&bounded), Some(3));
+        for index in 5..9 {
+            let mut action = exchange(&format!("tail-{index}"), EffectState::KnownApplied);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut action[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownApplied,
+                    Evidence::HostObserved,
+                    format!("different-{index}"),
+                    false,
+                )
+                .unwrap();
+            }
+            bounded.extend(action);
+        }
+        assert_eq!(repeated_action_run(&bounded), None);
+
+        let mut denied = vec![ModelContextItem::user_text("task").unwrap()];
+        for id in ["one", "two", "three"] {
+            denied.extend(exchange(id, EffectState::NotStarted));
+        }
+        let mut denied_action = exchange("four", EffectState::NotStarted);
+        if let ModelContextItem::ToolResult { outcome, .. } = &mut denied_action[1] {
+            *outcome = ToolOutcome::new(
+                ExecutionStatus::Denied,
+                EffectState::NotStarted,
+                Evidence::HostObserved,
+                "source",
+                false,
+            )
+            .unwrap();
+        }
+        denied.extend(denied_action);
+        denied.extend(exchange("five", EffectState::NotStarted));
+        assert_eq!(repeated_action_run(&denied), None);
+
+        let mut trailing_call = vec![ModelContextItem::user_text("task").unwrap()];
+        for id in ["one", "two", "three"] {
+            trailing_call.extend(exchange(id, EffectState::KnownNotApplied));
+        }
+        if let ModelContextItem::AssistantCall { call, .. } =
+            &exchange("unfinished", EffectState::KnownNotApplied)[0]
+        {
+            trailing_call.push(
+                ModelContextItem::assistant_call("unfinished", "unfinished", call.clone()).unwrap(),
+            );
+        }
+        assert_eq!(repeated_action_run(&trailing_call), None);
     }
 
     #[test]
@@ -1019,7 +1274,7 @@ mod tests {
                 ExecutionStatus::TimedOut,
                 EffectState::Unknown,
                 Evidence::Uncertain,
-                "中文".repeat(2000),
+                format!("HEAD{}TAIL", "中".repeat(2000)),
                 true,
             )
             .unwrap();
@@ -1069,6 +1324,9 @@ mod tests {
             "evidence=Uncertain",
             "original_output_truncated=true",
             "preview_omitted=true",
+            "HEAD",
+            "TAIL",
+            "middle of archived output omitted",
             "do not blindly retry",
         ] {
             assert!(text.as_str().contains(expected), "missing {expected}");
@@ -1076,6 +1334,19 @@ mod tests {
         assert!(!text.as_str().contains("verbose private reasoning"));
         assert!(text.as_str().len() < 2000);
         assert!(context_calls_are_paired(&plan.items));
+    }
+
+    #[test]
+    fn evidence_output_preview_is_bounded_utf8_safe_and_keeps_both_ends() {
+        let source = format!("HEAD{}TAIL", "中".repeat(100));
+        let (preview, omitted) = evidence_output_preview(&source, 16);
+        assert!(omitted);
+        assert!(preview.starts_with("HEAD中"));
+        assert!(preview.ends_with("中TAIL"));
+        assert!(preview.len() <= 16 + "[middle of archived output omitted]".len());
+        let (whole, omitted) = evidence_output_preview("短", 16);
+        assert!(!omitted);
+        assert_eq!(whole, "短");
     }
 
     #[test]

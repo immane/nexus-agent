@@ -110,6 +110,121 @@ Summary completion, reduced request occupancy, and reaching the target are
 separate outcomes. Increasing generation limits alone does not address either
 the summary byte limit or the retained-history growth.
 
+### Exposed Sphinx endurance run (2026-10-25)
+
+The offline `sphinx-doc__sphinx-9461` run used local `ollama-local/qwen3-27b`, a
+reference-only 94,208-token context window, a 65% compaction trigger, 10% target,
+32,768-token task output cap, and benchmark limits of 500 model turns, 4,096
+tool calls, and 24 hours. This was an exposed endurance/debug workload, not a
+blind task evaluation. The run lasted 6,928.726 seconds (1h 55m 28.7s), then
+stopped with `ResourceLimit: context summary failed; original conversation
+preserved`. It made 154 model requests (78 task, 76 summary), 116 tool calls,
+and 19 context reductions; known final usage was 2,273,240 input and 239,774
+output tokens. The workspace remained unchanged, the session store retained 260
+source records, and container cleanup completed. It did not reach the 4-hour
+endurance target; the stop was not the configured time, turn, or tool-call cap.
+
+The last task request took about 13m41s and returned 29,714 output tokens. The
+persisted source record for that response contains 109,889 bytes of provider
+reasoning, followed by three source-reading tool calls. This is evidence of a
+long model response, not a confirmed deadlock. The final compaction planned at
+an estimated 101,991 input tokens against a 94,208-token window and 32,768-token
+output reserve. The final summary response passed protocol validation, stopped
+normally, and contained 2,478 text bytes (below the 8,192-byte memory ceiling),
+but the run still terminated. The current `summary rejected` diagnostic covers
+both invalid summary output and a valid summary whose complete projected request
+cannot fit; this log does not identify the exact rejecting branch. Therefore the
+post-summary budget failure is plausible but not proven from this run alone.
+
+The source store contains 78 complete tool groups. Of 116 tool results, 97 had
+`effect=Unknown`; 92 older uncertain results were outside the newest three
+protected groups at termination. Those results are safety evidence and cannot
+be treated as no effect or discarded. The newest three groups alone contain
+110,671 bytes of reasoning, dominated by the final 109,889-byte record. The
+current output-preview fallback shortens tool-result bodies, not reasoning or
+deterministic uncertainty evidence. This combination can leave a large
+irreducible request floor even after a valid summary. Repeated compaction late in
+the run also yielded limited headroom; estimates are heuristic and the run's
+reference window is not proof of the provider's effective capacity.
+
+The summary prompt already requests `Established`, `Ruled out`, `Open`, and
+`Next`, but that is not a stagnation controller. In this run the agent repeatedly
+read the same autodoc/importer/documenter regions, tried to inspect unavailable
+Git history, and never modified files or ran pytest. This is evidence that the
+prompt and rolling memory did not prevent repeated exploration in this trace;
+it does not establish whether the summaries omitted the relevant facts, the
+model ignored them, or the next-step instruction was insufficiently operational.
+
+#### Follow-up design: bounded context and investigation progress
+
+Treat context endurance and investigation progress as separate workstreams; a
+longer run that repeats the same work is not a successful endurance result.
+
+1. **Improve failure observability first.** Distinguish summary protocol/content
+   rejection, request-construction failure, valid-summary-but-projection-over-
+   budget, protected-context floor over budget, and other resource limits. Record
+   per-request estimated occupancy, reserve, and bounded component byte/token
+   estimates for instructions, tool schemas, user/task text, reasoning, tool
+   results, derived memory, and uncertainty projections. Preserve unknown usage
+   as unknown; estimates are not provider token counts.
+2. **Separate full source from active model projection.** Keep original accepted
+   records and execution outcomes in the session archive; build bounded requests
+   from the current task/corrections, a covered-range investigation summary,
+   recent exchanges, and safety-critical execution state. Archive retention and
+   model-context size have distinct explicit limits. Add bounded read-by-record
+   or range access only if the current session API cannot retrieve needed detail.
+3. **Bound recent content without violating provider contracts.** Do not pin an
+   arbitrary amount of reasoning merely because it belongs to the newest three
+   groups. Determine whether each provider requires reasoning/continuation fields
+   to be replayed. Omit or project fields only where the provider contract allows
+   it; never blindly truncate protocol-required reasoning. Keep calls/results
+   paired and retain unresolved execution state in a compact, traceable form that
+   does not imply certainty. If the minimum valid request still cannot fit, stop
+   with a precise protected-context limit rather than retrying compaction.
+4. **Make compaction outcome-aware.** Preflight the irreducible context floor
+   before spending summary calls, measure actual projected savings, and avoid
+   immediate repeated summarization when the prior reduction cannot create
+   useful headroom. Keep generation reserve, active input, archive limits, and
+   soft compaction target as separate budgets. Summary text remains untrusted
+   derived memory; originals and execution evidence are not replaced by it.
+5. **Add bounded stagnation detection.** Detect candidate repetition over a
+   recent tool-call window using tool/revision, normalized arguments, results,
+   and repository/environment change where available. Identical reads after a
+   relevant file change or a justified verification rerun are not automatically
+   redundant. No diff alone is not stagnation. Record the detector's reason.
+6. **Trigger an investigation review, not an unrestricted second agent.** On
+   repeated low-information actions, provide a compact, redacted trace and current
+   investigation state. Ask for evidence-backed established facts, hypotheses
+   still open, repeated actions that produced no new information, and one
+   bounded discriminating experiment with predicted outcomes. The review grants
+   no tool authority and is not execution evidence. Give it a cooldown and a
+   per-run call/usage bound; do not recursively review reviews.
+7. **Require an actionable next step and escalate finitely.** Prefer a small
+   reproduction or test that distinguishes hypotheses over another broad source
+   reread. After a review, measure whether new evidence was actually produced.
+   If the next action repeats without relevant state change, switch strategy
+   once (for example, source tracing to minimal reproduction); after bounded
+   strategy changes, report the concrete blocker or ask the user rather than
+   looping indefinitely. Endurance mode may continue for stress testing, but
+   must label low-progress intervals separately from productive work.
+8. **Keep requests, logs, and review data safe.** Apply existing secret
+   redaction, bounded event and artifact sizes, and retention controls. Do not
+   log credentials or unrestricted arguments/output by default. Do not expose
+   hidden evaluator feedback, enable network access, silently replay tools, or
+   turn unknown effects into safe-to-repeat actions.
+
+Implement in increments: (A) precise compaction diagnostics and deterministic
+budget regressions; (B) provider-contract-aware bounded context projection and
+uncertainty representation; (C) stagnation telemetry and offline trace review;
+(D) bounded runtime review/action loop only after replay tests show the detector
+can distinguish repetition from legitimate verification. Validate first with
+deterministic synthetic traces, then a fresh isolated offline Sphinx endurance
+run against this preserved baseline. Report elapsed time, termination reason,
+task/summary calls and usage, compaction attempts versus commits, protected
+context floor, exact review triggers/actions, repeated-action rate, workspace
+diff, and resource sampling separately. Do not claim a 4h pass unless the run
+actually survives that interval.
+
 ### Archived-history summary increment
 
 For persistent runs whose accepted sources have all been saved, summarization
@@ -147,6 +262,54 @@ table and recovery discussion earlier in this section describe a historical
 baseline, not the complete current workspace.
 
 #### Inspected implementation
+
+The 2026-10-26 follow-up now reports summary rejection categories separately:
+invalid provider batch, invalid summary text, projected request construction or
+headroom projection failure, projected item-limit overflow, and a valid summary
+whose projected input plus output reserve remains over the configured window.
+The latter has a specific `LimitReached` message and reports estimated input,
+output reserve, and window; it preserves the original active conversation and
+does not adopt the candidate summary. These figures remain estimates, not
+provider-reported occupancy. This diagnostic change does not alter provider
+reasoning replay.
+
+Uncertain-outcome projections now retain at most 128 bytes of tool output as
+UTF-8-safe head/tail excerpts, with an explicit middle-omitted marker and the
+original output length/truncation state. The full archived source record remains
+unchanged. This reduces repeated result text in active context; it does not
+remove call identity, arguments, uncertainty, or authorization boundaries.
+
+Before issuing a summary request, the runtime now evaluates a lower-bound
+projection with no derived summary text and the existing bounded tool-output
+previews. If that candidate still exceeds the configured input-plus-output or
+item budget, it returns a protected-context limit without spending a summary
+turn. This is a best-effort estimate, not provider tokenization; the original
+conversation remains unchanged. It avoids futile summarization but does not
+make an irreducible oversized recent item fit.
+
+The runtime also emits an advisory low-information repetition diagnostic for a
+run of at least three identical, completed tool actions (tool revision,
+normalized arguments, and observed outcome) among the latest eight actions.
+Only correctly ordered, single-call/result pairs are considered. User messages,
+denied, parallel, unpaired, malformed, unknown, or uncertain records break the
+candidate sequence. It records only counts and the comparison reason, not
+arguments or outputs. This is telemetry—not proof that the environment was
+unchanged, and it neither blocks calls nor triggers an automatic review.
+Repository/environment change detection and bounded review remain future work.
+
+Summary commits now report the estimated request occupancy immediately before
+and after commit, their signed estimated token savings, the configured
+generation reserve, and the window. These are runtime estimator heuristics, not
+provider-reported input usage. A valid candidate is accepted when it fits the
+complete input-plus-reserve budget; it need not reach the soft target or produce
+a minimum savings amount. For archived history under the Summarize strategy,
+remaining above the soft trigger alone does not immediately schedule another
+summary; exceeding the hard input-plus-reserve budget still enters reduction
+and protected-floor checks. Non-archived runs retain their existing
+certainty-based selection and may attempt reduction again on a later request.
+There is no savings-based retry guard: no evidence currently demonstrates an
+unbounded invalid-summary payment loop, and accepted summaries are not rejected
+solely for low estimated savings.
 
 The estimator uses `ceil(payload_bytes / 3)` plus message/tool framing. It starts
 with a 1.25 safety multiplier and now exposes the raw estimate, adjusted estimate

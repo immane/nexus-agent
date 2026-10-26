@@ -312,8 +312,35 @@ fn assert_single_token(value: &str, context: &str) {
     percent_decode(value).unwrap_or_else(|error| panic!("{context} decodes: {error}"));
 }
 
-/// Strips the host-issued run and call identities, which the runtime mints per
-/// incarnation, so two runs of one task can be compared field for field.
+/// Strips host identities and their derived token estimates. Incarnation hex
+/// strings have variable widths, and their bytes count toward request payloads.
+fn normalize_line(line: &str, incarnation: &str) -> String {
+    let line = line.replace(incarnation, "<incarnation>");
+    if !line.split(' ').any(|token| token == "kind=model-request") {
+        return line;
+    }
+    let raw: u64 = field(&line, "raw-estimated-input")
+        .parse()
+        .expect("raw estimate");
+    let scale: u64 = field(&line, "estimate-scale-millis")
+        .parse()
+        .expect("estimate scale");
+    let estimated: u64 = field(&line, "estimated-input")
+        .parse()
+        .expect("scaled estimate");
+    assert!(raw > 0, "the request has a nonempty payload");
+    assert_eq!(estimated, raw.saturating_mul(scale).div_ceil(1000));
+    line.split(' ')
+        .map(|token| match token.split_once('=') {
+            Some(("estimated-input", _)) => "estimated-input=<derived>",
+            Some(("raw-estimated-input", _)) => "raw-estimated-input=<derived>",
+            _ => token,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Compares all other fields and their order across runtime incarnations.
 fn normalized_lines(report: &HeadlessReport) -> Vec<String> {
     let incarnation = report
         .run
@@ -324,8 +351,24 @@ fn normalized_lines(report: &HeadlessReport) -> Vec<String> {
     report
         .lines
         .iter()
-        .map(|line| line.replace(incarnation, "<incarnation>"))
+        .map(|line| normalize_line(line, incarnation))
         .collect()
+}
+
+#[test]
+fn report_normalization_handles_identity_width_without_hiding_other_fields() {
+    let short = "run=r123-1 kind=model-request estimated-input=574 raw-estimated-input=459 estimate-scale-millis=1250 purpose=Task";
+    let long = "run=r123456-1 kind=model-request estimated-input=577 raw-estimated-input=461 estimate-scale-millis=1250 purpose=Task";
+    assert_eq!(normalize_line(short, "123"), normalize_line(long, "123456"));
+    assert_ne!(
+        normalize_line(short, "123"),
+        normalize_line(&long.replace("purpose=Task", "purpose=Summary"), "123456")
+    );
+    let text = "run=r123-1 kind=text text=estimated-input%3D574";
+    assert_eq!(
+        normalize_line(text, "123"),
+        "run=r<incarnation>-1 kind=text text=estimated-input%3D574"
+    );
 }
 
 fn encoded_len(lines: &[String]) -> usize {

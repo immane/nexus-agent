@@ -419,6 +419,8 @@ pub struct UserConfig {
     modes: Vec<AgentMode>,
     default_mode: Option<String>,
     context_management: ContextManagementPolicy,
+    gateway_image: Option<String>,
+    workload_image: Option<String>,
 }
 
 impl UserConfig {
@@ -434,6 +436,8 @@ impl UserConfig {
             modes: Vec::new(),
             default_mode: None,
             context_management: ContextManagementPolicy::default(),
+            gateway_image: None,
+            workload_image: None,
         }
     }
 
@@ -459,6 +463,39 @@ impl UserConfig {
     /// Replaces the global policy with a validated core policy.
     pub fn set_context_management(&mut self, policy: ContextManagementPolicy) {
         self.context_management = policy;
+    }
+
+    /// Locally installed Docker image reference used by optional container execution.
+    #[must_use]
+    pub fn gateway_image(&self) -> Option<&str> {
+        self.gateway_image.as_deref()
+    }
+
+    /// Locally installed Docker workload image reference.
+    #[must_use]
+    pub fn workload_image(&self) -> Option<&str> {
+        self.workload_image.as_deref()
+    }
+
+    /// Sets container image references. References may be mutable tags; startup resolves them locally.
+    pub fn set_container_images(
+        &mut self,
+        gateway: Option<String>,
+        workload: Option<String>,
+    ) -> Result<(), ConfigError> {
+        fn valid(value: &Option<String>) -> bool {
+            value.as_ref().is_none_or(|s| {
+                !s.is_empty()
+                    && s.len() <= 512
+                    && !s.bytes().any(|b| b.is_ascii_whitespace() || b == 0)
+            })
+        }
+        if !valid(&gateway) || !valid(&workload) {
+            return Err(invalid("container image reference is invalid"));
+        }
+        self.gateway_image = gateway;
+        self.workload_image = workload;
+        Ok(())
     }
 
     /// Resolves configured settings for a provider and optional model entry id.
@@ -742,6 +779,16 @@ impl UserConfig {
                 policy_json(self.context_management),
             );
         }
+        if self.gateway_image.is_some() || self.workload_image.is_some() {
+            let mut images = Map::new();
+            if let Some(image) = &self.gateway_image {
+                images.insert("gateway".to_owned(), Value::String(image.clone()));
+            }
+            if let Some(image) = &self.workload_image {
+                images.insert("workload".to_owned(), Value::String(image.clone()));
+            }
+            document.insert("container_images".to_owned(), Value::Object(images));
+        }
         Value::Object(document).to_string()
     }
 
@@ -763,6 +810,7 @@ impl UserConfig {
                 "modes",
                 "default_mode",
                 "context_management",
+                "container_images",
             ],
         )?;
         let revision = document
@@ -775,6 +823,18 @@ impl UserConfig {
         let mut config = Self::default_config();
         if let Some(policy) = document.get("context_management") {
             config.set_context_management(parse_policy(policy)?);
+        }
+        if let Some(images) = document.get("container_images") {
+            let images = images
+                .as_object()
+                .ok_or(invalid("container image reference is invalid"))?;
+            reject_unknown(images, &["gateway", "workload"])?;
+            let parse = |key| match images.get(key) {
+                None => Ok(None),
+                Some(Value::String(value)) => Ok(Some(value.clone())),
+                _ => Err(invalid("container image reference is invalid")),
+            };
+            config.set_container_images(parse("gateway")?, parse("workload")?)?;
         }
         for provider in object_array(document, "providers")? {
             config.add_provider(parse_provider(provider, revision)?)?;
@@ -1140,4 +1200,24 @@ fn parse_mode(object: &Map<String, Value>) -> Result<AgentMode, ConfigError> {
         require_str(object, "label")?.to_owned(),
         read_only,
     )
+}
+
+#[cfg(test)]
+mod container_image_config_tests {
+    use super::UserConfig;
+
+    #[test]
+    fn image_references_round_trip_and_validate() {
+        let mut config = UserConfig::default_config();
+        config
+            .set_container_images(Some("gateway:dev".into()), Some("workload:stable".into()))
+            .unwrap();
+        let restored = UserConfig::from_json(&config.to_json()).unwrap();
+        assert_eq!(restored.gateway_image(), Some("gateway:dev"));
+        assert_eq!(restored.workload_image(), Some("workload:stable"));
+        assert!(config.set_container_images(Some(" ".into()), None).is_err());
+        assert!(
+            UserConfig::from_json(r#"{"revision":2,"container_images":{"gateway":4}}"#).is_err()
+        );
+    }
 }

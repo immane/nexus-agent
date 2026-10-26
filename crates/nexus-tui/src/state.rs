@@ -793,6 +793,17 @@ pub struct ModelChoice {
     pub provider: String,
 }
 
+/// One live or saved conversation offered by the session picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionChoice {
+    /// Exact session identity, never a display label or numeric index.
+    pub id: String,
+    /// Safe display label including live status or saved revision.
+    pub label: String,
+    /// Saved sessions must be explicitly restored before use.
+    pub saved: bool,
+}
+
 /// Transient picker state for the model dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPicker {
@@ -819,6 +830,8 @@ impl ModelPicker {
 pub enum Overlay {
     /// Searchable configured-model list opened by bare `:model`.
     ModelPicker(ModelPicker),
+    /// Session list, sharing the model picker's filter and cursor behavior.
+    SessionPicker(ModelPicker),
     /// Scrollable keyboard and command reference.
     Help(HelpDialog),
 }
@@ -948,6 +961,7 @@ pub struct AppState {
     /// still validates against live configuration, so a stale snapshot
     /// can never select an unknown id.
     model_choices: Vec<ModelChoice>,
+    session_choices: Vec<SessionChoice>,
     /// Active modal dialog, if any. While set, keyboard input routes to
     /// the overlay first and never falls through to composer, viewport,
     /// or approval shortcuts.
@@ -1011,6 +1025,7 @@ impl AppState {
             mode_index: 1,
             last_usage: None,
             model_choices: Vec::new(),
+            session_choices: Vec::new(),
             overlay: None,
             command_line: None,
             completion: None,
@@ -1363,8 +1378,13 @@ impl AppState {
                         sanitize(error.message())
                     )
                 });
+                let persistence = match finished.persistence() {
+                    nexus_core::PersistenceState::Ephemeral => "memory-only history",
+                    nexus_core::PersistenceState::Saved => "source history saved",
+                    nexus_core::PersistenceState::SaveFailed => "source history save failed",
+                };
                 self.push_system(format!(
-                    "run {} finished: {:?} (ephemeral record){detail}",
+                    "run {} finished: {:?} ({persistence}){detail}",
                     event.run().as_str(),
                     finished.outcome()
                 ));
@@ -1496,6 +1516,50 @@ impl AppState {
         }
         self.history_cursor = None;
         self.history_stash.clear();
+    }
+
+    /// Displays restored records through the normal sanitized retention path.
+    /// No live events, approvals, reasoning traces, or tool execution are restored.
+    pub fn record_restored_history(&mut self, items: &[nexus_core::provider::ModelContextItem]) {
+        use nexus_core::provider::ModelContextItem;
+
+        for item in items {
+            let (kind, title, text, folded) = match item {
+                ModelContextItem::UserText(text) => {
+                    self.record_submitted(text.as_str());
+                    continue;
+                }
+                ModelContextItem::AssistantText { text, .. } => (
+                    EntryKind::Assistant,
+                    "assistant · saved".to_owned(),
+                    text.as_str().to_owned(),
+                    false,
+                ),
+                ModelContextItem::ToolResult { tool, outcome, .. } => (
+                    EntryKind::Tool,
+                    format!(
+                        "{} · saved · {:?} · {:?}",
+                        tool.name(),
+                        outcome.status(),
+                        outcome.effect()
+                    ),
+                    outcome.content().to_owned(),
+                    true,
+                ),
+                ModelContextItem::AssistantCall { .. }
+                | ModelContextItem::AssistantDeniedCall { .. }
+                | ModelContextItem::AssistantReasoning { .. } => continue,
+            };
+            let mut entry = Entry::new(kind, &title);
+            for line in sanitize(&text).split('\n') {
+                entry.push_line(line);
+            }
+            entry.folded = folded;
+            if let ModelContextItem::ToolResult { outcome, .. } = item {
+                entry.truncated |= outcome.is_truncated();
+            }
+            self.push_entry(entry);
+        }
     }
 
     /// Recalls the previous submitted input into the composer (`Up`).
@@ -1986,6 +2050,31 @@ impl AppState {
         }));
     }
 
+    /// Opens a bounded snapshot of live and saved sessions without loading history.
+    pub fn open_session_picker(&mut self, choices: Vec<SessionChoice>) {
+        self.session_choices = choices
+            .into_iter()
+            .take(nexus_core::commands::MAX_LIST_LIMIT + 16)
+            .collect();
+        self.clear_colon();
+        self.overlay = Some(Overlay::SessionPicker(ModelPicker {
+            filter: String::new(),
+            selected: 0,
+        }));
+    }
+
+    /// Whether the session picker owns keyboard input.
+    #[must_use]
+    pub fn session_picker_open(&self) -> bool {
+        matches!(&self.overlay, Some(Overlay::SessionPicker(_)))
+    }
+
+    /// Session metadata snapshot; contains no conversation content.
+    #[must_use]
+    pub fn session_choices(&self) -> &[SessionChoice] {
+        &self.session_choices
+    }
+
     /// Opens the unified help dialog without adding a transcript entry.
     pub fn open_help(&mut self) {
         self.command_line = None;
@@ -2201,7 +2290,7 @@ impl AppState {
     #[must_use]
     pub fn picker_filter(&self) -> &str {
         match &self.overlay {
-            Some(Overlay::ModelPicker(picker)) => &picker.filter,
+            Some(Overlay::ModelPicker(picker) | Overlay::SessionPicker(picker)) => &picker.filter,
             Some(Overlay::Help(_)) => "",
             None => "",
         }
@@ -2211,7 +2300,7 @@ impl AppState {
     #[must_use]
     pub fn picker_selected(&self) -> usize {
         match &self.overlay {
-            Some(Overlay::ModelPicker(picker)) => picker.selected,
+            Some(Overlay::ModelPicker(picker) | Overlay::SessionPicker(picker)) => picker.selected,
             Some(Overlay::Help(_)) => 0,
             None => 0,
         }
@@ -2224,6 +2313,19 @@ impl AppState {
     pub fn picker_matches(&self) -> Vec<usize> {
         let picker = match &self.overlay {
             Some(Overlay::ModelPicker(picker)) => picker,
+            Some(Overlay::SessionPicker(picker)) => {
+                let needle = picker.filter.to_lowercase();
+                return self
+                    .session_choices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, choice)| {
+                        choice.id.to_lowercase().contains(&needle)
+                            || choice.label.to_lowercase().contains(&needle)
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+            }
             Some(Overlay::Help(_)) => return Vec::new(),
             None => return Vec::new(),
         };
@@ -2242,7 +2344,8 @@ impl AppState {
         if char.is_control() || is_bidi_format(char) {
             return;
         }
-        if let Some(Overlay::ModelPicker(picker)) = &mut self.overlay
+        if let Some(Overlay::ModelPicker(picker) | Overlay::SessionPicker(picker)) =
+            &mut self.overlay
             && picker.filter.len() + char.len_utf8() <= MAX_PICKER_FILTER_BYTES
         {
             picker.filter.push(char);
@@ -2252,7 +2355,9 @@ impl AppState {
 
     /// Deletes the last picker filter char, resetting the cursor.
     pub fn picker_backspace(&mut self) {
-        if let Some(Overlay::ModelPicker(picker)) = &mut self.overlay {
+        if let Some(Overlay::ModelPicker(picker) | Overlay::SessionPicker(picker)) =
+            &mut self.overlay
+        {
             picker.filter.pop();
             picker.selected = 0;
         }
@@ -2261,7 +2366,9 @@ impl AppState {
     /// Moves the picker cursor over `count` visible matches, saturating at
     /// both ends so navigation never wraps onto an unintended row.
     pub fn picker_move(&mut self, delta: isize, count: usize) {
-        if let Some(Overlay::ModelPicker(picker)) = &mut self.overlay {
+        if let Some(Overlay::ModelPicker(picker) | Overlay::SessionPicker(picker)) =
+            &mut self.overlay
+        {
             let max = count.saturating_sub(1);
             let next = (picker.selected as isize + delta).clamp(0, max as isize);
             picker.selected = next as usize;
@@ -2274,7 +2381,11 @@ impl AppState {
     #[must_use]
     pub fn picker_confirm(&self, count: usize) -> Option<usize> {
         match &self.overlay {
-            Some(Overlay::ModelPicker(picker)) if picker.selected < count => Some(picker.selected),
+            Some(Overlay::ModelPicker(picker) | Overlay::SessionPicker(picker))
+                if picker.selected < count =>
+            {
+                Some(picker.selected)
+            }
             _ => None,
         }
     }
@@ -3202,7 +3313,7 @@ mod tests {
         let lines: Vec<String> = state.transcript();
         assert!(
             lines.iter().any(
-                |line| line.contains("finished: Completed (ephemeral record)")
+                |line| line.contains("finished: Completed (memory-only history)")
                     && !line.contains("error=")
             ),
             "a clean finish carries no error detail: {lines:?}"
@@ -3229,13 +3340,48 @@ mod tests {
         assert!(state.apply_event(&failed));
         let lines: Vec<String> = state.transcript();
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("finished: Failed (ephemeral record)")
+            lines.iter().any(
+                |line| line.contains("finished: Failed (memory-only history)")
                     && line.contains("error=Protocol")
-                    && line.contains("provider reply tool call arguments are invalid")),
+                    && line.contains("provider reply tool call arguments are invalid")
+            ),
             "a failed run names its error on the transcript: {lines:?}"
         );
+    }
+
+    #[test]
+    fn finish_describes_source_persistence_not_a_saved_terminal_record() {
+        use nexus_core::{AgentError, ErrorCategory, PersistenceState, RetryGuidance, RunFinished};
+        for (persistence, label) in [
+            (PersistenceState::Ephemeral, "memory-only history"),
+            (PersistenceState::Saved, "source history saved"),
+            (PersistenceState::SaveFailed, "source history save failed"),
+        ] {
+            let mut state = AppState::new();
+            assert!(state.apply_event(&started(0)));
+            let (session, run) = session_run();
+            let error = (persistence == PersistenceState::SaveFailed).then(|| {
+                AgentError::new(
+                    ErrorCategory::Internal,
+                    "session save failed",
+                    RetryGuidance::DoNotRetry,
+                )
+                .unwrap()
+            });
+            let event = RunEvent::new(
+                session,
+                run,
+                1,
+                EventPayload::RunFinished(
+                    RunFinished::new(RunOutcome::Completed, persistence, error).unwrap(),
+                ),
+            );
+            assert!(state.apply_event(&event));
+            let transcript = state.transcript().join("\n");
+            assert!(transcript.contains(&format!("finished: Completed ({label})")));
+            assert!(!transcript.contains("ephemeral record"));
+            assert!(!transcript.contains("terminal record saved"));
+        }
     }
 
     #[test]
@@ -3303,6 +3449,27 @@ mod tests {
             state.entry_count() < MAX_RETAINED_ENTRIES,
             "aggregate budget drops before the entry count cap"
         );
+    }
+
+    #[test]
+    fn restored_history_is_visible_sanitized_and_recallable_without_live_state() {
+        use nexus_core::provider::ModelContextItem;
+
+        let mut state = AppState::new();
+        let items = vec![
+            ModelContextItem::user_text("saved question").unwrap(),
+            ModelContextItem::assistant_text("saved-answer", "saved answer\x1b[2J").unwrap(),
+        ];
+        state.record_restored_history(&items);
+        assert_eq!(state.entry_count(), 2);
+        assert_eq!(state.entries[0].kind, EntryKind::User);
+        assert_eq!(state.entries[1].kind, EntryKind::Assistant);
+        assert!(state.entries[1].lines.join("\n").contains("saved answer"));
+        assert!(!state.entries[1].lines.join("\n").contains('\x1b'));
+        assert!(state.active_run.is_none());
+        assert!(state.pending_approval.is_none());
+        state.recall_prev();
+        assert_eq!(state.composer(), "saved question");
     }
 
     #[test]

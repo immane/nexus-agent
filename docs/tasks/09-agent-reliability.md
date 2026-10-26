@@ -108,9 +108,38 @@ verification requirements to inflate completion rates.
 Acceptance: incorrect temporary assertions are not silently delivered. Official
 evaluation uses the original submitted prediction, not a manually improved patch.
 
+### 6. Improve tool discovery and evidence-based research
+
+- [ ] Provide a runtime-generated, bounded capability summary at task start:
+  available executables and relevant versions, tool path scopes, writable
+  locations, and supported network/search interfaces. Do not rely on stale
+  image documentation or repeated command probes.
+- [ ] Make tool errors distinguish unsupported commands/options, invalid or
+  out-of-scope paths, worker startup failures, and execution failures, while
+  keeping diagnostics bounded and free of sensitive payloads.
+- [ ] Evaluate a dedicated, permission-bounded web search and page-reading
+  integration that returns limited titles, snippets, URLs, and source identity;
+  prefer it to ad hoc shell scripts and raw HTML when available.
+- [ ] For research tasks, use a staged retrieval strategy: identify the relevant
+  project facts, formulate comparison criteria, search a small candidate set,
+  and open only sources needed to verify claims. Bound page and result output.
+- [ ] Require final factual recommendations to retain source links and separate
+  verified facts from similarity judgments and unverified candidates. Exclude
+  claims whose author, title, or cited detail could not be verified.
+- [ ] Stop and change strategy after repeated low-yield searches or environment
+  probes. Record the blocker or uncertainty rather than inventing an explanation
+  for search behavior or filling gaps from uncertain memory.
+- [ ] Track useful progress versus repeated planning, probes, and failed
+  retrievals; assess context use alongside tool-call count and completion time.
+
+Acceptance: a generic multi-step research task can discover its actual tool
+capabilities, gather bounded and attributable evidence, and produce calibrated
+recommendations without repeated environment probing or unsupported factual
+claims. Improvements must be evaluated on tasks not used to design the behavior.
+
 ## P1: Make experiments and resource lifecycle reliable
 
-### 6. Add startup preflight checks
+### 7. Add startup preflight checks
 
 - [ ] Check that the server supports container execution.
 - [ ] Check port availability, model endpoint, credential references, images,
@@ -125,7 +154,7 @@ evaluation uses the original submitted prediction, not a manually improved patch
 Acceptance: missing features and premature server exits are identified before a
 task starts.
 
-### 7. Improve shutdown and cleanup
+### 8. Improve shutdown and cleanup
 
 - [ ] Determine why workload and gateway containers remain after task completion.
 - [ ] Design and verify graceful server shutdown with bounded cleanup.
@@ -137,7 +166,7 @@ task starts.
 Acceptance: normal operation leaves no run-owned resources. Exceptional paths do
 not delete unrelated resources or falsely report successful cleanup.
 
-### 8. Preserve partial and final results
+### 9. Preserve partial and final results
 
 - [ ] Save the patch, known usage, and errors where possible after abnormal agent
   termination.
@@ -151,7 +180,7 @@ record.
 
 ## P2: Validate context reduction independently
 
-### 9. Start with deterministic long-history replay
+### 10. Start with deterministic long-history replay
 
 - [ ] Construct cross-turn histories unrelated to any specific benchmark answer.
 - [ ] Trigger item and byte pressure independently.
@@ -167,7 +196,7 @@ record.
 Acceptance: explain when reduction occurs, what it removes, and why removal is
 allowed. Context notes never confer tool authority.
 
-### 10. Run live comparisons only when warranted
+### 11. Run live comparisons only when warranted
 
 - [ ] After deterministic validation, select tasks that naturally create long
   histories.
@@ -182,7 +211,7 @@ evidence that context reduction actually occurred.
 
 ## P2: Evaluate generalization on a small fixed sample
 
-### 11. Preselect the next task batch
+### 12. Preselect the next task batch
 
 - [ ] Start with four to six tasks across repositories and problem types.
 - [ ] Do not replace tasks based on known solution difficulty or interim results.
@@ -192,7 +221,7 @@ evidence that context reduction actually occurred.
 - [ ] Retain failed and infrastructure-invalid attempts, not only resolved tasks.
 - [ ] Finish batch analysis before tuning prompts and retrying failed tasks.
 
-### 12. Compare outcomes and efficiency
+### 13. Compare outcomes and efficiency
 
 - [ ] Report official task-test results and normal agent completion separately.
 - [ ] Measure additional turns and time after the first correct repair where

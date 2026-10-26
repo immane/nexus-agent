@@ -31,10 +31,12 @@ Enter or Tab inserts the selected completion, and a subsequent Enter executes
 the command. Esc first closes the popup without moving focus. `@` path
 completion is display/insertion only and does not read or attach file content.
 
-Interactive TUI runtimes allow up to 64 model turns per run to accommodate
-coding workflows with inspect/edit/check and recovery cycles. Other finite
-M0-test resource limits remain unchanged; this is a TUI-specific override,
-not a change to the shared runtime or headless defaults.
+Interactive TUI runtimes allow up to 64 model turns and 128 tool calls per run,
+with a one-hour run deadline and 512 retained context items, to accommodate
+coding workflows with inspect/edit/check and recovery cycles. The 16 tool calls
+per turn and other finite M0-test limits remain unchanged; these are TUI-specific
+overrides, not changes to shared runtime or headless defaults. Run snapshots can
+represent up to 128 tool outcomes so the increased call budget remains reportable.
 
 ## Approvals
 
@@ -47,6 +49,15 @@ Cancellation must remain available while output streams or an approval is pendin
 ## History and Rendering
 
 Start a new conversation by default. Automatic saves use the configured local store outside the project. Listing or selecting previous sessions is explicit and bounded; restoration never reruns old tools or restores their grants.
+
+`Ctrl+S`, `:s`, and bare `:session` open a searchable session dialog combining
+live slots and saved sessions. Arrow keys select, Enter switches or restores, and
+Esc dismisses without changing the conversation. Live switching preserves each
+slot's draft. Restoring also displays the runtime's bounded history projection
+(user and assistant text plus folded tool results), with an explicit notice when
+older context items were omitted. Saved reasoning and authorization are not
+restored into the UI. `:session show` reports the active session; explicit
+ID-based commands remain available.
 
 Batch stream updates, cache layout where useful, and process visible entries rather than reparsing all history. Bound retained text, output, and caches; report presentation truncation separately from accepted conversation records. Render untrusted content without allowing terminal control-sequence injection.
 

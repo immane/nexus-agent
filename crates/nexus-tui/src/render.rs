@@ -26,6 +26,7 @@ use ratatui::widgets::{
 
 use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
+use crate::sanitize::sanitize;
 use crate::state::{
     AppState, ApprovalGeometry, EntryKind, MAX_PICKER_VISIBLE_ROWS, PendingApprovalCard,
     PointerGeometry, chunks, display_width, wrapped_height,
@@ -492,7 +493,8 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     let visible = matches.len().min(MAX_PICKER_VISIBLE_ROWS);
     // Prefer a 24..=56-cell dialog, shrinking with the frame on tiny
     // terminals instead of overflowing it.
-    let width = match area.width.saturating_sub(4).min(56) {
+    let preferred_width = if state.session_picker_open() { 88 } else { 56 };
+    let width = match area.width.saturating_sub(4).min(preferred_width) {
         narrow if narrow < 24 => narrow.min(area.width),
         wide => wide,
     };
@@ -517,7 +519,11 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green).bg(Color::Black))
-        .title(" model ")
+        .title(if state.session_picker_open() {
+            " sessions · Ctrl+S "
+        } else {
+            " model "
+        })
         .title_bottom(" ↑↓ navigate · enter select · esc close ");
     let inner = block.inner(popup);
     block.render(popup, buf);
@@ -537,15 +543,26 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     ]));
     let active = state.active_model().map(str::to_owned);
     for (row, index) in matches.iter().skip(start).take(visible).enumerate() {
-        let Some(choice) = state.model_choices().get(*index) else {
-            continue;
+        let mut label = if state.session_picker_open() {
+            let Some(choice) = state.session_choices().get(*index) else {
+                continue;
+            };
+            sanitize(&format!("{} · {}", choice.label, choice.id))
+        } else {
+            let Some(choice) = state.model_choices().get(*index) else {
+                continue;
+            };
+            let mut label = format!("{} @ {}", choice.id, choice.provider);
+            if active.as_deref() == Some(choice.id.as_str()) {
+                label.push_str(" ●");
+            }
+            label
         };
-        let mut label = format!("{} @ {}", choice.id, choice.provider);
-        if active.as_deref() == Some(choice.id.as_str()) {
-            label.push_str(" ●");
-        }
         // Hard-truncate to the popup width so long ids cannot overflow.
-        let label: String = label.chars().take(inner.width as usize - 2).collect();
+        label = label
+            .chars()
+            .take(inner.width.saturating_sub(2) as usize)
+            .collect();
         if start + row == selected {
             rows.push(Line::from(vec![
                 Span::raw("▸ "),
@@ -605,7 +622,7 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
     lines.push(help_row("Terminal UI", "Ratatui 0.26.3 · Crossterm 0.27.0"));
     lines.push(help_row(
         "Runtime",
-        "M0-test resource policy · ephemeral sessions",
+        "Bounded runs · local history (ephemeral in --demo)",
     ));
     lines.push(help_row("Model", model));
     lines.push(help_row("Session", session));
@@ -630,8 +647,11 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
         "Select an exact configured model ID",
     ));
     lines.push(help_row(":usage", "Show the last observed token usage"));
-    lines.push(help_row(":s", "List local sessions"));
-    lines.push(help_row(":session", "Show the active session"));
+    lines.push(help_row(
+        "Ctrl+S · :s · :session",
+        "Choose a live or saved session",
+    ));
+    lines.push(help_row(":session show", "Show the active session"));
     lines.push(help_row(
         ":session new",
         "Create and switch to a new session",
@@ -642,6 +662,10 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
         "Explicitly read and import the legacy session file",
     ));
     lines.push(help_row(":session delete <id>", "Delete a saved session"));
+    lines.push(help_row(
+        ":session restore <id>",
+        "Restore saved history without replay",
+    ));
     lines.push(help_row(
         ":session switch <target>",
         "Switch by index, label, or ID",
@@ -2923,16 +2947,17 @@ mod cov_render_private {
             rows.iter().any(|row| row.contains(":session switch")),
             "{rows:?}"
         );
-        assert!(
-            rows.iter().any(|row| row.contains("Ctrl+J / Alt+Enter")),
-            "{rows:?}"
-        );
+        assert!(rows.iter().any(|row| row.contains("Ctrl+S")), "{rows:?}");
         assert!(
             rows.iter().any(|row| row.contains("example-model")),
             "active model is included: {rows:?}"
         );
         state.scroll_help(20);
         let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
+        assert!(
+            rows.iter().any(|row| row.contains("Ctrl+J / Alt+Enter")),
+            "{rows:?}"
+        );
         assert!(
             rows.iter().any(|row| row.contains("CONVERSATION VIEWPORT")),
             "{rows:?}"

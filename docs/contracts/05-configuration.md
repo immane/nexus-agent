@@ -60,6 +60,13 @@ A frontend or plugin cannot change host policy by emitting content. Loading an o
 
 The current TUI owns one mutable user-config document per process and serializes its recent-model updates and saves through that owner. Saves use atomic replacement, but this is not a cross-process merge or lock: if multiple processes update the same file, the last successful rename wins and an earlier process's changes may be lost. This policy does not promise reconciliation with edits made by another process while the TUI is running.
 
+The shared revision-2 user config may also contain `container_images`, an object
+with optional `gateway` and `workload` local Docker image references. References
+are validated as bounded nonempty strings, not as immutable digests, because
+local tags are resolved to Docker image IDs at container startup. CLI image
+flags override their respective config fields. Startup only inspects local
+images; it never pulls or builds them.
+
 ## Compatibility and Privacy
 
 Version stored configuration independently from provider and external-plugin protocols. Explain migrations and reject unsupported required formats instead of inferring them.

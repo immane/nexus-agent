@@ -219,6 +219,8 @@ pub struct CommandResponse {
     sessions: Vec<crate::SessionMetadata>,
     has_sessions: bool,
     restored_session: Option<crate::SessionId>,
+    restored_history: Vec<crate::provider::ModelContextItem>,
+    restored_omitted_items: usize,
 }
 
 impl CommandResponse {
@@ -232,6 +234,8 @@ impl CommandResponse {
             sessions: Vec::new(),
             has_sessions: false,
             restored_session: None,
+            restored_history: Vec::new(),
+            restored_omitted_items: 0,
         }
     }
 
@@ -254,6 +258,31 @@ impl CommandResponse {
     pub fn with_restored_session(mut self, session: crate::SessionId) -> Self {
         self.restored_session = Some(session);
         self
+    }
+
+    /// Attaches the runtime's bounded restored context projection for display.
+    /// These records never replay tools or restore authorization.
+    #[must_use]
+    pub fn with_restored_history(
+        mut self,
+        items: Vec<crate::provider::ModelContextItem>,
+        omitted_items: usize,
+    ) -> Self {
+        self.restored_history = items;
+        self.restored_omitted_items = omitted_items;
+        self
+    }
+
+    /// Bounded history projection loaded by an accepted restore command.
+    #[must_use]
+    pub fn restored_history(&self) -> &[crate::provider::ModelContextItem] {
+        &self.restored_history
+    }
+
+    /// Older items omitted from the restored context projection.
+    #[must_use]
+    pub fn restored_omitted_items(&self) -> usize {
+        self.restored_omitted_items
     }
 
     /// Returns the correlation identity.
@@ -756,7 +785,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Builds a snapshot, bounding pending approvals by the concurrency
-    /// budget and known outcomes by the per-run call budget.
+    /// budget and known outcomes by the snapshot representation limit.
     pub fn new(
         session: SessionId,
         run: RunId,
@@ -769,7 +798,7 @@ impl Snapshot {
         if pending_approvals.len() > Limits::M0_TEST_MAX_CONCURRENT_OPS {
             return Err(command_error("snapshot exceeds pending approval bound"));
         }
-        if known_outcomes.len() > Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize {
+        if known_outcomes.len() > Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES {
             return Err(command_error("snapshot exceeds known outcome bound"));
         }
         Ok(Self {
@@ -1212,6 +1241,8 @@ mod cov_commands_private {
             sessions: Vec::new(),
             has_sessions: false,
             restored_session: None,
+            restored_history: Vec::new(),
+            restored_omitted_items: 0,
         };
         assert_eq!(response.request().as_str(), "req-1");
         assert_eq!(response.reply(), CommandReply::Accepted);

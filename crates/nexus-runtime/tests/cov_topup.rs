@@ -1159,12 +1159,13 @@ fn a_tool_the_policy_no_longer_authorizes_is_denied_before_dispatch() {
 }
 
 #[test]
-fn the_retained_snapshot_bounds_known_outcomes_by_the_m0_call_budget() {
-    // One more admitted call than the M0 snapshot bound allows.
-    let admitted = Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize + 1;
+fn the_retained_snapshot_bounds_known_outcomes_by_the_representation_limit() {
+    // One more admitted call than the snapshot representation bound allows.
+    let admitted = Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES + 1;
     let mut limits = Limits::m0_test();
     limits.max_tool_calls_per_run = admitted as u32;
     limits.max_tool_calls_per_turn = admitted as u32;
+    limits.retained_context_items = 512;
     let candidates: Vec<CallCandidate> = (0..admitted)
         .map(|index| {
             candidate(
@@ -1218,7 +1219,7 @@ fn the_retained_snapshot_bounds_known_outcomes_by_the_m0_call_budget() {
         let bounded = known_outcome_summaries(&snapshot);
         assert_eq!(
             bounded.len(),
-            Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize,
+            Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES,
             "the retained view drops the oldest excess outcome"
         );
         assert!(

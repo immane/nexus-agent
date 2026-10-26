@@ -313,7 +313,7 @@ fn snapshot_accepts_exact_pending_and_outcome_bounds() {
     let pending: Vec<ApprovalId> = (0..Limits::M0_TEST_MAX_CONCURRENT_OPS)
         .map(approval)
         .collect();
-    let outcomes: Vec<OutcomeSummary> = (0..Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize)
+    let outcomes: Vec<OutcomeSummary> = (0..Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES)
         .map(outcome_summary)
         .collect();
     let snapshot = Snapshot::new(
@@ -360,8 +360,8 @@ fn snapshot_rejects_pending_approvals_over_the_concurrency_budget() {
 }
 
 #[test]
-fn snapshot_rejects_known_outcomes_over_the_per_run_call_budget() {
-    let over: Vec<OutcomeSummary> = (0..=Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize)
+fn snapshot_rejects_known_outcomes_over_the_representation_bound() {
+    let over: Vec<OutcomeSummary> = (0..=Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES)
         .map(outcome_summary)
         .collect();
     let error = Snapshot::new(

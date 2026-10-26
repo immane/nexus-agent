@@ -27,6 +27,8 @@ pub enum SlashCommand {
 /// runs, approvals, or drafts between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionArgs {
+    /// Open the searchable live/saved session picker.
+    Pick,
     /// Show the active session plus the full list.
     Show,
     /// Start a new empty session and switch to it.
@@ -55,7 +57,8 @@ impl SessionArgs {
             None => (args, ""),
         };
         match (word, rest) {
-            ("", _) => SessionArgs::Show,
+            ("", _) | ("switch", "") | ("restore", "") => SessionArgs::Pick,
+            ("show", "") => SessionArgs::Show,
             ("new", "") => SessionArgs::New,
             ("list", "") => SessionArgs::List,
             ("import", "") => SessionArgs::Import,
@@ -70,7 +73,8 @@ impl SessionArgs {
     /// Short usage listing, rendered as one transcript notice.
     #[must_use]
     pub fn usage_text() -> &'static str {
-        ":session — show the active session\n\
+        "Ctrl+S, :s, :session — open the session picker\n\
+         :session show — show the active session\n\
          :session new — start a session and switch to it\n\
          :session list — list sessions\n\
          :session import — explicitly read the legacy session file and import sessions\n\
@@ -113,7 +117,7 @@ impl SlashCommand {
             }
             "usage" => SlashCommand::Usage,
             "s" | "session" => SlashCommand::Session(if word == "s" && args.is_empty() {
-                SessionArgs::List
+                SessionArgs::Pick
             } else {
                 SessionArgs::parse(args)
             }),
@@ -131,7 +135,8 @@ impl SlashCommand {
          :m, :model — open the model picker\n\
          :m <id>, :model <id>, :model set <id> — select an exact configured model\n\
          :usage — show observed input/output tokens\n\
-         :s — list sessions; :session [new|list|import|delete <id>|restore <id>|switch <target>|help] — manage sessions\n\
+         Ctrl+S, :s, :session — choose a live or saved session\n\
+         :session [show|new|list|import|delete <id>|restore <id>|switch <target>|help] — manage sessions\n\
          :q, :quit — leave the TUI\n\
          Type : then Enter to open commands; Enter executes. @path suggestions insert a reference only."
     }
@@ -176,8 +181,14 @@ mod tests {
     #[test]
     fn session_subcommands_parse_without_guessing() {
         use SessionArgs::*;
+        for input in [":session", ":s", ":session switch", ":session restore"] {
+            assert_eq!(
+                SlashCommand::parse(input),
+                Some(SlashCommand::Session(Pick))
+            );
+        }
         assert_eq!(
-            SlashCommand::parse(":session"),
+            SlashCommand::parse(":session show"),
             Some(SlashCommand::Session(Show))
         );
         assert_eq!(
@@ -215,8 +226,6 @@ mod tests {
             ":session new extra",
             ":session import extra",
             ":session Import",
-            ":session switch",
-            ":session restore",
             ":session help",
         ] {
             assert_eq!(

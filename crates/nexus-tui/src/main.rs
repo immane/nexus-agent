@@ -64,6 +64,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
+mod diagnostics;
+
 const DEMO_PROFILE: &str = "m0-test";
 const DEMO_INPUT: &str = "m0 test-only demo submission";
 /// Persistent tick: keyboard polling and stalled-reorder handling happen at
@@ -85,6 +87,9 @@ const DEMO_SESSION: &str = "sess-tui-m0-test";
 /// The M0 fixture default is intentionally small, but interactive coding
 /// runs need room for inspect/edit/check/retry cycles.
 const TUI_MODEL_TURNS_PER_RUN: u32 = 64;
+const TUI_TOOL_CALLS_PER_RUN: u32 = 128;
+const TUI_RUN_DURATION: Duration = Duration::from_secs(60 * 60);
+const TUI_RETAINED_CONTEXT_ITEMS: usize = 512;
 static SESSION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn new_tui_session_id() -> io::Result<SessionId> {
@@ -114,6 +119,9 @@ fn application_session_store() -> io::Result<SessionStoreHandle> {
 fn tui_runtime_limits() -> Limits {
     let mut limits = Limits::m0_test();
     limits.max_model_turns_per_run = TUI_MODEL_TURNS_PER_RUN;
+    limits.max_tool_calls_per_run = TUI_TOOL_CALLS_PER_RUN;
+    limits.run_duration = TUI_RUN_DURATION;
+    limits.retained_context_items = TUI_RETAINED_CONTEXT_ITEMS;
     limits
 }
 
@@ -149,6 +157,7 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 /// active model, and history.
 #[derive(Debug, Clone)]
 struct SessionConfig {
+    diagnostics: Option<diagnostics::DiagnosticLog>,
     user_config: SharedUserConfig,
     active_model: Option<String>,
     /// Project root for real file reads/writes: `--tools-root`, else the working
@@ -202,18 +211,41 @@ fn user_config_snapshot(shared: &SharedUserConfig) -> UserConfig {
 fn load_session_config() -> io::Result<SessionConfig> {
     let args = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
         StartupAction::Run(args) => args,
-        StartupAction::Usage => startup_usage(),
+        StartupAction::Help => startup_usage(true),
+        StartupAction::Usage => startup_usage(false),
     };
     let mut session = session_config_at(resolve_path(None))?;
+    let config = user_config_snapshot(&session.user_config);
+    let (effective_gateway, effective_workload) = merge_startup_images(&args, &config);
+    let mut effective_args = args.clone();
+    effective_args.gateway_image = effective_gateway.clone();
+    effective_args.workload_image = effective_workload.clone();
     let root_resolved = resolve_tools_root(args.tools_root.clone()).is_some();
-    validate_execution_args(&args, root_resolved, cfg!(feature = "container"))?;
+    validate_execution_args(&effective_args, root_resolved, cfg!(feature = "container"))?;
     session.tools_root = resolve_tools_root(args.tools_root);
     session.demo = args.demo;
     session.strict_tools = args.strict_tools;
     session.execution = args.execution;
-    session.gateway_image = args.gateway_image;
-    session.workload_image = args.workload_image;
+    session.gateway_image = effective_gateway;
+    session.workload_image = effective_workload;
     Ok(session)
+}
+
+fn merge_startup_images(
+    args: &StartupArgs,
+    config: &UserConfig,
+) -> (Option<String>, Option<String>) {
+    if args.execution == ExecutionMode::Local {
+        return (args.gateway_image.clone(), args.workload_image.clone());
+    }
+    (
+        args.gateway_image
+            .clone()
+            .or_else(|| config.gateway_image().map(str::to_owned)),
+        args.workload_image
+            .clone()
+            .or_else(|| config.workload_image().map(str::to_owned)),
+    )
 }
 
 fn validate_execution_args(
@@ -245,7 +277,7 @@ fn validate_execution_args(
     if args.gateway_image.is_none() || args.workload_image.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "container execution requires --gateway-image and --container-image",
+            "container execution requires gateway and workload images; configure them in user config or pass --gateway-image and --container-image",
         ));
     }
     if !container_feature {
@@ -284,6 +316,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
     };
     let active_model = boot_model(&config);
     Ok(SessionConfig {
+        diagnostics: None,
         user_config: shared_user_config(config, path),
         active_model,
         tools_root: None,
@@ -349,6 +382,8 @@ struct StartupArgs {
 enum StartupAction {
     /// Serve the TUI with this optional real-files jail.
     Run(StartupArgs),
+    /// Print help and exit successfully.
+    Help,
     /// Print usage and exit 2.
     Usage,
 }
@@ -368,10 +403,10 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--help" | "-h" => return StartupAction::Usage,
+            "--help" | "-h" => return StartupAction::Help,
             "--demo" => demo = true,
             "--strict-tools" => strict_tools = true,
-            "--execution" => {
+            "--execution" | "--run" => {
                 if execution_set {
                     return StartupAction::Usage;
                 }
@@ -419,24 +454,47 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     })
 }
 
-/// Prints usage and exits 2. Splitting the exit from the parser keeps
-/// every rejection path unit-testable.
-fn startup_usage() -> ! {
-    eprintln!(
-        "usage: nexus-tui [--tools-root PATH] [--strict-tools] [--demo] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--help]"
+/// Prints actionable help or a concise invalid-argument diagnostic.
+/// Keeping the exit separate from parsing makes rejection paths testable.
+fn startup_usage(help: bool) -> ! {
+    let text = format!(
+        concat!(
+            "Usage: nexus-tui [OPTIONS]\n\n",
+            "Modes:\n",
+            "  --execution <MODE>  Select local (default) or container execution\n",
+            "  --run <MODE>        Alias for --execution\n",
+            "  --demo              Run the scripted demo (fake provider/tools; submits a canned task)\n\n",
+            "Workspace and tools:\n",
+            "  --tools-root <PATH> Workspace jail; defaults to the current directory\n",
+            "  --strict-tools      Use the strict jailed-tools policy\n\n",
+            "Container images:\n",
+            "  --gateway-image <IMAGE>    Gateway image (overrides configured image)\n",
+            "  --container-image <IMAGE>  Workload image (overrides configured image)\n\n",
+            "Other:\n",
+            "  -h, --help          Print this help\n\n",
+            "Behavior:\n",
+            "  Without --demo, live provider wiring is used when configured; otherwise\n",
+            "  task submission reports that no provider is configured. Local mode is default.\n",
+            "  Container mode is experimental, needs a container-enabled build, both images\n",
+            "  (flags or user config), and a workspace. It does not establish isolation.\n",
+            "  Build: cargo build -p nexus-tui --features container\n",
+            "  Example: cargo run -p nexus-tui --features container -- --execution container\n",
+            "           --tools-root \"$PWD\" --gateway-image GATEWAY --container-image WORKLOAD\n",
+            "  Images must already be available locally; startup does not pull them.\n",
+            "  See QUICKSTART.md and docs/design/11-container-execution.md.\n\n",
+            "{}\n",
+        ),
+        if cfg!(feature = "container") {
+            "Container support: enabled in this build."
+        } else {
+            "Container support: disabled; rebuild with the command above."
+        }
     );
-    #[cfg(feature = "container")]
-    eprintln!(
-        "  container: --execution container [--tools-root PATH] --gateway-image IMAGE@sha256:DIGEST --container-image IMAGE@sha256:DIGEST"
-    );
-    #[cfg(not(feature = "container"))]
-    eprintln!("  --execution container is available only in container-enabled builds.");
-    eprintln!("  Without --demo the TUI attempts live wiring; unconfigured runs");
-    eprintln!("  fail with a not-configured diagnostic instead of serving fakes.");
-    eprintln!("  With --demo, every tool is scripted and one canned submission fires.");
-    eprintln!("  Project root is --tools-root, defaulting to the working directory.");
-    eprintln!("  Development tools are default: project/temp operations need no approval.");
-    eprintln!("  --strict-tools keeps jailed reads and approval-required writes/exec.");
+    if help {
+        print!("{text}");
+        std::process::exit(0);
+    }
+    eprintln!("Invalid command-line arguments.\n\n{text}");
     std::process::exit(2);
 }
 
@@ -1086,6 +1144,10 @@ fn runtime_with_tools(
         None => Runtime::try_new(config, provider, tools),
     }
     .map_err(io::Error::other)?;
+    let runtime = match &session_config.diagnostics {
+        Some(log) => runtime.with_diagnostic_writer(log.clone()),
+        None => runtime,
+    };
     Ok((runtime, streams, binding))
 }
 
@@ -1121,15 +1183,6 @@ fn wiring_notice(
 
 fn main() {
     install_panic_hook();
-    eprintln!(
-        "nexus-tui dev: live wiring by default. Interactive sessions use private local history storage (not encrypted); \
-          A slot whose model resolves to a configured provider with a credential \
-          uses the real adapter (network egress, billable); local --tools-root enables \
-           jailed file tools + sandboxed exec (writes/exec require approval). \
-           --execution container is experimental and does not establish isolation. \
-           Without a configured provider, runs fail as not-configured; \
-           relaunch with --demo for the scripted ephemeral demo."
-    );
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -1163,6 +1216,15 @@ async fn run() -> io::Result<()> {
     // fail as a startup error on the plain stderr surface, never inside a
     // restored-screen report. Both paths below share this one load.
     let session_config = load_session_config()?;
+    eprintln!(
+        "nexus-tui dev: live wiring by default. Interactive sessions use private local history storage (not encrypted); \
+          A slot whose model resolves to a configured provider with a credential \
+          uses the real adapter (network egress, billable); local --tools-root enables \
+           jailed file tools + sandboxed exec (writes/exec require approval). \
+           --execution container is experimental and does not establish isolation. \
+           Without a configured provider, runs fail as not-configured; \
+           relaunch with --demo for the scripted ephemeral demo."
+    );
     if session_config.execution == ExecutionMode::Container {
         eprintln!(
             "SECURITY WARNING: container isolation is not validated on native Linux. \
@@ -1207,6 +1269,11 @@ async fn run() -> io::Result<()> {
                 }
             }
             Err(error) => {
+                if session_config.execution == ExecutionMode::Container {
+                    return Err(io::Error::other(format!(
+                        "terminal setup failed ({error}); container execution requires an interactive terminal and cannot fall back to scripted tools"
+                    )));
+                }
                 if !session_config.demo {
                     return Err(io::Error::other(format!(
                         "terminal setup failed ({error}); relaunch with --demo for the scripted transcript fallback"
@@ -1218,6 +1285,11 @@ async fn run() -> io::Result<()> {
             }
         }
     } else {
+        if session_config.execution == ExecutionMode::Container {
+            return Err(io::Error::other(
+                "container execution requires an interactive terminal; it cannot fall back to scripted tools",
+            ));
+        }
         if !session_config.demo {
             return Err(io::Error::other(
                 "no terminal attached; relaunch with --demo for the scripted transcript fallback",
@@ -2455,6 +2527,15 @@ const MAX_SESSIONS: usize = 16;
 /// inline and keep every session alive).
 fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) -> bool {
     match args {
+        SessionArgs::Pick => {
+            let choices = live_session_choices(sessions);
+            sessions
+                .active_mut()
+                .front
+                .state
+                .open_session_picker(choices);
+            false
+        }
         SessionArgs::Show => {
             let line = {
                 let active = sessions.active();
@@ -2559,6 +2640,28 @@ fn handle_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) ->
     }
 }
 
+fn live_session_choices(sessions: &SessionRegistry) -> Vec<nexus_tui::state::SessionChoice> {
+    sessions
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| nexus_tui::state::SessionChoice {
+            id: slot.front.session.as_str().to_owned(),
+            label: format!(
+                "{}{} · {}",
+                slot.label,
+                if index == sessions.active {
+                    " [active]"
+                } else {
+                    ""
+                },
+                slot.front.state.status()
+            ),
+            saved: false,
+        })
+        .collect()
+}
+
 async fn execute_session_command(sessions: &mut SessionRegistry, args: &SessionArgs) {
     sessions.poll_maintenance();
     if sessions.maintenance.is_some()
@@ -2568,12 +2671,54 @@ async fn execute_session_command(sessions: &mut SessionRegistry, args: &SessionA
                 | SessionArgs::Delete(_)
                 | SessionArgs::List
                 | SessionArgs::Restore(_)
+                | SessionArgs::Pick
         )
     {
         sessions.active_mut().front.state.notice("session maintenance is still running; no additional storage command was started; quitting does not roll it back");
         return;
     }
     match args {
+        SessionArgs::Pick => {
+            let mut choices = live_session_choices(sessions);
+            if sessions.store.is_some() {
+                let request = sessions.active_mut().front.next_request();
+                let reply = sessions
+                    .active()
+                    .runtime
+                    .handle(nexus_core::Command::ListSessions(
+                        ListSessionsCommand::new(request, nexus_core::commands::MAX_LIST_LIMIT)
+                            .expect("finite session list bound is valid"),
+                    ))
+                    .await
+                    .0;
+                if reply.reply() == CommandReply::Accepted && reply.has_sessions() {
+                    for entry in reply.sessions() {
+                        if choices
+                            .iter()
+                            .any(|choice| choice.id == entry.session.as_str())
+                        {
+                            continue;
+                        }
+                        choices.push(nexus_tui::state::SessionChoice {
+                            id: entry.session.as_str().to_owned(),
+                            label: format!("saved · revision {}", entry.logical_revision),
+                            saved: true,
+                        });
+                    }
+                } else {
+                    sessions
+                        .active_mut()
+                        .front
+                        .state
+                        .notice("saved session listing failed; showing live sessions only");
+                }
+            }
+            sessions
+                .active_mut()
+                .front
+                .state
+                .open_session_picker(choices);
+        }
         SessionArgs::Import if sessions.store.is_some() => {
             let store = sessions.store.as_ref().expect("guarded above").clone();
             sessions
@@ -2769,7 +2914,16 @@ async fn restore_persisted_session(sessions: &mut SessionRegistry, id: &str) {
     let label = format!("s{number}");
     let mut front = Frontend::with_config(session, config.clone());
     front.state.set_session_label(&label);
+    front
+        .state
+        .record_restored_history(reply.restored_history());
     front.attach_live(live, config.tools_root.as_deref(), config.execution);
+    if reply.restored_omitted_items() > 0 {
+        front.state.notice(&format!(
+            "restored recent history; {} older context items omitted",
+            reply.restored_omitted_items()
+        ));
+    }
     front.state.notice(
         "saved history is loaded into model context; interrupted calls remain uncertain and are not replayed",
     );
@@ -2836,6 +2990,23 @@ fn handle_overlay_key(front: &mut Frontend, key: KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Esc => front.state.dismiss_overlay(),
+        KeyCode::Enter if front.state.session_picker_open() => {
+            let matches = front.state.picker_matches();
+            let choice = front
+                .state
+                .picker_confirm(matches.len())
+                .and_then(|cursor| matches.get(cursor))
+                .and_then(|index| front.state.session_choices().get(*index))
+                .cloned();
+            front.state.dismiss_overlay();
+            if let Some(choice) = choice {
+                front.pending_session_cmds.push(if choice.saved {
+                    SessionArgs::Restore(choice.id)
+                } else {
+                    SessionArgs::Switch(choice.id)
+                });
+            }
+        }
         KeyCode::Enter => confirm_model_picker(front),
         KeyCode::Up => move_picker(front, -1),
         KeyCode::Down => move_picker(front, 1),
@@ -2973,6 +3144,24 @@ fn handle_vim_viewport_key(front: &mut Frontend, key: KeyEvent) -> Option<bool> 
 
 /// Handles one key event. Returns true when the TUI should exit.
 async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> bool {
+    handle_key_with_runtime(front, Some(runtime), key).await
+}
+
+async fn handle_key_with_runtime(
+    front: &mut Frontend,
+    runtime: Option<&Runtime>,
+    key: KeyEvent,
+) -> bool {
+    if key.kind == KeyEventKind::Press
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        && key.code == crossterm::event::KeyCode::Char('s')
+        && !front.state.overlay_open()
+    {
+        front.pending_session_cmds.push(SessionArgs::Pick);
+        return false;
+    }
     if !front.state.colon_pending()
         && !front.state.overlay_open()
         && let Some(quit) = handle_vim_viewport_key(front, key)
@@ -3084,6 +3273,11 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
     };
     match action {
         Action::Submit => {
+            // The normal UI is available during container preparation, but
+            // no task may be dispatched until its real runtime is ready.
+            let Some(runtime) = runtime else {
+                return false;
+            };
             if front.storage_busy {
                 front.state.notice("session maintenance is still running; draft preserved; submit after it completes");
                 return false;
@@ -3231,6 +3425,9 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             front.state.cycle_variant();
         }
         Action::ApproveOnce | Action::Deny => {
+            let Some(runtime) = runtime else {
+                return false;
+            };
             let Some((run, notice)) = front.live_approval.clone() else {
                 front.state.notice("no live approval to decide");
                 return false;
@@ -3302,6 +3499,9 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             }
             match front.state.active_run().cloned() {
                 Some(run) => {
+                    let Some(runtime) = runtime else {
+                        return false;
+                    };
                     let reply = runtime
                         .handle(cancel_command(front.next_request(), &run))
                         .await
@@ -3330,7 +3530,11 @@ struct InteractiveReport {
 /// error, cancelling live work first. Conversations live in a session
 /// registry: the first slot serves the canned submission, further slots
 /// arrive through `:session new`, and only the active slot is polled.
-async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
+async fn interactive(mut session_config: SessionConfig) -> io::Result<InteractiveReport> {
+    // Demo/PTY tests remain isolated from the user's local state directory.
+    if !session_config.demo {
+        session_config.diagnostics = Some(diagnostics::DiagnosticLog::open_default()?);
+    }
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
     let session_store = if session_config.demo {
@@ -3338,15 +3542,41 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     } else {
         Some(application_session_store()?)
     };
-    let (runtime, streams, live) =
-        build_live_runtime_with_store(&session_config, session_store.clone())?;
     let session = if session_config.demo {
         SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?
     } else {
         new_tui_session_id()?
     };
     let mut front = Frontend::with_config(session, session_config.clone());
+    front.execution = session_config.execution;
     front.state.set_session_label("s1");
+    #[cfg(feature = "container")]
+    let (runtime, streams, live) = if session_config.execution == ExecutionMode::Container {
+        let Some((runtime, resolved_config)) = prepare_live_runtime_with_progress(
+            session_config.clone(),
+            session_store.clone(),
+            &mut terminal,
+            &mut front,
+        )
+        .await?
+        else {
+            return Ok(InteractiveReport {
+                result: Ok(()),
+                unresolved_blocking: false,
+            });
+        };
+        session_config = resolved_config;
+        session_config.active_model = front.active_model.clone();
+        front
+            .state
+            .set_toast("Container ready".to_owned(), TOAST_TTL);
+        runtime
+    } else {
+        build_live_runtime_with_store(&session_config, session_store.clone())?
+    };
+    #[cfg(not(feature = "container"))]
+    let (runtime, streams, live) =
+        build_live_runtime_with_store(&session_config, session_store.clone())?;
     if !session_config.demo
         && nexus_session::default_data_dir()
             .is_some_and(|directory| directory.join("session-store.json").exists())
@@ -3418,6 +3648,208 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     })
 }
 
+#[cfg(feature = "container")]
+fn resolve_container_images(session_config: &mut SessionConfig) -> io::Result<()> {
+    let resolve = |image: Option<String>, label: &str| -> io::Result<String> {
+        let image = image.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("container mode requires {label} image; set it in user config or pass its image flag"),
+            )
+        })?;
+        nexus_container::resolve_local_image(&image).map_err(|error| {
+            io::Error::other(format!(
+                "{label} image resolution failed: {error}; check Docker on PATH, the local default context, daemon availability, and the installed image reference (no image was pulled)"
+            ))
+        })
+    };
+    session_config.gateway_image = Some(resolve(session_config.gateway_image.clone(), "gateway")?);
+    session_config.workload_image =
+        Some(resolve(session_config.workload_image.clone(), "workload")?);
+    Ok(())
+}
+
+#[cfg(feature = "container")]
+async fn prepare_live_runtime_with_progress(
+    mut session_config: SessionConfig,
+    session_store: Option<SessionStoreHandle>,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    front: &mut Frontend,
+) -> io::Result<Option<((Runtime, EventStreams, LiveHandle), SessionConfig)>> {
+    prepare_container_with_progress(
+        move || {
+            resolve_container_images(&mut session_config)?;
+            let runtime = build_live_runtime_with_store(&session_config, session_store)?;
+            Ok((runtime, session_config))
+        },
+        front,
+        startup_read_input,
+        |front, message| {
+            front.state.set_toast(message.to_owned(), TOAST_TTL);
+            front.state.tick_caret();
+            draw(terminal, front)
+        },
+    )
+    .await
+}
+
+// Keep Docker and terminal I/O at the boundary so lifecycle failures can be
+// exercised with a controlled resource owner and without a real daemon or TTY.
+#[cfg(feature = "container")]
+async fn prepare_container_with_progress<T: Send + 'static, U>(
+    prepare: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ui: &mut U,
+    mut read_input: impl AsyncFnMut(&mut U) -> io::Result<bool>,
+    mut draw_progress: impl FnMut(&mut U, &str) -> io::Result<()>,
+) -> io::Result<Option<T>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("container-startup".to_owned())
+        .spawn(move || {
+            let _ = sender.send(prepare());
+        })
+        .map_err(io::Error::other)?;
+
+    let mut quit_requested = false;
+    let mut terminal_error = None;
+    loop {
+        if terminal_error.is_none() && !quit_requested {
+            match read_input(ui).await {
+                Ok(quit) => quit_requested = quit,
+                Err(error) => {
+                    terminal_error = Some(error);
+                    quit_requested = true;
+                }
+            }
+        } else if terminal_error.is_none() {
+            // Continue draining input while initialization finishes; never
+            // let queued keystrokes become the first task after startup.
+            if let Err(error) = read_input(ui).await {
+                terminal_error = Some(error);
+            }
+        }
+
+        match receiver.try_recv() {
+            Ok(Ok(runtime)) if quit_requested || terminal_error.is_some() => {
+                worker.join().map_err(|_| {
+                    startup_error_with_terminal_context(
+                        terminal_error.take(),
+                        io::Error::other("container startup worker panicked"),
+                    )
+                })?;
+                if terminal_error.is_none()
+                    && let Err(error) = draw_progress(
+                        ui,
+                        "Quit requested. Waiting for container startup to finish safely…",
+                    )
+                {
+                    terminal_error = Some(error);
+                }
+                let cleanup = std::thread::Builder::new()
+                    .name("container-startup-cleanup".to_owned())
+                    .spawn(move || drop(runtime))
+                    .map_err(|error| {
+                        startup_error_with_terminal_context(terminal_error.take(), error)
+                    })?;
+                while !cleanup.is_finished() {
+                    if terminal_error.is_none()
+                        && let Err(error) =
+                            draw_progress(ui, "Quit requested. Cleaning up the prepared container…")
+                    {
+                        terminal_error = Some(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if cleanup.join().is_err() {
+                    return Err(startup_error_with_terminal_context(
+                        terminal_error,
+                        io::Error::other("container startup cleanup thread panicked"),
+                    ));
+                }
+                if let Some(error) = terminal_error {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
+            Ok(result) => {
+                worker.join().map_err(|_| {
+                    startup_error_with_terminal_context(
+                        terminal_error.take(),
+                        io::Error::other("container startup worker panicked"),
+                    )
+                })?;
+                return result
+                    .map(Some)
+                    .map_err(|error| startup_error_with_terminal_context(terminal_error, error));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let _ = worker.join();
+                return Err(startup_error_with_terminal_context(
+                    terminal_error,
+                    io::Error::other("container startup worker exited without a result"),
+                ));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        let message = if quit_requested {
+            "Quit requested. Waiting for container startup to finish safely…"
+        } else {
+            "Preparing container · Enter to submit is disabled"
+        };
+        if terminal_error.is_none()
+            && let Err(error) = draw_progress(ui, message)
+        {
+            terminal_error = Some(error);
+            quit_requested = true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(feature = "container")]
+fn startup_error_with_terminal_context(
+    terminal_error: Option<io::Error>,
+    startup_error: io::Error,
+) -> io::Error {
+    match terminal_error {
+        Some(terminal_error) => io::Error::new(
+            startup_error.kind(),
+            format!("{startup_error}; terminal I/O also failed: {terminal_error}"),
+        ),
+        None => startup_error,
+    }
+}
+
+#[cfg(feature = "container")]
+async fn startup_read_input(front: &mut Frontend) -> io::Result<bool> {
+    // Drain queued startup keys before readiness is checked so an Enter
+    // pressed during preparation cannot become a submission after handoff.
+    while poll(Duration::ZERO)? {
+        match read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if handle_key_with_runtime(front, None, key).await {
+                    return Ok(true);
+                }
+            }
+            Event::Mouse(mouse) => {
+                handle_mouse(front, mouse);
+            }
+            Event::Paste(text) => {
+                for character in text.chars() {
+                    if character == '\n' {
+                        front.state.composer_newline();
+                    } else {
+                        front.state.composer_type(character);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 async fn interactive_loop(
     sessions: &mut SessionRegistry,
     gate: &mut RefreshGate,
@@ -3427,6 +3859,17 @@ async fn interactive_loop(
     let mut event_since_tick = false;
     loop {
         let mut dirty = false;
+        if sessions
+            .template
+            .diagnostics
+            .as_ref()
+            .is_some_and(|log| log.take_failure())
+        {
+            sessions.active_mut().front.state.notice(
+                "local runtime diagnostic write failed; diagnostics may be missing (redirected stderr remains a fallback)",
+            );
+            dirty = true;
+        }
         // Only the active slot is polled and drawn; background slots keep
         // buffering in their bounded channels until switched back to. The
         // borrow ends before the step is handled so a session switch inside
@@ -4961,6 +5404,246 @@ mod cov_main_private {
     }
 }
 
+#[cfg(all(test, feature = "container"))]
+mod container_startup_tests {
+    use super::*;
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn readiness_preserves_the_frontend_and_enables_explicit_submit() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (release_prepare, prepare_gate) = std::sync::mpsc::channel();
+        let mut release_prepare = Some(release_prepare);
+        let mut front = Frontend::new(SessionId::new("startup-ui").unwrap());
+        let mut typed = false;
+        let prepared = prepare_container_with_progress(
+            move || {
+                prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                build_runtime()
+            },
+            &mut front,
+            async |front| {
+                if !typed {
+                    typed = true;
+                    for code in [KeyCode::Char('q'), KeyCode::Char('u'), KeyCode::Enter] {
+                        assert!(
+                            !handle_key_with_runtime(
+                                front,
+                                None,
+                                KeyEvent::new(code, KeyModifiers::NONE)
+                            )
+                            .await
+                        );
+                    }
+                    front.state.caret_left();
+                    front.state.open_help();
+                }
+                Ok(false)
+            },
+            |front, message| {
+                assert!(front.state.help_open());
+                assert_eq!(front.state.composer(), "qu");
+                front.state.set_toast(message.to_owned(), TOAST_TTL);
+                let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                render(&mut front.state, area, &mut buffer, front.focus);
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("Nexus Agent"));
+                assert!(!text.contains("Container startup"));
+                if let Some(release) = release_prepare.take() {
+                    release.send(()).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let (runtime, _streams) = prepared.expect("preparation succeeds without quitting");
+        assert_eq!(front.state.composer(), "qu");
+        assert!(front.state.help_open());
+        assert_eq!(front.focus, Focus::Composer);
+        assert_eq!(front.request_counter, 0, "readiness never auto-submits");
+        assert!(front.state.active_run().is_none());
+        front.state.dismiss_overlay();
+        front.state.composer_type('x');
+        assert_eq!(front.state.composer(), "qxu", "caret position is retained");
+        assert!(
+            !handle_key(
+                &mut front,
+                &runtime,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            )
+            .await
+        );
+        assert_eq!(front.request_counter, 1);
+        assert!(front.state.composer().is_empty());
+    }
+
+    struct Resource {
+        cleanup_started: Option<tokio::sync::oneshot::Sender<()>>,
+        release_cleanup: std::sync::mpsc::Receiver<()>,
+        cleaned: Arc<AtomicBool>,
+    }
+
+    impl Drop for Resource {
+        fn drop(&mut self) {
+            let _ = self.cleanup_started.take().unwrap().send(());
+            self.release_cleanup
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must release cleanup");
+            self.cleaned.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_io_failures_wait_for_preparation_and_cleanup() {
+        for fail_input in [true, false] {
+            let (release_prepare, prepare_gate) = std::sync::mpsc::channel();
+            let (cleanup_started, cleanup_observed) = tokio::sync::oneshot::channel();
+            let (release_cleanup, cleanup_gate) = std::sync::mpsc::channel();
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let resource = Resource {
+                cleanup_started: Some(cleanup_started),
+                release_cleanup: cleanup_gate,
+                cleaned: Arc::clone(&cleaned),
+            };
+            let mut input_calls = 0;
+            let mut draw_calls = 0;
+            let mut ui = ();
+            let mut startup = Box::pin(prepare_container_with_progress(
+                move || {
+                    prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(resource)
+                },
+                &mut ui,
+                async |_| {
+                    input_calls += 1;
+                    assert_eq!(input_calls, 1, "input stops after terminal failure");
+                    if fail_input {
+                        Err(io::Error::other("input failed"))
+                    } else {
+                        Ok(false)
+                    }
+                },
+                |_, _| {
+                    draw_calls += 1;
+                    assert_eq!(draw_calls, 1, "drawing stops after terminal failure");
+                    Err(io::Error::other("draw failed"))
+                },
+            ));
+
+            poll_fn(|cx| {
+                assert!(startup.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(!cleaned.load(Ordering::SeqCst));
+            release_prepare.send(()).unwrap();
+            tokio::select! {
+                _ = &mut startup => panic!("startup returned before cleanup completed"),
+                started = cleanup_observed => started.unwrap(),
+            }
+            poll_fn(|cx| {
+                assert!(startup.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(!cleaned.load(Ordering::SeqCst));
+            release_cleanup.send(()).unwrap();
+            let error = match startup.await {
+                Err(error) => error,
+                Ok(_) => panic!("terminal error was lost"),
+            };
+            assert_eq!(
+                error.to_string(),
+                if fail_input {
+                    "input failed"
+                } else {
+                    "draw failed"
+                }
+            );
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert_eq!(draw_calls, usize::from(!fail_input));
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_draw_failure_still_waits_for_resource_drop() {
+        let (cleanup_started, cleanup_observed) = tokio::sync::oneshot::channel();
+        let (release_cleanup, cleanup_gate) = std::sync::mpsc::channel();
+        let (draw_failed, failure_observed) = tokio::sync::oneshot::channel();
+        let mut draw_failed = Some(draw_failed);
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let resource = Resource {
+            cleanup_started: Some(cleanup_started),
+            release_cleanup: cleanup_gate,
+            cleaned: Arc::clone(&cleaned),
+        };
+        let mut ui = ();
+        let mut startup = Box::pin(prepare_container_with_progress(
+            move || Ok(resource),
+            &mut ui,
+            async |_| Ok(true),
+            |_, message| {
+                assert!(draw_failed.is_some(), "drawing stops after failure");
+                if message.contains("Cleaning up") {
+                    draw_failed.take().unwrap().send(()).unwrap();
+                    Err(io::Error::other("cleanup draw failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        ));
+        tokio::select! {
+            _ = &mut startup => panic!("startup returned before cleanup completed"),
+            failed = failure_observed => failed.unwrap(),
+        }
+        cleanup_observed.await.unwrap();
+        poll_fn(|cx| {
+            assert!(startup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!cleaned.load(Ordering::SeqCst));
+        release_cleanup.send(()).unwrap();
+        match startup.await {
+            Err(error) => assert_eq!(error.to_string(), "cleanup draw failed"),
+            Ok(_) => panic!("terminal error was lost"),
+        }
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn startup_failure_after_input_failure_preserves_both_errors() {
+        let (release_prepare, prepare_gate) = std::sync::mpsc::channel();
+        let mut ui = ();
+        let mut startup = Box::pin(prepare_container_with_progress::<(), _>(
+            move || {
+                prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                Err(io::Error::new(io::ErrorKind::NotFound, "image missing"))
+            },
+            &mut ui,
+            async |_| Err(io::Error::other("input failed")),
+            |_, _| panic!("must not draw after input failure"),
+        ));
+        poll_fn(|cx| {
+            assert!(startup.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        release_prepare.send(()).unwrap();
+        let error = startup.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "image missing; terminal I/O also failed: input failed"
+        );
+    }
+}
+
 /// Coverage top-up for the paths the two modules above leave unexercised:
 /// the non-terminal fallback itself, the full `handle_key` action table, the
 /// approval decision and cancellation branches, the presentation-state
@@ -4982,18 +5665,88 @@ mod cov_main_topup {
     use ratatui::layout::Rect;
     use ratatui::{TerminalOptions, Viewport};
 
+    #[cfg(feature = "container")]
+    #[tokio::test]
+    async fn container_startup_uses_normal_keys_but_cannot_submit() {
+        let mut front = Frontend::new(session());
+        front.execution = ExecutionMode::Container;
+        for code in [KeyCode::Char('q'), KeyCode::Char('u'), KeyCode::Enter] {
+            assert!(
+                !handle_key_with_runtime(&mut front, None, KeyEvent::new(code, KeyModifiers::NONE))
+                    .await
+            );
+        }
+        assert_eq!(front.state.composer(), "qu");
+        assert_eq!(front.request_counter, 0);
+        assert!(front.state.active_run().is_none());
+        assert!(front.live.is_none());
+        assert!(front.state.transcript().is_empty());
+
+        assert!(
+            !handle_key_with_runtime(
+                &mut front,
+                None,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+            )
+            .await
+        );
+        assert_eq!(front.state.composer(), "qu\n");
+        assert!(
+            !handle_key_with_runtime(
+                &mut front,
+                None,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            )
+            .await
+        );
+        assert_eq!(front.focus, Focus::Viewport);
+        for code in [
+            KeyCode::Char(':'),
+            KeyCode::Char('h'),
+            KeyCode::Char('e'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+            KeyCode::Enter,
+        ] {
+            assert!(
+                !handle_key_with_runtime(&mut front, None, KeyEvent::new(code, KeyModifiers::NONE))
+                    .await
+            );
+        }
+        assert!(front.state.help_open());
+        assert_eq!(front.state.composer(), "qu\n");
+    }
+
+    #[cfg(feature = "container")]
     #[test]
-    fn interactive_runtime_raises_only_the_model_turn_budget_to_64() {
+    fn container_startup_failure_keeps_terminal_io_context() {
+        let error = startup_error_with_terminal_context(
+            Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "terminal draw failed",
+            )),
+            io::Error::new(io::ErrorKind::NotFound, "image missing"),
+        );
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "image missing; terminal I/O also failed: terminal draw failed"
+        );
+
+        let startup_only = startup_error_with_terminal_context(
+            None,
+            io::Error::new(io::ErrorKind::NotFound, "image missing"),
+        );
+        assert_eq!(startup_only.to_string(), "image missing");
+    }
+
+    #[test]
+    fn interactive_runtime_raises_model_turns_and_run_budget() {
         let limits = tui_runtime_limits();
         assert_eq!(limits.max_model_turns_per_run, 64);
-        assert_eq!(
-            limits.max_tool_calls_per_run,
-            Limits::M0_TEST_TOOL_CALLS_PER_RUN
-        );
-        assert_eq!(
-            limits.run_duration,
-            Duration::from_secs(Limits::M0_TEST_RUN_DURATION_SECS)
-        );
+        assert_eq!(limits.max_tool_calls_per_run, 128);
+        assert_eq!(limits.run_duration, Duration::from_secs(3_600));
+        assert_eq!(limits.retained_context_items, 512);
         limits
             .validate()
             .expect("interactive limits remain finite and valid");
@@ -5129,6 +5882,7 @@ mod cov_main_topup {
     /// exercise the loop rather than persistence.
     fn defaults_config() -> SessionConfig {
         SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
@@ -5173,6 +5927,7 @@ mod cov_main_topup {
         }
         let active_model = boot_model(&config);
         SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(config, None),
             active_model,
             tools_root: None,
@@ -5238,6 +5993,44 @@ mod cov_main_topup {
         SessionRegistry::new(first, template)
     }
 
+    #[tokio::test]
+    async fn session_picker_shortcut_filters_and_switches_without_losing_drafts() {
+        let mut sessions = registry();
+        sessions.active_mut().front.state.composer_type('a');
+        let index = sessions.create().unwrap();
+        sessions.switch(index);
+        sessions.active_mut().front.state.composer_type('b');
+        let key = KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let slot = sessions.active_mut();
+        assert!(!handle_key_with_runtime(&mut slot.front, Some(&slot.runtime), key).await);
+        assert_eq!(
+            slot.front.pending_session_cmds.pop(),
+            Some(SessionArgs::Pick)
+        );
+        execute_session_command(&mut sessions, &SessionArgs::Pick).await;
+        let front = &mut sessions.active_mut().front;
+        assert!(front.state.session_picker_open());
+        assert_eq!(front.state.session_choices().len(), 2);
+        front.state.picker_push('1');
+        assert_eq!(front.state.picker_matches(), vec![0]);
+        handle_overlay_key(
+            front,
+            KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        let command = front.pending_session_cmds.pop().unwrap();
+        assert_eq!(command, SessionArgs::Switch("sess-test-1".to_owned()));
+        execute_session_command(&mut sessions, &command).await;
+        assert_eq!(sessions.active, 0);
+        assert_eq!(sessions.active().front.state.composer(), "a");
+        assert_eq!(sessions.slots[1].front.state.composer(), "b");
+    }
+
     fn session_store_test_directory() -> std::path::PathBuf {
         let nonce = SESSION_NONCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -5259,6 +6052,60 @@ mod cov_main_topup {
             DEMO_PROFILE,
         )
         .expect("valid saved checkpoint")
+    }
+
+    #[tokio::test]
+    async fn session_picker_restores_saved_history_and_deduplicates_live_sessions() {
+        use nexus_core::SessionStore;
+
+        let directory = session_store_test_directory();
+        let mut store = nexus_session::DirectorySessionStore::open(&directory).unwrap();
+        let checkpoint = saved_checkpoint("sess-saved-picker");
+        store.initialize_session(&checkpoint).unwrap();
+        store
+            .append_source_items(
+                checkpoint.session(),
+                &RunId::new("run-saved-picker").unwrap(),
+                &[
+                    nexus_core::provider::ModelContextItem::user_text("saved conversation")
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+        let store = SessionStoreHandle::new(Box::new(store));
+        let mut sessions = registry();
+        let (runtime, streams, _) =
+            build_live_runtime_with_store(&sessions.template, Some(store.clone())).unwrap();
+        sessions.slots[0].runtime = runtime;
+        sessions.slots[0].streams = streams;
+        sessions.store = Some(store);
+        execute_session_command(&mut sessions, &SessionArgs::Pick).await;
+        let front = &mut sessions.active_mut().front;
+        assert_eq!(front.state.session_choices().len(), 2);
+        for character in "saved-picker".chars() {
+            front.state.picker_push(character);
+        }
+        handle_overlay_key(
+            front,
+            KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        let command = front.pending_session_cmds.pop().unwrap();
+        assert_eq!(
+            command,
+            SessionArgs::Restore("sess-saved-picker".to_owned())
+        );
+        execute_session_command(&mut sessions, &command).await;
+        assert_eq!(sessions.active().front.session, *checkpoint.session());
+        assert!(transcript(&sessions.active().front).contains("saved conversation"));
+        execute_session_command(&mut sessions, &SessionArgs::Pick).await;
+        let choices = sessions.active().front.state.session_choices();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().all(|choice| !choice.saved));
+        drop(sessions);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     async fn finish_maintenance(sessions: &mut SessionRegistry) {
@@ -7571,7 +8418,9 @@ mod cov_live_wiring {
     fn tools_root(args: &[&str]) -> Option<std::path::PathBuf> {
         match parse_startup_args(&argv(args)) {
             StartupAction::Run(parsed) => parsed.tools_root,
-            StartupAction::Usage => panic!("expected a run action for {args:?}"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("expected a run action for {args:?}")
+            }
         }
     }
 
@@ -7579,7 +8428,9 @@ mod cov_live_wiring {
     fn demo_flag(args: &[&str]) -> bool {
         match parse_startup_args(&argv(args)) {
             StartupAction::Run(parsed) => parsed.demo,
-            StartupAction::Usage => panic!("expected a run action for {args:?}"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("expected a run action for {args:?}")
+            }
         }
     }
 
@@ -7592,6 +8443,17 @@ mod cov_live_wiring {
     }
 
     #[test]
+    fn help_flag_has_a_successful_help_action() {
+        for args in [&["--help"][..], &["-h"][..]] {
+            assert!(matches!(
+                parse_startup_args(&argv(args)),
+                StartupAction::Help
+            ));
+        }
+        usage(&["--unknown"]);
+    }
+
+    #[test]
     fn no_arguments_yield_no_explicit_jail() {
         assert_eq!(tools_root(&[]), None);
     }
@@ -7600,7 +8462,9 @@ mod cov_live_wiring {
     fn container_selection_is_explicit_and_requires_a_workspace_and_images() {
         let incomplete = match parse_startup_args(&argv(&["--execution", "container"])) {
             StartupAction::Run(parsed) => parsed,
-            StartupAction::Usage => panic!("syntactically valid flags should parse"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("syntactically valid flags should parse")
+            }
         };
         assert!(validate_execution_args(&incomplete, true, cfg!(feature = "container")).is_err());
         let incomplete_images = match parse_startup_args(&argv(&[
@@ -7612,7 +8476,9 @@ mod cov_live_wiring {
             "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ])) {
             StartupAction::Run(parsed) => parsed,
-            StartupAction::Usage => panic!("syntactically valid flags should parse"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("syntactically valid flags should parse")
+            }
         };
         assert!(
             validate_execution_args(&incomplete_images, true, cfg!(feature = "container")).is_err()
@@ -7631,7 +8497,9 @@ mod cov_live_wiring {
                 assert_eq!(parsed.execution, ExecutionMode::Container);
                 assert!(validate_execution_args(&parsed, true, true).is_ok());
             }
-            StartupAction::Usage => panic!("complete container options should parse"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("complete container options should parse")
+            }
         }
         let current_directory_default = match parse_startup_args(&argv(&[
             "--execution",
@@ -7642,9 +8510,59 @@ mod cov_live_wiring {
             "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ])) {
             StartupAction::Run(parsed) => parsed,
-            StartupAction::Usage => panic!("container images should parse without a root flag"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("container images should parse without a root flag")
+            }
         };
         assert!(validate_execution_args(&current_directory_default, true, true).is_ok());
+    }
+
+    #[test]
+    fn run_alias_selects_container_and_mode_flags_remain_single_use() {
+        let parsed = match parse_startup_args(&argv(&["--run", "container"])) {
+            StartupAction::Run(parsed) => parsed,
+            StartupAction::Help | StartupAction::Usage => panic!("alias should parse"),
+        };
+        assert_eq!(parsed.execution, ExecutionMode::Container);
+        usage(&["--run", "container", "--execution", "container"]);
+        usage(&["--execution", "local", "--run", "container"]);
+        usage(&["--run", "container", "--run", "local"]);
+    }
+
+    #[test]
+    fn local_startup_ignores_saved_images_but_rejects_explicit_image_flags() {
+        let mut config = UserConfig::default_config();
+        config
+            .set_container_images(Some("gateway:saved".into()), Some("workload:saved".into()))
+            .expect("valid saved images");
+        let args = match parse_startup_args(&argv(&[])) {
+            StartupAction::Run(args) => args,
+            StartupAction::Help | StartupAction::Usage => panic!("default startup parses"),
+        };
+        let (gateway, workload) = merge_startup_images(&args, &config);
+        assert_eq!((gateway, workload), (None, None));
+        let mut args = args;
+        args.gateway_image = Some("gateway:explicit".into());
+        assert!(validate_execution_args(&args, true, cfg!(feature = "container")).is_err());
+    }
+
+    #[test]
+    fn container_startup_merges_cli_and_saved_images() {
+        let mut config = UserConfig::default_config();
+        config
+            .set_container_images(Some("gateway:saved".into()), Some("workload:saved".into()))
+            .expect("valid saved images");
+        let mut args = match parse_startup_args(&argv(&["--execution", "container"])) {
+            StartupAction::Run(args) => args,
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("container startup parses")
+            }
+        };
+        args.gateway_image = Some("gateway:cli".into());
+        assert_eq!(
+            merge_startup_images(&args, &config),
+            (Some("gateway:cli".into()), Some("workload:saved".into()))
+        );
     }
 
     #[test]
@@ -7681,8 +8599,14 @@ mod cov_live_wiring {
 
     #[test]
     fn unknown_or_incomplete_flags_are_usage_never_silent_defaults() {
-        usage(&["--help"]);
-        usage(&["-h"]);
+        assert!(matches!(
+            parse_startup_args(&argv(&["--help"])),
+            StartupAction::Help
+        ));
+        assert!(matches!(
+            parse_startup_args(&argv(&["-h"])),
+            StartupAction::Help
+        ));
         usage(&["--tools-root"]);
         usage(&["--tools-root", ""]);
         usage(&["--tools"]);
@@ -8004,6 +8928,7 @@ mod cov_live_wiring {
     fn live_roots_must_exist_as_directories() {
         let missing = std::path::PathBuf::from("/nonexistent-nexus-tui-jail");
         let session = SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: Some(missing),
@@ -8031,6 +8956,7 @@ mod cov_live_wiring {
     #[test]
     fn demo_wiring_builds_without_a_jail() {
         let session = SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,

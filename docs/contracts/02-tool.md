@@ -45,6 +45,11 @@ In persistent mode, side-effecting dispatch MUST meet the [session-store intent 
 
 Execution statuses include succeeded, failed, denied, cancelled, and timed out. Effect states distinguish not started, known not applied, known applied, and unknown. Evidence distinguishes host observations from plugin reports.
 
+In development/container policy checks, an unresolvable or disallowed tool path
+is recorded as a denied, not-started tool result and returned to the model. It
+does not grant approval or terminate the run solely because the path check
+failed; the model may correct its request within the existing run budgets.
+
 A successful command exit means the command met its execution convention; it does not prove the user's intended task. An interrupted plugin can have unknown effects even when no result arrived. The runtime MUST preserve the original outcome rather than replacing it with a fabricated success or rollback.
 
 ## Output

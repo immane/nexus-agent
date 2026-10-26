@@ -244,10 +244,46 @@ fn parse_fields(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Asserts stderr is exactly `expected`, so no diagnostic can be added,
-/// dropped, or reordered without failing.
+/// Identifies the bounded runtime finish diagnostic, whose run identity varies
+/// on every invocation.
+fn is_runtime_finish_diagnostic(line: &str) -> bool {
+    line.starts_with("nexus-runtime: run finished run=")
+}
+
+/// Asserts stderr is exactly `expected`, apart from the one variable-valued
+/// runtime finish diagnostic emitted after a completed run.
 fn assert_stderr_lines(stderr: &str, expected: &[&str]) {
-    let lines: Vec<&str> = stderr.lines().collect();
+    let mut finish_diagnostics = 0;
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| {
+            if is_runtime_finish_diagnostic(line) {
+                finish_diagnostics += 1;
+                for field in [
+                    " outcome=",
+                    " error_category=",
+                    " source_persistence=",
+                    " turns=",
+                    " calls=",
+                    " elapsed_ms=",
+                    " output_limit_recovery_used=",
+                    " data_dropped=",
+                    " terminal_delivery=",
+                ] {
+                    assert!(
+                        line.contains(field),
+                        "incomplete runtime diagnostic: {line}"
+                    );
+                }
+                return false;
+            }
+            true
+        })
+        .collect();
+    assert!(
+        finish_diagnostics <= 1,
+        "at most one run finishes per CLI invocation"
+    );
     assert_eq!(lines, expected, "stderr line order is pinned");
     assert!(stderr.ends_with('\n'), "every stderr line is terminated");
 }
@@ -419,8 +455,7 @@ fn sequence(records: &[Record]) -> Vec<u64> {
 /// The runtime mints `r{incarnation:x}-{run_n}`,
 /// `c{incarnation:x}-{run_n}-{call_seq}`, and
 /// `a{incarnation:x}-{run_n}-{approval_n}`. The incarnation is the only part a
-/// fresh process is free to change, so it is the only part a comparison across
-/// two processes may ignore.
+/// fresh process is free to change within an identity.
 fn split_issued(raw: &str, kind: char) -> (&str, &str) {
     let rest = raw
         .strip_prefix(kind)
@@ -437,7 +472,7 @@ fn split_issued(raw: &str, kind: char) -> (&str, &str) {
 const ISSUED_KEYS: [(&str, char); 3] = [("run", 'r'), ("call", 'c'), ("approval", 'a')];
 
 /// The report with every process-issued identity reduced to its ordinal tail,
-/// the one value a fresh process is free to differ in.
+/// plus normalized token estimates derived from variable-width identities.
 ///
 /// Only the incarnation segment is folded away, so `r<incarnation>-1`,
 /// `c<incarnation>-1-0`, and `a<incarnation>-1-0` remain under comparison: a
@@ -469,9 +504,41 @@ fn without_incarnation(records: &[Record]) -> Vec<String> {
                 // text, so replacing the raw token covers both spellings.
                 line = line.replace(value, &format!("{kind}<incarnation>-{ordinals}"));
             }
+            if record.kind() == Some("model-request") {
+                let raw = record.count("raw-estimated-input") as u64;
+                let scale = record.count("estimate-scale-millis") as u64;
+                assert!(raw > 0, "the request has a nonempty payload");
+                assert_eq!(
+                    record.count("estimated-input") as u64,
+                    raw.saturating_mul(scale).div_ceil(1000)
+                );
+                line = line
+                    .split(' ')
+                    .map(|token| match token.split_once('=') {
+                        Some(("estimated-input", _)) => "estimated-input=<derived>",
+                        Some(("raw-estimated-input", _)) => "raw-estimated-input=<derived>",
+                        _ => token,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
             line
         })
         .collect()
+}
+
+#[test]
+fn report_comparison_accounts_for_identity_width_and_keeps_ordinals() {
+    let short = "run=r123-1 kind=model-request estimated-input=574 raw-estimated-input=459 estimate-scale-millis=1250";
+    let long = "run=r123456-1 kind=model-request estimated-input=577 raw-estimated-input=461 estimate-scale-millis=1250";
+    assert_eq!(
+        without_incarnation(&[Record::new(short)]),
+        without_incarnation(&[Record::new(long)])
+    );
+    assert_ne!(
+        without_incarnation(&[Record::new(short)]),
+        without_incarnation(&[Record::new(&long.replace("-1 ", "-2 "))])
+    );
 }
 
 /// Encoding round-trip for one text, including the canonical-form property a
@@ -803,7 +870,8 @@ fn stdout_carries_only_machine_records_and_stderr_carries_the_banner() {
                 line == FAKE_BANNER
                     || line == USAGE
                     || line == RUNTIME_CONTEXT_BUDGET
-                    || line.starts_with("nexus-headless: "),
+                    || line.starts_with("nexus-headless: ")
+                    || is_runtime_finish_diagnostic(line),
                 "stderr carries only diagnostics: {line}"
             );
             assert!(
@@ -1013,11 +1081,9 @@ fn machine_encoding_round_trips_through_the_public_api() {
     );
 }
 
-/// Two identical runs report identical records: the script is fixed and nothing
-/// in the report depends on wall-clock time or process identity. The runtime
-/// stamps a fresh incarnation into every run, call, and approval id, so that
-/// segment is the one value two processes may legitimately differ in — and
-/// every other value, including each id's ordinal tail, must match exactly.
+/// Two identical scripts report identical records apart from fresh identity
+/// incarnations and token estimates derived from their variable byte lengths.
+/// Every other value, including each id's ordinal tail, must match exactly.
 #[test]
 fn repeated_runs_report_the_same_records() {
     let first = invoke(&["hello"]);
@@ -1096,15 +1162,30 @@ fn merged_stream_orders_the_banner_before_the_records() {
     assert_eq!(lines[2], RUNTIME_CONTEXT_BUDGET);
     let body = &lines[3..lines.len() - 1];
     assert!(!body.is_empty(), "records follow the banner: {lines:?}");
+    let finish_diagnostics: Vec<_> = body
+        .iter()
+        .copied()
+        .filter(|line| is_runtime_finish_diagnostic(line))
+        .collect();
+    assert_eq!(
+        finish_diagnostics.len(),
+        1,
+        "the run emits one runtime diagnostic"
+    );
+    let records: Vec<_> = body
+        .iter()
+        .copied()
+        .filter(|line| !is_runtime_finish_diagnostic(line))
+        .collect();
     let prefix = format!("rev={OUTPUT_REV} ");
-    for line in body {
+    for line in &records {
         assert!(
             line.starts_with(&prefix),
-            "only machine records sit between banner and summary: {line}"
+            "only machine records or the runtime diagnostic sit before the summary: {line}"
         );
     }
     // The interleaved records still satisfy the machine contract.
-    assert!(!parse_records(&format!("{}\n", body.join("\n"))).is_empty());
+    assert!(!parse_records(&format!("{}\n", records.join("\n"))).is_empty());
 }
 
 /// A consumer that closes stdout before the run finishes gets the documented
@@ -1143,7 +1224,11 @@ fn broken_stdout_pipe_exits_without_panic() {
             RUNTIME_CONTEXT_BUDGET,
         ],
     );
-    for marker in ["panicked", "Broken pipe", "BrokenPipe", "run="] {
+    assert!(
+        invocation.stderr.lines().any(is_runtime_finish_diagnostic),
+        "the completed run keeps its bounded diagnostic"
+    );
+    for marker in ["panicked", "Broken pipe", "BrokenPipe"] {
         assert!(
             !invocation.stderr.contains(marker),
             "the closed consumer stays quiet: {}",
