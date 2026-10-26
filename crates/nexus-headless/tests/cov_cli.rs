@@ -244,10 +244,46 @@ fn parse_fields(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Asserts stderr is exactly `expected`, so no diagnostic can be added,
-/// dropped, or reordered without failing.
+/// Identifies the bounded runtime finish diagnostic, whose run identity varies
+/// on every invocation.
+fn is_runtime_finish_diagnostic(line: &str) -> bool {
+    line.starts_with("nexus-runtime: run finished run=")
+}
+
+/// Asserts stderr is exactly `expected`, apart from the one variable-valued
+/// runtime finish diagnostic emitted after a completed run.
 fn assert_stderr_lines(stderr: &str, expected: &[&str]) {
-    let lines: Vec<&str> = stderr.lines().collect();
+    let mut finish_diagnostics = 0;
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| {
+            if is_runtime_finish_diagnostic(line) {
+                finish_diagnostics += 1;
+                for field in [
+                    " outcome=",
+                    " error_category=",
+                    " source_persistence=",
+                    " turns=",
+                    " calls=",
+                    " elapsed_ms=",
+                    " output_limit_recovery_used=",
+                    " data_dropped=",
+                    " terminal_delivery=",
+                ] {
+                    assert!(
+                        line.contains(field),
+                        "incomplete runtime diagnostic: {line}"
+                    );
+                }
+                return false;
+            }
+            true
+        })
+        .collect();
+    assert!(
+        finish_diagnostics <= 1,
+        "at most one run finishes per CLI invocation"
+    );
     assert_eq!(lines, expected, "stderr line order is pinned");
     assert!(stderr.ends_with('\n'), "every stderr line is terminated");
 }
@@ -803,7 +839,8 @@ fn stdout_carries_only_machine_records_and_stderr_carries_the_banner() {
                 line == FAKE_BANNER
                     || line == USAGE
                     || line == RUNTIME_CONTEXT_BUDGET
-                    || line.starts_with("nexus-headless: "),
+                    || line.starts_with("nexus-headless: ")
+                    || is_runtime_finish_diagnostic(line),
                 "stderr carries only diagnostics: {line}"
             );
             assert!(
@@ -1096,15 +1133,30 @@ fn merged_stream_orders_the_banner_before_the_records() {
     assert_eq!(lines[2], RUNTIME_CONTEXT_BUDGET);
     let body = &lines[3..lines.len() - 1];
     assert!(!body.is_empty(), "records follow the banner: {lines:?}");
+    let finish_diagnostics: Vec<_> = body
+        .iter()
+        .copied()
+        .filter(|line| is_runtime_finish_diagnostic(line))
+        .collect();
+    assert_eq!(
+        finish_diagnostics.len(),
+        1,
+        "the run emits one runtime diagnostic"
+    );
+    let records: Vec<_> = body
+        .iter()
+        .copied()
+        .filter(|line| !is_runtime_finish_diagnostic(line))
+        .collect();
     let prefix = format!("rev={OUTPUT_REV} ");
-    for line in body {
+    for line in &records {
         assert!(
             line.starts_with(&prefix),
-            "only machine records sit between banner and summary: {line}"
+            "only machine records or the runtime diagnostic sit before the summary: {line}"
         );
     }
     // The interleaved records still satisfy the machine contract.
-    assert!(!parse_records(&format!("{}\n", body.join("\n"))).is_empty());
+    assert!(!parse_records(&format!("{}\n", records.join("\n"))).is_empty());
 }
 
 /// A consumer that closes stdout before the run finishes gets the documented
@@ -1143,7 +1195,11 @@ fn broken_stdout_pipe_exits_without_panic() {
             RUNTIME_CONTEXT_BUDGET,
         ],
     );
-    for marker in ["panicked", "Broken pipe", "BrokenPipe", "run="] {
+    assert!(
+        invocation.stderr.lines().any(is_runtime_finish_diagnostic),
+        "the completed run keeps its bounded diagnostic"
+    );
+    for marker in ["panicked", "Broken pipe", "BrokenPipe"] {
         assert!(
             !invocation.stderr.contains(marker),
             "the closed consumer stays quiet: {}",
