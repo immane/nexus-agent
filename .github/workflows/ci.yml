@@ -73,6 +73,9 @@ jobs:
       - name: Tests (complete suite)
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast --run-ignored all
 
+      - name: Benchmark tooling tests (offline)
+        run: python3 -B -m unittest discover -s tools/benchmarks -p 'test_*.py'
+
   doc:
     timeout-minutes: 15
     runs-on: ubuntu-latest

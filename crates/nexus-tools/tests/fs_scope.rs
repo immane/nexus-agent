@@ -261,8 +261,10 @@ fn oversize_content_truncates_on_a_boundary_with_its_flag() {
     let outcome = reader_for(&root).execute(&call(r#"{"path":"big.txt"}"#), &context(100, false));
     assert_eq!(outcome.status(), ExecutionStatus::Succeeded);
     assert!(outcome.is_truncated(), "the cut is flagged");
-    assert_eq!(outcome.content().len(), 100);
-    assert_eq!(outcome.content(), "x".repeat(100));
+    assert!(outcome.content().len() <= 100);
+    let (header, page) = outcome.content().split_once('\n').unwrap();
+    assert_eq!(header, format!("[more; next_offset={}]", page.len()));
+    assert_eq!(page, "x".repeat(page.len()));
 }
 
 #[test]
@@ -278,15 +280,142 @@ fn non_utf8_content_fails_without_mangling() {
 #[test]
 fn bounded_read_cut_inside_utf8_preserves_text_and_truncation() {
     let root = TempRoot::new();
-    let cap = Limits::M0_TEST_TOOL_OUTPUT_BYTES;
+    let cap = 8192;
     let mut text = "x".repeat(cap - 1);
     text.push_str("中文");
     root.file("big-utf8.txt", text.as_bytes());
     let outcome =
-        reader_for(&root).execute(&call(r#"{"path":"big-utf8.txt"}"#), &context(cap, false));
+        reader_for(&root).execute(&call(r#"{"path":"big-utf8.txt"}"#), &context(16384, false));
     assert_eq!(outcome.status(), ExecutionStatus::Succeeded);
     assert!(outcome.is_truncated());
-    assert_eq!(outcome.content(), "x".repeat(cap - 1));
+    assert_eq!(
+        outcome.content(),
+        format!("[more; next_offset={}]\n{}", cap - 1, "x".repeat(cap - 1))
+    );
+    let next = reader_for(&root).execute(
+        &call(&format!(
+            r#"{{"path":"big-utf8.txt","offset":{}}}"#,
+            cap - 1
+        )),
+        &context(4096, false),
+    );
+    assert_eq!(next.content(), "中文");
+    assert!(!next.is_truncated());
+}
+
+#[test]
+fn default_pages_bound_large_single_lines_and_reconstruct_the_whole_file() {
+    let root = TempRoot::new();
+    let source = "a界🦀".repeat(10_000);
+    root.file("long.txt", source.as_bytes());
+    let reader = reader_for(&root);
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    loop {
+        let outcome = reader.execute(
+            &call(&format!(r#"{{"path":"long.txt","offset":{offset}}}"#)),
+            &context(Limits::M0_TEST_TOOL_OUTPUT_BYTES, false),
+        );
+        assert_eq!(outcome.status(), ExecutionStatus::Succeeded);
+        assert!(outcome.content().len() <= 8192 + 64);
+        if !outcome.is_truncated() {
+            reconstructed.push_str(outcome.content());
+            break;
+        }
+        let (header, page) = outcome.content().split_once('\n').unwrap();
+        assert!(!page.is_empty());
+        offset += page.len();
+        assert_eq!(header, format!("[more; next_offset={offset}]"));
+        reconstructed.push_str(page);
+    }
+    assert_eq!(reconstructed, source);
+}
+
+#[test]
+fn explicit_pages_eof_and_invalid_options_are_honest() {
+    let root = TempRoot::new();
+    root.file("page.txt", "abcd界efgh".as_bytes());
+    let reader = reader_for(&root);
+    let page = reader.execute(
+        &call(r#"{"path":"page.txt","offset":4,"limit":4}"#),
+        &context(4096, false),
+    );
+    assert_eq!(page.content(), "[more; next_offset=8]\n界e");
+    assert!(page.is_truncated());
+    for offset in [11, 100_000] {
+        let page = reader.execute(
+            &call(&format!(r#"{{"path":"page.txt","offset":{offset}}}"#)),
+            &context(4096, false),
+        );
+        assert_eq!(page.content(), "");
+        assert!(!page.is_truncated());
+    }
+    for extra in [
+        r#""offset":-1"#,
+        r#""offset":1.5"#,
+        r#""offset":null"#,
+        r#""limit":0"#,
+        r#""limit":3"#,
+        r#""limit":16385"#,
+        r#""limit":"4""#,
+        r#""other":1"#,
+        r#""offset":5"#,
+    ] {
+        let outcome = reader.execute(
+            &call(&format!(r#"{{"path":"page.txt",{extra}}}"#)),
+            &context(4096, false),
+        );
+        assert_eq!(outcome.status(), ExecutionStatus::Failed, "{extra}");
+    }
+}
+
+#[test]
+fn maximum_page_and_tiny_output_budgets_stay_bounded() {
+    let root = TempRoot::new();
+    root.file("large.txt", &vec![b'x'; 20_000]);
+    let reader = reader_for(&root);
+    let outcome = reader.execute(
+        &call(r#"{"path":"large.txt","limit":16384}"#),
+        &context(32_000, false),
+    );
+    assert_eq!(
+        outcome.content(),
+        format!("[more; next_offset=16384]\n{}", "x".repeat(16384))
+    );
+    for budget in [1, 4, 20] {
+        let outcome = reader.execute(&call(r#"{"path":"large.txt"}"#), &context(budget, false));
+        assert_eq!(outcome.status(), ExecutionStatus::Failed);
+        assert!(outcome.content().len() <= budget);
+        assert!(!outcome.content().contains("next_offset="));
+    }
+}
+
+#[test]
+fn four_byte_characters_are_retried_from_their_start_and_exact_eof_is_not_more() {
+    let root = TempRoot::new();
+    root.file("emoji.txt", "a🦀z".as_bytes());
+    let reader = reader_for(&root);
+    for (offset, expected, truncated) in [
+        (0, "[more; next_offset=1]\na", true),
+        (1, "[more; next_offset=5]\n🦀", true),
+        (5, "z", false),
+    ] {
+        let outcome = reader.execute(
+            &call(&format!(
+                r#"{{"path":"emoji.txt","offset":{offset},"limit":4}}"#
+            )),
+            &context(4096, false),
+        );
+        assert_eq!(outcome.content(), expected);
+        assert_eq!(outcome.is_truncated(), truncated);
+    }
+    root.file("exact.txt", b"abcd");
+    let exact = reader.execute(
+        &call(r#"{"path":"exact.txt","limit":4}"#),
+        &context(4096, false),
+    );
+    assert_eq!(exact.content(), "abcd");
+    assert!(!exact.is_truncated());
 }
 
 #[test]

@@ -156,3 +156,111 @@ cached amd64 task workload, disconnected its network, verified the namespace and
 cleaned up the exact gateway/workload pair without model inference. This does not
 establish task success, correctness of every cached image, or Linux-host support.
 The default build-enabled `--prepare-only` path was also exercised successfully.
+
+## Ten-task diagnostic suite
+
+`swe_suite.json` fixes the diagnostic selection/order, dataset revision, evaluator
+version, and initial budgets. This is a development set, not a representative
+leaderboard sample or a claim of blind evaluation. The ten tasks cover config
+compatibility, CLI failures, explicit empty values, nested redaction, missing
+masks, redirect state, incorrectly skipped tests, array round trips, empty ML
+pipeline branches, and implicit plotting state changes.
+
+```sh
+# Inspect the portable selection; no Docker, network, or model requests.
+python3 tools/benchmarks/swe_suite.py list
+
+# Fetch the pinned canonical metadata. Gold/tests remain outside task mounts.
+python3 tools/benchmarks/prepare_swe_suite.py
+
+# Explicitly pull official amd64 images and build Nexus adapters.
+python3 tools/benchmarks/prepare_swe_suite.py --images
+
+# After worker source changes, explicitly rebuild recorded adapters, verifying
+# existing image identities first. No unrelated tags/images are overwritten.
+python3 tools/benchmarks/prepare_swe_suite.py --images --rebuild-images
+
+# Build the server once; sequentially verify each fresh checkout, isolated
+# session, network disconnection, source imports, and cleanup. No inference.
+python3 tools/benchmarks/swe_suite.py prepare
+
+# Explicitly authorize one live attempt per selected task, sequentially.
+# Defaults: 24 hours / 4096 tools per task, no automatic task retries.
+python3 tools/benchmarks/swe_suite.py run
+
+# Explicit tight-budget efficiency diagnostic; do not mix with normal runs.
+python3 tools/benchmarks/swe_suite.py run --max-run-seconds 1800 --max-tool-calls 150
+
+# Restrict preparation or inference to a suite member.
+python3 tools/benchmarks/swe_suite.py run --task pallets__flask-4992
+
+# Read existing batch accounting without any external operations.
+python3 tools/benchmarks/swe_suite.py summarize --batch BATCH/batch.json
+```
+
+Use the same `--work-root` for metadata preparation and batches. Preparation
+defaults to the separate sibling `../nexus-benchmark-work/lite-diagnostics-v1`
+directory; the original single-task launcher retains its older work-root default.
+Preparation
+generates a host-local `suite-profiles.json`; `--profiles` can override it.
+Each batch writes its own `batch.json`, `summary.json`, per-task launcher log,
+and independent attempt directory. All selected tasks, including unstarted
+ones, remain in accounting after interruption. Preparation checks the entire
+selection for metadata/images before starting any model work. Cleanup
+uncertainty stops the batch. Failed tasks are preserved and are never retried
+automatically; repeating the command creates a new batch, not a resume.
+
+The launcher import preflight verifies the mounted base commit, clean Git
+status, and module location under `/workspace` inside the disconnected workload.
+Suite adapters put `/workspace`, `/workspace/src`, and `/workspace/lib` on the
+task interpreter's import path. Native extensions and narrowly selected generated
+version/config files are retained from the official image before `/testbed` is
+removed. They are restored only at the identical base commit, with content
+hashes, no Git history, and no overwriting different workspace files. Git status
+is checked again afterwards; unignored changes block preparation.
+Official images can add setup commits changing permissions or dependency metadata.
+The disposable adapter build resets `/testbed` to the canonical task base before
+capture. Capture checks every tracked path/blob against that base (ignoring only
+regular-file executable bits) and rejects remaining source-content changes.
+It is **not** a public-test pass or official evaluator pass. The task's actual
+test command still depends on its historical repository and installed tools.
+Do not treat an installed `pytest` as proof every repository uses it.
+
+Official evaluation remains explicit and separate:
+
+```sh
+# Environment/oracle preflight. Keep gold artifacts private and outside mounts.
+python3 tools/benchmarks/evaluate_swe_suite.py --task pallets__flask-4992 --mode gold
+
+# An empty submission validates evaluator input handling, not FAIL_TO_PASS
+# execution: the official harness can skip empty patches entirely.
+python3 tools/benchmarks/evaluate_swe_suite.py --task pallets__flask-4992 --mode empty
+
+# Score the exact saved agent prediction, without another model invocation.
+python3 tools/benchmarks/evaluate_swe_suite.py --task pallets__flask-4992 \
+  --mode prediction --prediction RUN/artifacts/pallets__flask-4992.prediction.jsonl
+
+# Sequential oracle preflight for all ten, or score a saved live batch.
+python3 tools/benchmarks/swe_suite.py evaluate --mode gold
+python3 tools/benchmarks/swe_suite.py evaluate --mode prediction --batch BATCH/batch.json
+```
+
+Evaluation batches write a separate summary linked to the source live batch and
+its fingerprint; they never change the original attempt records. Missing
+predictions remain explicit, and evaluator errors/timeouts stop the batch for
+container inspection rather than starting another evaluation blindly.
+
+Image preparation and scoring require external downloads and considerable disk,
+CPU, and possibly amd64 emulation. They do not invoke a model. Live batches use
+the existing local/private endpoint restriction; hosted inference/spend is not
+enabled. Runtime token accounting remains observational rather than a hard
+pre-generation spend cap. The sequential batch's default wall budget can still
+consume up to ten days for ten tasks, excluding preparation/evaluation.
+Container isolation limitations and private unredacted archives described above
+apply unchanged.
+
+Preparation fingerprints the explicit Cargo/crates build inputs, including
+untracked source files, and rejects stale adapter provenance on reuse. Official
+scoring verifies canonical-row hashes and the prepared official image identity;
+the evaluator receives its immutable repository digest rather than `latest`.
+Gold preflight results are environment evidence, never agent-solving results.

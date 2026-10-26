@@ -401,9 +401,9 @@ impl Policy {
     /// 2. the call's tool revision must equal the policy revision;
     /// 3. the tool must be automatic;
     /// 4. arguments must pass the strict JSON parse (duplicate keys and
-    ///    depth/node/byte budgets rejected) and be exactly
-    ///    `{"path": <string>}` with a canonical logical project-relative
-    ///    path.
+    ///    depth/node/byte budgets rejected) with a canonical logical
+    ///    project-relative path. Reads also allow bounded integer byte-page
+    ///    `offset` and `limit`; searches require a nonempty `query`.
     ///
     /// A refusal returns a static diagnostic and never interpolates the
     /// rejected arguments. The returned scope is `read:<path>` or
@@ -434,8 +434,23 @@ impl Policy {
             ));
         }
         let args = parse_object_args(call)?;
-        let expected_len = if name == "host_search" { 2 } else { 1 };
-        if args.len() != expected_len {
+        let valid_args = if name == "host_read" {
+            args.keys()
+                .all(|key| matches!(key.as_str(), "path" | "offset" | "limit"))
+                && args.get("offset").is_none_or(|value| {
+                    value
+                        .as_u64()
+                        .is_some_and(|offset| offset <= i64::MAX as u64)
+                })
+                && args.get("limit").is_none_or(|value| {
+                    value
+                        .as_u64()
+                        .is_some_and(|limit| (4..=16384).contains(&limit))
+                })
+        } else {
+            args.len() == if name == "host_search" { 2 } else { 1 }
+        };
+        if !valid_args {
             return Err(policy_error(
                 ErrorCategory::PermissionDenied,
                 "automatic tool arguments are not a canonical path",
@@ -953,6 +968,45 @@ mod tests {
                 .as_str(),
             "search:crates/nexus-core/src"
         );
+    }
+
+    #[test]
+    fn strict_read_pages_accept_only_bounded_integer_arguments() {
+        let policy = Policy::m0_test();
+        for args in [
+            r#"{"path":"src/lib.rs","offset":0}"#,
+            r#"{"path":"src/lib.rs","limit":4}"#,
+            r#"{"path":"src/lib.rs","offset":9223372036854775807,"limit":16384}"#,
+        ] {
+            assert_eq!(
+                policy
+                    .authorize(&call("host_read", M0_REVISION, args))
+                    .unwrap()
+                    .as_str(),
+                "read:src/lib.rs"
+            );
+        }
+        for args in [
+            r#"{"path":"src/lib.rs","offset":-1}"#,
+            r#"{"path":"src/lib.rs","offset":0.5}"#,
+            r#"{"path":"src/lib.rs","offset":9223372036854775808}"#,
+            r#"{"path":"src/lib.rs","limit":3}"#,
+            r#"{"path":"src/lib.rs","limit":16385}"#,
+            r#"{"path":"src/lib.rs","limit":4.5}"#,
+            r#"{"path":"src/lib.rs","limit":null}"#,
+            r#"{"path":"src/lib.rs","offset":true}"#,
+            r#"{"path":"src/lib.rs","offset":0,"recursive":true}"#,
+            r#"{"path":"../outside","offset":0,"limit":4}"#,
+            r#"{"path":"src/lib.rs","offset":0,"offset":1}"#,
+            r#"{"offset":0,"limit":4}"#,
+        ] {
+            assert!(
+                policy
+                    .authorize(&call("host_read", M0_REVISION, args))
+                    .is_err(),
+                "{args}"
+            );
+        }
     }
 
     #[test]

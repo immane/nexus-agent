@@ -276,6 +276,45 @@ the live summary request or compaction behavior. The selected task was already
 exposed in prior runs and is not blind evidence. Reviewed artifacts are indexed
 in [the evidence README](evidence/README.md).
 
+### Ten-task diagnostics and Flask harness validation (2026-10-26)
+
+A fixed ten-task SWE-bench Lite diagnostic set was added under
+`tools/benchmarks/` with a pinned dataset revision
+(`b0dde1093fe417d83b7184254edf8199c1f0dff5`) and SWE-bench `5.0.2`. The tasks are
+selected for diagnostic breadth, not a representative sample. Preparation keeps
+gold rows outside task mounts; batches run sequentially, record unstarted and
+interrupted tasks, and never retry automatically. Official scoring is a separate,
+explicit step and reports its own outcome rather than reusing agent completion.
+
+Only `pallets__flask-4992` was run end to end. Two attempts are relevant:
+
+- The first attempt stopped after 17 minutes and 18 turns with
+  `LimitReached: context summary failed validation`. The provider batch was
+  protocol-valid, the finish reason was `Stop`, and `text_bytes=0`: the summary
+  contained no usable text. History was preserved, but the runtime had no
+  recovery and exited for a cause that was not a turn or time limit.
+- The second attempt used bounded 8 KiB paged reads, isolated task/summary
+  calibration, and a one-shot empty-summary retry. It completed after 4,140 s
+  with 99 model turns, 82 tool calls, 34 validated summary responses, and five
+  committed reductions. Cumulative read output was about 31 KB versus about 100 KB
+  before paging; provider-reported input peaked at 14,448 tokens before the first
+  reduction and reached 34,879 by the final turn, still well below the
+  94,208-token window. No empty summary occurred, so the retry path was covered by
+  tests but not triggered live.
+
+The submitted patch added `**open_args` to `Config.from_file()` and forwarded it
+to `open()`. It applied cleanly, passed all 19 `PASS_TO_PASS` tests, and failed
+the hidden `test_config_from_file_toml`, which calls
+`from_file(..., text=False)`. `open()` has no `text` parameter, so the required
+API must translate `text` into `"r"`/`"rb"` rather than forward it. The agent had
+verified `mode="rb"` on its own, but not the expected interface. Official
+evaluation therefore recorded `resolved: false`, without an infrastructure
+failure. This is a convergence and interface-inference failure, not evidence
+that the model failed to locate the defect.
+
+Agent wall time is the task run only and excludes preparation and the separate
+official evaluation.
+
 ### Earlier pilot observations
 
 One SWE-bench Lite task, `sympy__sympy-20590`, was used to validate the path;

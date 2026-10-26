@@ -180,6 +180,24 @@ durability; external-writer conflict detection is best-effort, not a universal
 race guarantee. These filesystem changes have macOS evidence only; Linux
 validation remains blocked. See the [migration record](docs/tasks/08-architecture-migration.md).
 
+`host_read` returns bounded UTF-8 **byte pages**, on both host and container
+backends. Arguments are `path`, optional zero-based byte `offset` (default `0`),
+and optional integer `limit` (default `8192`, range `4..16384` source bytes).
+For example, `{"path":"CHANGELOG.md","offset":0,"limit":8192}` reads the
+first page. When more bytes remain, the result has `truncated=true` and starts
+with `[more; next_offset=N]`; continue with that exact `offset=N`. The header
+is not file content. Pages may end mid-line, but never split UTF-8 characters
+or skip unread bytes. Offsets are not line numbers; no line numbering or total
+file size is reported. The output budget includes the continuation header and
+may reduce the page size; a budget too small for a header plus one character
+fails rather than emitting an unusable cursor. An offset inside a UTF-8
+character is invalid; an offset at or beyond EOF returns empty content.
+Reads do not snapshot the file, so concurrent edits can change later pages.
+If later context compaction marks a result as a model-context projection, its
+cursor still refers to the original page; re-read that page's original offset
+to recover omitted middle content rather than treating the preview as complete.
+Existing path scopes, protected-path restrictions, and jail checks still apply.
+
 Changing the environment in another shell does not change a running TUI's
 credentials; restart it after changing credentials.
 

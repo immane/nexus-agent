@@ -18,6 +18,7 @@ account for these differences when comparing other evaluations.
 | [Django](nexus-qwen-django-context-observation-20261024/report.json) | 2026-10-24 | 34m 02s | Completed | Resolved | 3 passed | 19 passed |
 | [SymPy summary-fix v2](nexus-qwen-sympy-20590-context-summaryfix-v2-20261025/report.json) | 2026-10-25 | 14m 11s | Completed | Resolved | 1 passed | 21 passed |
 | Astropy context-retention run (artifacts local) | 2026-10-25 | 13m 13s | Completed | Resolved | Not recorded | Not recorded |
+| Flask `Config.from_file` harness-validation run (artifacts local) | 2026-10-26 | 1h 09m 00s | Completed | **Unresolved** | 0 passed, 1 failed | 19 passed |
 
 The unbounded SymPy row is the earlier exposed-task pilot. The summary-fix v2
 row is another exposed-task replay, not blind benchmark evidence. Its official
@@ -33,6 +34,15 @@ artifacts at
 This single result does not show that investigation repetition decreased or
 that context-retention changes caused the repair. FAIL_TO_PASS and PASS_TO_PASS
 counts were not captured in the aggregate evaluator report.
+
+The Flask run is an exposed-task harness-validation replay, not blind evidence.
+The patch applied cleanly and left every PASS_TO_PASS test passing, but failed
+`tests/test_config.py::test_config_from_file_toml` because the hidden test calls
+`from_file(..., text=False)` and the prediction implemented `**open_args`, which
+forwards `text=False` to `open()` (an invalid keyword there). The evaluator
+recorded no infrastructure failure. The run used the current paged-read and
+split-calibration context path and committed five reductions from 34 validated
+summary responses.
 
 ## Artifact mapping
 

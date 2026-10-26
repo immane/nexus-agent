@@ -116,7 +116,7 @@ impl DevelopmentOperation {
         match self {
             Self::Read(port) => (
                 port.describe(),
-                "Read a runtime-authorized file path. Protected credential paths are unavailable.",
+                "Read a bounded UTF-8 byte page from a runtime-authorized file. Defaults: offset=0, limit=8192; both must be integers, limit is 4..16384. Follow next_offset on truncation. Offsets are zero-based bytes, not lines. Protected credential paths are unavailable.",
             ),
             Self::List(port) => (
                 port.describe(),
@@ -144,7 +144,7 @@ impl DevelopmentOperation {
         context: &ToolContext,
     ) -> ToolOutcome {
         match self {
-            Self::Read(port) => port.execute_resolved(target, context),
+            Self::Read(port) => port.execute_resolved(target, args, context),
             Self::List(port) => port.execute_resolved(target, context),
             Self::Search(port) => args
                 .get("query")
@@ -293,6 +293,13 @@ mod tests {
             "path:/wrong".to_owned(),
         );
         assert_eq!(wrong.status(), ExecutionStatus::Denied);
+        let page = run(
+            "host_read",
+            serde_json::json!({"path":"plain.txt", "offset":9, "limit":4}),
+            format!("path:{}", plain.display()),
+        );
+        assert_eq!(page.content(), "data");
+        assert!(!page.is_truncated());
         let hidden = run(
             "host_read",
             serde_json::json!({"path":".env"}),

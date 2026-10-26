@@ -1,12 +1,12 @@
 //! Root-jailed file tools (`host_read` and `host_write` at the M0 revision).
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use nexus_core::{
-    AgentError, EffectState, ErrorCategory, Evidence, ExecutionStatus, Limits, M0_REVISION,
-    RetryGuidance, ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolSpec,
+    AgentError, EffectState, ErrorCategory, Evidence, ExecutionStatus, M0_REVISION, RetryGuidance,
+    ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolSpec,
 };
 
 use crate::fs_access::BoundRoot;
@@ -21,8 +21,34 @@ pub const HOST_SEARCH_TOOL: &str = "host_search";
 /// Tool name for approval-gated exact text replacement.
 pub const HOST_PATCH_TOOL: &str = "host_patch";
 
-/// Closed input schema: exactly one `path` string, nothing else.
-pub const READ_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"#;
+/// Closed input schema for bounded, zero-based byte pages (not line offsets).
+/// The runtime schema subset has no `integer` type; `read_page` enforces it.
+pub const READ_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number","minimum":0,"maximum":9223372036854775807},"limit":{"type":"number","minimum":4,"maximum":16384}},"required":["path"],"additionalProperties":false}"#;
+
+/// Shared closed validation for host adapters and the container wire protocol.
+pub fn valid_read_arguments(value: &serde_json::Value) -> bool {
+    read_page(value).is_some()
+}
+
+fn read_page(value: &serde_json::Value) -> Option<(u64, usize)> {
+    let object = value.as_object()?;
+    if !object.get("path")?.is_string()
+        || object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "path" | "offset" | "limit"))
+    {
+        return None;
+    }
+    let offset = match object.get("offset") {
+        Some(value) => value.as_u64()?,
+        None => 0,
+    };
+    let limit = match object.get("limit") {
+        Some(value) => usize::try_from(value.as_u64()?).ok()?,
+        None => 8192,
+    };
+    (offset <= i64::MAX as u64 && (4..=16384).contains(&limit)).then_some((offset, limit))
+}
 
 /// Read chunk size in bytes. Cancellation is observed between chunks.
 const READ_CHUNK_BYTES: usize = 65_536;
@@ -64,7 +90,7 @@ impl ScopedReader {
         }
         let spec = ToolSpec::new(
             ToolId::new(HOST_READ_TOOL, M0_REVISION).expect("static tool identity builds"),
-            "Read a file inside the tool root",
+            "Read a bounded UTF-8 byte page inside the tool root. Defaults: offset=0, limit=8192. Both must be integers; limit is 4..16384. On truncation follow next_offset; offsets are zero-based bytes, not lines. No total size is inferred.",
             READ_SCHEMA,
         )
         .map_err(|_| tool_error(ErrorCategory::Internal, "tool description is invalid"))?;
@@ -123,16 +149,30 @@ impl ScopedReader {
     fn read_scoped(
         &self,
         path: &Path,
+        offset: u64,
+        limit: usize,
         context: &ToolContext,
     ) -> Result<(String, bool), AgentError> {
         context.check_active()?;
-        let file = self
+        let mut file = self
             .access
             .open_file(path)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be read"))?;
-        // One byte past the global cap is enough: anything longer is cut
-        // with the truncation flag below, so memory stays bounded.
-        let mut limited = file.take(Limits::M0_TEST_TOOL_OUTPUT_BYTES as u64 + 1);
+        // Reserve the largest possible continuation header before reading so
+        // later budget enforcement cannot remove source bytes behind a cursor.
+        let header_bytes = format!("[more; next_offset={}]\n", offset + limit as u64).len();
+        let capacity = limit.min(context.output_budget_bytes().saturating_sub(header_bytes));
+        if capacity < 4 {
+            return Err(tool_error(
+                ErrorCategory::ResourceLimit,
+                "read output budget is too small",
+            ));
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| tool_error(ErrorCategory::ToolFailure, "file cannot be read"))?;
+        // One probe byte establishes more; the source prefix is validated
+        // separately so the probe cannot introduce a spurious UTF-8 error.
+        let mut limited = file.take(capacity as u64 + 1);
         let mut bytes = Vec::new();
         let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
@@ -148,10 +188,11 @@ impl ScopedReader {
                 }
             }
         }
-        let truncated = bytes.len() > Limits::M0_TEST_TOOL_OUTPUT_BYTES;
+        let more = bytes.len() > capacity;
+        bytes.truncate(capacity);
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
-            Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            Err(error) if more && error.utf8_error().error_len().is_none() => {
                 // A bounded read can end inside the last UTF-8 character.
                 // Reject actual invalid bytes, but retain the valid prefix
                 // when the only invalidity is our deliberate cut.
@@ -167,44 +208,59 @@ impl ScopedReader {
                 ));
             }
         };
-        Ok((text, truncated))
+        context.check_active()?;
+        if more {
+            let next = offset + text.len() as u64;
+            Ok((format!("[more; next_offset={next}]\n{text}"), true))
+        } else {
+            Ok((text, false))
+        }
     }
 
-    pub(crate) fn execute_resolved(&self, path: &Path, context: &ToolContext) -> ToolOutcome {
-        if context.check_active().is_err() {
-            return Self::failed(tool_error(
-                if context.is_cancelled() {
-                    ErrorCategory::Cancelled
-                } else {
-                    ErrorCategory::Timeout
-                },
-                "filesystem call is no longer active",
-            ));
-        }
-        let (text, truncated) = match self.read_scoped(path, context) {
-            Ok(result) => result,
-            Err(error) => return Self::failed(error),
-        };
-        match ToolOutcome::from_bounded_content(
-            ExecutionStatus::Succeeded,
-            EffectState::KnownNotApplied,
-            Evidence::HostObserved,
-            text,
-            truncated,
-        ) {
-            Ok(outcome) => outcome
-                .enforce_budget(context.output_budget_bytes())
-                .unwrap_or_else(|_| {
-                    Self::failed(tool_error(
-                        ErrorCategory::Internal,
-                        "tool output could not be bounded",
-                    ))
-                }),
-            Err(_) => Self::failed(tool_error(
-                ErrorCategory::Internal,
-                "tool output could not be bounded",
-            )),
-        }
+    pub(crate) fn execute_resolved(
+        &self,
+        path: &Path,
+        args: &serde_json::Value,
+        context: &ToolContext,
+    ) -> ToolOutcome {
+        let outcome = (|| {
+            let Some((offset, limit)) = read_page(args) else {
+                return Self::failed(tool_error(
+                    ErrorCategory::InvalidInput,
+                    "tool arguments are invalid",
+                ));
+            };
+            if context.check_active().is_err() {
+                return Self::failed(tool_error(
+                    if context.is_cancelled() {
+                        ErrorCategory::Cancelled
+                    } else {
+                        ErrorCategory::Timeout
+                    },
+                    "filesystem call is no longer active",
+                ));
+            }
+            let (text, truncated) = match self.read_scoped(path, offset, limit, context) {
+                Ok(result) => result,
+                Err(error) => return Self::failed(error),
+            };
+            match ToolOutcome::from_bounded_content(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownNotApplied,
+                Evidence::HostObserved,
+                text,
+                truncated,
+            ) {
+                Ok(outcome) => outcome,
+                Err(_) => Self::failed(tool_error(
+                    ErrorCategory::Internal,
+                    "tool output could not be bounded",
+                )),
+            }
+        })();
+        outcome
+            .enforce_budget(context.output_budget_bytes())
+            .expect("valid read output budget")
     }
 
     /// Maps an internal failure to an honest outcome: unknown effects,
@@ -222,6 +278,7 @@ impl ScopedReader {
                 ErrorCategory::PermissionDenied => "path escapes the tool root",
                 ErrorCategory::Cancelled => "tool call was cancelled",
                 ErrorCategory::InvalidInput => "tool input is invalid",
+                ErrorCategory::ResourceLimit => "read output budget is too small",
                 _ => "file cannot be read",
             },
             false,
@@ -248,20 +305,27 @@ impl ToolPort for ScopedReader {
     }
 
     fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
-        if context.is_cancelled() {
-            return Self::failed(tool_error(
-                ErrorCategory::Cancelled,
-                "tool call was cancelled",
-            ));
-        }
-        let path = match self.resolve(call.args().as_str()) {
-            Ok(path) => path,
-            Err(error) if error.category() == ErrorCategory::PermissionDenied => {
-                return Self::denied();
+        let outcome = (|| {
+            if context.is_cancelled() {
+                return Self::failed(tool_error(
+                    ErrorCategory::Cancelled,
+                    "tool call was cancelled",
+                ));
             }
-            Err(error) => return Self::failed(error),
-        };
-        self.execute_resolved(&path, context)
+            let path = match self.resolve(call.args().as_str()) {
+                Ok(path) => path,
+                Err(error) if error.category() == ErrorCategory::PermissionDenied => {
+                    return Self::denied();
+                }
+                Err(error) => return Self::failed(error),
+            };
+            let args =
+                serde_json::from_str(call.args().as_str()).expect("resolve parsed arguments");
+            self.execute_resolved(&path, &args, context)
+        })();
+        outcome
+            .enforce_budget(context.output_budget_bytes())
+            .expect("valid read output budget")
     }
 }
 

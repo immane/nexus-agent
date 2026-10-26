@@ -274,6 +274,7 @@ struct ActiveRun {
     pending_compaction: Option<PendingCompaction>,
     input_estimate: u64,
     token_estimator: TokenEstimator,
+    summary_token_estimator: TokenEstimator,
     instruction_bytes: usize,
     context_note: String,
     context_note_bytes: usize,
@@ -963,6 +964,7 @@ impl Runtime {
             pending_compaction: None,
             input_estimate: 0,
             token_estimator: TokenEstimator::default(),
+            summary_token_estimator: TokenEstimator::default(),
             instruction_bytes: self.shared.instructions.payload_bytes(),
             context_note,
             context_note_bytes,
@@ -1483,8 +1485,14 @@ impl Runtime {
                 .window
                 .map(|window| window.tokens());
             let max_output_tokens = request.max_output_tokens();
-            let raw_estimated_input_tokens = Some(active.token_estimator.raw_estimate(&request));
-            let estimated_input_tokens = Some(active.token_estimator.estimate(&request));
+            let estimator = if active.pending_compaction.is_some() {
+                &active.summary_token_estimator
+            } else {
+                &active.token_estimator
+            };
+            let raw_estimated_input_tokens = Some(estimator.raw_estimate(&request));
+            let estimated_input_tokens = Some(estimator.estimate(&request));
+            let estimate_scale_millis = estimator.scale_millis();
             let outcome = emit_control(
                 &self.shared,
                 active,
@@ -1494,7 +1502,7 @@ impl Runtime {
                     purpose,
                     estimated_input_tokens,
                     raw_estimated_input_tokens,
-                    estimate_scale_millis: active.token_estimator.scale_millis(),
+                    estimate_scale_millis,
                     context_window_tokens: window,
                     context_trigger_percent: active.context_management.policy.trigger_percent(),
                     context_target_percent: active.context_management.policy.target_percent(),
@@ -7219,6 +7227,7 @@ mod cov_runtime_private {
             pending_compaction: None,
             input_estimate: 0,
             token_estimator: TokenEstimator::default(),
+            summary_token_estimator: TokenEstimator::default(),
             instruction_bytes: 0,
             context_note: String::new(),
             context_note_bytes: 0,
@@ -8967,6 +8976,7 @@ mod cov_runtime_topup_private {
             pending_compaction: None,
             input_estimate: 0,
             token_estimator: TokenEstimator::default(),
+            summary_token_estimator: TokenEstimator::default(),
             instruction_bytes: 0,
             context_note: String::new(),
             context_note_bytes: 0,

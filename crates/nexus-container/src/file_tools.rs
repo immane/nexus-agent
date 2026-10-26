@@ -70,7 +70,7 @@ pub(crate) fn container_file_tools_with_handler<T: WorkerTransport>(
     ContainerFileTools {
         read: port(
             HOST_READ_TOOL,
-            "Read a file inside the container workspace",
+            "Read a bounded UTF-8 byte page inside the container workspace. Defaults: offset=0, limit=8192; both must be integers, limit is 4..16384. Follow next_offset on truncation. Offsets are zero-based bytes, not lines; no total size is inferred.",
             READ_SCHEMA,
         ),
         list: port(

@@ -42,3 +42,37 @@ fn response_expansion_is_bounded_before_writing() {
     assert!(matches!(result, Err(ProtocolError::ResponseTooLarge)));
     assert!(output.is_empty());
 }
+
+#[test]
+fn read_pagination_round_trips_and_remains_closed_and_jailed() {
+    let arguments = json!({"path":"sub/file", "offset":8192, "limit":16384});
+    let wire =
+        json!({"version":1,"operation":"host_read","arguments":arguments,"output_limit":20000});
+    let request = read_request(&mut Cursor::new(wire.to_string())).unwrap();
+    assert_eq!(request.arguments, arguments);
+    assert!(validate_workspace_paths(&request.operation, &request.arguments).is_ok());
+    for arguments in [
+        json!({"path":"a","offset":-1}),
+        json!({"path":"a","offset":1.5}),
+        json!({"path":"a","offset":null}),
+        json!({"path":"a","offset":9223372036854775808_u64}),
+        json!({"path":"a","limit":0}),
+        json!({"path":"a","limit":16385}),
+        json!({"path":"a","limit":"10"}),
+        json!({"path":"a","offset":0,"extra":true}),
+    ] {
+        let wire =
+            json!({"version":1,"operation":"host_read","arguments":arguments,"output_limit":20000});
+        assert!(
+            read_request(&mut Cursor::new(wire.to_string())).is_err(),
+            "{arguments}"
+        );
+    }
+    assert!(
+        validate_workspace_paths(
+            "host_read",
+            &json!({"path":"../secret","offset":8192,"limit":4})
+        )
+        .is_err()
+    );
+}

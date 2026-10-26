@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "name": "lite-diagnostics-v1",
+  "dataset": {
+    "name": "SWE-bench/SWE-bench_Lite",
+    "split": "test",
+    "revision": "b0dde1093fe417d83b7184254edf8199c1f0dff5"
+  },
+  "evaluator_version": "5.0.2",
+  "platform": "linux/amd64",
+  "defaults": {
+    "max_run_seconds": 86400,
+    "max_tool_calls": 4096,
+    "tool_log_bytes": 8192
+  },
+  "tasks": [
+    {"instance_id": "pallets__flask-4992", "domain": "web framework", "purpose": "Diagnose request and response behavior in a small web framework.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "pylint-dev__pylint-6506", "domain": "static analysis", "purpose": "Diagnose Python lint inference and false-positive handling.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "sphinx-doc__sphinx-8595", "domain": "documentation", "purpose": "Diagnose documentation generation and cross-component behavior.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "django__django-12700", "domain": "web framework", "purpose": "Diagnose a mature framework with a focused regression test.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "astropy__astropy-14995", "domain": "astronomy", "purpose": "Diagnose scientific Python behavior and regression testing.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "psf__requests-1963", "domain": "HTTP client", "purpose": "Diagnose HTTP client semantics and compatibility.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "pytest-dev__pytest-7373", "domain": "testing", "purpose": "Diagnose test-runner behavior and reporting.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "pydata__xarray-4094", "domain": "labeled arrays", "purpose": "Diagnose labeled-array operations and metadata behavior.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "scikit-learn__scikit-learn-25570", "domain": "machine learning", "purpose": "Diagnose estimator behavior and numerical regression coverage.", "exposure": "selected diagnostic task; blind status not established"},
+    {"instance_id": "matplotlib__matplotlib-23299", "domain": "plotting", "purpose": "Diagnose plotting-library behavior and regression coverage.", "exposure": "selected diagnostic task; blind status not established"}
+  ]
+}
