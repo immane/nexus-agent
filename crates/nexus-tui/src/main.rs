@@ -211,7 +211,8 @@ fn user_config_snapshot(shared: &SharedUserConfig) -> UserConfig {
 fn load_session_config() -> io::Result<SessionConfig> {
     let args = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
         StartupAction::Run(args) => args,
-        StartupAction::Usage => startup_usage(),
+        StartupAction::Help => startup_usage(true),
+        StartupAction::Usage => startup_usage(false),
     };
     let mut session = session_config_at(resolve_path(None))?;
     let config = user_config_snapshot(&session.user_config);
@@ -381,6 +382,8 @@ struct StartupArgs {
 enum StartupAction {
     /// Serve the TUI with this optional real-files jail.
     Run(StartupArgs),
+    /// Print help and exit successfully.
+    Help,
     /// Print usage and exit 2.
     Usage,
 }
@@ -400,7 +403,7 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--help" | "-h" => return StartupAction::Usage,
+            "--help" | "-h" => return StartupAction::Help,
             "--demo" => demo = true,
             "--strict-tools" => strict_tools = true,
             "--execution" | "--run" => {
@@ -451,24 +454,47 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     })
 }
 
-/// Prints usage and exits 2. Splitting the exit from the parser keeps
-/// every rejection path unit-testable.
-fn startup_usage() -> ! {
-    eprintln!(
-        "usage: nexus-tui [--tools-root PATH] [--strict-tools] [--demo] [--run|--execution local|container] [--gateway-image IMAGE] [--container-image IMAGE] [--help]"
+/// Prints actionable help or a concise invalid-argument diagnostic.
+/// Keeping the exit separate from parsing makes rejection paths testable.
+fn startup_usage(help: bool) -> ! {
+    let text = format!(
+        concat!(
+            "Usage: nexus-tui [OPTIONS]\n\n",
+            "Modes:\n",
+            "  --execution <MODE>  Select local (default) or container execution\n",
+            "  --run <MODE>        Alias for --execution\n",
+            "  --demo              Run the scripted demo (fake provider/tools; submits a canned task)\n\n",
+            "Workspace and tools:\n",
+            "  --tools-root <PATH> Workspace jail; defaults to the current directory\n",
+            "  --strict-tools      Use the strict jailed-tools policy\n\n",
+            "Container images:\n",
+            "  --gateway-image <IMAGE>    Gateway image (overrides configured image)\n",
+            "  --container-image <IMAGE>  Workload image (overrides configured image)\n\n",
+            "Other:\n",
+            "  -h, --help          Print this help\n\n",
+            "Behavior:\n",
+            "  Without --demo, live provider wiring is used when configured; otherwise\n",
+            "  task submission reports that no provider is configured. Local mode is default.\n",
+            "  Container mode is experimental, needs a container-enabled build, both images\n",
+            "  (flags or user config), and a workspace. It does not establish isolation.\n",
+            "  Build: cargo build -p nexus-tui --features container\n",
+            "  Example: cargo run -p nexus-tui --features container -- --execution container\n",
+            "           --tools-root \"$PWD\" --gateway-image GATEWAY --container-image WORKLOAD\n",
+            "  Images must already be available locally; startup does not pull them.\n",
+            "  See QUICKSTART.md and docs/design/11-container-execution.md.\n\n",
+            "{}\n",
+        ),
+        if cfg!(feature = "container") {
+            "Container support: enabled in this build."
+        } else {
+            "Container support: disabled; rebuild with the command above."
+        }
     );
-    #[cfg(feature = "container")]
-    eprintln!(
-        "  container: --run container [--tools-root PATH] (images may be set in user config; flags override individually)"
-    );
-    #[cfg(not(feature = "container"))]
-    eprintln!("  --execution container is available only in container-enabled builds.");
-    eprintln!("  Without --demo the TUI attempts live wiring; unconfigured runs");
-    eprintln!("  fail with a not-configured diagnostic instead of serving fakes.");
-    eprintln!("  With --demo, every tool is scripted and one canned submission fires.");
-    eprintln!("  Project root is --tools-root, defaulting to the working directory.");
-    eprintln!("  Development tools are default: project/temp operations need no approval.");
-    eprintln!("  --strict-tools keeps jailed reads and approval-required writes/exec.");
+    if help {
+        print!("{text}");
+        std::process::exit(0);
+    }
+    eprintln!("Invalid command-line arguments.\n\n{text}");
     std::process::exit(2);
 }
 
@@ -1157,15 +1183,6 @@ fn wiring_notice(
 
 fn main() {
     install_panic_hook();
-    eprintln!(
-        "nexus-tui dev: live wiring by default. Interactive sessions use private local history storage (not encrypted); \
-          A slot whose model resolves to a configured provider with a credential \
-          uses the real adapter (network egress, billable); local --tools-root enables \
-           jailed file tools + sandboxed exec (writes/exec require approval). \
-           --execution container is experimental and does not establish isolation. \
-           Without a configured provider, runs fail as not-configured; \
-           relaunch with --demo for the scripted ephemeral demo."
-    );
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -1199,6 +1216,15 @@ async fn run() -> io::Result<()> {
     // fail as a startup error on the plain stderr surface, never inside a
     // restored-screen report. Both paths below share this one load.
     let session_config = load_session_config()?;
+    eprintln!(
+        "nexus-tui dev: live wiring by default. Interactive sessions use private local history storage (not encrypted); \
+          A slot whose model resolves to a configured provider with a credential \
+          uses the real adapter (network egress, billable); local --tools-root enables \
+           jailed file tools + sandboxed exec (writes/exec require approval). \
+           --execution container is experimental and does not establish isolation. \
+           Without a configured provider, runs fail as not-configured; \
+           relaunch with --demo for the scripted ephemeral demo."
+    );
     if session_config.execution == ExecutionMode::Container {
         eprintln!(
             "SECURITY WARNING: container isolation is not validated on native Linux. \
@@ -8392,7 +8418,9 @@ mod cov_live_wiring {
     fn tools_root(args: &[&str]) -> Option<std::path::PathBuf> {
         match parse_startup_args(&argv(args)) {
             StartupAction::Run(parsed) => parsed.tools_root,
-            StartupAction::Usage => panic!("expected a run action for {args:?}"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("expected a run action for {args:?}")
+            }
         }
     }
 
@@ -8400,7 +8428,9 @@ mod cov_live_wiring {
     fn demo_flag(args: &[&str]) -> bool {
         match parse_startup_args(&argv(args)) {
             StartupAction::Run(parsed) => parsed.demo,
-            StartupAction::Usage => panic!("expected a run action for {args:?}"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("expected a run action for {args:?}")
+            }
         }
     }
 
@@ -8413,6 +8443,17 @@ mod cov_live_wiring {
     }
 
     #[test]
+    fn help_flag_has_a_successful_help_action() {
+        for args in [&["--help"][..], &["-h"][..]] {
+            assert!(matches!(
+                parse_startup_args(&argv(args)),
+                StartupAction::Help
+            ));
+        }
+        usage(&["--unknown"]);
+    }
+
+    #[test]
     fn no_arguments_yield_no_explicit_jail() {
         assert_eq!(tools_root(&[]), None);
     }
@@ -8421,7 +8462,9 @@ mod cov_live_wiring {
     fn container_selection_is_explicit_and_requires_a_workspace_and_images() {
         let incomplete = match parse_startup_args(&argv(&["--execution", "container"])) {
             StartupAction::Run(parsed) => parsed,
-            StartupAction::Usage => panic!("syntactically valid flags should parse"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("syntactically valid flags should parse")
+            }
         };
         assert!(validate_execution_args(&incomplete, true, cfg!(feature = "container")).is_err());
         let incomplete_images = match parse_startup_args(&argv(&[
@@ -8433,7 +8476,9 @@ mod cov_live_wiring {
             "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ])) {
             StartupAction::Run(parsed) => parsed,
-            StartupAction::Usage => panic!("syntactically valid flags should parse"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("syntactically valid flags should parse")
+            }
         };
         assert!(
             validate_execution_args(&incomplete_images, true, cfg!(feature = "container")).is_err()
@@ -8452,7 +8497,9 @@ mod cov_live_wiring {
                 assert_eq!(parsed.execution, ExecutionMode::Container);
                 assert!(validate_execution_args(&parsed, true, true).is_ok());
             }
-            StartupAction::Usage => panic!("complete container options should parse"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("complete container options should parse")
+            }
         }
         let current_directory_default = match parse_startup_args(&argv(&[
             "--execution",
@@ -8463,7 +8510,9 @@ mod cov_live_wiring {
             "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ])) {
             StartupAction::Run(parsed) => parsed,
-            StartupAction::Usage => panic!("container images should parse without a root flag"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("container images should parse without a root flag")
+            }
         };
         assert!(validate_execution_args(&current_directory_default, true, true).is_ok());
     }
@@ -8472,7 +8521,7 @@ mod cov_live_wiring {
     fn run_alias_selects_container_and_mode_flags_remain_single_use() {
         let parsed = match parse_startup_args(&argv(&["--run", "container"])) {
             StartupAction::Run(parsed) => parsed,
-            StartupAction::Usage => panic!("alias should parse"),
+            StartupAction::Help | StartupAction::Usage => panic!("alias should parse"),
         };
         assert_eq!(parsed.execution, ExecutionMode::Container);
         usage(&["--run", "container", "--execution", "container"]);
@@ -8488,7 +8537,7 @@ mod cov_live_wiring {
             .expect("valid saved images");
         let args = match parse_startup_args(&argv(&[])) {
             StartupAction::Run(args) => args,
-            StartupAction::Usage => panic!("default startup parses"),
+            StartupAction::Help | StartupAction::Usage => panic!("default startup parses"),
         };
         let (gateway, workload) = merge_startup_images(&args, &config);
         assert_eq!((gateway, workload), (None, None));
@@ -8505,7 +8554,9 @@ mod cov_live_wiring {
             .expect("valid saved images");
         let mut args = match parse_startup_args(&argv(&["--execution", "container"])) {
             StartupAction::Run(args) => args,
-            StartupAction::Usage => panic!("container startup parses"),
+            StartupAction::Help | StartupAction::Usage => {
+                panic!("container startup parses")
+            }
         };
         args.gateway_image = Some("gateway:cli".into());
         assert_eq!(
@@ -8548,8 +8599,14 @@ mod cov_live_wiring {
 
     #[test]
     fn unknown_or_incomplete_flags_are_usage_never_silent_defaults() {
-        usage(&["--help"]);
-        usage(&["-h"]);
+        assert!(matches!(
+            parse_startup_args(&argv(&["--help"])),
+            StartupAction::Help
+        ));
+        assert!(matches!(
+            parse_startup_args(&argv(&["-h"])),
+            StartupAction::Help
+        ));
         usage(&["--tools-root"]);
         usage(&["--tools-root", ""]);
         usage(&["--tools"]);
