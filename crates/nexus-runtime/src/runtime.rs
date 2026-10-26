@@ -5192,6 +5192,60 @@ mod tests {
         }
     }
 
+    struct BlockingAfterToolProvider {
+        entered: std::sync::mpsc::Sender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        calls: AtomicUsize,
+    }
+
+    impl BlockingAfterToolProvider {
+        fn new() -> (
+            Self,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            (
+                Self {
+                    entered: entered_tx,
+                    release: StdMutex::new(release_rx),
+                    calls: AtomicUsize::new(0),
+                },
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    impl ProviderPort for BlockingAfterToolProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                streaming: true,
+                tool_calls: true,
+                structured_output: false,
+                usage_reporting: false,
+                max_context_items: None,
+                max_output_bytes: None,
+            }
+        }
+
+        fn stream(
+            &self,
+            _request: &ModelRequest,
+            _context: &ProviderContext,
+        ) -> Vec<ProviderEvent> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return FakeProvider::tool_turn(vec![candidate("host_read", r#"{"path":"src"}"#)]);
+            }
+            let _ = self.entered.send(());
+            let release = self.release.lock().expect("release lock");
+            let _ = release.recv_timeout(Duration::from_secs(5));
+            FakeProvider::stop_turn("after tool")
+        }
+    }
+
     struct Bed {
         runtime: Runtime,
         data: mpsc::Receiver<RunEvent>,
@@ -6805,10 +6859,8 @@ mod tests {
     fn cancelled_blocked_tool_finalizes_promptly_and_quarantines_until_termination() {
         let (tool, _entered, release) = BlockingTool::new();
         let tool = Arc::new(tool);
-        let provider = Arc::new(FakeProvider::new(vec![
-            FakeProvider::tool_turn(vec![candidate("host_read", r#"{"path":"src"}"#)]),
-            FakeProvider::stop_turn("done"),
-        ]));
+        let (provider, next_turn_entered, next_turn_release) = BlockingAfterToolProvider::new();
+        let provider = Arc::new(provider);
         let tools = vec![ToolRegistration::read(tool.clone())];
         let (runtime, streams) = Runtime::new(quick_config(), provider, tools);
         let mut data = streams.data;
@@ -6870,11 +6922,21 @@ mod tests {
             })
             .await
             .expect("quarantine clears after termination");
+            tokio::task::spawn_blocking(move || {
+                next_turn_entered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("new run reaches its deliberately blocked provider turn");
+            })
+            .await
+            .expect("provider entry waiter completes");
             assert!(
                 runtime.has_unconfirmed_work().await,
                 "the newly admitted run is active"
             );
             assert_eq!(accepted.reply(), CommandReply::Accepted);
+            next_turn_release
+                .send(())
+                .expect("release the provider turn");
             let _ = collect_until_finished(&mut data, &mut control).await;
             assert_eq!(tool.executions.load(Ordering::SeqCst), 1);
         });
