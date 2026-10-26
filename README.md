@@ -349,8 +349,10 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 
 ## Benchmark Observations
 
-Local SWE-bench Lite pilots with `ollama-local/qwen3-27b` produced patches
-marked **resolved** by the official SWE-bench evaluator (2026-10-24–25):
+Local SWE-bench Lite pilots with `ollama-local/qwen3-27b` were scored by the
+official SWE-bench evaluator (2026-10-24–26). **Three selected runs resolved and
+one completed run did not**; agent completion is tracked separately from official
+resolution:
 
 **Model configuration:** Qwen3.8-27B, **IQ3_M quantization**, with a configured
 **92K context window (94,208 tokens, input plus output)**, served through Ollama
@@ -363,8 +365,19 @@ comparisons should account for quantization, context budget, and agent harness.
 | `sympy__sympy-20590` (summary-fix v2, latest) | 2026-10-25 | 14m 11s | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
 | `astropy__astropy-12907` (context-retention run) | 2026-10-25 | 13m 13s | Preserve separability matrices in nested compound models. | Resolved | Completed |
 | `django__django-11099` | 2026-10-24 | 34m 02s | Reject trailing newlines in username validators. | Resolved | Completed |
+| `pallets__flask-4992` (harness validation) | 2026-10-26 | 1h 09m 00s | Pass `open()` keyword arguments through `Config.from_file`. | **Unresolved** | Completed |
 
-These are three selected tasks, **not a leaderboard score or a general success
+The Flask run produced a patch that applied cleanly and kept all 19
+`PASS_TO_PASS` tests passing. It failed `test_config_from_file_toml` because the
+hidden test calls `from_file(..., text=False)`, while the agent implemented
+`**open_args` and forwarded `text=False` to `open()`, which rejects it. Its own
+`mode="rb"` check passed, so this is an interface mismatch, not an infrastructure
+failure: the reported behavior was close but the expected API name was not
+inferred. Its 1,969-byte patch had no missing hunks; the agent verified its own
+`mode="rb"` example, cleaned up temporary files, and declared completion without
+checking the parameter name the hidden test expects.
+
+These are four selected task runs, **not a leaderboard score or a general success
 rate**; SymPy was attempted repeatedly. The table reports the latest evaluated
 run for each task, not every attempt; an earlier SymPy attempt ended with
 `limit-reached`. The Astropy context-retention run completed one context
@@ -376,6 +389,26 @@ prediction did not.
 
 Agent wall time is the runner's recorded task duration, excluding the separate
 official evaluator run. Dates are the pilot run dates (UTC).
+
+The Flask harness-validation run also exercised the recent context and tooling
+changes: bounded 8 KiB paged reads (16 KiB maximum) kept file reads near 31 KB
+instead of the earlier ~100 KB; task and summarizer requests now use separate
+token-calibration windows; and empty summaries get one bounded retry. That run
+made 99 model turns and 82 tool calls over 4,140 s, committed five summaries from
+34 validated summary responses, and hit no run-ending summary failure. An earlier
+18-turn attempt had stopped on a protocol-valid but empty summary after 17
+minutes; it also raised the misleading `limit-reached` label that is now reported
+as a `Protocol` failure once recovery is exhausted. These changes improve
+execution continuity, **not** repair accuracy: the completed Flask run still did
+not resolve.
+
+A repeatable ten-task diagnostic suite, fixed to dataset revision
+`b0dde1093fe417d83b7184254edf8199c1f0dff5` and SWE-bench evaluator `5.0.2`, lives
+in `tools/benchmarks/swe_suite.json`. Preparation, sequential batches, official
+scoring, and offline summaries are separate explicit steps that never invoke a
+model implicitly. Only the Flask task has been exercised end to end so far; the
+other nine tasks have prepared images and offline environment checks, not live
+results.
 
 See [benchmark methodology and earlier run records](docs/research/agent-benchmarks.md)
 and the [reliability follow-up backlog](docs/tasks/09-agent-reliability.md) for
