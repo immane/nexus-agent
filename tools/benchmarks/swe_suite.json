@@ -9,8 +9,8 @@
   "evaluator_version": "5.0.2",
   "platform": "linux/amd64",
   "defaults": {
-    "max_run_seconds": 1800,
-    "max_tool_calls": 150,
+    "max_run_seconds": 86400,
+    "max_tool_calls": 4096,
     "tool_log_bytes": 8192
   },
   "tasks": [

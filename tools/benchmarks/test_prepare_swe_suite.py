@@ -39,7 +39,7 @@ class PreparationTests(unittest.TestCase):
                          "psf__requests-1963", "pytest-dev__pytest-7373", "pydata__xarray-4094",
                          "scikit-learn__scikit-learn-25570", "matplotlib__matplotlib-23299"])
         self.assertEqual(self.suite["dataset"]["revision"], "b0dde1093fe417d83b7184254edf8199c1f0dff5")
-        self.assertEqual(self.suite["defaults"], {"max_run_seconds": 1800, "max_tool_calls": 150,
+        self.assertEqual(self.suite["defaults"], {"max_run_seconds": 86400, "max_tool_calls": 4096,
                                                  "tool_log_bytes": 8192})
         profiles = prepare.make_profiles(self.suite)
         local = json.loads((prepare.HERE / "local_profiles.json").read_text())

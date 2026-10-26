@@ -185,8 +185,11 @@ python3 tools/benchmarks/prepare_swe_suite.py --images --rebuild-images
 python3 tools/benchmarks/swe_suite.py prepare
 
 # Explicitly authorize one live attempt per selected task, sequentially.
-# Defaults: 30 minutes / 150 tools per task, no automatic task retries.
+# Defaults: 24 hours / 4096 tools per task, no automatic task retries.
 python3 tools/benchmarks/swe_suite.py run
+
+# Explicit tight-budget efficiency diagnostic; do not mix with normal runs.
+python3 tools/benchmarks/swe_suite.py run --max-run-seconds 1800 --max-tool-calls 150
 
 # Restrict preparation or inference to a suite member.
 python3 tools/benchmarks/swe_suite.py run --task pallets__flask-4992
@@ -252,7 +255,7 @@ CPU, and possibly amd64 emulation. They do not invoke a model. Live batches use
 the existing local/private endpoint restriction; hosted inference/spend is not
 enabled. Runtime token accounting remains observational rather than a hard
 pre-generation spend cap. The sequential batch's default wall budget can still
-consume roughly five hours for ten tasks, excluding preparation/evaluation.
+consume up to ten days for ten tasks, excluding preparation/evaluation.
 Container isolation limitations and private unredacted archives described above
 apply unchanged.
 
