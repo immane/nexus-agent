@@ -3011,6 +3011,14 @@ fn handle_vim_viewport_key(front: &mut Frontend, key: KeyEvent) -> Option<bool> 
 
 /// Handles one key event. Returns true when the TUI should exit.
 async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> bool {
+    handle_key_with_runtime(front, Some(runtime), key).await
+}
+
+async fn handle_key_with_runtime(
+    front: &mut Frontend,
+    runtime: Option<&Runtime>,
+    key: KeyEvent,
+) -> bool {
     if !front.state.colon_pending()
         && !front.state.overlay_open()
         && let Some(quit) = handle_vim_viewport_key(front, key)
@@ -3122,6 +3130,11 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
     };
     match action {
         Action::Submit => {
+            // The normal UI is available during container preparation, but
+            // no task may be dispatched until its real runtime is ready.
+            let Some(runtime) = runtime else {
+                return false;
+            };
             if front.storage_busy {
                 front.state.notice("session maintenance is still running; draft preserved; submit after it completes");
                 return false;
@@ -3269,6 +3282,9 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             front.state.cycle_variant();
         }
         Action::ApproveOnce | Action::Deny => {
+            let Some(runtime) = runtime else {
+                return false;
+            };
             let Some((run, notice)) = front.live_approval.clone() else {
                 front.state.notice("no live approval to decide");
                 return false;
@@ -3340,6 +3356,9 @@ async fn handle_key(front: &mut Frontend, runtime: &Runtime, key: KeyEvent) -> b
             }
             match front.state.active_run().cloned() {
                 Some(run) => {
+                    let Some(runtime) = runtime else {
+                        return false;
+                    };
                     let reply = runtime
                         .handle(cancel_command(front.next_request(), &run))
                         .await
@@ -3378,12 +3397,21 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
     } else {
         Some(application_session_store()?)
     };
+    let session = if session_config.demo {
+        SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?
+    } else {
+        new_tui_session_id()?
+    };
+    let mut front = Frontend::with_config(session, session_config.clone());
+    front.execution = session_config.execution;
+    front.state.set_session_label("s1");
     #[cfg(feature = "container")]
-    let (built_runtime, startup_draft) = if session_config.execution == ExecutionMode::Container {
-        let Some((runtime, resolved_config, draft)) = prepare_live_runtime_with_progress(
+    let (runtime, streams, live) = if session_config.execution == ExecutionMode::Container {
+        let Some((runtime, resolved_config)) = prepare_live_runtime_with_progress(
             session_config.clone(),
             session_store.clone(),
             &mut terminal,
+            &mut front,
         )
         .await?
         else {
@@ -3393,44 +3421,17 @@ async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveRep
             });
         };
         session_config = resolved_config;
-        (Some(runtime), draft)
+        session_config.active_model = front.active_model.clone();
+        front
+            .state
+            .set_toast("Container ready".to_owned(), TOAST_TTL);
+        runtime
     } else {
-        (
-            Some(build_live_runtime_with_store(
-                &session_config,
-                session_store.clone(),
-            )?),
-            String::new(),
-        )
+        build_live_runtime_with_store(&session_config, session_store.clone())?
     };
     #[cfg(not(feature = "container"))]
-    let (built_runtime, startup_draft) = (
-        Some(build_live_runtime_with_store(
-            &session_config,
-            session_store.clone(),
-        )?),
-        String::new(),
-    );
-    let Some((runtime, streams, live)) = built_runtime else {
-        return Ok(InteractiveReport {
-            result: Ok(()),
-            unresolved_blocking: false,
-        });
-    };
-    let session = if session_config.demo {
-        SessionId::new(DEMO_SESSION).map_err(|_| io::Error::other("demo session id rejected"))?
-    } else {
-        new_tui_session_id()?
-    };
-    let mut front = Frontend::with_config(session, session_config.clone());
-    for character in startup_draft.chars() {
-        if character == '\n' {
-            front.state.composer_newline();
-        } else {
-            front.state.composer_type(character);
-        }
-    }
-    front.state.set_session_label("s1");
+    let (runtime, streams, live) =
+        build_live_runtime_with_store(&session_config, session_store.clone())?;
     if !session_config.demo
         && nexus_session::default_data_dir()
             .is_some_and(|directory| directory.join("session-store.json").exists())
@@ -3528,28 +3529,34 @@ async fn prepare_live_runtime_with_progress(
     mut session_config: SessionConfig,
     session_store: Option<SessionStoreHandle>,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> io::Result<Option<((Runtime, EventStreams, LiveHandle), SessionConfig, String)>> {
-    let prepared = prepare_container_with_progress(
+    front: &mut Frontend,
+) -> io::Result<Option<((Runtime, EventStreams, LiveHandle), SessionConfig)>> {
+    prepare_container_with_progress(
         move || {
             resolve_container_images(&mut session_config)?;
             let runtime = build_live_runtime_with_store(&session_config, session_store)?;
             Ok((runtime, session_config))
         },
+        front,
         startup_read_input,
-        |message, draft| draw_container_startup(terminal, message, draft),
+        |front, message| {
+            front.state.set_toast(message.to_owned(), TOAST_TTL);
+            front.state.tick_caret();
+            draw(terminal, front)
+        },
     )
-    .await?;
-    Ok(prepared.map(|((runtime, config), draft)| (runtime, config, draft)))
+    .await
 }
 
 // Keep Docker and terminal I/O at the boundary so lifecycle failures can be
 // exercised with a controlled resource owner and without a real daemon or TTY.
 #[cfg(feature = "container")]
-async fn prepare_container_with_progress<T: Send + 'static>(
+async fn prepare_container_with_progress<T: Send + 'static, U>(
     prepare: impl FnOnce() -> io::Result<T> + Send + 'static,
-    mut read_input: impl FnMut(&mut AppState) -> io::Result<bool>,
-    mut draw_progress: impl FnMut(&str, &str) -> io::Result<()>,
-) -> io::Result<Option<(T, String)>> {
+    ui: &mut U,
+    mut read_input: impl AsyncFnMut(&mut U) -> io::Result<bool>,
+    mut draw_progress: impl FnMut(&mut U, &str) -> io::Result<()>,
+) -> io::Result<Option<T>> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
         .name("container-startup".to_owned())
@@ -3560,10 +3567,9 @@ async fn prepare_container_with_progress<T: Send + 'static>(
 
     let mut quit_requested = false;
     let mut terminal_error = None;
-    let mut draft = AppState::new();
     loop {
         if terminal_error.is_none() && !quit_requested {
-            match read_input(&mut draft) {
+            match read_input(ui).await {
                 Ok(quit) => quit_requested = quit,
                 Err(error) => {
                     terminal_error = Some(error);
@@ -3573,7 +3579,7 @@ async fn prepare_container_with_progress<T: Send + 'static>(
         } else if terminal_error.is_none() {
             // Continue draining input while initialization finishes; never
             // let queued keystrokes become the first task after startup.
-            if let Err(error) = read_input(&mut draft) {
+            if let Err(error) = read_input(ui).await {
                 terminal_error = Some(error);
             }
         }
@@ -3588,8 +3594,8 @@ async fn prepare_container_with_progress<T: Send + 'static>(
                 })?;
                 if terminal_error.is_none()
                     && let Err(error) = draw_progress(
+                        ui,
                         "Quit requested. Waiting for container startup to finish safely…",
-                        draft.composer(),
                     )
                 {
                     terminal_error = Some(error);
@@ -3602,10 +3608,8 @@ async fn prepare_container_with_progress<T: Send + 'static>(
                     })?;
                 while !cleanup.is_finished() {
                     if terminal_error.is_none()
-                        && let Err(error) = draw_progress(
-                            "Quit requested. Cleaning up the prepared container…",
-                            draft.composer(),
-                        )
+                        && let Err(error) =
+                            draw_progress(ui, "Quit requested. Cleaning up the prepared container…")
                     {
                         terminal_error = Some(error);
                     }
@@ -3630,7 +3634,7 @@ async fn prepare_container_with_progress<T: Send + 'static>(
                     )
                 })?;
                 return result
-                    .map(|runtime| Some((runtime, draft.composer().to_owned())))
+                    .map(Some)
                     .map_err(|error| startup_error_with_terminal_context(terminal_error, error));
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -3646,10 +3650,10 @@ async fn prepare_container_with_progress<T: Send + 'static>(
         let message = if quit_requested {
             "Quit requested. Waiting for container startup to finish safely…"
         } else {
-            "Preparing the container environment. Tasks are disabled until it is ready. Type to keep a draft; press Esc or Ctrl-C to quit."
+            "Preparing container · Enter to submit is disabled"
         };
         if terminal_error.is_none()
-            && let Err(error) = draw_progress(message, draft.composer())
+            && let Err(error) = draw_progress(ui, message)
         {
             terminal_error = Some(error);
             quit_requested = true;
@@ -3673,73 +3677,32 @@ fn startup_error_with_terminal_context(
 }
 
 #[cfg(feature = "container")]
-fn startup_read_input(draft: &mut AppState) -> io::Result<bool> {
-    let mut quit = false;
+async fn startup_read_input(front: &mut Frontend) -> io::Result<bool> {
+    // Drain queued startup keys before readiness is checked so an Enter
+    // pressed during preparation cannot become a submission after handoff.
     while poll(Duration::ZERO)? {
         match read()? {
-            Event::Key(key) => quit |= apply_startup_key(draft, key),
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if handle_key_with_runtime(front, None, key).await {
+                    return Ok(true);
+                }
+            }
+            Event::Mouse(mouse) => {
+                handle_mouse(front, mouse);
+            }
             Event::Paste(text) => {
                 for character in text.chars() {
                     if character == '\n' {
-                        draft.composer_newline();
+                        front.state.composer_newline();
                     } else {
-                        draft.composer_type(character);
+                        front.state.composer_type(character);
                     }
                 }
             }
             _ => {}
         }
     }
-    Ok(quit)
-}
-
-#[cfg(feature = "container")]
-fn apply_startup_key(draft: &mut AppState, key: KeyEvent) -> bool {
-    use crossterm::event::{KeyCode, KeyModifiers};
-    if key.kind != KeyEventKind::Press {
-        return false;
-    }
-    if key.code == KeyCode::Esc
-        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
-    {
-        return true;
-    }
-    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
-        match key.code {
-            KeyCode::Char(character) => draft.composer_type(character),
-            KeyCode::Backspace => {
-                draft.composer_backspace();
-            }
-            KeyCode::Left => draft.caret_left(),
-            KeyCode::Right => draft.caret_right(),
-            KeyCode::Enter if key.modifiers == KeyModifiers::SHIFT => draft.composer_newline(),
-            _ => {}
-        }
-    }
-    false
-}
-
-#[cfg(feature = "container")]
-fn draw_container_startup(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    message: &str,
-    draft: &str,
-) -> io::Result<()> {
-    let text = format!("{message}\n\nDraft (not submitted yet):\n{draft}");
-    terminal
-        .draw(|frame| {
-            let paragraph = ratatui::widgets::Paragraph::new(text)
-                .block(
-                    ratatui::widgets::Block::default()
-                        .title(" Container startup ")
-                        .borders(ratatui::widgets::Borders::ALL),
-                )
-                .alignment(ratatui::layout::Alignment::Center)
-                .wrap(ratatui::widgets::Wrap { trim: true });
-            frame.render_widget(paragraph, frame.size());
-        })
-        .map(|_| ())
-        .map_err(io::Error::other)
+    Ok(false)
 }
 
 async fn interactive_loop(
@@ -5292,6 +5255,77 @@ mod container_startup_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::Poll;
 
+    #[tokio::test]
+    async fn readiness_preserves_the_frontend_and_enables_explicit_submit() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let (release_prepare, prepare_gate) = std::sync::mpsc::channel();
+        let mut release_prepare = Some(release_prepare);
+        let mut front = Frontend::new(SessionId::new("startup-ui").unwrap());
+        let mut typed = false;
+        let prepared = prepare_container_with_progress(
+            move || {
+                prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                build_runtime()
+            },
+            &mut front,
+            async |front| {
+                if !typed {
+                    typed = true;
+                    for code in [KeyCode::Char('q'), KeyCode::Char('u'), KeyCode::Enter] {
+                        assert!(
+                            !handle_key_with_runtime(
+                                front,
+                                None,
+                                KeyEvent::new(code, KeyModifiers::NONE)
+                            )
+                            .await
+                        );
+                    }
+                    front.state.caret_left();
+                    front.state.open_help();
+                }
+                Ok(false)
+            },
+            |front, message| {
+                assert!(front.state.help_open());
+                assert_eq!(front.state.composer(), "qu");
+                front.state.set_toast(message.to_owned(), TOAST_TTL);
+                let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                render(&mut front.state, area, &mut buffer, front.focus);
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("Nexus Agent"));
+                assert!(!text.contains("Container startup"));
+                if let Some(release) = release_prepare.take() {
+                    release.send(()).unwrap();
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let (runtime, _streams) = prepared.expect("preparation succeeds without quitting");
+        assert_eq!(front.state.composer(), "qu");
+        assert!(front.state.help_open());
+        assert_eq!(front.focus, Focus::Composer);
+        assert_eq!(front.request_counter, 0, "readiness never auto-submits");
+        assert!(front.state.active_run().is_none());
+        front.state.dismiss_overlay();
+        front.state.composer_type('x');
+        assert_eq!(front.state.composer(), "qxu", "caret position is retained");
+        assert!(
+            !handle_key(
+                &mut front,
+                &runtime,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            )
+            .await
+        );
+        assert_eq!(front.request_counter, 1);
+        assert!(front.state.composer().is_empty());
+    }
+
     struct Resource {
         cleanup_started: Option<tokio::sync::oneshot::Sender<()>>,
         release_cleanup: std::sync::mpsc::Receiver<()>,
@@ -5322,12 +5356,14 @@ mod container_startup_tests {
             };
             let mut input_calls = 0;
             let mut draw_calls = 0;
+            let mut ui = ();
             let mut startup = Box::pin(prepare_container_with_progress(
                 move || {
                     prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
                     Ok(resource)
                 },
-                |_| {
+                &mut ui,
+                async |_| {
                     input_calls += 1;
                     assert_eq!(input_calls, 1, "input stops after terminal failure");
                     if fail_input {
@@ -5390,10 +5426,12 @@ mod container_startup_tests {
             release_cleanup: cleanup_gate,
             cleaned: Arc::clone(&cleaned),
         };
+        let mut ui = ();
         let mut startup = Box::pin(prepare_container_with_progress(
             move || Ok(resource),
-            |_| Ok(true),
-            |message, _| {
+            &mut ui,
+            async |_| Ok(true),
+            |_, message| {
                 assert!(draw_failed.is_some(), "drawing stops after failure");
                 if message.contains("Cleaning up") {
                     draw_failed.take().unwrap().send(()).unwrap();
@@ -5425,12 +5463,14 @@ mod container_startup_tests {
     #[tokio::test]
     async fn startup_failure_after_input_failure_preserves_both_errors() {
         let (release_prepare, prepare_gate) = std::sync::mpsc::channel();
-        let mut startup = Box::pin(prepare_container_with_progress::<()>(
+        let mut ui = ();
+        let mut startup = Box::pin(prepare_container_with_progress::<(), _>(
             move || {
                 prepare_gate.recv_timeout(Duration::from_secs(5)).unwrap();
                 Err(io::Error::new(io::ErrorKind::NotFound, "image missing"))
             },
-            |_| Err(io::Error::other("input failed")),
+            &mut ui,
+            async |_| Err(io::Error::other("input failed")),
             |_, _| panic!("must not draw after input failure"),
         ));
         poll_fn(|cx| {
@@ -5470,30 +5510,55 @@ mod cov_main_topup {
     use ratatui::{TerminalOptions, Viewport};
 
     #[cfg(feature = "container")]
-    #[test]
-    fn container_startup_keeps_a_draft_and_only_escape_or_ctrl_c_quits() {
-        let mut draft = AppState::new();
-        assert!(!apply_startup_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
-        ));
-        assert!(!apply_startup_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)
-        ));
-        assert!(!apply_startup_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-        ));
-        assert_eq!(draft.composer(), "qu");
-        assert!(apply_startup_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
-        ));
-        assert!(apply_startup_key(
-            &mut draft,
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
-        ));
+    #[tokio::test]
+    async fn container_startup_uses_normal_keys_but_cannot_submit() {
+        let mut front = Frontend::new(session());
+        front.execution = ExecutionMode::Container;
+        for code in [KeyCode::Char('q'), KeyCode::Char('u'), KeyCode::Enter] {
+            assert!(
+                !handle_key_with_runtime(&mut front, None, KeyEvent::new(code, KeyModifiers::NONE))
+                    .await
+            );
+        }
+        assert_eq!(front.state.composer(), "qu");
+        assert_eq!(front.request_counter, 0);
+        assert!(front.state.active_run().is_none());
+        assert!(front.live.is_none());
+        assert!(front.state.transcript().is_empty());
+
+        assert!(
+            !handle_key_with_runtime(
+                &mut front,
+                None,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+            )
+            .await
+        );
+        assert_eq!(front.state.composer(), "qu\n");
+        assert!(
+            !handle_key_with_runtime(
+                &mut front,
+                None,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            )
+            .await
+        );
+        assert_eq!(front.focus, Focus::Viewport);
+        for code in [
+            KeyCode::Char(':'),
+            KeyCode::Char('h'),
+            KeyCode::Char('e'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+            KeyCode::Enter,
+        ] {
+            assert!(
+                !handle_key_with_runtime(&mut front, None, KeyEvent::new(code, KeyModifiers::NONE))
+                    .await
+            );
+        }
+        assert!(front.state.help_open());
+        assert_eq!(front.state.composer(), "qu\n");
     }
 
     #[cfg(feature = "container")]
