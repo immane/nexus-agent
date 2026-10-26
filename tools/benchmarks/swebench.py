@@ -203,6 +203,35 @@ def cleanup_containers(record, workspace):
         command(["docker", "rm", "-f", identity], timeout=20)
 
 
+def verify_task_environment(record, row):
+    """Check checkout authority and imports offline, without exposing evaluator data."""
+    modules = {"django/django": "django", "pallets/flask": "flask",
+               "pylint-dev/pylint": "pylint", "sphinx-doc/sphinx": "sphinx",
+               "astropy/astropy": "astropy", "psf/requests": "requests",
+               "pytest-dev/pytest": "pytest", "pydata/xarray": "xarray",
+               "scikit-learn/scikit-learn": "sklearn", "matplotlib/matplotlib": "matplotlib"}
+    module = modules.get(row["repo"])
+    if module is None:
+        raise RuntimeError("no import preflight registered for this repository")
+    prefix = ["docker", "exec", "-w", "/workspace", record["workload_id"]]
+    head = command(prefix + ["git", "rev-parse", "HEAD"], timeout=30)
+    if head != row["base_commit"] or command(prefix + ["git", "status", "--porcelain"], timeout=30):
+        raise RuntimeError("agent checkout is not clean at the task base")
+    support = json.loads(command(prefix + ["python", "/usr/local/lib/nexus-swe-support.py", "restore",
+                                          "/opt/nexus-task-support", "/workspace"], timeout=120))
+    if command(prefix + ["git", "status", "--porcelain"], timeout=30):
+        raise RuntimeError("native build support changed tracked/unignored task files")
+    code = ("import importlib, importlib.util, json, pathlib, sys; "
+            f"m = importlib.import_module({module!r}); "
+            "p = pathlib.Path(m.__file__).resolve(); "
+            "assert pathlib.Path('/workspace') in p.parents, str(p); "
+            "print(json.dumps({'python': sys.version, 'module': m.__name__, "
+            "'source': str(p), 'pytest_available': importlib.util.find_spec('pytest') is not None}))")
+    imported = json.loads(command(prefix + ["python", "-c", code], timeout=120))
+    return {"base_commit": head, "clean_checkout": True, "native_support": support, "import": imported,
+            "public_tests": "not-run; import preflight is not test-suite validation"}
+
+
 def launch(args, profiles, task):
     if not task["image"] and not args.container_image:
         raise RuntimeError("no cached adapter image; build it first or specify --container-image")
@@ -331,6 +360,9 @@ def launch(args, profiles, task):
         manifest["containers"] = record
         manifest["network"] = disconnect_network(record, workspace)
         progress("network-verified", evidence=manifest["network"])
+        if getattr(args, "verify_task_environment", False):
+            manifest["environment"] = verify_task_environment(record, row)
+            progress("environment-verified", evidence=manifest["environment"])
         manifest["status"] = "prepared"
         write_json(run / "launch.json", manifest)
         if args.prepare_only:
@@ -341,7 +373,7 @@ def launch(args, profiles, task):
                   "--server", url, "--session-id", session, "--token-env", "NEXUS_BENCH_LAUNCH_TOKEN",
                   "--provider", provider_id, "--model", model_id, "--output-dir", str(run / "artifacts"),
                   "--nexus-revision", revision + "+diff-" + manifest["working_diff_sha256"],
-                  "--run-label", "exposed-network-disabled", "--max-run-seconds", str(args.max_run_seconds),
+                  "--run-label", task["exposure"] + "; network-disabled", "--max-run-seconds", str(args.max_run_seconds),
                   "--max-tool-calls", str(args.max_tool_calls), "--tool-log-bytes", str(args.tool_log_bytes)]
         if profiles.get("context_window_tokens") and model_id == profiles["model"] and provider_id == profiles["provider"]:
             runner += ["--context-window-tokens", str(profiles["context_window_tokens"])]
@@ -423,6 +455,8 @@ def main():
     parser.add_argument("--tool-log-bytes", type=int, default=8192,
                         help="redacted tool content preview bytes per event; 0 disables content logging")
     parser.add_argument("--prepare-only", action="store_true", help="verify preparation/network and clean up; no inference")
+    parser.add_argument("--verify-task-environment", action="store_true",
+                        help="verify clean task revision and imports inside the offline workload")
     parser.add_argument("--build", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     if args.max_run_seconds <= 0 or args.max_tool_calls <= 0 or not 0 <= args.port <= 65535:
