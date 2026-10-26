@@ -72,6 +72,15 @@ Existing safeguards include unknown windows staying unknown, explicit settings
 overriding discovery, provider-usage calibration, and disabling incompatible
 history rewriting with opaque continuations. Retain them.
 
+Empty-summary recovery now allows one additional tool-free invocation per staged
+reduction when a protocol-valid response stops normally without continuation,
+tool proposals, or usable text. Reasoning-only output is not derived memory.
+The retry retains the current chunk and accepted rolling memory without changing
+the active conversation, and uses the normal cancellation, deadline, and model-turn
+checks. A second empty response fails with `Protocol`, not a misleading resource
+limit. Other invalid summaries retain their existing fail-closed behavior; no
+partial rolling summary is committed and no unbudgeted original request is sent.
+
 ### Session recovery boundary at this baseline
 
 The runtime's `State.history` is an in-memory, bounded cache of completed

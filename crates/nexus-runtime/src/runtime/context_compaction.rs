@@ -33,6 +33,8 @@ pub(super) struct PendingCompaction {
     summary_memory: Option<String>,
     summary_in_flight: bool,
     summary_retry_depth: u8,
+    // One empty-response retry for the entire staged reduction, not per chunk.
+    empty_summary_retried: bool,
 }
 
 fn summary_source_chunks(items: &[ModelContextItem]) -> Vec<String> {
@@ -450,6 +452,7 @@ pub(super) fn prepare_context_request(
             summary_memory: None,
             summary_in_flight: false,
             summary_retry_depth: 0,
+            empty_summary_retried: false,
         };
         let removed = plan.removed;
         if stage.removed > 0 {
@@ -681,8 +684,39 @@ pub(super) fn ingest_summary(
         }
     }
     let summary = valid.then(|| summary_text(&events, &prefix.text)).flatten();
+    // A normal stop can contain only reasoning or whitespace. Repeating this
+    // tool-free derivation is safe, but never use reasoning as derived memory
+    // or retry a batch with tool proposals, continuation, or lost streamed text.
+    let empty_summary = valid
+        && matches!(events.last(), Some(ProviderEvent::TurnFinished(finished))
+            if finished.reason() == FinishReason::Stop && finished.continuation().is_none())
+        && events.iter().all(|event| match event {
+            ProviderEvent::TextDelta { text, .. } => text.trim().is_empty(),
+            ProviderEvent::ToolCallDelta { .. }
+            | ProviderEvent::ToolCallReady(_)
+            | ProviderEvent::Failed(_) => false,
+            _ => true,
+        })
+        && prefix.text.values().all(|text| text.trim().is_empty());
+    if empty_summary && !stage.empty_summary_retried && !stage.summary_chunks.is_empty() {
+        if active.turns_used.saturating_add(1) >= shared.limits.max_model_turns_per_run {
+            return Err(Terminal::limit(
+                "model turn budget cannot retry empty context summary",
+            ));
+        }
+        stage.empty_summary_retried = true;
+        stage.summary_in_flight = false;
+        shared.diagnostic(format_args!(
+            "nexus-runtime: empty context summary run={} turn_sequence={}; retrying same chunk once; original conversation and accepted staged memory preserved",
+            run.as_str(), active.turn_seq,
+        ));
+        active.pending_compaction = Some(stage);
+        return Ok(RunState::CallingModel);
+    }
     let mut rejection_reason = if !valid {
         "provider_batch_invalid"
+    } else if empty_summary {
+        "summary_text_empty"
     } else if summary.is_none() {
         "summary_text_invalid"
     } else {
@@ -768,6 +802,12 @@ pub(super) fn ingest_summary(
         stage.summary_retry_depth,
         nexus_context::MAX_MEMORY_BYTES,
     ));
+    if empty_summary {
+        return Err(Terminal::failed(runtime_error(
+            ErrorCategory::Protocol,
+            "context summary returned no usable text; bounded empty-summary recovery exhausted; original conversation preserved",
+        )));
+    }
     Err(Terminal::limit(match rejection_reason {
         "projected_request_exceeds_input_plus_output_budget" => {
             "valid context summary cannot fit the configured input and output budget; original conversation preserved"
@@ -1295,6 +1335,7 @@ mod tests {
             summary_memory: None,
             summary_in_flight: true,
             summary_retry_depth: 0,
+            empty_summary_retried: false,
         });
         active.turns_used = 1;
         active.input_estimate = 10_000;
@@ -1471,9 +1512,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_empty_incomplete_oversized_and_failed_summaries_preserve_conversation() {
+    fn invalid_incomplete_oversized_and_failed_summaries_preserve_conversation() {
         for events in [
-            stop("   "),
             stop(&"x".repeat(MAX_MEMORY_BYTES + 1)),
             vec![ProviderEvent::TextDelta {
                 item_key: "partial".to_owned(),
@@ -1506,6 +1546,219 @@ mod tests {
                 Some("Previous summary remains.")
             );
             assert_eq!(active.turns_used, 1);
+        }
+    }
+
+    #[test]
+    fn empty_or_reasoning_only_summary_retries_once_then_accepts_real_text() {
+        for events in [
+            stop("   "),
+            vec![
+                ProviderEvent::ReasoningDelta {
+                    text: "Private reasoning is not a summary.".to_owned(),
+                },
+                ProviderEvent::TurnFinished(TurnFinished::new(
+                    FinishReason::Stop,
+                    Usage::new(Some(100), Some(219), UsageFinality::Final),
+                    None,
+                )),
+            ],
+        ] {
+            let (shared, _data) = shared_with_data();
+            let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+            roomy_summary_budget(&mut active);
+            let original = active.conversation.clone();
+            active.derived_memory = Some("Prior accepted memory.".to_owned());
+            let first = prepare(&shared, &mut active);
+            let run = active.run.clone();
+            assert_eq!(
+                ingest_summary(
+                    &shared,
+                    &mut active,
+                    &run,
+                    events,
+                    &mut StreamedPrefix::default(),
+                )
+                .unwrap_or_else(|terminal| panic!("empty retry failed: {:?}", terminal.error)),
+                RunState::CallingModel
+            );
+            assert_eq!(active.conversation, original);
+            assert_eq!(
+                active.derived_memory.as_deref(),
+                Some("Prior accepted memory.")
+            );
+            let retry = prepare(&shared, &mut active);
+            assert_eq!(first.conversation(), retry.conversation());
+            assert_eq!(active.turns_used, 2);
+            ingest_summary(
+                &shared,
+                &mut active,
+                &run,
+                stop("Verified historical facts."),
+                &mut StreamedPrefix::default(),
+            )
+            .unwrap_or_else(|terminal| panic!("summary recovery failed: {:?}", terminal.error));
+            assert!(active.pending_compaction.is_none());
+            assert_eq!(
+                active.derived_memory.as_deref(),
+                Some("Verified historical facts.")
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_empty_summary_fails_as_protocol_error_without_discarding_history() {
+        let (shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        let original = active.conversation.clone();
+        active.derived_memory = Some("Prior accepted memory.".to_owned());
+        prepare(&shared, &mut active);
+        let run = active.run.clone();
+        ingest_summary(
+            &shared,
+            &mut active,
+            &run,
+            stop(" "),
+            &mut StreamedPrefix::default(),
+        )
+        .unwrap_or_else(|terminal| panic!("retry failed: {:?}", terminal.error));
+        prepare(&shared, &mut active);
+        let terminal = ingest_summary(
+            &shared,
+            &mut active,
+            &run,
+            stop(" "),
+            &mut StreamedPrefix::default(),
+        )
+        .expect_err("a second empty response must not loop");
+        assert_eq!(terminal.outcome, RunOutcome::Failed);
+        assert_eq!(terminal.error.unwrap().category(), ErrorCategory::Protocol);
+        assert_eq!(active.turns_used, 2);
+        assert!(active.pending_compaction.is_none());
+        assert_eq!(active.conversation, original);
+        assert_eq!(
+            active.derived_memory.as_deref(),
+            Some("Prior accepted memory.")
+        );
+    }
+
+    #[test]
+    fn empty_summary_retry_budget_is_not_reset_between_chunks() {
+        let (shared, _data) = shared_with_data();
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        active.context_management.window =
+            Some(ContextWindow::new(32_768, ContextWindowSource::Configured).unwrap());
+        active.conversation[1] =
+            ModelContextItem::assistant_text("large-old-answer", "historical fact ".repeat(4_000))
+                .unwrap();
+        let original = active.conversation.clone();
+        prepare(&shared, &mut active);
+        assert!(
+            active
+                .pending_compaction
+                .as_ref()
+                .unwrap()
+                .summary_chunks
+                .len()
+                > 1
+        );
+        let run = active.run.clone();
+        ingest_summary(
+            &shared,
+            &mut active,
+            &run,
+            stop(" "),
+            &mut StreamedPrefix::default(),
+        )
+        .unwrap_or_else(|terminal| panic!("retry failed: {:?}", terminal.error));
+        prepare(&shared, &mut active);
+        ingest_summary(
+            &shared,
+            &mut active,
+            &run,
+            stop("First chunk accepted but not committed."),
+            &mut StreamedPrefix::default(),
+        )
+        .unwrap_or_else(|terminal| panic!("first chunk failed: {:?}", terminal.error));
+        assert_eq!(active.pending_compaction.as_ref().unwrap().summary_index, 1);
+        prepare(&shared, &mut active);
+        let terminal = ingest_summary(
+            &shared,
+            &mut active,
+            &run,
+            stop(" "),
+            &mut StreamedPrefix::default(),
+        )
+        .expect_err("one retry per reduction, not per chunk");
+        assert_eq!(terminal.outcome, RunOutcome::Failed);
+        assert_eq!(active.conversation, original);
+        assert!(
+            active.derived_memory.is_none(),
+            "never commit a partial rolling summary"
+        );
+    }
+
+    #[test]
+    fn empty_summary_recovery_respects_cancellation_deadline_and_turn_budget() {
+        for cause in [0, 1, 2] {
+            let (shared, _data) = shared_with_data();
+            let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+            let original = active.conversation.clone();
+            prepare(&shared, &mut active);
+            match cause {
+                0 => active.token.cancel(),
+                1 => active.deadline = StdInstant::now() - Duration::from_millis(1),
+                _ => active.turns_used = shared.limits.max_model_turns_per_run - 1,
+            }
+            let run = active.run.clone();
+            let terminal = ingest_summary(
+                &shared,
+                &mut active,
+                &run,
+                stop(" "),
+                &mut StreamedPrefix::default(),
+            )
+            .expect_err("no retry without a remaining budget");
+            assert_eq!(
+                terminal.outcome,
+                if cause == 0 {
+                    RunOutcome::Cancelled
+                } else {
+                    RunOutcome::LimitReached
+                }
+            );
+            assert_eq!(active.conversation, original);
+            assert!(active.derived_memory.is_none());
+        }
+    }
+
+    #[test]
+    fn empty_summary_retry_does_not_mask_continuation_or_missing_streamed_text() {
+        for continuation in [false, true] {
+            let (shared, _data) = shared_with_data();
+            let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+            let original = active.conversation.clone();
+            prepare(&shared, &mut active);
+            let run = active.run.clone();
+            let mut prefix = StreamedPrefix::default();
+            if !continuation {
+                prefix
+                    .text
+                    .insert("summary".to_owned(), "Already streamed text.".to_owned());
+            }
+            let events = vec![ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::Stop,
+                Usage::new(Some(100), Some(219), UsageFinality::Final),
+                continuation.then(|| {
+                    ContinuationData::new("test-adapter", "profile", b"opaque".to_vec()).unwrap()
+                }),
+            ))];
+            ingest_summary(&shared, &mut active, &run, events, &mut prefix)
+                .expect_err("not a retryable empty response");
+            assert!(active.pending_compaction.is_none());
+            assert_eq!(active.turns_used, 1);
+            assert_eq!(active.conversation, original);
+            assert!(active.derived_memory.is_none());
         }
     }
 
