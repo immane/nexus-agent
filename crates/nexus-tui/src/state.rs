@@ -1378,8 +1378,13 @@ impl AppState {
                         sanitize(error.message())
                     )
                 });
+                let persistence = match finished.persistence() {
+                    nexus_core::PersistenceState::Ephemeral => "memory-only history",
+                    nexus_core::PersistenceState::Saved => "source history saved",
+                    nexus_core::PersistenceState::SaveFailed => "source history save failed",
+                };
                 self.push_system(format!(
-                    "run {} finished: {:?} (ephemeral record){detail}",
+                    "run {} finished: {:?} ({persistence}){detail}",
                     event.run().as_str(),
                     finished.outcome()
                 ));
@@ -3308,7 +3313,7 @@ mod tests {
         let lines: Vec<String> = state.transcript();
         assert!(
             lines.iter().any(
-                |line| line.contains("finished: Completed (ephemeral record)")
+                |line| line.contains("finished: Completed (memory-only history)")
                     && !line.contains("error=")
             ),
             "a clean finish carries no error detail: {lines:?}"
@@ -3335,13 +3340,48 @@ mod tests {
         assert!(state.apply_event(&failed));
         let lines: Vec<String> = state.transcript();
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("finished: Failed (ephemeral record)")
+            lines.iter().any(
+                |line| line.contains("finished: Failed (memory-only history)")
                     && line.contains("error=Protocol")
-                    && line.contains("provider reply tool call arguments are invalid")),
+                    && line.contains("provider reply tool call arguments are invalid")
+            ),
             "a failed run names its error on the transcript: {lines:?}"
         );
+    }
+
+    #[test]
+    fn finish_describes_source_persistence_not_a_saved_terminal_record() {
+        use nexus_core::{AgentError, ErrorCategory, PersistenceState, RetryGuidance, RunFinished};
+        for (persistence, label) in [
+            (PersistenceState::Ephemeral, "memory-only history"),
+            (PersistenceState::Saved, "source history saved"),
+            (PersistenceState::SaveFailed, "source history save failed"),
+        ] {
+            let mut state = AppState::new();
+            assert!(state.apply_event(&started(0)));
+            let (session, run) = session_run();
+            let error = (persistence == PersistenceState::SaveFailed).then(|| {
+                AgentError::new(
+                    ErrorCategory::Internal,
+                    "session save failed",
+                    RetryGuidance::DoNotRetry,
+                )
+                .unwrap()
+            });
+            let event = RunEvent::new(
+                session,
+                run,
+                1,
+                EventPayload::RunFinished(
+                    RunFinished::new(RunOutcome::Completed, persistence, error).unwrap(),
+                ),
+            );
+            assert!(state.apply_event(&event));
+            let transcript = state.transcript().join("\n");
+            assert!(transcript.contains(&format!("finished: Completed ({label})")));
+            assert!(!transcript.contains("ephemeral record"));
+            assert!(!transcript.contains("terminal record saved"));
+        }
     }
 
     #[test]

@@ -199,6 +199,31 @@ the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
 `:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
 command.
 
+### TUI diagnostics
+
+Interactive non-demo runs automatically retain metadata-only runtime diagnostics:
+
+- macOS: `~/Library/Application Support/nexus-agent/logs/tui-runtime.log`
+- Linux/other Unix: `${XDG_STATE_HOME:-$HOME/.local/state}/nexus-agent/logs/tui-runtime.log`
+
+The current file and one rotated file (`tui-runtime.log.1`) each hold at most
+1 MiB; older records are overwritten on rotation, with no age-based retention.
+An empty `tui-runtime.lock` serializes writes/rotation across local TUI processes.
+Directories are owner-only (0700), files owner-only (0600); unsafe existing log
+paths cause startup to fail rather than following symlinks or broadening access.
+Records over 4 KiB are refused. Later write failures produce a TUI notice and
+fall back to stderr only when it is redirected, never to the TUI-owned terminal.
+
+Records contain timestamps, host-generated run/turn identifiers, byte/count
+metrics, context budgets, output-limit recovery decisions, and terminal outcome,
+error category, source-persistence status, duration, and delivery metadata.
+They do **not** contain prompts, response/reasoning text, tool arguments/results,
+provider payloads, credentials, or error-message text. Logging does not change
+retry policy or budgets. Logs are not conversation archives or saved terminal
+checkpoints: “source history saved” in the completion line refers only to source
+history, not a saved terminal outcome. `--demo` does not open the user's logs;
+redirect stderr to retain its diagnostics. Noninteractive behavior is unchanged.
+
 ### Automatic context management
 
 All three provider protocols accept the same optional configuration fields.

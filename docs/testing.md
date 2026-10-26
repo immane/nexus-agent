@@ -30,8 +30,10 @@ It connects stdout and stderr to the same pseudo-terminal and checks incremental
 rendering at three sizes while opening commands, creating/listing/switching
 sessions, and opening/closing help. It uses `--demo` with an empty configuration;
 it does not call live providers or open the user's session store. Runtime
-diagnostics must not write directly to a terminal owned by the TUI; redirect
-stderr to a file to retain those diagnostics without corrupting the screen.
+diagnostics must not write directly to a terminal owned by the TUI. Interactive
+non-demo runs write bounded, metadata-only local logs automatically (see
+[Quickstart diagnostics](../QUICKSTART.md#tui-diagnostics)). Demo runs do not open
+the user's log directory; redirect stderr to retain their runtime diagnostics.
 
 Development/test builds retain line-table debug information, debug assertions,
 overflow checks, and incremental compilation. Dependencies omit debug information.

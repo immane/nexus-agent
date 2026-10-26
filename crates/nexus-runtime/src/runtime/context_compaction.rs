@@ -372,7 +372,7 @@ pub(super) fn prepare_context_request(
         return next_summary_request(shared, active, turn);
     }
     if let Some(repeated) = nexus_context::repeated_action_run(&active.conversation) {
-        diagnostic(format_args!(
+        shared.diagnostic(format_args!(
             "nexus-runtime: candidate low-information action repetition repeated_actions={repeated} window_calls={} reason=identical_resolved_tool_revision_arguments_and_outcome; state_change_not_observed; no_automatic_recovery",
             nexus_context::STAGNATION_WINDOW_CALLS,
         ));
@@ -416,7 +416,7 @@ pub(super) fn prepare_context_request(
                     .map(|request| estimate(active, &request))
             })?
         };
-        diagnostic(format_args!(
+        shared.diagnostic(format_args!(
             "nexus-runtime: context compaction planned estimated_input_tokens={input} target_tokens={target} window_tokens={window} output_reserve_tokens={output} archived={archived} removed_items={} retained_items={}",
             plan.removed.len(),
             plan.items.len(),
@@ -432,7 +432,7 @@ pub(super) fn prepare_context_request(
             if minimum.conversation().len() > shared.context_items_bound
                 || minimum_input.saturating_add(output) > window
             {
-                diagnostic(format_args!(
+                shared.diagnostic(format_args!(
                     "nexus-runtime: protected context floor exceeds budget estimated_input_tokens={minimum_input} output_reserve_tokens={output} window_tokens={window} retained_items={}; summary call skipped",
                     minimum.conversation().len(),
                 ));
@@ -461,7 +461,7 @@ pub(super) fn prepare_context_request(
                 }
                 stage.summary_chunks = summary_source_chunks(&removed);
                 if !stage.summary_chunks.is_empty() {
-                    diagnostic(format_args!(
+                    shared.diagnostic(format_args!(
                         "nexus-runtime: context summary split into {} bounded chunks source_bytes={}",
                         stage.summary_chunks.len(),
                         removed
@@ -495,7 +495,7 @@ pub(super) fn prepare_context_request(
         input = estimate(active, &request);
     }
     if input.saturating_add(output) > window {
-        diagnostic(format_args!(
+        shared.diagnostic(format_args!(
             "nexus-runtime: context cannot fit after reduction estimated_input_tokens={input} window_tokens={window} output_reserve_tokens={output} retained_items={}; protected context was not discarded",
             request.conversation().len(),
         ));
@@ -586,12 +586,12 @@ fn commit(
         active.context_note_bytes =
             runtime_note_bytes(&active.context_note, active.instruction_bytes > 0);
     }
-    diagnostic(format_args!(
+    shared.diagnostic(format_args!(
         "nexus-runtime: automatic context compaction method={method} estimated_input_tokens={estimated}; token occupancy is estimated, not exact"
     ));
     if method == "summarize" {
         let (window, reserve) = window.unwrap_or((0, 0));
-        diagnostic(format_args!(
+        shared.diagnostic(format_args!(
             "nexus-runtime: summary compaction outcome before_estimated_input_tokens={before_estimated} after_estimated_input_tokens={estimated} estimated_savings_tokens={} output_reserve_tokens={reserve} window_tokens={window} measurement=heuristic_not_provider_usage",
             i128::from(before_estimated) - i128::from(estimated),
         ));
@@ -672,9 +672,9 @@ pub(super) fn ingest_summary(
             stage.summary_chunks.insert(stage.summary_index + 1, tail);
             stage.summary_retry_depth += 1;
             stage.summary_in_flight = false;
-            diagnostic(format_args!(
-                "nexus-runtime: summary output limit; retrying smaller chunk retry={}/{} chunk_bytes={} previous_partial_discarded=true",
-                stage.summary_retry_depth, MAX_SUMMARY_OUTPUT_RETRIES, head_len,
+            shared.diagnostic(format_args!(
+                "nexus-runtime: summary output limit run={} turn_sequence={}; retrying smaller chunk retry={}/{} chunk_bytes={} previous_partial_discarded=true",
+                run.as_str(), active.turn_seq, stage.summary_retry_depth, MAX_SUMMARY_OUTPUT_RETRIES, head_len,
             ));
             active.pending_compaction = Some(stage);
             return Ok(RunState::CallingModel);
@@ -697,7 +697,7 @@ pub(super) fn ingest_summary(
             stage.summary_memory = Some(summary);
             stage.summary_in_flight = false;
             stage.summary_retry_depth = 0;
-            diagnostic(format_args!(
+            shared.diagnostic(format_args!(
                 "nexus-runtime: context summary chunk accepted chunk={}/{}; active context remains unchanged",
                 stage.summary_index,
                 stage.summary_chunks.len(),
@@ -746,7 +746,7 @@ pub(super) fn ingest_summary(
                         rejection_reason = "projected_context_item_limit_exceeded";
                     } else {
                         rejection_reason = "projected_request_exceeds_input_plus_output_budget";
-                        diagnostic(format_args!(
+                        shared.diagnostic(format_args!(
                             "nexus-runtime: summary candidate does not fit estimated_input_tokens={input} output_reserve_tokens={output} window_tokens={}; candidate_preserved=false",
                             active
                                 .context_management
@@ -762,8 +762,9 @@ pub(super) fn ingest_summary(
         ProviderEvent::TextDelta { text, .. } => bytes.saturating_add(text.len()),
         _ => bytes,
     });
-    diagnostic(format_args!(
-        "nexus-runtime: summary rejected reason={rejection_reason} protocol_valid={valid} finish_reason={finish_reason:?} retry_depth={} text_bytes={text_bytes} memory_byte_limit={}; original conversation preserved",
+    shared.diagnostic(format_args!(
+        "nexus-runtime: summary rejected run={} turn_sequence={} reason={rejection_reason} protocol_valid={valid} finish_reason={finish_reason:?} retry_depth={} text_bytes={text_bytes} memory_byte_limit={}; original conversation preserved",
+        run.as_str(), active.turn_seq,
         stage.summary_retry_depth,
         nexus_context::MAX_MEMORY_BYTES,
     ));

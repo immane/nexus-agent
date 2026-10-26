@@ -64,6 +64,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
+mod diagnostics;
+
 const DEMO_PROFILE: &str = "m0-test";
 const DEMO_INPUT: &str = "m0 test-only demo submission";
 /// Persistent tick: keyboard polling and stalled-reorder handling happen at
@@ -155,6 +157,7 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 /// active model, and history.
 #[derive(Debug, Clone)]
 struct SessionConfig {
+    diagnostics: Option<diagnostics::DiagnosticLog>,
     user_config: SharedUserConfig,
     active_model: Option<String>,
     /// Project root for real file reads/writes: `--tools-root`, else the working
@@ -312,6 +315,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
     };
     let active_model = boot_model(&config);
     Ok(SessionConfig {
+        diagnostics: None,
         user_config: shared_user_config(config, path),
         active_model,
         tools_root: None,
@@ -1114,6 +1118,10 @@ fn runtime_with_tools(
         None => Runtime::try_new(config, provider, tools),
     }
     .map_err(io::Error::other)?;
+    let runtime = match &session_config.diagnostics {
+        Some(log) => runtime.with_diagnostic_writer(log.clone()),
+        None => runtime,
+    };
     Ok((runtime, streams, binding))
 }
 
@@ -3496,9 +3504,11 @@ struct InteractiveReport {
 /// error, cancelling live work first. Conversations live in a session
 /// registry: the first slot serves the canned submission, further slots
 /// arrive through `:session new`, and only the active slot is polled.
-async fn interactive(session_config: SessionConfig) -> io::Result<InteractiveReport> {
-    #[cfg(feature = "container")]
-    let mut session_config = session_config;
+async fn interactive(mut session_config: SessionConfig) -> io::Result<InteractiveReport> {
+    // Demo/PTY tests remain isolated from the user's local state directory.
+    if !session_config.demo {
+        session_config.diagnostics = Some(diagnostics::DiagnosticLog::open_default()?);
+    }
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io::Error::other)?;
     let session_store = if session_config.demo {
@@ -3823,6 +3833,17 @@ async fn interactive_loop(
     let mut event_since_tick = false;
     loop {
         let mut dirty = false;
+        if sessions
+            .template
+            .diagnostics
+            .as_ref()
+            .is_some_and(|log| log.take_failure())
+        {
+            sessions.active_mut().front.state.notice(
+                "local runtime diagnostic write failed; diagnostics may be missing (redirected stderr remains a fallback)",
+            );
+            dirty = true;
+        }
         // Only the active slot is polled and drawn; background slots keep
         // buffering in their bounded channels until switched back to. The
         // borrow ends before the step is handled so a session switch inside
@@ -5835,6 +5856,7 @@ mod cov_main_topup {
     /// exercise the loop rather than persistence.
     fn defaults_config() -> SessionConfig {
         SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,
@@ -5879,6 +5901,7 @@ mod cov_main_topup {
         }
         let active_model = boot_model(&config);
         SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(config, None),
             active_model,
             tools_root: None,
@@ -8848,6 +8871,7 @@ mod cov_live_wiring {
     fn live_roots_must_exist_as_directories() {
         let missing = std::path::PathBuf::from("/nonexistent-nexus-tui-jail");
         let session = SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: Some(missing),
@@ -8875,6 +8899,7 @@ mod cov_live_wiring {
     #[test]
     fn demo_wiring_builds_without_a_jail() {
         let session = SessionConfig {
+            diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
             active_model: None,
             tools_root: None,

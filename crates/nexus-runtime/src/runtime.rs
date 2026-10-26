@@ -104,6 +104,7 @@ pub struct Runtime {
 }
 
 struct Shared {
+    diagnostic_writer: StdMutex<Option<Box<dyn std::io::Write + Send>>>,
     instructions: ModelInstructions,
     limits: Limits,
     effective_output_budget: usize,
@@ -437,12 +438,71 @@ fn runtime_error(category: ErrorCategory, message: &'static str) -> AgentError {
 // A terminal may be owned by a full-screen frontend. Uncoordinated writes
 // invalidate its screen buffer; retain diagnostics only for redirected stderr.
 fn diagnostic(message: std::fmt::Arguments<'_>) {
-    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        eprintln!("{message}");
+    diagnostic_to(
+        message,
+        &mut std::io::stderr().lock(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    );
+}
+
+fn diagnostic_to(
+    message: std::fmt::Arguments<'_>,
+    writer: &mut impl std::io::Write,
+    terminal: bool,
+) {
+    if !terminal {
+        let _ = writeln!(writer, "{message}");
+    }
+}
+
+impl Shared {
+    fn diagnostic(&self, message: std::fmt::Arguments<'_>) {
+        use std::io::Write;
+        if let Ok(mut writer) = self.diagnostic_writer.lock()
+            && let Some(sink) = writer.as_mut()
+        {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let line = format!("timestamp_unix_s={timestamp} {message}\n");
+            if sink
+                .write_all(line.as_bytes())
+                .and_then(|()| sink.flush())
+                .is_ok()
+            {
+                return;
+            }
+            // Do not repeatedly retry a failed sink or write into a TUI terminal.
+            *writer = None;
+            diagnostic(format_args!(
+                "nexus-runtime: local diagnostic writer failed"
+            ));
+        }
+        diagnostic(message);
     }
 }
 
 impl Runtime {
+    /// Routes metadata-only runtime diagnostics to a host-owned writer instead
+    /// of stderr. Install before submitting runs; the host owns file retention.
+    /// Write failure falls back to redirected (never terminal) stderr.
+    #[must_use]
+    pub fn with_diagnostic_writer(self, writer: impl std::io::Write + Send + 'static) -> Self {
+        *self
+            .shared
+            .diagnostic_writer
+            .lock()
+            .expect("diagnostic writer lock") = Some(Box::new(writer));
+        self.shared.diagnostic(format_args!(
+            "nexus-runtime: context budget configured_items={} effective_items={} max_bytes={}",
+            self.shared.limits.retained_context_items,
+            self.shared.context_items_bound,
+            nexus_core::provider::MAX_CONVERSATION_BYTES,
+        ));
+        self
+    }
+
     /// Fallible production constructor: validates limits, provider
     /// capabilities, and every host registration (one `describe()` call per
     /// tool, exact M0 revision, no duplicate names, closed-schema compile)
@@ -608,6 +668,7 @@ impl Runtime {
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
+            diagnostic_writer: StdMutex::new(None),
             instructions,
             limits: config.limits,
             effective_output_budget,
@@ -1852,6 +1913,15 @@ impl Runtime {
             if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
                 && active.pending_compaction.is_some()
             {
+                if matches!(events.last(), Some(ProviderEvent::TurnFinished(finished)) if finished.reason() == FinishReason::OutputLimit)
+                {
+                    self.shared.diagnostic(format_args!(
+                        "nexus-runtime: summary output limit run={} turn={} event_count={}",
+                        run.as_str(),
+                        turn.as_str(),
+                        events.len(),
+                    ));
+                }
                 return context_compaction::ingest_summary(
                     &self.shared,
                     active,
@@ -2102,8 +2172,9 @@ impl Runtime {
                     let argument_progress_bytes = argument_progress
                         .values()
                         .fold(0usize, |sum, bytes| sum.saturating_add(*bytes));
-                    diagnostic(format_args!(
-                        "model output limit: turn={} text_bytes={} reasoning_bytes={} candidate_count={} argument_progress_bytes={} recovery_attempted={}",
+                    self.shared.diagnostic(format_args!(
+                        "model output limit: run={} turn={} text_bytes={} reasoning_bytes={} candidate_count={} argument_progress_bytes={} recovery_attempted={}",
+                        run.as_str(),
                         turn.as_str(),
                         text_items
                             .iter()
@@ -3465,6 +3536,16 @@ impl Runtime {
         let delivery_closed =
             delivery == ControlOutcome::Closed || self.shared.control_closed.load(Ordering::SeqCst);
         let delivery_truncated = delivery_closed || delivery == ControlOutcome::Exhausted;
+        self.shared.diagnostic(format_args!(
+            "nexus-runtime: run finished run={} outcome={outcome:?} error_category={:?} source_persistence={persistence:?} turns={} calls={} elapsed_ms={} output_limit_recovery_used={} data_dropped={} terminal_delivery={delivery:?}",
+            run.as_str(),
+            error.as_ref().map(AgentError::category),
+            active.turns_used,
+            active.calls_used,
+            active.started.elapsed().as_millis(),
+            active.output_limit_recovery_used,
+            active.data_dropped,
+        ));
         if delivery_closed {
             let mut outbox = self.shared.outbox.lock().expect("control outbox readable");
             let discarded_bytes = outbox.iter().map(control_event_bytes).sum::<usize>();
@@ -3983,7 +4064,7 @@ fn publish_context_reduction(
     run: &RunId,
     reduction: ContextReduction,
 ) {
-    diagnostic(format_args!(
+    shared.diagnostic(format_args!(
         "nexus-runtime: context reduced: removed_items={} retained_items={} max_items={} retained_bytes={} max_bytes={}",
         reduction.removed_items,
         reduction.retained_items,
@@ -8928,6 +9009,137 @@ mod cov_runtime_topup_private {
             Usage::new(Some(3), Some(4), UsageFinality::Final),
             None,
         ))]
+    }
+
+    #[derive(Clone, Default)]
+    struct DiagnosticCapture(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn diagnostic_routing_protects_terminal_and_tolerates_failed_writer() {
+        let mut bytes = Vec::new();
+        diagnostic_to(format_args!("metadata"), &mut bytes, true);
+        assert!(bytes.is_empty());
+        diagnostic_to(format_args!("metadata"), &mut bytes, false);
+        assert_eq!(bytes, b"metadata\n");
+        diagnostic_to(format_args!("metadata"), &mut std::io::sink(), true);
+
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("private failure detail"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        diagnostic_to(format_args!("metadata"), &mut Broken, false);
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let _runtime = bed.runtime.clone().with_diagnostic_writer(Broken);
+        assert!(bed.shared.diagnostic_writer.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn diagnostic_writers_are_runtime_local() {
+        let a = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let b = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let capture_a = DiagnosticCapture::default();
+        let capture_b = DiagnosticCapture::default();
+        let _a = a.runtime.clone().with_diagnostic_writer(capture_a.clone());
+        let _b = b.runtime.clone().with_diagnostic_writer(capture_b.clone());
+        a.shared.diagnostic(format_args!("runtime-a"));
+        b.shared.diagnostic(format_args!("runtime-b"));
+        let a = String::from_utf8(capture_a.0.lock().unwrap().clone()).unwrap();
+        let b = String::from_utf8(capture_b.0.lock().unwrap().clone()).unwrap();
+        assert!(a.contains("runtime-a") && !a.contains("runtime-b"));
+        assert!(b.contains("runtime-b") && !b.contains("runtime-a"));
+    }
+
+    #[test]
+    fn output_limit_diagnostics_correlate_run_turn_and_terminal_without_content() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let capture = DiagnosticCapture::default();
+        let runtime = bed.runtime.clone().with_diagnostic_writer(capture.clone());
+        let run = run_id("diagnostic-run");
+        test_rt().block_on(async {
+            let mut active = active_for(&run);
+            active
+                .conversation
+                .push(ModelContextItem::user_text("private-prompt").unwrap());
+            install(&bed, active).await;
+            let mut events = vec![
+                ProviderEvent::TextDelta {
+                    item_key: "private-item".into(),
+                    text: "private-response".into(),
+                },
+                ProviderEvent::ReasoningDelta {
+                    text: "private-reasoning".into(),
+                },
+                ProviderEvent::ToolCallReady(
+                    CallCandidate::new(
+                        "private-candidate",
+                        "private-provider-reference",
+                        "host_read",
+                        r#"{"value":"private-payload-and-credential"}"#,
+                    )
+                    .unwrap(),
+                ),
+            ];
+            events.extend(output_limit_turn());
+            assert!(matches!(
+                runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("diagnostic-turn"),
+                        events,
+                        &mut StreamedPrefix::default()
+                    )
+                    .await,
+                Ok(RunState::CallingModel)
+            ));
+            runtime
+                .finish_run(
+                    &run,
+                    RunOutcome::LimitReached,
+                    Some(runtime_error(
+                        ErrorCategory::ResourceLimit,
+                        "model output limit reached",
+                    )),
+                )
+                .await;
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("model output limit: run=run-diagnostic-run turn=turn-diagnostic-turn text_bytes=16 reasoning_bytes=17"), "{log}");
+        assert!(log.contains("recovery_attempted=true"));
+        assert!(log.contains("run finished run=run-diagnostic-run outcome=LimitReached error_category=Some(ResourceLimit)"));
+        assert!(log.contains("source_persistence=Ephemeral turns=1 calls=0 elapsed_ms="));
+        assert!(
+            log.contains(
+                "output_limit_recovery_used=true data_dropped=false terminal_delivery=Sent"
+            )
+        );
+        for private in [
+            "private-item",
+            "private-response",
+            "private-reasoning",
+            "private-prompt",
+            "private-candidate",
+            "private-provider-reference",
+            "private-payload-and-credential",
+            "model output limit reached",
+        ] {
+            assert!(!log.contains(private), "diagnostics must exclude content");
+        }
     }
 
     #[test]
