@@ -805,7 +805,7 @@ fn snapshot_accepts_exact_bounds_and_rejects_one_over() {
     let pending: Vec<ApprovalId> = (0..Limits::M0_TEST_MAX_CONCURRENT_OPS)
         .map(|index| ApprovalId::new(format!("appr-{index}")).expect("valid approval id"))
         .collect();
-    let outcomes: Vec<OutcomeSummary> = (0..Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize)
+    let outcomes: Vec<OutcomeSummary> = (0..Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES)
         .map(outcome_summary)
         .collect();
 
@@ -832,7 +832,7 @@ fn snapshot_accepts_exact_bounds_and_rejects_one_over() {
     );
     assert_eq!(
         snapshot.known_outcomes().len(),
-        Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize
+        Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES
     );
     assert!(snapshot.is_content_truncated());
 

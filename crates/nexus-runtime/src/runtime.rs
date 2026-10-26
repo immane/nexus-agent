@@ -4615,8 +4615,8 @@ fn snapshot_view(
     mut known: Vec<OutcomeSummary>,
     truncated: bool,
 ) -> Option<Snapshot> {
-    let truncated = if known.len() > Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize {
-        let excess = known.len() - Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize;
+    let truncated = if known.len() > Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES {
+        let excess = known.len() - Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES;
         known.drain(..excess);
         true
     } else {

@@ -756,7 +756,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Builds a snapshot, bounding pending approvals by the concurrency
-    /// budget and known outcomes by the per-run call budget.
+    /// budget and known outcomes by the snapshot representation limit.
     pub fn new(
         session: SessionId,
         run: RunId,
@@ -769,7 +769,7 @@ impl Snapshot {
         if pending_approvals.len() > Limits::M0_TEST_MAX_CONCURRENT_OPS {
             return Err(command_error("snapshot exceeds pending approval bound"));
         }
-        if known_outcomes.len() > Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize {
+        if known_outcomes.len() > Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES {
             return Err(command_error("snapshot exceeds known outcome bound"));
         }
         Ok(Self {

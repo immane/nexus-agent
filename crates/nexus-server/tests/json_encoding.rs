@@ -1099,7 +1099,7 @@ fn snapshot_json_encodes_known_outcomes_in_order_within_the_bound() {
         }
     }
     assert_eq!(summaries.len(), 51, "every admissible combination is built");
-    let bound = Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize;
+    let bound = Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES;
     // Cycle the matrix to the bound: the bound exceeds the admissible
     // combinations, and repetition keeps construction order checkable.
     let summaries: Vec<OutcomeSummary> = (0..bound)
@@ -1182,7 +1182,7 @@ fn snapshot_json_carries_the_content_truncation_flag() {
 
 #[test]
 fn snapshot_json_accepts_the_exact_known_outcome_bound() {
-    let known_outcomes: Vec<OutcomeSummary> = (0..Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize)
+    let known_outcomes: Vec<OutcomeSummary> = (0..Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES)
         .map(|index| OutcomeSummary {
             call: call(&format!("call-{index}")),
             status: ExecutionStatus::Succeeded,
@@ -1204,10 +1204,10 @@ fn snapshot_json_accepts_the_exact_known_outcome_bound() {
     let list = encoded["known_outcomes"]
         .as_array()
         .expect("outcome summaries are an array");
-    assert_eq!(list.len(), Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize);
+    assert_eq!(list.len(), Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES);
     assert_eq!(list[15]["call"], "call-15", "ordering is preserved");
 
-    let over_bound: Vec<OutcomeSummary> = (0..=Limits::M0_TEST_TOOL_CALLS_PER_RUN as usize)
+    let over_bound: Vec<OutcomeSummary> = (0..=Limits::MAX_SNAPSHOT_KNOWN_OUTCOMES)
         .map(|index| OutcomeSummary {
             call: call(&format!("call-{index}")),
             status: ExecutionStatus::Succeeded,

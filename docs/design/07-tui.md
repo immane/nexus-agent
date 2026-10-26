@@ -31,10 +31,12 @@ Enter or Tab inserts the selected completion, and a subsequent Enter executes
 the command. Esc first closes the popup without moving focus. `@` path
 completion is display/insertion only and does not read or attach file content.
 
-Interactive TUI runtimes allow up to 64 model turns per run to accommodate
-coding workflows with inspect/edit/check and recovery cycles. Other finite
-M0-test resource limits remain unchanged; this is a TUI-specific override,
-not a change to the shared runtime or headless defaults.
+Interactive TUI runtimes allow up to 64 model turns and 128 tool calls per run,
+with a one-hour run deadline and 512 retained context items, to accommodate
+coding workflows with inspect/edit/check and recovery cycles. The 16 tool calls
+per turn and other finite M0-test limits remain unchanged; these are TUI-specific
+overrides, not changes to shared runtime or headless defaults. Run snapshots can
+represent up to 128 tool outcomes so the increased call budget remains reportable.
 
 ## Approvals
 

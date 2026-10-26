@@ -85,6 +85,9 @@ const DEMO_SESSION: &str = "sess-tui-m0-test";
 /// The M0 fixture default is intentionally small, but interactive coding
 /// runs need room for inspect/edit/check/retry cycles.
 const TUI_MODEL_TURNS_PER_RUN: u32 = 64;
+const TUI_TOOL_CALLS_PER_RUN: u32 = 128;
+const TUI_RUN_DURATION: Duration = Duration::from_secs(60 * 60);
+const TUI_RETAINED_CONTEXT_ITEMS: usize = 512;
 static SESSION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn new_tui_session_id() -> io::Result<SessionId> {
@@ -114,6 +117,9 @@ fn application_session_store() -> io::Result<SessionStoreHandle> {
 fn tui_runtime_limits() -> Limits {
     let mut limits = Limits::m0_test();
     limits.max_model_turns_per_run = TUI_MODEL_TURNS_PER_RUN;
+    limits.max_tool_calls_per_run = TUI_TOOL_CALLS_PER_RUN;
+    limits.run_duration = TUI_RUN_DURATION;
+    limits.retained_context_items = TUI_RETAINED_CONTEXT_ITEMS;
     limits
 }
 
@@ -5514,17 +5520,12 @@ mod cov_main_topup {
     }
 
     #[test]
-    fn interactive_runtime_raises_only_the_model_turn_budget_to_64() {
+    fn interactive_runtime_raises_model_turns_and_run_budget() {
         let limits = tui_runtime_limits();
         assert_eq!(limits.max_model_turns_per_run, 64);
-        assert_eq!(
-            limits.max_tool_calls_per_run,
-            Limits::M0_TEST_TOOL_CALLS_PER_RUN
-        );
-        assert_eq!(
-            limits.run_duration,
-            Duration::from_secs(Limits::M0_TEST_RUN_DURATION_SECS)
-        );
+        assert_eq!(limits.max_tool_calls_per_run, 128);
+        assert_eq!(limits.run_duration, Duration::from_secs(3_600));
+        assert_eq!(limits.retained_context_items, 512);
         limits
             .validate()
             .expect("interactive limits remain finite and valid");
