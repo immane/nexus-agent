@@ -455,8 +455,7 @@ fn sequence(records: &[Record]) -> Vec<u64> {
 /// The runtime mints `r{incarnation:x}-{run_n}`,
 /// `c{incarnation:x}-{run_n}-{call_seq}`, and
 /// `a{incarnation:x}-{run_n}-{approval_n}`. The incarnation is the only part a
-/// fresh process is free to change, so it is the only part a comparison across
-/// two processes may ignore.
+/// fresh process is free to change within an identity.
 fn split_issued(raw: &str, kind: char) -> (&str, &str) {
     let rest = raw
         .strip_prefix(kind)
@@ -473,7 +472,7 @@ fn split_issued(raw: &str, kind: char) -> (&str, &str) {
 const ISSUED_KEYS: [(&str, char); 3] = [("run", 'r'), ("call", 'c'), ("approval", 'a')];
 
 /// The report with every process-issued identity reduced to its ordinal tail,
-/// the one value a fresh process is free to differ in.
+/// plus normalized token estimates derived from variable-width identities.
 ///
 /// Only the incarnation segment is folded away, so `r<incarnation>-1`,
 /// `c<incarnation>-1-0`, and `a<incarnation>-1-0` remain under comparison: a
@@ -505,9 +504,41 @@ fn without_incarnation(records: &[Record]) -> Vec<String> {
                 // text, so replacing the raw token covers both spellings.
                 line = line.replace(value, &format!("{kind}<incarnation>-{ordinals}"));
             }
+            if record.kind() == Some("model-request") {
+                let raw = record.count("raw-estimated-input") as u64;
+                let scale = record.count("estimate-scale-millis") as u64;
+                assert!(raw > 0, "the request has a nonempty payload");
+                assert_eq!(
+                    record.count("estimated-input") as u64,
+                    raw.saturating_mul(scale).div_ceil(1000)
+                );
+                line = line
+                    .split(' ')
+                    .map(|token| match token.split_once('=') {
+                        Some(("estimated-input", _)) => "estimated-input=<derived>",
+                        Some(("raw-estimated-input", _)) => "raw-estimated-input=<derived>",
+                        _ => token,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
             line
         })
         .collect()
+}
+
+#[test]
+fn report_comparison_accounts_for_identity_width_and_keeps_ordinals() {
+    let short = "run=r123-1 kind=model-request estimated-input=574 raw-estimated-input=459 estimate-scale-millis=1250";
+    let long = "run=r123456-1 kind=model-request estimated-input=577 raw-estimated-input=461 estimate-scale-millis=1250";
+    assert_eq!(
+        without_incarnation(&[Record::new(short)]),
+        without_incarnation(&[Record::new(long)])
+    );
+    assert_ne!(
+        without_incarnation(&[Record::new(short)]),
+        without_incarnation(&[Record::new(&long.replace("-1 ", "-2 "))])
+    );
 }
 
 /// Encoding round-trip for one text, including the canonical-form property a
@@ -1050,11 +1081,9 @@ fn machine_encoding_round_trips_through_the_public_api() {
     );
 }
 
-/// Two identical runs report identical records: the script is fixed and nothing
-/// in the report depends on wall-clock time or process identity. The runtime
-/// stamps a fresh incarnation into every run, call, and approval id, so that
-/// segment is the one value two processes may legitimately differ in — and
-/// every other value, including each id's ordinal tail, must match exactly.
+/// Two identical scripts report identical records apart from fresh identity
+/// incarnations and token estimates derived from their variable byte lengths.
+/// Every other value, including each id's ordinal tail, must match exactly.
 #[test]
 fn repeated_runs_report_the_same_records() {
     let first = invoke(&["hello"]);
