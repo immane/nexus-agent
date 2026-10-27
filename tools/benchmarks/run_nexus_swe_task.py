@@ -21,6 +21,8 @@ from context_metrics import derive_metrics, load_events
 
 RUNNER_GRACE_SECONDS = 60
 EVENT_SCHEMA_VERSION = 1
+WAIT_REPORT_SECONDS = 30
+QUIET_TOOL_SECONDS = 120
 
 
 def tool_log_text(text, byte_limit, secrets):
@@ -78,6 +80,16 @@ def event_record(event, elapsed_seconds):
 def write_event_line(stream, event, elapsed_seconds):
     stream.write(json.dumps(event_record(event, elapsed_seconds), separators=(",", ":")) + "\n")
     stream.flush()
+
+
+def tool_wait_report(tool_started_at, tool_last_output_at, now):
+    """Transport liveness is not evidence that a command is making progress."""
+    return [
+        {"call": call, "elapsed_seconds": round(now - started, 3),
+         "no_output_seconds": round(now - tool_last_output_at.get(call, started), 3),
+         "quiet": now - tool_last_output_at.get(call, started) >= QUIET_TOOL_SECONDS}
+        for call, started in tool_started_at.items()
+    ]
 
 
 def capture_event(stream, event, elapsed_seconds):
@@ -282,6 +294,33 @@ def build_task_prompt(instance, base_commit, problem_statement):
         "testing, follow the test instructions documented in this checkout; do not "
         "assume a particular test framework or invent a custom runner when the "
         "project provides one.\n\n"
+        "Test execution guidance:\n"
+        "- Run the targeted regression first, then the related suite; run the full "
+        "suite only when justified by the change and remaining budget.\n"
+        "- Preserve and report the exact test process exit status. Do not pipe "
+        "tests through tail/head (or another output filter) in a way that masks "
+        "failure. Prefer saving stdout/stderr to a log and capturing the test "
+        "status before inspecting it; if using a Bash pipeline, enable pipefail "
+        "and capture the real test status from PIPESTATUS, not the filter's status.\n"
+        "- If a timeout wrapper terminates tests, report its timeout status and "
+        "incomplete results separately; partial output is not proof of a pass.\n"
+        "- Retain a progress log with test case names and results so the last "
+        "started/completed case is identifiable. A runner heartbeat means only "
+        "that it is alive, not that tests are making progress.\n"
+        "- Use a bounded execution deadline and, where the installed framework "
+        "supports it, a diagnostic stack dump before that deadline. If this "
+        "checkout uses pytest and its installed version supports the built-in "
+        "faulthandler plugin, use -vv -o faulthandler_timeout=120 for case names "
+        "and thread stack dumps (choose an interval below the execution deadline). "
+        "This dumps stacks; it does not terminate a hung test. Do not assume "
+        "pytest-timeout or other uninstalled plugins are available.\n"
+        "- After a timeout, inspect the progress log and available stacks, identify "
+        "the stalled case or phase, and narrow the diagnostic run. Do not repeat "
+        "the same full-suite command unchanged. Report timeouts and incomplete "
+        "coverage honestly; a timeout is not a passing test result.\n"
+        "- Do not weaken tests, skip failing cases, or change expectations merely "
+        "to obtain a pass. Do not enable external network access or download "
+        "dependencies/plugins to make tests run.\n\n"
         "Solve the issue in the checked-out repository. Make a minimal correct "
         "fix, run relevant tests when practical, and summarize the change. Work "
         "only in the repository. Do not modify benchmark metadata or access secrets.\n"
@@ -503,15 +542,37 @@ def main():
     current_turn = None
     tool_calls = 0
     tool_started_at = {}
+    tool_last_output_at = {}
     approved_calls = 0
     run_observation = new_run_observation()
     budget_stop_reason = None
     budget_cancelled_at = None
     model_output_started = False
     started = time.monotonic()
+    last_wait_report_at = started
     last_event_seq = None
     event_sequence_gaps = 0
     collection_status = {"error": None}
+
+    def check_runner_budget():
+        nonlocal budget_stop_reason, budget_cancelled_at
+        if budget_stop_reason is not None:
+            return
+        budget_stop_reason = reached_budget(
+            time.monotonic() - started, args, tool_calls, usage,
+            usage_complete, final_usage_events,
+        )
+        if budget_stop_reason is not None:
+            budget_cancelled_at = time.monotonic()
+            print(
+                f"\n[budget] {budget_stop_reason}; requesting run cancellation "
+                "(provider usage budgets are soft limits based on reported counters)",
+                file=sys.stderr, flush=True,
+            )
+            try:
+                request(args.server, token, f"/sessions/{session}/runs/{run}/cancel", {}, timeout=30)
+            except RuntimeError as cancel_error:
+                print(f"[budget] cancellation request returned: {cancel_error}", file=sys.stderr, flush=True)
 
     with event_stream_response(
         f"{args.server}/sessions/{session}/runs/{run}/events",
@@ -526,6 +587,15 @@ def main():
                 collection_status["error"] = "cancellation grace period expired before terminal event"
                 break
             if not raw.startswith(b"data: "):
+                check_runner_budget()
+                now = time.monotonic()
+                if raw.strip() == b": ping" and now - last_wait_report_at >= WAIT_REPORT_SECONDS:
+                    last_wait_report_at = now
+                    print("\n[heartbeat] " + json.dumps({
+                        "elapsed_seconds": round(now - started, 3),
+                        "active_tools": tool_wait_report(tool_started_at, tool_last_output_at, now),
+                        "note": "event connection alive; command progress unknown; quiet does not mean stalled",
+                    }), file=sys.stderr, flush=True)
                 continue
             event = json.loads(raw[6:])
             event_stream, capture_error = capture_event(
@@ -543,7 +613,7 @@ def main():
                 last_event_seq = seq
             detail = event.get("detail") or {}
             kind = event.get("kind")
-            if kind not in ("assistant-text", "tool-output"):
+            if kind != "assistant-text":
                 # Structured metadata excludes model/tool text and approval scope.
                 print("\n[event] " + json.dumps(event_record(event, time.monotonic() - started)),
                       file=sys.stderr, flush=True)
@@ -581,11 +651,16 @@ def main():
                     file=sys.stderr,
                     flush=True,
                 )
+            elif kind == "tool-output":
+                call = detail.get("call")
+                if call in tool_started_at:
+                    tool_last_output_at[call] = time.monotonic()
             elif kind == "tool-finished":
                 tool_outcome = detail.get("outcome") or {}
                 content = tool_outcome.get("content") or ""
                 call = detail.get("call")
                 tool_started = tool_started_at.pop(call, None)
+                tool_last_output_at.pop(call, None)
                 tool_duration = (
                     "unknown"
                     if tool_started is None
@@ -679,27 +754,7 @@ def main():
                 )
             if event.get("terminal"):
                 break
-            if budget_stop_reason is None:
-                budget_stop_reason = reached_budget(
-                    time.monotonic() - started,
-                    args,
-                    tool_calls,
-                    usage,
-                    usage_complete,
-                    final_usage_events,
-                )
-                if budget_stop_reason is not None:
-                    budget_cancelled_at = time.monotonic()
-                    print(
-                        f"\n[budget] {budget_stop_reason}; requesting run cancellation "
-                        "(provider usage budgets are soft limits based on reported counters)",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    try:
-                        request(args.server, token, f"/sessions/{session}/runs/{run}/cancel", {}, timeout=30)
-                    except RuntimeError as cancel_error:
-                        print(f"[budget] cancellation request returned: {cancel_error}", file=sys.stderr, flush=True)
+            check_runner_budget()
 
     if event_stream is not None:
         try:

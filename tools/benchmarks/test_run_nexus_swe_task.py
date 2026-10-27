@@ -158,6 +158,49 @@ class TaskPromptTests(unittest.TestCase):
         self.assertIn("follow the test instructions documented in this checkout", prompt)
         self.assertIn("do not assume a particular test framework", prompt)
 
+    def test_prompt_stages_validation_before_justified_full_suite(self):
+        prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
+        self.assertIn("targeted regression first, then the related suite", prompt)
+        self.assertIn("full suite only when justified", prompt)
+        self.assertIn("remaining budget", prompt)
+
+    def test_prompt_preserves_real_test_status_when_inspecting_output(self):
+        prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
+        self.assertIn("exact test process exit status", prompt)
+        self.assertIn("tail/head", prompt)
+        self.assertIn("capturing the test status before inspecting", prompt)
+        self.assertIn("enable pipefail", prompt)
+        self.assertIn("real test status from PIPESTATUS, not the filter's status", prompt)
+        self.assertIn("report its timeout status and incomplete results separately", prompt)
+
+    def test_prompt_distinguishes_progress_from_heartbeat_and_diagnoses_timeout(self):
+        prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
+        self.assertIn("progress log with test case names and results", prompt)
+        self.assertIn("last started/completed case", prompt)
+        self.assertIn("heartbeat means only that it is alive", prompt)
+        self.assertIn("not that tests are making progress", prompt)
+        self.assertIn("bounded execution deadline", prompt)
+        self.assertIn("inspect the progress log and available stacks", prompt)
+        self.assertIn("narrow the diagnostic run", prompt)
+        self.assertIn("Do not repeat the same full-suite command unchanged", prompt)
+        self.assertIn("a timeout is not a passing test result", prompt)
+
+    def test_prompt_conditions_pytest_diagnostics_on_installed_support(self):
+        prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
+        self.assertIn("If this checkout uses pytest", prompt)
+        self.assertIn("installed version supports the built-in faulthandler plugin", prompt)
+        self.assertIn("-vv -o faulthandler_timeout=120", prompt)
+        self.assertIn("interval below the execution deadline", prompt)
+        self.assertIn("does not terminate a hung test", prompt)
+        self.assertIn("Do not assume pytest-timeout or other uninstalled plugins", prompt)
+
+    def test_prompt_forbids_weakening_tests_or_enabling_network(self):
+        prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
+        self.assertIn("Do not weaken tests, skip failing cases", prompt)
+        self.assertIn("change expectations merely to obtain a pass", prompt)
+        self.assertIn("Do not enable external network access", prompt)
+        self.assertIn("or download dependencies/plugins", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
