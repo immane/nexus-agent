@@ -5,7 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.3--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
-A Rust coding agent designed around very fast startup, a minimal core, and a native terminal interface. Broader capabilities belong in replaceable tools and plugins, not an ever-growing engine.
+A Rust coding agent with live model integrations, native terminal sessions,
+coding tools, and optional container execution. Designed around very fast startup
+and a minimal core, with broader capabilities in replaceable tools and adapters,
+not an ever-growing engine. External plugins remain planned.
 
 <div align="center">
 <img src="docs/images/demo.gif" alt="Nexus Agent terminal demo" width="100%" />
@@ -16,7 +19,7 @@ A Rust coding agent designed around very fast startup, a minimal core, and a nat
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.3-alpha**, built on the M0 runtime with live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Conversation history is memory-only by default; the server can optionally persist source and tool-operation records, but no session restore API is provided. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.3-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -95,14 +98,17 @@ repository profiles were not changed. `opt-level = "z"` is the smallest measured
 binary, not a production default: runtime performance and tests were not
 measured for these size-oriented profiles. These measurements describe a local
 development worktree, not a published release. The 100 ms first-interactive
-startup target remains a goal; startup measurements are still pending.
+startup target remains a goal; startup measurements are still pending. Binary
+sizes are historical measurements, not measurements of the current HEAD.
 
 ## Architecture
 
 The first diagram shows the host's in-process core, runtime, frontend, and
-adapters; built-in tools do not pay an IPC cost. `nexus-session` has an
-initial file-backed store implementation, and runtime offers opt-in durable
-source-history and tool-operation recording; application-level restore is not wired;
+adapters; direct in-process tool dispatch does not require plugin IPC (container
+tools still use Docker worker transport). `nexus-session` has
+file-backed storage and runtime source-history/tool-operation recording. Normal
+interactive TUI sessions use it by default and can explicitly restore history;
+server persistence is opt-in and has no HTTP restore API;
 external plugins are also not implemented. Provider TLS and sandboxed commands
 can launch helper processes.
 
@@ -112,13 +118,13 @@ flowchart TB
     Core["Domain core<br/>Types, transitions, contracts"]
     Runtime["Agent runtime<br/>Policy, lifecycle, cancellation"]
     Context["Context engine: nexus-context<br/>Estimation, safe reduction, memory projection"]
-    Provider["Provider adapters<br/>Direct APIs and relay plugins"]
+    Provider["Provider adapters<br/>Protocol and direct/relay routing"]
     Tools["Tool execution adapters"]
     Container["Container environment crate<br/>Gateway, worker, lifecycle"]
-    Store["nexus-session<br/>file store; operation journal opt-in"]
+    Store["nexus-session<br/>TUI default; server opt-in"]
     Builtin["Built-in Rust coding tools"]
-    Bridge["External tool adapter"]
-    Plugins["External tool processes<br/>Any language"]
+    Bridge["External tool adapter<br/>(planned)"]
+    Plugins["External tool processes<br/>Any language (planned)"]
 
     Frontend <-->|Commands / events| Runtime
     Frontend -. "optional composition" .-> Container
@@ -127,7 +133,7 @@ flowchart TB
     Context --> Core
     Runtime <-->|Provider port| Provider
     Runtime <-->|Tool port| Tools
-    Container -. "filesystem executors" .-> Tools
+    Container -. "file and command executors" .-> Tools
     Runtime <-->|Store port| Store
     Tools -->|Direct calls| Builtin
     Tools --> Bridge
@@ -202,7 +208,11 @@ See [component boundaries](docs/design/01-components.md) for dependency directio
 
 ### Agent Execution
 
-The following sequence illustrates the proposed persistent run, not today's ephemeral storage. Denial, refusal, errors, cancellation, and uncertain effects have explicit outcomes in the contracts.
+The following sequence illustrates the runtime flow with persistence enabled.
+Source-history and operation records are implemented; the final checkpoint is
+conceptual, not a promise of crash-resumable active execution. Restoring saved
+history never resumes an interrupted process or replays tool calls. Denial,
+refusal, errors, cancellation, and uncertain effects have explicit outcomes.
 
 ```mermaid
 sequenceDiagram
@@ -258,7 +268,7 @@ Accepted in [Decision 01](docs/design/decisions/01-first-release-defaults.md); d
 | --- | --- |
 | Permissions | Development mode by default: project/temp operations are automatic, external file access needs approval (allow once or a session-only directory grant); `--strict-tools` keeps project-jailed reads with confirmation for mutations and exec. |
 | Frontend | Grok Build-style full-screen Rust TUI plus a headless entry point over the same runtime. |
-| Sessions | Target: save automatically outside the project; restore history only on explicit request. TUI/default history is memory-only; the server has an opt-in file store for source and tool-operation records, without restore APIs. |
+| Sessions | Normal interactive TUI sessions save locally outside the project; history restoration is explicit. Demo/headless remain ephemeral. The server has an opt-in file store for source and tool-operation records, without HTTP restore APIs. |
 | Authentication | API configuration with external credential references; browser login deferred. |
 | API relay | Relay is a provider plugin; support existing services first and keep local execution optional. |
 
@@ -280,7 +290,10 @@ Configure a model before submitting in the TUI; an unconfigured launch does not 
 | `build` (default) | Full capability; in development mode project/temp operations are automatic while external paths need approval, and `--strict-tools` requires explicit approval for mutations and exec. |
 | `plan` | Read-only: mutations, processes, and unclassified tools are denied without prompting; permitted reads still run. |
 
-In the TUI, `Tab` in the composer cycles modes, and the composer border color and title name the active one. One-shot headless runs take `--mode plan|build|<custom>`. Further modes come from configuration:
+In the local-execution TUI, `Tab` in the composer cycles modes unless path
+completion is open, when it accepts a suggestion. Container execution does not
+allow mode switching. The composer border color and title name the active mode.
+One-shot headless runs take `--mode plan|build|<custom>`. Further modes come from configuration:
 
 ```json
 {
@@ -297,7 +310,13 @@ Assistant messages render a Markdown subset (headings, emphasis, code, lists, qu
 
 Type `:` in the viewport to open the desktop command line. `:help` opens a scrollable reference dialog with commands, key bindings, application version, platform, active model, and session. Commands execute only after Enter; use `:q` to exit. The viewport supports Vim-style navigation (`j`/`k`, `gg`/`G`, `H`/`M`/`L`, `Ctrl+f`/`b`, `Ctrl+d`/`u`). In the composer, `@` offers project-relative path suggestions; accepting one inserts a literal reference and does not read or attach the file contents.
 
-Use `:model` to select a configured model, and `:session new`, `:session list`, or `:session switch <target>` to manage up to 16 in-memory sessions. Restarting loses conversations and session grants; saving configuration is not durable session storage.
+Use `:model` to select a configured model, and `:session new`, `:session list`, or
+`:session switch <target>` to manage up to 16 loaded sessions. `:session` opens
+the live/saved session picker; `:session restore <id>` explicitly loads saved
+history into a new runtime using current configuration. Normal interactive
+sessions persist locally, but active execution and session grants do not survive
+restart. Demo sessions remain ephemeral; saving configuration is separate from
+session storage.
 
 ## Extensions
 
@@ -312,7 +331,17 @@ The extension design gives built-in and external tools one semantic contract, bu
 
 API relay is separate from tool plugins: a relay is a provider implementation behind the provider port, not a model-invoked tool. Existing relay services come first; local relay execution remains an optional boundary and never mandatory startup work.
 
-The initial coding distribution provides scoped reads, listing, and search, full-file writes, exact-text patches, and sandboxed `argv` execution without a shell or network access (`sandbox-exec` on macOS, `bwrap` on Linux). In development mode project/temp operations are automatic and external paths are approval-gated; `--strict-tools` restores per-call confirmation for every mutation and execution. Workflow, context selection, storage, and frontend replacement retain explicit boundaries without allowing arbitrary mutation of runtime internals.
+The coding distribution provides scoped reads, listing, and search, full-file
+writes, exact-text patches, and command execution. The local backend accepts
+`argv` without an implicit shell and denies network access through
+`sandbox-exec` on macOS or `bwrap` on Linux. Container-backed `host_exec` accepts
+either `argv` or an explicit `shell_command` (Bash); its network policy belongs
+to the selected container environment. In local development mode project/temp
+operations are automatic and external paths are approval-gated; `--strict-tools`
+restores per-call confirmation for every mutation and execution. Container mode
+uses its separate workspace-scoped policy. Workflow, context selection, storage,
+and frontend replacement retain explicit boundaries without allowing arbitrary
+mutation of runtime internals.
 
 **An extensible core does not make every enabled plugin free.** Optional integrations should initialize on demand; heavy dependencies should remain outside the minimal build. Native dynamic-library loading, WASM runtimes, and arbitrary lifecycle hooks are not initial-core goals.
 
@@ -344,7 +373,7 @@ one-hour run budget; each tool deadline is clamped to the remaining run budget.
 Benchmark-pilot mode allows one hour per tool within a 24-hour run budget.
 Timeouts do not bypass uncertain-effect handling or worker quarantine.
 
-Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Built-in `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
+Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Local-backend `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Container-backed execution uses the separate prototype boundary described above. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
 
 The server binds to loopback only. Configured providers or real tools require `--auth-token-env NAME` with a 64-hex-character bearer token. That server-wide token also authorizes approval/control routes; session IDs are not credentials. Loopback HTTP is not encrypted and does not isolate mutually untrusted same-user processes.
 
@@ -358,7 +387,8 @@ Results are grouped by inference environment, with separate tables and counts.
 Agent completion is not official resolution. These selected diagnostic runs are
 **not a leaderboard score, a general success rate, or a controlled model
 comparison**. Agent wall time excludes the separate official evaluator run;
-dates are UTC.
+dates are UTC. Links into `../nexus-benchmark-work/` refer to preserved local
+artifacts outside this repository; they are not available in a standalone clone.
 
 ### Local inference: Qwen3.8-27B via Ollama
 
@@ -433,7 +463,7 @@ not recorded. These runs used prepared task images in the offline container
 workload. The first Sphinx, Pylint, and Flask runs had no configured
 context-window reference; later Pylint follow-ups used harness context-window
 references of 94,208 tokens (matching the Qwen profile) and 32,768 tokens. These
-are harness references, not claims about DeepSeek's server-side limit. The Sphinx launch
+are harness references, not claims about DeepSeek's server-side limit. The Sphinx 8595 launch
 reused the existing release server (`--no-build`), so it does not validate the
 newly added `shell_command` interface; the first Pylint run built the release
 server from current source.
@@ -462,14 +492,16 @@ scoring completed separately in about 38 seconds. This previously exposed task
 is not a blind evaluation sample. See the [launch record](../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/launch.json)
 and [official result](../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/official-evaluation/sphinx-doc__sphinx-9461-prediction-20261027T040234.790700Z-d83b863e5864422b8737ae8c44b8f1d8/evaluation.json).
 
-Sphinx used 47 model requests and 59 tool calls (940,165 input and 11,286 output
+Sphinx 8595 used 47 model requests and 59 tool calls (940,165 input and 11,286 output
 tokens); Pylint used 38 model requests and 42 tool calls (810,483 input and
 13,832 output tokens); Flask used 14 model requests and 19 tool calls (107,329
 input and 5,992 output tokens). The 94,208-token-context Pylint follow-up used
 48 model requests and 43 tool calls (824,105 input and 12,985 output tokens); it
 triggered no context compaction. The 32,768-token-context follow-up used 61
 model requests and 58 tool calls (1,414,270 input and 18,576 output tokens); it
-also triggered no context compaction. These are provider-reported token counts.
+also triggered no context compaction. Sphinx 9461 used 108 model requests and
+114 tool calls (7,195,402 input and 66,390 output tokens), without a configured
+context-window reference. These are provider-reported token counts.
 Hosted inference was explicitly authorized; the runner had no cumulative token
 or spend cap. The credential was loaded from the owner-only `deepseek.env` for
 each background process only; the shared provider configuration was not changed.
@@ -516,21 +548,100 @@ remaining work on convergence, verification, result recording, and cleanup.
 
 ## Project Status
 
-- [x] MIT license and confirmed project direction.
-- [x] Draft architecture, performance, security, and interface contracts.
-- [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
-- [x] Review and accept the minimal implementation contracts ([M0 lock](docs/tasks/06-m0-lock.md)).
-- [x] Implement the shared runtime, live TUI, loopback HTTP/SSE server, scripted headless runner, file read/list/search/write/patch, and sandboxed exec.
-- [x] Implement Chat Completions, OpenAI Responses, and Anthropic Messages adapters with explicit protocol configuration and offline regression fixtures.
-- [x] Add bounded host instructions with native protocol mapping and runtime history projection that protects tool-call pairing and uncertain-effect evidence. Conversation history remains memory-only by default; the server can opt into file-backed source and tool-operation records with `--session-store DIRECTORY`, but session restore is not implemented. Semantic IR and durable recovery are not implemented. See the [provider contract](docs/contracts/01-provider.md) and [server session-store notes](crates/nexus-server/src/lib.rs).
-- [x] Implement M4 consolidation slices: shared ordered-event consumption, tool composition, and current provider capability handling. The default-feature workspace suite has recorded passing macOS evidence; see [migration status](docs/tasks/08-architecture-migration.md) and [Testing](docs/testing.md).
-- [x] Add an opt-in container worker/gateway/workload path with runtime authorization and TUI/server selection. It is not a validated isolation boundary: native Linux host/LAN, metadata, IPv6/DNS, and public-egress checks remain outstanding. Image build and keeper-only smoke test are not isolation evidence.
-- [ ] Establish Linux and macOS reference baselines: only historical spawn-to-exit characterization exists, which is not first-interactive startup evidence; RSS results are method-confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements are pending.
-- [ ] Complete M0 acceptance against the [M0 gates](docs/tasks/04-m0-gates.md). Gates were executed historically, but the acceptance checklist is incomplete and its evidence is under repair pending coordinator review.
-- [ ] Close migration gates: Linux file race/metadata and sandbox-isolation validation remain blocked; escaped-descendant cleanup remains unresolved. Temporary macOS-only development scope is not cross-platform acceptance.
-- [ ] Verify live compatibility for individual services/models and extend protocol coverage as needed; Gemini is not implemented.
-- [ ] Add bounded external-plugin interoperability and session recovery.
-- [ ] Complete native Linux container network/isolation validation and lifecycle recovery before treating opt-in container mode as suitable for secure or production workloads.
+**Current position: M4 consolidation slices implemented, with selected M5
+capabilities already delivered; earlier acceptance gates remain open.**
+Development has been capability-driven rather than strictly milestone-ordered:
+the real model/tool/container loop and complex task repairs were exercised before
+all baseline measurements and acceptance reviews were finished. Implementation
+progress and verified readiness are tracked separately.
+
+| Stage | Implementation and remaining acceptance work |
+| --- | --- |
+| **M0 — Minimal execution baseline** | Functionality substantially exceeded; formal acceptance, current cross-platform evidence, and performance baselines remain incomplete. |
+| **M1 — Correctness and lifecycle** | Multiple slices implemented and verified; descendant cleanup limitations and Linux validation remain unresolved. |
+| **M2 — Permissions and platform boundaries** | Host-owned policy and scope handling implemented; filesystem and sandbox evidence covers macOS, with Linux validation blocked. |
+| **M3 — Configuration and composition** | Consolidation slices recorded as verified. |
+| **M4 — Internal consolidation** | M4.1–M4.3 implemented, with passing macOS default-feature workspace evidence; the overall gate remains open. |
+| **M5 — On-demand extensions** | Additional provider protocols implemented with offline fixtures; external-tool transport and HTTP/TLS replacement remain deferred. |
+
+M1–M5 refer to the [architecture migration stages](docs/tasks/08-architecture-migration.md),
+not sequential product releases. Officially resolved SWE-bench tasks demonstrate
+real end-to-end capability, not completion of every safety, performance, or
+cross-platform gate. Near-term work is incremental reliability improvement and
+acceptance closure, not a core rewrite or adding features merely to advance a
+milestone number.
+
+### M0–M5 implementation inventory
+
+Checked entries identify implemented work, **not blanket acceptance or production
+readiness**. Unchecked entries identify incomplete validation, partial work, or
+explicitly deferred extensions. The detailed [migration evidence](docs/tasks/08-architecture-migration.md)
+records the tested scope and historical commands; it is not a fresh full-suite
+validation of every subsequent revision.
+
+#### M0 — Shared execution baseline
+
+- [x] Accepted minimal semantic contracts and finite test budgets ([M0 lock](docs/tasks/06-m0-lock.md)).
+- [x] Shared typed core/runtime, fake model/tool loop, scripted headless entry point, and terminal frontend.
+- [x] Runtime authorization, exact-call approvals, cancellation, explicit effect states, bounded events/output, and stale-run rejection.
+- [ ] Formal [M0 acceptance](docs/tasks/04-m0-gates.md), including reviewed current Linux/macOS evidence.
+- [ ] Reference performance baselines: PTY first-interactive startup, attributable RSS, idle CPU, streaming, buffer high-water marks, and dispatch overhead. Historical spawn-to-exit and size measurements do not close this gate.
+
+#### M1 — Correctness and lifecycle
+
+- [x] **M1.1:** Bind server submissions and usage to the session's actual provider/model selection.
+- [x] **M1.2:** Treat closed control transport as terminal rather than repeatedly scheduling delivery.
+- [x] **M1.3:** Bound provisional streaming and control retention, validate usage updates, and preserve terminal-delivery accounting.
+- [x] **M1.4, implemented portion:** Nonblocking exec pipe draining, capped retained output, bounded cleanup checks, and ownership/quarantine for uncertain workers.
+- [ ] **M1.4, remaining:** Resolve escaped-descendant cleanup limitations and validate Linux exec/sandbox failure paths.
+- [x] **M1.5:** Attribute TUI usage to the accepted run's model despite later picker changes.
+- [x] **M1.6:** Bound server connections, sessions, SSE retention, and completion/usage bookkeeping.
+- [x] **M1.7:** Enforce the loopback real-tool server trust boundary with bearer authentication and Host/Origin checks.
+- [ ] **M1 gate:** Close remaining cleanup and Linux validation blockers.
+
+#### M2 — Permissions and platform boundaries
+
+- [x] **M2.1:** Host-owned tool access classification, including conservative unknown/read-only handling.
+- [x] **M2.2:** Shared file/exec scope construction and exact authorization matching.
+- [x] **M2.3, macOS scope:** Descriptor-bound file access, staged replacement, no-clobber creation, hardlink refusal, and supported metadata preservation.
+- [x] **M2.4, macOS scope:** Actual sandbox tests recorded separately from backend-unavailable denial tests.
+- [ ] **M2 gate:** Linux file-race/metadata and sandbox-isolation validation; macOS evidence is not cross-platform acceptance.
+
+#### M3 — Configuration and composition
+
+- [x] **M3.1:** One mutable TUI configuration owner with serialized writeback across sessions.
+- [x] **M3.2:** Shared strict/development tool constructors without introducing a second application/runtime layer.
+- [x] **M3.3:** Explicit provider capability requirements and validation at live run binding.
+- [x] **M3 gate:** Targeted regression evidence recorded; frontend-specific configuration and failure behavior preserved.
+
+#### M4 — Internal consolidation
+
+- [x] **M4.1:** Shared bounded ordered-event consumption across TUI, headless, and server, retaining frontend-specific presentation/reconnect policies.
+- [x] **M4.2:** Direct reuse of concrete development file operations without per-call tool reconstruction or JSON redispatch.
+- [x] **M4.3:** Public-contract/consumer review, compatibility-preserving API retention, and correction of stale provider-event documentation.
+- [x] Default-feature workspace regression evidence recorded on macOS, with affected-package formatting and Clippy checks.
+- [ ] **M4 gate:** Full closure remains dependent on the M1/M2 cleanup and Linux blockers; continued macOS development is not a security waiver for release.
+
+#### M5 — Extensions on concrete demand
+
+- [x] **M5.1:** Chat Completions, OpenAI Responses, and Anthropic Messages protocol selection, capability handling, configuration migration, and offline regression fixtures.
+- [ ] Universal live compatibility is not established; individual services/models need their own evidence. Gemini native APIs are not implemented.
+- [ ] **M5.2, deferred:** External tool transport/plugins and their bounded lifecycle/trust contract.
+- [ ] **M5.3, deferred:** HTTP/TLS transport replacement evaluation; the current OpenSSL bridge remains in use.
+
+### Additional delivered capabilities
+
+These capabilities extend beyond the original M0 scope and do not redefine the
+M1–M5 migration gates above.
+
+- [x] Live configured providers in the TUI/server, scoped file read/list/search/write/patch tools, and local sandboxed command execution.
+- [x] Bounded host instructions, context estimation/calibration, transactional compaction, and history projection protecting tool-call pairing and uncertain-effect evidence.
+- [x] Normal interactive TUI local persistence and explicit saved-history restoration; optional server source/tool-operation persistence, without HTTP restore APIs.
+- [x] Opt-in container gateway/worker/workload composition, workspace tools, explicit shell commands, and lifecycle/quarantine handling.
+- [x] SWE-bench preparation, isolated model attempts, worker preflight, heartbeat diagnostics, and separate official scoring, with resolved task evidence above.
+- [ ] Native Linux container host/LAN, metadata, IPv6/DNS, public-egress, and lifecycle recovery validation before secure/production-use claims.
+- [ ] Recovery of active execution; restoring history does not resume processes or replay uncertain tool calls.
+- [ ] Semantic IR, graph/vector retrieval, and LoRA research components; these remain a vision, not shipped features.
 
 Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The alpha version is not a stable-release or production-readiness claim.
 
