@@ -339,6 +339,11 @@ See [model integration](docs/design/03-model-integration.md), [API relay](docs/d
 
 The runtime enforces permissions, resource scopes, deadlines, and output limits. Tool access categories come from host registration, not model-visible descriptions. Model output is data, not a permission grant.
 
+The TUI and ordinary server CLI allow up to 10 minutes per tool call within a
+one-hour run budget; each tool deadline is clamped to the remaining run budget.
+Benchmark-pilot mode allows one hour per tool within a 24-hour run budget.
+Timeouts do not bypass uncertain-effect handling or worker quarantine.
+
 Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Built-in `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
 
 The server binds to loopback only. Configured providers or real tools require `--auth-token-env NAME` with a 64-hex-character bearer token. That server-wide token also authorizes approval/control routes; session IDs are not credentials. Loopback HTTP is not encrypted and does not isolate mutually untrusted same-user processes.
