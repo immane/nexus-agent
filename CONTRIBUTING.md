@@ -1,8 +1,10 @@
 # Contributing to Nexus Agent
 
 Thanks for helping improve Nexus Agent. The project is an evolving Rust coding
-agent; the current M0 implementation is test-only and is not a stable release.
-Please keep proposals aligned with the documented boundaries and clearly
+agent in alpha, with a live TUI, loopback HTTP/SSE server, provider adapters,
+and local or opt-in container-backed tools. Real coding tasks have been
+evaluated, but neither M0 acceptance nor cross-platform security readiness is
+complete. Keep proposals aligned with the documented boundaries and clearly
 separate implemented behavior from design-stage work.
 
 ## Before opening an issue
@@ -14,8 +16,8 @@ separate implemented behavior from design-stage work.
   report includes the context maintainers need.
 - Do not include API keys, access tokens, private source, or unredacted personal
   data in issues, logs, screenshots, or terminal transcripts. For a suspected
-  security vulnerability, do not file a public issue; use GitHub's private
-  vulnerability reporting for this repository if it is enabled.
+  security vulnerability, do not file a public issue; follow the
+  [security policy](SECURITY.md) for private reporting.
 
 ## Development setup
 
@@ -60,10 +62,18 @@ of normal validation; see `docs/testing.md` before changing its subjects.
 - Prefer small changes that follow nearby naming, layering, and test patterns.
 - Update the relevant contract/design/task documentation when public behavior,
   commands, configuration, or safety properties change.
-- TUI and server integration test modules belong in their `tests/behavior.rs`
-  entry points; automatic test discovery is disabled for those packages.
+- TUI, server, tools, and container integration test modules belong in their
+  `tests/behavior.rs` entry points; automatic test target discovery is disabled
+  for those packages.
 - Do not add generated build output, credentials, local configuration, or
   provider responses to a patch.
+
+For benchmark changes, follow [the benchmark workflow](tools/benchmarks/README.md).
+Start SWE-bench model runs as background jobs, preserve logs and artifacts, and
+record interruptions without automatically retrying. Hosted inference requires
+explicit opt-in and may incur uncapped costs. Keep agent completion separate
+from official resolution, and do not present benchmark success as security or
+isolation validation.
 
 ## Pull requests
 
@@ -76,6 +86,6 @@ Keep pull requests focused. Include:
 4. Screenshots or a short terminal recording for visible TUI changes, after
    checking that they contain no secrets or private paths.
 
-Use clear commit messages; when following Conventional Commits, prefer a
+Use English commit messages; when following Conventional Commits, prefer a
 specific scope such as `feat(tui): ...` or `docs: ...`. Do not bundle unrelated
 formatting or dependency updates with a behavior change.

@@ -423,23 +423,32 @@ Ollama endpoint was unavailable. They are not included in the Qwen pilot table
 or its counts.
 
 **Inference environment:** DeepSeek's hosted API at `https://api.deepseek.com`,
-selected as `deepseek/deepseek-flash`. Unlike the local Qwen profile, these runs
-had no configured context-window reference; quantization and serving hardware
-were not recorded. They used prepared task images in the offline container
-workload. The Sphinx launch reused the existing release server (`--no-build`),
-so it does not validate the newly added `shell_command` interface; the Pylint
-run built the release server from current source.
+selected as `deepseek/deepseek-flash`. Quantization and serving hardware were
+not recorded. These runs used prepared task images in the offline container
+workload. The first Sphinx, Pylint, and Flask runs had no configured
+context-window reference; later Pylint follow-ups used harness context-window
+references of 94,208 tokens (matching the Qwen profile) and 32,768 tokens. These
+are harness references, not claims about DeepSeek's server-side limit. The Sphinx launch
+reused the existing release server (`--no-build`), so it does not validate the
+newly added `shell_command` interface; the first Pylint run built the release
+server from current source.
 
 | Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
 | --- | --- | ---: | --- | --- | --- |
 | `sphinx-doc__sphinx-8595` | 2026-10-26 | 1m 46s | Treat `__all__ = []` as explicitly empty rather than falling back to all members. | Resolved | Completed |
 | `pylint-dev__pylint-6506` | 2026-10-26 | 2m 21s | Report unrecognized CLI options through argparse usage errors instead of a traceback. | Resolved | Completed |
+| `pylint-dev__pylint-6506` (94,208-token context reference) | 2026-10-26 | 2m 31s | Same repair; context-controlled follow-up run. | Resolved | Completed |
+| `pylint-dev__pylint-6506` (32,768-token context reference) | 2026-10-26 | 3m 47s | Same repair; context-controlled follow-up run, no compaction observed. | Resolved | Completed |
 | `pallets__flask-4992` | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
 
 Sphinx used 47 model requests and 59 tool calls (940,165 input and 11,286 output
 tokens); Pylint used 38 model requests and 42 tool calls (810,483 input and
 13,832 output tokens); Flask used 14 model requests and 19 tool calls (107,329
-input and 5,992 output tokens). These are provider-reported token counts.
+input and 5,992 output tokens). The 94,208-token-context Pylint follow-up used
+48 model requests and 43 tool calls (824,105 input and 12,985 output tokens); it
+triggered no context compaction. The 32,768-token-context follow-up used 61
+model requests and 58 tool calls (1,414,270 input and 18,576 output tokens); it
+also triggered no context compaction. These are provider-reported token counts.
 Hosted inference was explicitly authorized; the runner had no cumulative token
 or spend cap. The credential was loaded from the owner-only `deepseek.env` for
 each background process only; the shared provider configuration was not changed.
@@ -450,6 +459,12 @@ and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suit
 Pylint evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/batch.json),
 [launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T222755Z-6400a8c7/launch.json),
 and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e3f0859627cc436d8e5cce6b6ebd4e6e/official/pylint-dev__pylint-6506-prediction-20261026T223040.009489Z-c6f8b6e5bf0e4f9695dd3c38b2f39522/evaluation.json).
+Pylint context-controlled follow-up evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/batch.json),
+[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T233956Z-6ec98125/launch.json),
+and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-574e369bc5684c639d8f080e5b19f1cc/official/pylint-dev__pylint-6506-prediction-20261026T234254.241866Z-4edce9768314456b91f4551fad59807f/evaluation.json).
+Pylint 32,768-token-context follow-up evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/batch.json),
+[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T234359Z-68a9b74a/launch.json),
+and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e7e79a5da02b423fae474952cb1dd1e5/official/pylint-dev__pylint-6506-prediction-20261026T234807.926531Z-741dd5afe4314fbe9196275d6fa7b9a3/evaluation.json).
 Flask evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/batch.json),
 [launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/pallets__flask-4992/run-pallets__flask-4992-20261026T223312Z-adfc89ce/launch.json),
 and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-d10c7f09e7d2402c819bc9c6815fb01c/official/pallets__flask-4992-prediction-20261026T223451.689810Z-528bce98331c42308f5dd8e74fa79f51/evaluation.json).
