@@ -169,6 +169,11 @@ the shared session is poisoned and owned
 workload cleanup is requested, not silently replaced or declared reusable.
 The runner follows the authoritative run terminal event; an intermediate
 `tool-finished` with `TimedOut` does not itself cancel or fail a benchmark.
+Provider access failures likewise back off until success, explicit cancellation,
+or the runtime deadline, without a fixed retry-count cutoff. Retries do not
+replay executed tools or turn partial responses into accepted predictions.
+The runner's own wall-clock bound still applies, and a completed model answer
+is not an official benchmark resolution score.
 
 The task prompt follows each checkout's documented test runner, not an assumed
 framework. It directs the agent to run the targeted regression first, then the

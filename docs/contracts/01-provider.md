@@ -57,22 +57,31 @@ field. This is a provider-defined effort preference, not a hard reasoning-token
 budget or a guarantee that the model will spend fewer tokens.
 
 When a validated summary turn ends with `OutputLimit`, the runtime discards all
-partial output and may split that source chunk in half and retry it, at most
-twice per chunk (three attempts total). Each attempt consumes normal run
-turn/time/usage budgets. Accepted earlier chunk summaries remain staged; neither
-they nor any partial retry output replace active history until the complete
-summary passes request-headroom validation. Exhausted retries preserve the
-original conversation and terminate compaction.
+partial output and may split that source chunk in half, with at most two
+successive splits before accepting a chunk; exhaustion stops compaction rather
+than retrying the same chunk unchanged. Empty or reasoning-only summaries and
+safe `Incomplete` summaries share one additional no-progress retry per
+compaction, including across chunk boundaries. Normal processing of multiple
+chunks is not counted as failure recovery. Accepted earlier chunk summaries
+remain staged; neither they nor any partial retry output replace active history
+until the complete summary passes request-headroom validation. Exhausted
+recovery or an unsafe projection preserves the original conversation and
+terminates compaction.
 
 A validated task response ending in `OutputLimit` is incomplete, not a successful
 answer or permission to execute any included tool candidates. The runtime may
-make at most one fresh, concise task request within the same run, using only the
-previously accepted conversation. Both attempts consume normal turn/time/usage
-budgets. Cancellation, exhaustion, or opaque continuation prevents recovery;
-another output-limited response terminates the run. Partial text, reasoning, and
-arguments are not replayed or restored as accepted conversation. Diagnostics
+make fresh, concise task requests within the same run, using only the
+previously accepted conversation. Every completed attempt consumes normal
+turn/time/usage budgets. Only one consecutive output-limit recovery is allowed;
+a second output limit ends the run. A successful accepted response resets this
+consecutive-failure allowance. Cancellation, exhaustion, or opaque continuation
+prevents recovery. Partial text, reasoning, and arguments are not replayed or
+restored as accepted conversation. Diagnostics
 record payload sizes and discarded-candidate counts, not raw reasoning. Existing
 source-history storage does not archive rejected partial provider payloads.
+The runtime emits a correlated `ModelResponseDiscarded` event for abandoned
+task responses so frontends can distinguish visible partial output from
+accepted assistant progress.
 
 `nexus_context::estimated_input_tokens` includes instruction/note payloads,
 conversation and reasoning, call/result metadata, tool definitions, and framing
@@ -166,6 +175,20 @@ The core MUST NOT interpret opaque state as permissions or expose it as ordinary
 ## Errors and Retries
 
 Surface safe authentication, rate-limit, transport, protocol, and capability errors. Any retry must obey runtime limits and policy.
+
+Remote access failures use increasing backoff until success, explicit user
+cancellation, or the absolute run deadline, rather than a fixed attempt count.
+Failed access attempts do not spend successful model turns. Retries retain the
+prepared request only while no response stream record has arrived; once a
+provider stream begins, a truncation is a terminal `Protocol` failure, not a
+replay. A recoverable partial task response instead requires a fresh invocation
+with a bounded host recovery note.
+No failed response authorizes tool dispatch. Local invalid requests, unsafe
+credentials, untrusted continuation or identity/usage inconsistencies, storage
+integrity failures, and hard resource bounds remain terminal. Explicit user
+cancellation takes precedence until finalization and stops new model requests,
+retry waits, and tool dispatch; it does not establish worker termination or
+rollback.
 
 After partial output, a retry MUST not silently concatenate a new attempt onto the previous turn, reuse ambiguous tool candidates, or replay already executed calls. Make the abandoned attempt and replacement turn explicit.
 

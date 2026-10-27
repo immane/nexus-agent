@@ -385,6 +385,19 @@ host worker returns: killing the
 Docker CLI does not establish remote termination, and poisoned tools remain
 unavailable. No automatic command retry or container replacement is performed.
 
+Recoverable failures are inputs to the model loop, not automatic run terminals.
+Tool failures and denials retain their actual effects and evidence. Provider
+access failures use increasing backoff (1, 2, 5, 10, 30, then 60 seconds)
+until a response succeeds, the user cancels, or the run deadline expires; failed
+access attempts do not consume successful model turns. Numeric `Retry-After`
+headers can extend the wait, but never the run deadline. Partial responses never
+authorize tools or silently merge into replacement attempts. Explicit user
+cancellation stops further model requests, retries, and tool dispatch, including
+during backoff. Hard resource limits, unsafe or inconsistent protocol state,
+and persistence/integrity failures still stop the run rather than bypassing
+safety checks. Stopping a run does not imply that an outstanding worker has
+stopped or that its effects were rolled back.
+
 Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Local-backend `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Container-backed execution uses the separate prototype boundary described above. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
 
 The server binds to loopback only. Configured providers or real tools require `--auth-token-env NAME` with a 64-hex-character bearer token. That server-wide token also authorizes approval/control routes; session IDs are not credentials. Loopback HTTP is not encrypted and does not isolate mutually untrusted same-user processes.

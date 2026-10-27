@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use gates::{GatedProvider, GatedTool, candidate, next_entry, review_bed, stop_turn, tool_turn};
 use nexus_core::{
-    CommandReply, EventPayload, ExecutionStatus, Limits, RunOutcome, ToolRegistration,
+    CommandReply, EffectState, EventPayload, ExecutionStatus, Limits, RunOutcome, ToolRegistration,
 };
 use nexus_runtime::{Policy, RuntimeConfig};
 
@@ -52,6 +52,9 @@ fn timed_out_worker_still_live_blocks_conflicting_next_dispatch() {
                     candidate("item-1", "prov-ref-1", "host_read", r#"{"path":"b"}"#),
                 ]),
                 stop_turn("done"),
+                // The run continues past the unconfirmed timeout, so the
+                // second accepted run needs its own terminal turn.
+                stop_turn("done after quarantine cleared"),
             ],
             false,
         );
@@ -155,8 +158,8 @@ fn timed_out_worker_still_live_blocks_conflicting_next_dispatch() {
         );
         assert_eq!(
             finished.outcome(),
-            RunOutcome::LimitReached,
-            "a timeout whose termination is unconfirmed is an explicit limit outcome"
+            RunOutcome::Completed,
+            "the model may finish while the unconfirmed tool remains quarantined"
         );
         assert_eq!(
             tool.execution_count(),
@@ -177,9 +180,16 @@ fn timed_out_worker_still_live_blocks_conflicting_next_dispatch() {
             .collect();
         assert_eq!(
             statuses,
-            vec![ExecutionStatus::TimedOut],
-            "the timed-out call keeps its honest outcome"
+            vec![ExecutionStatus::TimedOut, ExecutionStatus::Denied],
+            "the timed-out call keeps its honest outcome and conflicting work is denied"
         );
+        assert!(control.iter().any(|event| matches!(
+            event.payload(),
+            EventPayload::ToolFinished(info)
+                if info.outcome.status() == ExecutionStatus::Denied
+                    && info.outcome.effect() == EffectState::NotStarted
+                    && info.outcome.content().contains("quarantin")
+        )));
 
         // Ownership is released only after the worker actually terminates, so
         // a new run becomes admissible again once that is established.

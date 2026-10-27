@@ -24,6 +24,19 @@
 //! - Cancellation is observed before connecting, after connecting, and
 //!   between read quanta; a cancelled call ends `Cancelled`, never
 //!   half-ingested.
+//! - Before provisional delivery, remote access failures retry at 1, 2, 5,
+//!   10, 30, then 60-second intervals (remaining at 60 seconds), until success,
+//!   cancellation, or the run deadline. Legacy contexts without a deadline
+//!   receive a ten-minute call bound. Numeric `Retry-After` is a minimum delay;
+//!   HTTP-date values are ignored. HTTP 300–599 responses retry except 400/422
+//!   request validation failures; redirects are not followed. Locally invalid
+//!   requests, unavailable/unsafe credentials, TLS verification failures, and
+//!   resource/internal constraints remain terminal. Connection, write, read,
+//!   and premature-EOF failures retry only while no response stream record has
+//!   arrived; a stream that already began is reported as `Protocol` and never
+//!   replayed. Subsequent recovery belongs to the runtime, not request replay.
+//!   System DNS resolution and an in-flight TCP connect are blocking: runtime
+//!   cancellation/deadline watchdogs retain ownership until that worker returns.
 //! - Response bodies are capped; oversize replies fail `ResourceLimit`
 //!   instead of allocating unboundedly. Malformed replies fail `Protocol`,
 //!   transport failures fail `Protocol`, timeouts fail `Timeout`, and a

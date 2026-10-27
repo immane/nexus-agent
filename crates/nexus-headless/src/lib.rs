@@ -607,6 +607,7 @@ fn is_mandatory(payload: &EventPayload) -> bool {
             | EventPayload::ContextReduced { .. }
             | EventPayload::ModelRequestStarted { .. }
             | EventPayload::ModelRequestFinished { .. }
+            | EventPayload::ModelResponseDiscarded { .. }
             | EventPayload::ApprovalRequired(_)
             | EventPayload::ToolStarted(_)
             | EventPayload::ToolFinished(_)
@@ -922,6 +923,9 @@ fn format_event(event: &RunEvent) -> String {
             response_validated,
         } => {
             format!("{head}model-response response-validated={response_validated}")
+        }
+        EventPayload::ModelResponseDiscarded { turn } => {
+            format!("{head}model-response-discarded turn={}", turn.as_str())
         }
         EventPayload::ToolCallPreview { item_key } => {
             format!("{head}preview item={}", sanitize(item_key))

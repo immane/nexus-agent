@@ -640,6 +640,12 @@ pub enum EventPayload {
         /// Whether the provider batch passed protocol validation.
         response_validated: bool,
     },
+    /// A provider response was abandoned; its partial output and candidates
+    /// were not accepted as task progress.
+    ModelResponseDiscarded {
+        /// Provider turn identity matching `ModelRequestStarted`.
+        turn: TurnId,
+    },
     /// Non-executable proposed-call progress.
     ToolCallPreview {
         /// Turn-local item key.
@@ -669,7 +675,8 @@ impl EventPayload {
             Self::AssistantTextDelta(text) => text.validate(),
             Self::ContextReduced { .. }
             | Self::ModelRequestStarted { .. }
-            | Self::ModelRequestFinished { .. } => Ok(()),
+            | Self::ModelRequestFinished { .. }
+            | Self::ModelResponseDiscarded { .. } => Ok(()),
             Self::ToolCallPreview { item_key } => {
                 if item_key.is_empty() || item_key.len() > crate::content::MAX_ITEM_KEY_LEN {
                     return Err(command_error("tool call preview is invalid"));

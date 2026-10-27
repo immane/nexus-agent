@@ -1199,6 +1199,10 @@ impl AppState {
             }
             EventPayload::ModelRequestStarted { .. } => {}
             EventPayload::ModelRequestFinished { .. } => {}
+            EventPayload::ModelResponseDiscarded { turn } => self.push_system(format!(
+                "model response {} was discarded as incomplete; its partial text and proposed actions were not accepted",
+                turn.as_str()
+            )),
             EventPayload::ToolCallPreview { item_key } => {
                 self.push_tool_with_fold(
                     format!("preview {item_key}"),
@@ -3235,6 +3239,24 @@ mod tests {
         assert!(notice.contains("4 earlier items"));
         assert!(notice.contains("re-check earlier facts"));
         assert!(!notice.contains("not a summary"));
+    }
+
+    #[test]
+    fn discarded_model_response_is_visibly_marked_in_transcript() {
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let (session, run) = session_run();
+        assert!(state.apply_event(&RunEvent::new(
+            session,
+            run,
+            1,
+            EventPayload::ModelResponseDiscarded {
+                turn: nexus_core::TurnId::new("t1-0").expect("valid"),
+            },
+        )));
+        let notice = render_entry_lines(state.entries.back().unwrap(), 200).join("\n");
+        assert!(notice.contains("discarded as incomplete"));
+        assert!(notice.contains("partial text and proposed actions were not accepted"));
     }
 
     fn started_run(run: &str, seq: u64) -> RunEvent {

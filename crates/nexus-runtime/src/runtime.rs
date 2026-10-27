@@ -303,8 +303,11 @@ struct ActiveRun {
     approval_seq: u64,
     turns_used: u32,
     calls_used: u32,
-    /// One fresh task request may replace a truncated response, never resume it.
+    /// Fresh task requests may replace discarded responses, never resume them.
     output_limit_recovery_used: bool,
+    task_output_limit_recovery_attempts: u8,
+    response_recovery_note: Option<&'static str>,
+    access_failure_attempts: usize,
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
     /// Index of the first context item not yet committed to source history.
@@ -408,6 +411,24 @@ impl Terminal {
     fn failed_internal(message: &'static str) -> Self {
         Self::failed(runtime_error(ErrorCategory::Internal, message))
     }
+}
+
+/// Provider access classification is deliberately narrower than a blanket
+/// retry of protocol/internal errors. Access failures must opt in; local
+/// input, credential-safety, integrity, and resource failures stay terminal.
+fn provider_access_failure(error: &AgentError) -> bool {
+    matches!(
+        error.category(),
+        ErrorCategory::Authentication
+            | ErrorCategory::PermissionDenied
+            | ErrorCategory::RateLimited
+            | ErrorCategory::Timeout
+            | ErrorCategory::Protocol
+    ) && error.retry() != nexus_core::RetryGuidance::DoNotRetry
+}
+
+fn provider_recovery_delay(attempt: usize) -> Duration {
+    Duration::from_secs([1, 2, 5, 10, 30, 60][attempt.min(5)])
 }
 
 /// Control-delivery classification: saturation is not a disconnect.
@@ -989,6 +1010,9 @@ impl Runtime {
             turns_used: 0,
             calls_used: 0,
             output_limit_recovery_used: false,
+            task_output_limit_recovery_attempts: 0,
+            response_recovery_note: None,
+            access_failure_attempts: 0,
             continuation: None,
             conversation,
             source_cursor,
@@ -1532,217 +1556,339 @@ impl Runtime {
                 None => return Err(Terminal::cancelled()),
             }
         };
-        let provider = self.shared.provider.clone();
-        let incremental = provider.supports_incremental_streaming();
-        let (stream_tx, mut stream_rx) =
-            mpsc::channel::<ProviderEvent>(PROVISIONAL_STREAM_CAPACITY);
-        let stream_overflow = Arc::new(AtomicBool::new(false));
-        let producer_overflow = stream_overflow.clone();
-        let producer_token = token.clone();
-        let stream_bytes = Arc::new(AtomicUsize::new(0));
-        let producer_bytes = stream_bytes.clone();
-        let worker_context = context.clone();
-        let mut handle = tokio::task::spawn_blocking(move || {
-            if incremental {
-                let sink = |event: ProviderEvent| {
-                    if !matches!(
-                        &event,
-                        ProviderEvent::TextDelta { .. } | ProviderEvent::ToolCallDelta { .. }
-                    ) && !matches!(&event, ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional)
-                    {
-                        return;
-                    }
-                    let bytes = provisional_event_bytes(&event);
-                    let previous = producer_bytes.fetch_add(bytes, Ordering::SeqCst);
-                    if previous.saturating_add(bytes) > PROVISIONAL_STREAM_BYTE_CAPACITY {
-                        producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                        producer_overflow.store(true, Ordering::SeqCst);
-                        producer_token.cancel();
-                        return;
-                    }
-                    if let Err(error) = stream_tx.try_send(event) {
-                        producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                        drop(error);
-                        producer_overflow.store(true, Ordering::SeqCst);
-                        producer_token.cancel();
-                    }
-                };
-                provider.stream_with_sink(&request, &worker_context, &sink)
-            } else {
-                provider.stream(&request, &worker_context)
-            }
-        });
-        let mut prefix = StreamedPrefix::default();
-        let mut cancelled_first = false;
-        let joined = loop {
+        loop {
             if token.is_cancelled() {
-                cancelled_first = true;
-                break None;
+                return Err(Terminal::cancelled());
             }
-            tokio::select! {
-                biased;
-                joined = &mut handle => break Some(joined),
-                streamed = stream_rx.recv() => {
-                        if let Some(event) = streamed {
-                            stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
-                            self.publish_provisional(run, &turn, event, &mut prefix)
-                            .await;
-                    }
-                }
-                () = wake.notified() => {
-                    if token.is_cancelled() {
-                        cancelled_first = true;
-                        break None;
-                    }
-                }
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break None,
+            if StdInstant::now() >= deadline {
+                return Err(Terminal::limit(
+                    "run duration exhausted while awaiting provider",
+                ));
             }
-        };
-        match joined {
-            Some(Ok(events)) => {
-                let mut effective_limits = self.shared.limits;
-                effective_limits.max_tool_output_bytes = self.shared.effective_output_budget;
-                let response_validated =
-                    crate::protocol::validate_batch(&events, &effective_limits).is_ok();
-                self.publish_model_request_finished(run, &turn, response_validated)
-                    .await;
-                // The join can become ready after the deadline while the
-                // deadline branch is also ready. Because the join branch is
-                // biased, do not accept the provider batch without checking
-                // the invocation's live control state again.
-                if let Err(error) = context.check_active() {
-                    let mut state = self.shared.state.lock().await;
-                    if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
-                        && active.pending_compaction.is_some()
-                    {
-                        context_compaction::record_summary_usage(
-                            &self.shared,
-                            active,
+            let provider = self.shared.provider.clone();
+            let incremental = provider.supports_incremental_streaming();
+            let (stream_tx, mut stream_rx) =
+                mpsc::channel::<ProviderEvent>(PROVISIONAL_STREAM_CAPACITY);
+            let stream_overflow = Arc::new(AtomicBool::new(false));
+            let producer_overflow = stream_overflow.clone();
+            let producer_token = token.clone();
+            let stream_bytes = Arc::new(AtomicUsize::new(0));
+            let producer_bytes = stream_bytes.clone();
+            let worker_context = context.clone();
+            let request = request.clone();
+            let mut handle = tokio::task::spawn_blocking(move || {
+                if incremental {
+                    let sink = |event: ProviderEvent| {
+                        if !matches!(
+                            &event,
+                            ProviderEvent::TextDelta { .. } | ProviderEvent::ToolCallDelta { .. }
+                        ) && !matches!(&event, ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional)
+                        {
+                            return;
+                        }
+                        let bytes = provisional_event_bytes(&event);
+                        let previous = producer_bytes.fetch_add(bytes, Ordering::SeqCst);
+                        if previous.saturating_add(bytes) > PROVISIONAL_STREAM_BYTE_CAPACITY {
+                            producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                            producer_overflow.store(true, Ordering::SeqCst);
+                            producer_token.cancel();
+                            return;
+                        }
+                        if let Err(error) = stream_tx.try_send(event) {
+                            producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                            drop(error);
+                            producer_overflow.store(true, Ordering::SeqCst);
+                            producer_token.cancel();
+                        }
+                    };
+                    provider.stream_with_sink(&request, &worker_context, &sink)
+                } else {
+                    provider.stream(&request, &worker_context)
+                }
+            });
+            let mut prefix = StreamedPrefix::default();
+            let mut cancelled_first = false;
+            let joined = loop {
+                if token.is_cancelled() {
+                    cancelled_first = true;
+                    break None;
+                }
+                tokio::select! {
+                    biased;
+                    joined = &mut handle => break Some(joined),
+                    streamed = stream_rx.recv() => {
+                            if let Some(event) = streamed {
+                                stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
+                                self.publish_provisional(run, &turn, event, &mut prefix)
+                                .await;
+                        }
+                    }
+                    () = wake.notified() => {
+                        if token.is_cancelled() {
+                            cancelled_first = true;
+                            break None;
+                        }
+                    }
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break None,
+                }
+            };
+            return match joined {
+                Some(Ok(events)) => {
+                    let mut effective_limits = self.shared.limits;
+                    effective_limits.max_tool_output_bytes = self.shared.effective_output_budget;
+                    let response_validated =
+                        crate::protocol::validate_batch(&events, &effective_limits).is_ok();
+                    self.publish_model_request_finished(run, &turn, response_validated)
+                        .await;
+                    if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                        self.check_completed_stream_limits(
                             run,
                             &events,
                             &mut prefix,
-                        );
-                        if let Some(outcome) = active.terminal {
-                            return Err(Terminal {
-                                outcome,
-                                error: active.terminal_error.clone(),
-                            });
-                        }
-                        if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
-                            return Err(Terminal::limit(
-                                "summary provider stream exceeded its bound",
-                            ));
-                        }
+                            stream_overflow.load(Ordering::SeqCst),
+                        )
+                        .await?;
                     }
-                    return Err(match error.category() {
-                        ErrorCategory::Cancelled => Terminal::cancelled_with(error),
-                        ErrorCategory::Timeout => {
-                            Terminal::limit("run duration exhausted while awaiting provider")
-                        }
-                        _ => Terminal::failed(error),
-                    });
-                }
-                // The join may win the race while provisional events are
-                // still buffered: drain them first so every streamed prefix
-                // publishes before the authoritative batch ingests.
-                self.drain_stream(run, &turn, &mut stream_rx, &stream_bytes, &mut prefix)
-                    .await;
-                self.check_completed_stream_limits(
-                    run,
-                    &events,
-                    &mut prefix,
-                    stream_overflow.load(Ordering::SeqCst),
-                )
-                .await?;
-                let result = self
-                    .ingest_model_batch(run, &turn, events, &mut prefix)
-                    .await;
-                if let Err(error) = self.persist_pending_source(run).await {
-                    let mut state = self.shared.state.lock().await;
-                    if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
-                    {
-                        active.persistence_error = Some(error.clone());
-                    }
-                    return Err(Terminal::failed(error));
-                }
-                if matches!(&result, Ok(RunState::ValidatingTools)) {
-                    let reduction = {
+                    // The join can become ready after the deadline while the
+                    // deadline branch is also ready. Because the join branch is
+                    // biased, do not accept the provider batch without checking
+                    // the invocation's live control state again.
+                    if let Err(error) = context.check_active() {
                         let mut state = self.shared.state.lock().await;
-                        let Some(active) =
+                        if let Some(active) =
                             state.active.as_mut().filter(|active| &active.run == run)
-                        else {
-                            return Err(Terminal::cancelled());
+                            && active.pending_compaction.is_some()
+                        {
+                            context_compaction::record_summary_usage(
+                                &self.shared,
+                                active,
+                                run,
+                                &events,
+                                &mut prefix,
+                            );
+                            if let Some(outcome) = active.terminal {
+                                return Err(Terminal {
+                                    outcome,
+                                    error: active.terminal_error.clone(),
+                                });
+                            }
+                            if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                                return Err(Terminal::limit(
+                                    "summary provider stream exceeded its bound",
+                                ));
+                            }
+                        }
+                        return Err(match error.category() {
+                            ErrorCategory::Cancelled => Terminal::cancelled_with(error),
+                            ErrorCategory::Timeout => {
+                                Terminal::limit("run duration exhausted while awaiting provider")
+                            }
+                            _ => Terminal::failed(error),
+                        });
+                    }
+                    // The join may win the race while provisional events are
+                    // still buffered: drain them first so every streamed prefix
+                    // publishes before the authoritative batch ingests.
+                    self.drain_stream(run, &turn, &mut stream_rx, &stream_bytes, &mut prefix)
+                        .await;
+                    self.check_completed_stream_limits(
+                        run,
+                        &events,
+                        &mut prefix,
+                        stream_overflow.load(Ordering::SeqCst),
+                    )
+                    .await?;
+                    // Only joined access failures may replay this prepared
+                    // request. Task output must be absent; summary text is
+                    // private staging and can be discarded without replaying
+                    // client-visible text or admitting any proposed tool call.
+                    if response_validated
+                        && let Some(ProviderEvent::Failed(error)) = events.last()
+                        && provider_access_failure(error)
+                    {
+                        let summary = {
+                            let mut state = self.shared.state.lock().await;
+                            let active = state
+                                .active
+                                .as_mut()
+                                .filter(|active| &active.run == run)
+                                .ok_or_else(Terminal::cancelled)?;
+                            if active.pending_compaction.is_some() {
+                                context_compaction::record_summary_usage(
+                                    &self.shared,
+                                    active,
+                                    run,
+                                    &events,
+                                    &mut prefix,
+                                );
+                                if let Some(outcome) = active.terminal {
+                                    return Err(Terminal {
+                                        outcome,
+                                        error: active.terminal_error.clone(),
+                                    });
+                                }
+                                true
+                            } else {
+                                false
+                            }
                         };
-                        compact_context(active, self.shared.context_items_bound)?
-                    };
-                    if let Some(reduction) = reduction {
+                        if summary || (events.len() == 1 && prefix.event_count == 0) {
+                            self.wait_provider_recovery(run, error.category()).await?;
+                            continue;
+                        }
+                    }
+                    let result = self
+                        .ingest_model_batch(run, &turn, events, &mut prefix)
+                        .await;
+                    if let Err(error) = self.persist_pending_source(run).await {
                         let mut state = self.shared.state.lock().await;
                         if let Some(active) =
                             state.active.as_mut().filter(|active| &active.run == run)
                         {
-                            publish_context_reduction(&self.shared, active, run, reduction);
+                            active.persistence_error = Some(error.clone());
+                        }
+                        return Err(Terminal::failed(error));
+                    }
+                    if matches!(&result, Ok(RunState::ValidatingTools)) {
+                        let reduction = {
+                            let mut state = self.shared.state.lock().await;
+                            let Some(active) =
+                                state.active.as_mut().filter(|active| &active.run == run)
+                            else {
+                                return Err(Terminal::cancelled());
+                            };
+                            compact_context(active, self.shared.context_items_bound)?
+                        };
+                        if let Some(reduction) = reduction {
+                            let mut state = self.shared.state.lock().await;
+                            if let Some(active) =
+                                state.active.as_mut().filter(|active| &active.run == run)
+                            {
+                                publish_context_reduction(&self.shared, active, run, reduction);
+                            }
                         }
                     }
+                    result
                 }
-                result
-            }
-            Some(Err(join)) => {
-                let message = if join.is_panic() {
-                    "provider worker panicked"
-                } else {
-                    "provider worker ended without a result"
-                };
-                Err(Terminal::failed_internal(message))
-            }
-            None => {
-                if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
-                    self.quarantine_provider(run, handle).await;
-                    return Err(Terminal::limit(if prefix.exceeded {
-                        "provisional output budget exhausted"
+                Some(Err(join)) => {
+                    let message = if join.is_panic() {
+                        "provider worker panicked"
                     } else {
-                        "provisional provider stream exceeded its bound"
-                    }));
+                        "provider worker ended without a result"
+                    };
+                    Err(Terminal::failed_internal(message))
                 }
-                let forced = {
-                    let state = self.shared.state.lock().await;
-                    state
-                        .active
-                        .as_ref()
-                        .filter(|active| &active.run == run)
-                        .and_then(|active| {
-                            active.terminal.map(|outcome| Terminal {
-                                outcome,
-                                error: active.terminal_error.clone(),
+                None => {
+                    if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                        self.quarantine_provider(run, handle).await;
+                        return Err(Terminal::limit(if prefix.exceeded {
+                            "provisional output budget exhausted"
+                        } else {
+                            "provisional provider stream exceeded its bound"
+                        }));
+                    }
+                    let forced = {
+                        let state = self.shared.state.lock().await;
+                        state
+                            .active
+                            .as_ref()
+                            .filter(|active| &active.run == run)
+                            .and_then(|active| {
+                                active.terminal.map(|outcome| Terminal {
+                                    outcome,
+                                    error: active.terminal_error.clone(),
+                                })
                             })
-                        })
-                };
-                if let Some(forced) = forced {
+                    };
+                    if let Some(forced) = forced {
+                        self.quarantine_provider(run, handle).await;
+                        return Err(forced);
+                    }
+                    let cancelled = cancelled_first || token.is_cancelled() || {
+                        let state = self.shared.state.lock().await;
+                        state
+                            .active
+                            .as_ref()
+                            .filter(|active| &active.run == run)
+                            .is_some_and(|active| active.cancelled)
+                    };
+                    // Prompt logical terminal: the blocked worker stays owned
+                    // (quarantined) until it actually terminates.
                     self.quarantine_provider(run, handle).await;
-                    return Err(forced);
+                    if cancelled {
+                        Err(Terminal::cancelled_with(runtime_error(
+                            ErrorCategory::Cancelled,
+                            "run cancelled while provider termination was unconfirmed",
+                        )))
+                    } else {
+                        Err(Terminal::limit(
+                            "run duration exhausted while awaiting provider",
+                        ))
+                    }
                 }
-                let cancelled = cancelled_first || token.is_cancelled() || {
-                    let state = self.shared.state.lock().await;
-                    state
-                        .active
-                        .as_ref()
-                        .filter(|active| &active.run == run)
-                        .is_some_and(|active| active.cancelled)
-                };
-                // Prompt logical terminal: the blocked worker stays owned
-                // (quarantined) until it actually terminates.
-                self.quarantine_provider(run, handle).await;
-                if cancelled {
-                    Err(Terminal::cancelled_with(runtime_error(
-                        ErrorCategory::Cancelled,
-                        "run cancelled while provider termination was unconfirmed",
-                    )))
-                } else {
-                    Err(Terminal::limit(
-                        "run duration exhausted while awaiting provider",
-                    ))
+            };
+        }
+    }
+
+    async fn wait_provider_recovery(
+        &self,
+        run: &RunId,
+        category: ErrorCategory,
+    ) -> Result<(), Terminal> {
+        let (token, wake, deadline, context, attempt) = {
+            let mut state = self.shared.state.lock().await;
+            let active = state
+                .active
+                .as_mut()
+                .filter(|active| &active.run == run)
+                .ok_or_else(Terminal::cancelled)?;
+            if active.cancelled {
+                return Err(Terminal::cancelled());
+            }
+            let context = ProviderContext::new(active.started.elapsed(), false, None)
+                .with_control(active.token.clone(), active.deadline);
+            let attempt = active.access_failure_attempts;
+            active.access_failure_attempts = attempt.saturating_add(1);
+            (
+                active.token.clone(),
+                active.wake.clone(),
+                active.deadline,
+                context,
+                attempt,
+            )
+        };
+        let check = || {
+            context
+                .check_active()
+                .map_err(|error| match error.category() {
+                    ErrorCategory::Cancelled => Terminal::cancelled_with(error),
+                    ErrorCategory::Timeout => {
+                        Terminal::limit("run duration exhausted while recovering provider access")
+                    }
+                    _ => Terminal::failed(error),
+                })
+        };
+        check()?;
+        let delay = provider_recovery_delay(attempt);
+        self.shared.diagnostic(format_args!(
+            "nexus-runtime: provider access recovery run={} attempt={} delay_seconds={} error_category={category:?}",
+            run.as_str(), attempt.saturating_add(1), delay.as_secs(),
+        ));
+        let retry_at = tokio::time::Instant::now() + delay;
+        loop {
+            if token.is_cancelled() {
+                return Err(Terminal::cancelled());
+            }
+            tokio::select! {
+                biased;
+                () = wake.notified() => { check()?; }
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    return Err(Terminal::limit("run duration exhausted while recovering provider access"));
                 }
+                () = tokio::time::sleep_until(retry_at) => break,
             }
         }
+        check()
     }
 
     async fn publish_model_request_finished(
@@ -1944,9 +2090,9 @@ impl Runtime {
         }
         // Full-turn atomic validation: duplicate references, partial/final
         // disagreement, and finish-reason conflicts fail before any
-        // admission, identity consumption, or queue mutation. An honestly
-        // failed invocation keeps its provider error primary: a protocol
-        // ordering diagnostic must not replace a typed timeout/failure.
+        // admission, identity consumption, or queue mutation. A malformed
+        // failure remains terminal even if its primary provider cause is an
+        // otherwise recoverable access category.
         let mut effective_limits = self.shared.limits;
         effective_limits.max_tool_output_bytes = self.shared.effective_output_budget;
         if let Err(protocol_error) = crate::protocol::validate_batch(&events, &effective_limits) {
@@ -1973,6 +2119,11 @@ impl Runtime {
         }
         if &active.run != run || active.cancelled || active.token.is_cancelled() {
             return Err(Terminal::cancelled());
+        }
+        if StdInstant::now() >= active.deadline {
+            return Err(Terminal::limit(
+                "run duration exhausted before accepting provider response",
+            ));
         }
         let mut candidates = Vec::new();
         let mut text_items: Vec<(String, String)> = Vec::new();
@@ -2134,6 +2285,11 @@ impl Runtime {
         if active.terminal.is_some() {
             return Ok(RunState::Finished);
         }
+        if StdInstant::now() >= active.deadline {
+            return Err(Terminal::limit(
+                "run duration exhausted before accepting provider response",
+            ));
+        }
         flush_text(&self.shared, active);
         let Some(terminal) = terminal else {
             return Err(Terminal::failed(runtime_error(
@@ -2141,10 +2297,41 @@ impl Runtime {
                 "provider batch ended without a terminal event",
             )));
         };
+        let discarded = match &terminal {
+            Err(_) => true,
+            Ok(finished) => matches!(
+                finished.reason(),
+                FinishReason::Incomplete | FinishReason::OutputLimit
+            ),
+        };
+        if discarded {
+            // Both the drained streamed prefix and any authoritative batch
+            // suffix must precede this marker, even for non-streaming providers.
+            let outcome = emit_control(
+                &self.shared,
+                active,
+                run,
+                EventPayload::ModelResponseDiscarded { turn: turn.clone() },
+            );
+            apply_control_outcome(active, outcome);
+            if active.terminal.is_some() {
+                return Ok(RunState::Finished);
+            }
+        }
         match terminal {
             Err(error) => {
                 if error.category() == ErrorCategory::Cancelled {
                     Err(Terminal::cancelled_with(error))
+                } else if provider_access_failure(&error) && active.continuation.is_none() {
+                    // Output may already be visible, so this is a fresh model
+                    // turn, not a replay. No failed candidate or partial text
+                    // enters accepted context; the host notice is bounded.
+                    active.response_recovery_note = Some(
+                        "The previous model invocation failed before a complete response was accepted. Its partial response and proposed tool calls were discarded; no proposed action executed. Choose the next small step from the accepted conversation, without reconstructing incomplete tool calls.",
+                    );
+                    drop(state);
+                    self.wait_provider_recovery(run, error.category()).await?;
+                    Ok(RunState::CallingModel)
                 } else {
                     Err(Terminal::failed(error))
                 }
@@ -2157,7 +2344,7 @@ impl Runtime {
                     continuation.is_compatible_with(adapter, &scope)
                 });
                 if finished.reason() == FinishReason::OutputLimit {
-                    let recovery_attempted = !active.output_limit_recovery_used
+                    let recovery_attempted = active.task_output_limit_recovery_attempts < 1
                         && active.continuation.is_none()
                         && finished.continuation().is_none()
                         && continuation_compatible
@@ -2212,6 +2399,7 @@ impl Runtime {
                         // and no text, reasoning, arguments, or opaque state is replayed.
                         // Request projection owns the bounded host recovery instruction.
                         active.output_limit_recovery_used = true;
+                        active.task_output_limit_recovery_attempts += 1;
                         return Ok(RunState::CallingModel);
                     }
                     return Err(Terminal::limit("model output limit reached"));
@@ -2222,11 +2410,30 @@ impl Runtime {
                         "provider continuation is incompatible with this profile",
                     )));
                 }
+                if finished.reason() == FinishReason::Incomplete {
+                    if active.continuation.is_some() || finished.continuation().is_some() {
+                        return Err(Terminal::failed(runtime_error(
+                            ErrorCategory::Protocol,
+                            "incomplete response cannot safely resume opaque continuation",
+                        )));
+                    }
+                    self.shared
+                        .limits
+                        .check_model_turns(active.turns_used)
+                        .map_err(|_| Terminal::limit("model turn budget exhausted"))?;
+                    active.response_recovery_note = Some(
+                        "The previous model response ended incomplete and was discarded, including proposed tool calls. No proposed action executed. Choose the next small step from the accepted conversation; do not reconstruct or continue incomplete tool calls.",
+                    );
+                    return Ok(RunState::CallingModel);
+                }
+                active.access_failure_attempts = 0;
+                active.response_recovery_note = None;
                 if let Some(continuation) = finished.continuation().cloned() {
                     active.continuation = Some(continuation);
                 }
                 match finished.reason() {
                     FinishReason::Stop => {
+                        active.task_output_limit_recovery_attempts = 0;
                         if text_items.iter().all(|(_, text)| text.is_empty())
                             && !reasoning.is_empty()
                         {
@@ -2242,10 +2449,9 @@ impl Runtime {
                     FinishReason::OutputLimit => {
                         unreachable!("output limit handled before continuation adoption")
                     }
-                    FinishReason::Incomplete => Err(Terminal::failed(runtime_error(
-                        ErrorCategory::Protocol,
-                        "model turn ended incomplete",
-                    ))),
+                    FinishReason::Incomplete => {
+                        unreachable!("incomplete response handled before continuation adoption")
+                    }
                     FinishReason::ToolCalls => {
                         if candidates.is_empty() {
                             return Err(Terminal::failed(runtime_error(
@@ -2261,6 +2467,7 @@ impl Runtime {
                             candidates,
                             if has_text { "" } else { &reasoning },
                         )?;
+                        active.task_output_limit_recovery_attempts = 0;
                         Ok(RunState::ValidatingTools)
                     }
                 }
@@ -3454,7 +3661,22 @@ impl Runtime {
         let Some(active) = state.active.as_mut() else {
             return;
         };
-        if &active.run != run || active.terminal.is_some() {
+        if &active.run != run {
+            return;
+        }
+        if active.cancelled {
+            active.terminal = Some(RunOutcome::Cancelled);
+            active.terminal_error = error
+                .filter(|error| error.category() == ErrorCategory::Cancelled)
+                .or_else(|| {
+                    active
+                        .terminal_error
+                        .take()
+                        .filter(|error| error.category() == ErrorCategory::Cancelled)
+                });
+            return;
+        }
+        if active.terminal.is_some() {
             return;
         }
         active.terminal = Some(outcome);
@@ -3464,6 +3686,13 @@ impl Runtime {
     async fn take_terminal(&self, run: &RunId) -> (RunOutcome, Option<AgentError>) {
         let state = self.shared.state.lock().await;
         match state.active.as_ref() {
+            Some(active) if &active.run == run && active.cancelled => (
+                RunOutcome::Cancelled,
+                active
+                    .terminal_error
+                    .clone()
+                    .filter(|error| error.category() == ErrorCategory::Cancelled),
+            ),
             Some(active) if &active.run == run => (
                 active.terminal.unwrap_or(RunOutcome::Cancelled),
                 active.terminal_error.clone(),
@@ -3497,6 +3726,23 @@ impl Runtime {
             state.active = Some(active);
             return;
         }
+        // Only explicit user cancellation dominates terminal arbitration.
+        // Internal token cancellation (e.g. stream overflow) retains its cause.
+        let (outcome, error) = if active.cancelled {
+            (
+                RunOutcome::Cancelled,
+                error
+                    .filter(|error| error.category() == ErrorCategory::Cancelled)
+                    .or_else(|| {
+                        active
+                            .terminal_error
+                            .clone()
+                            .filter(|error| error.category() == ErrorCategory::Cancelled)
+                    }),
+            )
+        } else {
+            (outcome, error)
+        };
         if let Some((call, decided)) = active.outcome_slot.take() {
             let dispatched = active
                 .current
@@ -4345,7 +4591,8 @@ fn control_event_bytes(event: &RunEvent) -> usize {
             byte_limit: _,
         } => method.as_str().len() + 5 * std::mem::size_of::<usize>(),
         EventPayload::ModelRequestStarted { turn, .. } => turn.as_str().len() + 64,
-        EventPayload::ModelRequestFinished { turn, .. } => turn.as_str().len() + 16,
+        EventPayload::ModelRequestFinished { turn, .. }
+        | EventPayload::ModelResponseDiscarded { turn } => turn.as_str().len() + 16,
         EventPayload::ToolCallPreview { item_key } => item_key.len(),
         EventPayload::ApprovalRequired(notice) => {
             notice.approval.as_str().len()
@@ -7304,6 +7551,9 @@ mod cov_runtime_private {
             turns_used: 0,
             calls_used: 0,
             output_limit_recovery_used: false,
+            task_output_limit_recovery_attempts: 0,
+            response_recovery_note: None,
+            access_failure_attempts: 0,
             continuation: None,
             conversation: Vec::new(),
             source_cursor: 0,
@@ -8759,6 +9009,7 @@ mod cov_runtime_topup_private {
     /// optional gate that keeps a worker deterministically live.
     struct ScriptedProvider {
         calls: AtomicUsize,
+        requests: StdMutex<Vec<ModelRequest>>,
         script: StdMutex<VecDeque<Vec<ProviderEvent>>>,
         gate: Option<Gate>,
     }
@@ -8767,6 +9018,7 @@ mod cov_runtime_topup_private {
         fn new(script: Vec<Vec<ProviderEvent>>) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                requests: StdMutex::new(Vec::new()),
                 script: StdMutex::new(script.into()),
                 gate: None,
             }
@@ -8775,6 +9027,7 @@ mod cov_runtime_topup_private {
         fn gated(script: Vec<Vec<ProviderEvent>>, gate: Gate) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                requests: StdMutex::new(Vec::new()),
                 script: StdMutex::new(script.into()),
                 gate: Some(gate),
             }
@@ -8798,12 +9051,9 @@ mod cov_runtime_topup_private {
             }
         }
 
-        fn stream(
-            &self,
-            _request: &ModelRequest,
-            _context: &ProviderContext,
-        ) -> Vec<ProviderEvent> {
+        fn stream(&self, request: &ModelRequest, _context: &ProviderContext) -> Vec<ProviderEvent> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request.clone());
             if let Some(gate) = &self.gate {
                 gate.wait();
             }
@@ -9053,6 +9303,9 @@ mod cov_runtime_topup_private {
             turns_used: 0,
             calls_used: 0,
             output_limit_recovery_used: false,
+            task_output_limit_recovery_attempts: 0,
+            response_recovery_note: None,
+            access_failure_attempts: 0,
             continuation: None,
             conversation: Vec::new(),
             source_cursor: 0,
@@ -9136,6 +9389,619 @@ mod cov_runtime_topup_private {
             Usage::new(Some(3), Some(4), UsageFinality::Final),
             None,
         ))]
+    }
+
+    #[test]
+    fn access_recovery_reuses_prepared_request_beyond_turn_budget() {
+        let mut limits = Limits::m0_test();
+        limits.max_model_turns_per_run = 1;
+        let failure = |category| {
+            vec![ProviderEvent::Failed(
+                AgentError::new(
+                    category,
+                    "access unavailable",
+                    RetryGuidance::RetryAfterBackoff,
+                )
+                .unwrap(),
+            )]
+        };
+        let bed = make_bed(
+            limits,
+            true,
+            vec![
+                failure(ErrorCategory::Authentication),
+                failure(ErrorCategory::RateLimited),
+                stop_turn("recovered"),
+            ],
+            None,
+            None,
+        );
+        let run = run_id("access-recovery");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            let terminal = bed
+                .runtime
+                .on_calling_model(&run)
+                .await
+                .expect_err("completed");
+            assert_eq!(terminal.outcome, RunOutcome::Completed);
+            assert_eq!(inspect(&bed, |active| active.turns_used).await, Some(1));
+            assert!(bed.shared.state.lock().await.quarantine.is_empty());
+        });
+        let requests = bed.provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[1], requests[2]);
+    }
+
+    #[test]
+    fn access_recovery_classification_does_not_retry_integrity_or_local_failures() {
+        for category in [
+            ErrorCategory::InvalidInput,
+            ErrorCategory::Internal,
+            ErrorCategory::ResourceLimit,
+            ErrorCategory::StorageFailure,
+            ErrorCategory::PermissionDenied,
+            ErrorCategory::Protocol,
+            ErrorCategory::Cancelled,
+            ErrorCategory::Authentication,
+            ErrorCategory::RateLimited,
+            ErrorCategory::Timeout,
+        ] {
+            assert!(!provider_access_failure(&runtime_error(
+                category,
+                "terminal failure"
+            )));
+        }
+        let transport = AgentError::new(
+            ErrorCategory::Protocol,
+            "transport unavailable",
+            RetryGuidance::RetryAfterBackoff,
+        )
+        .unwrap();
+        assert!(provider_access_failure(&transport));
+    }
+
+    #[test]
+    fn access_recovery_backoff_observes_cancel_and_deadline_without_dispatch() {
+        for cancelled in [true, false] {
+            let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+            let run = run_id("backoff-controls");
+            test_rt().block_on(async {
+                let mut active = active_for(&run);
+                active.access_failure_attempts = 5;
+                if !cancelled {
+                    active.deadline = StdInstant::now() + Duration::from_millis(10);
+                }
+                let token = active.token.clone();
+                let wake = active.wake.clone();
+                install(&bed, active).await;
+                let wait = bed
+                    .runtime
+                    .wait_provider_recovery(&run, ErrorCategory::Timeout);
+                let cancel = async {
+                    tokio::task::yield_now().await;
+                    if cancelled {
+                        token.cancel();
+                        wake.notify_one();
+                    }
+                };
+                let (result, ()) = tokio::join!(wait, cancel);
+                let terminal = result.expect_err("backoff interrupted");
+                assert_eq!(
+                    terminal.outcome,
+                    if cancelled {
+                        RunOutcome::Cancelled
+                    } else {
+                        RunOutcome::LimitReached
+                    }
+                );
+                assert_eq!(bed.provider.call_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn task_responses_after_deadline_never_complete_or_admit_tools() {
+        for events in [
+            stop_turn("late answer"),
+            vec![
+                ProviderEvent::ToolCallReady(
+                    CallCandidate::new("candidate", "reference", "host_read", "{}").unwrap(),
+                ),
+                ProviderEvent::TurnFinished(TurnFinished::new(
+                    FinishReason::ToolCalls,
+                    Usage::new(None, None, UsageFinality::Final),
+                    None,
+                )),
+            ],
+        ] {
+            let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+            let run = run_id("late-provider-response");
+            test_rt().block_on(async {
+                let mut active = active_for(&run);
+                active.deadline = StdInstant::now();
+                let original = active.conversation.clone();
+                install(&bed, active).await;
+                let terminal = bed
+                    .runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("late"),
+                        events,
+                        &mut StreamedPrefix::default(),
+                    )
+                    .await
+                    .expect_err("the run deadline cannot lose to response acceptance");
+                assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+                assert_eq!(
+                    inspect(&bed, |active| active.conversation.clone()).await,
+                    Some(original)
+                );
+                assert_eq!(
+                    inspect(&bed, |active| (
+                        active.turns_used,
+                        active.calls_used,
+                        active.queue.len()
+                    ))
+                    .await,
+                    Some((0, 0, 0))
+                );
+                assert_eq!(bed.read.execution_count(), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn discarded_response_marker_follows_all_text_and_precedes_replacement_request() {
+        struct Provider {
+            inner: ScriptedProvider,
+            incremental: bool,
+        }
+        impl ProviderPort for Provider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                self.inner.capabilities()
+            }
+
+            fn stream(
+                &self,
+                request: &ModelRequest,
+                context: &ProviderContext,
+            ) -> Vec<ProviderEvent> {
+                self.inner.stream(request, context)
+            }
+
+            fn supports_incremental_streaming(&self) -> bool {
+                self.incremental
+            }
+
+            fn stream_with_sink(
+                &self,
+                request: &ModelRequest,
+                context: &ProviderContext,
+                sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+            ) -> Vec<ProviderEvent> {
+                let events = self.stream(request, context);
+                for event in &events {
+                    if matches!(event, ProviderEvent::TextDelta { .. }) {
+                        sink(event.clone());
+                    }
+                }
+                events
+            }
+        }
+
+        for incremental in [false, true] {
+            for reason in [
+                None,
+                Some(FinishReason::Incomplete),
+                Some(FinishReason::OutputLimit),
+            ] {
+                let terminal = reason.map_or_else(
+                    || {
+                        ProviderEvent::Failed(
+                            AgentError::new(
+                                ErrorCategory::Protocol,
+                                "transport interrupted",
+                                RetryGuidance::RetryAfterBackoff,
+                            )
+                            .unwrap(),
+                        )
+                    },
+                    |reason| {
+                        ProviderEvent::TurnFinished(TurnFinished::new(
+                            reason,
+                            Usage::new(None, None, UsageFinality::Final),
+                            None,
+                        ))
+                    },
+                );
+                let provider = Arc::new(Provider {
+                    inner: ScriptedProvider::new(vec![
+                        vec![
+                            ProviderEvent::TextDelta {
+                                item_key: "partial".into(),
+                                text: "first ".into(),
+                            },
+                            ProviderEvent::TextDelta {
+                                item_key: "partial".into(),
+                                text: "last".into(),
+                            },
+                            terminal,
+                        ],
+                        stop_turn("replacement"),
+                    ]),
+                    incremental,
+                });
+                let (runtime, mut streams) = Runtime::new(
+                    RuntimeConfig {
+                        limits: Limits::m0_test(),
+                        policy: Policy::m0_test(),
+                        has_approval_handler: false,
+                    },
+                    provider,
+                    Vec::new(),
+                );
+                let run = run_id("discard-order");
+                test_rt().block_on(async {
+                    runtime.shared.state.lock().await.active = Some(active_for(&run));
+                    assert!(matches!(
+                        runtime.on_calling_model(&run).await,
+                        Ok(RunState::CallingModel)
+                    ));
+                    assert_eq!(
+                        runtime
+                            .on_calling_model(&run)
+                            .await
+                            .expect_err("completed")
+                            .outcome,
+                        RunOutcome::Completed
+                    );
+                });
+                let mut events = Vec::new();
+                while let Ok(event) = streams.control.try_recv() {
+                    events.push(event);
+                }
+                while let Ok(event) = streams.data.try_recv() {
+                    events.push(event);
+                }
+                events.sort_by_key(RunEvent::seq);
+                let discarded_turn = events
+                    .iter()
+                    .find_map(|event| match event.payload() {
+                        EventPayload::ModelResponseDiscarded { turn } => Some(turn.clone()),
+                        _ => None,
+                    })
+                    .expect("discard marker");
+                let marker = events
+                    .iter()
+                    .position(|event| {
+                        matches!(event.payload(), EventPayload::ModelResponseDiscarded { .. })
+                    })
+                    .unwrap();
+                let mut text = String::new();
+                for (index, event) in events.iter().enumerate() {
+                    if let EventPayload::AssistantTextDelta(fragment) = event.payload()
+                        && fragment.turn == discarded_turn
+                    {
+                        assert!(index < marker, "discarded text must precede its marker");
+                        text.push_str(&fragment.text);
+                    }
+                }
+                assert_eq!(text, "first last");
+                let replacement = events.iter().position(|event| matches!(event.payload(), EventPayload::ModelRequestStarted { turn, .. } if *turn != discarded_turn)).expect("replacement request");
+                assert!(marker < replacement);
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(
+                            event.payload(),
+                            EventPayload::ModelResponseDiscarded { .. }
+                        ))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_and_partial_failed_responses_feed_host_note_without_candidates() {
+        for incomplete in [true, false] {
+            let mut limits = Limits::m0_test();
+            if !incomplete {
+                limits.max_model_turns_per_run = 1;
+            }
+            let bed = make_bed(limits, true, vec![stop_turn("recovered")], None, None);
+            let run = run_id("partial-recovery");
+            test_rt().block_on(async {
+                let active = active_for(&run);
+                let original = active.conversation.clone();
+                install(&bed, active).await;
+                let mut events = vec![
+                    ProviderEvent::TextDelta {
+                        item_key: "partial".into(),
+                        text: "unfinished response".into(),
+                    },
+                    ProviderEvent::ToolCallReady(
+                        CallCandidate::new("candidate", "reference", "host_read", "{}").unwrap(),
+                    ),
+                ];
+                events.push(if incomplete {
+                    ProviderEvent::TurnFinished(TurnFinished::new(
+                        FinishReason::Incomplete,
+                        Usage::new(None, None, UsageFinality::Final),
+                        None,
+                    ))
+                } else {
+                    ProviderEvent::Failed(
+                        AgentError::new(
+                            ErrorCategory::Timeout,
+                            "provider response interrupted",
+                            RetryGuidance::RetryAfterBackoff,
+                        )
+                        .unwrap(),
+                    )
+                });
+                let mut prefix = StreamedPrefix::default();
+                bed.runtime
+                    .publish_provisional(&run, &turn_id("partial"), events[0].clone(), &mut prefix)
+                    .await;
+                assert!(matches!(
+                    bed.runtime
+                        .ingest_model_batch(&run, &turn_id("partial"), events, &mut prefix)
+                        .await,
+                    Ok(RunState::CallingModel)
+                ));
+                assert_eq!(
+                    inspect(&bed, |active| active.conversation.clone()).await,
+                    Some(original)
+                );
+                assert_eq!(
+                    inspect(&bed, |active| (
+                        active.calls_used,
+                        active.call_seq,
+                        active.queue.len()
+                    ))
+                    .await,
+                    Some((0, 0, 0))
+                );
+                assert_eq!(
+                    bed.runtime
+                        .on_calling_model(&run)
+                        .await
+                        .expect_err("completed")
+                        .outcome,
+                    RunOutcome::Completed
+                );
+                assert_eq!(bed.read.execution_count(), 0);
+                assert_eq!(
+                    inspect(&bed, |active| active.response_recovery_note).await,
+                    Some(None),
+                    "an accepted response clears the abandoned-invocation notice"
+                );
+                if !incomplete {
+                    assert_eq!(
+                        inspect(&bed, |active| (
+                            active.turns_used,
+                            active.access_failure_attempts
+                        ))
+                        .await,
+                        Some((1, 0))
+                    );
+                }
+            });
+            let requests = bed.provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "no replay of the failed invocation");
+            assert!(requests[0].context_note().contains("discarded"));
+            assert!(!format!("{:?}", requests[0].conversation()).contains("unfinished response"));
+        }
+    }
+
+    #[test]
+    fn repeated_partial_access_failures_share_increasing_backoff_without_spending_turns() {
+        assert_eq!(
+            (0..8)
+                .map(|attempt| provider_recovery_delay(attempt).as_secs())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 5, 10, 30, 60, 60, 60]
+        );
+        assert_eq!(provider_recovery_delay(usize::MAX).as_secs(), 60);
+        let failure = || {
+            vec![
+                ProviderEvent::TextDelta {
+                    item_key: "partial".into(),
+                    text: "private partial output".into(),
+                },
+                ProviderEvent::Failed(
+                    AgentError::new(
+                        ErrorCategory::Protocol,
+                        "private transport detail",
+                        RetryGuidance::RetryAfterBackoff,
+                    )
+                    .unwrap(),
+                ),
+            ]
+        };
+        let mut limits = Limits::m0_test();
+        limits.max_model_turns_per_run = 1;
+        let bed = make_bed(
+            limits,
+            true,
+            vec![failure(), failure(), stop_turn("recovered")],
+            None,
+            None,
+        );
+        let capture = DiagnosticCapture::default();
+        let runtime = bed.runtime.clone().with_diagnostic_writer(capture.clone());
+        let run = run_id("partial-backoff");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            for attempt in 1..=2 {
+                assert!(matches!(
+                    runtime.on_calling_model(&run).await,
+                    Ok(RunState::CallingModel)
+                ));
+                assert_eq!(
+                    inspect(&bed, |active| (
+                        active.turns_used,
+                        active.access_failure_attempts
+                    ))
+                    .await,
+                    Some((0, attempt))
+                );
+            }
+            assert_eq!(
+                runtime
+                    .on_calling_model(&run)
+                    .await
+                    .expect_err("completed")
+                    .outcome,
+                RunOutcome::Completed
+            );
+            assert_eq!(
+                inspect(&bed, |active| (
+                    active.turns_used,
+                    active.access_failure_attempts
+                ))
+                .await,
+                Some((1, 0))
+            );
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("attempt=1 delay_seconds=1 error_category=Protocol"));
+        assert!(log.contains("attempt=2 delay_seconds=2 error_category=Protocol"));
+        assert!(!log.contains("private"));
+        let requests = bed.provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_ne!(
+            requests[0], requests[1],
+            "recovery is a fresh request, not a replay"
+        );
+        assert!(requests[1].context_note().contains("discarded"));
+    }
+
+    #[test]
+    fn explicit_cancel_dominates_terminal_until_finalization_but_internal_cancel_does_not() {
+        for explicit in [true, false] {
+            let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+            let run = run_id("terminal-arbitration");
+            test_rt().block_on(async {
+                let mut active = active_for(&run);
+                active.cancelled = explicit;
+                active.token.cancel();
+                active.terminal = Some(RunOutcome::Completed);
+                install(&bed, active).await;
+                bed.runtime
+                    .set_terminal(
+                        &run,
+                        RunOutcome::LimitReached,
+                        Some(runtime_error(
+                            ErrorCategory::ResourceLimit,
+                            "stream overflow",
+                        )),
+                    )
+                    .await;
+                if explicit {
+                    assert_eq!(
+                        bed.runtime.take_terminal(&run).await,
+                        (RunOutcome::Cancelled, None)
+                    );
+                }
+                // Cancellation arriving after take_terminal must still win in finish_run.
+                bed.runtime
+                    .finish_run(
+                        &run,
+                        RunOutcome::LimitReached,
+                        Some(runtime_error(
+                            ErrorCategory::ResourceLimit,
+                            "stream overflow",
+                        )),
+                    )
+                    .await;
+                let event = bed.control.recv().await.unwrap();
+                let EventPayload::RunFinished(finished) = event.payload() else {
+                    panic!("terminal event")
+                };
+                assert_eq!(
+                    finished.outcome(),
+                    if explicit {
+                        RunOutcome::Cancelled
+                    } else {
+                        RunOutcome::LimitReached
+                    }
+                );
+                if !explicit {
+                    assert_eq!(
+                        finished.error().unwrap().category(),
+                        ErrorCategory::ResourceLimit
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn explicit_cancellation_preserves_unconfirmed_worker_diagnostic_through_finalization() {
+        let mut bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("cancel-diagnostic");
+        test_rt().block_on(async {
+            let mut active = active_for(&run);
+            active.cancelled = true;
+            install(&bed, active).await;
+            let error = runtime_error(ErrorCategory::Cancelled, "provider termination unconfirmed");
+            bed.runtime
+                .set_terminal(&run, RunOutcome::Cancelled, Some(error.clone()))
+                .await;
+            assert_eq!(
+                bed.runtime.take_terminal(&run).await,
+                (RunOutcome::Cancelled, Some(error.clone()))
+            );
+            // A stale non-cancellation result cannot replace either the user's
+            // cancellation or the retained diagnostic about the live worker.
+            bed.runtime
+                .finish_run(
+                    &run,
+                    RunOutcome::Failed,
+                    Some(runtime_error(ErrorCategory::Internal, "stale failure")),
+                )
+                .await;
+            let event = bed.control.recv().await.unwrap();
+            let EventPayload::RunFinished(finished) = event.payload() else {
+                panic!("terminal event")
+            };
+            assert_eq!(finished.outcome(), RunOutcome::Cancelled);
+            assert_eq!(finished.error(), Some(&error));
+        });
+    }
+
+    #[test]
+    fn repeated_output_limit_recovery_stops_after_one_retry() {
+        let mut limits = Limits::m0_test();
+        limits.max_model_turns_per_run = 3;
+        let bed = make_bed(limits, true, Vec::new(), None, None);
+        let run = run_id("repeated-output-limit");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            for used in 1..=2 {
+                let result = bed
+                    .runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("limited"),
+                        output_limit_turn(),
+                        &mut StreamedPrefix::default(),
+                    )
+                    .await;
+                if used == 1 {
+                    assert!(matches!(result, Ok(RunState::CallingModel)));
+                } else {
+                    assert_limit(result, "model output limit reached");
+                }
+                assert_eq!(inspect(&bed, |active| active.turns_used).await, Some(used));
+                assert_eq!(inspect(&bed, |active| active.calls_used).await, Some(0));
+            }
+        });
     }
 
     #[derive(Clone, Default)]
@@ -9327,12 +10193,55 @@ mod cov_runtime_topup_private {
     }
 
     #[test]
+    fn consecutive_task_output_limits_stop_after_one_recovery() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("output-limit-consecutive");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            assert!(matches!(
+                bed.runtime
+                    .ingest_model_batch(
+                        &run,
+                        &turn_id("first-limit"),
+                        output_limit_turn(),
+                        &mut StreamedPrefix::default(),
+                    )
+                    .await,
+                Ok(RunState::CallingModel)
+            ));
+            let terminal = bed
+                .runtime
+                .ingest_model_batch(
+                    &run,
+                    &turn_id("second-limit"),
+                    output_limit_turn(),
+                    &mut StreamedPrefix::default(),
+                )
+                .await
+                .expect_err("second consecutive limit must terminate the run");
+            assert_eq!(terminal.outcome, RunOutcome::LimitReached);
+            assert_eq!(
+                terminal.error.unwrap().category(),
+                ErrorCategory::ResourceLimit
+            );
+            assert_eq!(
+                inspect(&bed, |active| active.task_output_limit_recovery_attempts).await,
+                Some(1)
+            );
+            assert!(
+                inspect(&bed, |active| active.output_limit_recovery_used)
+                    .await
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
     fn output_limit_recovery_respects_opaque_state_turn_budget_and_controls() {
         for guard in [
             "opaque",
             "response-opaque",
             "incompatible",
-            "used",
             "turns",
             "cancelled",
             "deadline",
@@ -9352,7 +10261,6 @@ mod cov_runtime_topup_private {
                         .unwrap(),
                     )
                 }
-                "used" => active.output_limit_recovery_used = true,
                 "turns" => active.turns_used = limits.max_model_turns_per_run - 1,
                 "cancelled" => active.token.cancel(),
                 "deadline" => active.deadline = StdInstant::now() - Duration::from_secs(1),
@@ -9393,7 +10301,10 @@ mod cov_runtime_topup_private {
                     .await;
                 match guard {
                     "cancelled" => assert_cancelled(result),
-                    "deadline" => assert_limit(result, "run duration exhausted"),
+                    "deadline" => assert_limit(
+                        result,
+                        "run duration exhausted before accepting provider response",
+                    ),
                     "incompatible" => {
                         let Err(terminal) = result else {
                             panic!("incompatible continuation must fail");
