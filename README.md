@@ -441,10 +441,26 @@ server from current source.
 | Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
 | --- | --- | ---: | --- | --- | --- |
 | `sphinx-doc__sphinx-8595` | 2026-10-26 | 1m 46s | Treat `__all__ = []` as explicitly empty rather than falling back to all members. | Resolved | Completed |
+| `sphinx-doc__sphinx-9461` | 2026-10-27 | 1h 49m 12s | Document class properties decorated with `@classmethod` and `@property`. | Resolved | Completed |
 | `pylint-dev__pylint-6506` | 2026-10-26 | 2m 21s | Report unrecognized CLI options through argparse usage errors instead of a traceback. | Resolved | Completed |
 | `pylint-dev__pylint-6506` (94,208-token context reference) | 2026-10-26 | 2m 31s | Same repair; context-controlled follow-up run. | Resolved | Completed |
 | `pylint-dev__pylint-6506` (32,768-token context reference) | 2026-10-26 | 3m 47s | Same repair; context-controlled follow-up run, no compaction observed. | Resolved | Completed |
 | `pallets__flask-4992` | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
+
+The Sphinx 9461 run completed and its unchanged saved patch was **resolved by
+the official SWE-bench 5.0.2 evaluator (1/1; no infrastructure failures)**.
+During the run, two full-suite pytest commands each hit their `timeout 3000`
+limit after **50 minutes**: approximately 02:17–03:07 UTC and 03:07–03:57 UTC.
+Both outputs stopped around 37% progress. The first command piped through
+`tail`, masking the timeout exit status; the second captured `EXIT=124` and
+confirmed the timeout. A subsequent targeted suite completed in 10.84 seconds:
+272 passed and one `test_ext_autodoc.py::test_cython` failed. The agent reported
+that failure also occurs on the unmodified baseline; that baseline comparison
+was not independently verified here. These were intermediate test timeouts,
+not an agent-run timeout. The full agent run took 1h 49m 12s, and official
+scoring completed separately in about 38 seconds. This previously exposed task
+is not a blind evaluation sample. See the [launch record](../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/launch.json)
+and [official result](../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/official-evaluation/sphinx-doc__sphinx-9461-prediction-20261027T040234.790700Z-d83b863e5864422b8737ae8c44b8f1d8/evaluation.json).
 
 Sphinx used 47 model requests and 59 tool calls (940,165 input and 11,286 output
 tokens); Pylint used 38 model requests and 42 tool calls (810,483 input and
