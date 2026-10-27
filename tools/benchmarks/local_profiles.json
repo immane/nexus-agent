@@ -21,7 +21,7 @@
       "exposure": "previously contaminated; not blind"
     },
     "sphinx-doc__sphinx-9461": {
-      "images": ["nexus-swebench-sphinx-9461-isolated:pilot"],
+      "images": ["nexus-swebench-sphinx-9461-paged-read:pilot", "nexus-swebench-sphinx-9461-isolated:pilot"],
       "exposure": "previously attempted; not blind"
     },
     "pytest-dev__pytest-10051": {

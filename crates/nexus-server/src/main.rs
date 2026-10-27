@@ -23,6 +23,14 @@ const DEFAULT_PORT: u16 = 8471;
 const BENCHMARK_MAX_MODEL_TURNS: u32 = 500;
 const BENCHMARK_MAX_TOOL_CALLS: u32 = 4_096;
 const BENCHMARK_MAX_TOOL_CALLS_PER_TURN: u32 = 64;
+const BENCHMARK_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn server_runtime_limits() -> Limits {
+    let mut limits = Limits::m0_test();
+    limits.run_duration = std::time::Duration::from_secs(60 * 60);
+    limits.per_tool_timeout = std::time::Duration::from_secs(10 * 60);
+    limits
+}
 const BENCHMARK_RETAINED_CONTEXT_ITEMS: usize = 8_192;
 /// Maximum simultaneously serviced sockets; excess connections are closed
 /// immediately instead of creating another unbounded thread.
@@ -339,6 +347,10 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
+    if let Err(error) = server.set_limits(server_runtime_limits()) {
+        eprintln!("nexus-server: invalid runtime limits ({error})");
+        std::process::exit(2);
+    }
     if let Some(store) = session_store {
         server.set_session_store(store);
     }
@@ -348,14 +360,14 @@ fn main() {
         limits.max_tool_calls_per_run = BENCHMARK_MAX_TOOL_CALLS;
         limits.max_tool_calls_per_turn = BENCHMARK_MAX_TOOL_CALLS_PER_TURN;
         limits.run_duration = Limits::M0_TEST_MAX_DURATION;
-        limits.per_tool_timeout = std::time::Duration::from_secs(2 * 60);
+        limits.per_tool_timeout = BENCHMARK_TOOL_TIMEOUT;
         limits.retained_context_items = BENCHMARK_RETAINED_CONTEXT_ITEMS;
         if let Err(error) = server.set_limits(limits) {
             eprintln!("nexus-server: invalid benchmark pilot limits ({error})");
             std::process::exit(2);
         }
         eprintln!(
-            "nexus-server: finite benchmark pilot limits enabled (500 turns, 4096 tool calls, 24 hours)"
+            "nexus-server: finite benchmark pilot limits enabled (500 turns, 4096 tool calls, 24 hours, 1 hour per tool)"
         );
     }
     if let Some(token) = token.as_deref()
@@ -680,14 +692,26 @@ mod cov_main_args {
         limits.max_tool_calls_per_run = BENCHMARK_MAX_TOOL_CALLS;
         limits.max_tool_calls_per_turn = BENCHMARK_MAX_TOOL_CALLS_PER_TURN;
         limits.run_duration = Limits::M0_TEST_MAX_DURATION;
-        limits.per_tool_timeout = std::time::Duration::from_secs(2 * 60);
+        limits.per_tool_timeout = super::BENCHMARK_TOOL_TIMEOUT;
         limits.retained_context_items = BENCHMARK_RETAINED_CONTEXT_ITEMS;
         assert_eq!(limits.max_model_turns_per_run, 500);
         assert_eq!(limits.max_tool_calls_per_run, 4_096);
         assert_eq!(
+            limits.per_tool_timeout,
+            std::time::Duration::from_secs(3_600)
+        );
+        assert_eq!(
             limits.run_duration,
             std::time::Duration::from_secs(24 * 60 * 60)
         );
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn ordinary_server_allows_ten_minute_tools_within_a_one_hour_run() {
+        let limits = super::server_runtime_limits();
+        assert_eq!(limits.per_tool_timeout, std::time::Duration::from_secs(600));
+        assert_eq!(limits.run_duration, std::time::Duration::from_secs(3_600));
         assert!(limits.validate().is_ok());
     }
 

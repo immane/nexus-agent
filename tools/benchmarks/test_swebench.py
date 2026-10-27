@@ -6,9 +6,10 @@ from pathlib import Path
 import tempfile
 import sys
 import threading
+import subprocess
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import swebench
 
@@ -125,6 +126,62 @@ class CleanupTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "mismatched workspace"):
             swebench.cleanup_containers(owner(), Path("workspace"))
 
+    def test_runtime_removed_workload_does_not_leak_gateway(self):
+        record = {**owner(), "workload_id": None, "workload_name": None}
+        gateway = {"Id": record["gateway_id"],
+                   "Config": {"Labels": {"io.nexus-agent.gateway-owner": record["gateway_name"]}}}
+        with patch.object(swebench, "command", side_effect=[record["gateway_id"], "", json.dumps([gateway]), ""]) as commands:
+            swebench.cleanup_containers(record, Path("workspace"))
+        self.assertEqual(commands.call_args_list[1].args[0][-1], "name=^nexus-workload-" + record["nonce"] + "$")
+        self.assertEqual(commands.call_args_list[-1].args[0], ["docker", "rm", "-f", record["gateway_id"]])
+
+    def test_missing_id_with_surviving_named_workload_fails_closed(self):
+        with patch.object(swebench, "command", side_effect=["b" * 64, "c" * 64]) as commands, \
+                self.assertRaisesRegex(RuntimeError, "incomplete ownership"):
+            swebench.cleanup_containers({**owner(), "workload_id": None}, Path("workspace"))
+        self.assertFalse(any("rm" in call.args[0] for call in commands.call_args_list))
+
+    def test_missing_id_lookup_failure_blocks_gateway_deletion(self):
+        with patch.object(swebench, "command", side_effect=["b" * 64, RuntimeError("Docker unavailable")]) as commands, \
+                self.assertRaisesRegex(RuntimeError, "Docker unavailable"):
+            swebench.cleanup_containers({**owner(), "workload_id": None}, Path("workspace"))
+        self.assertFalse(any("rm" in call.args[0] for call in commands.call_args_list))
+
+
+class WorkerPreflightTests(unittest.TestCase):
+    def response(self, **changes):
+        return json.dumps({"version": 1, "result": {"status": "Succeeded", "effect": "KnownNotApplied",
+                          "content": "[more; next_offset=5]\naaaa", "truncated": True, **changes}})
+
+    def test_paged_read_is_checked_without_model_calls_or_workspace_writes(self):
+        result = SimpleNamespace(returncode=0, stdout=self.response())
+        with patch.object(swebench.subprocess, "run", return_value=result) as run:
+            evidence = swebench.verify_worker(owner(), row())
+        self.assertTrue(evidence["verified"])
+        self.assertTrue(evidence["paged_read"])
+        self.assertEqual(run.call_args.args[0], ["docker", "exec", "--interactive", "--workdir", "/workspace",
+                                                owner()["workload_id"], "/usr/local/bin/container-worker"])
+        frame = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(frame["operation"], "host_read")
+        self.assertEqual(frame["arguments"], {"path": "/workspace/.git/HEAD", "offset": 1, "limit": 4})
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_old_worker_rejection_and_invalid_responses_block_inference(self):
+        for code, output in [(2, ""), (0, "not JSON"), (0, self.response(content="whole file")),
+                             (0, self.response(status="Failed")), (0, self.response(truncated=False)),
+                             (0, '{"version":2}')]:
+            with self.subTest(code=code, output=output), \
+                    patch.object(swebench.subprocess, "run", return_value=SimpleNamespace(returncode=code, stdout=output)), \
+                    self.assertRaisesRegex(RuntimeError, "rebuild the task adapter image.*no inference started"):
+                swebench.verify_worker(owner(), row())
+
+    def test_timeout_and_spawn_failure_do_not_retry(self):
+        for error in (OSError("unavailable"), subprocess.TimeoutExpired("docker", 30)):
+            with self.subTest(error=error), patch.object(swebench.subprocess, "run", side_effect=error) as run, \
+                    self.assertRaisesRegex(RuntimeError, "preflight failed"):
+                swebench.verify_worker(owner(), row())
+            self.assertEqual(run.call_count, 1)
+
 
 class ModelPreflightTests(unittest.TestCase):
     def test_ollama_preflight_does_not_require_or_send_a_token(self):
@@ -200,6 +257,54 @@ class OutputTests(unittest.TestCase):
 
 
 class ArchiveLaunchTests(unittest.TestCase):
+    def test_worker_preflight_failure_stops_before_runner_and_preserves_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = root / "target/release/nexus-server"
+            server.parent.mkdir(parents=True)
+            server.write_bytes(b"fixture")
+            config = root / "config.json"
+            config.write_text(json.dumps({
+                "providers": [{"id": "ollama-local", "endpoint": "http://127.0.0.1:11434/v1",
+                               "credential": {"env": "OLLAMA_API_KEY"}}],
+                "models": [{"id": "local-model", "provider": "ollama-local"}],
+            }))
+            profiles = {"provider": "ollama-local", "model": "local-model", "gateway_image": "gateway"}
+            profile_path = root / "profiles.json"
+            profile_path.write_text(json.dumps(profiles))
+            args = SimpleNamespace(config=config, profiles=profile_path, model=None, provider=None,
+                                   model_output_tokens=None, gateway_image=None, container_image=None,
+                                   build=False, work_root=root / "runs", task=row()["instance_id"], port=0,
+                                   max_tool_calls=4096, max_run_seconds=86400)
+            task = {"row": row(), "image": "workload", "source": "fixture", "exposure": "exposed"}
+            process, pump = Mock(), Mock()
+            process.pid = 1234
+            process.poll.return_value = None
+            pump.is_alive.return_value = False
+            errors = []
+            with patch.object(swebench, "REPO", root), \
+                    patch.object(swebench, "check_model"), \
+                    patch.object(swebench, "inspect_image", return_value={"Id": "fixture", "Architecture": "arm64"}), \
+                    patch.object(swebench, "command", return_value=row()["base_commit"]), \
+                    patch.object(swebench.socket, "socket") as socket, \
+                    patch.object(swebench, "build_opener"), \
+                    patch.object(swebench, "request", return_value={"session": "fixture"}), \
+                    patch.object(swebench, "owner_record", return_value=owner()), \
+                    patch.object(swebench, "disconnect_network", return_value={"verified": True}), \
+                    patch.object(swebench, "verify_worker", side_effect=RuntimeError("rebuild task adapter")), \
+                    patch.object(swebench, "logged_process", return_value=(process, pump, errors)) as spawn, \
+                    patch.object(swebench.sys, "stdout", io.StringIO()):
+                socket.return_value.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 12345)
+                with self.assertRaisesRegex(RuntimeError, "rebuild task adapter"):
+                    swebench.launch(args, profiles, task)
+            self.assertEqual(spawn.call_count, 1, "must start only the server, never the model runner")
+            run = next(args.work_root.iterdir())
+            evidence = json.loads((run / "launch.json").read_text())
+            self.assertEqual(evidence["status"], "interrupted-or-failed")
+            self.assertEqual(evidence["evaluation"], "not-run")
+            self.assertNotIn("runner_argv", evidence)
+            process.terminate.assert_called_once()
+
     def test_launcher_uses_a_run_local_archive_outside_the_workload_mount(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

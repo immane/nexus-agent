@@ -51,6 +51,7 @@ metadata paths, not repositories or arbitrary model artifacts.
 | Gateway / workload | Cached profile tags resolved to immutable image IDs before launch; override via `--gateway-image`, `--container-image` |
 | Model turns | Server's `--benchmark-pilot`: 500 |
 | Tool calls / wall time | 4,096 / 86,400 seconds; lower with `--max-tool-calls`, `--max-run-seconds` |
+| Per-tool deadline | 3,600 seconds in `--benchmark-pilot` mode, clamped to the remaining runtime run budget; timeout still preserves uncertain-effect handling and quarantine |
 | Token caps | None; provider final usage accounting is recorded, not a hard spend cap |
 | Per-request output | Model config `max_output_tokens`, or legacy window-based default. `--model-output-tokens` writes a private run-local config; this is not a cumulative run token budget |
 | Context window reference | 94,208 tokens from local profile; reference-only, not a tokenizer or provider configuration |
@@ -117,11 +118,20 @@ Each invocation creates a unique `<work-root>/run-<task>-<UTC>-<nonce>` director
 Do not attach these logs publicly without review: task/model/tool output is not
 guaranteed free of sensitive material. Workspaces and artifacts are preserved,
 including failures and interrupted runs. Exit 0 means agent completion with a
-nonempty patch, **not official resolution**. `--prepare-only` exit 0 means only
-environment/network preparation succeeded. Cleanup errors exit nonzero and leave
+nonempty patch, **not official resolution**. Before inference (including in
+`--prepare-only` mode), the launcher exercises a read-only paged `host_read`
+against the detached checkout's `.git/HEAD` through the container worker.
+Incompatible or broken workers stop preparation with a rebuild diagnostic; rebuilding
+the server alone does not update workers embedded in cached task adapter images.
+Successful evidence is recorded under `worker` in `launch.json`.
+`--prepare-only` exit 0 means environment/network/worker preparation succeeded,
+not that tests passed. Cleanup errors exit nonzero and leave
 identity evidence for manual reconciliation; no global Docker prune is used.
 SIGINT/SIGTERM attempts bounded child shutdown and label-verified cleanup;
 SIGKILL/power loss cannot guarantee cleanup. No new run takes over old resources.
+If runtime quarantine already removed a workload and cleared its durable ID,
+the launcher verifies the exact container name is absent before continuing gateway
+cleanup. A surviving container with a missing ID still requires manual inspection.
 Tool previews redact known credential environment values and Bearer tokens before
 byte truncation, and explicitly mark log truncation separately from tool output
 truncation. This is best-effort redaction, **not** a guarantee against arbitrary
@@ -131,6 +141,45 @@ The standalone task runner defaults to omitting tool content unless explicitly
 enabled; the isolated launcher enables the bounded previews for diagnosis.
 Closed terminal pipes do not stop disk capture. Capture failures are recorded in
 `launch.json.log_errors` rather than silently claiming complete logs.
+During idle SSE periods, server pings produce a rate-limited `[heartbeat]` report
+(at most once per 30 seconds) with active call durations and time since the last
+observed `tool-output` event. After 120 seconds without such an event, a call is
+marked `quiet`, not failed or stalled. Heartbeats do not reset tool deadlines or
+prove test progress; they are console metadata, not sequenced runtime events.
+Configured runner budgets are checked on heartbeats too, so silent tools cannot
+defer the runner's wall-clock cancellation until their completion.
+Available `tool-output` byte counts are shown without content by default; raw
+previews still require `--tool-log-bytes`. The container executor currently
+collects stdout/stderr until completion: these reports do not add live stdout
+streaming. A case log and framework stack diagnostics remain necessary to locate
+a hung test; silence alone never triggers automatic cancellation or retry.
+
+## Task test execution guidance
+
+The task prompt follows each checkout's documented test runner, not an assumed
+framework. It directs the agent to run the targeted regression first, then the
+related suite, and the full suite only when justified by the change and remaining
+budget. Test output must preserve the exact test process exit status: prefer a
+stdout/stderr log with the status captured before inspecting it. A `tail`/`head`
+pipeline must not hide failure; Bash pipelines need `pipefail` and the real test
+status captured from `PIPESTATUS`, rather than the output filter's status.
+
+Keep case names/results in a progress log so the last started/completed case is
+identifiable. Runner heartbeats establish liveness, not actual test progress.
+Use a bounded execution deadline and supported stack diagnostics before it. For
+checkouts using a compatible installed pytest with its built-in faulthandler
+plugin, `-vv -o faulthandler_timeout=120` records case names and dumps thread
+stacks after a test exceeds 120 seconds; choose an interval below the execution
+deadline. This diagnostic **does not kill a hung test** and requires no new plugin.
+See pytest's official [verbosity documentation](https://docs.pytest.org/en/stable/how-to/output.html#verbosity)
+and [fault handler documentation](https://docs.pytest.org/en/stable/how-to/failures.html#fault-handler)
+(built in since pytest 5.0); verify support in the task's historical environment.
+
+After a timeout, inspect logs/stacks, identify the stalled case or phase, and
+narrow the diagnostic run rather than repeating the same full-suite command
+unchanged. Report timeout/incomplete coverage, not a pass. This guidance does
+not authorize weakening tests, skipping failing cases, changing expectations to
+pass, enabling external networking, or downloading dependencies/plugins.
 
 ## Scoring is separate
 

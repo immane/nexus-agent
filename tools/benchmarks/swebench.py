@@ -201,11 +201,19 @@ def disconnect_network(record, workspace):
 
 def cleanup_containers(record, workspace):
     """Only delete exact, label-verified resources of this launch, never global prune."""
+    if not re.fullmatch(r"[a-f0-9]{16,64}", record.get("nonce", "")):
+        raise RuntimeError("invalid ownership nonce")
     existing = set(command(["docker", "ps", "-aq", "--no-trunc"], timeout=15).splitlines())
     for kind, prefix in (("workload", "workload-"), ("gateway", "nexus-gw-")):
         identity = record.get(kind + "_id")
         if not identity:
-            raise RuntimeError("incomplete ownership record; inspect preparation manually")
+            # Runtime quarantine can already have removed the workload and
+            # cleared its durable ID. Never infer absence from the ID alone:
+            # partial creation can also leave a named container without an ID.
+            name = ("nexus-workload-" if kind == "workload" else "nexus-gw-") + record["nonce"]
+            if command(["docker", "ps", "-aq", "--no-trunc", "--filter", "name=^" + name + "$"], timeout=15):
+                raise RuntimeError("incomplete ownership record; inspect preparation manually")
+            continue
         if not re.fullmatch(r"[a-f0-9]{64}", identity):
             raise RuntimeError("invalid container identity")
         if identity not in existing:
@@ -219,6 +227,32 @@ def cleanup_containers(record, workspace):
                 and Path(mount["Source"]).resolve() == workspace.resolve() for mount in info["Mounts"]):
             raise RuntimeError("refusing cleanup of mismatched workspace")
         command(["docker", "rm", "-f", identity], timeout=20)
+
+
+def verify_worker(record, row):
+    """Exercise the versioned file-worker protocol before spending model tokens."""
+    # Detached HEAD is launcher-controlled, read-only, and has a known prefix.
+    # Non-default paging distinguishes old workers that only accept `path`.
+    frame = {"version": 1, "operation": "host_read",
+             "arguments": {"path": "/workspace/.git/HEAD", "offset": 1, "limit": 4},
+             "output_limit": 4096}
+    message = "container file-worker preflight failed; rebuild the task adapter image with current sources; no inference started"
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "--interactive", "--workdir", "/workspace", record["workload_id"],
+             "/usr/local/bin/container-worker"],
+            input=json.dumps(frame), capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError(message)
+        response = json.loads(result.stdout)
+        expected = {"version": 1, "result": {
+            "status": "Succeeded", "effect": "KnownNotApplied",
+            "content": "[more; next_offset=5]\n" + row["base_commit"][1:5], "truncated": True}}
+        if response != expected:
+            raise RuntimeError(message)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(message) from error
+    return {"verified": True, "protocol_version": 1, "operation": "host_read", "paged_read": True}
 
 
 def verify_task_environment(record, row):
@@ -364,6 +398,8 @@ def launch(args, profiles, task):
         manifest["containers"] = record
         manifest["network"] = disconnect_network(record, workspace)
         progress("network-verified", evidence=manifest["network"])
+        manifest["worker"] = verify_worker(record, row)
+        progress("worker-verified", evidence=manifest["worker"])
         if getattr(args, "verify_task_environment", False):
             manifest["environment"] = verify_task_environment(record, row)
             progress("environment-verified", evidence=manifest["environment"])

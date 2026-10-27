@@ -22,11 +22,95 @@ from run_nexus_swe_task import (
     observe_run_event,
     stream_end_error,
     summarize_usage_by_turn,
+    tool_wait_report,
 )
 
 
 def event(seq, kind, detail):
     return {"seq": seq, "kind": kind, "detail": detail}
+
+
+class HeartbeatTests(unittest.TestCase):
+    def run_stream(self, schedule, max_seconds=86400):
+        clock = [0.0]
+
+        class Stream:
+            def __iter__(self):
+                for at, value in schedule:
+                    clock[0] = at
+                    yield value if isinstance(value, bytes) else b"data: " + json.dumps(value).encode() + b"\n"
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = root / "task.json"
+            task.write_text(json.dumps({"instance_id": "task-1", "base_commit": "base", "problem_statement": "Fix it"}))
+            output = root / "output"
+            argv = ["runner", "--task-json", str(task), "--workspace", str(root),
+                    "--output-dir", str(output), "--provider", "fake", "--model", "fake",
+                    "--max-run-seconds", str(max_seconds)]
+            with (
+                patch("sys.argv", argv),
+                patch.dict("os.environ", {"NEXUS_BENCH_SMOKE_TOKEN": "test-only"}),
+                patch("sys.stdout", new_callable=io.StringIO),
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                patch("run_nexus_swe_task.time.monotonic", side_effect=lambda: clock[0]),
+                patch("run_nexus_swe_task.validate_container_git_checkout"),
+                patch("run_nexus_swe_task.git", side_effect=[SimpleNamespace(stdout="base\n"), SimpleNamespace(stdout="")]),
+                patch("run_nexus_swe_task.request", side_effect=[{"session": "s1"}, {"run": "r1"}, {}]) as request_mock,
+                patch("run_nexus_swe_task.urlopen", return_value=Stream()),
+                patch("run_nexus_swe_task.collect_patch", return_value="diff"),
+            ):
+                runner_main()
+            run_dir = next((output / "runs").iterdir())
+            return (stderr.getvalue(), load_events(run_dir / "events.jsonl"),
+                    json.loads((run_dir / "result.json").read_text()), request_mock.call_args_list)
+
+    def test_wait_reports_are_rate_limited_text_free_and_not_sequenced_events(self):
+        schedule = [
+            (0, event(0, "run-started", {})),
+            (1, event(1, "tool-started", {"call": "c1", "tool": "host_exec", "args_preview": "private args"})),
+            (30, b": ping\n"), (31, b": ping\n"), (60, b": ping\n"), (121, b": ping\n"),
+            (122, event(2, "tool-output", {"call": "c1", "preview": "private output", "truncated": False})),
+            (152, b": ping\n"),
+            (153, event(3, "tool-finished", {"call": "c1", "outcome": {"status": "Succeeded"}})),
+            (182, b": ping\n"),
+            (183, {**event(4, "run-finished", {"outcome": "completed"}), "terminal": True}),
+        ]
+        log, events, result, requests = self.run_stream(schedule)
+        reports = [json.loads(line.removeprefix("[heartbeat] ")) for line in log.splitlines() if line.startswith("[heartbeat] ")]
+        self.assertEqual([r["elapsed_seconds"] for r in reports], [30, 60, 121, 152, 182])
+        self.assertTrue(reports[2]["active_tools"][0]["quiet"])
+        self.assertEqual(reports[3]["active_tools"][0]["no_output_seconds"], 30)
+        self.assertFalse(reports[3]["active_tools"][0]["quiet"])
+        self.assertEqual(reports[4]["active_tools"], [])
+        self.assertIn('"preview_bytes": 14', log)
+        self.assertIn("command progress unknown", log)
+        self.assertNotIn("private output", log)
+        self.assertNotIn("private args", log)
+        self.assertEqual([e["seq"] for e in events], list(range(5)))
+        self.assertEqual(result["event_sequence_gaps"], 0)
+        self.assertEqual(len(requests), 2, "quiet tools must not be cancelled automatically")
+
+    def test_wall_clock_budget_is_checked_on_heartbeat_and_cancelled_once(self):
+        log, events, result, requests = self.run_stream([
+            (0, event(0, "run-started", {})),
+            (1, event(1, "tool-started", {"call": "c1", "tool": "host_exec"})),
+            (30, b": ping\n"), (31, b": ping\n"),
+            (32, {**event(2, "run-finished", {"outcome": "cancelled"}), "terminal": True}),
+        ], max_seconds=10)
+        self.assertEqual(result["budget_stop_reason"], "wall-clock budget reached")
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(requests[-1].args[2], "/sessions/s1/runs/r1/cancel")
+        self.assertEqual(len(events), 3)
+        self.assertIn("requesting run cancellation", log)
+
+    def test_wait_report_tracks_each_call_independently(self):
+        reports = tool_wait_report({"c1": 0, "c2": 100}, {"c1": 110}, 130)
+        self.assertEqual([r["no_output_seconds"] for r in reports], [20, 30])
+        self.assertEqual([r["elapsed_seconds"] for r in reports], [130, 30])
 
 
 class EventCaptureTests(unittest.TestCase):

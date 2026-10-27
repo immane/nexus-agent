@@ -121,6 +121,7 @@ fn tui_runtime_limits() -> Limits {
     limits.max_model_turns_per_run = TUI_MODEL_TURNS_PER_RUN;
     limits.max_tool_calls_per_run = TUI_TOOL_CALLS_PER_RUN;
     limits.run_duration = TUI_RUN_DURATION;
+    limits.per_tool_timeout = Duration::from_secs(10 * 60);
     limits.retained_context_items = TUI_RETAINED_CONTEXT_ITEMS;
     limits
 }
@@ -5746,6 +5747,7 @@ mod cov_main_topup {
         assert_eq!(limits.max_model_turns_per_run, 64);
         assert_eq!(limits.max_tool_calls_per_run, 128);
         assert_eq!(limits.run_duration, Duration::from_secs(3_600));
+        assert_eq!(limits.per_tool_timeout, Duration::from_secs(600));
         assert_eq!(limits.retained_context_items, 512);
         limits
             .validate()
