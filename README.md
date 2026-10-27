@@ -516,6 +516,29 @@ remaining work on convergence, verification, result recording, and cleanup.
 
 ## Project Status
 
+**Current position: M4 consolidation slices implemented, with selected M5
+capabilities already delivered; earlier acceptance gates remain open.**
+Development has been capability-driven rather than strictly milestone-ordered:
+the real model/tool/container loop and complex task repairs were exercised before
+all baseline measurements and acceptance reviews were finished. Implementation
+progress and verified readiness are tracked separately.
+
+| Stage | Implementation and remaining acceptance work |
+| --- | --- |
+| **M0 — Minimal execution baseline** | Functionality substantially exceeded; formal acceptance, current cross-platform evidence, and performance baselines remain incomplete. |
+| **M1 — Correctness and lifecycle** | Multiple slices implemented and verified; descendant cleanup limitations and Linux validation remain unresolved. |
+| **M2 — Permissions and platform boundaries** | Host-owned policy and scope handling implemented; filesystem and sandbox evidence covers macOS, with Linux validation blocked. |
+| **M3 — Configuration and composition** | Consolidation slices recorded as verified. |
+| **M4 — Internal consolidation** | M4.1–M4.3 implemented, with passing macOS default-feature workspace evidence; the overall gate remains open. |
+| **M5 — On-demand extensions** | Additional provider protocols implemented with offline fixtures; external-tool transport and HTTP/TLS replacement remain deferred. |
+
+M1–M5 refer to the [architecture migration stages](docs/tasks/08-architecture-migration.md),
+not sequential product releases. Officially resolved SWE-bench tasks demonstrate
+real end-to-end capability, not completion of every safety, performance, or
+cross-platform gate. Near-term work is incremental reliability improvement and
+acceptance closure, not a core rewrite or adding features merely to advance a
+milestone number.
+
 - [x] MIT license and confirmed project direction.
 - [x] Draft architecture, performance, security, and interface contracts.
 - [x] First-release defaults for permissions, TUI, sessions, entry points, authentication, relay scope, and code simplicity.
