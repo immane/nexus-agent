@@ -4,9 +4,9 @@
 //! timeout, through the public `Runtime` API only.
 //!
 //! The runtime owns a provider or tool worker until its termination is
-//! established. Cancellation and deadline expiry must publish a prompt,
-//! honest terminal while the worker is still blocked: the quarantined worker
-//! keeps new submits `Busy`, and the quarantine clears only after the worker
+//! established. Cancellation must publish a prompt, honest terminal, while a
+//! per-tool timeout lets the model complete with an honest tool outcome. The
+//! quarantined worker keeps new submits `Busy`, and quarantine clears only after it
 //! actually terminates. `nexus-fakes` is not a dependency of this crate, so
 //! these tests carry in-file gated doubles (an entry signal plus an explicit
 //! release). Every wait is bounded and every hand-off is channel-driven, so
@@ -792,15 +792,11 @@ fn per_tool_timeout_records_unknown_without_rollback_and_refines_late_evidence()
 
         let entry = next_entry(&mut entries).await;
 
-        // The deadline publishes a prompt terminal while the worker is
-        // blocked; effects stay inconclusive and are never claimed as
-        // rolled back or applied.
+        // The model completes while the timed-out worker remains blocked;
+        // effects stay inconclusive, never claimed as rolled back or applied.
         let (collected, finished) = collect_until_finished(&mut bed).await;
-        assert_eq!(finished.outcome(), RunOutcome::LimitReached);
-        assert!(
-            finished.error().is_none(),
-            "an unconfirmed deadline is not a typed failure"
-        );
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(finished.error().is_none());
         assert_eq!(tool_started_count(&collected), 1);
         let outcomes = tool_outcomes(&collected);
         assert_eq!(outcomes.len(), 1);
@@ -884,8 +880,8 @@ fn per_tool_timeout_records_unknown_without_rollback_and_refines_late_evidence()
         assert_eq!(next_finished.outcome(), RunOutcome::Completed);
         assert_eq!(
             provider.call_count(),
-            2,
-            "the timed-out turn plus the next run's turn"
+            3,
+            "the timed-out turn, model completion, and next run's turn"
         );
     });
 }

@@ -372,6 +372,18 @@ The TUI and ordinary server CLI allow up to 10 minutes per tool call within a
 one-hour run budget; each tool deadline is clamped to the remaining run budget.
 Benchmark-pilot mode allows one hour per tool within a 24-hour run budget.
 Timeouts do not bypass uncertain-effect handling or worker quarantine.
+Per-tool expiry is not, by itself, a run-budget failure. The runtime allows a
+bounded cleanup grace (up to two seconds, within the remaining run budget)
+without extending the tool's execution deadline. If the worker returns, its
+result is recorded and the model can continue; cancellation or an exhausted run
+budget still stops the run. A worker that remains live after per-tool cleanup
+grace is quarantined and records `TimedOut` / `Unknown` / `Uncertain`; the model
+can continue, but new tool dispatch is denied (`NotStarted`) while any
+quarantined worker remains. Background ownership is retained until the worker
+completes. Container transport timeouts can poison the session even after the
+host worker returns: killing the
+Docker CLI does not establish remote termination, and poisoned tools remain
+unavailable. No automatic command retry or container replacement is performed.
 
 Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Local-backend `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Container-backed execution uses the separate prototype boundary described above. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
 

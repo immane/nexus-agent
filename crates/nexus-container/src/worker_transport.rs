@@ -32,6 +32,7 @@ pub(crate) enum DockerExecError {
     InvalidConfiguration,
     Deadline,
     CancelledBeforeStart,
+    ExecutionTimedOut,
     ExecutionUncertain,
     Io,
     Failed,
@@ -46,6 +47,7 @@ impl fmt::Display for DockerExecError {
             Self::InvalidConfiguration => "Docker worker transport configuration is invalid",
             Self::Deadline => "Docker worker exchange deadline expired",
             Self::CancelledBeforeStart => "container command cancelled before dispatch",
+            Self::ExecutionTimedOut => "container command deadline exceeded after dispatch",
             Self::ExecutionUncertain => "container command outcome is uncertain",
             Self::Io => "Docker worker exchange I/O failed",
             Self::Failed => "Docker worker process failed",
@@ -215,7 +217,7 @@ impl DockerExecTransport {
             // Before spawn, `Deadline` guarantees no remote command was
             // submitted. Once the CLI exists, timeout makes remote state
             // uncertain even when local cleanup succeeds.
-            Err(DockerExecError::Deadline) => return Err(DockerExecError::ExecutionUncertain),
+            Err(DockerExecError::Deadline) => return Err(DockerExecError::ExecutionTimedOut),
             Err(error) => return Err(error),
         };
         Ok((status.code().unwrap_or(-1), out, err))
@@ -472,7 +474,15 @@ fn run_child(
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
-            cleanup(child, reaper)?;
+            cleanup(child, reaper).map_err(|cleanup_error| {
+                // Preserve the deadline cause even when CLI reaping remains
+                // uncertain. Neither case establishes remote termination.
+                if matches!(error, DockerExecError::Deadline) {
+                    DockerExecError::ExecutionTimedOut
+                } else {
+                    cleanup_error
+                }
+            })?;
             Err(error)
         }
     }
@@ -758,5 +768,28 @@ mod tests {
             Err(DockerExecError::ExecutionUncertain)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn argv_deadline_after_spawn_is_a_timeout_with_unknown_remote_termination() {
+        let f = Fixture::new(
+            "if [ \"$1\" = context ]; then echo unix:///tmp/docker.sock; exit; fi\nsleep 10",
+        );
+        let mut transport = DockerExecTransport::new(&f.docker(), ID, None).unwrap();
+        assert!(matches!(
+            transport.exec_argv(&["sleep", "10"], 64, Instant::now(), &|| false),
+            Err(DockerExecError::Deadline)
+        ));
+        let started = Instant::now();
+        assert!(matches!(
+            transport.exec_argv(
+                &["sleep", "10"],
+                64,
+                started + Duration::from_millis(50),
+                &|| false,
+            ),
+            Err(DockerExecError::ExecutionTimedOut)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

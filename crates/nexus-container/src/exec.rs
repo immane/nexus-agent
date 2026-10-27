@@ -177,6 +177,10 @@ impl<T: ExecTransport> ContainerExecTool<T> {
                 Ok((code, text, truncated))
             }
             Err(DockerExecError::Deadline) => Err(OutcomeFailure::TimedOut),
+            Err(DockerExecError::ExecutionTimedOut) => {
+                session.poison();
+                Err(OutcomeFailure::TimedOutAfterDispatch)
+            }
             Err(DockerExecError::CancelledBeforeStart) => Err(OutcomeFailure::Cancelled),
             Err(DockerExecError::InvalidConfiguration | DockerExecError::RequestTooLarge) => {
                 Err(OutcomeFailure::Invalid)
@@ -204,6 +208,7 @@ enum OutcomeFailure {
     Denied,
     Cancelled,
     TimedOut,
+    TimedOutAfterDispatch,
     Uncertain,
     Poisoned,
 }
@@ -254,6 +259,13 @@ impl<T: ExecTransport> ToolPort for ContainerExecTool<T> {
                 EffectState::NotStarted,
                 Evidence::HostObserved,
                 "command deadline expired before dispatch",
+                false,
+            ),
+            Err(OutcomeFailure::TimedOutAfterDispatch) => ToolOutcome::new(
+                ExecutionStatus::TimedOut,
+                EffectState::Unknown,
+                Evidence::Uncertain,
+                "command deadline exceeded after dispatch; container session unavailable; do not retry",
                 false,
             ),
             Err(OutcomeFailure::Poisoned) => ToolOutcome::new(
@@ -500,5 +512,52 @@ mod tests {
         assert_eq!(second.status(), ExecutionStatus::Failed);
         assert_eq!(second.effect(), EffectState::Unknown);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn dispatched_timeout_retains_timeout_status_and_poisons_session_once() {
+        struct DeadlineTransport(Arc<AtomicUsize>);
+        impl crate::worker_client::WorkerTransport for DeadlineTransport {
+            type Error = DockerExecError;
+
+            fn exchange(&mut self, _: &[u8], _: usize, _: Instant) -> Result<Vec<u8>, Self::Error> {
+                panic!("file requests must not be dispatched by this exec fixture")
+            }
+        }
+        impl ExecTransport for DeadlineTransport {
+            fn run(
+                &mut self,
+                _: &[&str],
+                _: usize,
+                _: Instant,
+                _: &dyn Fn() -> bool,
+            ) -> Result<(i32, Vec<u8>, Vec<u8>), DockerExecError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(DockerExecError::ExecutionTimedOut)
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let cleanup = Arc::clone(&cleanup_calls);
+        let session = Arc::new(ContainerSession::with_poison_handler(
+            DeadlineTransport(Arc::clone(&calls)),
+            Some(Arc::new(move || {
+                cleanup.fetch_add(1, Ordering::SeqCst);
+            })),
+        ));
+        let tool = ContainerExecTool::from_session(Arc::clone(&session));
+        let context = ctx("/workspace", Instant::now() + Duration::from_secs(1));
+        let command = call(r#"{"argv":["sleep","10"]}"#);
+        let timeout = tool.execute(&command, &context);
+        assert_eq!(timeout.status(), ExecutionStatus::TimedOut);
+        assert_eq!(timeout.effect(), EffectState::Unknown);
+        assert_eq!(timeout.evidence(), Evidence::Uncertain);
+        assert!(timeout.content().contains("do not retry"));
+        assert!(session.inner.lock().unwrap().poisoned);
+        let refused = tool.execute(&command, &context);
+        assert_eq!(refused.effect(), EffectState::NotStarted);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
     }
 }

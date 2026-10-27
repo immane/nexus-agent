@@ -112,6 +112,58 @@ class HeartbeatTests(unittest.TestCase):
         self.assertEqual([r["no_output_seconds"] for r in reports], [20, 30])
         self.assertEqual([r["elapsed_seconds"] for r in reports], [130, 30])
 
+    def test_recovered_tool_timeout_does_not_end_or_cancel_benchmark_run(self):
+        log, events, result, requests = self.run_stream([
+            (0, event(0, "run-started", {})),
+            (1, event(1, "tool-started", {"call": "c1", "tool": "host_exec"})),
+            (3, event(2, "tool-finished", {"call": "c1", "outcome": {
+                "status": "TimedOut", "effect": "Unknown", "evidence": "HostObserved",
+                "content": "command timed out; process cleanup completed",
+            }})),
+            (4, event(3, "model-request-started", {"turn": "t2", "purpose": "task"})),
+            (5, event(4, "tool-started", {"call": "c2", "tool": "host_read"})),
+            (6, event(5, "tool-finished", {"call": "c2", "outcome": {"status": "Succeeded"}})),
+            (7, {**event(6, "run-finished", {"outcome": "completed"}), "terminal": True}),
+        ])
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["tool_calls"], 2)
+        self.assertIsNone(result["budget_stop_reason"])
+        self.assertTrue(result["terminal_observed"])
+        self.assertEqual(result["event_sequence_gaps"], 0)
+        self.assertEqual(events[2]["detail"]["outcome"]["status"], "TimedOut")
+        self.assertEqual(len(requests), 2, "a tool timeout is not a run cancellation")
+        self.assertIn("status=TimedOut", log)
+
+    def test_unconfirmed_cleanup_denies_tools_but_allows_model_completion(self):
+        log, events, result, requests = self.run_stream([
+            (0, event(0, "run-started", {})),
+            (1, event(1, "tool-started", {"call": "c1", "tool": "host_exec"})),
+            (3, event(2, "tool-finished", {"call": "c1", "outcome": {
+                "status": "TimedOut", "effect": "Unknown", "evidence": "Uncertain",
+            }})),
+            (4, event(3, "model-request-started", {"turn": "t2", "purpose": "task"})),
+            (5, event(4, "tool-finished", {"call": "c2", "outcome": {
+                "status": "Denied", "effect": "NotStarted", "evidence": "HostObserved",
+                "content": "tool dispatch blocked while a worker remains quarantined",
+            }})),
+            (6, event(5, "model-request-started", {"turn": "t3", "purpose": "task"})),
+            (7, event(6, "assistant-text", {"text": "Completed with uncertain tool effects."})),
+            (8, {**event(7, "run-finished", {"outcome": "completed"}), "terminal": True}),
+        ])
+        self.assertEqual(result["outcome"], "completed")
+        self.assertIsNone(result["error"])
+        self.assertIsNone(result["budget_stop_reason"])
+        self.assertTrue(result["terminal_observed"])
+        self.assertEqual(result["event_sequence_gaps"], 0)
+        self.assertEqual(events[2]["detail"]["outcome"], {
+            "status": "TimedOut", "effect": "Unknown", "evidence": "Uncertain",
+            "output_bytes": 0,
+        })
+        self.assertEqual(events[4]["detail"]["outcome"]["status"], "Denied")
+        self.assertEqual(events[4]["detail"]["outcome"]["effect"], "NotStarted")
+        self.assertEqual(len(requests), 2, "unconfirmed cleanup is not a run cancellation")
+        self.assertNotIn("requesting run cancellation", log)
+
 
 class EventCaptureTests(unittest.TestCase):
     def test_incomplete_http_read_finalizes_runner_and_requests_cancellation(self):

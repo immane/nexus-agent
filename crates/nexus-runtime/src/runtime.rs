@@ -63,6 +63,9 @@ mod context_compaction;
 use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY};
 use context_compaction::{PendingCompaction, prepare_context_request};
 
+// Observation time for cooperative cleanup, not additional execution authority.
+const TOOL_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+
 /// Single-run lifecycle states (design 02-execution baseline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
@@ -2854,12 +2857,14 @@ impl Runtime {
                 tool,
                 context,
                 tool_deadline,
+                active.deadline,
                 wake,
                 token,
                 intent,
             )
         };
-        let (session, call, tool, context, tool_deadline, wake, token, intent) = setup;
+        let (session, call, tool, context, tool_deadline, run_deadline, wake, token, intent) =
+            setup;
         let call_id = call.call().clone();
         if let Err(error) = self.persist_tool_intent(&session, intent.clone()).await {
             let mut state = self.shared.state.lock().await;
@@ -2892,6 +2897,7 @@ impl Runtime {
         // the durable intent and immediately before marking the call started.
         {
             let mut state = self.shared.state.lock().await;
+            let worker_quarantined = !state.quarantine.is_empty();
             let Some(active) = state.active.as_mut() else {
                 return Err(Terminal::cancelled());
             };
@@ -2910,6 +2916,29 @@ impl Runtime {
                     timeout_outcome("run deadline passed before dispatch"),
                 ));
                 active.force_terminal = Some(RunOutcome::LimitReached);
+                return Ok(RunState::RecordingResult);
+            }
+            if StdInstant::now() >= tool_deadline {
+                active.outcome_slot = Some((
+                    call_id,
+                    ToolOutcome::new(
+                        ExecutionStatus::TimedOut,
+                        EffectState::NotStarted,
+                        Evidence::HostObserved,
+                        "tool deadline passed before dispatch",
+                        false,
+                    )
+                    .expect("bounded not-started timeout outcome builds"),
+                ));
+                return Ok(RunState::RecordingResult);
+            }
+            if worker_quarantined {
+                active.outcome_slot = Some((
+                    call_id,
+                    denied_outcome(
+                        "tool dispatch unavailable while a previous worker remains quarantined; termination and effects are unconfirmed; do not retry the previous operation",
+                    ),
+                ));
                 return Ok(RunState::RecordingResult);
             }
             let Some(current) = active.current.as_ref() else {
@@ -2975,10 +3004,18 @@ impl Runtime {
             }
         }
         let mut handle = tokio::task::spawn_blocking(move || tool.execute(&call, &context));
+        // The context retains the original deadline. A cooperative tool may
+        // need bounded time to stop its work and report the actual effects.
+        let cleanup_deadline = tool_deadline
+            .checked_add(TOOL_CLEANUP_GRACE)
+            .map_or(run_deadline, |deadline| deadline.min(run_deadline));
         let mut cancelled_first = false;
         let joined = loop {
             if token.is_cancelled() {
                 cancelled_first = true;
+                break None;
+            }
+            if StdInstant::now() >= run_deadline {
                 break None;
             }
             tokio::select! {
@@ -2990,7 +3027,7 @@ impl Runtime {
                         break None;
                     }
                 }
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(tool_deadline)) => break None,
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(cleanup_deadline)) => break None,
             }
         };
         let mut state = self.shared.state.lock().await;
@@ -3018,21 +3055,28 @@ impl Runtime {
                 let cancelled = cancelled_first || active.cancelled || token.is_cancelled();
                 let outcome = if cancelled {
                     cancelled_outcome("run cancelled while tool termination was unconfirmed")
-                } else {
+                } else if StdInstant::now() >= run_deadline {
                     timeout_outcome("tool deadline exceeded; termination unconfirmed")
+                } else {
+                    timeout_outcome(
+                        "tool deadline exceeded; termination and effects are unconfirmed; worker remains quarantined in the background; new tool dispatch is unavailable until termination; do not retry this operation",
+                    )
                 };
                 active.outcome_slot = Some((call_id.clone(), outcome));
                 if active.terminal.is_none() {
-                    active.force_terminal = Some(if cancelled {
-                        RunOutcome::Cancelled
+                    active.force_terminal = if cancelled {
+                        Some(RunOutcome::Cancelled)
+                    } else if StdInstant::now() >= run_deadline {
+                        Some(RunOutcome::LimitReached)
                     } else {
-                        RunOutcome::LimitReached
-                    });
+                        None
+                    };
                 }
                 drop(state);
                 // Ownership is retained: the worker stays quarantined until
                 // it actually terminates, and no next call or new run can
-                // start meanwhile.
+                // start meanwhile. The model may still receive the outcome
+                // and explain the uncertainty without dispatching tools.
                 self.quarantine_tool(run, call_id, handle).await;
                 Ok(RunState::RecordingResult)
             }
@@ -6474,13 +6518,14 @@ mod tests {
 
     #[test]
     fn per_tool_timeout_records_unknown_without_rollback_claims() {
-        let slow = Arc::new(FakeTool::slow("host_read", Duration::from_millis(400)));
+        let (blocked_tool, _entered, release) = BlockingTool::new();
+        let blocked_tool = Arc::new(blocked_tool);
         let provider = Arc::new(FakeProvider::new(vec![FakeProvider::tool_turn(vec![
             candidate("host_read", r#"{"path":"src"}"#),
         ])]));
         let mut limits = Limits::m0_test();
         limits.per_tool_timeout = Duration::from_millis(50);
-        let tools = vec![ToolRegistration::read(slow.clone())];
+        let tools = vec![ToolRegistration::read(blocked_tool.clone())];
         let (runtime, streams) = Runtime::new(
             RuntimeConfig {
                 limits,
@@ -6495,7 +6540,7 @@ mod tests {
             data: streams.data,
             control: streams.control,
             provider: Arc::new(FakeProvider::new(vec![])),
-            read_tool: slow.clone(),
+            read_tool: Arc::new(FakeTool::succeeding("host_read", nexus_core::M0_REVISION)),
             write_tool: Arc::new(FakeTool::succeeding("host_write", nexus_core::M0_REVISION)),
         };
         let rt = test_rt();
@@ -6505,7 +6550,8 @@ mod tests {
             let run = submit.run().cloned().expect("run issued");
             let (collected, finished) =
                 collect_until_finished(&mut bed.data, &mut bed.control).await;
-            assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert!(finished.error().is_none());
             let outcomes = tool_finished_map(&collected);
             assert_eq!(outcomes.len(), 1);
             let outcome = outcomes.values().next().expect("timeout recorded");
@@ -6517,7 +6563,16 @@ mod tests {
             // worker actually terminates.
             let blocked = bed.runtime.submit(submit_cmd("quarantine")).await;
             assert_eq!(blocked.reply(), CommandReply::Busy);
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            release
+                .send(())
+                .expect("release after cleanup grace expires");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while bed.runtime.has_unconfirmed_work().await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("late worker terminates and clears quarantine");
 
             // Late evidence refines the retained snapshot without emitting a
             // duplicate ToolFinished event.
@@ -10453,6 +10508,78 @@ mod cov_runtime_topup_private {
                 .await,
                 Some(true)
             );
+        });
+    }
+
+    #[test]
+    fn tool_deadline_expiring_during_intent_persistence_never_dispatches_or_ends_run() {
+        struct IntentStore(Gate);
+        impl SessionStore for IntentStore {
+            fn list_sessions(
+                &self,
+                _: usize,
+            ) -> Result<Vec<nexus_core::SessionMetadata>, AgentError> {
+                Ok(Vec::new())
+            }
+            fn load_session(&self, _: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+                unreachable!("test installs an active run")
+            }
+            fn save_checkpoint(&mut self, _: &SessionCheckpoint) -> Result<(), AgentError> {
+                Ok(())
+            }
+            fn record_intent(&mut self, _: &ToolIntentRecord) -> Result<(), AgentError> {
+                self.0.wait();
+                Ok(())
+            }
+            fn record_outcome(&mut self, _: &ToolOutcomeRecord) -> Result<(), AgentError> {
+                Ok(())
+            }
+        }
+        let (gate, mut handle) = gate();
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let mut limits = Limits::m0_test();
+        limits.per_tool_timeout = Duration::from_millis(50);
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits,
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(IntentStore(gate)),
+        )
+        .unwrap();
+        let run = run_id("intent-tool-timeout");
+        let call = read_call(&run, call_id("not-dispatched"));
+        let mut active = active_for(&run);
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            let (step, ()) = tokio::join!(runtime.on_executing(&run), async {
+                handle.entered.recv().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                handle.release.send(()).unwrap();
+            });
+            assert!(matches!(step, Ok(RunState::RecordingResult)));
+            assert_eq!(read.execution_count(), 0);
+            assert!(
+                streams.control.try_recv().is_err(),
+                "no ToolStarted before dispatch"
+            );
+            let state = runtime.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            let (_, outcome) = active.outcome_slot.as_ref().unwrap();
+            assert_eq!(outcome.status(), ExecutionStatus::TimedOut);
+            assert_eq!(outcome.effect(), EffectState::NotStarted);
+            assert_eq!(outcome.evidence(), Evidence::HostObserved);
+            assert!(
+                active.force_terminal.is_none(),
+                "only the call deadline expired"
+            );
+            assert!(!active.current.as_ref().unwrap().dispatched);
+            assert!(state.quarantine.is_empty());
         });
     }
 
