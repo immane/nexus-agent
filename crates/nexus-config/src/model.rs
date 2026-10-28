@@ -442,6 +442,7 @@ pub struct UserConfig {
     modes: Vec<AgentMode>,
     default_mode: Option<String>,
     context_management: ContextManagementPolicy,
+    show_reasoning: bool,
     gateway_image: Option<String>,
     workload_image: Option<String>,
 }
@@ -459,6 +460,7 @@ impl UserConfig {
             modes: Vec::new(),
             default_mode: None,
             context_management: ContextManagementPolicy::default(),
+            show_reasoning: false,
             gateway_image: None,
             workload_image: None,
         }
@@ -486,6 +488,17 @@ impl UserConfig {
     /// Replaces the global policy with a validated core policy.
     pub fn set_context_management(&mut self, policy: ContextManagementPolicy) {
         self.context_management = policy;
+    }
+
+    /// Whether the local TUI reveals provider-returned reasoning by default.
+    #[must_use]
+    pub fn show_reasoning(&self) -> bool {
+        self.show_reasoning
+    }
+
+    /// Sets the local reasoning visibility preference.
+    pub fn set_show_reasoning(&mut self, show: bool) {
+        self.show_reasoning = show;
     }
 
     /// Locally installed Docker image reference used by optional container execution.
@@ -802,6 +815,9 @@ impl UserConfig {
                 policy_json(self.context_management),
             );
         }
+        if self.show_reasoning {
+            document.insert("show_reasoning".to_owned(), Value::Bool(true));
+        }
         if self.gateway_image.is_some() || self.workload_image.is_some() {
             let mut images = Map::new();
             if let Some(image) = &self.gateway_image {
@@ -833,6 +849,7 @@ impl UserConfig {
                 "modes",
                 "default_mode",
                 "context_management",
+                "show_reasoning",
                 "container_images",
             ],
         )?;
@@ -846,6 +863,12 @@ impl UserConfig {
         let mut config = Self::default_config();
         if let Some(policy) = document.get("context_management") {
             config.set_context_management(parse_policy(policy)?);
+        }
+        if let Some(show) = document.get("show_reasoning") {
+            config.set_show_reasoning(
+                show.as_bool()
+                    .ok_or(invalid("reasoning visibility preference is invalid"))?,
+            );
         }
         if let Some(images) = document.get("container_images") {
             let images = images
@@ -1241,5 +1264,17 @@ mod container_image_config_tests {
         assert!(
             UserConfig::from_json(r#"{"revision":2,"container_images":{"gateway":4}}"#).is_err()
         );
+    }
+
+    #[test]
+    fn reasoning_visibility_is_opt_in_and_round_trips() {
+        let mut config = UserConfig::default_config();
+        assert!(!config.show_reasoning());
+        assert!(!config.to_json().contains("show_reasoning"));
+        config.set_show_reasoning(true);
+        let encoded = config.to_json();
+        assert!(encoded.contains(r#""show_reasoning":true"#));
+        assert!(UserConfig::from_json(&encoded).unwrap().show_reasoning());
+        assert!(UserConfig::from_json(r#"{"revision":2,"show_reasoning":"yes"}"#).is_err());
     }
 }

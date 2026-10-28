@@ -1588,6 +1588,8 @@ impl Frontend {
             .state
             .set_settings(config.settings.tui().clone())
             .expect("validated startup preferences");
+        let show_reasoning = front.config_snapshot().show_reasoning();
+        front.state.set_reasoning_visible(show_reasoning);
         front.sync_model_display();
         // Composer modes: built-ins first, then configuration customs, with
         // the configured default (or `build`) selected.
@@ -1990,6 +1992,29 @@ impl Frontend {
         if save_failed {
             self.state.notice("config save failed");
         }
+    }
+
+    fn toggle_reasoning(&mut self) {
+        let show = !self.state.reasoning_visible();
+        self.state.set_reasoning_visible(show);
+        let save_failed = {
+            let mut document = self
+                .user_config
+                .lock()
+                .expect("user configuration lockable");
+            document.config.set_show_reasoning(show);
+            document
+                .path
+                .as_ref()
+                .is_some_and(|path| save_config(&document.config, path).is_err())
+        };
+        self.state.notice(if save_failed {
+            "reasoning visibility changed; config save failed"
+        } else if show {
+            "reasoning shown · Ctrl+R hides"
+        } else {
+            "reasoning hidden · Ctrl+R shows"
+        });
     }
 
     fn next_request(&mut self) -> RequestId {
@@ -3591,6 +3616,7 @@ async fn handle_key_with_runtime(
             // Display-only: the title names the new variant at once.
             front.state.cycle_variant();
         }
+        Action::ToggleReasoning => front.toggle_reasoning(),
         Action::ApproveOnce | Action::Deny => {
             let Some(runtime) = runtime else {
                 return false;

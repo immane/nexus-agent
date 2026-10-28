@@ -761,6 +761,7 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
         "m  ·  Ctrl+T",
         "Cycle model / cycle model variant",
     ));
+    lines.push(help_row("Ctrl+R", "Show / hide provider reasoning (saved)"));
     lines.push(help_row(":", "Open the editable desktop command line"));
     lines.push(help_row(
         "Tab / Esc",
@@ -3342,7 +3343,7 @@ mod cov_render_private {
             rows.iter().any(|row| row.contains("example-model")),
             "active model is included: {rows:?}"
         );
-        state.scroll_help(20);
+        state.scroll_help(24);
         let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
         assert!(
             rows.iter().any(|row| row.contains("Ctrl+J / Alt+Enter")),

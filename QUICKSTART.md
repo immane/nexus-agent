@@ -410,6 +410,9 @@ the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
 `:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
 command.
 
+`Ctrl+R` toggles all provider-returned reasoning in the TUI. It is hidden by
+default; the preference is saved in the user config and restored on next start.
+
 The footer is the only run-status indicator: `idle`, `running`, tool execution,
 approval waiting or the final outcome. Active model/tool work uses a cyan dot
 spinner; waiting and finished states do not animate. It also shows the latest

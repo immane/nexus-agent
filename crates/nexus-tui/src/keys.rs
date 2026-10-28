@@ -111,6 +111,8 @@ pub enum Action {
     /// viewport (plain `t` still types); never in the approval card, whose
     /// keys decide.
     CycleVariant,
+    /// Show or hide all provider-returned reasoning entries.
+    ToggleReasoning,
     /// Allow the exact live approval once.
     ApproveOnce,
     /// Refuse the live approval without executing.
@@ -150,6 +152,7 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Cancel),
+            KeyCode::Char('r') => Some(Action::ToggleReasoning),
             KeyCode::Char('j') if focus == Focus::Composer => Some(Action::Newline),
             KeyCode::Char('t') if focus == Focus::Composer || focus == Focus::Viewport => {
                 Some(Action::CycleVariant)
@@ -335,6 +338,14 @@ mod tests {
             KeyEventKind::Release,
         );
         assert_eq!(map_key(Focus::ApprovalCard, release_cancel), None);
+    }
+
+    #[test]
+    fn ctrl_r_toggles_reasoning_in_every_focus() {
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        for focus in [Focus::Composer, Focus::Viewport, Focus::ApprovalCard] {
+            assert_eq!(map_key(focus, key), Some(Action::ToggleReasoning));
+        }
     }
 
     #[test]

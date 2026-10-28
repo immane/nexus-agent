@@ -926,6 +926,7 @@ pub struct AppState {
     /// path bytes are bounded; overflow hides unidentified output fail-closed.
     file_tools: Vec<FileToolPresentation>,
     file_tools_overflowed: bool,
+    show_reasoning: bool,
     /// Sum of retained per-entry bytes, bounded by [`MAX_RETAINED_BYTES`].
     retained_bytes: usize,
     /// Presentation-only drops; accepted records are unaffected.
@@ -1049,6 +1050,7 @@ impl AppState {
             entries: VecDeque::new(),
             file_tools: Vec::new(),
             file_tools_overflowed: false,
+            show_reasoning: false,
             retained_bytes: 0,
             dropped_entries: 0,
             composer: String::new(),
@@ -1118,6 +1120,25 @@ impl AppState {
     /// Active presentation preferences.
     pub fn settings(&self) -> &nexus_config::TuiSettings {
         &self.settings
+    }
+
+    pub fn set_reasoning_visible(&mut self, show: bool) -> bool {
+        if self.show_reasoning == show {
+            return false;
+        }
+        self.show_reasoning = show;
+        for entry in &mut self.entries {
+            if entry.kind == EntryKind::Reasoning {
+                entry.folded = !show;
+                entry.height_cache.set(None);
+            }
+        }
+        self.clear_text_selection();
+        true
+    }
+
+    pub fn reasoning_visible(&self) -> bool {
+        self.show_reasoning
     }
 
     /// Picker page size measured by the last frame, clamped to available space.
@@ -1301,7 +1322,14 @@ impl AppState {
             EventPayload::AssistantReasoningDelta(fragment) => {
                 let clean = sanitize(&fragment.text);
                 if !clean.is_empty() {
-                    self.push_stream_fragment(EntryKind::Reasoning, "thinking", StreamKey::Reasoning { turn: fragment.turn.clone() }, &clean);
+                    self.push_stream_fragment(
+                        EntryKind::Reasoning,
+                        "thinking",
+                        StreamKey::Reasoning {
+                            turn: fragment.turn.clone(),
+                        },
+                        &clean,
+                    );
                 }
             }
             EventPayload::ContextReduced { removed_items, .. } => {
@@ -1623,7 +1651,7 @@ impl AppState {
                 entry.folded = true;
             }
             if kind == EntryKind::Reasoning {
-                entry.folded = true;
+                entry.folded = !self.show_reasoning;
             }
             self.push_entry(entry);
         }
@@ -1711,7 +1739,7 @@ impl AppState {
                 for line in sanitize(reasoning).split('\n') {
                     entry.push_line(line);
                 }
-                entry.folded = true;
+                entry.folded = !self.show_reasoning;
                 self.push_entry(entry);
             }
             let (kind, title, text, folded) = match item {
@@ -3872,6 +3900,38 @@ mod tests {
             .unwrap();
         assert!(state.toggle_tool_at_row(row));
         assert!(state.transcript().join("\n").contains("thought"));
+    }
+
+    #[test]
+    fn global_reasoning_visibility_updates_existing_and_future_entries() {
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let (session, run) = session_run();
+        let fragment =
+            nexus_core::AssistantText::new(TurnId::new("t1-0").unwrap(), "reasoning", "thought")
+                .unwrap();
+        assert!(state.apply_event(&RunEvent::new(
+            session.clone(),
+            run.clone(),
+            1,
+            EventPayload::AssistantReasoningDelta(fragment),
+        )));
+        assert!(state.entries.back().unwrap().folded);
+        assert!(state.set_reasoning_visible(true));
+        assert!(!state.entries.back().unwrap().folded);
+        assert!(!state.set_reasoning_visible(true));
+        let next =
+            nexus_core::AssistantText::new(TurnId::new("t1-0").unwrap(), "reasoning", "more")
+                .unwrap();
+        assert!(state.apply_event(&RunEvent::new(
+            session,
+            run,
+            2,
+            EventPayload::AssistantReasoningDelta(next),
+        )));
+        assert!(!state.entries.back().unwrap().folded);
+        assert!(state.set_reasoning_visible(false));
+        assert!(state.entries.back().unwrap().folded);
     }
 
     #[test]
