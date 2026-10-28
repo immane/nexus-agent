@@ -80,16 +80,19 @@ fn usage() -> ! {
 
 /// CLI outcome: run with a port, or print usage and exit. Splitting the
 /// decision from the exit keeps every rejection path unit-testable.
+// The startup parser constructs this once; boxing its owned arguments would
+// add allocation without reducing any steady-state footprint.
+#[allow(clippy::large_enum_variant)]
 enum CliAction {
     /// Serve on this loopback port with this optional explicit config path
     /// and tool wiring.
     Run {
-        port: u16,
+        port: Option<u16>,
         config: Option<String>,
-        tools_real: bool,
+        tools: Option<nexus_config::ServerToolsMode>,
         tools_root: Option<String>,
         strict_tools: bool,
-        execution: ExecutionMode,
+        execution: Option<ExecutionMode>,
         gateway_image: Option<String>,
         workload_image: Option<String>,
         auth_token_env: Option<String>,
@@ -111,13 +114,12 @@ enum ExecutionMode {
 }
 
 fn parse_args(argv: &[String]) -> CliAction {
-    let mut port = DEFAULT_PORT;
+    let mut port = None;
     let mut config: Option<String> = None;
-    let mut tools_real = false;
+    let mut tools = None;
     let mut tools_root: Option<String> = None;
     let mut strict_tools = false;
-    let mut execution = ExecutionMode::Local;
-    let mut execution_set = false;
+    let mut execution = None;
     let mut gateway_image = None;
     let mut workload_image = None;
     let mut auth_token_env = None;
@@ -150,13 +152,12 @@ fn parse_args(argv: &[String]) -> CliAction {
                 benchmark_pilot = true;
             }
             "--execution" => {
-                if execution_set {
+                if execution.is_some() {
                     return CliAction::Usage;
                 }
-                execution_set = true;
                 execution = match args.next().map(String::as_str) {
-                    Some("local") => ExecutionMode::Local,
-                    Some("container") => ExecutionMode::Container,
+                    Some("local") => Some(ExecutionMode::Local),
+                    Some("container") => Some(ExecutionMode::Container),
                     _ => return CliAction::Usage,
                 };
             }
@@ -183,7 +184,7 @@ fn parse_args(argv: &[String]) -> CliAction {
                 _ => return CliAction::Usage,
             },
             "--port" => match args.next().and_then(|value| value.parse().ok()) {
-                Some(value) => port = value,
+                Some(value) => port = Some(value),
                 None => return CliAction::Usage,
             },
             // An explicit empty value is accepted as a path the resolver
@@ -213,8 +214,8 @@ fn parse_args(argv: &[String]) -> CliAction {
             "--check-config" => check_config = true,
             "--print-effective-config" => print_effective_config = true,
             "--tools" => match args.next().map(String::as_str) {
-                Some("real") => tools_real = true,
-                Some("fake") => tools_real = false,
+                Some("real") => tools = Some(nexus_config::ServerToolsMode::Real),
+                Some("fake") => tools = Some(nexus_config::ServerToolsMode::Fake),
                 _ => return CliAction::Usage,
             },
             "--tools-root" => match args.next() {
@@ -224,25 +225,10 @@ fn parse_args(argv: &[String]) -> CliAction {
             _ => return CliAction::Usage,
         }
     }
-    if execution == ExecutionMode::Container
-        && (!tools_real
-            || tools_root.as_deref().is_some_and(str::is_empty)
-            || strict_tools
-            || gateway_image.is_none()
-            || workload_image.is_none())
-    {
-        return CliAction::Usage;
-    }
-    if benchmark_pilot && (execution != ExecutionMode::Container || !tools_real || strict_tools) {
-        return CliAction::Usage;
-    }
-    if execution == ExecutionMode::Local && (gateway_image.is_some() || workload_image.is_some()) {
-        return CliAction::Usage;
-    }
     CliAction::Run {
         port,
         config,
-        tools_real,
+        tools,
         tools_root,
         strict_tools,
         execution,
@@ -256,6 +242,30 @@ fn parse_args(argv: &[String]) -> CliAction {
         check_config,
         print_effective_config,
     }
+}
+
+fn valid_startup_selection(
+    execution: ExecutionMode,
+    tools_real: bool,
+    strict_tools: bool,
+    tools_root: Option<&str>,
+    gateway_image: Option<&str>,
+    workload_image: Option<&str>,
+    benchmark_pilot: bool,
+) -> bool {
+    if execution == ExecutionMode::Container
+        && (!tools_real
+            || strict_tools
+            || tools_root.is_some_and(str::is_empty)
+            || gateway_image.is_none()
+            || workload_image.is_none())
+    {
+        return false;
+    }
+    if benchmark_pilot && (execution != ExecutionMode::Container || !tools_real || strict_tools) {
+        return false;
+    }
+    !(execution == ExecutionMode::Local && (gateway_image.is_some() || workload_image.is_some()))
 }
 
 /// Loads the user configuration at startup.
@@ -291,7 +301,7 @@ fn main() {
     let (
         port,
         explicit_config,
-        tools_real,
+        tools,
         tools_root,
         strict_tools,
         execution,
@@ -308,7 +318,7 @@ fn main() {
         CliAction::Run {
             port,
             config,
-            tools_real,
+            tools,
             tools_root,
             strict_tools,
             execution,
@@ -324,7 +334,7 @@ fn main() {
         } => (
             port,
             config,
-            tools_real,
+            tools,
             tools_root,
             strict_tools,
             execution,
@@ -340,26 +350,6 @@ fn main() {
         ),
         CliAction::Usage => usage(),
     };
-    #[cfg(not(feature = "container"))]
-    let _ = (&gateway_image, &workload_image);
-    #[cfg(not(feature = "container"))]
-    if execution == ExecutionMode::Container {
-        eprintln!(
-            "nexus-server: container execution is not enabled; rebuild with --features container"
-        );
-        std::process::exit(2);
-    }
-    #[cfg(feature = "container")]
-    if execution == ExecutionMode::Container {
-        for image in [gateway_image.as_deref(), workload_image.as_deref()] {
-            if let Some(image) = image
-                && nexus_container::validate_image_reference(image).is_err()
-            {
-                eprintln!("nexus-server: container images must use immutable sha256 digests");
-                std::process::exit(2);
-            }
-        }
-    }
     let (config, path) = load_user_config(explicit_config.as_deref());
     let settings_profile = if benchmark_pilot {
         nexus_config::SettingsProfile::Benchmark
@@ -379,6 +369,60 @@ fn main() {
     if print_effective_config {
         println!("{}", nexus_config::settings_json(&settings));
         std::process::exit(0);
+    }
+    let launch = settings.launch();
+    let port = port.or(launch.server_port).unwrap_or(DEFAULT_PORT);
+    let tools_real = tools
+        .or(launch.server_tools)
+        .is_some_and(|mode| mode == nexus_config::ServerToolsMode::Real);
+    let strict_tools = strict_tools || launch.strict_tools.unwrap_or(false);
+    let tools_root = tools_root.or_else(|| launch.tools_root.clone());
+    let auth_token_env = auth_token_env.or_else(|| launch.auth_token_env.clone());
+    let session_store = session_store.or_else(|| launch.session_store.clone());
+    let execution = execution.unwrap_or(match launch.execution {
+        Some(nexus_config::ExecutionMode::Container) => ExecutionMode::Container,
+        Some(nexus_config::ExecutionMode::Local) | None => ExecutionMode::Local,
+    });
+    let gateway_image = gateway_image.or_else(|| {
+        (execution == ExecutionMode::Container)
+            .then(|| config.gateway_image().map(str::to_owned))
+            .flatten()
+    });
+    let workload_image = workload_image.or_else(|| {
+        (execution == ExecutionMode::Container)
+            .then(|| config.workload_image().map(str::to_owned))
+            .flatten()
+    });
+    if !valid_startup_selection(
+        execution,
+        tools_real,
+        strict_tools,
+        tools_root.as_deref(),
+        gateway_image.as_deref(),
+        workload_image.as_deref(),
+        benchmark_pilot,
+    ) {
+        usage();
+    }
+    #[cfg(not(feature = "container"))]
+    let _ = (&gateway_image, &workload_image);
+    #[cfg(not(feature = "container"))]
+    if execution == ExecutionMode::Container {
+        eprintln!(
+            "nexus-server: container execution is not enabled; rebuild with --features container"
+        );
+        std::process::exit(2);
+    }
+    #[cfg(feature = "container")]
+    if execution == ExecutionMode::Container {
+        for image in [gateway_image.as_deref(), workload_image.as_deref()] {
+            if let Some(image) = image
+                && nexus_container::validate_image_reference(image).is_err()
+            {
+                eprintln!("nexus-server: container images must use immutable sha256 digests");
+                std::process::exit(2);
+            }
+        }
     }
     let needs_auth = tools_real || !config.providers().is_empty();
     let token = match auth_token_env.as_deref() {
@@ -606,6 +650,7 @@ mod cov_main_args {
     use super::{
         BENCHMARK_MAX_MODEL_TURNS, BENCHMARK_MAX_TOOL_CALLS, BENCHMARK_MAX_TOOL_CALLS_PER_TURN,
         BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, DEFAULT_PORT, ExecutionMode, parse_args,
+        valid_startup_selection,
     };
     use nexus_core::Limits;
 
@@ -670,22 +715,29 @@ mod cov_main_args {
     }
 
     /// Unwraps the `Run` variant, asserting the branch was taken.
-    fn run(args: &[&str]) -> (u16, Option<String>, bool, Option<String>) {
+    fn run(
+        args: &[&str],
+    ) -> (
+        Option<u16>,
+        Option<String>,
+        Option<nexus_config::ServerToolsMode>,
+        Option<String>,
+    ) {
         match parse_args(&argv(args)) {
             CliAction::Run {
                 port,
                 config,
-                tools_real,
+                tools,
                 tools_root,
                 ..
-            } => (port, config, tools_real, tools_root),
+            } => (port, config, tools, tools_root),
             CliAction::Usage => panic!("expected a run action for {args:?}"),
         }
     }
 
     /// The port half of a `Run` variant, for the port-only cases.
     fn port(args: &[&str]) -> u16 {
-        run(args).0
+        run(args).0.unwrap_or(DEFAULT_PORT)
     }
 
     /// The explicit `--config` value of a `Run` variant.
@@ -696,7 +748,10 @@ mod cov_main_args {
     /// The tool wiring of a `Run` variant: real reads plus optional root.
     fn tools(args: &[&str]) -> (bool, Option<String>) {
         let parsed = run(args);
-        (parsed.2, parsed.3)
+        (
+            parsed.2 == Some(nexus_config::ServerToolsMode::Real),
+            parsed.3,
+        )
     }
 
     /// Asserts the parser rejects the flags with usage.
@@ -725,7 +780,7 @@ mod cov_main_args {
         assert!(matches!(
             parse_args(&argv(&["--tools", "real"])),
             CliAction::Run {
-                tools_real: true,
+                tools: Some(nexus_config::ServerToolsMode::Real),
                 strict_tools: false,
                 ..
             }
@@ -733,7 +788,7 @@ mod cov_main_args {
         assert!(matches!(
             parse_args(&argv(&["--tools", "real", "--strict-tools"])),
             CliAction::Run {
-                tools_real: true,
+                tools: Some(nexus_config::ServerToolsMode::Real),
                 strict_tools: true,
                 ..
             }
@@ -755,32 +810,62 @@ mod cov_main_args {
         assert!(matches!(
             parse_args(&argv(&args)),
             CliAction::Run {
-                execution: ExecutionMode::Container,
-                tools_real: true,
+                execution: Some(ExecutionMode::Container),
+                tools: Some(nexus_config::ServerToolsMode::Real),
                 tools_root: None,
                 ..
             }
         ));
-        usage(&["--execution", "container"]);
+        assert!(matches!(
+            parse_args(&argv(&["--execution", "container"])),
+            CliAction::Run { .. }
+        ));
+        assert!(!valid_startup_selection(
+            ExecutionMode::Container,
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+        ));
         #[cfg(feature = "container")]
         assert!(nexus_container::validate_image_reference("gateway:latest").is_err());
-        usage(&[
-            "--tools",
-            "real",
-            "--strict-tools",
-            "--execution",
-            "container",
-            "--gateway-image",
-            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--container-image",
-            "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        ]);
+        assert!(!valid_startup_selection(
+            ExecutionMode::Container,
+            true,
+            true,
+            None,
+            Some("gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            false,
+        ));
     }
 
     #[test]
     fn benchmark_pilot_is_explicit_and_requires_container_tools() {
-        usage(&["--benchmark-pilot"]);
-        usage(&["--tools", "real", "--benchmark-pilot"]);
+        assert!(matches!(
+            parse_args(&argv(&["--benchmark-pilot"])),
+            CliAction::Run { .. }
+        ));
+        assert!(!valid_startup_selection(
+            ExecutionMode::Local,
+            false,
+            false,
+            None,
+            None,
+            None,
+            true,
+        ));
+        assert!(!valid_startup_selection(
+            ExecutionMode::Local,
+            true,
+            false,
+            None,
+            None,
+            None,
+            true,
+        ));
         let args = [
             "--tools",
             "real",
@@ -796,9 +881,18 @@ mod cov_main_args {
             parse_args(&argv(&args)),
             CliAction::Run {
                 benchmark_pilot: true,
-                execution: ExecutionMode::Container,
+                execution: Some(ExecutionMode::Container),
                 ..
             }
+        ));
+        assert!(valid_startup_selection(
+            ExecutionMode::Container,
+            true,
+            false,
+            None,
+            Some("gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            true,
         ));
         usage(&["--benchmark-pilot", "--benchmark-pilot"]);
     }
@@ -857,7 +951,7 @@ mod cov_main_args {
         ));
         assert!(matches!(
             parse_args(&argv(&["--session-store", "run/private session-store", "--port", "9401"])),
-            CliAction::Run { session_store: Some(directory), port: 9401, .. }
+            CliAction::Run { session_store: Some(directory), port: Some(9401), .. }
                 if directory == "run/private session-store"
         ));
         usage(&["--session-store"]);
@@ -966,11 +1060,11 @@ mod cov_main_args {
     fn port_and_config_flags_combine_independently() {
         assert_eq!(
             run(&["--port", "9401", "--config", "/tmp/c.json"]),
-            (9401, Some("/tmp/c.json".to_owned()), false, None)
+            (Some(9401), Some("/tmp/c.json".to_owned()), None, None)
         );
         assert_eq!(
             run(&["--config", "/tmp/c.json", "--port", "9401"]),
-            (9401, Some("/tmp/c.json".to_owned()), false, None)
+            (Some(9401), Some("/tmp/c.json".to_owned()), None, None)
         );
     }
 

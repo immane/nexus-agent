@@ -17,6 +17,93 @@ use crate::tui_settings::TuiSettings;
 const SETTINGS_REVISION: u64 = 1;
 const BASE_CONFIG_PATH: &str = "/etc/nexus-agent/base.jsonc";
 
+/// Execution backend selected by startup configuration or a command-line flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    Local,
+    Container,
+}
+
+/// Server's default tool registration mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerToolsMode {
+    Fake,
+    Real,
+}
+
+/// Existing command-line startup defaults, without credentials or policy bypasses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default = "LaunchSettings::empty", deny_unknown_fields)]
+pub struct LaunchSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_tools: Option<ServerToolsMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_store: Option<String>,
+    /// Name of the environment variable containing the bearer token, never the token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
+}
+
+impl Default for LaunchSettings {
+    fn default() -> Self {
+        Self {
+            execution: Some(ExecutionMode::Local),
+            strict_tools: Some(false),
+            tools_root: None,
+            server_port: Some(8471),
+            server_tools: Some(ServerToolsMode::Fake),
+            session_store: None,
+            auth_token_env: None,
+        }
+    }
+}
+
+impl LaunchSettings {
+    fn empty() -> Self {
+        Self {
+            execution: None,
+            strict_tools: None,
+            tools_root: None,
+            server_port: None,
+            server_tools: None,
+            session_store: None,
+            auth_token_env: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for path in [self.tools_root.as_deref(), self.session_store.as_deref()] {
+            if path.is_some_and(|value| {
+                value.is_empty() || value.len() > 4096 || value.bytes().any(|byte| byte == 0)
+            }) {
+                return Err(invalid("startup path is invalid"));
+            }
+        }
+        if self.auth_token_env.as_deref().is_some_and(|name| {
+            name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        }) {
+            return Err(invalid(
+                "authentication environment variable name is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Selects the established frontend budget profile. Defaults match current
 /// TUI and ordinary-server behavior exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +146,7 @@ impl SettingsProfile {
             provider: ProviderSettings::default(),
             server: ServerSettings::default(),
             tools: ToolsSettings::default(),
+            launch: LaunchSettings::default(),
             tui: TuiSettings::default(),
         }
     }
@@ -77,6 +165,7 @@ fn benchmark_defaults() -> EffectiveSettings {
         provider: ProviderSettings::default(),
         server: ServerSettings::default(),
         tools: ToolsSettings::default(),
+        launch: LaunchSettings::default(),
         tui: TuiSettings::default(),
     }
 }
@@ -194,6 +283,7 @@ pub struct EffectiveSettings {
     provider: ProviderSettings,
     server: ServerSettings,
     tools: ToolsSettings,
+    launch: LaunchSettings,
     tui: TuiSettings,
 }
 
@@ -227,6 +317,12 @@ impl EffectiveSettings {
     #[must_use]
     pub fn tools(&self) -> &ToolsSettings {
         &self.tools
+    }
+
+    /// Returns optional defaults for existing frontend startup options.
+    #[must_use]
+    pub fn launch(&self) -> &LaunchSettings {
+        &self.launch
     }
 
     /// Returns frontend presentation settings.
@@ -313,6 +409,7 @@ pub fn settings_json(settings: &EffectiveSettings) -> String {
         "provider": settings.provider,
         "server": settings.server,
         "tools": settings.tools,
+        "launch": settings.launch,
         "tui": settings.tui,
     }))
     .expect("validated operational settings are JSON serializable")
@@ -424,7 +521,10 @@ fn apply_profile(
     settings: &mut EffectiveSettings,
     object: &Map<String, Value>,
 ) -> Result<(), ConfigError> {
-    reject_unknown(object, &["runtime", "provider", "server", "tools", "tui"])?;
+    reject_unknown(
+        object,
+        &["runtime", "provider", "server", "tools", "launch", "tui"],
+    )?;
     if let Some(runtime) = object.get("runtime") {
         let runtime = section(runtime)?;
         reject_unknown(
@@ -563,6 +663,34 @@ fn apply_profile(
             serde_json::from_value(merged).map_err(|_| invalid("tools settings are invalid"))?;
         tools.validate()?;
         settings.tools = tools;
+    }
+    if let Some(launch) = object.get("launch") {
+        let overlay: LaunchSettings = serde_json::from_value(launch.clone())
+            .map_err(|_| invalid("startup settings are invalid"))?;
+        let mut merged = settings.launch.clone();
+        if overlay.execution.is_some() {
+            merged.execution = overlay.execution;
+        }
+        if overlay.strict_tools.is_some() {
+            merged.strict_tools = overlay.strict_tools;
+        }
+        if overlay.tools_root.is_some() {
+            merged.tools_root = overlay.tools_root;
+        }
+        if overlay.server_port.is_some() {
+            merged.server_port = overlay.server_port;
+        }
+        if overlay.server_tools.is_some() {
+            merged.server_tools = overlay.server_tools;
+        }
+        if overlay.session_store.is_some() {
+            merged.session_store = overlay.session_store;
+        }
+        if overlay.auth_token_env.is_some() {
+            merged.auth_token_env = overlay.auth_token_env;
+        }
+        merged.validate()?;
+        settings.launch = merged;
     }
     if let Some(tui) = object.get("tui") {
         apply_tui(settings, tui)?;
@@ -851,6 +979,7 @@ mod tests {
             assert_eq!(layer["defaults"]["provider"], printed["provider"]);
             assert_eq!(layer["defaults"]["server"], printed["server"]);
             assert_eq!(layer["defaults"]["tools"], printed["tools"]);
+            assert_eq!(layer["defaults"]["launch"], printed["launch"]);
             assert_eq!(layer["tui"], printed["tui"]);
         }
     }
@@ -1074,6 +1203,47 @@ mod tests {
                 session_cleanup_interval_seconds: 5,
             }
         );
+    }
+
+    #[test]
+    fn launch_defaults_merge_and_validate_references_without_exposing_secrets() {
+        let mut settings = SettingsProfile::Tui.defaults();
+        apply_layer(
+            &mut settings,
+            r#"{"revision":1,"defaults":{"launch":{"execution":"container","tools_root":"workspace","auth_token_env":"NEXUS_TOKEN","server_port":9000}},"profiles":{"tui":{"launch":{"strict_tools":true}}}}"#,
+            SettingsProfile::Tui,
+        )
+        .unwrap();
+        assert_eq!(settings.launch.execution, Some(ExecutionMode::Container));
+        assert_eq!(settings.launch.strict_tools, Some(true));
+        assert_eq!(settings.launch.tools_root.as_deref(), Some("workspace"));
+        assert_eq!(settings.launch.server_port, Some(9000));
+        assert_eq!(
+            settings.launch.auth_token_env.as_deref(),
+            Some("NEXUS_TOKEN")
+        );
+        let output: Value = serde_json::from_str(&settings_json(&settings)).unwrap();
+        assert_eq!(output["launch"]["auth_token_env"], "NEXUS_TOKEN");
+        assert!(output["launch"].get("token").is_none());
+
+        for invalid in [
+            r#"{"revision":1,"defaults":{"launch":{"execution":"remote"}}}"#,
+            r#"{"revision":1,"defaults":{"launch":{"server_tools":"admin"}}}"#,
+            r#"{"revision":1,"defaults":{"launch":{"server_port":65536}}}"#,
+            r#"{"revision":1,"defaults":{"launch":{"tools_root":""}}}"#,
+            r#"{"revision":1,"defaults":{"launch":{"auth_token_env":"BAD-NAME"}}}"#,
+            r#"{"revision":1,"profiles":{"server":{"launch":{"unexpected":true}}}}"#,
+        ] {
+            assert!(
+                apply_layer(
+                    &mut SettingsProfile::Tui.defaults(),
+                    invalid,
+                    SettingsProfile::Tui
+                )
+                .is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]

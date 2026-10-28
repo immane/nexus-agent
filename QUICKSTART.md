@@ -245,6 +245,19 @@ they do not change bind/authentication policy or tool permissions. Idle cleanup
 still retains sessions with active work, streams, or external owners. Expiry is
 checked periodically, so an eligible idle session may remain until the next pass.
 
+Existing startup options can also have defaults under `defaults.launch` or the
+selected profile's `launch`: `execution` (`local` or `container`),
+`strict_tools`, `tools_root`, `server_port`, `server_tools` (`fake` or `real`),
+`session_store`, and `auth_token_env` (an environment-variable **name**, never
+the token). Container image references remain in the provider/model config or
+CLI because that is where they are already stored. An explicit CLI option wins;
+otherwise launch settings apply, then the existing built-in behavior. For
+example, setting `execution` to `container` and the two image references allows
+TUI startup without repeating `--execution container`; `--execution local`
+still forces local execution. These are startup-only defaults, not hot reload or
+permission-policy overrides. `strict_tools: true` can tighten execution; config
+cannot disable strict mode selected by `--strict-tools`.
+
 Tool budgets belong in `defaults.tools` or `profiles.tui.tools` /
 `profiles.server.tools`: `list_entry_limit` defaults to 10,000 entries (range
 1–10,000), and `search_file_bytes` to 1,048,576 bytes per file (1–1,048,576).

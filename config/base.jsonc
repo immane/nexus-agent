@@ -21,6 +21,14 @@
       "max_sessions": 128,
       "session_idle_seconds": 1800,
       "session_cleanup_interval_seconds": 60
+    },
+    "launch": {
+      // CLI flags override these defaults. Container mode requires immutable
+      // image references, configured in provider/model config.json or CLI.
+      "execution": "local",
+      "strict_tools": false,
+      "server_port": 8471,
+      "server_tools": "fake"
     }
   },
   "tui": {

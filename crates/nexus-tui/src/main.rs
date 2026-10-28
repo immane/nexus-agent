@@ -213,7 +213,7 @@ fn user_config_snapshot(shared: &SharedUserConfig) -> UserConfig {
 /// would hide a broken document and then overwrite it on the first terminal
 /// outcome, destroying the user's actual settings.
 fn load_session_config() -> io::Result<SessionConfig> {
-    let args = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
+    let mut args = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
         StartupAction::Run(args) => args,
         StartupAction::Help => startup_usage(true),
         StartupAction::Usage => startup_usage(false),
@@ -234,12 +234,17 @@ fn load_session_config() -> io::Result<SessionConfig> {
         std::process::exit(0);
     }
     let config = user_config_snapshot(&session.user_config);
+    let launch = session.settings.launch();
+    apply_tui_launch_defaults(&mut args, launch);
     let (effective_gateway, effective_workload) = merge_startup_images(&args, &config);
     let mut effective_args = args.clone();
     effective_args.gateway_image = effective_gateway.clone();
     effective_args.workload_image = effective_workload.clone();
-    let root_resolved = resolve_tools_root(args.tools_root.clone()).is_some();
-    validate_execution_args(&effective_args, root_resolved, cfg!(feature = "container"))?;
+    validate_execution_args(
+        &effective_args,
+        resolve_tools_root(args.tools_root.clone()).is_some(),
+        cfg!(feature = "container"),
+    )?;
     session.tools_root = resolve_tools_root(args.tools_root);
     session.demo = args.demo;
     session.strict_tools = args.strict_tools;
@@ -247,6 +252,19 @@ fn load_session_config() -> io::Result<SessionConfig> {
     session.gateway_image = effective_gateway;
     session.workload_image = effective_workload;
     Ok(session)
+}
+
+fn apply_tui_launch_defaults(args: &mut StartupArgs, launch: &nexus_config::LaunchSettings) {
+    if !args.execution_set {
+        args.execution = match launch.execution {
+            Some(nexus_config::ExecutionMode::Container) => ExecutionMode::Container,
+            Some(nexus_config::ExecutionMode::Local) | None => ExecutionMode::Local,
+        };
+    }
+    args.strict_tools |= launch.strict_tools.unwrap_or(false);
+    if args.tools_root.is_none() {
+        args.tools_root = launch.tools_root.as_deref().map(std::path::PathBuf::from);
+    }
 }
 
 fn merge_startup_images(
@@ -403,6 +421,7 @@ struct StartupArgs {
     /// submission). The dev-version default is off.
     demo: bool,
     execution: ExecutionMode,
+    execution_set: bool,
     gateway_image: Option<String>,
     workload_image: Option<String>,
     base_config: Option<std::path::PathBuf>,
@@ -505,6 +524,7 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
         demo,
         strict_tools,
         execution,
+        execution_set,
         gateway_image,
         workload_image,
         base_config,
@@ -9291,6 +9311,45 @@ mod cov_live_wiring {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn launch_defaults_apply_but_explicit_cli_values_win() {
+        let launch = nexus_config::LaunchSettings {
+            execution: Some(nexus_config::ExecutionMode::Container),
+            strict_tools: Some(true),
+            tools_root: Some("configured-workspace".into()),
+            ..Default::default()
+        };
+        let mut configured = match parse_startup_args(&["nexus-tui".into()]) {
+            StartupAction::Run(args) => args,
+            _ => panic!("default arguments parse"),
+        };
+        apply_tui_launch_defaults(&mut configured, &launch);
+        assert_eq!(configured.execution, ExecutionMode::Container);
+        assert!(configured.strict_tools);
+        assert_eq!(
+            configured.tools_root.as_deref(),
+            Some(std::path::Path::new("configured-workspace"))
+        );
+
+        let mut explicit = match parse_startup_args(&[
+            "nexus-tui".into(),
+            "--execution".into(),
+            "local".into(),
+            "--tools-root".into(),
+            "cli-workspace".into(),
+        ]) {
+            StartupAction::Run(args) => args,
+            _ => panic!("explicit arguments parse"),
+        };
+        apply_tui_launch_defaults(&mut explicit, &launch);
+        assert_eq!(explicit.execution, ExecutionMode::Local);
+        assert_eq!(
+            explicit.tools_root.as_deref(),
+            Some(std::path::Path::new("cli-workspace"))
+        );
+        assert!(explicit.strict_tools, "configuration may tighten tool mode");
     }
 }
 
