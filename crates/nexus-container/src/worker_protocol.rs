@@ -334,6 +334,22 @@ mod tests {
     }
 
     #[test]
+    fn read_pages_accept_integral_numbers_and_reject_fractional_values() {
+        for (arguments, valid) in [
+            (r#"{"path":"a","offset":0.0,"limit":16384.0}"#, true),
+            (r#"{"path":"a","offset":8e0,"limit":4e0}"#, true),
+            (r#"{"path":"a","offset":1.5,"limit":4.0}"#, false),
+            (r#"{"path":"a","offset":0.0,"limit":4.5}"#, false),
+            (r#"{"path":"a","offset":9223372036854775808.0}"#, false),
+        ] {
+            let input = format!(
+                r#"{{"version":2,"operation":"host_read","arguments":{arguments},"output_limit":64,"tools":{{"list_entry_limit":10000,"search_file_bytes":1048576}}}}"#
+            );
+            assert_eq!(frame(&input).is_ok(), valid, "{arguments}");
+        }
+    }
+
+    #[test]
     fn rejects_unknown_version_operation_and_fields() {
         for input in [
             r#"{"version":1,"operation":"host_read","arguments":{"path":"a"},"output_limit":1,"tools":{"list_entry_limit":1,"search_file_bytes":1}}"#,

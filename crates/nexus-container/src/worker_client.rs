@@ -435,6 +435,10 @@ mod tests {
         for (op, args) in [
             ("host_read", json!({"path":"a"})),
             ("host_read", json!({"path":"a","offset":8192,"limit":16384})),
+            (
+                "host_read",
+                json!({"path":"a","offset":8192.0,"limit":16384.0}),
+            ),
             ("host_list", json!({"path":"a"})),
             ("host_search", json!({"path":"a","query":"q"})),
             ("host_write", json!({"path":"a","content":"x"})),

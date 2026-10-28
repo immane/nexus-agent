@@ -342,6 +342,14 @@ fn explicit_pages_eof_and_invalid_options_are_honest() {
     );
     assert_eq!(page.content(), "[more; next_offset=8]\n界e");
     assert!(page.is_truncated());
+    for arguments in [
+        r#"{"path":"page.txt","offset":4.0,"limit":4.0}"#,
+        r#"{"path":"page.txt","offset":4e0,"limit":4e0}"#,
+    ] {
+        let page = reader.execute(&call(arguments), &context(4096, false));
+        assert_eq!(page.status(), ExecutionStatus::Succeeded, "{arguments}");
+        assert_eq!(page.content(), "[more; next_offset=8]\n界e");
+    }
     for offset in [11, 100_000] {
         let page = reader.execute(
             &call(&format!(r#"{{"path":"page.txt","offset":{offset}}}"#)),
@@ -353,10 +361,14 @@ fn explicit_pages_eof_and_invalid_options_are_honest() {
     for extra in [
         r#""offset":-1"#,
         r#""offset":1.5"#,
+        r#""offset":9223372036854775808.0"#,
+        r#""offset":-0.5"#,
         r#""offset":null"#,
         r#""limit":0"#,
         r#""limit":3"#,
         r#""limit":16385"#,
+        r#""limit":4.5"#,
+        r#""limit":16384.1"#,
         r#""limit":"4""#,
         r#""other":1"#,
         r#""offset":5"#,

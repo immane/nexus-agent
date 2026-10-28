@@ -30,6 +30,17 @@ pub fn valid_read_arguments(value: &serde_json::Value) -> bool {
     read_page(value).is_some()
 }
 
+fn nonnegative_integer(value: &serde_json::Value) -> Option<u64> {
+    if let Some(integer) = value.as_u64() {
+        return Some(integer);
+    }
+    let number = value.as_f64()?;
+    // i64::MAX rounds up to 2^63 as f64; an exclusive bound avoids
+    // accepting an out-of-range float through a saturating cast.
+    ((0.0..9_223_372_036_854_775_808.0).contains(&number) && number.fract() == 0.0)
+        .then_some(number as u64)
+}
+
 fn read_page(value: &serde_json::Value) -> Option<(u64, usize)> {
     let object = value.as_object()?;
     if !object.get("path")?.is_string()
@@ -40,11 +51,11 @@ fn read_page(value: &serde_json::Value) -> Option<(u64, usize)> {
         return None;
     }
     let offset = match object.get("offset") {
-        Some(value) => value.as_u64()?,
+        Some(value) => nonnegative_integer(value)?,
         None => 0,
     };
     let limit = match object.get("limit") {
-        Some(value) => usize::try_from(value.as_u64()?).ok()?,
+        Some(value) => usize::try_from(nonnegative_integer(value)?).ok()?,
         None => 8192,
     };
     (offset <= i64::MAX as u64 && (4..=16384).contains(&limit)).then_some((offset, limit))
