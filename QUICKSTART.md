@@ -169,10 +169,25 @@ default features; experimental container support is not included.
 
 ```sh
 ./scripts/install.sh
+nexus-config
 nexus-config provider
 nexus-config model
 nexus-tui
 ```
+
+Run `nexus-config` for the interactive configuration menu. Provider presets
+include DeepSeek, OpenCode Go, local Ollama, OpenAI, Anthropic, OpenRouter,
+and custom endpoints.
+Review the selected endpoint before supplying credentials. Deleting a provider
+can also remove its associated models and their favourites/recent entries only
+after confirmation; deletion of a stored key is a separate choice.
+OpenCode Go requires an active subscription and an API key; Nexus identifies
+its requests and sends a session identifier to the official Go endpoint. Model
+availability and account privacy settings remain subject to the service.
+
+To remove the installed commands while retaining configuration and credentials,
+run `./scripts/uninstall.sh` and confirm. Pass the same install directory if you
+used a custom one: `./scripts/uninstall.sh /path/to/bin`.
 
 The helper uses the same `NEXUS_CONFIG`/XDG default path. It can save an API key
 in a separate `$XDG_CONFIG_HOME/nexus-agent/credentials.json` file (or

@@ -11,7 +11,7 @@ use crate::content::{
 };
 use crate::error::{AgentError, ErrorCategory, RetryGuidance};
 use crate::execution::CancellationToken;
-use crate::ids::{CallId, RunId, ToolId, TurnId};
+use crate::ids::{CallId, RunId, SessionId, ToolId, TurnId};
 use crate::limits::Limits;
 use crate::outcomes::{ToolOutcome, TurnFinished, Usage};
 use crate::tool::ToolSpec;
@@ -449,6 +449,7 @@ pub struct ModelRequest {
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     run: RunId,
+    session: Option<SessionId>,
     turn: TurnId,
     profile: String,
     enabled_tools: Vec<ToolId>,
@@ -485,6 +486,7 @@ impl ModelRequest {
             max_output_tokens: None,
             reasoning_effort: None,
             run,
+            session: None,
             turn,
             profile,
             enabled_tools,
@@ -545,6 +547,19 @@ impl ModelRequest {
     #[must_use]
     pub fn run(&self) -> &RunId {
         &self.run
+    }
+
+    /// Associates this request with its host-issued conversation identity.
+    #[must_use]
+    pub fn with_session(mut self, session: SessionId) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Returns the conversation identity when supplied by the host.
+    #[must_use]
+    pub fn session(&self) -> Option<&SessionId> {
+        self.session.as_ref()
     }
 
     /// Returns the turn identity.

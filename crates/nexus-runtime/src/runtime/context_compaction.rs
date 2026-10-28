@@ -254,6 +254,7 @@ fn request_for(
         shared.effective_output_budget,
     )
     .map_err(Terminal::failed)?
+    .with_session(active.session.clone())
     .with_context_management(active.context_management)
     // Summarization is a separate operation, not another coding-agent turn.
     // Inheriting task/environment directives can make it resume the task.
@@ -3480,6 +3481,10 @@ mod tests {
         submit_and_finish(&runtime, &mut streams, "session-b", "other-task").await;
         let requests = provider.requests.lock().expect("requests");
         assert_eq!(requests.len(), 5);
+        for request in &requests[..4] {
+            assert_eq!(request.session().unwrap().as_str(), "session-a");
+        }
+        assert_eq!(requests[4].session().unwrap().as_str(), "session-b");
         assert!(requests[1].tool_definitions().is_empty());
         for request in &requests[2..4] {
             assert!(request.conversation().iter().any(|item| matches!(item, ModelContextItem::AssistantText { text, .. } if text.as_str().contains("Derived memory: earlier work."))));

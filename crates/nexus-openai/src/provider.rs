@@ -489,6 +489,7 @@ impl OpenAiProvider {
     fn stream_with_sink_impl(
         &self,
         body: &[u8],
+        request: &ModelRequest,
         context: &ProviderContext,
         sink: &(dyn Fn(ProviderEvent) + Send + Sync),
     ) -> Vec<ProviderEvent> {
@@ -509,6 +510,10 @@ impl OpenAiProvider {
                 "provider deadline elapsed before send",
             )];
         }
+        let extra_headers = match self.opencode_go_headers(request) {
+            Ok(headers) => headers,
+            Err(failure) => return vec![failure],
+        };
         let token = match nexus_config::resolve_credential(&self.credential) {
             Ok(token) => token,
             Err(_) => {
@@ -539,7 +544,7 @@ impl OpenAiProvider {
             }
         };
         let head = format!(
-            "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\naccept: text/event-stream, application/json\r\ncontent-length: {}\r\n{auth}connection: close\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\naccept: text/event-stream, application/json\r\ncontent-length: {}\r\n{auth}{extra_headers}connection: close\r\n\r\n",
             address,
             body.len(),
         );
@@ -599,6 +604,28 @@ impl OpenAiProvider {
             },
             wait_before_retry,
         )
+    }
+
+    fn opencode_go_headers(&self, request: &ModelRequest) -> Result<String, ProviderEvent> {
+        if !self.use_tls
+            || self.port != 443
+            || !self.host.eq_ignore_ascii_case("opencode.ai")
+            || self.base_path != "/inference/go/openai/v1"
+            || self.protocol != ProtocolKind::ChatCompletions
+        {
+            return Ok(String::new());
+        }
+        let session = request.session().ok_or_else(|| {
+            provider_error(
+                ErrorCategory::InvalidInput,
+                "OpenCode Go requires a conversation session identity",
+            )
+        })?;
+        Ok(format!(
+            "user-agent: nexus-agent/{}\r\nx-opencode-session: {}\r\n",
+            env!("CARGO_PKG_VERSION"),
+            session.as_str()
+        ))
     }
 }
 
@@ -3270,7 +3297,96 @@ impl ProviderPort for OpenAiProvider {
                 "provider request could not be encoded",
             )];
         }
-        self.stream_with_sink_impl(&body, context, sink)
+        self.stream_with_sink_impl(&body, request, context, sink)
+    }
+}
+
+#[cfg(test)]
+mod opencode_go_tests {
+    use super::*;
+    use nexus_core::{RunId, SessionId, TurnId};
+
+    fn request(session: Option<&str>, run: &str) -> ModelRequest {
+        let request = ModelRequest::new(
+            RunId::new(run).unwrap(),
+            TurnId::new("turn").unwrap(),
+            "profile",
+            Vec::new(),
+            None,
+            1024,
+        )
+        .unwrap();
+        match session {
+            Some(id) => request.with_session(SessionId::new(id).unwrap()),
+            None => request,
+        }
+    }
+
+    fn provider(endpoint: &str, protocol: ProtocolKind) -> OpenAiProvider {
+        OpenAiProvider::new_for_protocol(
+            endpoint,
+            CredentialRef::env_var("TEST_OPENCODE_KEY").unwrap(),
+            "model",
+            protocol,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn headers_are_stable_per_session_and_require_identity() {
+        let provider = provider(
+            "https://opencode.ai/inference/go/openai/v1",
+            ProtocolKind::ChatCompletions,
+        );
+        let first = provider
+            .opencode_go_headers(&request(Some("session-a"), "run-a"))
+            .unwrap();
+        let next = provider
+            .opencode_go_headers(&request(Some("session-a"), "run-b"))
+            .unwrap();
+        let other = provider
+            .opencode_go_headers(&request(Some("session-b"), "run-c"))
+            .unwrap();
+        assert_eq!(first, next);
+        assert!(first.contains("x-opencode-session: session-a\r\n"));
+        assert!(first.contains(concat!(
+            "user-agent: nexus-agent/",
+            env!("CARGO_PKG_VERSION"),
+            "\r\n"
+        )));
+        assert_ne!(first, other);
+        assert!(
+            provider
+                .opencode_go_headers(&request(None, "run-d"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn headers_never_reach_other_endpoints_or_protocols() {
+        for endpoint in [
+            "http://opencode.ai/inference/go/openai/v1",
+            "https://opencode.ai:444/inference/go/openai/v1",
+            "https://opencode.ai.evil.test/inference/go/openai/v1",
+            "https://opencode.ai/inference/openai/v1",
+            "https://opencode.ai/inference/go/openai/v1/other",
+        ] {
+            assert_eq!(
+                provider(endpoint, ProtocolKind::ChatCompletions)
+                    .opencode_go_headers(&request(Some("session-a"), "run"))
+                    .unwrap(),
+                ""
+            );
+        }
+        assert_eq!(
+            provider(
+                "https://opencode.ai/inference/go/openai/v1",
+                ProtocolKind::OpenAiResponses
+            )
+            .opencode_go_headers(&request(Some("session-a"), "run"))
+            .unwrap(),
+            ""
+        );
     }
 }
 
