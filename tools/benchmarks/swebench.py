@@ -233,9 +233,10 @@ def verify_worker(record, row):
     """Exercise the versioned file-worker protocol before spending model tokens."""
     # Detached HEAD is launcher-controlled, read-only, and has a known prefix.
     # Non-default paging distinguishes old workers that only accept `path`.
-    frame = {"version": 1, "operation": "host_read",
+    frame = {"version": 2, "operation": "host_read",
              "arguments": {"path": "/workspace/.git/HEAD", "offset": 1, "limit": 4},
-             "output_limit": 4096}
+             "output_limit": 4096,
+             "tools": {"list_entry_limit": 10000, "search_file_bytes": 1048576}}
     message = "container file-worker preflight failed; rebuild the task adapter image with current sources; no inference started"
     try:
         result = subprocess.run(
@@ -245,14 +246,14 @@ def verify_worker(record, row):
         if result.returncode:
             raise RuntimeError(message)
         response = json.loads(result.stdout)
-        expected = {"version": 1, "result": {
+        expected = {"version": 2, "result": {
             "status": "Succeeded", "effect": "KnownNotApplied",
             "content": "[more; next_offset=5]\n" + row["base_commit"][1:5], "truncated": True}}
         if response != expected:
             raise RuntimeError(message)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(message) from error
-    return {"verified": True, "protocol_version": 1, "operation": "host_read", "paged_read": True}
+    return {"verified": True, "protocol_version": 2, "operation": "host_read", "paged_read": True}
 
 
 def verify_task_environment(record, row):

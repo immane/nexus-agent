@@ -9,6 +9,7 @@ use std::{
     time::Instant,
 };
 
+use nexus_config::ToolsSettings;
 use nexus_core::{EffectState, Evidence, ExecutionStatus, ToolOutcome};
 use serde_json::Value;
 
@@ -82,11 +83,26 @@ impl<E: Error + 'static> Error for ClientError<E> {}
 
 pub struct ContainerWorkerClient<T> {
     transport: T,
+    settings: ToolsSettings,
 }
 
 impl<T: WorkerTransport> ContainerWorkerClient<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            settings: ToolsSettings::default(),
+        }
+    }
+
+    pub fn with_settings(
+        mut self,
+        settings: &ToolsSettings,
+    ) -> Result<Self, ClientError<T::Error>> {
+        settings
+            .validate()
+            .map_err(|_| ClientError::InvalidRequest)?;
+        self.settings = settings.clone();
+        Ok(self)
     }
 
     pub fn execute(
@@ -98,6 +114,7 @@ impl<T: WorkerTransport> ContainerWorkerClient<T> {
     ) -> Result<ToolOutcome, ClientError<T::Error>> {
         Self::execute_using(
             &mut self.transport,
+            &self.settings,
             operation,
             arguments,
             output_limit,
@@ -105,12 +122,13 @@ impl<T: WorkerTransport> ContainerWorkerClient<T> {
         )
     }
 
-    pub(crate) fn into_transport(self) -> T {
-        self.transport
+    pub(crate) fn into_parts(self) -> (T, ToolsSettings) {
+        (self.transport, self.settings)
     }
 
     pub(crate) fn execute_using(
         transport: &mut T,
+        settings: &ToolsSettings,
         operation: &str,
         arguments: &Value,
         output_limit: usize,
@@ -118,6 +136,7 @@ impl<T: WorkerTransport> ContainerWorkerClient<T> {
     ) -> Result<ToolOutcome, ClientError<T::Error>> {
         Self::execute_using_controlled(
             transport,
+            settings,
             operation,
             arguments,
             output_limit,
@@ -128,13 +147,14 @@ impl<T: WorkerTransport> ContainerWorkerClient<T> {
 
     pub(crate) fn execute_using_controlled(
         transport: &mut T,
+        settings: &ToolsSettings,
         operation: &str,
         arguments: &Value,
         output_limit: usize,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ToolOutcome, ClientError<T::Error>> {
-        let request = encode_request(operation, arguments, output_limit)?;
+        let request = encode_request(operation, arguments, output_limit, settings)?;
         if Instant::now() >= deadline {
             return Err(ClientError::DeadlineExpired);
         }
@@ -153,7 +173,11 @@ fn encode_request<E>(
     operation: &str,
     arguments: &Value,
     output_limit: usize,
+    settings: &ToolsSettings,
 ) -> Result<Vec<u8>, ClientError<E>> {
+    settings
+        .validate()
+        .map_err(|_| ClientError::InvalidRequest)?;
     if output_limit == 0
         || output_limit > MAX_OUTPUT_BYTES
         || !valid_arguments(operation, arguments)
@@ -172,6 +196,7 @@ fn encode_request<E>(
         operation,
         arguments,
         output_limit,
+        tools: settings,
     };
     let mut bytes = Vec::with_capacity(MAX_REQUEST_BYTES.min(4096));
     let mut writer = BoundedWriter {
@@ -187,15 +212,17 @@ struct RequestEnvelope<'a> {
     operation: &'a str,
     arguments: &'a Value,
     output_limit: usize,
+    tools: &'a ToolsSettings,
 }
 impl serde::Serialize for RequestEnvelope<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("RequestEnvelope", 4)?;
+        let mut state = serializer.serialize_struct("RequestEnvelope", 5)?;
         state.serialize_field("version", &self.version)?;
         state.serialize_field("operation", self.operation)?;
         state.serialize_field("arguments", self.arguments)?;
         state.serialize_field("output_limit", &self.output_limit)?;
+        state.serialize_field("tools", self.tools)?;
         state.end()
     }
 }
@@ -298,10 +325,88 @@ mod tests {
         }
     }
     fn frame(result: &str) -> Vec<u8> {
-        format!(r#"{{"version":1,"result":{result}}}"#).into_bytes()
+        format!(r#"{{"version":2,"result":{result}}}"#).into_bytes()
     }
     const GOOD: &str =
         r#"{"status":"Succeeded","effect":"KnownApplied","content":"ok","truncated":false}"#;
+
+    #[test]
+    fn reduced_settings_are_retained_and_sent_for_every_operation() {
+        let mut settings = ToolsSettings {
+            list_entry_limit: 2,
+            search_file_bytes: 7,
+        };
+        let mut client = ContainerWorkerClient::new(Fake {
+            response: frame(GOOD),
+            ..Fake::default()
+        })
+        .with_settings(&settings)
+        .unwrap();
+        settings.list_entry_limit = 9;
+        assert_eq!(settings.list_entry_limit, 9);
+        for (operation, arguments) in [
+            ("host_read", json!({"path":"a"})),
+            ("host_list", json!({"path":"a"})),
+            ("host_search", json!({"path":"a","query":"q"})),
+            ("host_write", json!({"path":"a","content":"x"})),
+            (
+                "host_patch",
+                json!({"path":"a","old_text":"x","new_text":"y"}),
+            ),
+        ] {
+            client
+                .execute(
+                    operation,
+                    &arguments,
+                    64,
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .unwrap();
+            let request =
+                crate::worker_protocol::read_request(&mut client.transport.request.as_slice())
+                    .unwrap();
+            assert_eq!(request.version, 2);
+            assert_eq!(
+                request.tools,
+                ToolsSettings {
+                    list_entry_limit: 2,
+                    search_file_bytes: 7
+                }
+            );
+        }
+        assert_eq!(client.transport.calls, 5);
+    }
+
+    #[test]
+    fn invalid_settings_are_rejected_before_dispatch() {
+        for settings in [
+            ToolsSettings {
+                list_entry_limit: 0,
+                search_file_bytes: 1,
+            },
+            ToolsSettings {
+                list_entry_limit: 10001,
+                search_file_bytes: 1,
+            },
+            ToolsSettings {
+                list_entry_limit: 1,
+                search_file_bytes: 0,
+            },
+            ToolsSettings {
+                list_entry_limit: 1,
+                search_file_bytes: 1048577,
+            },
+        ] {
+            assert!(matches!(
+                ContainerWorkerClient::new(Fake::default()).with_settings(&settings),
+                Err(ClientError::InvalidRequest)
+            ));
+            assert!(
+                encode_request::<io::Error>("host_read", &json!({"path":"a"}), 64, &settings)
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn good_round_trip_and_file_schemas() {
@@ -325,7 +430,7 @@ mod tests {
         let decoded: Value = serde_json::from_slice(&client.transport.request).unwrap();
         assert_eq!(
             decoded,
-            json!({"version":PROTOCOL_VERSION,"operation":"host_write","arguments":{"path":"a","content":"x"},"output_limit":12})
+            json!({"version":PROTOCOL_VERSION,"operation":"host_write","arguments":{"path":"a","content":"x"},"output_limit":12,"tools":ToolsSettings::default()})
         );
         for (op, args) in [
             ("host_read", json!({"path":"a"})),
@@ -338,7 +443,10 @@ mod tests {
                 json!({"path":"a","old_text":"x","new_text":"y"}),
             ),
         ] {
-            assert!(encode_request::<io::Error>(op, &args, 10).is_ok(), "{op}");
+            assert!(
+                encode_request::<io::Error>(op, &args, 10, &ToolsSettings::default()).is_ok(),
+                "{op}"
+            );
         }
     }
 
@@ -369,9 +477,9 @@ mod tests {
     fn malformed_response_matrix_is_rejected() {
         for bytes in [
             frame(r#"{"status":"Succeeded","effect":"Unknown","content":"","truncated":false,"extra":1}"#),
-            br#"{"version":1,"result":{"status":"Succeeded","status":"Failed","effect":"Unknown","content":"","truncated":false}}"#.to_vec(),
+            br#"{"version":2,"result":{"status":"Succeeded","status":"Failed","effect":"Unknown","content":"","truncated":false}}"#.to_vec(),
             [frame(GOOD), b" {}".to_vec()].concat(), frame(r#"{"status":"Succeeded","effect":"Unknown","content":"","truncated":false}garbage"#),
-            format!(r#"{{"version":2,"result":{GOOD}}}"#).into_bytes(),
+            format!(r#"{{"version":1,"result":{GOOD}}}"#).into_bytes(),
             frame(r#"{"status":"Bogus","effect":"Unknown","content":"","truncated":false}"#),
             frame(r#"{"status":"Succeeded","effect":"Bogus","content":"","truncated":false}"#),
             frame(r#"{"status":"Denied","effect":"Unknown","content":"","truncated":false}"#),
@@ -413,15 +521,23 @@ mod tests {
             Err(ClientError::InvalidResponse)
         ));
         assert!(
-            encode_request::<io::Error>("host_write", &json!({"path":"../x","content":"y"}), 1)
-                .is_err()
+            encode_request::<io::Error>(
+                "host_write",
+                &json!({"path":"../x","content":"y"}),
+                1,
+                &ToolsSettings::default()
+            )
+            .is_err()
         );
         for (operation, args, limit) in [
             ("unknown", json!({"path":"a"}), 1),
             ("host_read", json!({"path":1}), 1),
             ("host_read", json!({"path":"a"}), MAX_OUTPUT_BYTES + 1),
         ] {
-            assert!(encode_request::<io::Error>(operation, &args, limit).is_err());
+            assert!(
+                encode_request::<io::Error>(operation, &args, limit, &ToolsSettings::default())
+                    .is_err()
+            );
         }
     }
 
@@ -438,9 +554,17 @@ mod tests {
             serde_json::to_vec(&exact).unwrap().len(),
             MAX_ARGUMENT_BYTES
         );
-        assert!(encode_request::<io::Error>("host_write", &exact, 1).is_ok());
-        assert!(encode_request::<io::Error>("host_write", &unicode_fit, 1).is_ok());
-        assert!(encode_request::<io::Error>("host_write", &unicode_over, 1).is_err());
+        assert!(
+            encode_request::<io::Error>("host_write", &exact, 1, &ToolsSettings::default()).is_ok()
+        );
+        assert!(
+            encode_request::<io::Error>("host_write", &unicode_fit, 1, &ToolsSettings::default())
+                .is_ok()
+        );
+        assert!(
+            encode_request::<io::Error>("host_write", &unicode_over, 1, &ToolsSettings::default())
+                .is_err()
+        );
     }
 
     #[test]

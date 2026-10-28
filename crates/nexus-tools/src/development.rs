@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::{
     SandboxedExecutor, ScopedLister, ScopedPatcher, ScopedReader, ScopedSearcher, ScopedWriter,
 };
+use nexus_config::ToolsSettings;
 use nexus_core::{
     AgentError, EffectState, Evidence, ExecutionStatus, ToolAccess, ToolCall, ToolContext,
     ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
@@ -17,10 +18,22 @@ use nexus_permissions::DirectoryPolicy;
 /// Constructs the real-file strict tool set shared by the TUI and server.
 /// Runtime policy and provider composition remain owned by each entrypoint.
 pub fn strict_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
+    strict_tools_with_settings(root, &ToolsSettings::default())
+}
+
+/// Constructs strict tools with validated filesystem operational ceilings.
+pub fn strict_tools_with_settings(
+    root: &Path,
+    settings: &ToolsSettings,
+) -> Result<Vec<ToolRegistration>, AgentError> {
     Ok(vec![
         ToolRegistration::read(Arc::new(ScopedReader::with_root(root)?)),
-        ToolRegistration::read(Arc::new(ScopedLister::with_root(root)?)),
-        ToolRegistration::read(Arc::new(ScopedSearcher::with_root(root)?)),
+        ToolRegistration::read(Arc::new(
+            ScopedLister::with_root(root)?.with_settings(settings)?,
+        )),
+        ToolRegistration::read(Arc::new(
+            ScopedSearcher::with_root(root)?.with_settings(settings)?,
+        )),
         ToolRegistration::mutation(Arc::new(ScopedWriter::with_root(root)?)),
         ToolRegistration::mutation(Arc::new(ScopedPatcher::with_root(root)?)),
         ToolRegistration::process(Arc::new(SandboxedExecutor::with_root(root)?)),
@@ -30,7 +43,15 @@ pub fn strict_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
 /// Constructs development file and exec tools shared by the TUI and server.
 /// Runtime permission policy is still configured by the caller.
 pub fn development_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
-    let mut tools = development_file_tools(root)?;
+    development_tools_with_settings(root, &ToolsSettings::default())
+}
+
+/// Constructs development tools with validated filesystem operational ceilings.
+pub fn development_tools_with_settings(
+    root: &Path,
+    settings: &ToolsSettings,
+) -> Result<Vec<ToolRegistration>, AgentError> {
+    let mut tools = development_file_tools_with_settings(root, settings)?;
     tools.push(ToolRegistration::process(Arc::new(
         SandboxedExecutor::development(root)?,
     )));
@@ -38,6 +59,14 @@ pub fn development_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentErro
 }
 
 pub fn development_file_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
+    development_file_tools_with_settings(root, &ToolsSettings::default())
+}
+
+/// Constructs development file tools with validated operational ceilings.
+pub fn development_file_tools_with_settings(
+    root: &Path,
+    settings: &ToolsSettings,
+) -> Result<Vec<ToolRegistration>, AgentError> {
     let policy = DirectoryPolicy::new(root).map_err(|_| {
         AgentError::new(
             nexus_core::ErrorCategory::InvalidInput,
@@ -58,13 +87,17 @@ pub fn development_file_tools(root: &Path) -> Result<Vec<ToolRegistration>, Agen
         (
             ToolAccess::Read,
             DevelopmentOperation::List(
-                ScopedLister::with_root(Path::new("/"))?.with_protected_paths(policy.clone()),
+                ScopedLister::with_root(Path::new("/"))?
+                    .with_settings(settings)?
+                    .with_protected_paths(policy.clone()),
             ),
         ),
         (
             ToolAccess::Read,
             DevelopmentOperation::Search(
-                ScopedSearcher::with_root(Path::new("/"))?.with_protected_paths(policy.clone()),
+                ScopedSearcher::with_root(Path::new("/"))?
+                    .with_settings(settings)?
+                    .with_protected_paths(policy.clone()),
             ),
         ),
         (

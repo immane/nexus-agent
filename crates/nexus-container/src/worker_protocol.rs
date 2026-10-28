@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_REQUEST_BYTES: usize = 1_048_576;
 pub const MAX_OUTPUT_BYTES: usize = 262_144;
 // A JSON string can expand each input byte to six ASCII bytes (`\\u00XX`).
@@ -27,6 +27,7 @@ pub struct Request {
     pub operation: String,
     pub arguments: Value,
     pub output_limit: usize,
+    pub tools: nexus_config::ToolsSettings,
 }
 
 #[derive(Debug)]
@@ -78,10 +79,34 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<Request, ProtocolError> {
         .end()
         .map_err(|_| ProtocolError::InvalidRequest)?;
     let object = value.as_object().ok_or(ProtocolError::InvalidRequest)?;
-    if object.len() != 4 {
+    if object.len() != 5 {
         return Err(ProtocolError::InvalidRequest);
     }
+    // Configuration deserialization may provide defaults; the wire protocol
+    // deliberately requires both budgets, including for read/write requests.
+    let tools = object
+        .get("tools")
+        .and_then(Value::as_object)
+        .ok_or(ProtocolError::InvalidRequest)?;
+    if tools.len() != 2 {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let tools = nexus_config::ToolsSettings {
+        list_entry_limit: tools
+            .get("list_entry_limit")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or(ProtocolError::InvalidRequest)?,
+        search_file_bytes: tools
+            .get("search_file_bytes")
+            .and_then(Value::as_u64)
+            .ok_or(ProtocolError::InvalidRequest)?,
+    };
+    tools
+        .validate()
+        .map_err(|_| ProtocolError::InvalidRequest)?;
     let request = Request {
+        tools,
         version: object
             .get("version")
             .and_then(Value::as_u64)
@@ -302,7 +327,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let input = format!(
-                r#"{{"version":1,"operation":"{operation}","arguments":{arguments},"output_limit":64}}"#
+                r#"{{"version":2,"operation":"{operation}","arguments":{arguments},"output_limit":64,"tools":{{"list_entry_limit":10000,"search_file_bytes":1048576}}}}"#
             );
             assert_eq!(frame(&input).unwrap().operation, operation);
         }
@@ -311,10 +336,10 @@ mod tests {
     #[test]
     fn rejects_unknown_version_operation_and_fields() {
         for input in [
-            r#"{"version":2,"operation":"host_read","arguments":{},"output_limit":1}"#,
-            r#"{"version":1,"operation":"exec","arguments":{},"output_limit":1}"#,
-            r#"{"version":1,"operation":"host_read","arguments":{},"output_limit":1,"extra":true}"#,
-            r#"{"version":1,"operation":"host_read","arguments":{},"output_limit":1} {}"#,
+            r#"{"version":1,"operation":"host_read","arguments":{"path":"a"},"output_limit":1,"tools":{"list_entry_limit":1,"search_file_bytes":1}}"#,
+            r#"{"version":2,"operation":"exec","arguments":{"path":"a"},"output_limit":1,"tools":{"list_entry_limit":1,"search_file_bytes":1}}"#,
+            r#"{"version":2,"operation":"host_read","arguments":{"path":"a"},"output_limit":1,"tools":{"list_entry_limit":1,"search_file_bytes":1},"extra":true}"#,
+            r#"{"version":2,"operation":"host_read","arguments":{"path":"a"},"output_limit":1,"tools":{"list_entry_limit":1,"search_file_bytes":1}} {}"#,
         ] {
             assert!(matches!(frame(input), Err(ProtocolError::InvalidRequest)));
         }
@@ -329,11 +354,70 @@ mod tests {
         ));
         assert!(matches!(
             frame(&format!(
-                r#"{{"version":1,"operation":"host_read","arguments":{{}},"output_limit":{}}}"#,
+                r#"{{"version":2,"operation":"host_read","arguments":{{"path":"a"}},"tools":{{"list_entry_limit":1,"search_file_bytes":1}},"output_limit":{}}}"#,
                 MAX_OUTPUT_BYTES + 1
             )),
             Err(ProtocolError::InvalidRequest)
         ));
+    }
+
+    #[test]
+    fn tools_are_mandatory_closed_unique_and_bounded() {
+        assert!(frame(r#"{"version":1,"operation":"host_read","arguments":{"path":"a"},"output_limit":10}"#).is_err());
+        assert!(frame(r#"{"version":2,"operation":"host_read","arguments":{"path":"a"},"output_limit":10}"#).is_err());
+        assert!(frame(r#"{"version":2,"operation":"host_read","arguments":{"path":"a"},"output_limit":10,"tools":{"list_entry_limit":1,"search_file_bytes":1},"tools":{"list_entry_limit":2,"search_file_bytes":2}}"#).is_err());
+        for tools in [
+            "null",
+            "[]",
+            "1",
+            "{}",
+            r#"{"list_entry_limit":1}"#,
+            r#"{"search_file_bytes":1}"#,
+            r#"{"list_entry_limit":1,"search_file_bytes":1,"extra":1}"#,
+            r#"{"list_entry_limit":1,"list_entry_limit":2,"search_file_bytes":1}"#,
+            r#"{"list_entry_limit":1,"search_file_bytes":1,"search_file_bytes":2}"#,
+        ] {
+            let wire = format!(
+                r#"{{"version":2,"operation":"host_read","arguments":{{"path":"a"}},"output_limit":10,"tools":{tools}}}"#
+            );
+            assert!(frame(&wire).is_err(), "{wire}");
+        }
+        for (field, invalid) in [
+            ("list_entry_limit", "10001"),
+            ("search_file_bytes", "1048577"),
+        ] {
+            for invalid in [
+                invalid,
+                "0",
+                "-1",
+                "1.5",
+                "1.0",
+                "null",
+                "true",
+                r#""1""#,
+                "18446744073709551616",
+            ] {
+                // Keep the original JSON numeric representation for type checks.
+                let other = if field == "list_entry_limit" {
+                    "search_file_bytes"
+                } else {
+                    "list_entry_limit"
+                };
+                let wire = format!(
+                    r#"{{"version":2,"operation":"host_read","arguments":{{"path":"a"}},"output_limit":10,"tools":{{"{field}":{invalid},"{other}":1}}}}"#
+                );
+                assert!(frame(&wire).is_err(), "{wire}");
+            }
+        }
+        for tools in [
+            r#"{"list_entry_limit":1,"search_file_bytes":1}"#,
+            r#"{"list_entry_limit":10000,"search_file_bytes":1048576}"#,
+        ] {
+            let wire = format!(
+                r#"{{"version":2,"operation":"host_read","arguments":{{"path":"a"}},"output_limit":10,"tools":{tools}}}"#
+            );
+            assert!(frame(&wire).is_ok(), "{wire}");
+        }
     }
 
     #[test]

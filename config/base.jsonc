@@ -9,6 +9,11 @@
       "fallback_call_timeout_seconds": 600,
       "retry_backoff_seconds": [1, 2, 5, 10, 30, 60]
     },
+    // Tool budgets are downward-only caps, applied to host and container tools.
+    "tools": {
+      "list_entry_limit": 10000,
+      "search_file_bytes": 1048576
+    },
     // Server admission caps: 1..64 connections, 1..128 sessions.
     // Idle expiry and cleanup intervals are seconds (1..86400).
     "server": {

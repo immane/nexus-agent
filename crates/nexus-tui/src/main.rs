@@ -1153,8 +1153,13 @@ fn build_live_runtime_with_store(
                 let workload_image = session_config.workload_image.as_deref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "workload image is missing")
                 })?;
-                nexus_container::tool_registrations(root, gateway_image, workload_image)
-                    .map_err(io::Error::other)?
+                nexus_container::tool_registrations_with_settings(
+                    root,
+                    gateway_image,
+                    workload_image,
+                    session_config.settings.tools(),
+                )
+                .map_err(io::Error::other)?
             }
             #[cfg(not(feature = "container"))]
             {
@@ -1180,11 +1185,15 @@ fn build_live_runtime_with_store(
                     ));
                 }
                 if !session_config.strict_tools {
-                    let tools =
-                        nexus_tools::development_tools(&canonical).map_err(io::Error::other)?;
+                    let tools = nexus_tools::development_tools_with_settings(
+                        &canonical,
+                        session_config.settings.tools(),
+                    )
+                    .map_err(io::Error::other)?;
                     return runtime_with_tools(session_config, config, tools, session_store);
                 }
-                nexus_tools::strict_tools(&canonical).map_err(io::Error::other)?
+                nexus_tools::strict_tools_with_settings(&canonical, session_config.settings.tools())
+                    .map_err(io::Error::other)?
             }
         },
     };
@@ -9089,6 +9098,155 @@ mod cov_live_wiring {
             build_live_runtime(&session).is_err(),
             "a non-directory jail is a startup error"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_tool_bounds_execute_in_strict_and_development_runtimes() {
+        use std::io::{Read, Write};
+
+        for strict_tools in [true, false] {
+            let root = std::env::temp_dir().join(format!(
+                "nexus-tui-tool-settings-{}-{strict_tools}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("a"), "prefix needle\n").unwrap();
+            std::fs::write(root.join("b"), "prefix needle\n").unwrap();
+            let settings_path = root.join("settings.json");
+            std::fs::write(&settings_path, r#"{"revision":1,"defaults":{"runtime":{"run_timeout_seconds":5,"tool_timeout_seconds":3},"provider":{"connect_timeout_seconds":1,"fallback_call_timeout_seconds":5,"retry_backoff_seconds":[1]},"tools":{"list_entry_limit":1,"search_file_bytes":4}}}"#).unwrap();
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let mock = std::thread::spawn(move || {
+                for turn in 0..2 {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::WouldBlock
+                                    && Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("mock accept failed: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut head = Vec::new();
+                    let mut byte = [0];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).unwrap();
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8(head).unwrap();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    stream.read_exact(&mut vec![0; length]).unwrap();
+                    let body = if turn == 0 {
+                        r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"list","type":"function","function":{"name":"host_list","arguments":"{\"path\":\".\"}"}},{"id":"search","type":"function","function":{"name":"host_search","arguments":"{\"path\":\".\",\"query\":\"needle\"}"}}]},"finish_reason":"tool_calls"}]}"#
+                    } else {
+                        r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let mut user_config = UserConfig::default_config();
+            user_config
+                .add_provider(
+                    nexus_config::ProviderProfile::new_with_protocol(
+                        "mock",
+                        "Mock",
+                        nexus_config::AdapterKind::Direct,
+                        nexus_config::ProtocolKind::ChatCompletions,
+                        Some(endpoint),
+                        nexus_config::CredentialRef::env_var("PATH").unwrap(),
+                        "mock-model",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            user_config
+                .add_model(nexus_config::ModelEntry::new("mock", "mock", "mock-model").unwrap())
+                .unwrap();
+            let config = SessionConfig {
+                diagnostics: None,
+                user_config: shared_user_config(user_config, None),
+                settings: nexus_config::load_settings(
+                    nexus_config::SettingsProfile::Tui,
+                    Some(&settings_path),
+                    &[],
+                )
+                .unwrap(),
+                active_model: Some("mock".to_owned()),
+                tools_root: Some(root.clone()),
+                demo: false,
+                strict_tools,
+                execution: ExecutionMode::Local,
+                gateway_image: None,
+                workload_image: None,
+            };
+            let (runtime, mut streams, _live) = build_live_runtime(&config).unwrap();
+            let reply = runtime
+                .handle(
+                    submit_command(
+                        RequestId::new("req-tool-settings").unwrap(),
+                        SessionId::new("sess-tool-settings").unwrap(),
+                        "inspect files",
+                        DEMO_PROFILE,
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .0;
+            assert_eq!(reply.reply(), CommandReply::Accepted);
+            let mut outcomes = Vec::new();
+            let mut finished = false;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let event = tokio::select! {
+                        Some(event) = streams.data.recv() => event,
+                        Some(event) = streams.control.recv() => event,
+                    };
+                    match event.payload() {
+                        EventPayload::ToolFinished(info) => outcomes.push(info.outcome.clone()),
+                        EventPayload::RunFinished(_) => finished = true,
+                        _ => {}
+                    }
+                    if finished && outcomes.len() == 2 {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            mock.join().unwrap();
+            assert_eq!(outcomes.len(), 2);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| { outcome.status() == nexus_core::ExecutionStatus::Succeeded })
+            );
+            assert!(outcomes.iter().all(|outcome| outcome.is_truncated()));
+            assert!(outcomes.iter().any(|outcome| outcome.content().is_empty()));
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| outcome.content().lines().count() == 1)
+            );
+            drop(runtime);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

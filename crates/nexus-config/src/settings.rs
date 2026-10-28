@@ -58,6 +58,7 @@ impl SettingsProfile {
             limits,
             provider: ProviderSettings::default(),
             server: ServerSettings::default(),
+            tools: ToolsSettings::default(),
             tui: TuiSettings::default(),
         }
     }
@@ -75,6 +76,7 @@ fn benchmark_defaults() -> EffectiveSettings {
         limits,
         provider: ProviderSettings::default(),
         server: ServerSettings::default(),
+        tools: ToolsSettings::default(),
         tui: TuiSettings::default(),
     }
 }
@@ -156,12 +158,42 @@ impl ServerSettings {
     }
 }
 
+/// Filesystem tool ceilings. Settings may reduce, but never raise, hard caps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolsSettings {
+    pub list_entry_limit: usize,
+    pub search_file_bytes: u64,
+}
+
+impl Default for ToolsSettings {
+    fn default() -> Self {
+        Self {
+            list_entry_limit: 10_000,
+            search_file_bytes: 1_048_576,
+        }
+    }
+}
+
+impl ToolsSettings {
+    /// Validates reductions of the hard listing and per-file search caps.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=10_000).contains(&self.list_entry_limit)
+            || !(1..=1_048_576).contains(&self.search_file_bytes)
+        {
+            return Err(invalid("tools settings are invalid"));
+        }
+        Ok(())
+    }
+}
+
 /// Validated settings after built-in defaults, system base, and overlays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveSettings {
     limits: Limits,
     provider: ProviderSettings,
     server: ServerSettings,
+    tools: ToolsSettings,
     tui: TuiSettings,
 }
 
@@ -189,6 +221,12 @@ impl EffectiveSettings {
     #[must_use]
     pub fn server(&self) -> &ServerSettings {
         &self.server
+    }
+
+    /// Returns filesystem tool operational ceilings.
+    #[must_use]
+    pub fn tools(&self) -> &ToolsSettings {
+        &self.tools
     }
 
     /// Returns frontend presentation settings.
@@ -274,6 +312,7 @@ pub fn settings_json(settings: &EffectiveSettings) -> String {
         },
         "provider": settings.provider,
         "server": settings.server,
+        "tools": settings.tools,
         "tui": settings.tui,
     }))
     .expect("validated operational settings are JSON serializable")
@@ -385,7 +424,7 @@ fn apply_profile(
     settings: &mut EffectiveSettings,
     object: &Map<String, Value>,
 ) -> Result<(), ConfigError> {
-    reject_unknown(object, &["runtime", "provider", "server", "tui"])?;
+    reject_unknown(object, &["runtime", "provider", "server", "tools", "tui"])?;
     if let Some(runtime) = object.get("runtime") {
         let runtime = section(runtime)?;
         reject_unknown(
@@ -515,6 +554,15 @@ fn apply_profile(
             serde_json::from_value(merged).map_err(|_| invalid("server settings are invalid"))?;
         server.validate()?;
         settings.server = server;
+    }
+    if let Some(tools) = object.get("tools") {
+        let mut merged = serde_json::to_value(&settings.tools)
+            .map_err(|_| invalid("tools settings are invalid"))?;
+        merge_partial(&mut merged, tools)?;
+        let tools: ToolsSettings =
+            serde_json::from_value(merged).map_err(|_| invalid("tools settings are invalid"))?;
+        tools.validate()?;
+        settings.tools = tools;
     }
     if let Some(tui) = object.get("tui") {
         apply_tui(settings, tui)?;
@@ -720,6 +768,7 @@ mod tests {
         for settings in [tui, server, benchmark] {
             assert_eq!(settings.provider(), &ProviderSettings::default());
             assert_eq!(settings.server(), &ServerSettings::default());
+            assert_eq!(settings.tools(), &ToolsSettings::default());
             assert_eq!(settings.tui(), &TuiSettings::default());
             assert_eq!(settings.provider_retry_backoff(), &[1, 2, 5, 10, 30, 60]);
         }
@@ -801,6 +850,7 @@ mod tests {
             );
             assert_eq!(layer["defaults"]["provider"], printed["provider"]);
             assert_eq!(layer["defaults"]["server"], printed["server"]);
+            assert_eq!(layer["defaults"]["tools"], printed["tools"]);
             assert_eq!(layer["tui"], printed["tui"]);
         }
     }
@@ -875,6 +925,121 @@ mod tests {
             serde_json::to_value(settings.server()).unwrap()
         );
         assert_eq!(output["runtime"].as_object().unwrap().len(), 12);
+        assert_eq!(
+            output["tools"],
+            serde_json::to_value(settings.tools()).unwrap()
+        );
+    }
+
+    #[test]
+    fn tools_layers_merge_defaults_profiles_and_overlays_in_order() {
+        for profile in [
+            SettingsProfile::Tui,
+            SettingsProfile::Server,
+            SettingsProfile::Benchmark,
+        ] {
+            let mut settings = profile.defaults();
+            apply_layer(&mut settings, r#"{"revision":1,"defaults":{"tools":{"list_entry_limit":100,"search_file_bytes":1000}},"profiles":{"tui":{"tools":{"list_entry_limit":50}},"server":{"tools":{"list_entry_limit":25}}}}"#, profile).unwrap();
+            assert_eq!(
+                settings.tools().list_entry_limit,
+                if profile == SettingsProfile::Tui {
+                    50
+                } else {
+                    25
+                }
+            );
+            assert_eq!(settings.tools().search_file_bytes, 1000);
+            apply_layer(
+                &mut settings,
+                r#"{"revision":1,"defaults":{"tools":{"search_file_bytes":500}}}"#,
+                profile,
+            )
+            .unwrap();
+            assert_eq!(settings.tools().search_file_bytes, 500);
+            assert_eq!(
+                settings.tools().list_entry_limit,
+                if profile == SettingsProfile::Tui {
+                    50
+                } else {
+                    25
+                }
+            );
+            let output: Value = serde_json::from_str(&settings_json(&settings)).unwrap();
+            assert_eq!(
+                output["tools"],
+                serde_json::to_value(settings.tools()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn tools_bounds_types_and_unknown_fields_fail_closed_in_all_profiles() {
+        assert_eq!(ToolsSettings::default().list_entry_limit, 10_000);
+        assert_eq!(ToolsSettings::default().search_file_bytes, 1_048_576);
+        ToolsSettings::default().validate().unwrap();
+        for (key, upper) in [
+            ("list_entry_limit", 10_000),
+            ("search_file_bytes", 1_048_576),
+        ] {
+            for value in [serde_json::json!(1), serde_json::json!(upper)] {
+                let mut settings = SettingsProfile::Tui.defaults();
+                let document = serde_json::json!({"revision":1,"defaults":{"tools":{key:value}}});
+                apply_layer(&mut settings, &document.to_string(), SettingsProfile::Tui).unwrap();
+                settings.tools().validate().unwrap();
+            }
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!(upper + 1),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!(true),
+                serde_json::json!(null),
+                serde_json::json!("1"),
+            ] {
+                for location in ["defaults", "active", "inactive"] {
+                    let tools = serde_json::json!({key:value});
+                    let document = match location {
+                        "defaults" => serde_json::json!({"revision":1,"defaults":{"tools":tools}}),
+                        "active" => {
+                            serde_json::json!({"revision":1,"profiles":{"tui":{"tools":tools}}})
+                        }
+                        _ => {
+                            serde_json::json!({"revision":1,"profiles":{"server":{"tools":tools}}})
+                        }
+                    };
+                    assert!(
+                        apply_layer(
+                            &mut SettingsProfile::Tui.defaults(),
+                            &document.to_string(),
+                            SettingsProfile::Tui
+                        )
+                        .is_err(),
+                        "accepted {document}"
+                    );
+                }
+            }
+        }
+        for tools in [
+            serde_json::json!({"unknown":1}),
+            serde_json::json!(null),
+            serde_json::json!(1),
+        ] {
+            let document = serde_json::json!({"revision":1,"profiles":{"server":{"tools":tools}}});
+            assert!(
+                apply_layer(
+                    &mut SettingsProfile::Tui.defaults(),
+                    &document.to_string(),
+                    SettingsProfile::Tui
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<ToolsSettings>(
+                serde_json::json!({"list_entry_limit":1,"search_file_bytes":1,"unknown":1})
+            )
+            .is_err()
+        );
     }
 
     #[test]

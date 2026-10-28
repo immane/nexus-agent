@@ -210,6 +210,7 @@ dependencies = [
 name = "nexus-container"
 version = "0.2.3-alpha"
 dependencies = [
+ "nexus-config",
  "nexus-core",
  "nexus-tools",
  "nexus-validation",
@@ -320,6 +321,7 @@ dependencies = [
 name = "nexus-tools"
 version = "0.2.3-alpha"
 dependencies = [
+ "nexus-config",
  "nexus-core",
  "nexus-permissions",
  "rustix",

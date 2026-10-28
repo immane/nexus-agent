@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use nexus_config::ToolsSettings;
 use nexus_config::settings::{ProviderSettings, ServerSettings};
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
@@ -399,6 +400,7 @@ pub struct Server {
     limits: Limits,
     provider_settings: ProviderSettings,
     server_settings: ServerSettings,
+    tools_settings: ToolsSettings,
     session_store: Option<SessionStoreHandle>,
     /// Accepted run id to the model id it was submitted with. Entries are
     /// consumed by the completion watcher, a terminal SSE event, a subsequent
@@ -474,6 +476,7 @@ impl Server {
             limits: Limits::m0_test(),
             provider_settings: ProviderSettings::default(),
             server_settings: ServerSettings::default(),
+            tools_settings: ToolsSettings::default(),
             session_store: None,
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
@@ -547,6 +550,30 @@ impl Server {
             return Err(invalid());
         }
         self.server_settings = settings.clone();
+        Ok(())
+    }
+
+    /// Installs tool bounds before any sessions are admitted.
+    /// Invalid values or existing/pending sessions leave settings unchanged.
+    pub fn set_tools_settings(
+        &mut self,
+        settings: &ToolsSettings,
+    ) -> Result<(), nexus_core::AgentError> {
+        let invalid = || {
+            nexus_core::AgentError::new(
+                nexus_core::ErrorCategory::InvalidInput,
+                "tool settings are invalid or sessions already exist",
+                nexus_core::RetryGuidance::DoNotRetry,
+            )
+            .expect("static safe settings message builds")
+        };
+        settings.validate().map_err(|_| invalid())?;
+        if !self.sessions.lock().expect("sessions lockable").is_empty()
+            || self.pending_sessions.load(Ordering::Acquire) != 0
+        {
+            return Err(invalid());
+        }
+        self.tools_settings = settings.clone();
         Ok(())
     }
 
@@ -632,23 +659,31 @@ impl Server {
                 ToolRegistration::read(Arc::new(FakeTool::read_only())),
                 ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
             ],
-            ToolsMode::Development { root } => nexus_tools::development_tools(root)
-                .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?,
-            ToolsMode::RealFiles { root } => nexus_tools::strict_tools(root)
-                .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+            ToolsMode::Development { root } => {
+                nexus_tools::development_tools_with_settings(root, &self.tools_settings)
+                    .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?
+            }
+            ToolsMode::RealFiles { root } => {
+                nexus_tools::strict_tools_with_settings(root, &self.tools_settings)
+                    .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?
+            }
             #[cfg(feature = "container")]
             ToolsMode::Container {
                 root,
                 gateway_image,
                 workload_image,
-            } => nexus_container::tool_registrations(root, gateway_image, workload_image).map_err(
-                |error| {
-                    // ContainerError contains fixed host-side diagnostics only,
-                    // never Docker output, environment values, or credentials.
-                    eprintln!("container environment preparation failed: {error}");
-                    SessionError::new(503, "container environment is unavailable")
-                },
-            )?,
+            } => nexus_container::tool_registrations_with_settings(
+                root,
+                gateway_image,
+                workload_image,
+                &self.tools_settings,
+            )
+            .map_err(|error| {
+                // ContainerError contains fixed host-side diagnostics only,
+                // never Docker output, environment values, or credentials.
+                eprintln!("container environment preparation failed: {error}");
+                SessionError::new(503, "container environment is unavailable")
+            })?,
         };
         let (runtime, streams): (Runtime, EventStreams) = match &self.session_store {
             Some(store) => Runtime::try_new_with_session_store_handle(
@@ -1735,6 +1770,53 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    #[test]
+    fn tools_settings_are_atomic_and_rejected_with_sessions_or_reservations() {
+        let (mut server, _runtime) = server_with_gated_config();
+        assert_eq!(server.tools_settings, ToolsSettings::default());
+        let settings = ToolsSettings {
+            list_entry_limit: 1,
+            search_file_bytes: 4,
+        };
+        server.set_tools_settings(&settings).unwrap();
+        for invalid in [
+            ToolsSettings {
+                list_entry_limit: 0,
+                ..settings.clone()
+            },
+            ToolsSettings {
+                list_entry_limit: 10_001,
+                ..settings.clone()
+            },
+            ToolsSettings {
+                search_file_bytes: 0,
+                ..settings.clone()
+            },
+            ToolsSettings {
+                search_file_bytes: 1_048_577,
+                ..settings.clone()
+            },
+        ] {
+            assert!(server.set_tools_settings(&invalid).is_err());
+            assert_eq!(server.tools_settings, settings);
+        }
+        server.pending_sessions.store(1, Ordering::Release);
+        assert!(
+            server
+                .set_tools_settings(&ToolsSettings::default())
+                .is_err()
+        );
+        assert_eq!(server.tools_settings, settings);
+        server.pending_sessions.store(0, Ordering::Release);
+        server.create_session().unwrap();
+        assert!(
+            server
+                .set_tools_settings(&ToolsSettings::default())
+                .is_err()
+        );
+        assert_eq!(server.tools_settings, settings);
+    }
 
     #[test]
     fn server_settings_are_atomic_and_rejected_with_sessions_or_reservations() {

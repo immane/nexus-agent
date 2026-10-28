@@ -24,6 +24,7 @@ name = "behavior"
 path = "tests/behavior.rs"
 
 [dependencies]
+nexus-config = { path = "../nexus-config" }
 nexus-core = { path = "../nexus-core" }
 nexus-tools = { path = "../nexus-tools" }
 serde = "1"

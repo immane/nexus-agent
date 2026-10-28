@@ -184,8 +184,8 @@ not supported. The separate provider/model `config.json` remains strict JSON
 and is unchanged.
 
 Complete example: [`config/base.jsonc`](config/base.jsonc). It lists every
-configurable runtime budget, provider deadline/retry default, server lifecycle setting,
-and TUI preference. Its values
+configurable runtime budget, provider deadline/retry default, tool budget,
+server lifecycle setting, and TUI preference. Its values
 match the existing TUI and ordinary server defaults. Choose it explicitly:
 
 ```sh
@@ -244,6 +244,19 @@ Server lifecycle settings belong in `defaults.server` or `profiles.server.server
 they do not change bind/authentication policy or tool permissions. Idle cleanup
 still retains sessions with active work, streams, or external owners. Expiry is
 checked periodically, so an eligible idle session may remain until the next pass.
+
+Tool budgets belong in `defaults.tools` or `profiles.tui.tools` /
+`profiles.server.tools`: `list_entry_limit` defaults to 10,000 entries (range
+1–10,000), and `search_file_bytes` to 1,048,576 bytes per file (1–1,048,576).
+These startup settings apply to both strict/development host tools and container
+file tools; they do not change approval or filesystem scope. Listing may return
+a truncated subset when the cap is exceeded; directory enumeration happens
+before sorting, so the subset is not guaranteed to be the first sorted entries.
+Search examines a bounded prefix and reports truncation; an incomplete final
+UTF-8 character at the byte boundary is excluded from that prefix.
+Container workers now require protocol version 2. Rebuild workload images from
+this revision before using container tools; old images fail explicitly rather
+than ignoring configured budgets (see [container build instructions](containers/README.md#build-and-checks)).
 
 ```sh
 cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project

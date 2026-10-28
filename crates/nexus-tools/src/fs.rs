@@ -342,6 +342,7 @@ pub struct ScopedLister {
     access: BoundRoot,
     spec: ToolSpec,
     protected: Option<nexus_permissions::DirectoryPolicy>,
+    entry_limit: usize,
 }
 
 impl ScopedLister {
@@ -361,7 +362,19 @@ impl ScopedLister {
             access,
             spec,
             protected: None,
+            entry_limit: LIST_ENTRY_LIMIT,
         })
+    }
+    /// Applies validated operational ceilings without changing the jail or policy.
+    pub fn with_settings(
+        mut self,
+        settings: &nexus_config::ToolsSettings,
+    ) -> Result<Self, AgentError> {
+        settings
+            .validate()
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tools settings are invalid"))?;
+        self.entry_limit = settings.list_entry_limit;
+        Ok(self)
     }
     pub(crate) fn with_protected_paths(
         mut self,
@@ -401,7 +414,7 @@ impl ScopedLister {
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
         let mut iterator = rustix::fs::Dir::read_from(&directory)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
-        while entries.len() < LIST_ENTRY_LIMIT {
+        while entries.len() < self.entry_limit {
             match iterator.read() {
                 Some(Ok(entry)) => {
                     if entry.file_name().to_bytes() != b"." && entry.file_name().to_bytes() != b".."
@@ -418,7 +431,7 @@ impl ScopedLister {
                 None => break,
             }
         }
-        let mut truncated = entries.len() == LIST_ENTRY_LIMIT && iterator.read().is_some();
+        let mut truncated = entries.len() == self.entry_limit && iterator.read().is_some();
         entries.sort_by_key(|entry| entry.file_name().to_owned());
         let mut output = String::new();
         for entry in entries {
@@ -485,6 +498,7 @@ pub struct ScopedSearcher {
     access: BoundRoot,
     spec: ToolSpec,
     protected: Option<nexus_permissions::DirectoryPolicy>,
+    file_bytes: u64,
 }
 
 impl ScopedSearcher {
@@ -504,7 +518,19 @@ impl ScopedSearcher {
             access,
             spec,
             protected: None,
+            file_bytes: SEARCH_FILE_BYTES,
         })
+    }
+    /// Applies validated operational ceilings without changing the jail or policy.
+    pub fn with_settings(
+        mut self,
+        settings: &nexus_config::ToolsSettings,
+    ) -> Result<Self, AgentError> {
+        settings
+            .validate()
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tools settings are invalid"))?;
+        self.file_bytes = settings.search_file_bytes;
+        Ok(self)
     }
     pub(crate) fn with_protected_paths(
         mut self,
@@ -591,17 +617,23 @@ impl ScopedSearcher {
                 let Ok(file) = self.access.open_file(&path) else {
                     continue;
                 };
-                let mut limited = file.take(SEARCH_FILE_BYTES + 1);
+                let mut limited = file.take(self.file_bytes + 1);
                 let mut bytes = Vec::new();
                 if limited.read_to_end(&mut bytes).is_err() {
                     continue;
                 }
-                if bytes.len() as u64 > SEARCH_FILE_BYTES {
+                let file_truncated = bytes.len() as u64 > self.file_bytes;
+                if file_truncated {
                     truncated = true;
-                    bytes.truncate(SEARCH_FILE_BYTES as usize);
+                    bytes.truncate(self.file_bytes as usize);
                 }
-                let Ok(text) = std::str::from_utf8(&bytes) else {
-                    continue;
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(text) => text,
+                    Err(error) if file_truncated && error.error_len().is_none() => {
+                        std::str::from_utf8(&bytes[..error.valid_up_to()])
+                            .expect("validated UTF-8 prefix")
+                    }
+                    Err(_) => continue,
                 };
                 for (index, line) in text.lines().enumerate() {
                     if line.contains(query) {

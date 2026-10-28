@@ -343,7 +343,7 @@ mod tests {
             if self.fail {
                 Err(std::io::Error::other("lost response"))
             } else {
-                Ok(br#"{"version":1,"result":{"status":"Succeeded","effect":"KnownApplied","content":"ok","truncated":false}}"#.to_vec())
+                Ok(br#"{"version":2,"result":{"status":"Succeeded","effect":"KnownApplied","content":"ok","truncated":false}}"#.to_vec())
             }
         }
     }

@@ -432,6 +432,10 @@ fn main() {
         eprintln!("nexus-server: invalid server settings ({error})");
         std::process::exit(2);
     }
+    if let Err(error) = server.set_tools_settings(settings.tools()) {
+        eprintln!("nexus-server: invalid tool settings ({error})");
+        std::process::exit(2);
+    }
     if let Some(store) = session_store {
         server.set_session_store(store);
     }
