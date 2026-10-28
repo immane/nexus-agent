@@ -2039,6 +2039,50 @@ mod tests {
     }
 
     #[test]
+    fn large_composer_does_not_hide_or_falsely_measure_approval_detail() {
+        let (mut state, mut terminal) = harness(60, 24);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.display.composer_max_rows = 100;
+        state.set_settings(settings).unwrap();
+        for _ in 0..19 {
+            state.composer_type('x');
+            state.composer_newline();
+        }
+        started(&mut state, 0);
+        assert!(state.apply_event(&approval_event(1, &"s".repeat(500), "project scope")));
+        let area = Rect::new(0, 0, 60, 24);
+        let requested = approval_layout(
+            state.pending_approval().unwrap(),
+            Some("run-1"),
+            None,
+            area,
+            19,
+            false,
+            0,
+        );
+        assert_eq!(
+            split(area, 19, requested.rows).approval.unwrap().height,
+            requested.rows
+        );
+        draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        assert!(screen(&terminal).contains("approval required"));
+        assert!(!state.approval_decision_allowed());
+        state.inspect_approval();
+        draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        assert!(screen(&terminal).contains("approval detail"));
+        assert!(!state.approval_decision_allowed());
+        for _ in 0..256 {
+            if state.approval_detail_seen_all() {
+                break;
+            }
+            state.approval_detail_page(1);
+            draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        }
+        assert!(state.approval_detail_seen_all());
+        assert!(state.approval_decision_allowed());
+    }
+
+    #[test]
     fn long_operation_detail_is_readable_in_the_expanded_view() {
         let (mut state, mut terminal) = harness(60, 18);
         started(&mut state, 0);

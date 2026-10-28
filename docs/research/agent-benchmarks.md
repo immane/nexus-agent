@@ -774,7 +774,7 @@ Results are grouped by inference environment, with separate tables and counts.
 Agent completion is not official resolution. These selected diagnostic runs are
 **not a leaderboard score, a general success rate, or a controlled model
 comparison**. Agent wall time excludes the separate official evaluator run;
-dates are UTC. Links into `../../nexus-benchmark-work/` refer to preserved local
+dates are UTC. Links into `../../../nexus-benchmark-work/` refer to preserved local
 artifacts outside this repository; they are not available in a standalone clone.
 
 ### Local inference: Qwen3.8-27B via Ollama
@@ -801,8 +801,8 @@ The 2026-10-28 Django run is a regression rerun of a previously evaluated
 task, not a blind sample. It used 42 model requests (including 11 context
 summaries), 40 tool calls, and 335,333 input / 49,898 output tokens. The
 official evaluator resolved it in 82 seconds with no infrastructure failures.
-See the [launch record](../../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/launch.json)
-and [official evaluation report](../../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/official-evaluation/qwen-django-20261028T023105Z-899b2d2e/ollama-local__qwen3-27b.qwen-django-20261028T023105Z-899b2d2e.json).
+See the [launch record](../../../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/launch.json)
+and [official evaluation report](../../../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/official-evaluation/qwen-django-20261028T023105Z-899b2d2e/ollama-local__qwen3-27b.qwen-django-20261028T023105Z-899b2d2e.json).
 
 The Flask run produced a patch that applied cleanly and kept all 19
 `PASS_TO_PASS` tests passing. It failed `test_config_from_file_toml` because the
@@ -884,8 +884,8 @@ that failure also occurs on the unmodified baseline; that baseline comparison
 was not independently verified here. These were intermediate test timeouts,
 not an agent-run timeout. The full agent run took 1h 49m 12s, and official
 scoring completed separately in about 38 seconds. This previously exposed task
-is not a blind evaluation sample. See the [launch record](../../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/launch.json)
-and [official result](../../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/official-evaluation/sphinx-doc__sphinx-9461-prediction-20261027T040234.790700Z-d83b863e5864422b8737ae8c44b8f1d8/evaluation.json).
+is not a blind evaluation sample. See the [launch record](../../../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/launch.json)
+and [official result](../../../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/official-evaluation/sphinx-doc__sphinx-9461-prediction-20261027T040234.790700Z-d83b863e5864422b8737ae8c44b8f1d8/evaluation.json).
 
 Sphinx 8595 used 47 model requests and 59 tool calls (940,165 input and 11,286 output
 tokens); Pylint used 38 model requests and 42 tool calls (810,483 input and
@@ -901,21 +901,21 @@ Hosted inference was explicitly authorized; the runner had no cumulative token
 or spend cap. The credential was loaded from the owner-only `deepseek.env` for
 each background process only; the shared provider configuration was not changed.
 Evidence:
-[run batch](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/batch.json),
-[launch record](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/sphinx-doc__sphinx-8595/run-sphinx-doc__sphinx-8595-20261026T221257Z-41b36a30/launch.json),
-and [official evaluator result](../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-a2e3d22059dc44dbb0a73868956ce902/official/sphinx-doc__sphinx-8595-prediction-20261026T221511.628724Z-11b56200b2ec48449c56d853aaa9cdee/evaluation.json).
-Pylint evidence: [run batch](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/batch.json),
-[launch record](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T222755Z-6400a8c7/launch.json),
-and [official evaluator result](../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e3f0859627cc436d8e5cce6b6ebd4e6e/official/pylint-dev__pylint-6506-prediction-20261026T223040.009489Z-c6f8b6e5bf0e4f9695dd3c38b2f39522/evaluation.json).
-Pylint context-controlled follow-up evidence: [run batch](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/batch.json),
-[launch record](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T233956Z-6ec98125/launch.json),
-and [official evaluator result](../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-574e369bc5684c639d8f080e5b19f1cc/official/pylint-dev__pylint-6506-prediction-20261026T234254.241866Z-4edce9768314456b91f4551fad59807f/evaluation.json).
-Pylint 32,768-token-context follow-up evidence: [run batch](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/batch.json),
-[launch record](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T234359Z-68a9b74a/launch.json),
-and [official evaluator result](../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e7e79a5da02b423fae474952cb1dd1e5/official/pylint-dev__pylint-6506-prediction-20261026T234807.926531Z-741dd5afe4314fbe9196275d6fa7b9a3/evaluation.json).
-Flask evidence: [run batch](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/batch.json),
-[launch record](../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/pallets__flask-4992/run-pallets__flask-4992-20261026T223312Z-adfc89ce/launch.json),
-and [official evaluator result](../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-d10c7f09e7d2402c819bc9c6815fb01c/official/pallets__flask-4992-prediction-20261026T223451.689810Z-528bce98331c42308f5dd8e74fa79f51/evaluation.json).
+[run batch](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/batch.json),
+[launch record](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/sphinx-doc__sphinx-8595/run-sphinx-doc__sphinx-8595-20261026T221257Z-41b36a30/launch.json),
+and [official evaluator result](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-a2e3d22059dc44dbb0a73868956ce902/official/sphinx-doc__sphinx-8595-prediction-20261026T221511.628724Z-11b56200b2ec48449c56d853aaa9cdee/evaluation.json).
+Pylint evidence: [run batch](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/batch.json),
+[launch record](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T222755Z-6400a8c7/launch.json),
+and [official evaluator result](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e3f0859627cc436d8e5cce6b6ebd4e6e/official/pylint-dev__pylint-6506-prediction-20261026T223040.009489Z-c6f8b6e5bf0e4f9695dd3c38b2f39522/evaluation.json).
+Pylint context-controlled follow-up evidence: [run batch](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/batch.json),
+[launch record](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T233956Z-6ec98125/launch.json),
+and [official evaluator result](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-574e369bc5684c639d8f080e5b19f1cc/official/pylint-dev__pylint-6506-prediction-20261026T234254.241866Z-4edce9768314456b91f4551fad59807f/evaluation.json).
+Pylint 32,768-token-context follow-up evidence: [run batch](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/batch.json),
+[launch record](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T234359Z-68a9b74a/launch.json),
+and [official evaluator result](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e7e79a5da02b423fae474952cb1dd1e5/official/pylint-dev__pylint-6506-prediction-20261026T234807.926531Z-741dd5afe4314fbe9196275d6fa7b9a3/evaluation.json).
+Flask evidence: [run batch](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/batch.json),
+[launch record](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/pallets__flask-4992/run-pallets__flask-4992-20261026T223312Z-adfc89ce/launch.json),
+and [official evaluator result](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-d10c7f09e7d2402c819bc9c6815fb01c/official/pallets__flask-4992-prediction-20261026T223451.689810Z-528bce98331c42308f5dd8e74fa79f51/evaluation.json).
 
 ### Shared evaluation workflow and suite progress
 

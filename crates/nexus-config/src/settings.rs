@@ -665,6 +665,7 @@ fn apply_profile(
         settings.tools = tools;
     }
     if let Some(launch) = object.get("launch") {
+        section(launch)?;
         let overlay: LaunchSettings = serde_json::from_value(launch.clone())
             .map_err(|_| invalid("startup settings are invalid"))?;
         let mut merged = settings.launch.clone();
@@ -1241,6 +1242,9 @@ mod tests {
             r#"{"revision":1,"defaults":{"launch":{"server_port":65536}}}"#,
             r#"{"revision":1,"defaults":{"launch":{"tools_root":""}}}"#,
             r#"{"revision":1,"defaults":{"launch":{"auth_token_env":"BAD-NAME"}}}"#,
+            r#"{"revision":1,"defaults":{"launch":[]}}"#,
+            r#"{"revision":1,"defaults":{"launch":["container",true,"workspace",9000,"real","sessions","TOKEN"]}}"#,
+            r#"{"revision":1,"profiles":{"server":{"launch":[]}}}"#,
             r#"{"revision":1,"profiles":{"server":{"launch":{"unexpected":true}}}}"#,
         ] {
             assert!(
