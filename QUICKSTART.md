@@ -404,6 +404,12 @@ the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
 `:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
 command.
 
+The footer shows `idle` or `running`, the latest task request's estimated input
+tokens and percentage of its known context window (for example `~12.3K (12%)`),
+then the version at the right edge. `~` marks an estimate, not a live token
+count; missing input or window information is shown as `--`. Summary requests
+do not replace the task estimate.
+
 ### TUI diagnostics
 
 Interactive non-demo runs automatically retain metadata-only runtime diagnostics:

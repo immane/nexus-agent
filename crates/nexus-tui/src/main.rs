@@ -3394,6 +3394,18 @@ async fn handle_key_with_runtime(
         front.state.dismiss_overlay();
         front.state.clear_colon();
     }
+    if front.focus == Focus::Viewport
+        && front.state.pending_approval().is_some()
+        && key.kind == KeyEventKind::Press
+        && key.modifiers.is_empty()
+        && matches!(key.code, crossterm::event::KeyCode::Char('a' | 'd'))
+    {
+        front.focus = Focus::ApprovalCard;
+        front
+            .state
+            .notice("approval focused; press a or d again to decide");
+        return false;
+    }
     let directory_approval = front.focus == Focus::ApprovalCard
         && key.kind == KeyEventKind::Press
         && key.modifiers.is_empty()
@@ -7946,6 +7958,20 @@ mod cov_main_topup {
             "wheel down returns to the tail"
         );
         assert!(!handle_mouse(&mut front, wheel(MouseEventKind::Moved)));
+    }
+
+    #[tokio::test]
+    async fn parked_approval_shortcut_focuses_without_deciding() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        for key in ['a', 'd'] {
+            let mut front = awaiting_approval(&run_id("run-parked-approval"), "c1-0");
+            front.focus = Focus::Viewport;
+            assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(key))).await);
+            assert_eq!(front.focus, Focus::ApprovalCard);
+            assert_eq!(front.request_counter, 0, "focus must never approve or deny");
+            assert!(front.live_approval.is_some());
+            assert!(transcript(&front).contains("press a or d again"));
+        }
     }
 
     #[tokio::test]

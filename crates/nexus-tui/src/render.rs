@@ -270,7 +270,7 @@ const EMPTY_SUBTITLE: &str = "nexus-agent dev · fast to start · small by desig
 /// retired M0-TEST branding. Baked in at compile time from the crate
 /// version (`concat!` needs literals, so one const per shape).
 const HEADER_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"), " ");
-const FOOTER_TAG: &str = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
+const FOOTER_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Small-terminal wordmark, centered when the banner does not fit.
 const WORDMARK: &str = "nexus-agent";
@@ -394,7 +394,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
     render_header(state, regions.header, buf, focus);
     render_body(state, regions.body, buf);
     if let (Some(layout), Some(card_area)) = (approval.as_ref(), regions.approval) {
-        render_approval_with_theme(layout, card_area, buf, &state.settings().theme);
+        render_approval_with_theme(layout, card_area, buf, &state.settings().theme, focus);
     }
     render_composer(state, regions.composer, buf, focus);
     // Composer pointer geometry: origin plus the inner draft grid the
@@ -1214,7 +1214,13 @@ fn push_wrapped(text: &str, width: usize, budget: usize, out: &mut Vec<String>) 
 
 #[cfg(test)]
 fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
-    render_approval_with_theme(layout, area, buf, &ThemeSettings::default());
+    render_approval_with_theme(
+        layout,
+        area,
+        buf,
+        &ThemeSettings::default(),
+        Focus::ApprovalCard,
+    );
 }
 
 fn render_approval_with_theme(
@@ -1222,8 +1228,13 @@ fn render_approval_with_theme(
     area: Rect,
     buf: &mut Buffer,
     theme: &ThemeSettings,
+    focus: Focus,
 ) {
-    let title = if layout.expanded {
+    let title = if focus == Focus::Viewport {
+        " approval unfocused · Tab to focus ".to_owned()
+    } else if focus == Focus::Composer {
+        " approval unfocused · Esc then Tab to focus ".to_owned()
+    } else if layout.expanded {
         let end = layout
             .scroll
             .saturating_add(layout.view_rows)
@@ -1420,15 +1431,43 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
 
 fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
     let status = if state.can_cancel() {
-        state.status()
+        "running"
     } else {
         "idle"
     };
-    let right_text = format!("{FOOTER_TAG}{status}");
-    let right_width = display_width(&right_text).min(area.width as usize) as u16;
-    Paragraph::new(right_text)
+    let context = match state.context_estimate() {
+        Some((Some(tokens), window)) => {
+            let percent = window.filter(|window| *window > 0).map_or_else(
+                || "--".to_owned(),
+                |window| format!("{}", u128::from(tokens) * 100 / u128::from(window)),
+            );
+            format!("~{:.1}K ({percent}%)", tokens as f64 / 1000.0)
+        }
+        _ => "--.-K (--%)".to_owned(),
+    };
+    let version_width = display_width(FOOTER_TAG).min(area.width as usize) as u16;
+    let version_area = Rect::new(
+        area.x + area.width.saturating_sub(version_width),
+        area.y,
+        version_width,
+        area.height,
+    );
+    Paragraph::new(FOOTER_TAG)
         .alignment(Alignment::Right)
-        .render(area, buf);
+        .render(version_area, buf);
+    let info = format!("{status}  {context}  ");
+    let available = area.width.saturating_sub(version_width);
+    let info_width = (display_width(&info).min(available as usize)) as u16;
+    let info_area = Rect::new(
+        area.x + available.saturating_sub(info_width),
+        area.y,
+        info_width,
+        area.height,
+    );
+    Paragraph::new(info)
+        .alignment(Alignment::Right)
+        .render(info_area, buf);
+    let right_width = info_width + version_width;
 
     if let Some(command) = state.command_line() {
         let text = format!(":{command}▊");
@@ -1454,6 +1493,19 @@ mod tests {
         draw(&mut state, &mut terminal, Focus::Viewport);
         assert!(!screen(&terminal).contains("Type i / o to edit"));
         assert!(screen(&terminal).contains('x'));
+    }
+
+    #[test]
+    fn parked_approval_explains_how_to_restore_focus() {
+        let (mut state, mut terminal) = harness(100, 30);
+        started(&mut state, 0);
+        assert!(state.apply_event(&approval_event(1, "run tool", "project")));
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(screen(&terminal).contains("approval unfocused · Tab to focus"));
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert!(screen(&terminal).contains("approval unfocused · Esc then Tab to focus"));
+        draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        assert!(screen(&terminal).contains("approval required"));
     }
 
     #[test]
@@ -2890,7 +2942,7 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(
-            footer.contains(format!(" {} ", concat!("v", env!("CARGO_PKG_VERSION"))).as_str()),
+            footer.ends_with(concat!("v", env!("CARGO_PKG_VERSION"))),
             "{footer:?}"
         );
         assert!(footer.contains("idle"), "{footer:?}");
@@ -2901,7 +2953,10 @@ mod cov_render_private {
         assert!(!footer.contains("[i]"), "{footer:?}");
         assert_eq!(
             footer.trim_start(),
-            format!("{} idle", concat!("v", env!("CARGO_PKG_VERSION"))),
+            format!(
+                "idle  --.-K (--%)  {}",
+                concat!("v", env!("CARGO_PKG_VERSION"))
+            ),
             "{footer:?}"
         );
 
@@ -2912,7 +2967,10 @@ mod cov_render_private {
             .clone();
         assert_eq!(
             footer.trim_start(),
-            format!("{} running", concat!("v", env!("CARGO_PKG_VERSION"))),
+            format!(
+                "running  --.-K (--%)  {}",
+                concat!("v", env!("CARGO_PKG_VERSION"))
+            ),
             "{footer:?}"
         );
 
@@ -2921,20 +2979,79 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(
-            footer.trim_end().ends_with("awaiting approval"),
-            "{footer:?}"
-        );
+        assert!(footer.trim_start().starts_with("running"), "{footer:?}");
 
         state.inspect_approval();
         let footer = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
+        assert!(footer.trim_start().starts_with("running"), "{footer:?}");
+    }
+
+    #[test]
+    fn footer_shows_task_context_estimate_and_ignores_summary_requests() {
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 80, 1);
+        assert!(state.apply_event(&started(0)));
+        let request = |seq, purpose, input, window| {
+            RunEvent::new(
+                SessionId::new("sess-1").unwrap(),
+                RunId::new("run-1").unwrap(),
+                seq,
+                EventPayload::ModelRequestStarted {
+                    turn: TurnId::new("t1-0").unwrap(),
+                    purpose,
+                    estimated_input_tokens: input,
+                    raw_estimated_input_tokens: input,
+                    estimate_scale_millis: 1000,
+                    context_window_tokens: window,
+                    context_trigger_percent: 65,
+                    context_target_percent: 10,
+                    compaction_strategy: nexus_core::ContextCompactionStrategy::Summarize,
+                    max_output_tokens: None,
+                    projected_tool_outputs: 0,
+                },
+            )
+        };
+        assert!(state.apply_event(&request(
+            1,
+            nexus_core::ModelRequestPurpose::Task,
+            Some(12_345),
+            Some(100_000)
+        )));
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
         assert!(
-            footer.trim_end().ends_with("awaiting approval"),
+            footer.ends_with(concat!(
+                "running  ~12.3K (12%)  v",
+                env!("CARGO_PKG_VERSION")
+            )),
             "{footer:?}"
         );
+        assert!(state.apply_event(&request(
+            2,
+            nexus_core::ModelRequestPurpose::Summary,
+            Some(99),
+            Some(100)
+        )));
+        assert_eq!(
+            state.context_estimate(),
+            Some((Some(12_345), Some(100_000)))
+        );
+        assert!(state.apply_event(&request(
+            3,
+            nexus_core::ModelRequestPurpose::Task,
+            Some(1500),
+            None
+        )));
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(footer.contains("~1.5K (--%)"), "{footer:?}");
     }
 
     #[test]
@@ -2953,10 +3070,7 @@ mod cov_render_private {
             .clone();
         assert!(armed.trim_start().starts_with(":▊"), "{armed:?}");
         let version = concat!("v", env!("CARGO_PKG_VERSION"));
-        assert!(
-            armed.trim_end().ends_with(&format!("{version} idle")),
-            "{armed:?}"
-        );
+        assert!(armed.trim_end().ends_with(version), "{armed:?}");
         assert!(
             armed.find(":▊").expect("left command") < armed.find(version).expect("right status"),
             "command precedes version/status: {armed:?}"
@@ -3741,12 +3855,12 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(shown.trim_end().ends_with("running"), "{shown:?}");
+        assert!(shown.contains("running  --.-K (--%)"), "{shown:?}");
         assert!(state.apply_event(&usage(2, Some(10), Some(3))));
         let shown = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(shown.trim_end().ends_with("running"), "{shown:?}");
+        assert!(shown.contains("running  --.-K (--%)"), "{shown:?}");
     }
 }

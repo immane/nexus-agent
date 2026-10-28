@@ -960,6 +960,8 @@ pub struct AppState {
     /// Latest usage counters observed on the live run. Cleared by the next
     /// `RunStarted` so a new run never wears the previous run's numbers.
     last_usage: Option<Usage>,
+    /// Last task request's estimated input tokens and known context window.
+    context_estimate: Option<(Option<u64>, Option<u32>)>,
     /// Configured-model snapshot offered while the model picker is open.
     /// Populated from configuration when the picker opens; confirmation
     /// still validates against live configuration, so a stale snapshot
@@ -1030,6 +1032,7 @@ impl AppState {
             modes: vec![AgentMode::plan(), AgentMode::build()],
             mode_index: 1,
             last_usage: None,
+            context_estimate: None,
             model_choices: Vec::new(),
             session_choices: Vec::new(),
             overlay: None,
@@ -1168,6 +1171,12 @@ impl AppState {
         self.last_usage
     }
 
+    /// Last task request's estimated input and its context window, when known.
+    #[must_use]
+    pub fn context_estimate(&self) -> Option<(Option<u64>, Option<u32>)> {
+        self.context_estimate
+    }
+
     /// Applies one runtime event to presentation state. Returns false without
     /// mutating state for stale-run updates, duplicate or out-of-order
     /// sequence numbers on the live run, and any event after that run's
@@ -1215,6 +1224,7 @@ impl AppState {
                 self.streaming = true;
                 self.finished = None;
                 self.last_usage = None;
+                self.context_estimate = None;
                 self.status = "running".to_owned();
                 self.push_system(format!("run {} started", event.run().as_str()));
             }
@@ -1233,6 +1243,14 @@ impl AppState {
                 self.push_system(format!(
                     "context reduced: replaced or omitted {removed_items} earlier items; re-check earlier facts before relying on them"
                 ));
+            }
+            EventPayload::ModelRequestStarted {
+                purpose: nexus_core::ModelRequestPurpose::Task,
+                estimated_input_tokens,
+                context_window_tokens,
+                ..
+            } => {
+                self.context_estimate = Some((*estimated_input_tokens, *context_window_tokens));
             }
             EventPayload::ModelRequestStarted { .. } => {}
             EventPayload::ModelRequestFinished { .. } => {}
