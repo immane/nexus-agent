@@ -11,8 +11,8 @@
 //! # Secrets
 //!
 //! Credentials are references, never values. A provider carries
-//! [`CredentialRef::EnvVar`], resolved only for the selected integration
-//! when needed via [`resolve_credential`]. The file format has no field
+//! [`CredentialRef::EnvVar`] or [`CredentialRef::Stored`], resolved only for
+//! the selected integration when needed via [`resolve_credential`]. The configuration format has no field
 //! that can hold a secret value, so none can be written, logged, or echoed
 //! by construction; error messages are static and never interpolate
 //! caller text.

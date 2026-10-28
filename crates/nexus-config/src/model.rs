@@ -48,7 +48,7 @@ pub const MODE_BUILD: &str = "build";
 
 /// Returns true for the lock identifier charset: ASCII letters, digits,
 /// `-`, and `_`. Empty text is rejected by the length check first.
-fn is_id_text(text: &str) -> bool {
+pub(crate) fn is_id_text(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= MAX_ID_LEN
         && text
@@ -158,14 +158,18 @@ impl ProtocolKind {
     }
 }
 
-/// Credential reference. The only variant names an environment variable;
-/// values are resolved at use time and never stored, logged, or echoed.
+/// Credential reference; values are resolved at use time and never logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialRef {
     /// Resolve `var` from the process environment when needed.
     EnvVar {
         /// Environment variable name (`[A-Z0-9_]`, leading letter).
         var: String,
+    },
+    /// Resolve a provider identifier from the local credentials file.
+    Stored {
+        /// Provider identifier in the credentials file.
+        provider: String,
     },
 }
 
@@ -189,11 +193,30 @@ impl CredentialRef {
         }
     }
 
-    /// Returns the referenced variable name (never a secret value).
+    /// Builds a stored credential reference with provider-id validation.
+    pub fn stored(provider: impl Into<String>) -> Result<Self, ConfigError> {
+        let provider = provider.into();
+        if is_id_text(&provider) {
+            Ok(Self::Stored { provider })
+        } else {
+            Err(invalid("credential reference is invalid"))
+        }
+    }
+
+    /// Returns the referenced name (never a secret value).
     #[must_use]
     pub fn var_name(&self) -> &str {
-        let Self::EnvVar { var } = self;
-        var
+        match self {
+            Self::EnvVar { var } => var,
+            Self::Stored { provider } => provider,
+        }
+    }
+
+    pub(crate) fn to_json(&self) -> Value {
+        match self {
+            Self::EnvVar { var } => serde_json::json!({ "env": var }),
+            Self::Stored { provider } => serde_json::json!({ "stored": provider }),
+        }
     }
 }
 
@@ -880,7 +903,7 @@ impl UserConfig {
 }
 
 /// Serializes one provider profile. The credential carries only the
-/// variable name; values never enter the document.
+/// reference name; values never enter the document.
 fn provider_json(profile: &ProviderProfile) -> Value {
     let mut object = Map::new();
     object.insert("id".to_owned(), Value::String(profile.id.clone()));
@@ -904,12 +927,7 @@ fn provider_json(profile: &ProviderProfile) -> Value {
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
-    let mut credential = Map::new();
-    credential.insert(
-        "env".to_owned(),
-        Value::String(profile.credential.var_name().to_owned()),
-    );
-    object.insert("credential".to_owned(), Value::Object(credential));
+    object.insert("credential".to_owned(), profile.credential.to_json());
     object.insert(
         "default_model".to_owned(),
         Value::String(profile.default_model.clone()),
@@ -1036,8 +1054,12 @@ fn parse_provider(
         .get("credential")
         .and_then(Value::as_object)
         .ok_or(invalid("credential reference is invalid"))?;
-    reject_unknown(credential, &["env"])?;
-    let var = require_str(credential, "env")?;
+    reject_unknown(credential, &["env", "stored"])?;
+    let credential = match (credential.get("env"), credential.get("stored")) {
+        (Some(Value::String(var)), None) => CredentialRef::env_var(var.clone())?,
+        (None, Some(Value::String(provider))) => CredentialRef::stored(provider.clone())?,
+        _ => return Err(invalid("credential reference is invalid")),
+    };
     let endpoint = match object.get("endpoint") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
@@ -1061,7 +1083,7 @@ fn parse_provider(
         AdapterKind::parse(require_str(object, "adapter")?)?,
         protocol,
         endpoint,
-        CredentialRef::env_var(var.to_owned())?,
+        credential,
         require_str(object, "default_model")?.to_owned(),
     )?;
     profile.context_window_tokens = parse_window_tokens(object)?;

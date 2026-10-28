@@ -146,9 +146,10 @@ frontend has durable conversation storage.
 
 ## Use a configured model in the TUI
 
-Configure a provider and model in the user configuration, with credentials
-referenced by environment-variable name, not embedded in JSON. Export that
-variable **before starting the TUI in the same shell**. No server is needed.
+Configure a provider and model in the user configuration. Credentials can be
+referenced by environment-variable name or stored separately by the config
+helper. For environment references, export the variable **before starting the
+TUI in the same shell**. No server is needed.
 
 Configuration lookup uses `NEXUS_CONFIG` when nonempty, otherwise
 `$XDG_CONFIG_HOME/nexus-agent/config.json`, falling back to
@@ -159,6 +160,43 @@ provider `--config` flag:
 ```sh
 export NEXUS_CONFIG=/path/to/config.json
 ```
+
+From the repository root, build and install the TUI, server, headless binary,
+and interactive config helper to `~/.local/bin` (or pass another install
+directory). Installation requires Cargo, Python 3, and the locked dependencies;
+Cargo may use the network if they are not cached. The installed binaries use
+default features; experimental container support is not included.
+
+```sh
+./scripts/install.sh
+nexus-config provider
+nexus-config model
+nexus-tui
+```
+
+The helper uses the same `NEXUS_CONFIG`/XDG default path. It can save an API key
+in a separate `$XDG_CONFIG_HOME/nexus-agent/credentials.json` file (or
+`$HOME/.config/nexus-agent/credentials.json`), with file mode `0600`. Keys are
+stored **in plaintext**, not encrypted; other processes running as the same
+user, backups, and development tools with access to that path may read them.
+Keep the credentials directory outside any workspace exposed to tools. The
+helper can also retain an environment-variable reference instead. Python 3 is required at runtime;
+the helper uses the installed `nexus-server` config validator before writing.
+When editing a stored credential, leave the hidden API key prompt blank to keep
+it, enter a new value to replace it, or enter `-` to delete it. A deleted key
+must be replaced before that provider can authenticate. The credentials and
+config files are saved separately; if the second save fails, the helper reports
+that the credentials file was already updated.
+Ensure the install directory is on `PATH`. Existing endpoint and token limits
+can be cleared by entering `-`.
+Avoid editing the same config concurrently; the helper detects changes made
+while it is prompting, but cannot coordinate with other writers.
+Provider and model entries can be selected by number or ID. When editing a
+provider, the helper lists locally configured models and, if the endpoint and
+credential environment variable are set, automatically requests the provider's
+model list. This sends the credential to the configured endpoint, so use only a
+trusted endpoint (HTTPS for remote services). Redirects are not followed;
+unsupported or unavailable model-list APIs fall back to local/manual input.
 
 Use the complete revision-2 example below. Revision 2 requires a provider
 `protocol`: `chat_completions`, `openai_responses`, or `anthropic_messages`.

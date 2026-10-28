@@ -117,7 +117,9 @@ def validate_model_endpoint(provider, model, args, env):
         local = endpoint.hostname == "localhost"
     if not local and not getattr(args, "allow_hosted_inference", False):
         raise RuntimeError("local benchmark launcher refuses public model endpoints")
-    credential = provider["credential"]["env"]
+    credential = provider.get("credential", {}).get("env")
+    if not credential:
+        raise RuntimeError("benchmark launcher requires an environment-variable provider credential")
     if not env.get(credential) and provider["id"] != "ollama-local":
         raise RuntimeError(f"missing provider credential environment variable: {credential}")
     check_model(provider, model, env)
