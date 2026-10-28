@@ -906,6 +906,9 @@ impl ProviderEvent {
 /// compatibility claim.
 pub const DEFAULT_ADAPTER_IDENTITY: &str = "unknown-adapter";
 
+/// An optional blocking discovery operation bound to one admission snapshot.
+pub type ContextWindowDiscovery = Box<dyn FnOnce() -> Option<crate::ContextWindow> + Send>;
+
 /// Provider port. Narrow by design: describe capabilities without mandatory
 /// network discovery, then perform one model turn. The two identity methods
 /// have stable defaults so existing implementors keep compiling; adapters
@@ -920,6 +923,19 @@ pub trait ProviderPort {
     /// an active run's policy. Unknown windows remain unknown by default.
     fn context_management(&self) -> crate::ContextManagementSettings {
         crate::ContextManagementSettings::default()
+    }
+
+    /// Snapshots local settings and an optional discovery operation for this run.
+    /// This method must not perform network I/O. The operation must own all
+    /// inputs needed to preserve the selection captured here; the runtime runs
+    /// it off the executor and applies its result only to an unknown window.
+    fn context_management_for_run(
+        &self,
+    ) -> (
+        crate::ContextManagementSettings,
+        Option<ContextWindowDiscovery>,
+    ) {
+        (self.context_management(), None)
     }
 
     /// Performs one model turn and returns normalized events ending in

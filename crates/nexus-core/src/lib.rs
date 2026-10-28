@@ -46,8 +46,8 @@ pub use outcomes::{
     PersistenceState, RunFinished, RunOutcome, ToolOutcome, TurnFinished, Usage, UsageFinality,
 };
 pub use provider::{
-    CredentialRef, DEFAULT_ADAPTER_IDENTITY, ItemKey, MAX_CONTEXT_NOTE_BYTES,
-    MAX_CONVERSATION_BYTES, MAX_CONVERSATION_ITEMS, MAX_INSTRUCTIONS_BYTES,
+    ContextWindowDiscovery, CredentialRef, DEFAULT_ADAPTER_IDENTITY, ItemKey,
+    MAX_CONTEXT_NOTE_BYTES, MAX_CONVERSATION_BYTES, MAX_CONVERSATION_ITEMS, MAX_INSTRUCTIONS_BYTES,
     MAX_TOOL_DEFINITION_BYTES, MAX_TOOL_DEFINITIONS, ModelContextItem, ModelInstructions,
     ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, ProviderRef,
     ReasoningEffort,

@@ -1378,7 +1378,7 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         // The hint never moves: the caret covers its first character
         // instead of taking a cell of its own, so blinking cannot make
         // the invitation jump back and forth.
-        let hint = "Type a task · : commands · @ project files";
+        let hint = "Type a task or ask a question · @ project files";
         let dim = Style::default().add_modifier(Modifier::DIM);
         if show_caret {
             let mut chars = hint.chars();
@@ -1399,7 +1399,7 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         }
     } else if draft.is_empty() && focus == Focus::Viewport {
         Line::from(Span::styled(
-            "Type i / o to edit",
+            "Type i / o to edit · : commands",
             Style::default().add_modifier(Modifier::DIM),
         ))
     } else if let Some((start, len)) = selected {
@@ -1486,9 +1486,11 @@ mod tests {
     fn empty_composer_hints_insert_keys_only_in_normal_mode() {
         let (mut state, mut terminal) = harness(100, 24);
         draw(&mut state, &mut terminal, Focus::Viewport);
-        assert!(screen(&terminal).contains("Type i / o to edit"));
+        assert!(screen(&terminal).contains("Type i / o to edit · : commands"));
         draw(&mut state, &mut terminal, Focus::Composer);
         assert!(!screen(&terminal).contains("Type i / o to edit"));
+        assert!(screen(&terminal).contains("Type a task or ask a question · @ project files"));
+        assert!(!screen(&terminal).contains(": commands"));
         state.composer_type('x');
         draw(&mut state, &mut terminal, Focus::Viewport);
         assert!(!screen(&terminal).contains("Type i / o to edit"));

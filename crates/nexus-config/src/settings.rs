@@ -184,7 +184,7 @@ impl Default for ProviderSettings {
     fn default() -> Self {
         Self {
             connect_timeout_seconds: 10,
-            context_discovery_timeout_seconds: 2,
+            context_discovery_timeout_seconds: 10,
             fallback_call_timeout_seconds: 600,
             retry_backoff_seconds: vec![1, 2, 5, 10, 30, 60],
         }

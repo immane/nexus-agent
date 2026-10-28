@@ -9,4 +9,5 @@ mod cov_state_retention;
 mod cov_state_sequences;
 mod cov_state_viewport;
 mod cov_terminal;
+mod discovery_footer;
 mod pty_render;

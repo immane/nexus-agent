@@ -419,14 +419,31 @@ impl OpenAiProvider {
     }
 
     fn discover_opencode_go_from(&self, catalog: &Self) -> Option<u32> {
+        let started = Instant::now();
         let address = join_host_port(&catalog.host, catalog.port);
         let request = format!(
             "GET /api.json HTTP/1.1\r\nhost: {address}\r\nuser-agent: nexus-agent/{}\r\naccept: application/json\r\nconnection: close\r\n\r\n",
             env!("CARGO_PKG_VERSION")
         );
         let response =
-            read_context_metadata_response(catalog, request.as_bytes(), MAX_CATALOG_BYTES)?;
-        parse_opencode_go_context_window(&response, &self.model)
+            read_context_metadata_response(catalog, request.as_bytes(), MAX_CATALOG_BYTES);
+        let window = response
+            .as_deref()
+            .and_then(|response| parse_opencode_go_context_window(response, &self.model));
+        let outcome = match (&response, window) {
+            (None, _) => "request_failed",
+            (Some(_), None) => "model_metadata_missing_or_invalid",
+            (Some(_), Some(_)) => "discovered",
+        };
+        // Log only bounded metadata: never credentials, response bodies or URLs.
+        eprintln!(
+            "nexus-openai: context discovery source=models.dev/opencode-go outcome={outcome} elapsed_ms={} timeout_seconds={} window_tokens={window:?}",
+            started.elapsed().as_millis(),
+            catalog
+                .operational_settings
+                .context_discovery_timeout_seconds,
+        );
+        window
     }
 
     fn discover_ollama_context_window(&self) -> Option<u32> {
@@ -1208,6 +1225,21 @@ mod catalog_tests {
             protocol,
         )
         .unwrap()
+    }
+
+    #[test]
+    #[ignore = "live: fetches the public models.dev catalog without provider credentials"]
+    fn live_opencode_go_catalog_discovery() {
+        let provider = OpenAiProvider::new(
+            "https://opencode.ai/inference/go/openai/v1",
+            CredentialRef::env_var("CATALOG_TEST_UNUSED").unwrap(),
+            "muse-spark-1.3-contributor",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let provider = provider.discover_context_management();
+        eprintln!("catalog lookup elapsed={:?}", started.elapsed());
+        assert!(provider.context_management().window.is_some());
     }
 
     #[test]
@@ -3709,7 +3741,7 @@ mod retry_policy_tests {
     fn public_operational_settings_are_validated_defensively() {
         let defaults = ProviderSettings::default();
         assert_eq!(defaults.connect_timeout_seconds, 10);
-        assert_eq!(defaults.context_discovery_timeout_seconds, 2);
+        assert_eq!(defaults.context_discovery_timeout_seconds, 10);
         assert_eq!(defaults.fallback_call_timeout_seconds, 600);
         assert!(OpenAiProvider::validate_operational_settings(&defaults).is_ok());
         for settings in [

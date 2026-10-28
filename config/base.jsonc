@@ -5,7 +5,8 @@
     // (1..3600); the final delay repeats until cancellation or deadline.
     "provider": {
       "connect_timeout_seconds": 10,
-      "context_discovery_timeout_seconds": 2,
+      // Remote model catalogs can be several megabytes; allow time to download.
+      "context_discovery_timeout_seconds": 10,
       "fallback_call_timeout_seconds": 600,
       "retry_backoff_seconds": [1, 2, 5, 10, 30, 60]
     },

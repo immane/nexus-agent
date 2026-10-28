@@ -982,8 +982,9 @@ impl Runtime {
             .rev()
             .filter(|exchange| exchange.session == command.session)
             .find_map(|exchange| exchange.derived_memory.clone());
+        let (context_management, discovery) = self.shared.provider.context_management_for_run();
         state.active = Some(ActiveRun {
-            context_management: self.shared.provider.context_management(),
+            context_management,
             derived_memory,
             pending_compaction: None,
             input_estimate: 0,
@@ -1048,7 +1049,7 @@ impl Runtime {
         let request = command.request.clone();
         tokio::spawn(async move {
             admitting
-                .complete_admission(command, run, source_input, already_initialized)
+                .complete_admission(command, run, source_input, already_initialized, discovery)
                 .await
         })
         .await
@@ -1061,6 +1062,7 @@ impl Runtime {
         run: RunId,
         source_input: ModelContextItem,
         already_initialized: bool,
+        discovery: Option<nexus_core::ContextWindowDiscovery>,
     ) -> CommandResponse {
         // Reserve the active slot before I/O, but never hold the state lock
         // while waiting for the blocking store. Concurrent commands stay live.
@@ -1100,7 +1102,7 @@ impl Runtime {
             let inner = {
                 let driver = driver.clone();
                 let run = run_for_task.clone();
-                tokio::spawn(async move { driver.drive(run).await })
+                tokio::spawn(async move { driver.drive(run, discovery).await })
             };
             if let Err(join) = inner.await {
                 driver.on_driver_failure(&run_for_task, join).await;
@@ -1340,7 +1342,7 @@ impl Runtime {
         CommandResponse::new(request.clone(), CommandReply::StaleOrUnknownTarget, None)
     }
 
-    async fn drive(&self, run: RunId) {
+    async fn drive(&self, run: RunId, discovery: Option<nexus_core::ContextWindowDiscovery>) {
         let request = {
             let state = self.shared.state.lock().await;
             match state.active.as_ref() {
@@ -1355,6 +1357,26 @@ impl Runtime {
         {
             self.finish_run(&run, RunOutcome::Cancelled, None).await;
             return;
+        }
+        // The operation owns its admission snapshot. Retain the run until it
+        // returns so cancellation cannot release a slot with work still active.
+        if let Some(discovery) = discovery {
+            let window = match tokio::task::spawn_blocking(discovery).await {
+                Ok(settings) => settings,
+                Err(_) => {
+                    let terminal = Terminal::failed_internal("context discovery worker failed");
+                    self.finish_run(&run, terminal.outcome, terminal.error)
+                        .await;
+                    return;
+                }
+            };
+            let mut state = self.shared.state.lock().await;
+            let Some(active) = state.active.as_mut().filter(|active| active.run == run) else {
+                return;
+            };
+            if active.context_management.window.is_none() {
+                active.context_management.window = window;
+            }
         }
         let (outcome, error) = self.run_loop(&run).await;
         self.finish_run(&run, outcome, error).await;

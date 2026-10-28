@@ -297,7 +297,7 @@ with valid immutable references. See the [benchmark run notes](docs/research/age
 for image preparation and workspace requirements. There is no benchmark-specific
 config option, environment variable, or reserved file name. Provider sections
 include `connect_timeout_seconds` (10),
-`context_discovery_timeout_seconds` (2), `fallback_call_timeout_seconds` (600),
+`context_discovery_timeout_seconds` (10), `fallback_call_timeout_seconds` (600),
 and `retry_backoff_seconds` ([1, 2, 5, 10, 30, 60]). Frontend presentation
 overrides belong in top-level `tui`, `defaults.tui`, or `profiles.tui.tui`; nested partial
 overrides inherit previous values. Unknown fields, invalid types, duplicate
@@ -465,6 +465,10 @@ unknown model leaves the window unknown. Discovered limits are held in memory,
 not written into the user config; catalog metadata does not guarantee the
 serving instance's effective limit. Set an explicit limit when the service
 requires a different one. Ollama uses its own model metadata.
+Catalog discovery uses `context_discovery_timeout_seconds` (10 seconds by
+default); an explicit shorter timeout remains in effect. TUI diagnostics record
+the lookup outcome, elapsed time and discovered window, without credentials or
+response contents.
 Zero, explicit null, and invalid types are rejected.
 
 TUI/server pass these settings through the provider interface; the runtime

@@ -916,7 +916,7 @@ impl SessionRegistry {
 struct PerRunProvider {
     capabilities: ProviderCapabilities,
     binding: LiveHandle,
-    discovered_context: Mutex<HashMap<String, nexus_core::ContextWindow>>,
+    discovered_context: Arc<Mutex<HashMap<String, nexus_core::ContextWindow>>>,
     current: Mutex<PerRunState>,
 }
 
@@ -951,7 +951,7 @@ impl PerRunProvider {
         Self {
             capabilities: tui_provider_capabilities(),
             binding,
-            discovered_context: Mutex::new(HashMap::new()),
+            discovered_context: Arc::new(Mutex::new(HashMap::new())),
             current: Mutex::new(PerRunState {
                 run: None,
                 provider: ActiveProvider::Fake(FakeProvider::demo_two_turn()),
@@ -966,14 +966,23 @@ impl ProviderPort for PerRunProvider {
     }
 
     fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        self.context_management_for_run().0
+    }
+
+    fn context_management_for_run(
+        &self,
+    ) -> (
+        nexus_core::ContextManagementSettings,
+        Option<nexus_core::ContextWindowDiscovery>,
+    ) {
         let selection_info = {
             let binding = self.binding.lock().expect("live selection lockable");
             let selection = binding.pending_run.as_deref().unwrap_or(&binding);
             let Some(model_id) = selection.active_model.as_deref() else {
-                return nexus_core::ContextManagementSettings::default();
+                return (nexus_core::ContextManagementSettings::default(), None);
             };
             let Some(entry) = selection.config.model(model_id) else {
-                return nexus_core::ContextManagementSettings::default();
+                return (nexus_core::ContextManagementSettings::default(), None);
             };
             // Invalid selections fail explicitly when resolving the live adapter;
             // no window or policy is inferred for an unavailable model.
@@ -982,7 +991,7 @@ impl ProviderPort for PerRunProvider {
                 .context_management_for(&entry.provider, Some(model_id))
                 .unwrap_or_default();
             let Some(profile) = selection.config.provider(&entry.provider) else {
-                return settings;
+                return (settings, None);
             };
             (
                 settings,
@@ -1003,7 +1012,7 @@ impl ProviderPort for PerRunProvider {
         };
         let (mut settings, cache_key, profile, model_name, provider_settings) = selection_info;
         if settings.window.is_some() {
-            return settings;
+            return (settings, None);
         }
         if let Some(window) = self
             .discovered_context
@@ -1013,31 +1022,32 @@ impl ProviderPort for PerRunProvider {
             .copied()
         {
             settings.window = Some(window);
-            return settings;
+            return (settings, None);
         }
         let Ok(adapter) = OpenAiProvider::from_profile(&profile, &model_name)
             .and_then(|adapter| adapter.with_operational_settings(&provider_settings))
         else {
-            return settings;
+            return (settings, None);
         };
         let adapter = adapter.with_context_management(settings);
-        if let Some(window) = adapter
-            .supports_context_discovery()
-            .then(|| {
-                adapter
-                    .discover_context_management()
-                    .context_management()
-                    .window
-            })
-            .flatten()
-        {
-            self.discovered_context
-                .lock()
-                .expect("discovered context lockable")
-                .insert(cache_key, window);
-            settings.window = Some(window);
+        if !adapter.supports_context_discovery() {
+            return (settings, None);
         }
-        settings
+        let cache = self.discovered_context.clone();
+        let discover = Box::new(move || {
+            let window = adapter
+                .discover_context_management()
+                .context_management()
+                .window;
+            if let Some(window) = window {
+                cache
+                    .lock()
+                    .expect("discovered context lockable")
+                    .insert(cache_key, window);
+            }
+            window
+        });
+        (settings, Some(discover))
     }
 
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
@@ -7140,6 +7150,99 @@ mod cov_main_topup {
         assert_eq!(user_line_count(&front), 1, "the draft is recorded once");
     }
 
+    struct BlockedDiscovery {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl ProviderPort for BlockedDiscovery {
+        fn capabilities(&self) -> ProviderCapabilities {
+            tui_provider_capabilities()
+        }
+
+        fn context_management_for_run(
+            &self,
+        ) -> (
+            nexus_core::ContextManagementSettings,
+            Option<nexus_core::ContextWindowDiscovery>,
+        ) {
+            let started = self.started.lock().unwrap().take().unwrap();
+            let release = self.release.lock().unwrap().take().unwrap();
+            (
+                Default::default(),
+                Some(Box::new(move || {
+                    started.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    None
+                })),
+            )
+        }
+
+        fn stream(&self, _: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
+            panic!("cancelled run must not call the model")
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_discovery_keeps_submit_input_and_cancel_responsive() {
+        let (started, discovery_started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockedDiscovery {
+            started: Mutex::new(Some(started)),
+            release: Mutex::new(Some(blocked)),
+        });
+        let config = RuntimeConfig {
+            limits: tui_runtime_limits(),
+            policy: Policy::m0_test(),
+            has_approval_handler: true,
+        };
+        let (runtime, mut streams) = Runtime::try_new(config, provider, vec![]).unwrap();
+        let mut front = Frontend::new(session());
+        type_draft(&mut front, "first");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_key(&mut front, &runtime, press(KeyCode::Enter)),
+        )
+        .await
+        .expect("submit must not wait for discovery");
+        let run = front.merger.active_run().unwrap().clone();
+        assert_eq!(front.state.composer(), "");
+        assert_eq!(user_line_count(&front), 1);
+        tokio::time::timeout(Duration::from_secs(1), discovery_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        type_draft(&mut front, "second");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_key(&mut front, &runtime, press(KeyCode::Enter)),
+        )
+        .await
+        .expect("busy submit must not wait for discovery");
+        assert_eq!(front.state.composer(), "second");
+        assert_eq!(user_line_count(&front), 1);
+        let command = cancel_command(front.next_request(), &run);
+        let response = tokio::time::timeout(Duration::from_secs(1), runtime.handle(command))
+            .await
+            .expect("cancel must not wait for discovery")
+            .0;
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        assert_eq!(front.state.composer(), "second");
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    assert_eq!(finished.outcome(), nexus_core::RunOutcome::Cancelled);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("cancelled run finishes after discovery returns");
+    }
+
     /// Types a full draft one char at a time, like the key handler would.
     fn type_draft(front: &mut Frontend, text: &str) {
         front.focus = Focus::Composer;
@@ -8876,6 +8979,34 @@ mod cov_live_wiring {
             provider.context_management(),
             nexus_core::ContextManagementSettings::default()
         );
+    }
+
+    #[test]
+    fn discovery_is_prepared_from_the_pending_model_not_the_current_selection() {
+        let mut selected = selection_with(Some("m0"));
+        selected.config = UserConfig::from_json(
+            r#"{
+            "revision": 2,
+            "providers": [{
+                "id": "demo-provider", "display_name": "Demo", "adapter": "direct",
+                "protocol": "chat_completions", "endpoint": "http://ollama.invalid/v1",
+                "credential": {"env": "NEXUS_TUI_TEST_KEY"}, "default_model": "demo-model"
+            }],
+            "models": [{"id": "m0", "provider": "demo-provider", "name": "demo-model"}],
+            "favourites": [], "recent": []
+        }"#,
+        )
+        .unwrap();
+        let mut current = selected.clone();
+        current.active_model = None;
+        current.pending_run = Some(Box::new(selected));
+        let binding = Arc::new(Mutex::new(current));
+        let provider = PerRunProvider::live(binding.clone());
+        let (settings, discovery) = provider.context_management_for_run();
+        assert!(settings.window.is_none());
+        assert!(discovery.is_some(), "pending model owns discovery");
+        binding.lock().unwrap().pending_run = None;
+        assert!(provider.context_management_for_run().1.is_none());
     }
 
     #[test]
