@@ -268,6 +268,47 @@ fn valid_startup_selection(
     !(execution == ExecutionMode::Local && (gateway_image.is_some() || workload_image.is_some()))
 }
 
+struct ServerLaunchOptions {
+    port: u16,
+    tools_real: bool,
+    strict_tools: bool,
+    tools_root: Option<String>,
+    auth_token_env: Option<String>,
+    session_store: Option<String>,
+    execution: ExecutionMode,
+}
+
+struct CliLaunchOptions {
+    port: Option<u16>,
+    tools: Option<nexus_config::ServerToolsMode>,
+    strict_tools: bool,
+    tools_root: Option<String>,
+    auth_token_env: Option<String>,
+    session_store: Option<String>,
+    execution: Option<ExecutionMode>,
+}
+
+fn resolve_launch_options(
+    cli: CliLaunchOptions,
+    launch: &nexus_config::LaunchSettings,
+) -> ServerLaunchOptions {
+    ServerLaunchOptions {
+        port: cli.port.or(launch.server_port).unwrap_or(DEFAULT_PORT),
+        tools_real: cli
+            .tools
+            .or(launch.server_tools)
+            .is_some_and(|mode| mode == nexus_config::ServerToolsMode::Real),
+        strict_tools: cli.strict_tools || launch.strict_tools.unwrap_or(false),
+        tools_root: cli.tools_root.or_else(|| launch.tools_root.clone()),
+        auth_token_env: cli.auth_token_env.or_else(|| launch.auth_token_env.clone()),
+        session_store: cli.session_store.or_else(|| launch.session_store.clone()),
+        execution: cli.execution.unwrap_or(match launch.execution {
+            Some(nexus_config::ExecutionMode::Container) => ExecutionMode::Container,
+            Some(nexus_config::ExecutionMode::Local) | None => ExecutionMode::Local,
+        }),
+    }
+}
+
 /// Loads the user configuration at startup.
 ///
 /// A missing file is not an error: the server starts on
@@ -370,19 +411,26 @@ fn main() {
         println!("{}", nexus_config::settings_json(&settings));
         std::process::exit(0);
     }
-    let launch = settings.launch();
-    let port = port.or(launch.server_port).unwrap_or(DEFAULT_PORT);
-    let tools_real = tools
-        .or(launch.server_tools)
-        .is_some_and(|mode| mode == nexus_config::ServerToolsMode::Real);
-    let strict_tools = strict_tools || launch.strict_tools.unwrap_or(false);
-    let tools_root = tools_root.or_else(|| launch.tools_root.clone());
-    let auth_token_env = auth_token_env.or_else(|| launch.auth_token_env.clone());
-    let session_store = session_store.or_else(|| launch.session_store.clone());
-    let execution = execution.unwrap_or(match launch.execution {
-        Some(nexus_config::ExecutionMode::Container) => ExecutionMode::Container,
-        Some(nexus_config::ExecutionMode::Local) | None => ExecutionMode::Local,
-    });
+    let ServerLaunchOptions {
+        port,
+        tools_real,
+        strict_tools,
+        tools_root,
+        auth_token_env,
+        session_store,
+        execution,
+    } = resolve_launch_options(
+        CliLaunchOptions {
+            port,
+            tools,
+            strict_tools,
+            tools_root,
+            auth_token_env,
+            session_store,
+            execution,
+        },
+        settings.launch(),
+    );
     let gateway_image = gateway_image.or_else(|| {
         (execution == ExecutionMode::Container)
             .then(|| config.gateway_image().map(str::to_owned))
@@ -649,8 +697,8 @@ mod cov_main_args {
 
     use super::{
         BENCHMARK_MAX_MODEL_TURNS, BENCHMARK_MAX_TOOL_CALLS, BENCHMARK_MAX_TOOL_CALLS_PER_TURN,
-        BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, DEFAULT_PORT, ExecutionMode, parse_args,
-        valid_startup_selection,
+        BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, CliLaunchOptions, DEFAULT_PORT, ExecutionMode,
+        parse_args, resolve_launch_options, valid_startup_selection,
     };
     use nexus_core::Limits;
 
@@ -773,6 +821,64 @@ mod cov_main_args {
         // Pin the advertised default so a constant change is a deliberate,
         // reviewable edit rather than a silent contract drift.
         assert_eq!(DEFAULT_PORT, 8471);
+    }
+
+    #[test]
+    fn cli_values_override_launch_defaults_without_weakening_strict_tools() {
+        let launch = nexus_config::LaunchSettings {
+            execution: Some(nexus_config::ExecutionMode::Container),
+            strict_tools: Some(true),
+            tools_root: Some("configured-root".into()),
+            server_port: Some(9300),
+            server_tools: Some(nexus_config::ServerToolsMode::Real),
+            session_store: Some("configured-store".into()),
+            auth_token_env: Some("CONFIG_TOKEN".into()),
+        };
+        let configured = resolve_launch_options(
+            CliLaunchOptions {
+                port: None,
+                tools: None,
+                strict_tools: false,
+                tools_root: None,
+                auth_token_env: None,
+                session_store: None,
+                execution: None,
+            },
+            &launch,
+        );
+        assert_eq!(configured.port, 9300);
+        assert!(configured.tools_real);
+        assert!(configured.strict_tools);
+        assert_eq!(configured.tools_root.as_deref(), Some("configured-root"));
+        assert_eq!(configured.auth_token_env.as_deref(), Some("CONFIG_TOKEN"));
+        assert_eq!(
+            configured.session_store.as_deref(),
+            Some("configured-store")
+        );
+        assert_eq!(configured.execution, ExecutionMode::Container);
+
+        let explicit = resolve_launch_options(
+            CliLaunchOptions {
+                port: Some(9400),
+                tools: Some(nexus_config::ServerToolsMode::Fake),
+                strict_tools: false,
+                tools_root: Some("cli-root".into()),
+                auth_token_env: Some("CLI_TOKEN".into()),
+                session_store: Some("cli-store".into()),
+                execution: Some(ExecutionMode::Local),
+            },
+            &launch,
+        );
+        assert_eq!(explicit.port, 9400);
+        assert!(!explicit.tools_real);
+        assert!(
+            explicit.strict_tools,
+            "CLI/config strict mode must not be weakened"
+        );
+        assert_eq!(explicit.tools_root.as_deref(), Some("cli-root"));
+        assert_eq!(explicit.auth_token_env.as_deref(), Some("CLI_TOKEN"));
+        assert_eq!(explicit.session_store.as_deref(), Some("cli-store"));
+        assert_eq!(explicit.execution, ExecutionMode::Local);
     }
 
     #[test]

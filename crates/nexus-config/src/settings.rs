@@ -1225,6 +1225,15 @@ mod tests {
         let output: Value = serde_json::from_str(&settings_json(&settings)).unwrap();
         assert_eq!(output["launch"]["auth_token_env"], "NEXUS_TOKEN");
         assert!(output["launch"].get("token").is_none());
+        apply_layer(
+            &mut settings,
+            r#"{"revision":1,"profiles":{"tui":{"launch":{"execution":null,"strict_tools":null,"server_port":null}}}}"#,
+            SettingsProfile::Tui,
+        )
+        .unwrap();
+        assert_eq!(settings.launch.execution, Some(ExecutionMode::Container));
+        assert_eq!(settings.launch.strict_tools, Some(true));
+        assert_eq!(settings.launch.server_port, Some(9000));
 
         for invalid in [
             r#"{"revision":1,"defaults":{"launch":{"execution":"remote"}}}"#,
