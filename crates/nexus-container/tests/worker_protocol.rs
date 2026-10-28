@@ -7,8 +7,8 @@ use std::io::Cursor;
 #[test]
 fn rejects_duplicate_keys_even_when_nested() {
     for input in [
-        r#"{"version":1,"operation":"host_read","arguments":{"path":"a","path":"b"},"output_limit":10}"#,
-        r#"{"version":1,"operation":"host_read","arguments":{"path":"a","nested":{"x":1,"x":2}},"output_limit":10}"#,
+        r#"{"version":2,"operation":"host_read","arguments":{"path":"a","path":"b"},"output_limit":10,"tools":{"list_entry_limit":1,"search_file_bytes":1}}"#,
+        r#"{"version":2,"operation":"host_read","arguments":{"path":"a","nested":{"x":1,"x":2}},"output_limit":10,"tools":{"list_entry_limit":1,"search_file_bytes":1}}"#,
     ] {
         assert!(matches!(
             read_request(&mut Cursor::new(input)),
@@ -20,8 +20,8 @@ fn rejects_duplicate_keys_even_when_nested() {
 #[test]
 fn requires_exact_operation_arguments_and_workspace_lexical_scope() {
     for input in [
-        r#"{"version":1,"operation":"host_read","arguments":{"path":"a","other":1},"output_limit":10}"#,
-        r#"{"version":1,"operation":"host_write","arguments":{"path":"a"},"output_limit":10}"#,
+        r#"{"version":2,"operation":"host_read","arguments":{"path":"a","other":1},"output_limit":10,"tools":{"list_entry_limit":1,"search_file_bytes":1}}"#,
+        r#"{"version":2,"operation":"host_write","arguments":{"path":"a"},"output_limit":10,"tools":{"list_entry_limit":1,"search_file_bytes":1}}"#,
     ] {
         assert!(read_request(&mut Cursor::new(input)).is_err());
     }
@@ -46,8 +46,7 @@ fn response_expansion_is_bounded_before_writing() {
 #[test]
 fn read_pagination_round_trips_and_remains_closed_and_jailed() {
     let arguments = json!({"path":"sub/file", "offset":8192, "limit":16384});
-    let wire =
-        json!({"version":1,"operation":"host_read","arguments":arguments,"output_limit":20000});
+    let wire = json!({"version":2,"operation":"host_read","arguments":arguments,"output_limit":20000,"tools":{"list_entry_limit":10000,"search_file_bytes":1048576}});
     let request = read_request(&mut Cursor::new(wire.to_string())).unwrap();
     assert_eq!(request.arguments, arguments);
     assert!(validate_workspace_paths(&request.operation, &request.arguments).is_ok());
@@ -61,8 +60,7 @@ fn read_pagination_round_trips_and_remains_closed_and_jailed() {
         json!({"path":"a","limit":"10"}),
         json!({"path":"a","offset":0,"extra":true}),
     ] {
-        let wire =
-            json!({"version":1,"operation":"host_read","arguments":arguments,"output_limit":20000});
+        let wire = json!({"version":2,"operation":"host_read","arguments":arguments,"output_limit":20000,"tools":{"list_entry_limit":10000,"search_file_bytes":1048576}});
         assert!(
             read_request(&mut Cursor::new(wire.to_string())).is_err(),
             "{arguments}"

@@ -1,0 +1,26 @@
+{
+  // An ordinary partial layer; any filename works with the base/overlay flags.
+  "revision": 1,
+  "defaults": {
+    "runtime": {
+      "max_model_turns_per_run": 500,
+      "max_tool_calls_per_run": 4096,
+      "max_tool_calls_per_turn": 64,
+      "run_timeout_seconds": 86400,
+      "tool_timeout_seconds": 3600,
+      "retained_context_items": 8192,
+      "max_arg_assembly_bytes": 65536,
+      "max_tool_output_bytes": 262144,
+      "event_data_capacity": 1024,
+      "event_control_capacity": 128,
+      "max_concurrent_ops": 8,
+      "approval_expiry_seconds": 120
+    },
+    "provider": {
+      "connect_timeout_seconds": 10,
+      "context_discovery_timeout_seconds": 10,
+      "fallback_call_timeout_seconds": 600,
+      "retry_backoff_seconds": [1, 2, 5, 10, 30, 60]
+    }
+  }
+}

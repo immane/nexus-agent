@@ -1,6 +1,6 @@
 [package]
 name = "nexus-container"
-version = "0.2.3-alpha"
+version = "0.2.4-alpha"
 edition = "2024"
 autotests = false
 
@@ -24,6 +24,7 @@ name = "behavior"
 path = "tests/behavior.rs"
 
 [dependencies]
+nexus-config = { path = "../nexus-config" }
 nexus-core = { path = "../nexus-core" }
 nexus-tools = { path = "../nexus-tools" }
 serde = "1"

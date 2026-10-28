@@ -150,7 +150,7 @@ class CleanupTests(unittest.TestCase):
 
 class WorkerPreflightTests(unittest.TestCase):
     def response(self, **changes):
-        return json.dumps({"version": 1, "result": {"status": "Succeeded", "effect": "KnownNotApplied",
+        return json.dumps({"version": 2, "result": {"status": "Succeeded", "effect": "KnownNotApplied",
                           "content": "[more; next_offset=5]\naaaa", "truncated": True, **changes}})
 
     def test_paged_read_is_checked_without_model_calls_or_workspace_writes(self):
@@ -159,9 +159,12 @@ class WorkerPreflightTests(unittest.TestCase):
             evidence = swebench.verify_worker(owner(), row())
         self.assertTrue(evidence["verified"])
         self.assertTrue(evidence["paged_read"])
+        self.assertEqual(evidence["protocol_version"], 2)
         self.assertEqual(run.call_args.args[0], ["docker", "exec", "--interactive", "--workdir", "/workspace",
                                                 owner()["workload_id"], "/usr/local/bin/container-worker"])
         frame = json.loads(run.call_args.kwargs["input"])
+        self.assertEqual(frame["version"], 2)
+        self.assertEqual(frame["tools"], {"list_entry_limit": 10000, "search_file_bytes": 1048576})
         self.assertEqual(frame["operation"], "host_read")
         self.assertEqual(frame["arguments"], {"path": "/workspace/.git/HEAD", "offset": 1, "limit": 4})
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
@@ -169,7 +172,8 @@ class WorkerPreflightTests(unittest.TestCase):
     def test_old_worker_rejection_and_invalid_responses_block_inference(self):
         for code, output in [(2, ""), (0, "not JSON"), (0, self.response(content="whole file")),
                              (0, self.response(status="Failed")), (0, self.response(truncated=False)),
-                             (0, '{"version":2}')]:
+                              (0, '{"version":2}'),
+                              (0, json.dumps({**json.loads(self.response()), "version": 1}))]:
             with self.subTest(code=code, output=output), \
                     patch.object(swebench.subprocess, "run", return_value=SimpleNamespace(returncode=code, stdout=output)), \
                     self.assertRaisesRegex(RuntimeError, "rebuild the task adapter image.*no inference started"):

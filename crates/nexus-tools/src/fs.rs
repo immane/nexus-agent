@@ -30,6 +30,17 @@ pub fn valid_read_arguments(value: &serde_json::Value) -> bool {
     read_page(value).is_some()
 }
 
+fn nonnegative_integer(value: &serde_json::Value) -> Option<u64> {
+    if let Some(integer) = value.as_u64() {
+        return Some(integer);
+    }
+    let number = value.as_f64()?;
+    // i64::MAX rounds up to 2^63 as f64; an exclusive bound avoids
+    // accepting an out-of-range float through a saturating cast.
+    ((0.0..9_223_372_036_854_775_808.0).contains(&number) && number.fract() == 0.0)
+        .then_some(number as u64)
+}
+
 fn read_page(value: &serde_json::Value) -> Option<(u64, usize)> {
     let object = value.as_object()?;
     if !object.get("path")?.is_string()
@@ -40,11 +51,11 @@ fn read_page(value: &serde_json::Value) -> Option<(u64, usize)> {
         return None;
     }
     let offset = match object.get("offset") {
-        Some(value) => value.as_u64()?,
+        Some(value) => nonnegative_integer(value)?,
         None => 0,
     };
     let limit = match object.get("limit") {
-        Some(value) => usize::try_from(value.as_u64()?).ok()?,
+        Some(value) => usize::try_from(nonnegative_integer(value)?).ok()?,
         None => 8192,
     };
     (offset <= i64::MAX as u64 && (4..=16384).contains(&limit)).then_some((offset, limit))
@@ -342,6 +353,7 @@ pub struct ScopedLister {
     access: BoundRoot,
     spec: ToolSpec,
     protected: Option<nexus_permissions::DirectoryPolicy>,
+    entry_limit: usize,
 }
 
 impl ScopedLister {
@@ -361,7 +373,19 @@ impl ScopedLister {
             access,
             spec,
             protected: None,
+            entry_limit: LIST_ENTRY_LIMIT,
         })
+    }
+    /// Applies validated operational ceilings without changing the jail or policy.
+    pub fn with_settings(
+        mut self,
+        settings: &nexus_config::ToolsSettings,
+    ) -> Result<Self, AgentError> {
+        settings
+            .validate()
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tools settings are invalid"))?;
+        self.entry_limit = settings.list_entry_limit;
+        Ok(self)
     }
     pub(crate) fn with_protected_paths(
         mut self,
@@ -399,26 +423,23 @@ impl ScopedLister {
             .access
             .open_directory(path)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
-        let mut iterator = rustix::fs::Dir::read_from(&directory)
+        let iterator = rustix::fs::Dir::read_from(&directory)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
-        while entries.len() < LIST_ENTRY_LIMIT {
-            match iterator.read() {
-                Some(Ok(entry)) => {
-                    if entry.file_name().to_bytes() != b"." && entry.file_name().to_bytes() != b".."
-                    {
-                        entries.push(entry);
-                    }
-                }
-                Some(Err(_)) => {
-                    return Err(tool_error(
-                        ErrorCategory::ToolFailure,
-                        "directory cannot be listed",
-                    ));
-                }
-                None => break,
+        let mut truncated = false;
+        for entry in iterator {
+            let entry = entry.map_err(|_| {
+                tool_error(ErrorCategory::ToolFailure, "directory cannot be listed")
+            })?;
+            if entry.file_name().to_bytes() == b"." || entry.file_name().to_bytes() == b".." {
+                continue;
             }
+            // Native enumeration can place dot entries after real children.
+            if entries.len() == self.entry_limit {
+                truncated = true;
+                break;
+            }
+            entries.push(entry);
         }
-        let mut truncated = entries.len() == LIST_ENTRY_LIMIT && iterator.read().is_some();
         entries.sort_by_key(|entry| entry.file_name().to_owned());
         let mut output = String::new();
         for entry in entries {
@@ -485,6 +506,7 @@ pub struct ScopedSearcher {
     access: BoundRoot,
     spec: ToolSpec,
     protected: Option<nexus_permissions::DirectoryPolicy>,
+    file_bytes: u64,
 }
 
 impl ScopedSearcher {
@@ -504,7 +526,19 @@ impl ScopedSearcher {
             access,
             spec,
             protected: None,
+            file_bytes: SEARCH_FILE_BYTES,
         })
+    }
+    /// Applies validated operational ceilings without changing the jail or policy.
+    pub fn with_settings(
+        mut self,
+        settings: &nexus_config::ToolsSettings,
+    ) -> Result<Self, AgentError> {
+        settings
+            .validate()
+            .map_err(|_| tool_error(ErrorCategory::InvalidInput, "tools settings are invalid"))?;
+        self.file_bytes = settings.search_file_bytes;
+        Ok(self)
     }
     pub(crate) fn with_protected_paths(
         mut self,
@@ -591,17 +625,23 @@ impl ScopedSearcher {
                 let Ok(file) = self.access.open_file(&path) else {
                     continue;
                 };
-                let mut limited = file.take(SEARCH_FILE_BYTES + 1);
+                let mut limited = file.take(self.file_bytes + 1);
                 let mut bytes = Vec::new();
                 if limited.read_to_end(&mut bytes).is_err() {
                     continue;
                 }
-                if bytes.len() as u64 > SEARCH_FILE_BYTES {
+                let file_truncated = bytes.len() as u64 > self.file_bytes;
+                if file_truncated {
                     truncated = true;
-                    bytes.truncate(SEARCH_FILE_BYTES as usize);
+                    bytes.truncate(self.file_bytes as usize);
                 }
-                let Ok(text) = std::str::from_utf8(&bytes) else {
-                    continue;
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(text) => text,
+                    Err(error) if file_truncated && error.error_len().is_none() => {
+                        std::str::from_utf8(&bytes[..error.valid_up_to()])
+                            .expect("validated UTF-8 prefix")
+                    }
+                    Err(_) => continue,
                 };
                 for (index, line) in text.lines().enumerate() {
                     if line.contains(query) {

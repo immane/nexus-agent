@@ -496,12 +496,24 @@ fn terminal_survives_data_saturation_while_usage_stays_bounded() {
         );
 
         // Control: RunStarted, request/response metadata, at most 16 provisional
-        // usage updates, final usage, the tool outcome pair, and the terminal.
+        // usage updates, final usage for each invocation, the tool outcome pair,
+        // and the terminal. Identical final counters from separate invocations
+        // must not be coalesced across requests.
         assert_eq!(
             control.len(),
-            25,
+            26,
             "usage updates are bounded while tool outcomes and terminal survive"
         );
+        let final_records: Vec<_> = control
+            .iter()
+            .filter_map(|event| match event.payload() {
+                EventPayload::UsageUpdated(usage) if usage.finality() == UsageFinality::Final => {
+                    Some(*usage)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(final_records, vec![Usage::new(None, None, UsageFinality::Final); 2]);
         let provisional_records: Vec<u64> = control
             .iter()
             .filter_map(|event| match event.payload() {
@@ -581,8 +593,8 @@ fn terminal_survives_data_saturation_while_usage_stays_bounded() {
             .collect();
         assert_eq!(
             after_drop.len(),
-            6,
-            "request metadata, final usage, tool outcome pair, and terminal follow the data-drop window"
+            7,
+            "request metadata, both invocations' final usage, tool outcome pair, and terminal follow the data-drop window"
         );
         assert_eq!(
             after_drop[0].seq(),

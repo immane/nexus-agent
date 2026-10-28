@@ -112,6 +112,18 @@ Building or smoke-testing this image does not approve it for secure agent
 sessions. Do not treat workspace mounts, worker dispatch, or successful runtime
 startup as evidence of isolation; native Linux validation remains outstanding.
 
+### Worker protocol compatibility
+
+The host and workload worker now use protocol version **2**. Every request
+includes mandatory `tools` budgets (`list_entry_limit` and `search_file_bytes`),
+validated against the same hard ceilings as local tools. Missing or invalid
+budgets and version-1 requests are rejected; older workers cannot silently ignore
+configured reductions. Rebuild the workload image from the same revision as the
+host using the command above, then select that rebuilt local image at startup.
+Startup does not pull or rebuild images automatically. This protocol change
+does not require rebuilding the gateway image and does not alter container
+permissions or networking policy.
+
 On a native Linux host only, an additional opt-in probe discovers interface and
 route CIDRs, binds a temporary listener exclusively to the Docker bridge
 gateway address, checks that an ordinary bridge container can reach it, and

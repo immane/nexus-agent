@@ -1,0 +1,116 @@
+{
+  "revision": 1,
+  "defaults": {
+    // Timeouts: seconds (1..86400). Retry delays: nondecreasing seconds
+    // (1..3600); the final delay repeats until cancellation or deadline.
+    "provider": {
+      "connect_timeout_seconds": 10,
+      // Remote model catalogs can be several megabytes; allow time to download.
+      "context_discovery_timeout_seconds": 10,
+      "fallback_call_timeout_seconds": 600,
+      "retry_backoff_seconds": [1, 2, 5, 10, 30, 60]
+    },
+    // Tool budgets are downward-only caps, applied to host and container tools.
+    "tools": {
+      "list_entry_limit": 10000,
+      "search_file_bytes": 1048576
+    },
+    // Server admission caps: 1..64 connections, 1..128 sessions.
+    // Idle expiry and cleanup intervals are seconds (1..86400).
+    "server": {
+      "max_connections": 64,
+      "max_sessions": 128,
+      "session_idle_seconds": 1800,
+      "session_cleanup_interval_seconds": 60
+    },
+    "launch": {
+      // CLI flags override these defaults. Container mode requires immutable
+      // image references, configured in provider/model config.json or CLI.
+      "execution": "local",
+      "strict_tools": false,
+      "server_port": 8471,
+      "server_tools": "fake"
+    }
+  },
+  "tui": {
+    // Colors: default, snake_case ANSI names, #RRGGBB, or index:0..255.
+    "theme": {
+      "foreground": "default",
+      "background": "default",
+      "accent": "green",
+      "warning": "yellow",
+      "danger": "red",
+      "info": "cyan",
+      "muted": "dark_gray",
+      "secondary": "gray",
+      "modal_background": "black",
+      "selected_background": "dark_gray",
+      "selected_text": "black",
+      "completion_text": "white",
+      "completion_match": "light_yellow",
+      "user_title": "light_green",
+      "assistant_title": "light_cyan",
+      "tool_title": "yellow",
+      "system_title": "dark_gray",
+      "markdown_code": "yellow",
+      "markdown_heading": "light_blue",
+      "markdown_link": "cyan",
+      "banner": ["#4ADE80", "#3FD074", "#34C269", "#2AB45E", "#20A854", "#16A34A"]
+    },
+    // Presentation limits do not change the model's context budget.
+    "display": {
+      "tool_preview_lines": 10,
+      "composer_max_rows": 5,
+      "picker_visible_rows": 10
+    },
+    "input": {
+      "mouse_capture": true,
+      "scroll_lines": 3,
+      // Clipboard modes: auto, system, osc52, disabled.
+      "clipboard": "auto",
+      "copy_on_select": true
+    },
+    "render": {
+      "redraw_interval_ms": 33,
+      // Blink half-period in milliseconds, using 50ms increments.
+      "caret_blink_interval_ms": 500
+    }
+  },
+  /* Runtime durations are seconds, *_bytes are byte budgets, and other
+     values count calls, items, events, or operations. Budgets must be positive.
+     Existing core/provider hard ceilings still apply. */
+  "profiles": {
+    "tui": {
+      "runtime": {
+        "max_model_turns_per_run": 64,
+        "max_tool_calls_per_run": 128,
+        "max_tool_calls_per_turn": 16,
+        "run_timeout_seconds": 3600,
+        "tool_timeout_seconds": 600,
+        "retained_context_items": 512,
+        "max_arg_assembly_bytes": 65536,
+        "max_tool_output_bytes": 262144,
+        "event_data_capacity": 1024,
+        "event_control_capacity": 128,
+        "max_concurrent_ops": 8,
+        "approval_expiry_seconds": 120
+      }
+    },
+    "server": {
+      "runtime": {
+        "max_model_turns_per_run": 8,
+        "max_tool_calls_per_run": 64,
+        "max_tool_calls_per_turn": 16,
+        "run_timeout_seconds": 3600,
+        "tool_timeout_seconds": 600,
+        "retained_context_items": 256,
+        "max_arg_assembly_bytes": 65536,
+        "max_tool_output_bytes": 262144,
+        "event_data_capacity": 1024,
+        "event_control_capacity": 128,
+        "max_concurrent_ops": 8,
+        "approval_expiry_seconds": 120
+      }
+    }
+  }
+}

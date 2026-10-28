@@ -35,6 +35,7 @@ pub struct ContainerFileTools<T> {
 /// One fixed-operation container-backed file tool.
 pub struct ContainerFileTool<T> {
     session: Arc<ContainerSession<T>>,
+    settings: nexus_config::ToolsSettings,
     operation: &'static str,
     spec: ToolSpec,
 }
@@ -53,12 +54,14 @@ pub(crate) fn container_file_tools_with_handler<T: WorkerTransport>(
     client: ContainerWorkerClient<T>,
     poison_handler: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> ContainerFileTools<T> {
+    let (transport, settings) = client.into_parts();
     let session = Arc::new(ContainerSession::with_poison_handler(
-        client.into_transport(),
+        transport,
         poison_handler,
     ));
     let port = |operation, description, schema| ContainerFileTool {
         session: Arc::clone(&session),
+        settings: settings.clone(),
         operation,
         spec: ToolSpec::new(
             ToolId::new(operation, M0_REVISION).expect("static tool identity builds"),
@@ -189,6 +192,7 @@ impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
         let cancelled = || context.is_cancelled();
         match ContainerWorkerClient::<T>::execute_using_controlled(
             &mut session.transport,
+            &self.settings,
             self.operation,
             &arguments,
             context.output_budget_bytes(),
@@ -372,7 +376,7 @@ mod tests {
         )
     }
     fn success() -> Vec<u8> {
-        br#"{"version":1,"result":{"status":"Succeeded","effect":"KnownApplied","content":"ok","truncated":false}}"#.to_vec()
+        br#"{"version":2,"result":{"status":"Succeeded","effect":"KnownApplied","content":"ok","truncated":false}}"#.to_vec()
     }
     fn setup(
         fail: bool,
@@ -407,6 +411,66 @@ mod tests {
             calls,
             operations,
         )
+    }
+
+    #[test]
+    fn factory_retains_reduced_settings_for_controlled_file_requests() {
+        struct Capture(Arc<Mutex<Vec<Value>>>);
+        impl WorkerTransport for Capture {
+            type Error = io::Error;
+            fn exchange(&mut self, _: &[u8], _: usize, _: Instant) -> Result<Vec<u8>, Self::Error> {
+                panic!("file ports must use controlled exchange")
+            }
+            fn exchange_controlled(
+                &mut self,
+                request: &[u8],
+                _: usize,
+                _: Instant,
+                _: &dyn Fn() -> bool,
+            ) -> Result<Vec<u8>, Self::Error> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(request).unwrap());
+                Ok(success())
+            }
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let settings = nexus_config::ToolsSettings {
+            list_entry_limit: 2,
+            search_file_bytes: 7,
+        };
+        let tools = container_file_tools(
+            ContainerWorkerClient::new(Capture(Arc::clone(&requests)))
+                .with_settings(&settings)
+                .unwrap(),
+        );
+        let ctx = context(
+            WORKSPACE_SCOPE,
+            false,
+            Instant::now() + Duration::from_secs(2),
+        );
+        for (tool, name) in [
+            (&tools.read, HOST_READ_TOOL),
+            (&tools.list, HOST_LIST_TOOL),
+            (&tools.search, HOST_SEARCH_TOOL),
+            (&tools.write, HOST_WRITE_TOOL),
+            (&tools.patch, HOST_PATCH_TOOL),
+        ] {
+            assert_eq!(
+                tool.execute(&call(name), &ctx).status(),
+                ExecutionStatus::Succeeded
+            );
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        for request in requests.iter() {
+            assert_eq!(request["version"], 2);
+            assert_eq!(
+                request["tools"],
+                serde_json::json!({"list_entry_limit":2,"search_file_bytes":7})
+            );
+        }
     }
 
     #[test]

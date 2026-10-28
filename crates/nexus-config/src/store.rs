@@ -6,7 +6,7 @@
 //! error). Saves are atomic (temporary file plus rename) with owner-only
 //! permissions on Unix.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -249,7 +249,7 @@ fn restrict_owner_only(_path: &Path) -> std::io::Result<()> {
 }
 
 /// Resolves a credential reference for the selected integration, reading
-/// the value only at use time. Missing or empty variables are safe
+/// the value only at use time. Missing or empty credentials are safe
 /// actionable failures; the value never enters an error or a log.
 pub fn resolve_credential(credential: &crate::model::CredentialRef) -> Result<String, ConfigError> {
     resolve_with(credential, |var| {
@@ -258,19 +258,74 @@ pub fn resolve_credential(credential: &crate::model::CredentialRef) -> Result<St
 }
 
 /// Resolves a credential through an injected lookup, so the missing/empty
-/// contract is testable without touching the process environment. `None`
+/// contract is testable without touching the process environment. Stored
+/// references use the credentials file instead of the injected lookup. `None`
 /// and empty values both fail; the looked-up value never enters an error.
 pub fn resolve_with(
     credential: &crate::model::CredentialRef,
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> Result<String, ConfigError> {
-    match lookup(credential.var_name()) {
+    let var = match credential {
+        crate::model::CredentialRef::EnvVar { var } => var,
+        crate::model::CredentialRef::Stored { provider } => {
+            let path = default_path()
+                .map(|path| path.with_file_name("credentials.json"))
+                .ok_or_else(missing_credential)?;
+            return resolve_stored_at(provider, &path);
+        }
+    };
+    match lookup(var) {
         Some(value) if !value.is_empty() => Ok(value),
-        _ => Err(ConfigError {
-            kind: ConfigErrorKind::MissingCredential,
-            message: "credential is not set",
-        }),
+        _ => Err(missing_credential()),
     }
+}
+
+fn missing_credential() -> ConfigError {
+    ConfigError {
+        kind: ConfigErrorKind::MissingCredential,
+        message: "credential is not set",
+    }
+}
+
+fn resolve_stored_at(provider: &str, path: &Path) -> Result<String, ConfigError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(missing_credential());
+        }
+        Err(_) => {
+            return Err(ConfigError {
+                kind: ConfigErrorKind::Io,
+                message: "credentials could not be read",
+            });
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_DOCUMENT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConfigError {
+            kind: ConfigErrorKind::Io,
+            message: "credentials could not be read",
+        })?;
+    if bytes.len() > MAX_DOCUMENT_BYTES {
+        return Err(invalid("credentials are too large"));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid("credentials are invalid"))?;
+    let document = nexus_validation::parse_object(text, MAX_DOCUMENT_BYTES)
+        .map_err(|_| invalid("credentials are invalid"))?;
+    let object = document
+        .as_object()
+        .ok_or(invalid("credentials are invalid"))?;
+    if !object.iter().all(|(id, value)| {
+        crate::model::is_id_text(id) && value.as_str().is_some_and(|key| !key.is_empty())
+    }) {
+        return Err(invalid("credentials are invalid"));
+    }
+    object
+        .get(provider)
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .ok_or_else(missing_credential)
 }
 
 /// Renders a redacted summary: identities, labels, references, and order,
@@ -286,7 +341,7 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "adapter": profile.adapter.name(),
                 "protocol": profile.protocol.name(),
                 "endpoint": profile.endpoint,
-                "credential": { "env": profile.credential.var_name() },
+                "credential": profile.credential.to_json(),
                 "default_model": profile.default_model,
             })
         }).collect::<Vec<_>>(),
@@ -300,4 +355,49 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
         "favourites": config.favourites(),
         "recent": config.recent(),
     })
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn stored_credentials_are_strict_bounded_and_read_on_demand() {
+        let path = std::env::temp_dir().join(format!(
+            "nexus-credentials-test-{}-{}",
+            std::process::id(),
+            SAVE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        assert_eq!(
+            resolve_stored_at("acme", &path).unwrap_err().kind(),
+            ConfigErrorKind::MissingCredential
+        );
+        std::fs::write(&path, r#"{"acme":"secret-one"}"#).unwrap();
+        assert_eq!(resolve_stored_at("acme", &path).unwrap(), "secret-one");
+        std::fs::write(&path, r#"{"acme":"secret-two"}"#).unwrap();
+        assert_eq!(resolve_stored_at("acme", &path).unwrap(), "secret-two");
+        assert_eq!(
+            resolve_stored_at("other", &path).unwrap_err().kind(),
+            ConfigErrorKind::MissingCredential
+        );
+        for text in [
+            r#"{"acme":"secret","acme":"other"}"#,
+            r#"{"bad id":"secret"}"#,
+            r#"{"acme":""}"#,
+            r#"{"acme":3}"#,
+            "[]",
+            "not-json",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let error = resolve_stored_at("acme", &path).unwrap_err();
+            assert_eq!(error.kind(), ConfigErrorKind::Invalid);
+            assert!(!error.to_string().contains("secret"));
+        }
+        std::fs::write(&path, vec![b' '; MAX_DOCUMENT_BYTES + 1]).unwrap();
+        assert_eq!(
+            resolve_stored_at("acme", &path).unwrap_err().kind(),
+            ConfigErrorKind::Invalid
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

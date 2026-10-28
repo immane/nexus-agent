@@ -1,6 +1,6 @@
 [package]
 name = "nexus-tui"
-version = "0.2.3-alpha"
+version = "0.2.4-alpha"
 edition = "2024"
 autotests = false
 
@@ -62,7 +62,7 @@ nexus-container = { path = "../nexus-container", optional = true }
 # Rationale: ratatui is the ONE terminal library for M0. Immediate-mode
 # rendering over a single crossterm backend covers the fixed composer,
 # bounded viewport, approval card, and footer with no extra fullscreen
-# framework (no multi-panel, theming, or marketplace layers). Version 0.26
+# framework (no multi-panel or marketplace layers). Version 0.26
 # matches the offline-cached crates. `default-features = false` plus only
 # the `crossterm` backend keeps the dependency closure minimal; crossterm
 # itself is reached solely through ratatui's re-export (`ratatui::crossterm`)
@@ -83,3 +83,4 @@ crossterm = { version = "0.27" }
 # channel types), `macros` (`select!` only). Mirrors nexus-runtime's set.
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
+serde_json = "1"

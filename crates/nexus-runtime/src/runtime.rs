@@ -53,7 +53,7 @@ use nexus_core::{
 use nexus_session::recover_session;
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::policy::Policy;
@@ -107,6 +107,7 @@ pub struct Runtime {
 }
 
 struct Shared {
+    local_reasoning: AtomicBool,
     diagnostic_writer: StdMutex<Option<Box<dyn std::io::Write + Send>>>,
     instructions: ModelInstructions,
     limits: Limits,
@@ -249,6 +250,7 @@ struct StreamedPrefix {
     /// Text already published per item, used to validate and append the
     /// authoritative batch suffix without replaying or hiding mismatches.
     text: HashMap<String, String>,
+    reasoning: String,
     /// Preview item keys already announced as `ToolCallPreview`.
     preview_keys: HashSet<String>,
     retained_bytes: usize,
@@ -693,6 +695,7 @@ impl Runtime {
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
+            local_reasoning: AtomicBool::new(false),
             diagnostic_writer: StdMutex::new(None),
             instructions,
             limits: config.limits,
@@ -748,6 +751,12 @@ impl Runtime {
     ) -> (Self, EventStreams) {
         Self::try_new(config, provider, tools)
             .expect("test-only runtime wiring must be valid; use Runtime::try_new in production")
+    }
+
+    /// Opt in to sensitive reasoning events on this runtime's local data stream.
+    /// Call only when that stream is owned by a trusted local presentation.
+    pub fn enable_local_reasoning(&self) {
+        self.shared.local_reasoning.store(true, Ordering::SeqCst);
     }
 
     /// Handles one typed frontend command, including explicit bounded history
@@ -982,8 +991,9 @@ impl Runtime {
             .rev()
             .filter(|exchange| exchange.session == command.session)
             .find_map(|exchange| exchange.derived_memory.clone());
+        let (context_management, discovery) = self.shared.provider.context_management_for_run();
         state.active = Some(ActiveRun {
-            context_management: self.shared.provider.context_management(),
+            context_management,
             derived_memory,
             pending_compaction: None,
             input_estimate: 0,
@@ -1048,7 +1058,7 @@ impl Runtime {
         let request = command.request.clone();
         tokio::spawn(async move {
             admitting
-                .complete_admission(command, run, source_input, already_initialized)
+                .complete_admission(command, run, source_input, already_initialized, discovery)
                 .await
         })
         .await
@@ -1061,6 +1071,7 @@ impl Runtime {
         run: RunId,
         source_input: ModelContextItem,
         already_initialized: bool,
+        discovery: Option<nexus_core::ContextWindowDiscovery>,
     ) -> CommandResponse {
         // Reserve the active slot before I/O, but never hold the state lock
         // while waiting for the blocking store. Concurrent commands stay live.
@@ -1100,7 +1111,7 @@ impl Runtime {
             let inner = {
                 let driver = driver.clone();
                 let run = run_for_task.clone();
-                tokio::spawn(async move { driver.drive(run).await })
+                tokio::spawn(async move { driver.drive(run, discovery).await })
             };
             if let Err(join) = inner.await {
                 driver.on_driver_failure(&run_for_task, join).await;
@@ -1340,7 +1351,7 @@ impl Runtime {
         CommandResponse::new(request.clone(), CommandReply::StaleOrUnknownTarget, None)
     }
 
-    async fn drive(&self, run: RunId) {
+    async fn drive(&self, run: RunId, discovery: Option<nexus_core::ContextWindowDiscovery>) {
         let request = {
             let state = self.shared.state.lock().await;
             match state.active.as_ref() {
@@ -1355,6 +1366,37 @@ impl Runtime {
         {
             self.finish_run(&run, RunOutcome::Cancelled, None).await;
             return;
+        }
+        // The operation owns its admission snapshot. Retain the run until it
+        // returns so cancellation cannot release a slot with work still active.
+        if let Some(discovery) = discovery {
+            let started = StdInstant::now();
+            let window = match tokio::task::spawn_blocking(discovery).await {
+                Ok(settings) => settings,
+                Err(_) => {
+                    let terminal = Terminal::failed_internal("context discovery worker failed");
+                    self.finish_run(&run, terminal.outcome, terminal.error)
+                        .await;
+                    return;
+                }
+            };
+            self.shared.diagnostic(format_args!(
+                "nexus-runtime: context discovery outcome={} elapsed_ms={} window_tokens={:?}",
+                if window.is_some() {
+                    "discovered"
+                } else {
+                    "unknown"
+                },
+                started.elapsed().as_millis(),
+                window.map(|window| window.tokens()),
+            ));
+            let mut state = self.shared.state.lock().await;
+            let Some(active) = state.active.as_mut().filter(|active| active.run == run) else {
+                return;
+            };
+            if active.context_management.window.is_none() {
+                active.context_management.window = window;
+            }
         }
         let (outcome, error) = self.run_loop(&run).await;
         self.finish_run(&run, outcome, error).await;
@@ -1419,7 +1461,7 @@ impl Runtime {
     }
 
     async fn on_calling_model(&self, run: &RunId) -> Result<RunState, Terminal> {
-        let (request, context, turn, deadline) = {
+        let (mut request, context, mut turn, deadline, mut started_payload) = {
             let mut state = self.shared.state.lock().await;
             let Some(active) = state.active.as_mut() else {
                 return Err(Terminal::cancelled());
@@ -1520,24 +1562,22 @@ impl Runtime {
             let raw_estimated_input_tokens = Some(estimator.raw_estimate(&request));
             let estimated_input_tokens = Some(estimator.estimate(&request));
             let estimate_scale_millis = estimator.scale_millis();
-            let outcome = emit_control(
-                &self.shared,
-                active,
-                run,
-                EventPayload::ModelRequestStarted {
-                    turn: turn.clone(),
-                    purpose,
-                    estimated_input_tokens,
-                    raw_estimated_input_tokens,
-                    estimate_scale_millis,
-                    context_window_tokens: window,
-                    context_trigger_percent: active.context_management.policy.trigger_percent(),
-                    context_target_percent: active.context_management.policy.target_percent(),
-                    compaction_strategy: active.context_management.policy.strategy(),
-                    max_output_tokens,
-                    projected_tool_outputs,
-                },
-            );
+            active.last_usage = None;
+            active.published_usage = None;
+            let started_payload = EventPayload::ModelRequestStarted {
+                turn: turn.clone(),
+                purpose,
+                estimated_input_tokens,
+                raw_estimated_input_tokens,
+                estimate_scale_millis,
+                context_window_tokens: window,
+                context_trigger_percent: active.context_management.policy.trigger_percent(),
+                context_target_percent: active.context_management.policy.target_percent(),
+                compaction_strategy: active.context_management.policy.strategy(),
+                max_output_tokens,
+                projected_tool_outputs,
+            };
+            let outcome = emit_control(&self.shared, active, run, started_payload.clone());
             apply_control_outcome(active, outcome);
             if let Some(outcome) = active.terminal {
                 return Err(Terminal {
@@ -1547,7 +1587,7 @@ impl Runtime {
             }
             let context = ProviderContext::new(active.started.elapsed(), active.cancelled, None)
                 .with_control(active.token.clone(), active.deadline);
-            (request, context, turn, active.deadline)
+            (request, context, turn, active.deadline, started_payload)
         };
         let (wake, token) = {
             let state = self.shared.state.lock().await;
@@ -1568,42 +1608,53 @@ impl Runtime {
             let provider = self.shared.provider.clone();
             let incremental = provider.supports_incremental_streaming();
             let (stream_tx, mut stream_rx) =
-                mpsc::channel::<ProviderEvent>(PROVISIONAL_STREAM_CAPACITY);
+                mpsc::channel::<(ProviderEvent, OwnedSemaphorePermit)>(PROVISIONAL_STREAM_CAPACITY);
             let stream_overflow = Arc::new(AtomicBool::new(false));
             let producer_overflow = stream_overflow.clone();
             let producer_token = token.clone();
-            let stream_bytes = Arc::new(AtomicUsize::new(0));
+            let stream_bytes = Arc::new(Semaphore::new(PROVISIONAL_STREAM_BYTE_CAPACITY));
             let producer_bytes = stream_bytes.clone();
+            let executor = tokio::runtime::Handle::current();
             let worker_context = context.clone();
-            let request = request.clone();
+            let worker_request = request.clone();
             let mut handle = tokio::task::spawn_blocking(move || {
                 if incremental {
                     let sink = |event: ProviderEvent| {
+                        if worker_context.check_active().is_err() {
+                            return;
+                        }
                         if !matches!(
                             &event,
-                            ProviderEvent::TextDelta { .. } | ProviderEvent::ToolCallDelta { .. }
+                            ProviderEvent::TextDelta { .. }
+                                | ProviderEvent::ReasoningDelta { .. }
+                                | ProviderEvent::ToolCallDelta { .. }
                         ) && !matches!(&event, ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional)
                         {
                             return;
                         }
                         let bytes = provisional_event_bytes(&event);
-                        let previous = producer_bytes.fetch_add(bytes, Ordering::SeqCst);
-                        if previous.saturating_add(bytes) > PROVISIONAL_STREAM_BYTE_CAPACITY {
-                            producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                        if bytes > PROVISIONAL_STREAM_BYTE_CAPACITY {
                             producer_overflow.store(true, Ordering::SeqCst);
                             producer_token.cancel();
                             return;
                         }
-                        if let Err(error) = stream_tx.try_send(event) {
-                            producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                            drop(error);
-                            producer_overflow.store(true, Ordering::SeqCst);
-                            producer_token.cancel();
-                        }
+                        // This sink runs on the blocking provider worker. Apply
+                        // backpressure at both bounds instead of cancelling a
+                        // valid response when the consumer briefly falls behind.
+                        executor.block_on(async {
+                            let Ok(permit) = producer_bytes
+                                .clone()
+                                .acquire_many_owned(bytes as u32)
+                                .await
+                            else {
+                                return;
+                            };
+                            let _ = stream_tx.send((event, permit)).await;
+                        });
                     };
-                    provider.stream_with_sink(&request, &worker_context, &sink)
+                    provider.stream_with_sink(&worker_request, &worker_context, &sink)
                 } else {
-                    provider.stream(&request, &worker_context)
+                    provider.stream(&worker_request, &worker_context)
                 }
             });
             let mut prefix = StreamedPrefix::default();
@@ -1617,9 +1668,9 @@ impl Runtime {
                     biased;
                     joined = &mut handle => break Some(joined),
                     streamed = stream_rx.recv() => {
-                            if let Some(event) = streamed {
-                                stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
-                                self.publish_provisional(run, &turn, event, &mut prefix)
+                        if let Some((event, permit)) = streamed {
+                            drop(permit);
+                            self.publish_provisional(run, &turn, event, &mut prefix)
                                 .await;
                         }
                     }
@@ -1632,6 +1683,11 @@ impl Runtime {
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break None,
                 }
             };
+            // Wake producers waiting on either bound before joining or
+            // quarantining them on cancellation/deadline. Buffered events can
+            // still be drained after a successful provider join.
+            stream_rx.close();
+            stream_bytes.close();
             return match joined {
                 Some(Ok(events)) => {
                     let mut effective_limits = self.shared.limits;
@@ -1689,7 +1745,7 @@ impl Runtime {
                     // The join may win the race while provisional events are
                     // still buffered: drain them first so every streamed prefix
                     // publishes before the authoritative batch ingests.
-                    self.drain_stream(run, &turn, &mut stream_rx, &stream_bytes, &mut prefix)
+                    self.drain_stream(run, &turn, &mut stream_rx, &mut prefix)
                         .await;
                     self.check_completed_stream_limits(
                         run,
@@ -1734,6 +1790,39 @@ impl Runtime {
                         };
                         if summary || (events.len() == 1 && prefix.event_count == 0) {
                             self.wait_provider_recovery(run, error.category()).await?;
+                            let mut state = self.shared.state.lock().await;
+                            let active = state
+                                .active
+                                .as_mut()
+                                .filter(|active| &active.run == run)
+                                .ok_or_else(Terminal::cancelled)?;
+                            if active.cancelled || token.is_cancelled() {
+                                return Err(Terminal::cancelled());
+                            }
+                            if StdInstant::now() >= deadline {
+                                return Err(Terminal::limit(
+                                    "run duration exhausted while recovering provider access",
+                                ));
+                            }
+                            let turn_n = active.turn_seq;
+                            active.turn_seq += 1;
+                            turn = TurnId::new(format!(
+                                "t{:x}-{}-{turn_n}",
+                                self.shared.incarnation, active.run_n
+                            ))
+                            .map_err(|_| Terminal::failed_internal("turn identity is invalid"))?;
+                            request = request.with_turn(turn.clone());
+                            // Usage belongs to an invocation, not its replacement.
+                            active.last_usage = None;
+                            active.published_usage = None;
+                            if let EventPayload::ModelRequestStarted { turn: identity, .. } =
+                                &mut started_payload
+                            {
+                                *identity = turn.clone();
+                            }
+                            let outcome =
+                                emit_control(&self.shared, active, run, started_payload.clone());
+                            apply_control_outcome(active, outcome);
                             continue;
                         }
                     }
@@ -1784,7 +1873,7 @@ impl Runtime {
                         return Err(Terminal::limit(if prefix.exceeded {
                             "provisional output budget exhausted"
                         } else {
-                            "provisional provider stream exceeded its bound"
+                            "provisional provider event exceeded its byte bound"
                         }));
                     }
                     let forced = {
@@ -1922,7 +2011,7 @@ impl Runtime {
         overflow: bool,
     ) -> Result<(), Terminal> {
         let message = if overflow {
-            "provisional provider stream exceeded its bound"
+            "provisional provider event exceeded its byte bound"
         } else if prefix.exceeded {
             "provisional output budget exhausted"
         } else {
@@ -1944,9 +2033,9 @@ impl Runtime {
     }
 
     /// Publishes one provisional provider event while its turn is still in
-    /// flight. Only presentation-safe prefixes publish here: text fragments
-    /// (flushed at once so the frontend updates now, not at the terminal),
-    /// call previews, and usage estimates. Candidates and terminals are
+    /// flight. Text, call previews and usage estimates publish immediately;
+    /// sensitive reasoning publishes only with explicit local opt-in.
+    /// Candidates and terminals are
     /// withheld by contract and arrive through the validated batch, so
     /// nothing streamed can dispatch work or conclude a turn early. Events
     /// for a stale, cancelled, or finished run publish nothing.
@@ -1983,6 +2072,18 @@ impl Runtime {
             return;
         }
         match event {
+            ProviderEvent::ReasoningDelta { text } => {
+                if !record_provisional(prefix, text.len(), self.shared.effective_output_budget) {
+                    active.data_dropped = true;
+                    prefix.exceeded = true;
+                    active.token.cancel();
+                    return;
+                }
+                prefix.reasoning.push_str(&text);
+                if active.pending_compaction.is_none() {
+                    emit_reasoning(&self.shared, active, run, turn, &text);
+                }
+            }
             ProviderEvent::TextDelta { item_key, text } => {
                 if !record_provisional(prefix, text.len(), self.shared.effective_output_budget)
                     || !record_identity(prefix, item_key.len())
@@ -2034,7 +2135,6 @@ impl Runtime {
             }
             ProviderEvent::ToolCallReady(_)
             | ProviderEvent::TurnFinished(_)
-            | ProviderEvent::ReasoningDelta { .. }
             | ProviderEvent::Failed(_) => {}
         }
     }
@@ -2048,12 +2148,11 @@ impl Runtime {
         &self,
         run: &RunId,
         turn: &TurnId,
-        stream_rx: &mut mpsc::Receiver<ProviderEvent>,
-        stream_bytes: &AtomicUsize,
+        stream_rx: &mut mpsc::Receiver<(ProviderEvent, OwnedSemaphorePermit)>,
         prefix: &mut StreamedPrefix,
     ) {
-        while let Ok(event) = stream_rx.try_recv() {
-            stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
+        while let Ok((event, permit)) = stream_rx.try_recv() {
+            drop(permit);
             self.publish_provisional(run, turn, event, prefix).await;
         }
     }
@@ -2175,6 +2274,19 @@ impl Runtime {
             )));
         }
         if successful_turn {
+            let authoritative_reasoning: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::ReasoningDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !authoritative_reasoning.starts_with(&prefix.reasoning) {
+                return Err(Terminal::failed(runtime_error(
+                    ErrorCategory::Protocol,
+                    "authoritative provider reasoning does not match its streamed prefix",
+                )));
+            }
             for (item_key, streamed) in &prefix.text {
                 if !text_items.iter().any(|(key, _)| key == item_key) && !streamed.is_empty() {
                     return Err(Terminal::failed(runtime_error(
@@ -2198,10 +2310,14 @@ impl Runtime {
             .iter()
             .map(|(key, text)| (key.clone(), text.len()))
             .collect();
-        // Thinking trace for this turn, echoed back on later turns when
-        // present. Accumulated silently: reasoning is never presented and
-        // never previewed, only recorded into the turn's assistant items.
+        // Keep the authoritative trace for replay, while publishing only the
+        // suffix not already delivered provisionally.
         let mut reasoning = String::new();
+        let mut reasoning_skip = if successful_turn || prefix.reasoning.is_empty() {
+            prefix.reasoning.len()
+        } else {
+            usize::MAX
+        };
         for event in &events {
             if active.terminal.is_some() {
                 break;
@@ -2209,6 +2325,14 @@ impl Runtime {
             match event {
                 ProviderEvent::ReasoningDelta { text } => {
                     reasoning.push_str(text);
+                    let mut skip = reasoning_skip.min(text.len());
+                    while !text.is_char_boundary(skip) {
+                        skip -= 1;
+                    }
+                    reasoning_skip = reasoning_skip.saturating_sub(skip);
+                    if skip < text.len() {
+                        emit_reasoning(&self.shared, active, run, turn, &text[skip..]);
+                    }
                 }
                 ProviderEvent::TextDelta { item_key, text } => {
                     let skip = if successful_turn {
@@ -4579,7 +4703,7 @@ fn provisional_event_bytes(event: &ProviderEvent) -> usize {
 fn control_event_bytes(event: &RunEvent) -> usize {
     let payload_bytes = match event.payload() {
         EventPayload::RunStarted { request } => request.as_str().len(),
-        EventPayload::AssistantTextDelta(text) => {
+        EventPayload::AssistantTextDelta(text) | EventPayload::AssistantReasoningDelta(text) => {
             text.turn.as_str().len() + text.item_key.len() + text.text.len()
         }
         EventPayload::ContextReduced {
@@ -4697,6 +4821,37 @@ fn emit_data(shared: &Arc<Shared>, active: &mut ActiveRun, run: &RunId, payload:
             commit_sequence(active, seq);
         }
         Err(_) => active.data_dropped = true,
+    }
+}
+
+fn emit_reasoning(
+    shared: &Arc<Shared>,
+    active: &mut ActiveRun,
+    run: &RunId,
+    turn: &TurnId,
+    text: &str,
+) {
+    if !shared.local_reasoning.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + MAX_TEXT_FRAGMENT_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if let Ok(fragment) = AssistantText::new(turn.clone(), "reasoning", &text[start..end]) {
+            emit_data(
+                shared,
+                active,
+                run,
+                EventPayload::AssistantReasoningDelta(fragment),
+            );
+        } else {
+            active.data_dropped = true;
+            return;
+        }
+        start = end;
     }
 }
 
@@ -9430,8 +9585,16 @@ mod cov_runtime_topup_private {
         });
         let requests = bed.provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[1], requests[2]);
+        assert_ne!(requests[0].turn(), requests[1].turn());
+        assert_ne!(requests[1].turn(), requests[2].turn());
+        assert_eq!(
+            requests[0].clone().with_turn(requests[1].turn().clone()),
+            requests[1]
+        );
+        assert_eq!(
+            requests[1].clone().with_turn(requests[2].turn().clone()),
+            requests[2]
+        );
     }
 
     #[test]

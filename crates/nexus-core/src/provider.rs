@@ -11,7 +11,7 @@ use crate::content::{
 };
 use crate::error::{AgentError, ErrorCategory, RetryGuidance};
 use crate::execution::CancellationToken;
-use crate::ids::{CallId, RunId, ToolId, TurnId};
+use crate::ids::{CallId, RunId, SessionId, ToolId, TurnId};
 use crate::limits::Limits;
 use crate::outcomes::{ToolOutcome, TurnFinished, Usage};
 use crate::tool::ToolSpec;
@@ -449,6 +449,7 @@ pub struct ModelRequest {
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     run: RunId,
+    session: Option<SessionId>,
     turn: TurnId,
     profile: String,
     enabled_tools: Vec<ToolId>,
@@ -485,6 +486,7 @@ impl ModelRequest {
             max_output_tokens: None,
             reasoning_effort: None,
             run,
+            session: None,
             turn,
             profile,
             enabled_tools,
@@ -547,10 +549,30 @@ impl ModelRequest {
         &self.run
     }
 
+    /// Associates this request with its host-issued conversation identity.
+    #[must_use]
+    pub fn with_session(mut self, session: SessionId) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Returns the conversation identity when supplied by the host.
+    #[must_use]
+    pub fn session(&self) -> Option<&SessionId> {
+        self.session.as_ref()
+    }
+
     /// Returns the turn identity.
     #[must_use]
     pub fn turn(&self) -> &TurnId {
         &self.turn
+    }
+
+    /// Gives a prepared request a fresh invocation identity without changing its payload.
+    #[must_use]
+    pub fn with_turn(mut self, turn: TurnId) -> Self {
+        self.turn = turn;
+        self
     }
 
     /// Returns the selected model profile name.
@@ -846,10 +868,9 @@ pub enum ProviderEvent {
         /// Fragment text.
         text: String,
     },
-    /// Thinking-trace fragment for the current turn. Withheld from
-    /// provisional sinks like tool previews: it is recorded for echo on
-    /// later turns (vendors running a thinking mode reject follow-ups that
-    /// drop it), never presented as an answer and never dispatched.
+    /// Sensitive thinking-trace fragment for the current turn. Providers may
+    /// stream it provisionally; it is also recorded for later-turn echo. It is
+    /// not an answer or an executable action.
     ReasoningDelta {
         /// Fragment text.
         text: String,
@@ -884,6 +905,9 @@ impl ProviderEvent {
 /// compatibility claim.
 pub const DEFAULT_ADAPTER_IDENTITY: &str = "unknown-adapter";
 
+/// An optional blocking discovery operation bound to one admission snapshot.
+pub type ContextWindowDiscovery = Box<dyn FnOnce() -> Option<crate::ContextWindow> + Send>;
+
 /// Provider port. Narrow by design: describe capabilities without mandatory
 /// network discovery, then perform one model turn. The two identity methods
 /// have stable defaults so existing implementors keep compiling; adapters
@@ -900,13 +924,27 @@ pub trait ProviderPort {
         crate::ContextManagementSettings::default()
     }
 
+    /// Snapshots local settings and an optional discovery operation for this run.
+    /// This method must not perform network I/O. The operation must own all
+    /// inputs needed to preserve the selection captured here; the runtime runs
+    /// it off the executor and applies its result only to an unknown window.
+    fn context_management_for_run(
+        &self,
+    ) -> (
+        crate::ContextManagementSettings,
+        Option<ContextWindowDiscovery>,
+    ) {
+        (self.context_management(), None)
+    }
+
     /// Performs one model turn and returns normalized events ending in
     /// exactly one terminal event.
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent>;
 
     /// Performs one model turn while offering provisional events to `sink`
-    /// as they arrive. Only presentation-safe prefixes travel the sink:
-    /// `TextDelta`, `ToolCallDelta`, and `Usage`. Candidates
+    /// as they arrive. `TextDelta`, sensitive `ReasoningDelta`,
+    /// `ToolCallDelta`, and `Usage` may travel the sink. Consumers must keep
+    /// reasoning private unless explicitly configured for local presentation. Candidates
     /// (`ToolCallReady`) and terminal events are withheld from the sink and
     /// arrive only in the returned batch, so nothing streamed can dispatch
     /// or conclude a turn before the full batch validates. Callers must
@@ -929,6 +967,7 @@ pub trait ProviderPort {
             matches!(
                 event,
                 ProviderEvent::TextDelta { .. }
+                    | ProviderEvent::ReasoningDelta { .. }
                     | ProviderEvent::ToolCallDelta { .. }
                     | ProviderEvent::Usage(_)
             )
@@ -1553,12 +1592,16 @@ mod tests {
         let seen = seen.lock().expect("sink log readable");
         assert_eq!(
             seen.len(),
-            1,
-            "only the non-terminal prefix travels the default sink"
+            2,
+            "reasoning and text travel the default sink, but candidates and terminals do not"
         );
+        assert!(matches!(
+            &seen[0],
+            ProviderEvent::ReasoningDelta { text } if text == "hidden trace"
+        ));
         assert!(
             matches!(
-                &seen[0],
+                &seen[1],
                 ProviderEvent::TextDelta { item_key, text }
                 if item_key == "item-0" && text == "hi"
             ),

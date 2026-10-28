@@ -3,7 +3,7 @@
 ## Status snapshot
 
 - See `git status` and `git log` for the current worktree and revision.
-- Implementation stage: **0.2.3-alpha**, built on the M0 runtime:
+- Implementation stage: **0.2.4-alpha**, built on the M0 runtime:
   Chat Completions, OpenAI Responses, and Anthropic Messages adapters
   (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
@@ -49,7 +49,8 @@ cargo run -p nexus-tui --locked --offline
 
 ### Experimental container mode
 
-An explicit prototype path is available with container-enabled builds. This
+An explicit prototype path is available with container-enabled builds, including
+the TUI and server installed by `scripts/install.sh`. This
 does **not** provide a validated isolation boundary: native Linux host/LAN,
 metadata, IPv6/DNS, and public-egress checks remain outstanding. Do not use it
 with secrets or valuable workspace data. The workspace is live-mounted and
@@ -146,18 +147,72 @@ frontend has durable conversation storage.
 
 ## Use a configured model in the TUI
 
-Configure a provider and model in the user configuration, with credentials
-referenced by environment-variable name, not embedded in JSON. Export that
-variable **before starting the TUI in the same shell**. No server is needed.
+Configure a provider and model in the user configuration. Credentials can be
+referenced by environment-variable name or stored separately by the config
+helper. For environment references, export the variable **before starting the
+TUI in the same shell**. No server is needed.
 
 Configuration lookup uses `NEXUS_CONFIG` when nonempty, otherwise
 `$XDG_CONFIG_HOME/nexus-agent/config.json`, falling back to
 `$HOME/.config/nexus-agent/config.json` (also on macOS). The server additionally
-accepts `--config PATH`, which takes precedence. The TUI has no `--config` flag:
+accepts `--config PATH`, which takes precedence. The TUI intentionally has no
+provider `--config` flag:
 
 ```sh
 export NEXUS_CONFIG=/path/to/config.json
 ```
+
+From the repository root, build and install the TUI, server, headless binary,
+and interactive config helper to `~/.local/bin` (or pass another install
+directory). Installation requires Cargo, Python 3, and the locked dependencies;
+Cargo may use the network if they are not cached. The installed binaries use
+default features; experimental container support is not included.
+
+```sh
+./scripts/install.sh
+nexus-config
+nexus-config provider
+nexus-config model
+nexus-tui
+```
+
+Run `nexus-config` for the interactive configuration menu. Provider presets
+include DeepSeek, OpenCode Go, local Ollama, OpenAI, Anthropic, OpenRouter,
+and custom endpoints.
+Review the selected endpoint before supplying credentials. Deleting a provider
+can also remove its associated models and their favourites/recent entries only
+after confirmation; deletion of a stored key is a separate choice.
+OpenCode Go requires an active subscription and an API key; Nexus identifies
+its requests and sends a session identifier to the official Go endpoint. Model
+availability and account privacy settings remain subject to the service.
+
+To remove the installed commands while retaining configuration and credentials,
+run `./scripts/uninstall.sh` and confirm. Pass the same install directory if you
+used a custom one: `./scripts/uninstall.sh /path/to/bin`.
+
+The helper uses the same `NEXUS_CONFIG`/XDG default path. It can save an API key
+in a separate `$XDG_CONFIG_HOME/nexus-agent/credentials.json` file (or
+`$HOME/.config/nexus-agent/credentials.json`), with file mode `0600`. Keys are
+stored **in plaintext**, not encrypted; other processes running as the same
+user, backups, and development tools with access to that path may read them.
+Keep the credentials directory outside any workspace exposed to tools. The
+helper can also retain an environment-variable reference instead. Python 3 is required at runtime;
+the helper uses the installed `nexus-server` config validator before writing.
+When editing a stored credential, leave the hidden API key prompt blank to keep
+it, enter a new value to replace it, or enter `-` to delete it. A deleted key
+must be replaced before that provider can authenticate. The credentials and
+config files are saved separately; if the second save fails, the helper reports
+that the credentials file was already updated.
+Ensure the install directory is on `PATH`. Existing endpoint and token limits
+can be cleared by entering `-`.
+Avoid editing the same config concurrently; the helper detects changes made
+while it is prompting, but cannot coordinate with other writers.
+Provider and model entries can be selected by number or ID. When editing a
+provider, the helper lists locally configured models and, if the endpoint and
+credential environment variable are set, automatically requests the provider's
+model list. This sends the credential to the configured endpoint, so use only a
+trusted endpoint (HTTPS for remote services). Redirects are not followed;
+unsupported or unavailable model-list APIs fall back to local/manual input.
 
 Use the complete revision-2 example below. Revision 2 requires a provider
 `protocol`: `chat_completions`, `openai_responses`, or `anthropic_messages`.
@@ -166,6 +221,130 @@ implemented plugin system. Revision-1 files without `protocol` remain readable
 as Chat Completions; saving writes revision 2. Missing config starts empty;
 invalid config fails startup explicitly. Config saves do not create missing
 parent directories, so create the chosen directory first.
+
+### Layered operational settings
+
+Runtime budgets are configured separately from the provider/model file, so TUI
+usage saves cannot flatten operational overrides. Both TUI and server accept an
+optional machine base (`/etc/nexus-agent/base.jsonc`, or `NEXUS_BASE_CONFIG`),
+`--base-config PATH` to select a different base, and repeatable
+`--config-overlay PATH` flags. Layers merge built-in profile defaults → base →
+overlays in command-line order. Use `--check-config` to validate or
+`--print-effective-config` to inspect resolved values without starting the UI or
+server. Operational input uses JSONC (JSON with `//` and `/* */` comments);
+effective output is plain JSON. Comments are recognized only outside strings,
+so string contents are preserved. Trailing commas and other JSON5 syntax are
+not supported. The separate provider/model `config.json` remains strict JSON
+and is unchanged.
+
+Complete example: [`config/base.jsonc`](config/base.jsonc). It lists every
+configurable runtime budget, provider deadline/retry default, tool budget,
+server lifecycle setting, and TUI preference. Its values
+match the existing TUI and ordinary server defaults. Choose it explicitly:
+
+```sh
+cargo run -p nexus-tui --locked --offline -- --base-config config/base.jsonc
+```
+
+For example, a partial overlay can contain:
+
+```jsonc
+{
+  "revision": 1,
+  "defaults": {
+    "runtime": {
+      "max_tool_output_bytes": 131072
+    }
+  },
+  "profiles": {
+    "tui": {
+      "runtime": {
+        // Override only the TUI turn budget.
+        "max_model_turns_per_run": 96
+      }
+    }
+  }
+}
+```
+
+The TUI and server profiles list every configurable core budget: turn and tool-call
+limits, run/tool/approval timeouts, retained context, argument assembly and
+tool output byte limits, event channel capacities, and concurrent operations.
+Only `tui` and `server` profiles belong in the shared `base.jsonc`.
+[`config/benchmark.jsonc`](config/benchmark.jsonc) is an ordinary settings file
+with the same schema, provided as an example for benchmark budgets. Use it with
+`--benchmark-pilot --base-config config/benchmark.jsonc`; the benchmark profile
+also supplies these runtime limits by default. This file does **not** select
+container execution, real tools, images, or credentials. A benchmark pilot
+requires a container-enabled build, explicit container/real-tool selection,
+immutable gateway and workload image references, and an auth-token environment
+variable. For example, after preparing the images and provider config:
+
+```sh
+cargo run -p nexus-server --features container --locked --offline -- \
+  --benchmark-pilot \
+  --base-config config/benchmark.jsonc \
+  --config /path/to/provider-config.json \
+  --execution container --tools real \
+  --gateway-image 'GATEWAY@sha256:DIGEST' \
+  --container-image 'WORKLOAD@sha256:DIGEST' \
+  --auth-token-env NEXUS_BENCH_SMOKE_TOKEN
+```
+
+Set `NEXUS_BENCH_SMOKE_TOKEN` and the provider credential referenced by the
+selected user config in the environment of the server process; never put secret
+values in config files or command arguments. Replace the image placeholders
+with valid immutable references. See the [benchmark run notes](docs/research/agent-benchmarks.md)
+for image preparation and workspace requirements. There is no benchmark-specific
+config option, environment variable, or reserved file name. Provider sections
+include `connect_timeout_seconds` (10),
+`context_discovery_timeout_seconds` (10), `fallback_call_timeout_seconds` (600),
+and `retry_backoff_seconds` ([1, 2, 5, 10, 30, 60]). Frontend presentation
+overrides belong in top-level `tui`, `defaults.tui`, or `profiles.tui.tui`; nested partial
+overrides inherit previous values. Unknown fields, invalid types, duplicate
+keys, and invalid inactive profiles fail validation. Each file is limited to
+65,536 bytes, with bounded reads. Plain operational JSON remains valid;
+existing operational TOML must be converted to JSONC. Filename extensions do
+not select the parser; operational settings have no TOML dependency.
+Within each layer, defaults apply first, then top-level `tui`, then the selected
+profile. Theme colors accept `default`, snake-case ANSI names, `#RRGGBB`, or
+`index:0` through `index:255`; see `config/base.jsonc` for all presentation keys.
+The effective snapshot reports merged settings, not a relaxation of existing
+tool/runtime safety caps (for example, the core 262,144-byte tool-output cap).
+
+Server lifecycle settings belong in `defaults.server` or `profiles.server.server`:
+`max_connections` defaults to 64 (range 1–64), `max_sessions` to 128 (1–128),
+`session_idle_seconds` to 1800, and `session_cleanup_interval_seconds` to 60
+(both durations accept 1–86,400 seconds). Settings are applied at startup;
+they do not change bind/authentication policy or tool permissions. Idle cleanup
+still retains sessions with active work, streams, or external owners. Expiry is
+checked periodically, so an eligible idle session may remain until the next pass.
+
+Existing startup options can also have defaults under `defaults.launch` or the
+selected profile's `launch`: `execution` (`local` or `container`),
+`strict_tools`, `tools_root`, `server_port`, `server_tools` (`fake` or `real`),
+`session_store`, and `auth_token_env` (an environment-variable **name**, never
+the token). Container image references remain in the provider/model config or
+CLI because that is where they are already stored. An explicit CLI option wins;
+otherwise launch settings apply, then the existing built-in behavior. For
+example, setting `execution` to `container` and the two image references allows
+TUI startup without repeating `--execution container`; `--execution local`
+still forces local execution. These are startup-only defaults, not hot reload or
+permission-policy overrides. `strict_tools: true` can tighten execution; config
+cannot disable strict mode selected by `--strict-tools`.
+
+Tool budgets belong in `defaults.tools` or `profiles.tui.tools` /
+`profiles.server.tools`: `list_entry_limit` defaults to 10,000 entries (range
+1–10,000), and `search_file_bytes` to 1,048,576 bytes per file (1–1,048,576).
+These startup settings apply to both strict/development host tools and container
+file tools; they do not change approval or filesystem scope. Listing may return
+a truncated subset when the cap is exceeded; directory enumeration happens
+before sorting, so the subset is not guaranteed to be the first sorted entries.
+Search examines a bounded prefix and reports truncation; an incomplete final
+UTF-8 character at the byte boundary is excluded from that prefix.
+Container workers now require protocol version 2. Rebuild workload images from
+this revision before using container tools; old images fail explicitly rather
+than ignoring configured budgets (see [container build instructions](containers/README.md#build-and-checks)).
 
 ```sh
 cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project
@@ -207,6 +386,11 @@ cursor still refers to the original page; re-read that page's original offset
 to recover omitted middle content rather than treating the preview as complete.
 Existing path scopes, protected-path restrictions, and jail checks still apply.
 
+The TUI shows `host_read` and `host_list` as non-collapsible path/status rows,
+including restored history. File contents and directory listings are not
+displayed; the model still receives tool results and source-history persistence
+is unchanged.
+
 Changing the environment in another shell does not change a running TUI's
 credentials; restart it after changing credentials.
 
@@ -225,6 +409,18 @@ cycles `build`, read-only `plan`, and custom modes; `default_mode` initializes
 the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
 `:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
 command.
+
+`Ctrl+R` toggles all provider-returned reasoning in the TUI. It is hidden by
+default; the preference is saved in the user config and restored on next start.
+
+The footer is the only run-status indicator: `idle`, `running`, tool execution,
+approval waiting or the final outcome. Active model/tool work uses a cyan dot
+spinner; waiting and finished states do not animate. It also shows the latest
+task request's estimated input
+tokens and percentage of its known context window (for example `~12.3K (12%)`),
+then the version at the right edge. `~` marks an estimate, not a live token
+count; missing input or window information is shown as `--`. Summary requests
+do not replace the task estimate.
 
 ### TUI diagnostics
 
@@ -273,8 +469,20 @@ that object use the built-in defaults, not individual global fields.
 A model entry may set `context_window_tokens`, for example `94208` for a
 92 × 1024-token window. A provider may set the same field for its
 `default_model` only; selecting another model does not inherit that limit.
-Explicit model limits take precedence. Missing windows remain unknown;
-zero, explicit null, and invalid types are rejected.
+Explicit model limits take precedence. For the official OpenCode Go endpoint,
+Nexus can also discover the selected model's context window from the public
+models.dev catalog, without sending provider credentials to the catalog. This
+requires network access and catalog metadata can change; a failed lookup or an
+unknown model leaves the window unknown. Discovered limits are held in memory,
+not written into the user config; catalog metadata does not guarantee the
+serving instance's effective limit. Set an explicit limit when the service
+requires a different one. Ollama uses its own model metadata.
+Catalog discovery uses `context_discovery_timeout_seconds` (10 seconds by
+default); an explicit shorter timeout remains in effect. TUI diagnostics record
+the lookup outcome, elapsed time and discovered window, without credentials or
+response contents. Provider diagnostics never write directly to an interactive
+terminal; additional request details are available when stderr is redirected.
+Zero, explicit null, and invalid types are rejected.
 
 TUI/server pass these settings through the provider interface; the runtime
 snapshots them at admission. A known window enables automatic reduction before

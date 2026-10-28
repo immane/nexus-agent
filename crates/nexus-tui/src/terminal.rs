@@ -110,12 +110,27 @@ impl TerminalIo for CrosstermIo<'_> {
 /// resource at the attempt: a write that fails while flushing can still have
 /// emitted part of the sequence, so rollback must cover it. On failure the
 /// partial acquisition is rolled back; steps whose rollback fails stay owned.
+#[cfg(test)]
 fn acquire(io: &mut impl TerminalIo, owned: &mut Ownership) -> io::Result<()> {
+    acquire_with_mouse(io, owned, true)
+}
+
+fn acquire_with_mouse(
+    io: &mut impl TerminalIo,
+    owned: &mut Ownership,
+    mouse_capture: bool,
+) -> io::Result<()> {
     io.enable_raw()?;
     owned.raw = true;
     owned.alternate = true;
-    owned.mouse = true;
-    if let Err(error) = io.enter_alternate().and_then(|()| io.enable_mouse()) {
+    owned.mouse = mouse_capture;
+    if let Err(error) = io.enter_alternate().and_then(|()| {
+        if mouse_capture {
+            io.enable_mouse()
+        } else {
+            Ok(())
+        }
+    }) {
         let _ = restore(io, owned);
         return Err(error);
     }
@@ -171,13 +186,18 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     /// Enters raw mode and the alternate screen.
     pub fn setup() -> io::Result<Self> {
+        Self::setup_with_mouse(true)
+    }
+
+    /// Enters the terminal, optionally leaving mouse handling to the terminal.
+    pub fn setup_with_mouse(mouse_capture: bool) -> io::Result<Self> {
         let mut guard = Self {
             owned: Ownership::default(),
             stdout: io::stdout(),
         };
         let result = {
             let mut io = CrosstermIo(&mut guard.stdout);
-            acquire(&mut io, &mut guard.owned)
+            acquire_with_mouse(&mut io, &mut guard.owned, mouse_capture)
         };
         guard.owned.publish();
         result?;
@@ -309,6 +329,24 @@ mod tests {
             mouse: true,
             published: false,
         }
+    }
+
+    #[test]
+    fn disabled_mouse_is_never_acquired_or_released() {
+        let mut io = FakeIo::default();
+        let mut state = Ownership::default();
+        acquire_with_mouse(&mut io, &mut state, false).unwrap();
+        assert!(!state.mouse);
+        restore(&mut io, &mut state).unwrap();
+        assert_eq!(
+            io.calls,
+            [
+                "enable_raw",
+                "enter_alternate",
+                "leave_alternate",
+                "disable_raw"
+            ]
+        );
     }
 
     #[test]

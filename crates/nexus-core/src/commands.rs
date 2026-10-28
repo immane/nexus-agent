@@ -589,6 +589,8 @@ pub enum EventPayload {
     },
     /// Ordered presentation fragment.
     AssistantTextDelta(AssistantText),
+    /// Sensitive provider reasoning, emitted only for explicitly opted-in local presentation.
+    AssistantReasoningDelta(AssistantText),
     /// Runtime committed a reduced active context view. The typed method says
     /// whether the change summarized, truncated, or bounded history; it never
     /// makes derived content authoritative execution evidence.
@@ -672,7 +674,7 @@ impl EventPayload {
     /// ordering and lifecycle rules are not part of this check.
     pub fn validate(&self) -> Result<(), AgentError> {
         match self {
-            Self::AssistantTextDelta(text) => text.validate(),
+            Self::AssistantTextDelta(text) | Self::AssistantReasoningDelta(text) => text.validate(),
             Self::ContextReduced { .. }
             | Self::ModelRequestStarted { .. }
             | Self::ModelRequestFinished { .. }

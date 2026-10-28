@@ -1,6 +1,6 @@
 # Configuration Contract
 
-Status: Draft contract, revision `draft-1`. Product defaults are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). No configuration parser, schema, environment-variable naming convention, or file format has been selected.
+Status: Implemented subset, revision `1` for operational settings. Provider/model configuration remains a separate revisioned document.
 
 ## Effective Configuration
 
@@ -28,7 +28,42 @@ These are product defaults, not names of implemented enum variants, config keys,
 
 ## Resolution and Validation
 
-The proposed precedence is built-in bounded defaults, selected configuration file, documented environment overrides, then explicit command-line options. Resolve this locally and deterministically, and distinguish absent values from invalid values.
+Operational settings resolve as profile built-ins, optional `/etc/nexus-agent/base.jsonc` (or `NEXUS_BASE_CONFIG`), then ordered repeatable `--config-overlay` files. `--base-config` replaces the base path. Shared profiles are only `tui` and `server`. A file such as `benchmark.jsonc` is an ordinary settings file with the same schema and can be passed through the existing base/overlay options; there is no benchmark-specific path, option, or environment variable. These settings are separate from the provider/model document and are never written back by the TUI. UserConfig remains strict JSON; its migration/save behavior is unchanged.
+
+Revision-1 operational JSONC is a JSON object with `"revision": 1` and optional `defaults`, `profiles`, and `tui` objects. `defaults` and each `profiles.tui` / `profiles.server` object may contain `runtime`, `provider`, `server`, `tools`, `launch`, and `tui` objects. Each layer is partial and omitted fields inherit preceding values, including nested frontend/theme fields. The same shape applies to every file name, including the checked-in [`config/benchmark.jsonc`](../../config/benchmark.jsonc) example; filename extensions do not select a parser. Plain operational JSON remains valid. Existing operational TOML must be converted to JSONC; operational settings have no TOML dependency.
+
+JSONC accepts only JSON plus `//` line comments and `/* */` block comments. Comment recognition is string-safe: comment markers inside JSON strings remain literal content, including escaped quotes and backslashes. Trailing commas and other JSON5 extensions are rejected. For example, a partial layer is:
+
+```jsonc
+{
+  "revision": 1,
+  "defaults": {
+    "runtime": {
+      "max_tool_output_bytes": 131072
+    }
+  },
+  "profiles": {
+    "tui": {
+      "runtime": {
+        // Override only the TUI turn budget.
+        "max_model_turns_per_run": 96
+      }
+    }
+  }
+}
+```
+
+Top-level `tui` is also supported for shared presentation settings. Within a layer, defaults apply first, then top-level TUI settings, then the selected profile. `tui.theme`, `tui.display`, `tui.input`, and `tui.render` objects are deeply merged with preceding settings before typed deserialization and validation. The checked-in [`config/base.jsonc`](../../config/base.jsonc) lists all default presentation fields.
+
+Every `Limits` field can be overridden: `max_model_turns_per_run`, `max_tool_calls_per_run`, `max_tool_calls_per_turn`, `run_timeout_seconds`, `tool_timeout_seconds`, `retained_context_items`, `max_arg_assembly_bytes`, `max_tool_output_bytes`, `event_data_capacity`, `event_control_capacity`, `max_concurrent_ops`, and `approval_expiry_seconds`. Provider settings include `connect_timeout_seconds` (10), `context_discovery_timeout_seconds` (10), `fallback_call_timeout_seconds` (600), and `retry_backoff_seconds` ([1, 2, 5, 10, 30, 60]). All provider deadlines must be between 1 and 86,400 seconds, matching adapter validation. Retry arrays contain 1–8 nondecreasing delays, each between 1 and 3,600 seconds.
+
+Server lifecycle settings use `defaults.server` or `profiles.server.server`: `max_connections` defaults to 64 (range 1–64), `max_sessions` to 128 (1–128), `session_idle_seconds` to 1800, and `session_cleanup_interval_seconds` to 60 (durations 1–86,400 seconds). Admission caps may be reduced but cannot exceed the existing hard ceilings. Pending session reservations count toward admission. Settings are installed before session creation and are not hot-reloaded. Idle expiry is rechecked during removal; active work, streams, external owners, and concurrent activity still prevent eviction. Eligible sessions are removed on a subsequent periodic cleanup pass, not exactly at the expiry instant. Bind address, authentication, and tool policy are unchanged.
+
+Tool budgets use `defaults.tools` or `profiles.tui.tools` / `profiles.server.tools`. `list_entry_limit` defaults to 10,000 (range 1–10,000); `search_file_bytes` defaults to 1,048,576 bytes per file (range 1–1,048,576). These are startup snapshots, not model-call arguments. Strict, development, and container file tools apply the same reductions without changing scope, protected paths, or approval policy. Listing beyond its entry budget reports truncation; enumeration precedes sorting, so no sorted-prefix guarantee is made. Search beyond its file budget reports truncation and omits an incomplete trailing UTF-8 character while retaining the valid prefix. Worker protocol version 2 carries mandatory validated budgets; stale workload images must be rebuilt and fail explicitly instead of ignoring reductions. See [container compatibility](../../containers/README.md#worker-protocol-compatibility). Other tool and container settings remain outside this schema.
+
+Launch defaults use `defaults.launch` or the selected profile’s `launch`: `execution` (`local`/`container`), `strict_tools`, `tools_root`, `server_port`, `server_tools` (`fake`/`real`), `session_store`, and `auth_token_env` (environment-variable name only). Explicit CLI options take precedence. A missing field or JSON `null` is treated as omitted and inherits the preceding layer; `null` does not clear an inherited value. `server_port` is a `u16` (0–65535); `server_tools`, `server_port`, `session_store`, and `auth_token_env` affect only the server, while `execution`, `strict_tools`, and `tools_root` are consumed by the frontends that support them. Relative `tools_root` and `session_store` paths are interpreted from the process working directory. Path strings must be nonempty, at most 4096 bytes, and contain no NUL; environment-variable names must be 1–128 ASCII letters, digits, or underscores. Container image references remain in the existing user configuration or CLI and retain their existing startup validation. Launch values are startup defaults; strict mode can only be tightened by configuration, and authorization/workspace validation remains in the existing execution paths. Configuration stores no bearer-token value.
+
+Both frontends accept `--check-config` and `--print-effective-config`. Effective output is plain JSON with `runtime`, `provider`, `server`, `tools`, `launch`, and `tui` objects, without comments. This diagnostic output is the resolved operational-configuration snapshot, not the final startup arguments after CLI overrides or user-config image selection. Unknown keys, duplicate keys, unsupported revisions, malformed files, and invalid values (including inactive profiles) fail explicitly. Files are limited to 65,536 bytes, enforced during bounded reads before parsing. An absent conventional system base is allowed; an explicitly configured base or overlay that cannot be read is an error.
 
 Validate revisions, selected profiles, numeric bounds, references, and incompatible settings before dispatch. Unknown mandatory settings fail explicitly. Deferred secrets or integrations may report not-ready status, but startup must not pretend unsafe or invalid configuration is ready for execution.
 
@@ -44,7 +79,7 @@ A relay receives only the credential reference assigned to its profile. Do not e
 
 ## Limits
 
-Before the first implementation ships, document finite defaults for model turns, tool calls, active operations, run duration, context/stream assembly, output, queues, pending requests, retained presentation/history, and plugin processes.
+The implemented operational settings cover all runtime `Limits` fields listed above, provider deadlines/retry backoff, server admission/lifecycle settings, tool list/search budgets, and typed frontend presentation settings. Omitted values retain their code-defined profile defaults.
 
 User overrides remain subject to host validation and policy. Zero, negative, overflowing, or incompatible values require defined semantics; they cannot accidentally disable a safety limit. Large legitimate workloads may use explicitly increased budgets without changing global defaults.
 

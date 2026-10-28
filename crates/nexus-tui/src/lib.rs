@@ -9,7 +9,7 @@
 //! // Rationale: `ratatui` 0.26 is the single terminal UI library for M0.
 //! Immediate-mode rendering over its one `crossterm` 0.27 backend covers the
 //! fixed composer, bounded viewport, approval card, and footer without a
-//! larger fullscreen framework (no side panels, theming, marketplaces, or
+//! larger fullscreen framework (no side panels, marketplaces, or
 //! multi-agent views per the DO-NOT-COPY list). Version 0.26 matches the
 //! offline-cached crates, `default-features = false` keeps only the
 //! `crossterm` backend, and its `TestBackend` makes renderer tests
@@ -29,6 +29,7 @@ pub mod sanitize;
 pub mod slash;
 pub mod state;
 pub mod terminal;
+mod theme;
 
 pub use decisions::{approve_command, cancel_command, deny_command, submit_command};
 pub use keys::{Action, Focus, map_key, next_focus};

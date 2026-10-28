@@ -2,6 +2,9 @@
 
 `Dockerfile` builds the two fixed container executables: `container-worker` for
 the bounded file protocol and `nexus-keeper` as the idle container entrypoint.
+The current host requires worker protocol version 2 with mandatory tool budgets.
+Rebuild workload and benchmark adapter images from the current sources; see
+[protocol compatibility](../README.md#worker-protocol-compatibility).
 The Dockerfile defaults pin the `linux/arm64` manifests for
 `rust:1.99.0-alpine3.23` (`sha256:58d81a4631c273a704b725e6e3f2b0f207301c82bcb50523f082eaed6d21e768`)
 and `alpine:3.23` (`sha256:8793abc479381bafd16c9d538b01c5a8dd7eef6aa10a737f2ad828ac73cb80e9`).

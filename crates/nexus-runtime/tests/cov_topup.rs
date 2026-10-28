@@ -756,6 +756,112 @@ fn context_settings_are_snapshotted_per_run_without_enabling_compaction() {
 }
 
 #[test]
+fn discovery_uses_admission_selection_and_preserves_policy_snapshot() {
+    use nexus_core::{ContextManagementSettings, ContextWindow, ContextWindowSource};
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DiscoveringProvider {
+        inner: ScriptedProvider,
+        window: StdMutex<ContextWindow>,
+        started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+    impl ProviderPort for DiscoveringProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        fn context_management_for_run(
+            &self,
+        ) -> (
+            ContextManagementSettings,
+            Option<nexus_core::ContextWindowDiscovery>,
+        ) {
+            let settings = self.inner.context_management();
+            let window = *self.window.lock().unwrap();
+            let started = self.started.lock().unwrap().take().unwrap();
+            let release = self.release.lock().unwrap().take().unwrap();
+            (
+                settings,
+                Some(Box::new(move || {
+                    started.send(()).unwrap();
+                    release.recv_timeout(WAIT).unwrap();
+                    Some(window)
+                })),
+            )
+        }
+        fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
+            self.inner.stream(request, context)
+        }
+    }
+
+    let first = ContextWindow::new(94_208, ContextWindowSource::ModelMetadata).unwrap();
+    let second = ContextWindow::new(32_768, ContextWindowSource::ModelMetadata).unwrap();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let provider = Arc::new(DiscoveringProvider {
+        inner: ScriptedProvider::standard(vec![stop_turn("done")]),
+        window: StdMutex::new(first),
+        started: StdMutex::new(Some(started)),
+        release: StdMutex::new(Some(release_rx)),
+    });
+    *provider.inner.context_management.lock().unwrap() = ContextManagementSettings {
+        max_output_tokens: Some(2048),
+        ..Default::default()
+    };
+    let (runtime, mut streams) = Runtime::new(
+        config(Limits::m0_test(), Policy::m0_test(), false),
+        provider.clone(),
+        vec![],
+    );
+    let log = LogCapture::default();
+    let runtime = runtime.with_diagnostic_writer(log.clone());
+    test_rt().block_on(async {
+        assert_eq!(
+            runtime
+                .submit(submit_cmd("discovery-snapshot"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        *provider.window.lock().unwrap() = second;
+        *provider.inner.context_management.lock().unwrap() = ContextManagementSettings::default();
+        tokio::time::timeout(WAIT, started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        let (_, _, finished) =
+            collect_until_finished(&mut streams.data, &mut streams.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+    });
+    assert_eq!(
+        provider.inner.requested_context_management.lock().unwrap()[0].window,
+        Some(first)
+    );
+    assert_eq!(
+        provider.inner.requested_context_management.lock().unwrap()[0].max_output_tokens,
+        Some(2048)
+    );
+    let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.contains("context discovery outcome=discovered"),
+        "{output}"
+    );
+    assert!(output.contains("window_tokens=Some(94208)"), "{output}");
+}
+
+#[test]
 fn repeated_output_limit_turns_stop_after_one_recovery_without_admitting_candidates() {
     let mut limits = Limits::m0_test();
     limits.max_model_turns_per_run = 3;

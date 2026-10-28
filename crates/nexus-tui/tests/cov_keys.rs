@@ -389,13 +389,35 @@ const PUBLISHED_ROWS: &[Row] = &[
         intent: Action::Cancel,
         doc: "Any | Ctrl+C | Clear composer, else cancel or quit",
     },
+    // Any | Ctrl+R | Show/hide all provider reasoning (saved preference)
+    Row {
+        focus: Focus::Composer,
+        code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::CONTROL,
+        intent: Action::ToggleReasoning,
+        doc: "Any | Ctrl+R | Show/hide all provider reasoning (saved preference)",
+    },
+    Row {
+        focus: Focus::Viewport,
+        code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::CONTROL,
+        intent: Action::ToggleReasoning,
+        doc: "Any | Ctrl+R | Show/hide all provider reasoning (saved preference)",
+    },
+    Row {
+        focus: Focus::ApprovalCard,
+        code: KeyCode::Char('r'),
+        modifiers: KeyModifiers::CONTROL,
+        intent: Action::ToggleReasoning,
+        doc: "Any | Ctrl+R | Show/hide all provider reasoning (saved preference)",
+    },
 ];
 
 /// The intents the published table gives to exactly one focus. Each row of
 /// [`PUBLISHED_ROWS`] must sit under the focus named here, which cross-checks
 /// the row transcription against the focus partition independently.
 ///
-/// The remaining families are shared (`FocusSwitch`, `Cancel`, `ParkFocus`,
+/// The remaining families are shared (`FocusSwitch`, `Cancel`, `ToggleReasoning`, `ParkFocus`,
 /// and the four scrolling/paging intents) and are pinned by
 /// [`SHARED_FAMILIES`].
 const EXCLUSIVE_FAMILIES: &[(&str, Focus)] = &[
@@ -421,6 +443,7 @@ const SHARED_FAMILIES: &[(&str, &[Focus])] = &[
     ("FocusSwitch", &[Focus::Viewport, Focus::ApprovalCard]),
     ("CycleVariant", &[Focus::Composer, Focus::Viewport]),
     ("Cancel", &ALL_FOCUSES),
+    ("ToggleReasoning", &ALL_FOCUSES),
     ("ParkFocus", &ALL_FOCUSES),
     (
         "ScrollUp",
@@ -468,12 +491,13 @@ const NAMED_CODES: &[KeyCode] = &[
 ];
 
 /// The modifier chords the published table documents: `Ctrl+C`, `Ctrl+J`,
-/// `Ctrl+T`, and `Alt+Enter`. Only these are swept, so the census
+/// `Ctrl+R`, `Ctrl+T`, and `Alt+Enter`. Only these are swept, so the census
 /// compares documented chords against documented chords; chord *negatives*
 /// are `cov_keys_edges.rs`’s subject.
 const DOCUMENTED_CHORDS: &[(KeyCode, KeyModifiers)] = &[
     (KeyCode::Char('c'), KeyModifiers::CONTROL),
     (KeyCode::Char('j'), KeyModifiers::CONTROL),
+    (KeyCode::Char('r'), KeyModifiers::CONTROL),
     (KeyCode::Char('t'), KeyModifiers::CONTROL),
     (KeyCode::Enter, KeyModifiers::ALT),
 ];
@@ -525,6 +549,7 @@ fn intent_family(intent: &Action) -> &'static str {
         Action::OpenLine => "OpenLine",
         Action::Colon => "Colon",
         Action::CycleVariant => "CycleVariant",
+        Action::ToggleReasoning => "ToggleReasoning",
         Action::ApproveOnce => "ApproveOnce",
         Action::Deny => "Deny",
         Action::InspectApproval => "InspectApproval",
@@ -553,6 +578,7 @@ fn all_intents() -> Vec<Action> {
         Action::OpenLine,
         Action::Colon,
         Action::CycleVariant,
+        Action::ToggleReasoning,
         Action::ApproveOnce,
         Action::Deny,
         Action::InspectApproval,
@@ -584,7 +610,7 @@ fn observed(focus: Focus, code: KeyCode, modifiers: KeyModifiers) -> Option<Stri
 }
 
 /// The fixed keyspace the producer census sweeps: every ASCII character and
-/// every named key the table binds, unmodified, plus the four documented
+/// every named key the table binds, unmodified, plus the five documented
 /// chords, in every focus.
 fn census_space() -> Vec<(Focus, KeyEvent)> {
     let mut space = Vec::new();
@@ -679,12 +705,12 @@ fn every_published_row_maps_to_its_documented_intent() {
 
 #[test]
 fn published_table_has_no_duplicate_or_conflicting_rows() {
-    // 40 literal rows: 13 composer, 13 viewport, 11 approval, and the 3
-    // focus-expanded `Any` rows (`Ctrl+C` in each focus). The
-    // 41st published row is parameterized over printable characters.
+    // 43 literal rows: 13 composer, 13 viewport, 11 approval, and the 6
+    // focus-expanded `Any` rows (`Ctrl+C` and `Ctrl+R` in each focus). The
+    // 44th published row is parameterized over printable characters.
     assert_eq!(
         PUBLISHED_ROWS.len(),
-        40,
+        43,
         "the transcription lost or invented a published row"
     );
     // The oracle is only meaningful if it is a function: no `(focus, key,
@@ -797,6 +823,7 @@ fn intents_are_partitioned_by_focus() {
                 "ScrollDown",
                 "ScrollUp",
                 "Submit",
+                "ToggleReasoning",
                 "Type",
             ],
         ),
@@ -815,6 +842,7 @@ fn intents_are_partitioned_by_focus() {
                 "ParkFocus",
                 "ScrollDown",
                 "ScrollUp",
+                "ToggleReasoning",
             ],
         ),
         (
@@ -830,6 +858,7 @@ fn intents_are_partitioned_by_focus() {
                 "ParkFocus",
                 "ScrollDown",
                 "ScrollUp",
+                "ToggleReasoning",
             ],
         ),
     ] {
@@ -1129,9 +1158,8 @@ fn the_tab_row_hands_the_keyboard_on_and_parking_never_re_arms_the_card() {
             "a focus switch from {focus:?} must change cards"
         );
     }
-    // `ParkFocus` steps back one rung: the composer parks into the viewport and
-    // the approval card parks back into the composer, so parking can never
-    // return the keyboard to a card it just left.
+    // `ParkFocus` returns both editing and approval focus to the normal-mode
+    // viewport, never implicitly re-entering the composer.
     assert_eq!(
         map_key(Focus::Composer, KeyEvent::new(KeyCode::Esc, NONE)),
         Some(Action::ParkFocus)
@@ -1141,7 +1169,7 @@ fn the_tab_row_hands_the_keyboard_on_and_parking_never_re_arms_the_card() {
         map_key(Focus::ApprovalCard, KeyEvent::new(KeyCode::Esc, NONE)),
         Some(Action::ParkFocus)
     );
-    assert_eq!(next_focus(Focus::ApprovalCard, true), Focus::Composer);
+    assert_eq!(next_focus(Focus::ApprovalCard, true), Focus::Viewport);
     assert_ne!(
         next_focus(Focus::ApprovalCard, false),
         Focus::ApprovalCard,

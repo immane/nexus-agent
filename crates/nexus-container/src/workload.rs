@@ -779,6 +779,25 @@ pub fn tool_registrations(
     gateway_image: &str,
     workload_image: &str,
 ) -> Result<Vec<ToolRegistration>, crate::gateway::ContainerError> {
+    tool_registrations_with_settings(
+        workspace,
+        gateway_image,
+        workload_image,
+        &nexus_config::ToolsSettings::default(),
+    )
+}
+
+/// Prepares container tools with validated, per-request file-tool budgets.
+/// Protocol v2 requires rebuilt worker images; older workers fail closed.
+pub fn tool_registrations_with_settings(
+    workspace: &Path,
+    gateway_image: &str,
+    workload_image: &str,
+    settings: &nexus_config::ToolsSettings,
+) -> Result<Vec<ToolRegistration>, crate::gateway::ContainerError> {
+    settings
+        .validate()
+        .map_err(|_| crate::gateway::ContainerError::WorkloadPreparation("tool settings"))?;
     crate::gateway::validate_image_reference(gateway_image)?;
     crate::gateway::validate_image_reference(workload_image)?;
     let docker = resolve_docker_executable()
@@ -796,8 +815,9 @@ pub fn tool_registrations(
         .strip_prefix("nexus-gw-")
         .ok_or(crate::gateway::ContainerError::DockerFailure)?
         .to_owned();
-    let session = ContainerWorkloadSession::prepare(gateway, workspace, workload_image, &nonce)
-        .map_err(crate::gateway::ContainerError::WorkloadPreparation)?;
+    let session =
+        ContainerWorkloadSession::prepare(gateway, workspace, workload_image, &nonce, settings)
+            .map_err(crate::gateway::ContainerError::WorkloadPreparation)?;
     let owner = Arc::new(Mutex::new(session));
     let registration = |kind, access| {
         let port: Arc<dyn ToolPort + Send + Sync> = Arc::new(OwnedContainerPort {
@@ -852,7 +872,9 @@ impl ContainerWorkloadSession {
         workspace: &Path,
         image: &str,
         nonce: &str,
+        settings: &nexus_config::ToolsSettings,
     ) -> Result<Self, &'static str> {
+        settings.validate().map_err(|_| "tool settings")?;
         if !gateway.is_healthy() {
             return Err("gateway readiness");
         }
@@ -928,7 +950,9 @@ impl ContainerWorkloadSession {
             }
         });
         let files = crate::file_tools::container_file_tools_with_handler(
-            crate::worker_client::ContainerWorkerClient::new(transport),
+            crate::worker_client::ContainerWorkerClient::new(transport)
+                .with_settings(settings)
+                .expect("settings validated before workload preparation"),
             Some(poison_handler),
         );
         let exec = files.exec_adapter();
@@ -1154,6 +1178,41 @@ fn valid_image(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_settings_before_images_or_docker_preparation() {
+        for settings in [
+            nexus_config::ToolsSettings {
+                list_entry_limit: 0,
+                search_file_bytes: 1,
+            },
+            nexus_config::ToolsSettings {
+                list_entry_limit: 1,
+                search_file_bytes: 0,
+            },
+            nexus_config::ToolsSettings {
+                list_entry_limit: 10001,
+                search_file_bytes: 1,
+            },
+            nexus_config::ToolsSettings {
+                list_entry_limit: 1,
+                search_file_bytes: 1048577,
+            },
+        ] {
+            let error = tool_registrations_with_settings(
+                Path::new("/nonexistent"),
+                "invalid",
+                "invalid",
+                &settings,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error,
+                crate::ContainerError::WorkloadPreparation("tool settings")
+            );
+        }
+    }
 
     #[test]
     fn workload_config_accepts_local_image_ids_and_repository_digests() {

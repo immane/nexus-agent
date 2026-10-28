@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.3--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.4--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent with live model integrations, native terminal sessions,
 coding tools, and optional container execution. Designed around very fast startup
@@ -19,7 +19,7 @@ not an ever-growing engine. External plugins remain planned.
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.3-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.4-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -360,6 +360,8 @@ Coverage is organized by protocol family rather than by a growing list of vendor
 
 Protocol selection is explicit in revision-2 provider configuration and separate from `direct`/`relay` routing. Revision-1 files remain readable as Chat Completions profiles; saves write revision 2. HTTPS uses the system `openssl` TLS bridge with certificate/hostname verification. Responses and Messages coverage is backed by offline fixtures, **not universal live service/model compatibility**. Unsupported continuation/thinking context fails explicitly; a configurable base URL alone does not establish support.
 
+When a Chat Completions provider returns `reasoning_content` or `reasoning`, the local TUI shows it in a collapsed thinking entry; click its header to expand or collapse it. Streaming providers can update it before the response finishes, and saved reasoning may be shown on history restoration. Reasoning can contain sensitive information: it is not emitted to headless or server clients, and expanded content is visible to anyone viewing the terminal. Not all providers or protocols expose a readable trace.
+
 First-release authentication uses API profiles with external credential references. Existing relay services integrate as provider plugins; local relay execution is optional and on demand.
 
 See [model integration](docs/design/03-model-integration.md), [API relay](docs/design/08-api-relay.md), and the [provider contract](docs/contracts/01-provider.md).
@@ -408,12 +410,12 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 
 ## Benchmark Observations
 
-Results are grouped by inference environment, with separate tables and counts.
-Agent completion is not official resolution. These selected diagnostic runs are
-**not a leaderboard score, a general success rate, or a controlled model
-comparison**. Agent wall time excludes the separate official evaluator run;
-dates are UTC. Links into `../nexus-benchmark-work/` refer to preserved local
-artifacts outside this repository; they are not available in a standalone clone.
+These selected diagnostic runs are **not a leaderboard score, a general success
+rate, or a controlled model comparison**. Agent completion is separate from
+an official resolution; agent wall time excludes evaluation time and dates are
+UTC. Reruns and previously exposed tasks are not blind samples. See the
+[benchmark run history](docs/research/agent-benchmarks.md#recent-benchmark-observations)
+for detailed methodology, limitations, and evidence.
 
 ### Local inference: Qwen3.8-27B via Ollama
 
@@ -434,55 +436,6 @@ comparisons should account for quantization, context budget, and agent harness.
 | `django__django-11099` (post-rebuild regression rerun) | 2026-10-28 | 25m 17s | Reject trailing newlines in username validators. | Resolved (official SWE-bench 5.0.2, 1/1) | Completed |
 | `pallets__flask-4992` (harness validation) | 2026-10-26 | 1h 09m 00s | Pass `open()` keyword arguments through `Config.from_file`. | **Unresolved** | Completed |
 | `pylint-dev__pylint-6506` (background attempt 2) | 2026-10-26 | 2h 09m 33s | No patch produced. | Not scored (Ollama server crashed under load; confirmed) | Interrupted |
-
-The 2026-10-28 Django run is a regression rerun of a previously evaluated
-task, not a blind sample. It used 42 model requests (including 11 context
-summaries), 40 tool calls, and 335,333 input / 49,898 output tokens. The
-official evaluator resolved it in 82 seconds with no infrastructure failures.
-See the [launch record](../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/launch.json)
-and [official evaluation report](../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/official-evaluation/qwen-django-20261028T023105Z-899b2d2e/ollama-local__qwen3-27b.qwen-django-20261028T023105Z-899b2d2e.json).
-
-The Flask run produced a patch that applied cleanly and kept all 19
-`PASS_TO_PASS` tests passing. It failed `test_config_from_file_toml` because the
-hidden test calls `from_file(..., text=False)`, while the agent implemented
-`**open_args` and forwarded `text=False` to `open()`, which rejects it. Its own
-`mode="rb"` check passed, so this is an interface mismatch, not an infrastructure
-failure: the reported behavior was close but the expected API name was not
-inferred. Its 1,969-byte patch had no missing hunks; the agent verified its own
-`mode="rb"` example, cleaned up temporary files, and declared completion without
-checking the parameter name the hidden test expects.
-
-SymPy was attempted repeatedly. The table reports the latest evaluated run for
-each scored task and the latest Pylint interruption, not every attempt; an
-earlier SymPy attempt ended with `limit-reached`. The Astropy context-retention
-run completed one context reduction and was resolved by the official evaluator;
-this single exposed-task
-run does not establish that the changes reduced repeated investigation or
-caused the successful repair, nor does it validate the semantic-memory vision.
-The earlier Astropy prediction included temporary scripts; the context-retention
-and correctness-regression predictions did not. The 2026-10-26 Astropy rerun
-again resolved officially (FAIL_TO_PASS 2/2, PASS_TO_PASS 13/13); it is a
-correctness regression check, not a performance comparison.
-
-The Flask harness-validation run also exercised the recent context and tooling
-changes: bounded 8 KiB paged reads (16 KiB maximum) kept file reads near 31 KB
-instead of the earlier ~100 KB; task and summarizer requests now use separate
-token-calibration windows; and empty summaries get one bounded retry. That run
-made 99 model turns and 82 tool calls over 4,140 s, committed five summaries from
-34 validated summary responses, and hit no run-ending summary failure. An earlier
-18-turn attempt had stopped on a protocol-valid but empty summary after 17
-minutes; it also raised the misleading `limit-reached` label that is now reported
-as a `Protocol` failure once recovery is exhausted. These changes improve
-execution continuity, **not** repair accuracy: the completed Flask run still did
-not resolve.
-
-Pylint has two interrupted attempts, neither with a terminal result or prediction.
-The first was a foreground invocation interrupted after about an hour, during
-its 82nd model request; its exact owned containers were verified and cleaned up.
-The persisted session store retains source/tool records but cannot restore the
-in-memory active runtime, so that attempt could not be resumed. The second was
-background-launched and ran for 2h 09m 33s before the Ollama server crashed under
-excessive load. Neither attempt was officially evaluated.
 
 ### Hosted inference: DeepSeek V4.1 Flash
 
@@ -509,75 +462,6 @@ server from current source.
 | `pylint-dev__pylint-6506` (94,208-token context reference) | 2026-10-26 | 2m 31s | Same repair; context-controlled follow-up run. | Resolved | Completed |
 | `pylint-dev__pylint-6506` (32,768-token context reference) | 2026-10-26 | 3m 47s | Same repair; context-controlled follow-up run, no compaction observed. | Resolved | Completed |
 | `pallets__flask-4992` | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
-
-The Sphinx 9461 run completed and its unchanged saved patch was **resolved by
-the official SWE-bench 5.0.2 evaluator (1/1; no infrastructure failures)**.
-During the run, two full-suite pytest commands each hit their `timeout 3000`
-limit after **50 minutes**: approximately 02:17–03:07 UTC and 03:07–03:57 UTC.
-Both outputs stopped around 37% progress. The first command piped through
-`tail`, masking the timeout exit status; the second captured `EXIT=124` and
-confirmed the timeout. A subsequent targeted suite completed in 10.84 seconds:
-272 passed and one `test_ext_autodoc.py::test_cython` failed. The agent reported
-that failure also occurs on the unmodified baseline; that baseline comparison
-was not independently verified here. These were intermediate test timeouts,
-not an agent-run timeout. The full agent run took 1h 49m 12s, and official
-scoring completed separately in about 38 seconds. This previously exposed task
-is not a blind evaluation sample. See the [launch record](../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/launch.json)
-and [official result](../nexus-benchmark-work/run-sphinx-doc__sphinx-9461-20261027T020949Z-d4776bcc/official-evaluation/sphinx-doc__sphinx-9461-prediction-20261027T040234.790700Z-d83b863e5864422b8737ae8c44b8f1d8/evaluation.json).
-
-Sphinx 8595 used 47 model requests and 59 tool calls (940,165 input and 11,286 output
-tokens); Pylint used 38 model requests and 42 tool calls (810,483 input and
-13,832 output tokens); Flask used 14 model requests and 19 tool calls (107,329
-input and 5,992 output tokens). The 94,208-token-context Pylint follow-up used
-48 model requests and 43 tool calls (824,105 input and 12,985 output tokens); it
-triggered no context compaction. The 32,768-token-context follow-up used 61
-model requests and 58 tool calls (1,414,270 input and 18,576 output tokens); it
-also triggered no context compaction. Sphinx 9461 used 108 model requests and
-114 tool calls (7,195,402 input and 66,390 output tokens), without a configured
-context-window reference. These are provider-reported token counts.
-Hosted inference was explicitly authorized; the runner had no cumulative token
-or spend cap. The credential was loaded from the owner-only `deepseek.env` for
-each background process only; the shared provider configuration was not changed.
-Evidence:
-[run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/batch.json),
-[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T221257Z-7581dfce/sphinx-doc__sphinx-8595/run-sphinx-doc__sphinx-8595-20261026T221257Z-41b36a30/launch.json),
-and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-a2e3d22059dc44dbb0a73868956ce902/official/sphinx-doc__sphinx-8595-prediction-20261026T221511.628724Z-11b56200b2ec48449c56d853aaa9cdee/evaluation.json).
-Pylint evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/batch.json),
-[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T222748Z-f098fba0/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T222755Z-6400a8c7/launch.json),
-and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e3f0859627cc436d8e5cce6b6ebd4e6e/official/pylint-dev__pylint-6506-prediction-20261026T223040.009489Z-c6f8b6e5bf0e4f9695dd3c38b2f39522/evaluation.json).
-Pylint context-controlled follow-up evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/batch.json),
-[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T233955Z-d8632e4d/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T233956Z-6ec98125/launch.json),
-and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-574e369bc5684c639d8f080e5b19f1cc/official/pylint-dev__pylint-6506-prediction-20261026T234254.241866Z-4edce9768314456b91f4551fad59807f/evaluation.json).
-Pylint 32,768-token-context follow-up evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/batch.json),
-[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T234358Z-0879c7f3/pylint-dev__pylint-6506/run-pylint-dev__pylint-6506-20261026T234359Z-68a9b74a/launch.json),
-and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-e7e79a5da02b423fae474952cb1dd1e5/official/pylint-dev__pylint-6506-prediction-20261026T234807.926531Z-741dd5afe4314fbe9196275d6fa7b9a3/evaluation.json).
-Flask evidence: [run batch](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/batch.json),
-[launch record](../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/pallets__flask-4992/run-pallets__flask-4992-20261026T223312Z-adfc89ce/launch.json),
-and [official evaluator result](../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-d10c7f09e7d2402c819bc9c6815fb01c/official/pallets__flask-4992-prediction-20261026T223451.689810Z-528bce98331c42308f5dd8e74fa79f51/evaluation.json).
-
-### Shared evaluation workflow and suite progress
-
-A repeatable ten-task diagnostic suite, fixed to dataset revision
-`b0dde1093fe417d83b7184254edf8199c1f0dff5` and SWE-bench evaluator `5.0.2`, lives
-in `tools/benchmarks/swe_suite.json`. Preparation, sequential batches, official
-scoring, and offline summaries are separate explicit steps that never invoke a
-model implicitly. Of the ten suite tasks, Flask has completed local-Qwen and
-hosted-DeepSeek scored runs; Sphinx and Pylint have separately recorded
-DeepSeek V4.1 Flash scored runs. Pylint also has two earlier local-Qwen
-interrupted, unscored attempts; the remaining seven tasks have prepared images
-and offline environment checks but no live model result.
-
-**Mandatory benchmark operation rule:** SWE-bench model runs must always be
-started and supervised as background jobs. Never run them as foreground,
-blocking tool executions. Confirm the background process is alive before
-continuing other work, preserve its logs and artifacts, and resume reporting
-from the same session when it completes. If interrupted, record the attempt as
-incomplete and do not silently retry or claim a score. The historical Pylint
-foreground interruption is recorded above.
-
-See [benchmark methodology and earlier run records](docs/research/agent-benchmarks.md)
-and the [reliability follow-up backlog](docs/tasks/09-agent-reliability.md) for
-remaining work on convergence, verification, result recording, and cleanup.
 
 ## Project Status
 

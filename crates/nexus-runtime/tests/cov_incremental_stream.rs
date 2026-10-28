@@ -26,12 +26,12 @@ use std::time::Duration;
 
 use nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES;
 use nexus_core::{
-    AgentError, AssistantText, CallCandidate, CommandReply, ErrorCategory, EventPayload,
-    FinishReason, Limits, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
-    ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunOutcome, SessionId,
-    SubmitCommand, TurnFinished, Usage, UsageFinality,
+    AgentError, AssistantText, CallCandidate, CancelCommand, CommandReply, ErrorCategory,
+    EventPayload, FinishReason, Limits, ModelRequest, ProviderCapabilities, ProviderContext,
+    ProviderEvent, ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunId,
+    RunOutcome, SessionId, SubmitCommand, TurnFinished, Usage, UsageFinality,
 };
-use nexus_runtime::{Policy, Runtime, RuntimeConfig};
+use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig};
 
 /// Bound for every wait. Nothing here blocks on the network, so exceeding it
 /// means a hang rather than a slow machine.
@@ -94,6 +94,254 @@ impl ProviderPort for StreamingProvider {
 /// Legacy provider double: whole batches only, no sink override.
 struct BatchProvider {
     batch: Mutex<Option<Vec<ProviderEvent>>>,
+}
+
+struct GatedBurstProvider {
+    inner: StreamingProvider,
+    ready: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    finished: std::sync::mpsc::Sender<()>,
+}
+
+impl ProviderPort for GatedBurstProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn supports_incremental_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream(&self, _: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
+        unreachable!()
+    }
+
+    fn stream_with_sink(
+        &self,
+        request: &ModelRequest,
+        context: &ProviderContext,
+        sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    ) -> Vec<ProviderEvent> {
+        self.ready.lock().unwrap().take().unwrap().send(()).unwrap();
+        self.release.lock().unwrap().recv_timeout(WAIT).unwrap();
+        let batch = self.inner.stream_with_sink(request, context, sink);
+        let _ = self.finished.send(());
+        batch
+    }
+}
+
+const BURST_FRAGMENTS: usize = 512;
+
+fn burst_text() -> String {
+    (0..BURST_FRAGMENTS)
+        .map(|index| format!("{index},"))
+        .collect()
+}
+
+fn burst_provider() -> StreamingProvider {
+    StreamingProvider::new(
+        (0..BURST_FRAGMENTS)
+            .map(|index| text("item-0", &format!("{index},")))
+            .collect(),
+        vec![
+            text("item-0", &burst_text()),
+            stop_turn(final_usage(None, None)),
+        ],
+    )
+}
+
+async fn start_backpressured_response(
+    runtime_config: RuntimeConfig,
+    inner: StreamingProvider,
+    wait: Duration,
+) -> (Runtime, EventStreams, RunId, std::sync::mpsc::Receiver<()>) {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let provider = Arc::new(GatedBurstProvider {
+        inner,
+        ready: Mutex::new(Some(ready_tx)),
+        release: Mutex::new(release_rx),
+        finished: finished_tx,
+    });
+    let (runtime, streams) = Runtime::new(runtime_config, provider, Vec::new());
+    let response = runtime.submit(submit_cmd("burst")).await;
+    assert_eq!(response.reply(), CommandReply::Accepted);
+    let run = response.run().unwrap().clone();
+    tokio::time::timeout(WAIT, ready_rx).await.unwrap().unwrap();
+    release_tx.send(()).unwrap();
+    // Deliberately hold the current-thread executor here: the worker must
+    // encounter a full internal queue before the consumer can run again.
+    assert_eq!(
+        finished_rx.recv_timeout(wait),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a full queue must pause the provider, not cancel it and finish early"
+    );
+    (runtime, streams, run, finished_rx)
+}
+
+async fn burst_terminal(streams: &mut EventStreams) -> (String, RunFinished) {
+    tokio::time::timeout(WAIT, async {
+        let mut text = String::new();
+        loop {
+            tokio::select! {
+                event = streams.data.recv() => {
+                    if let EventPayload::AssistantTextDelta(fragment) = event.unwrap().payload() {
+                        text.push_str(&fragment.text);
+                    }
+                }
+                event = streams.control.recv() => {
+                    if let EventPayload::RunFinished(done) = event.unwrap().payload() {
+                        while let Ok(event) = streams.data.try_recv() {
+                            if let EventPayload::AssistantTextDelta(fragment) = event.payload() {
+                                text.push_str(&fragment.text);
+                            }
+                        }
+                        return (text, done.clone());
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("backpressured run must finish promptly")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_response_burst_waits_for_capacity_without_losing_or_replaying_text() {
+    let (_runtime, mut streams, _, finished_rx) =
+        start_backpressured_response(config(), burst_provider(), Duration::from_millis(30)).await;
+    let (text, finished) = burst_terminal(&mut streams).await;
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert_eq!(text, burst_text());
+    finished_rx.recv_timeout(WAIT).unwrap();
+    assert!(streams.data.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_releases_a_provider_waiting_for_stream_capacity() {
+    let (runtime, mut streams, run, finished_rx) =
+        start_backpressured_response(config(), burst_provider(), Duration::from_millis(30)).await;
+    let cancel = CancelCommand {
+        request: RequestId::new("cancel-burst").unwrap(),
+        run,
+    };
+    assert_eq!(runtime.cancel(cancel).await.reply(), CommandReply::Accepted);
+    let (_, finished) = burst_terminal(&mut streams).await;
+    assert_eq!(finished.outcome(), RunOutcome::Cancelled);
+    finished_rx.recv_timeout(WAIT).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deadline_releases_a_provider_waiting_for_stream_capacity() {
+    let mut runtime_config = config();
+    runtime_config.limits.run_duration = Duration::from_millis(300);
+    let (_runtime, mut streams, _, finished_rx) =
+        start_backpressured_response(runtime_config, burst_provider(), Duration::from_millis(400))
+            .await;
+    let (_, finished) = burst_terminal(&mut streams).await;
+    assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+    finished_rx.recv_timeout(WAIT).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn output_exhaustion_releases_a_provider_waiting_for_stream_bytes() {
+    // Two individually bufferable events exceed the buffered-byte capacity,
+    // so the second must wait even though the event queue is nowhere near full.
+    let large = "x".repeat(600_000);
+    let provider = StreamingProvider::new(
+        vec![text("item-0", &large), text("item-0", &large)],
+        vec![stop_turn(final_usage(None, None))],
+    );
+    let (_runtime, mut streams, _, finished_rx) =
+        start_backpressured_response(config(), provider, Duration::from_millis(30)).await;
+    let (_, finished) = burst_terminal(&mut streams).await;
+    assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+    assert_eq!(
+        finished.error().unwrap().message(),
+        "provisional output budget exhausted"
+    );
+    finished_rx.recv_timeout(WAIT).unwrap();
+}
+
+#[tokio::test]
+async fn oversized_provisional_event_fails_without_waiting_for_impossible_capacity() {
+    let provider = Arc::new(StreamingProvider::new(
+        vec![text("item-0", &"x".repeat(1_048_577))],
+        vec![stop_turn(final_usage(None, None))],
+    ));
+    let (_, _, finished) = run_turn(provider, "oversized-event", 0).await;
+    assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+    assert_eq!(
+        finished.error().unwrap().message(),
+        "provisional provider event exceeded its byte bound"
+    );
+}
+
+struct GatedReasoningProvider {
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ProviderPort for GatedReasoningProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        StreamingProvider::new(Vec::new(), Vec::new()).capabilities()
+    }
+
+    fn stream(&self, _: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
+        unreachable!()
+    }
+
+    fn supports_incremental_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_with_sink(
+        &self,
+        _: &ModelRequest,
+        _: &ProviderContext,
+        sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    ) -> Vec<ProviderEvent> {
+        let trace = ProviderEvent::ReasoningDelta {
+            text: "live".into(),
+        };
+        sink(trace.clone());
+        self.release.lock().unwrap().recv_timeout(WAIT).unwrap();
+        vec![trace, stop_turn(final_usage(None, None))]
+    }
+}
+
+#[tokio::test]
+async fn reasoning_arrives_before_the_provider_finishes() {
+    let (release, gate) = std::sync::mpsc::channel();
+    let provider = Arc::new(GatedReasoningProvider {
+        release: Mutex::new(gate),
+    });
+    let (runtime, mut streams) = Runtime::new(config(), provider, Vec::new());
+    runtime.enable_local_reasoning();
+    assert_eq!(
+        runtime.submit(submit_cmd("live-reasoning")).await.reply(),
+        CommandReply::Accepted
+    );
+    let event = tokio::time::timeout(WAIT, streams.data.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event.payload(), EventPayload::AssistantReasoningDelta(fragment) if fragment.text == "live")
+    );
+    release.send(()).unwrap();
+    let finished = tokio::time::timeout(WAIT, async {
+        loop {
+            if let EventPayload::RunFinished(done) = streams.control.recv().await.unwrap().payload()
+            {
+                break done.clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert!(streams.data.try_recv().is_err());
 }
 
 impl ProviderPort for BatchProvider {
@@ -169,7 +417,19 @@ async fn run_turn(
     tag: &str,
     expected_data: usize,
 ) -> (Vec<RunEvent>, Vec<RunEvent>, RunFinished) {
+    run_turn_with_reasoning(provider, tag, expected_data, false).await
+}
+
+async fn run_turn_with_reasoning(
+    provider: Arc<dyn ProviderPort + Send + Sync>,
+    tag: &str,
+    expected_data: usize,
+    enabled: bool,
+) -> (Vec<RunEvent>, Vec<RunEvent>, RunFinished) {
     let (runtime, mut streams) = Runtime::new(config(), provider, Vec::new());
+    if enabled {
+        runtime.enable_local_reasoning();
+    }
     let response = runtime.submit(submit_cmd(tag)).await;
     assert_eq!(response.reply(), CommandReply::Accepted);
     let run = response
@@ -228,6 +488,54 @@ async fn run_turn(
         "every delivered event belongs to the submitted run"
     );
     (data, control, finished)
+}
+
+#[tokio::test]
+async fn reasoning_is_opt_in_and_streamed_prefix_is_not_replayed() {
+    for enabled in [false, true] {
+        let provider = Arc::new(StreamingProvider::new(
+            vec![ProviderEvent::ReasoningDelta {
+                text: "first ".into(),
+            }],
+            vec![
+                ProviderEvent::ReasoningDelta {
+                    text: "first second".into(),
+                },
+                stop_turn(final_usage(None, None)),
+            ],
+        ));
+        let (data, _, finished) =
+            run_turn_with_reasoning(provider, "reasoning", if enabled { 2 } else { 0 }, enabled)
+                .await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        let traces: Vec<_> = data
+            .iter()
+            .filter_map(|event| match event.payload() {
+                EventPayload::AssistantReasoningDelta(fragment) => Some(fragment.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(traces.concat(), if enabled { "first second" } else { "" });
+    }
+}
+
+#[tokio::test]
+async fn mismatched_reasoning_prefix_fails_the_turn() {
+    let provider = Arc::new(StreamingProvider::new(
+        vec![ProviderEvent::ReasoningDelta { text: "one".into() }],
+        vec![
+            ProviderEvent::ReasoningDelta {
+                text: "different".into(),
+            },
+            stop_turn(final_usage(None, None)),
+        ],
+    ));
+    let (_, _, finished) = run_turn_with_reasoning(provider, "reasoning-mismatch", 1, true).await;
+    assert_eq!(finished.outcome(), RunOutcome::Failed);
+    assert_eq!(
+        finished.error().unwrap().category(),
+        ErrorCategory::Protocol
+    );
 }
 
 fn data_texts(data: &[RunEvent]) -> Vec<&str> {

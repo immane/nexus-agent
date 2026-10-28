@@ -391,6 +391,34 @@ fn summaries_carry_no_secret_values() {
 }
 
 #[test]
+fn stored_references_round_trip_and_reject_ambiguous_credentials() {
+    let json = configured().to_json();
+    let mut document: serde_json::Value = serde_json::from_str(&json).unwrap();
+    document["providers"][0]["credential"] = serde_json::json!({"stored": "acme"});
+    let config = UserConfig::from_json(&document.to_string()).unwrap();
+    let serialized: serde_json::Value = serde_json::from_str(&config.to_json()).unwrap();
+    assert_eq!(
+        serialized["providers"][0]["credential"],
+        serde_json::json!({"stored": "acme"})
+    );
+    assert_eq!(
+        summary(&config)["providers"][0]["credential"],
+        serde_json::json!({"stored": "acme"})
+    );
+    assert!(CredentialRef::stored("bad id").is_err());
+    for credential in [
+        serde_json::json!({}),
+        serde_json::json!({"stored": ""}),
+        serde_json::json!({"stored": "bad id"}),
+        serde_json::json!({"stored": "acme", "env": "KEY"}),
+        serde_json::json!({"stored": 1}),
+    ] {
+        document["providers"][0]["credential"] = credential;
+        assert!(UserConfig::from_json(&document.to_string()).is_err());
+    }
+}
+
+#[test]
 fn error_display_is_static_and_total() {
     let error = UserConfig::from_json("{}").expect_err("empty rejected");
     assert_eq!(

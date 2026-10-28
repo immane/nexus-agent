@@ -1,6 +1,6 @@
 [package]
 name = "nexus-config"
-version = "0.2.3-alpha"
+version = "0.2.4-alpha"
 edition = "2024"
 
 [dependencies]
@@ -11,3 +11,5 @@ nexus-core = { path = "../nexus-core" }
 nexus-validation = { path = "../nexus-validation" }
 # JSON file format only: parsing plus canonical serialization for saves.
 serde_json = "1"
+# Typed operational settings; user config stays strict JSON.
+serde = { version = "1", features = ["derive"] }

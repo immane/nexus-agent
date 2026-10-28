@@ -486,6 +486,13 @@ mod cov_transport_private {
                 ),
             ),
             (
+                "AssistantReasoningDelta",
+                EventPayload::AssistantReasoningDelta(
+                    AssistantText::new(turn.clone(), "reasoning", "delta")
+                        .expect("valid fragment builds"),
+                ),
+            ),
+            (
                 "ContextReduced",
                 EventPayload::ContextReduced {
                     method: nexus_core::ContextReductionMethod::Truncate,
@@ -573,7 +580,7 @@ mod cov_transport_private {
     #[test]
     fn control_classification_covers_every_payload_variant() {
         let payloads = all_payloads();
-        assert_eq!(payloads.len(), 13, "one fixture per EventPayload variant");
+        assert_eq!(payloads.len(), 14, "one fixture per EventPayload variant");
 
         let mut control = Vec::new();
         let mut data = Vec::new();
@@ -593,6 +600,7 @@ mod cov_transport_private {
                 | EventPayload::UsageUpdated(_)
                 | EventPayload::RunFinished(_) => true,
                 EventPayload::AssistantTextDelta(_)
+                | EventPayload::AssistantReasoningDelta(_)
                 | EventPayload::ToolCallPreview { .. }
                 | EventPayload::ToolOutput(_) => false,
             };
@@ -623,7 +631,12 @@ mod cov_transport_private {
         );
         assert_eq!(
             data,
-            ["AssistantTextDelta", "ToolCallPreview", "ToolOutput"]
+            [
+                "AssistantTextDelta",
+                "AssistantReasoningDelta",
+                "ToolCallPreview",
+                "ToolOutput"
+            ]
         );
     }
 

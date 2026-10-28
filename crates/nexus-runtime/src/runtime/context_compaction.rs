@@ -254,6 +254,7 @@ fn request_for(
         shared.effective_output_budget,
     )
     .map_err(Terminal::failed)?
+    .with_session(active.session.clone())
     .with_context_management(active.context_management)
     // Summarization is a separate operation, not another coding-agent turn.
     // Inheriting task/environment directives can make it resume the task.
@@ -3006,15 +3007,21 @@ mod tests {
             )),
         ];
         let (sender, mut receiver) = mpsc::channel(PROVISIONAL_STREAM_CAPACITY);
-        let bytes = AtomicUsize::new(0);
+        let bytes = Arc::new(Semaphore::new(PROVISIONAL_STREAM_BYTE_CAPACITY));
         for event in &events[..2] {
-            bytes.fetch_add(provisional_event_bytes(event), Ordering::SeqCst);
-            sender.try_send(event.clone()).expect("buffered prefix");
+            let permit = bytes
+                .clone()
+                .try_acquire_many_owned(provisional_event_bytes(event) as u32)
+                .expect("buffered byte capacity");
+            sender
+                .try_send((event.clone(), permit))
+                .expect("buffered prefix");
         }
         let mut prefix = StreamedPrefix::default();
         runtime
-            .drain_stream(&run, &turn(), &mut receiver, &bytes, &mut prefix)
+            .drain_stream(&run, &turn(), &mut receiver, &mut prefix)
             .await;
+        assert_eq!(bytes.available_permits(), PROVISIONAL_STREAM_BYTE_CAPACITY);
         assert!(
             prefix.exceeded,
             "the queued second fragment exceeds the output bound during drain"
@@ -3349,7 +3356,18 @@ mod tests {
                 .contains("private unaccepted")
         );
         let mut failed_usage_recorded = false;
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        let mut final_usage = HashMap::new();
         while let Ok(event) = streams.control.try_recv() {
+            match event.payload() {
+                EventPayload::ModelRequestStarted { turn, .. } => started.push(turn.clone()),
+                EventPayload::ModelRequestFinished { turn, .. } => finished.push(turn.clone()),
+                EventPayload::UsageUpdated(usage) if usage.finality() == UsageFinality::Final => {
+                    final_usage.insert(started.last().unwrap().clone(), *usage);
+                }
+                _ => {}
+            }
             if let EventPayload::UsageUpdated(usage) = event.payload() {
                 failed_usage_recorded |=
                     usage.input_tokens() == Some(12) && usage.output_tokens() == Some(4);
@@ -3359,14 +3377,32 @@ mod tests {
             failed_usage_recorded,
             "failed summary usage remains accounted"
         );
+        assert_eq!(started.len(), 4);
+        assert_eq!(
+            started, finished,
+            "each attempt has paired lifecycle events"
+        );
+        assert_eq!(started.iter().collect::<HashSet<_>>().len(), 4);
+        assert_eq!(
+            final_usage.len(),
+            3,
+            "failed and successful usage remain separate"
+        );
+        assert_eq!(final_usage[&started[1]].input_tokens(), Some(12));
         assert!(
             streams.data.try_recv().is_err(),
             "partial summaries never become answer text"
         );
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[1], requests[2]);
+        assert_eq!(
+            requests[0].clone().with_turn(requests[1].turn().clone()),
+            requests[1]
+        );
+        assert_eq!(
+            requests[1].clone().with_turn(requests[2].turn().clone()),
+            requests[2]
+        );
         assert_ne!(
             requests[2], requests[3],
             "the final call derives the next chunk, not a failed-attempt replay"
@@ -3451,6 +3487,10 @@ mod tests {
         submit_and_finish(&runtime, &mut streams, "session-b", "other-task").await;
         let requests = provider.requests.lock().expect("requests");
         assert_eq!(requests.len(), 5);
+        for request in &requests[..4] {
+            assert_eq!(request.session().unwrap().as_str(), "session-a");
+        }
+        assert_eq!(requests[4].session().unwrap().as_str(), "session-b");
         assert!(requests[1].tool_definitions().is_empty());
         for request in &requests[2..4] {
             assert!(request.conversation().iter().any(|item| matches!(item, ModelContextItem::AssistantText { text, .. } if text.as_str().contains("Derived memory: earlier work."))));

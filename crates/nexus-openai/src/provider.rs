@@ -2,13 +2,14 @@
 //! with streaming SSE parsing and an `openssl s_client` TLS bridge.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use nexus_config::settings::ProviderSettings;
 use nexus_config::{CredentialRef, ProtocolKind, ProviderProfile};
 use nexus_core::{
     AgentError, CallCandidate, CorrelationData, ErrorCategory, FinishReason, Limits,
@@ -27,10 +28,8 @@ const MAX_STREAM_WIRE_BYTES: usize = 64 * 1_024 * 1_024;
 const MAX_SSE_RECORD_BYTES: usize = MAX_RESPONSE_BYTES;
 /// Maximum vendor model name in bytes, matching the configuration bound.
 pub const MAX_MODEL_LEN: usize = 128;
-/// Socket connect timeout. Reads use the remaining run deadline.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONTEXT_METADATA_BYTES: usize = 256 * 1024;
+const MAX_CATALOG_BYTES: usize = 12 * 1024 * 1024;
 /// Maximum response head (status line plus headers) in bytes. Anything
 /// larger fails instead of accumulating unboundedly while the head is still
 /// incomplete.
@@ -38,17 +37,6 @@ const MAX_HEAD_BYTES: usize = 16_384;
 /// Read poll quantum: cancellation and deadlines are re-checked between
 /// quanta so a stalled peer cannot park the worker past its bound.
 const READ_QUANTUM: Duration = Duration::from_secs(1);
-/// Access failures back off to one minute, then keep that interval until the
-/// live deadline or cancellation. Standalone callers also have a time bound.
-const FALLBACK_CALL_TIMEOUT: Duration = Duration::from_secs(600);
-const PROVIDER_RETRY_DELAYS: [Duration; 6] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-];
 /// The TLS stdout pump retains at most this many fixed-size chunks while the
 /// parser is behind (128 KiB total). A closed consumer releases a blocked send.
 const TLS_PUMP_CHUNKS: usize = 16;
@@ -83,7 +71,7 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
         match status {
             401 | 403 => ErrorCategory::Authentication,
             402 => ErrorCategory::PermissionDenied,
-            400 | 422 => ErrorCategory::InvalidInput,
+            400 | 413 | 422 | 431 => ErrorCategory::InvalidInput,
             429 => ErrorCategory::RateLimited,
             _ => ErrorCategory::Protocol,
         },
@@ -91,6 +79,8 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
             401 | 403 => "provider credentials were rejected",
             402 => "provider payment is required",
             400 | 422 => "provider request was rejected",
+            413 => "provider request body is too large",
+            431 => "provider request headers are too large",
             429 => "provider rate limit reached",
             _ => "provider request failed",
         },
@@ -99,9 +89,9 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
 
 fn status_retry_guidance(status: u16) -> RetryGuidance {
     // Remote access refusals (including auth, billing, routing and redirects)
-    // can recover without changing the local request. Body validation errors
-    // remain terminal; redirects are never followed with credentials.
-    if (300..=599).contains(&status) && !matches!(status, 400 | 422) {
+    // can recover without changing the local request. Request validation and
+    // size errors remain terminal; redirects are never followed with credentials.
+    if (300..=599).contains(&status) && !matches!(status, 400 | 413 | 422 | 431) {
         RetryGuidance::RetryAfterBackoff
     } else {
         RetryGuidance::DoNotRetry
@@ -147,6 +137,7 @@ fn status_error_with_head(status: u16, head: &str) -> ProviderEvent {
 /// `openssl s_client` TLS bridge. The profile selects Chat Completions,
 /// Responses, or Anthropic Messages; see [`OpenAiProvider::from_profile`].
 pub struct OpenAiProvider {
+    operational_settings: ProviderSettings,
     context_management: nexus_core::ContextManagementSettings,
     host: String,
     port: u16,
@@ -285,6 +276,7 @@ impl OpenAiProvider {
             ));
         }
         Ok(Self {
+            operational_settings: ProviderSettings::default(),
             context_management: nexus_core::ContextManagementSettings::default(),
             host,
             port,
@@ -315,6 +307,44 @@ impl OpenAiProvider {
         )
     }
 
+    /// Binds timeout and retry settings without performing any network I/O.
+    /// Apply this before context discovery so its timeout also takes effect.
+    ///
+    /// # Errors
+    /// Rejects zero, excessive, empty, or decreasing operational bounds.
+    pub fn with_operational_settings(
+        mut self,
+        settings: &ProviderSettings,
+    ) -> Result<Self, AgentError> {
+        Self::validate_operational_settings(settings)?;
+        self.operational_settings = settings.clone();
+        Ok(self)
+    }
+
+    /// Checks public operational settings defensively before installing them.
+    pub fn validate_operational_settings(settings: &ProviderSettings) -> Result<(), AgentError> {
+        if !(1..=86_400).contains(&settings.connect_timeout_seconds)
+            || !(1..=86_400).contains(&settings.context_discovery_timeout_seconds)
+            || !(1..=86_400).contains(&settings.fallback_call_timeout_seconds)
+            || settings.retry_backoff_seconds.is_empty()
+            || settings.retry_backoff_seconds.len() > 8
+            || settings
+                .retry_backoff_seconds
+                .iter()
+                .any(|seconds| !(1..=3_600).contains(seconds))
+            || settings
+                .retry_backoff_seconds
+                .windows(2)
+                .any(|pair| pair[0] > pair[1])
+        {
+            return Err(provider_error_inner(
+                ErrorCategory::InvalidInput,
+                "provider operational settings are invalid",
+            ));
+        }
+        Ok(())
+    }
+
     /// Binds validated host settings. This does not perform discovery or enable
     /// token counting or automatic compaction for any protocol.
     #[must_use]
@@ -326,18 +356,26 @@ impl OpenAiProvider {
         self
     }
 
-    /// Best-effort Ollama model metadata discovery. Explicit configuration
-    /// wins; unsupported endpoints, malformed metadata, and transient failures
-    /// leave the window unknown. This is a bounded, read-only `/api/show`
-    /// request to the already-configured origin, not model-name inference.
+    /// Best-effort model metadata discovery. Explicit configuration wins;
+    /// malformed metadata and transient failures leave the window unknown.
+    /// Frontends should use `supports_context_discovery` before calling this.
     #[must_use]
-    pub fn discover_context_management(mut self) -> Self {
+    pub fn discover_context_management(self) -> Self {
         if self.context_management.window.is_some()
             || self.protocol != ProtocolKind::ChatCompletions
         {
             return self;
         }
-        if let Some(tokens) = self.discover_ollama_context_window()
+        let tokens = if self.is_opencode_go_endpoint() {
+            self.discover_opencode_go_context_window()
+        } else {
+            self.discover_ollama_context_window()
+        };
+        self.apply_discovered_context(tokens)
+    }
+
+    fn apply_discovered_context(mut self, tokens: Option<u32>) -> Self {
+        if let Some(tokens) = tokens
             && let Ok(window) = nexus_core::ContextWindow::new(
                 tokens,
                 nexus_core::ContextWindowSource::ModelMetadata,
@@ -354,6 +392,58 @@ impl OpenAiProvider {
     pub fn is_ollama_endpoint(&self) -> bool {
         self.protocol == ProtocolKind::ChatCompletions
             && (self.port == 11_434 || self.host.to_ascii_lowercase().contains("ollama"))
+    }
+
+    /// Whether this is the official OpenCode Go Chat Completions endpoint.
+    #[must_use]
+    pub fn is_opencode_go_endpoint(&self) -> bool {
+        self.protocol == ProtocolKind::ChatCompletions
+            && self.use_tls
+            && self.host.eq_ignore_ascii_case("opencode.ai")
+            && self.port == 443
+            && self.base_path == "/inference/go/openai/v1"
+    }
+
+    /// Whether the frontend should attempt automatic metadata discovery.
+    #[must_use]
+    pub fn supports_context_discovery(&self) -> bool {
+        self.is_ollama_endpoint() || self.is_opencode_go_endpoint()
+    }
+
+    fn discover_opencode_go_context_window(&self) -> Option<u32> {
+        let catalog = Self::new("https://models.dev", self.credential.clone(), &self.model)
+            .ok()?
+            .with_operational_settings(&self.operational_settings)
+            .ok()?;
+        self.discover_opencode_go_from(&catalog)
+    }
+
+    fn discover_opencode_go_from(&self, catalog: &Self) -> Option<u32> {
+        let started = Instant::now();
+        let address = join_host_port(&catalog.host, catalog.port);
+        let request = format!(
+            "GET /api.json HTTP/1.1\r\nhost: {address}\r\nuser-agent: nexus-agent/{}\r\naccept: application/json\r\nconnection: close\r\n\r\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let response =
+            read_context_metadata_response(catalog, request.as_bytes(), MAX_CATALOG_BYTES);
+        let window = response
+            .as_deref()
+            .and_then(|response| parse_opencode_go_context_window(response, &self.model));
+        let outcome = match (&response, window) {
+            (None, _) => "request_failed",
+            (Some(_), None) => "model_metadata_missing_or_invalid",
+            (Some(_), Some(_)) => "discovered",
+        };
+        // Log only bounded metadata: never credentials, response bodies or URLs.
+        diagnostic(format_args!(
+            "nexus-openai: context discovery source=models.dev/opencode-go outcome={outcome} elapsed_ms={} timeout_seconds={} window_tokens={window:?}",
+            started.elapsed().as_millis(),
+            catalog
+                .operational_settings
+                .context_discovery_timeout_seconds,
+        ));
+        window
     }
 
     fn discover_ollama_context_window(&self) -> Option<u32> {
@@ -374,7 +464,7 @@ impl OpenAiProvider {
         );
         let mut request = head.into_bytes();
         request.extend_from_slice(&body);
-        let response = read_context_metadata_response(self, &request)?;
+        let response = read_context_metadata_response(self, &request, MAX_CONTEXT_METADATA_BYTES)?;
         parse_ollama_context_window(&response)
     }
 
@@ -460,6 +550,7 @@ impl OpenAiProvider {
     fn stream_with_sink_impl(
         &self,
         body: &[u8],
+        request: &ModelRequest,
         context: &ProviderContext,
         sink: &(dyn Fn(ProviderEvent) + Send + Sync),
     ) -> Vec<ProviderEvent> {
@@ -469,17 +560,21 @@ impl OpenAiProvider {
                 "provider call was cancelled",
             )];
         }
-        let deadline = Some(
-            context
-                .deadline()
-                .unwrap_or_else(|| Instant::now() + FALLBACK_CALL_TIMEOUT),
-        );
+        let deadline = Some(call_deadline(
+            context.deadline(),
+            &self.operational_settings,
+            Instant::now(),
+        ));
         if deadline.is_some_and(|at| Instant::now() >= at) {
             return vec![provider_error(
                 ErrorCategory::Timeout,
                 "provider deadline elapsed before send",
             )];
         }
+        let extra_headers = match self.opencode_go_headers(request) {
+            Ok(headers) => headers,
+            Err(failure) => return vec![failure],
+        };
         let token = match nexus_config::resolve_credential(&self.credential) {
             Ok(token) => token,
             Err(_) => {
@@ -510,11 +605,12 @@ impl OpenAiProvider {
             }
         };
         let head = format!(
-            "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\naccept: text/event-stream, application/json\r\ncontent-length: {}\r\n{auth}connection: close\r\n\r\n",
+            "POST {path} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\naccept: text/event-stream, application/json\r\ncontent-length: {}\r\n{auth}{extra_headers}connection: close\r\n\r\n",
             address,
             body.len(),
         );
         retry_exchange(
+            &self.operational_settings,
             context,
             deadline,
             sink,
@@ -527,6 +623,7 @@ impl OpenAiProvider {
                         body,
                         context,
                         deadline,
+                        Duration::from_secs(self.operational_settings.connect_timeout_seconds),
                     ) {
                         Ok(mut source) => stream_response(
                             &mut source,
@@ -538,7 +635,13 @@ impl OpenAiProvider {
                         Err(failure) => vec![failure],
                     }
                 } else {
-                    match connect_plain(&self.host, self.port, context, deadline) {
+                    match connect_plain(
+                        &self.host,
+                        self.port,
+                        context,
+                        deadline,
+                        Duration::from_secs(self.operational_settings.connect_timeout_seconds),
+                    ) {
                         Ok(mut stream) => {
                             if let Err(failure) =
                                 write_request(&mut stream, head.as_bytes(), body, context, deadline)
@@ -563,9 +666,32 @@ impl OpenAiProvider {
             wait_before_retry,
         )
     }
+
+    fn opencode_go_headers(&self, request: &ModelRequest) -> Result<String, ProviderEvent> {
+        if !self.use_tls
+            || self.port != 443
+            || !self.host.eq_ignore_ascii_case("opencode.ai")
+            || self.base_path != "/inference/go/openai/v1"
+            || self.protocol != ProtocolKind::ChatCompletions
+        {
+            return Ok(String::new());
+        }
+        let session = request.session().ok_or_else(|| {
+            provider_error(
+                ErrorCategory::InvalidInput,
+                "OpenCode Go requires a conversation session identity",
+            )
+        })?;
+        Ok(format!(
+            "user-agent: nexus-agent/{}\r\nx-opencode-session: {}\r\n",
+            env!("CARGO_PKG_VERSION"),
+            session.as_str()
+        ))
+    }
 }
 
 fn retry_exchange(
+    settings: &ProviderSettings,
     context: &ProviderContext,
     deadline: Option<Instant>,
     sink: &(dyn Fn(ProviderEvent) + Send + Sync),
@@ -574,7 +700,7 @@ fn retry_exchange(
 ) -> Vec<ProviderEvent> {
     // Keep this guard here as well as at the public entry point: no caller of
     // the retry driver can accidentally create an unbounded deadline-free loop.
-    let deadline = Some(deadline.unwrap_or_else(|| Instant::now() + FALLBACK_CALL_TIMEOUT));
+    let deadline = Some(call_deadline(deadline, settings, Instant::now()));
     let mut retry = 0usize;
     loop {
         if let Err(failure) = check_live(context, deadline) {
@@ -590,7 +716,7 @@ fn retry_exchange(
             return vec![failure];
         }
         let will_retry = !emitted.load(Ordering::Relaxed) && has_retryable_terminal(&events);
-        let mut delay = retry_delay(retry);
+        let mut delay = retry_delay(settings, retry);
         if let Some(ProviderEvent::Failed(error)) = events.last() {
             if let Some(seconds) = error
                 .correlation()
@@ -633,16 +759,61 @@ fn log_provider_failure(error: &AgentError, attempt: usize, delay: Option<Durati
         || "not-scheduled".to_owned(),
         |delay| format!("in {delay:?}"),
     );
-    eprintln!(
+    diagnostic(format_args!(
         "nexus-openai: provider attempt {attempt} failed: category={:?}, retry={:?} ({retry}), http_status={http_status}, message={}",
         error.category(),
         error.retry(),
         error.message(),
-    );
+    ));
 }
 
-fn retry_delay(retry: usize) -> Duration {
-    PROVIDER_RETRY_DELAYS[retry.min(PROVIDER_RETRY_DELAYS.len() - 1)]
+fn diagnostic(message: std::fmt::Arguments<'_>) {
+    let stderr = std::io::stderr();
+    diagnostic_to(message, &mut stderr.lock(), stderr.is_terminal());
+}
+
+// The full-screen frontend owns terminal output. Only redirected stderr may
+// receive provider diagnostics; run-scoped discovery metadata uses its logger.
+fn diagnostic_to(message: std::fmt::Arguments<'_>, writer: &mut impl Write, terminal: bool) {
+    if !terminal {
+        let _ = writeln!(writer, "{message}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn provider_diagnostics_never_write_to_a_terminal() {
+        let mut output = Vec::new();
+        diagnostic_to(
+            format_args!("nexus-openai: context discovery"),
+            &mut output,
+            true,
+        );
+        diagnostic_to(
+            format_args!("nexus-openai: provider attempt failed"),
+            &mut output,
+            true,
+        );
+        assert!(output.is_empty());
+        diagnostic_to(format_args!("metadata"), &mut output, false);
+        assert_eq!(output, b"metadata\n");
+    }
+}
+
+fn call_deadline(deadline: Option<Instant>, settings: &ProviderSettings, now: Instant) -> Instant {
+    deadline.unwrap_or_else(|| now + Duration::from_secs(settings.fallback_call_timeout_seconds))
+}
+
+fn retry_delay(settings: &ProviderSettings, retry: usize) -> Duration {
+    let delays = &settings.retry_backoff_seconds;
+    Duration::from_secs(delays[retry.min(delays.len() - 1)])
+}
+
+fn connect_timeout_for(timeout: Duration, deadline: Option<Instant>, now: Instant) -> Duration {
+    deadline.map_or(timeout, |at| timeout.min(at.saturating_duration_since(now)))
 }
 
 fn wait_before_retry(
@@ -872,15 +1043,14 @@ fn connect_plain(
     port: u16,
     context: &ProviderContext,
     deadline: Option<Instant>,
+    connect_timeout: Duration,
 ) -> Result<TcpStream, ProviderEvent> {
     check_live(context, deadline)?;
     let address = join_host_port(host, port);
     if let Ok(addresses) = address.to_socket_addrs() {
         for address in addresses {
             check_live(context, deadline)?;
-            let timeout = deadline.map_or(CONNECT_TIMEOUT, |at| {
-                CONNECT_TIMEOUT.min(at.saturating_duration_since(Instant::now()))
-            });
+            let timeout = connect_timeout_for(connect_timeout, deadline, Instant::now());
             match TcpStream::connect_timeout(&address, timeout.max(Duration::from_millis(1))) {
                 Ok(stream) => {
                     check_live(context, deadline)?;
@@ -968,12 +1138,22 @@ fn write_request(
 
 /// Sends one tightly bounded metadata request using the provider's configured
 /// origin. Discovery is deliberately not retried and never changes run state.
-fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> Option<Vec<u8>> {
+fn read_context_metadata_response(
+    provider: &OpenAiProvider,
+    request: &[u8],
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
     // The request is already assembled and bounded. Split at the HTTP header
     // terminator so the verified TLS helper can write the exact wire bytes.
     let boundary = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")? + 4;
     let (request_head, request_body) = request.split_at(boundary);
-    let deadline = Instant::now().checked_add(CONTEXT_DISCOVERY_TIMEOUT)?;
+    let deadline = Instant::now().checked_add(Duration::from_secs(
+        provider
+            .operational_settings
+            .context_discovery_timeout_seconds,
+    ))?;
+    let connect_timeout =
+        Duration::from_secs(provider.operational_settings.connect_timeout_seconds);
     let context = ProviderContext::new(Duration::ZERO, false, None);
     let mut response = Vec::new();
     if provider.use_tls {
@@ -984,6 +1164,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
             request_body,
             &context,
             Some(deadline),
+            connect_timeout,
         )
         .ok()?;
         while Instant::now() < deadline {
@@ -998,7 +1179,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
             {
                 Some(chunk) => {
                     response.extend_from_slice(&chunk);
-                    if response.len() > MAX_CONTEXT_METADATA_BYTES {
+                    if response.len() > max_bytes {
                         return None;
                     }
                 }
@@ -1008,7 +1189,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
     } else {
         let address = join_host_port(&provider.host, provider.port);
         let mut stream = address.to_socket_addrs().ok()?.find_map(|address| {
-            let timeout = deadline.saturating_duration_since(Instant::now());
+            let timeout = connect_timeout_for(connect_timeout, Some(deadline), Instant::now());
             (!timeout.is_zero())
                 .then(|| TcpStream::connect_timeout(&address, timeout))
                 .and_then(Result::ok)
@@ -1023,7 +1204,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
                 Ok(0) => break,
                 Ok(read) => {
                     response.extend_from_slice(&buffer[..read]);
-                    if response.len() > MAX_CONTEXT_METADATA_BYTES {
+                    if response.len() > max_bytes {
                         return None;
                     }
                 }
@@ -1045,8 +1226,155 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
     {
         return None;
     }
-    let body = decode_body(head, &response[boundary + 4..]);
-    (body.len() <= MAX_CONTEXT_METADATA_BYTES).then_some(body)
+    let body = if head.to_ascii_lowercase().contains("chunked") {
+        dechunk_bounded(&response[boundary + 4..], max_bytes)?
+    } else {
+        response[boundary + 4..].to_vec()
+    };
+    (body.len() <= max_bytes).then_some(body)
+}
+
+fn parse_opencode_go_context_window(response: &[u8], model: &str) -> Option<u32> {
+    let value: Value = serde_json::from_slice(response).ok()?;
+    value
+        .get("opencode-go")?
+        .get("models")?
+        .get(model)?
+        .get("limit")?
+        .get("context")?
+        .as_u64()
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use nexus_core::{ContextWindow, ContextWindowSource, ProviderPort};
+    use std::net::TcpListener;
+
+    fn adapter(endpoint: &str, protocol: ProtocolKind) -> OpenAiProvider {
+        OpenAiProvider::new_for_protocol(
+            endpoint,
+            CredentialRef::env_var("CATALOG_TEST_UNUSED").unwrap(),
+            "model-a",
+            protocol,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "live: fetches the public models.dev catalog without provider credentials"]
+    fn live_opencode_go_catalog_discovery() {
+        let provider = OpenAiProvider::new(
+            "https://opencode.ai/inference/go/openai/v1",
+            CredentialRef::env_var("CATALOG_TEST_UNUSED").unwrap(),
+            "muse-spark-1.3-contributor",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let provider = provider.discover_context_management();
+        eprintln!("catalog lookup elapsed={:?}", started.elapsed());
+        assert!(provider.context_management().window.is_some());
+    }
+
+    #[test]
+    fn catalog_requires_exact_provider_model_and_positive_u32_limit() {
+        let json = br#"{"opencode-go":{"models":{"model-a":{"limit":{"context":1000000}},"zero":{"limit":{"context":0}},"huge":{"limit":{"context":4294967296}}}},"other":{"models":{"missing":{"limit":{"context":123}}}}}"#;
+        assert_eq!(
+            parse_opencode_go_context_window(json, "model-a"),
+            Some(1_000_000)
+        );
+        for model in ["Model-a", "missing", "zero", "huge"] {
+            assert_eq!(parse_opencode_go_context_window(json, model), None);
+        }
+        assert_eq!(
+            parse_opencode_go_context_window(b"not json", "model-a"),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_and_configured_precedence() {
+        let official = adapter(
+            "https://opencode.ai/inference/go/openai/v1",
+            ProtocolKind::ChatCompletions,
+        );
+        assert!(official.supports_context_discovery());
+        for endpoint in [
+            "http://opencode.ai/inference/go/openai/v1",
+            "https://opencode.ai:444/inference/go/openai/v1",
+            "https://opencode.ai.example/inference/go/openai/v1",
+            "https://opencode.ai/inference/go/openai/v2",
+        ] {
+            assert!(!adapter(endpoint, ProtocolKind::ChatCompletions).supports_context_discovery());
+        }
+        assert!(
+            !adapter(
+                "https://opencode.ai/inference/go/openai/v1",
+                ProtocolKind::OpenAiResponses
+            )
+            .supports_context_discovery()
+        );
+        let settings = nexus_core::ContextManagementSettings {
+            window: Some(ContextWindow::new(42_000, ContextWindowSource::Configured).unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            official
+                .with_context_management(settings)
+                .discover_context_management()
+                .context_management(),
+            settings
+        );
+    }
+
+    #[test]
+    fn catalog_request_is_unauthenticated_and_worker_finishes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let body = r#"{"opencode-go":{"models":{"model-a":{"limit":{"context":1000000}}}}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let official = adapter(
+            "https://opencode.ai/inference/go/openai/v1",
+            ProtocolKind::ChatCompletions,
+        );
+        let catalog = adapter(&format!("http://{address}"), ProtocolKind::ChatCompletions);
+        let tokens = official.discover_opencode_go_from(&catalog);
+        let window = official
+            .apply_discovered_context(tokens)
+            .context_management()
+            .window
+            .unwrap();
+        assert_eq!(window.tokens(), 1_000_000);
+        assert_eq!(window.source(), ContextWindowSource::ModelMetadata);
+        let request = worker.join().unwrap();
+        assert!(request.starts_with("GET /api.json HTTP/1.1\r\n"));
+        assert!(!request.to_ascii_lowercase().contains("authorization"));
+        assert!(request.contains(concat!(
+            "user-agent: nexus-agent/",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
 }
 
 /// Reads the positive context limit exposed by Ollama's model-details API.
@@ -1085,6 +1413,7 @@ fn spawn_tls(
     body: &[u8],
     context: &ProviderContext,
     deadline: Option<Instant>,
+    connect_timeout: Duration,
 ) -> Result<TlsSource, ProviderEvent> {
     check_live(context, deadline)?;
     let target = join_host_port(host, port);
@@ -1191,6 +1520,7 @@ fn spawn_tls(
         child,
         started: Instant::now(),
         first_byte: true,
+        connect_timeout,
         security_receiver,
     })
 }
@@ -1294,6 +1624,7 @@ struct TlsSource {
     child: Child,
     started: Instant,
     first_byte: bool,
+    connect_timeout: Duration,
     security_receiver: mpsc::Receiver<bool>,
 }
 
@@ -1325,7 +1656,7 @@ impl ChunkSource for TlsSource {
             )),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 check_live(context, deadline)?;
-                if self.first_byte && self.started.elapsed() >= CONNECT_TIMEOUT {
+                if self.first_byte && self.started.elapsed() >= self.connect_timeout {
                     return Err(retryable_provider_error(
                         ErrorCategory::Protocol,
                         "provider is unreachable",
@@ -1541,8 +1872,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 #[derive(Default)]
 struct SseAccum {
     text: String,
-    /// Thinking trace to echo on later turns. Withheld from the provisional
-    /// sink: it is recorded for the batch only, never presented.
+    /// Thinking trace to echo on later turns and include in the final batch.
     reasoning: String,
     fragments: BTreeMap<u64, SseCall>,
     reason: String,
@@ -1553,6 +1883,7 @@ struct SseAccum {
 /// What one `data:` JSON chunk contributed, for provisional sink delivery.
 struct SseApplied {
     content: String,
+    reasoning: String,
     usage_present: bool,
     usage: (Option<u64>, Option<u64>),
 }
@@ -1582,6 +1913,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
     }
     let mut applied = SseApplied {
         content: String::new(),
+        reasoning: String::new(),
         usage_present: chunk.get("usage").is_some(),
         usage: (input, output),
     };
@@ -1610,8 +1942,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
         acc.text.push_str(fragment);
         applied.content.push_str(fragment);
     }
-    // Thinking-mode trace. Accumulated for echo on later turns; unlike
-    // text it never reaches the provisional sink. Vendors disagree on the
+    // Thinking-mode trace. Vendors disagree on the
     // field name (DeepSeek `reasoning_content`, Ollama `reasoning`), so
     // both feed the same accumulator.
     if let Some(trace) = delta
@@ -1620,6 +1951,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
         .and_then(Value::as_str)
     {
         acc.reasoning.push_str(trace);
+        applied.reasoning.push_str(trace);
     }
     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -1654,7 +1986,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
 }
 
 /// Builds the authoritative batch from aggregated SSE state: at most one
-/// text delta at `item-0`, the withheld thinking trace (when the vendor
+/// text delta at `item-0`, the complete thinking trace (when the vendor
 /// sent one), calls numbered from `item-1`, then exactly one terminal.
 fn finalize_sse(acc: &SseAccum) -> Vec<ProviderEvent> {
     if acc.text.len()
@@ -2106,7 +2438,7 @@ impl ProtocolSseLive {
 
 /// Incremental SSE parser: de-chunks when the head declares chunked framing,
 /// splits complete lines, folds them into [`SseAccum`], and delivers
-/// provisional text plus usage through the sink as chunks arrive. Tool-call
+/// provisional text, reasoning, and usage through the sink as chunks arrive. Tool-call
 /// fragments never touch the sink: previews only make sense against the
 /// finalized item keys. Returns the authoritative batch once `[DONE]`
 /// completes the turn; a strict terminator is required, EOF without one is
@@ -2118,6 +2450,56 @@ struct SseLive {
     last_usage: (Option<u64>, Option<u64>),
     raw_bytes: usize,
     records: usize,
+}
+
+#[cfg(test)]
+mod live_reasoning_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn streams_both_vendor_fields_and_keeps_one_complete_batch_trace() {
+        let mut parser = SseLive::new(false);
+        let seen = Mutex::new(Vec::new());
+        let sink = |event| seen.lock().unwrap().push(event);
+        assert!(
+            parser
+                .feed(
+                    b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first \"}}]}\n",
+                    &sink
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parser
+                .feed(
+                    b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"second\"}}]}\n",
+                    &sink
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ProviderEvent::ReasoningDelta {
+                    text: "first ".into()
+                },
+                ProviderEvent::ReasoningDelta {
+                    text: "second".into()
+                },
+            ]
+        );
+        parser
+            .feed(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                &sink,
+            )
+            .unwrap();
+        let batch = parser.feed(b"data: [DONE]\n", &sink).unwrap().unwrap();
+        assert!(batch.iter().any(|event| matches!(event, ProviderEvent::ReasoningDelta { text } if text == "first second")));
+    }
 }
 
 impl SseLive {
@@ -2214,6 +2596,11 @@ impl SseLive {
                 sink(ProviderEvent::TextDelta {
                     item_key: "item-0".to_owned(),
                     text: applied.content,
+                });
+            }
+            if !applied.reasoning.is_empty() {
+                sink(ProviderEvent::ReasoningDelta {
+                    text: applied.reasoning,
                 });
             }
             if applied.usage_present && applied.usage != self.last_usage {
@@ -2359,6 +2746,10 @@ fn decode_body(head: &str, body: &[u8]) -> Vec<u8> {
 /// Byte-level `Transfer-Encoding: chunked` decoder. Returns `None` on any
 /// framing violation.
 fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
+    dechunk_bounded(body, MAX_RESPONSE_BYTES)
+}
+
+fn dechunk_bounded(body: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(body.len());
     let mut cursor = 0;
     loop {
@@ -2370,7 +2761,7 @@ fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
         if size == 0 {
             return Some(out);
         }
-        if out.len().saturating_add(size) > MAX_RESPONSE_BYTES {
+        if out.len().saturating_add(size) > max_bytes {
             return None;
         }
         let end = cursor.checked_add(size)?;
@@ -3214,7 +3605,96 @@ impl ProviderPort for OpenAiProvider {
                 "provider request could not be encoded",
             )];
         }
-        self.stream_with_sink_impl(&body, context, sink)
+        self.stream_with_sink_impl(&body, request, context, sink)
+    }
+}
+
+#[cfg(test)]
+mod opencode_go_tests {
+    use super::*;
+    use nexus_core::{RunId, SessionId, TurnId};
+
+    fn request(session: Option<&str>, run: &str) -> ModelRequest {
+        let request = ModelRequest::new(
+            RunId::new(run).unwrap(),
+            TurnId::new("turn").unwrap(),
+            "profile",
+            Vec::new(),
+            None,
+            1024,
+        )
+        .unwrap();
+        match session {
+            Some(id) => request.with_session(SessionId::new(id).unwrap()),
+            None => request,
+        }
+    }
+
+    fn provider(endpoint: &str, protocol: ProtocolKind) -> OpenAiProvider {
+        OpenAiProvider::new_for_protocol(
+            endpoint,
+            CredentialRef::env_var("TEST_OPENCODE_KEY").unwrap(),
+            "model",
+            protocol,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn headers_are_stable_per_session_and_require_identity() {
+        let provider = provider(
+            "https://opencode.ai/inference/go/openai/v1",
+            ProtocolKind::ChatCompletions,
+        );
+        let first = provider
+            .opencode_go_headers(&request(Some("session-a"), "run-a"))
+            .unwrap();
+        let next = provider
+            .opencode_go_headers(&request(Some("session-a"), "run-b"))
+            .unwrap();
+        let other = provider
+            .opencode_go_headers(&request(Some("session-b"), "run-c"))
+            .unwrap();
+        assert_eq!(first, next);
+        assert!(first.contains("x-opencode-session: session-a\r\n"));
+        assert!(first.contains(concat!(
+            "user-agent: nexus-agent/",
+            env!("CARGO_PKG_VERSION"),
+            "\r\n"
+        )));
+        assert_ne!(first, other);
+        assert!(
+            provider
+                .opencode_go_headers(&request(None, "run-d"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn headers_never_reach_other_endpoints_or_protocols() {
+        for endpoint in [
+            "http://opencode.ai/inference/go/openai/v1",
+            "https://opencode.ai:444/inference/go/openai/v1",
+            "https://opencode.ai.evil.test/inference/go/openai/v1",
+            "https://opencode.ai/inference/openai/v1",
+            "https://opencode.ai/inference/go/openai/v1/other",
+        ] {
+            assert_eq!(
+                provider(endpoint, ProtocolKind::ChatCompletions)
+                    .opencode_go_headers(&request(Some("session-a"), "run"))
+                    .unwrap(),
+                ""
+            );
+        }
+        assert_eq!(
+            provider(
+                "https://opencode.ai/inference/go/openai/v1",
+                ProtocolKind::OpenAiResponses
+            )
+            .opencode_go_headers(&request(Some("session-a"), "run"))
+            .unwrap(),
+            ""
+        );
     }
 }
 
@@ -3276,10 +3756,144 @@ mod retry_policy_tests {
     use nexus_core::CancellationToken;
 
     #[test]
-    fn retry_schedule_increases_then_stays_at_one_minute() {
+    fn custom_settings_select_timeouts_without_overriding_a_run_deadline() {
+        let settings = ProviderSettings {
+            connect_timeout_seconds: 7,
+            context_discovery_timeout_seconds: 11,
+            fallback_call_timeout_seconds: 19,
+            retry_backoff_seconds: vec![3, 9],
+        };
+        let provider = OpenAiProvider::new(
+            "http://localhost/v1",
+            CredentialRef::env_var("NEXUS_TEST_UNUSED_TOKEN").unwrap(),
+            "model",
+        )
+        .unwrap()
+        .with_operational_settings(&settings)
+        .unwrap();
+        assert_eq!(provider.operational_settings, settings);
+        let now = Instant::now();
         assert_eq!(
-            PROVIDER_RETRY_DELAYS,
-            [
+            call_deadline(None, &settings, now),
+            now + Duration::from_secs(19)
+        );
+        for seconds in [2, 30] {
+            let deadline = now + Duration::from_secs(seconds);
+            assert_eq!(call_deadline(Some(deadline), &settings, now), deadline);
+            assert_eq!(
+                connect_timeout_for(Duration::from_secs(7), Some(deadline), now),
+                Duration::from_secs(seconds.min(7))
+            );
+        }
+        assert_eq!(
+            connect_timeout_for(Duration::from_secs(7), None, now),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            connect_timeout_for(Duration::from_secs(7), Some(now), now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn custom_retry_schedule_is_used_and_last_delay_repeats() {
+        let settings = ProviderSettings {
+            retry_backoff_seconds: vec![3, 9],
+            fallback_call_timeout_seconds: 17,
+            ..ProviderSettings::default()
+        };
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let events = retry_exchange(
+            &settings,
+            &context,
+            None,
+            &|_| {},
+            |_| {
+                attempts += 1;
+                if attempts <= 4 {
+                    vec![status_error(503)]
+                } else {
+                    Vec::new()
+                }
+            },
+            |_, _, delay| {
+                waits.push(delay);
+                Ok(())
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(attempts, 5);
+        assert_eq!(waits, [3, 9, 9, 9].map(Duration::from_secs));
+        assert_eq!(retry_delay(&settings, usize::MAX), Duration::from_secs(9));
+    }
+
+    #[test]
+    fn public_operational_settings_are_validated_defensively() {
+        let defaults = ProviderSettings::default();
+        assert_eq!(defaults.connect_timeout_seconds, 10);
+        assert_eq!(defaults.context_discovery_timeout_seconds, 10);
+        assert_eq!(defaults.fallback_call_timeout_seconds, 600);
+        assert!(OpenAiProvider::validate_operational_settings(&defaults).is_ok());
+        for settings in [
+            ProviderSettings {
+                connect_timeout_seconds: 0,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                connect_timeout_seconds: 86_401,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                context_discovery_timeout_seconds: 0,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                context_discovery_timeout_seconds: 86_401,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                fallback_call_timeout_seconds: 0,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                fallback_call_timeout_seconds: 86_401,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![0],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![3_601],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![2, 1],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![1; 9],
+                ..defaults.clone()
+            },
+        ] {
+            assert!(OpenAiProvider::validate_operational_settings(&settings).is_err());
+        }
+    }
+
+    #[test]
+    fn retry_schedule_increases_then_stays_at_one_minute() {
+        let settings = ProviderSettings::default();
+        assert_eq!(
+            (0..6)
+                .map(|retry| retry_delay(&settings, retry))
+                .collect::<Vec<_>>(),
+            vec![
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(2),
                 std::time::Duration::from_secs(5),
@@ -3289,7 +3903,7 @@ mod retry_policy_tests {
             ]
         );
         for index in [6, 7, 100, usize::MAX] {
-            assert_eq!(retry_delay(index), Duration::from_secs(60));
+            assert_eq!(retry_delay(&settings, index), Duration::from_secs(60));
         }
     }
 
@@ -3302,7 +3916,7 @@ mod retry_policy_tests {
                 "status {status}"
             );
         }
-        for status in [200, 400, 422, 600] {
+        for status in [200, 400, 413, 422, 431, 600] {
             assert_eq!(
                 status_retry_guidance(status),
                 RetryGuidance::DoNotRetry,
@@ -3330,6 +3944,7 @@ mod retry_policy_tests {
             port,
             &context,
             Some(Instant::now() + Duration::from_secs(1)),
+            Duration::from_secs(10),
         )
         .expect_err("closed port refuses connections");
         assert!(matches!(
@@ -3366,6 +3981,7 @@ mod retry_policy_tests {
         let mut attempts = 0;
         let mut waits = Vec::new();
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},
@@ -3388,7 +4004,12 @@ mod retry_policy_tests {
         );
         assert!(events.is_empty());
         assert_eq!(attempts, 11);
-        assert_eq!(waits, (0..10).map(retry_delay).collect::<Vec<_>>());
+        assert_eq!(
+            waits,
+            (0..10)
+                .map(|retry| retry_delay(&ProviderSettings::default(), retry))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3396,6 +4017,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},
@@ -3423,6 +4045,7 @@ mod retry_policy_tests {
             .with_control(token.clone(), Instant::now() + Duration::from_secs(10));
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             context.deadline(),
             &|_| {},
@@ -3470,6 +4093,7 @@ mod retry_policy_tests {
             .with_control(token.clone(), Instant::now() + Duration::from_secs(10));
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             context.deadline(),
             &|_| {},
@@ -3491,6 +4115,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},
@@ -3537,6 +4162,7 @@ mod retry_policy_tests {
             let context = ProviderContext::new(Duration::ZERO, false, None);
             let mut attempts = 0;
             let events = retry_exchange(
+                &ProviderSettings::default(),
                 &context,
                 None,
                 &|_| {},
@@ -3571,6 +4197,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| panic!("metadata must not publish provisional output"),
@@ -3607,6 +4234,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},

@@ -56,9 +56,9 @@ use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsum
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig, SessionStoreHandle};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, CompletionItem, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate,
-    SessionArgs, SlashCommand, TOAST_TTL, TextSelection, cancel_command, cell_to_char_col,
-    install_panic_hook, map_key, next_focus, render, submit_command,
+    Action, AppState, CompletionItem, Focus, ModelChoice, RefreshGate, SessionArgs, SlashCommand,
+    TOAST_TTL, TextSelection, cancel_command, cell_to_char_col, install_panic_hook, map_key,
+    next_focus, render, submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -129,9 +129,14 @@ fn tui_runtime_limits() -> Limits {
 /// Fallible production composition: the runtime validates limits, provider
 /// capabilities, and every tool registration before any run can start, so an
 /// invalid demo wiring is an explicit startup error, never a hung run.
+#[cfg(test)]
 fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
+    build_demo_runtime(tui_runtime_limits())
+}
+
+fn build_demo_runtime(limits: Limits) -> io::Result<(Runtime, EventStreams)> {
     let config = RuntimeConfig {
-        limits: tui_runtime_limits(),
+        limits,
         policy: Policy::m0_test(),
         has_approval_handler: true,
     };
@@ -147,12 +152,9 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 /// from (so every session writes back to the same document) and the model the
 /// session boots with. The document itself has one shared owner across slots.
 ///
-/// The TUI takes no `--config` flag: the document's location is
-/// [`nexus_config`]'s documented precedence (CLI path, then `NEXUS_CONFIG`,
-/// then the platform default), and this binary has no argument parser to
-/// receive a path. Adding a second, TUI-local way to choose the file would
-/// duplicate that precedence with no consumer here, and would risk writing
-/// model usage back to a file the user did not mean to write.
+/// The provider/model document's location remains [`nexus_config`]'s
+/// `NEXUS_CONFIG` / platform default. Operational base and overlay files are
+/// resolved separately and never become the TUI's writeback target.
 ///
 /// The shared document is process-owned; each slot keeps its own runtime,
 /// active model, and history.
@@ -160,6 +162,7 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 struct SessionConfig {
     diagnostics: Option<diagnostics::DiagnosticLog>,
     user_config: SharedUserConfig,
+    settings: nexus_config::EffectiveSettings,
     active_model: Option<String>,
     /// Project root for real file reads/writes: `--tools-root`, else the working
     /// directory. `None` (tests only) keeps every tool scripted. Cloned
@@ -210,19 +213,38 @@ fn user_config_snapshot(shared: &SharedUserConfig) -> UserConfig {
 /// would hide a broken document and then overwrite it on the first terminal
 /// outcome, destroying the user's actual settings.
 fn load_session_config() -> io::Result<SessionConfig> {
-    let args = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
+    let mut args = match parse_startup_args(&std::env::args().collect::<Vec<_>>()) {
         StartupAction::Run(args) => args,
         StartupAction::Help => startup_usage(true),
         StartupAction::Usage => startup_usage(false),
     };
-    let mut session = session_config_at(resolve_path(None))?;
+    let settings = nexus_config::load_settings(
+        nexus_config::SettingsProfile::Tui,
+        args.base_config.as_deref(),
+        &args.config_overlays,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut session = session_config_at_with_settings(resolve_path(None), settings)?;
+    if args.check_config {
+        println!("Configuration is valid.");
+        std::process::exit(0);
+    }
+    if args.print_effective_config {
+        println!("{}", nexus_config::settings_json(&session.settings));
+        std::process::exit(0);
+    }
     let config = user_config_snapshot(&session.user_config);
+    let launch = session.settings.launch();
+    apply_tui_launch_defaults(&mut args, launch);
     let (effective_gateway, effective_workload) = merge_startup_images(&args, &config);
     let mut effective_args = args.clone();
     effective_args.gateway_image = effective_gateway.clone();
     effective_args.workload_image = effective_workload.clone();
-    let root_resolved = resolve_tools_root(args.tools_root.clone()).is_some();
-    validate_execution_args(&effective_args, root_resolved, cfg!(feature = "container"))?;
+    validate_execution_args(
+        &effective_args,
+        resolve_tools_root(args.tools_root.clone()).is_some(),
+        cfg!(feature = "container"),
+    )?;
     session.tools_root = resolve_tools_root(args.tools_root);
     session.demo = args.demo;
     session.strict_tools = args.strict_tools;
@@ -230,6 +252,19 @@ fn load_session_config() -> io::Result<SessionConfig> {
     session.gateway_image = effective_gateway;
     session.workload_image = effective_workload;
     Ok(session)
+}
+
+fn apply_tui_launch_defaults(args: &mut StartupArgs, launch: &nexus_config::LaunchSettings) {
+    if !args.execution_set {
+        args.execution = match launch.execution {
+            Some(nexus_config::ExecutionMode::Container) => ExecutionMode::Container,
+            Some(nexus_config::ExecutionMode::Local) | None => ExecutionMode::Local,
+        };
+    }
+    args.strict_tools |= launch.strict_tools.unwrap_or(false);
+    if args.tools_root.is_none() {
+        args.tools_root = launch.tools_root.as_deref().map(std::path::PathBuf::from);
+    }
 }
 
 fn merge_startup_images(
@@ -301,7 +336,17 @@ fn resolve_tools_root(cli: Option<std::path::PathBuf>) -> Option<std::path::Path
 /// Same contract as [`load_session_config`] with the resolved path supplied
 /// directly, so both the missing-file and invalid-file branches are testable
 /// without mutating the process environment.
+#[cfg(test)]
 fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConfig> {
+    let settings = nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    session_config_at_with_settings(path, settings)
+}
+
+fn session_config_at_with_settings(
+    path: Option<std::path::PathBuf>,
+    settings: nexus_config::EffectiveSettings,
+) -> io::Result<SessionConfig> {
     let config = match path.as_deref() {
         Some(path) => load_config(path)
             .map_err(|error| {
@@ -319,6 +364,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
     Ok(SessionConfig {
         diagnostics: None,
         user_config: shared_user_config(config, path),
+        settings,
         active_model,
         tools_root: None,
         strict_tools: false,
@@ -359,9 +405,9 @@ fn boot_model(config: &UserConfig) -> Option<String> {
         .cloned()
 }
 
-/// Startup arguments. The TUI takes no `--config` flag (see
-/// [`SessionConfig`]); flags select the project root, strict permissions,
-/// or the scripted demo.
+/// Startup arguments select operational-settings layers, the project root,
+/// strict permissions, or the scripted demo. Provider/model configuration
+/// remains selected by `NEXUS_CONFIG` or the platform config path.
 /// Without `--demo` nothing scripted ever serves: unconfigured runs fail
 /// with a not-configured diagnostic instead of a silent fake.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,8 +421,13 @@ struct StartupArgs {
     /// submission). The dev-version default is off.
     demo: bool,
     execution: ExecutionMode,
+    execution_set: bool,
     gateway_image: Option<String>,
     workload_image: Option<String>,
+    base_config: Option<std::path::PathBuf>,
+    config_overlays: Vec<std::path::PathBuf>,
+    check_config: bool,
+    print_effective_config: bool,
 }
 
 /// Argument-parser outcome: run with the parsed jail, or print usage.
@@ -401,6 +452,10 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     let mut execution_set = false;
     let mut gateway_image = None;
     let mut workload_image = None;
+    let mut base_config = None;
+    let mut config_overlays = Vec::new();
+    let mut check_config = false;
+    let mut print_effective_config = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -436,6 +491,25 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
                     _ => return StartupAction::Usage,
                 };
             }
+            "--base-config" => {
+                if base_config.is_some() {
+                    return StartupAction::Usage;
+                }
+                base_config = match args.next() {
+                    Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                        Some(std::path::PathBuf::from(value))
+                    }
+                    _ => return StartupAction::Usage,
+                };
+            }
+            "--config-overlay" => match args.next() {
+                Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                    config_overlays.push(std::path::PathBuf::from(value));
+                }
+                _ => return StartupAction::Usage,
+            },
+            "--check-config" => check_config = true,
+            "--print-effective-config" => print_effective_config = true,
             "--tools-root" => match args.next() {
                 Some(value) if !value.is_empty() => {
                     tools_root = Some(std::path::PathBuf::from(value));
@@ -450,8 +524,13 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
         demo,
         strict_tools,
         execution,
+        execution_set,
         gateway_image,
         workload_image,
+        base_config,
+        config_overlays,
+        check_config,
+        print_effective_config,
     })
 }
 
@@ -468,6 +547,11 @@ fn startup_usage(help: bool) -> ! {
             "Workspace and tools:\n",
             "  --tools-root <PATH> Workspace jail; defaults to the current directory\n",
             "  --strict-tools      Use the strict jailed-tools policy\n\n",
+            "Operational settings:\n",
+            "  --base-config <PATH>       Replace the optional system base file\n",
+            "  --config-overlay <PATH>    Apply a partial overlay (repeatable)\n",
+            "  --check-config             Validate configuration and exit\n",
+            "  --print-effective-config   Print resolved runtime settings and exit\n\n",
             "Container images:\n",
             "  --gateway-image <IMAGE>    Gateway image (overrides configured image)\n",
             "  --container-image <IMAGE>  Workload image (overrides configured image)\n\n",
@@ -507,6 +591,7 @@ fn startup_usage(help: bool) -> ! {
 #[derive(Debug, Clone)]
 struct LiveSelection {
     config: UserConfig,
+    provider_settings: nexus_config::settings::ProviderSettings,
     active_model: Option<String>,
     /// Scripted demo explicitly requested. The resolver serves fakes only
     /// through this flag; an unconfigured selection without it fails
@@ -610,7 +695,9 @@ fn resolve_live_adapter(
             "selected model context configuration is invalid",
         );
     };
-    match OpenAiProvider::from_profile(profile, &entry.name) {
+    match OpenAiProvider::from_profile(profile, &entry.name)
+        .and_then(|adapter| adapter.with_operational_settings(&selection.provider_settings))
+    {
         Ok(adapter) => {
             let adapter = adapter.with_context_management(context_management);
             let capabilities = adapter.capabilities();
@@ -829,7 +916,7 @@ impl SessionRegistry {
 struct PerRunProvider {
     capabilities: ProviderCapabilities,
     binding: LiveHandle,
-    discovered_context: Mutex<HashMap<String, nexus_core::ContextWindow>>,
+    discovered_context: Arc<Mutex<HashMap<String, nexus_core::ContextWindow>>>,
     current: Mutex<PerRunState>,
 }
 
@@ -851,6 +938,7 @@ impl PerRunProvider {
     fn new() -> Self {
         Self::live(Arc::new(Mutex::new(LiveSelection {
             config: UserConfig::default_config(),
+            provider_settings: Default::default(),
             active_model: None,
             demo: true,
             pending_run: None,
@@ -863,7 +951,7 @@ impl PerRunProvider {
         Self {
             capabilities: tui_provider_capabilities(),
             binding,
-            discovered_context: Mutex::new(HashMap::new()),
+            discovered_context: Arc::new(Mutex::new(HashMap::new())),
             current: Mutex::new(PerRunState {
                 run: None,
                 provider: ActiveProvider::Fake(FakeProvider::demo_two_turn()),
@@ -878,14 +966,23 @@ impl ProviderPort for PerRunProvider {
     }
 
     fn context_management(&self) -> nexus_core::ContextManagementSettings {
+        self.context_management_for_run().0
+    }
+
+    fn context_management_for_run(
+        &self,
+    ) -> (
+        nexus_core::ContextManagementSettings,
+        Option<nexus_core::ContextWindowDiscovery>,
+    ) {
         let selection_info = {
             let binding = self.binding.lock().expect("live selection lockable");
             let selection = binding.pending_run.as_deref().unwrap_or(&binding);
             let Some(model_id) = selection.active_model.as_deref() else {
-                return nexus_core::ContextManagementSettings::default();
+                return (nexus_core::ContextManagementSettings::default(), None);
             };
             let Some(entry) = selection.config.model(model_id) else {
-                return nexus_core::ContextManagementSettings::default();
+                return (nexus_core::ContextManagementSettings::default(), None);
             };
             // Invalid selections fail explicitly when resolving the live adapter;
             // no window or policy is inferred for an unavailable model.
@@ -894,18 +991,28 @@ impl ProviderPort for PerRunProvider {
                 .context_management_for(&entry.provider, Some(model_id))
                 .unwrap_or_default();
             let Some(profile) = selection.config.provider(&entry.provider) else {
-                return settings;
+                return (settings, None);
             };
             (
                 settings,
-                format!("{}:{}:{}", entry.provider, entry.id, entry.name),
+                format!(
+                    "{:?}",
+                    (
+                        &entry.provider,
+                        &entry.id,
+                        &entry.name,
+                        &profile.endpoint,
+                        profile.protocol
+                    )
+                ),
                 profile.clone(),
                 entry.name.clone(),
+                selection.provider_settings.clone(),
             )
         };
-        let (mut settings, cache_key, profile, model_name) = selection_info;
+        let (mut settings, cache_key, profile, model_name, provider_settings) = selection_info;
         if settings.window.is_some() {
-            return settings;
+            return (settings, None);
         }
         if let Some(window) = self
             .discovered_context
@@ -915,29 +1022,32 @@ impl ProviderPort for PerRunProvider {
             .copied()
         {
             settings.window = Some(window);
-            return settings;
+            return (settings, None);
         }
-        let Ok(adapter) = OpenAiProvider::from_profile(&profile, &model_name) else {
-            return settings;
+        let Ok(adapter) = OpenAiProvider::from_profile(&profile, &model_name)
+            .and_then(|adapter| adapter.with_operational_settings(&provider_settings))
+        else {
+            return (settings, None);
         };
         let adapter = adapter.with_context_management(settings);
-        if let Some(window) = adapter
-            .is_ollama_endpoint()
-            .then(|| {
-                adapter
-                    .discover_context_management()
-                    .context_management()
-                    .window
-            })
-            .flatten()
-        {
-            self.discovered_context
-                .lock()
-                .expect("discovered context lockable")
-                .insert(cache_key, window);
-            settings.window = Some(window);
+        if !adapter.supports_context_discovery() {
+            return (settings, None);
         }
-        settings
+        let cache = self.discovered_context.clone();
+        let discover = Box::new(move || {
+            let window = adapter
+                .discover_context_management()
+                .context_management()
+                .window;
+            if let Some(window) = window {
+                cache
+                    .lock()
+                    .expect("discovered context lockable")
+                    .insert(cache_key, window);
+            }
+            window
+        });
+        (settings, Some(discover))
     }
 
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
@@ -1062,7 +1172,7 @@ fn build_live_runtime_with_store(
         }
     };
     let config = RuntimeConfig {
-        limits: tui_runtime_limits(),
+        limits: session_config.settings.limits(),
         policy,
         has_approval_handler: true,
     };
@@ -1082,8 +1192,13 @@ fn build_live_runtime_with_store(
                 let workload_image = session_config.workload_image.as_deref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "workload image is missing")
                 })?;
-                nexus_container::tool_registrations(root, gateway_image, workload_image)
-                    .map_err(io::Error::other)?
+                nexus_container::tool_registrations_with_settings(
+                    root,
+                    gateway_image,
+                    workload_image,
+                    session_config.settings.tools(),
+                )
+                .map_err(io::Error::other)?
             }
             #[cfg(not(feature = "container"))]
             {
@@ -1109,11 +1224,15 @@ fn build_live_runtime_with_store(
                     ));
                 }
                 if !session_config.strict_tools {
-                    let tools =
-                        nexus_tools::development_tools(&canonical).map_err(io::Error::other)?;
+                    let tools = nexus_tools::development_tools_with_settings(
+                        &canonical,
+                        session_config.settings.tools(),
+                    )
+                    .map_err(io::Error::other)?;
                     return runtime_with_tools(session_config, config, tools, session_store);
                 }
-                nexus_tools::strict_tools(&canonical).map_err(io::Error::other)?
+                nexus_tools::strict_tools_with_settings(&canonical, session_config.settings.tools())
+                    .map_err(io::Error::other)?
             }
         },
     };
@@ -1128,6 +1247,7 @@ fn runtime_with_tools(
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let binding = Arc::new(Mutex::new(LiveSelection {
         config: user_config_snapshot(&session_config.user_config),
+        provider_settings: session_config.settings.provider().clone(),
         active_model: session_config.active_model.clone(),
         demo: session_config.demo,
         pending_run: None,
@@ -1145,6 +1265,7 @@ fn runtime_with_tools(
         None => Runtime::try_new(config, provider, tools),
     }
     .map_err(io::Error::other)?;
+    runtime.enable_local_reasoning();
     let runtime = match &session_config.diagnostics {
         Some(log) => runtime.with_diagnostic_writer(log.clone()),
         None => runtime,
@@ -1234,7 +1355,9 @@ async fn run() -> io::Result<()> {
         );
     }
     if io::stdout().is_terminal() {
-        match nexus_tui::TerminalGuard::setup() {
+        match nexus_tui::TerminalGuard::setup_with_mouse(
+            session_config.settings.tui().input.mouse_capture,
+        ) {
             Ok(mut guard) => {
                 let report = interactive(session_config).await;
                 // Retryable restoration: a step that fails stays owned and is
@@ -1281,7 +1404,7 @@ async fn run() -> io::Result<()> {
                     )));
                 }
                 eprintln!("terminal setup failed ({error}); demo transcript fallback");
-                let (runtime, streams) = build_runtime()?;
+                let (runtime, streams) = build_demo_runtime(session_config.settings.limits())?;
                 headless(runtime, streams, session_config).await
             }
         }
@@ -1296,7 +1419,7 @@ async fn run() -> io::Result<()> {
                 "no terminal attached; relaunch with --demo for the scripted transcript fallback",
             ));
         }
-        let (runtime, streams) = build_runtime()?;
+        let (runtime, streams) = build_demo_runtime(session_config.settings.limits())?;
         headless(runtime, streams, session_config).await
     }
 }
@@ -1423,6 +1546,8 @@ struct Frontend {
     pointer_press: Option<usize>,
     /// First `g` in a viewport `gg` jump is waiting for its second key.
     g_pending: bool,
+    /// Clipboard I/O boundary; input tests inject a writer without a desktop session.
+    clipboard_writer: fn(&str, nexus_config::tui_settings::ClipboardMode) -> bool,
 }
 
 impl Frontend {
@@ -1448,6 +1573,7 @@ impl Frontend {
             storage_busy: false,
             pointer_press: None,
             g_pending: false,
+            clipboard_writer: yank_to_clipboard,
         }
     }
 
@@ -1461,6 +1587,12 @@ impl Frontend {
             demo: config.demo,
             ..Self::new(session)
         };
+        front
+            .state
+            .set_settings(config.settings.tui().clone())
+            .expect("validated startup preferences");
+        let show_reasoning = front.config_snapshot().show_reasoning();
+        front.state.set_reasoning_visible(show_reasoning);
         front.sync_model_display();
         // Composer modes: built-ins first, then configuration customs, with
         // the configured default (or `build`) selected.
@@ -1487,8 +1619,10 @@ impl Frontend {
             let mut binding = binding.lock().expect("live selection lockable");
             let pending_run = binding.pending_run.take();
             let pending_run_id = binding.pending_run_id.take();
+            let provider_settings = binding.provider_settings.clone();
             *binding = LiveSelection {
                 config,
+                provider_settings,
                 active_model: self.active_model.clone(),
                 demo: self.demo,
                 pending_run,
@@ -1863,6 +1997,29 @@ impl Frontend {
         }
     }
 
+    fn toggle_reasoning(&mut self) {
+        let show = !self.state.reasoning_visible();
+        self.state.set_reasoning_visible(show);
+        let save_failed = {
+            let mut document = self
+                .user_config
+                .lock()
+                .expect("user configuration lockable");
+            document.config.set_show_reasoning(show);
+            document
+                .path
+                .as_ref()
+                .is_some_and(|path| save_config(&document.config, path).is_err())
+        };
+        self.state.notice(if save_failed {
+            "reasoning visibility changed; config save failed"
+        } else if show {
+            "reasoning shown · Ctrl+R hides"
+        } else {
+            "reasoning hidden · Ctrl+R shows"
+        });
+    }
+
     fn next_request(&mut self) -> RequestId {
         self.request_counter += 1;
         RequestId::new(format!("req-tui-{}", self.request_counter))
@@ -2028,10 +2185,6 @@ enum Input {
     Mouse(MouseEvent),
 }
 
-/// Mouse wheel notches per scroll step (M0-test choice: a few wrapped lines
-/// per notch, never a full page jump).
-const WHEEL_LINES: usize = 3;
-
 /// Applies one mouse report. Wheel notches scroll the expanded approval
 /// detail while it is open, else the conversation viewport; a left press
 /// starts a drag selection (body rows or the composer draft), dragging
@@ -2125,19 +2278,32 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Copies text to the system clipboard, silently on every path: no
-/// notice, no diagnostic. A platform helper goes first (`pbcopy` on macOS,
-/// `wl-copy`/`xclip`/`xsel` on Linux), because helpers work in every
-/// terminal while OSC 52 is honored only by some. OSC 52 stays as the
-/// fallback for the rest. Empty text never copies.
-fn yank_to_clipboard(text: &str) -> bool {
+/// Copies according to the selected backend, without diagnostics. Auto tries
+/// a platform helper before OSC 52; explicit backends never fall back.
+/// Disabled mode and empty text never invoke either backend.
+fn yank_to_clipboard(text: &str, mode: nexus_config::tui_settings::ClipboardMode) -> bool {
     if text.is_empty() {
         return false;
     }
-    if write_clipboard_helper(text) {
-        return true;
+    copy_with(text, mode, write_clipboard_helper, write_osc52)
+}
+
+fn copy_with(
+    text: &str,
+    mode: nexus_config::tui_settings::ClipboardMode,
+    system: impl FnOnce(&str) -> bool,
+    osc52: impl FnOnce(&str) -> bool,
+) -> bool {
+    use nexus_config::tui_settings::ClipboardMode;
+    if text.is_empty() {
+        return false;
     }
-    write_osc52(text)
+    match mode {
+        ClipboardMode::Auto => system(text) || osc52(text),
+        ClipboardMode::System => system(text),
+        ClipboardMode::Osc52 => osc52(text),
+        ClipboardMode::Disabled => false,
+    }
 }
 
 /// Selects the platform clipboard helper (program plus argv), or `None`
@@ -2333,6 +2499,10 @@ fn find_project_paths(root: &std::path::Path, query: &str) -> Vec<String> {
 }
 
 fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
+    if !front.state.settings().input.mouse_capture {
+        return false;
+    }
+    let wheel_lines = front.state.settings().input.scroll_lines;
     // The mouse never completes a `:` command: a press disarms it so a
     // later letter cannot fire behind a click.
     if matches!(mouse.kind, MouseEventKind::Down(_)) {
@@ -2342,18 +2512,18 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
         MouseEventKind::ScrollUp => {
             front.pointer_press = None;
             if front.state.approval_detail_open() {
-                front.state.approval_detail_scroll(-(WHEEL_LINES as isize));
+                front.state.approval_detail_scroll(-(wheel_lines as isize));
             } else {
-                front.state.scroll_up(WHEEL_LINES);
+                front.state.scroll_up(wheel_lines);
             }
             true
         }
         MouseEventKind::ScrollDown => {
             front.pointer_press = None;
             if front.state.approval_detail_open() {
-                front.state.approval_detail_scroll(WHEEL_LINES as isize);
+                front.state.approval_detail_scroll(wheel_lines as isize);
             } else {
-                front.state.scroll_down(WHEEL_LINES);
+                front.state.scroll_down(wheel_lines);
             }
             true
         }
@@ -2404,7 +2574,13 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
                 Some(text) if !text.is_empty() => text,
                 _ => return false,
             };
-            yank_to_clipboard(&text);
+            if !front.state.settings().input.copy_on_select {
+                return true;
+            }
+            let copied = (front.clipboard_writer)(&text, front.state.settings().input.clipboard);
+            if !copied {
+                return true;
+            }
             front.state.clear_text_selection();
             front
                 .state
@@ -3011,8 +3187,14 @@ fn handle_overlay_key(front: &mut Frontend, key: KeyEvent) -> bool {
         KeyCode::Enter => confirm_model_picker(front),
         KeyCode::Up => move_picker(front, -1),
         KeyCode::Down => move_picker(front, 1),
-        KeyCode::PageUp => move_picker(front, -(MAX_PICKER_VISIBLE_ROWS as isize)),
-        KeyCode::PageDown => move_picker(front, MAX_PICKER_VISIBLE_ROWS as isize),
+        KeyCode::PageUp => {
+            let rows = front.state.picker_page_rows() as isize;
+            move_picker(front, -rows);
+        }
+        KeyCode::PageDown => {
+            let rows = front.state.picker_page_rows() as isize;
+            move_picker(front, rows);
+        }
         KeyCode::Home => {
             let count = front.state.picker_matches().len();
             front.state.picker_move(isize::MIN, count);
@@ -3260,6 +3442,18 @@ async fn handle_key_with_runtime(
         front.state.dismiss_overlay();
         front.state.clear_colon();
     }
+    if front.focus == Focus::Viewport
+        && front.state.pending_approval().is_some()
+        && key.kind == KeyEventKind::Press
+        && key.modifiers.is_empty()
+        && matches!(key.code, crossterm::event::KeyCode::Char('a' | 'd'))
+    {
+        front.focus = Focus::ApprovalCard;
+        front
+            .state
+            .notice("approval focused; press a or d again to decide");
+        return false;
+    }
     let directory_approval = front.focus == Focus::ApprovalCard
         && key.kind == KeyEventKind::Press
         && key.modifiers.is_empty()
@@ -3350,15 +3544,15 @@ async fn handle_key_with_runtime(
             front.state.clear_colon();
             // Step back one rung, never cancelling or deciding: an open
             // detail just closes (the card keeps focus so allow/deny stay
-            // one keypress away), the composer parks in the viewport for
-            // the viewport-only shortcuts, and anywhere else returns to
-            // the composer, where most work happens.
+            // one keypress away), the composer returns to normal mode in
+            // the viewport, and leaving approval also returns to normal
+            // mode. Esc never enters composer edit mode.
             if front.state.approval_detail_open() {
                 front.state.close_approval_detail();
             } else {
                 front.focus = match front.focus {
                     Focus::Composer => Focus::Viewport,
-                    _ => Focus::Composer,
+                    Focus::Viewport | Focus::ApprovalCard => Focus::Viewport,
                 };
             }
         }
@@ -3425,6 +3619,7 @@ async fn handle_key_with_runtime(
             // Display-only: the title names the new variant at once.
             front.state.cycle_variant();
         }
+        Action::ToggleReasoning => front.toggle_reasoning(),
         Action::ApproveOnce | Action::Deny => {
             let Some(runtime) = runtime else {
                 return false;
@@ -3478,11 +3673,14 @@ async fn handle_key_with_runtime(
             // press falls through instead of swallowing it.
             match selection_text(&front.state) {
                 Some(text) if !text.is_empty() => {
-                    yank_to_clipboard(&text);
+                    let copied =
+                        (front.clipboard_writer)(&text, front.state.settings().input.clipboard);
                     front.state.clear_text_selection();
-                    front
-                        .state
-                        .set_toast(format!("copied {} chars", text.chars().count()), TOAST_TTL);
+                    if copied {
+                        front
+                            .state
+                            .set_toast(format!("copied {} chars", text.chars().count()), TOAST_TTL);
+                    }
                     return false;
                 }
                 _ => front.state.clear_text_selection(),
@@ -3602,7 +3800,15 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
         session_config,
         session_store,
     );
-    let mut gate = RefreshGate::m0_test();
+    let mut gate = RefreshGate::new(Duration::from_millis(
+        sessions
+            .active()
+            .front
+            .state
+            .settings()
+            .render
+            .redraw_interval_ms,
+    ));
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -5886,6 +6092,8 @@ mod cov_main_topup {
         SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model: None,
             tools_root: None,
             demo: false,
@@ -5931,6 +6139,8 @@ mod cov_main_topup {
         SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(config, None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model,
             tools_root: None,
             demo: false,
@@ -6778,6 +6988,10 @@ mod cov_main_topup {
         let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
         let binding = Arc::new(Mutex::new(LiveSelection {
             config: front.config_snapshot(),
+            provider_settings: nexus_config::settings::ProviderSettings {
+                fallback_call_timeout_seconds: 123,
+                ..Default::default()
+            },
             active_model: Some("m0".to_owned()),
             demo: false,
             pending_run: None,
@@ -6797,6 +7011,11 @@ mod cov_main_topup {
         let captured = binding.pending_run.take().expect("submit snapshot");
         assert_eq!(captured.active_model.as_deref(), Some("m0"));
         assert_eq!(binding.active_model.as_deref(), Some("m1"));
+        assert_eq!(
+            captured.provider_settings.fallback_call_timeout_seconds,
+            123
+        );
+        assert_eq!(binding.provider_settings, captured.provider_settings);
     }
 
     #[test]
@@ -6804,6 +7023,7 @@ mod cov_main_topup {
         let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
         let binding = Arc::new(Mutex::new(LiveSelection {
             config: front.config_snapshot(),
+            provider_settings: Default::default(),
             active_model: Some("m0".to_owned()),
             demo: false,
             pending_run: None,
@@ -6838,6 +7058,7 @@ mod cov_main_topup {
     fn provider_discards_snapshot_owned_by_a_different_run() {
         let mut selection = LiveSelection {
             config: user_config_snapshot(&configured(2, &[], &[]).user_config),
+            provider_settings: Default::default(),
             active_model: Some("m1".to_owned()),
             demo: false,
             pending_run: None,
@@ -6958,6 +7179,99 @@ mod cov_main_topup {
             "only an accepted reply adopts a run"
         );
         assert_eq!(user_line_count(&front), 1, "the draft is recorded once");
+    }
+
+    struct BlockedDiscovery {
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl ProviderPort for BlockedDiscovery {
+        fn capabilities(&self) -> ProviderCapabilities {
+            tui_provider_capabilities()
+        }
+
+        fn context_management_for_run(
+            &self,
+        ) -> (
+            nexus_core::ContextManagementSettings,
+            Option<nexus_core::ContextWindowDiscovery>,
+        ) {
+            let started = self.started.lock().unwrap().take().unwrap();
+            let release = self.release.lock().unwrap().take().unwrap();
+            (
+                Default::default(),
+                Some(Box::new(move || {
+                    started.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    None
+                })),
+            )
+        }
+
+        fn stream(&self, _: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
+            panic!("cancelled run must not call the model")
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_discovery_keeps_submit_input_and_cancel_responsive() {
+        let (started, discovery_started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let provider = Arc::new(BlockedDiscovery {
+            started: Mutex::new(Some(started)),
+            release: Mutex::new(Some(blocked)),
+        });
+        let config = RuntimeConfig {
+            limits: tui_runtime_limits(),
+            policy: Policy::m0_test(),
+            has_approval_handler: true,
+        };
+        let (runtime, mut streams) = Runtime::try_new(config, provider, vec![]).unwrap();
+        let mut front = Frontend::new(session());
+        type_draft(&mut front, "first");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_key(&mut front, &runtime, press(KeyCode::Enter)),
+        )
+        .await
+        .expect("submit must not wait for discovery");
+        let run = front.merger.active_run().unwrap().clone();
+        assert_eq!(front.state.composer(), "");
+        assert_eq!(user_line_count(&front), 1);
+        tokio::time::timeout(Duration::from_secs(1), discovery_started)
+            .await
+            .unwrap()
+            .unwrap();
+
+        type_draft(&mut front, "second");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_key(&mut front, &runtime, press(KeyCode::Enter)),
+        )
+        .await
+        .expect("busy submit must not wait for discovery");
+        assert_eq!(front.state.composer(), "second");
+        assert_eq!(user_line_count(&front), 1);
+        let command = cancel_command(front.next_request(), &run);
+        let response = tokio::time::timeout(Duration::from_secs(1), runtime.handle(command))
+            .await
+            .expect("cancel must not wait for discovery")
+            .0;
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        assert_eq!(front.state.composer(), "second");
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    assert_eq!(finished.outcome(), nexus_core::RunOutcome::Cancelled);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("cancelled run finishes after discovery returns");
     }
 
     /// Types a full draft one char at a time, like the key handler would.
@@ -7247,8 +7561,8 @@ mod cov_main_topup {
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
         assert_eq!(
             front.focus,
-            Focus::Composer,
-            "Esc in the viewport returns home to the composer"
+            Focus::Viewport,
+            "Esc in normal mode must not enter composer edit mode"
         );
         assert!(!front.state.approval_detail_open(), "Esc never decides");
         assert_eq!(front.request_counter, 0, "no focus key issues a command");
@@ -7328,7 +7642,7 @@ mod cov_main_topup {
             "the card keeps focus so allow/deny stay one keypress away"
         );
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
-        assert_eq!(front.focus, Focus::Composer, "Esc then returns home");
+        assert_eq!(front.focus, Focus::Viewport, "Esc returns to normal mode");
         assert!(
             front.live_approval.is_some(),
             "stepping back decides nothing"
@@ -7453,6 +7767,10 @@ mod cov_main_topup {
     async fn ctrl_c_copies_a_live_selection_silently_before_the_draft() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "hello");
+            true
+        };
         type_draft(&mut front, "hello world");
         let mut terminal = fixed_terminal();
         draw(&mut terminal, &mut front).expect("frame draws");
@@ -7631,6 +7949,10 @@ mod cov_main_topup {
     #[test]
     fn mouse_drag_selects_body_text_and_release_toasts_silently() {
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "selectable");
+            true
+        };
         front.state.notice("selectable words here");
         let mut terminal = fixed_terminal();
         draw(&mut terminal, &mut front).expect("frame draws");
@@ -7683,6 +8005,10 @@ mod cov_main_topup {
         // "  \u{4e2d}\u{6587}\u{6d4b}\u{8bd5}\u{5185}\u{5bb9}": cells 2-3, 4-5, 6-7,
         // 8-9, 10-11, 12-13. A cell drag 4..10 must yank chars 1..4.
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "文测试");
+            true
+        };
         front
             .state
             .notice("\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}\u{5185}\u{5bb9}");
@@ -7718,6 +8044,10 @@ mod cov_main_topup {
     #[test]
     fn mouse_drag_selects_the_composer_draft_and_release_toasts() {
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "hello");
+            true
+        };
         type_draft(&mut front, "hello world");
         let mut terminal = fixed_terminal();
         draw(&mut terminal, &mut front).expect("frame draws");
@@ -7787,6 +8117,20 @@ mod cov_main_topup {
             "wheel down returns to the tail"
         );
         assert!(!handle_mouse(&mut front, wheel(MouseEventKind::Moved)));
+    }
+
+    #[tokio::test]
+    async fn parked_approval_shortcut_focuses_without_deciding() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        for key in ['a', 'd'] {
+            let mut front = awaiting_approval(&run_id("run-parked-approval"), "c1-0");
+            front.focus = Focus::Viewport;
+            assert!(!handle_key(&mut front, &runtime, press(KeyCode::Char(key))).await);
+            assert_eq!(front.focus, Focus::ApprovalCard);
+            assert_eq!(front.request_counter, 0, "focus must never approve or deny");
+            assert!(front.live_approval.is_some());
+            assert!(transcript(&front).contains("press a or d again"));
+        }
     }
 
     #[tokio::test]
@@ -8636,6 +8980,7 @@ mod cov_live_wiring {
         config.add_model(entry).expect("model admits");
         LiveSelection {
             config,
+            provider_settings: Default::default(),
             active_model: active_model.map(str::to_owned),
             demo: true,
             pending_run: None,
@@ -8684,9 +9029,38 @@ mod cov_live_wiring {
     }
 
     #[test]
+    fn discovery_is_prepared_from_the_pending_model_not_the_current_selection() {
+        let mut selected = selection_with(Some("m0"));
+        selected.config = UserConfig::from_json(
+            r#"{
+            "revision": 2,
+            "providers": [{
+                "id": "demo-provider", "display_name": "Demo", "adapter": "direct",
+                "protocol": "chat_completions", "endpoint": "http://ollama.invalid/v1",
+                "credential": {"env": "NEXUS_TUI_TEST_KEY"}, "default_model": "demo-model"
+            }],
+            "models": [{"id": "m0", "provider": "demo-provider", "name": "demo-model"}],
+            "favourites": [], "recent": []
+        }"#,
+        )
+        .unwrap();
+        let mut current = selected.clone();
+        current.active_model = None;
+        current.pending_run = Some(Box::new(selected));
+        let binding = Arc::new(Mutex::new(current));
+        let provider = PerRunProvider::live(binding.clone());
+        let (settings, discovery) = provider.context_management_for_run();
+        assert!(settings.window.is_none());
+        assert!(discovery.is_some(), "pending model owns discovery");
+        binding.lock().unwrap().pending_run = None;
+        assert!(provider.context_management_for_run().1.is_none());
+    }
+
+    #[test]
     fn no_selection_without_demo_fails_instead_of_serving_fakes() {
         let mut selection = LiveSelection {
             config: UserConfig::default_config(),
+            provider_settings: Default::default(),
             active_model: None,
             demo: false,
             pending_run: None,
@@ -8712,6 +9086,7 @@ mod cov_live_wiring {
     fn no_selection_serves_the_demo_script() {
         let selection = LiveSelection {
             config: UserConfig::default_config(),
+            provider_settings: Default::default(),
             active_model: None,
             demo: true,
             pending_run: None,
@@ -8896,6 +9271,7 @@ mod cov_live_wiring {
         config.add_model(entry).expect("model admits");
         let selection = LiveSelection {
             config,
+            provider_settings: Default::default(),
             active_model: Some("m0".to_owned()),
             demo: true,
             pending_run: None,
@@ -8932,6 +9308,8 @@ mod cov_live_wiring {
         let session = SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model: None,
             tools_root: Some(missing),
             demo: false,
@@ -8955,11 +9333,162 @@ mod cov_live_wiring {
         );
     }
 
+    #[tokio::test]
+    async fn configured_tool_bounds_execute_in_strict_and_development_runtimes() {
+        use std::io::{Read, Write};
+
+        for strict_tools in [true, false] {
+            let root = std::env::temp_dir().join(format!(
+                "nexus-tui-tool-settings-{}-{strict_tools}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("a"), "prefix needle\n").unwrap();
+            std::fs::write(root.join("b"), "prefix needle\n").unwrap();
+            let settings_path = root.join("settings.json");
+            std::fs::write(&settings_path, r#"{"revision":1,"defaults":{"runtime":{"run_timeout_seconds":5,"tool_timeout_seconds":3},"provider":{"connect_timeout_seconds":1,"fallback_call_timeout_seconds":5,"retry_backoff_seconds":[1]},"tools":{"list_entry_limit":1,"search_file_bytes":4}}}"#).unwrap();
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let mock = std::thread::spawn(move || {
+                for turn in 0..2 {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error)
+                                if error.kind() == io::ErrorKind::WouldBlock
+                                    && Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("mock accept failed: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    let mut head = Vec::new();
+                    let mut byte = [0];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).unwrap();
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8(head).unwrap();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    stream.read_exact(&mut vec![0; length]).unwrap();
+                    let body = if turn == 0 {
+                        r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"list","type":"function","function":{"name":"host_list","arguments":"{\"path\":\".\"}"}},{"id":"search","type":"function","function":{"name":"host_search","arguments":"{\"path\":\".\",\"query\":\"needle\"}"}}]},"finish_reason":"tool_calls"}]}"#
+                    } else {
+                        r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let mut user_config = UserConfig::default_config();
+            user_config
+                .add_provider(
+                    nexus_config::ProviderProfile::new_with_protocol(
+                        "mock",
+                        "Mock",
+                        nexus_config::AdapterKind::Direct,
+                        nexus_config::ProtocolKind::ChatCompletions,
+                        Some(endpoint),
+                        nexus_config::CredentialRef::env_var("PATH").unwrap(),
+                        "mock-model",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            user_config
+                .add_model(nexus_config::ModelEntry::new("mock", "mock", "mock-model").unwrap())
+                .unwrap();
+            let config = SessionConfig {
+                diagnostics: None,
+                user_config: shared_user_config(user_config, None),
+                settings: nexus_config::load_settings(
+                    nexus_config::SettingsProfile::Tui,
+                    Some(&settings_path),
+                    &[],
+                )
+                .unwrap(),
+                active_model: Some("mock".to_owned()),
+                tools_root: Some(root.clone()),
+                demo: false,
+                strict_tools,
+                execution: ExecutionMode::Local,
+                gateway_image: None,
+                workload_image: None,
+            };
+            let (runtime, mut streams, _live) = build_live_runtime(&config).unwrap();
+            let reply = runtime
+                .handle(
+                    submit_command(
+                        RequestId::new("req-tool-settings").unwrap(),
+                        SessionId::new("sess-tool-settings").unwrap(),
+                        "inspect files",
+                        DEMO_PROFILE,
+                        false,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .0;
+            assert_eq!(reply.reply(), CommandReply::Accepted);
+            let mut outcomes = Vec::new();
+            let mut finished = false;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let event = tokio::select! {
+                        Some(event) = streams.data.recv() => event,
+                        Some(event) = streams.control.recv() => event,
+                    };
+                    match event.payload() {
+                        EventPayload::ToolFinished(info) => outcomes.push(info.outcome.clone()),
+                        EventPayload::RunFinished(_) => finished = true,
+                        _ => {}
+                    }
+                    if finished && outcomes.len() == 2 {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            mock.join().unwrap();
+            assert_eq!(outcomes.len(), 2);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| { outcome.status() == nexus_core::ExecutionStatus::Succeeded })
+            );
+            assert!(outcomes.iter().all(|outcome| outcome.is_truncated()));
+            assert!(outcomes.iter().any(|outcome| outcome.content().is_empty()));
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| outcome.content().lines().count() == 1)
+            );
+            drop(runtime);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn demo_wiring_builds_without_a_jail() {
         let session = SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model: None,
             tools_root: None,
             demo: false,
@@ -8995,5 +9524,135 @@ mod cov_live_wiring {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn launch_defaults_apply_but_explicit_cli_values_win() {
+        let launch = nexus_config::LaunchSettings {
+            execution: Some(nexus_config::ExecutionMode::Container),
+            strict_tools: Some(true),
+            tools_root: Some("configured-workspace".into()),
+            ..Default::default()
+        };
+        let mut configured = match parse_startup_args(&["nexus-tui".into()]) {
+            StartupAction::Run(args) => args,
+            _ => panic!("default arguments parse"),
+        };
+        apply_tui_launch_defaults(&mut configured, &launch);
+        assert_eq!(configured.execution, ExecutionMode::Container);
+        assert!(configured.strict_tools);
+        assert_eq!(
+            configured.tools_root.as_deref(),
+            Some(std::path::Path::new("configured-workspace"))
+        );
+
+        let mut explicit = match parse_startup_args(&[
+            "nexus-tui".into(),
+            "--execution".into(),
+            "local".into(),
+            "--tools-root".into(),
+            "cli-workspace".into(),
+        ]) {
+            StartupAction::Run(args) => args,
+            _ => panic!("explicit arguments parse"),
+        };
+        apply_tui_launch_defaults(&mut explicit, &launch);
+        assert_eq!(explicit.execution, ExecutionMode::Local);
+        assert_eq!(
+            explicit.tools_root.as_deref(),
+            Some(std::path::Path::new("cli-workspace"))
+        );
+        assert!(explicit.strict_tools, "configuration may tighten tool mode");
+    }
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+    use nexus_config::tui_settings::ClipboardMode;
+    use std::cell::Cell;
+
+    #[test]
+    fn clipboard_modes_call_only_the_selected_backends() {
+        for (mode, system_ok, expected_system, expected_osc, expected_result) in [
+            (ClipboardMode::Auto, true, true, false, true),
+            (ClipboardMode::Auto, false, true, true, true),
+            (ClipboardMode::System, false, true, false, false),
+            (ClipboardMode::Osc52, false, false, true, true),
+            (ClipboardMode::Disabled, true, false, false, false),
+        ] {
+            let system_called = Cell::new(false);
+            let osc_called = Cell::new(false);
+            let result = copy_with(
+                "selection",
+                mode,
+                |_| {
+                    system_called.set(true);
+                    system_ok
+                },
+                |_| {
+                    osc_called.set(true);
+                    true
+                },
+            );
+            assert_eq!(result, expected_result);
+            assert_eq!(system_called.get(), expected_system);
+            assert_eq!(osc_called.get(), expected_osc);
+        }
+        assert!(!copy_with(
+            "",
+            ClipboardMode::Auto,
+            |_| panic!("empty copy"),
+            |_| panic!("empty copy")
+        ));
+    }
+
+    #[test]
+    fn disabled_mouse_leaves_presentation_untouched() {
+        let mut front = Frontend::new(SessionId::new("preferences").unwrap());
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.input.mouse_capture = false;
+        front.state.set_settings(settings).unwrap();
+        front.state.composer_type('x');
+        assert!(!handle_mouse(
+            &mut front,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(front.state.composer(), "x");
+    }
+
+    #[test]
+    fn wheel_distance_and_copy_on_select_are_configurable() {
+        let mut front = Frontend::new(SessionId::new("preferences").unwrap());
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.input.scroll_lines = 7;
+        settings.input.copy_on_select = false;
+        front.state.set_settings(settings).unwrap();
+        for _ in 0..30 {
+            front.state.notice("history");
+        }
+        front.state.set_viewport(80, 5);
+        let event = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(handle_mouse(&mut front, event(MouseEventKind::ScrollUp)));
+        assert_eq!(front.state.scrollback(), 7);
+        front.state.composer_type('x');
+        front.state.begin_composer_selection(0);
+        front.state.extend_composer_selection(1);
+        assert!(handle_mouse(
+            &mut front,
+            event(MouseEventKind::Up(MouseButton::Left))
+        ));
+        assert!(front.state.text_selection().is_some());
+        assert!(front.state.toast().is_none());
     }
 }

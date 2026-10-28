@@ -28,14 +28,16 @@ use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
 use crate::sanitize::sanitize;
 use crate::state::{
-    AppState, ApprovalGeometry, EntryKind, MAX_PICKER_VISIBLE_ROWS, PendingApprovalCard,
-    PointerGeometry, chunks, display_width, wrapped_height,
+    AppState, ApprovalGeometry, EntryKind, PendingApprovalCard, PointerGeometry, chunks,
+    display_width, wrapped_height,
 };
+use crate::theme::color;
+use nexus_config::ThemeSettings;
 
 /// Maps width-neutral Markdown style bits to terminal styling. Only color
 /// and modifiers change; the visible text (and its measured width) is
 /// untouched.
-fn markdown_style(style: MdStyle) -> Style {
+fn markdown_style_with_theme(style: MdStyle, theme: &ThemeSettings) -> Style {
     let mut out = Style::default();
     if style.contains(MdStyle::BOLD) || style.contains(MdStyle::HEADING) {
         out = out.add_modifier(Modifier::BOLD);
@@ -53,11 +55,11 @@ fn markdown_style(style: MdStyle) -> Style {
         out = out.add_modifier(Modifier::REVERSED);
     }
     if style.contains(MdStyle::CODE) {
-        out = out.fg(Color::Yellow);
+        out = out.fg(color(&theme.markdown_code));
     } else if style.contains(MdStyle::HEADING) {
-        out = out.fg(Color::LightBlue);
+        out = out.fg(color(&theme.markdown_heading));
     } else if style.contains(MdStyle::LINK) {
-        out = out.fg(Color::Cyan);
+        out = out.fg(color(&theme.markdown_link));
     } else if style.contains(MdStyle::LINK_URL) || style.contains(MdStyle::QUOTE) {
         out = out.add_modifier(Modifier::DIM);
     }
@@ -142,7 +144,12 @@ fn merge_selected(runs: &[StyledRun], start: usize, len: usize) -> Vec<StyledRun
     out
 }
 
+#[cfg(test)]
 fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
+    styled_line_with_theme(text, runs, &ThemeSettings::default())
+}
+
+fn styled_line_with_theme(text: &str, runs: &[StyledRun], theme: &ThemeSettings) -> Line<'static> {
     if runs.is_empty() {
         return Line::from(text.to_owned());
     }
@@ -165,7 +172,7 @@ fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
         if from < to {
             spans.push(Span::styled(
                 text[from..to].to_owned(),
-                markdown_style(run.style),
+                markdown_style_with_theme(run.style, theme),
             ));
         }
         cursor = cursor.max(run.start + run.len);
@@ -176,33 +183,40 @@ fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
     Line::from(spans)
 }
 
+#[cfg(test)]
 fn entry_title_style(kind: EntryKind) -> Style {
+    entry_title_style_with_theme(kind, &ThemeSettings::default())
+}
+
+fn entry_title_style_with_theme(kind: EntryKind, theme: &ThemeSettings) -> Style {
     match kind {
         EntryKind::User => Style::default()
-            .fg(Color::LightGreen)
+            .fg(color(&theme.user_title))
             .add_modifier(Modifier::BOLD),
         EntryKind::Assistant => Style::default()
-            .fg(Color::LightCyan)
+            .fg(color(&theme.assistant_title))
+            .add_modifier(Modifier::BOLD),
+        EntryKind::Reasoning => Style::default()
+            .fg(Color::Rgb(192, 132, 252))
             .add_modifier(Modifier::BOLD),
         EntryKind::Tool => Style::default()
-            .fg(Color::Yellow)
+            .fg(color(&theme.tool_title))
             .add_modifier(Modifier::BOLD),
-        EntryKind::System => Style::default().fg(Color::DarkGray),
+        EntryKind::System => Style::default().fg(color(&theme.system_title)),
     }
 }
 
 /// Welcome hero rows: the gradient banner plus breathing room and the
 /// subtitle, centered in a `width`-wide body. The caller guarantees the
 /// fit, so no row exceeds `width`.
-fn hero_lines() -> Vec<Line<'static>> {
+fn hero_lines_with_theme(theme: &ThemeSettings) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(EMPTY_ROWS);
     lines.push(Line::from(""));
     for (index, row) in LOGO.iter().enumerate() {
-        let (red, green, blue) = LOGO_GRADIENT[index];
         lines.push(Line::from(Span::styled(
             row.to_owned(),
             Style::default()
-                .fg(Color::Rgb(red, green, blue))
+                .fg(color(&theme.banner[index]))
                 .add_modifier(Modifier::BOLD),
         )));
     }
@@ -215,12 +229,12 @@ fn hero_lines() -> Vec<Line<'static>> {
 }
 
 /// Small-terminal hero: the wordmark plus subtitle, left-aligned. Two rows.
-fn wordmark_lines() -> Vec<Line<'static>> {
+fn wordmark_lines_with_theme(theme: &ThemeSettings) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
             WORDMARK.to_owned(),
             Style::default()
-                .fg(Color::Green)
+                .fg(color(&theme.accent))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -244,16 +258,6 @@ const LOGO: &[&str] = &[
 /// Banner width in cells (the widest row; shorter rows leave blanks).
 const LOGO_WIDTH: u16 = 91;
 
-/// Green gradient, one entry per banner row.
-const LOGO_GRADIENT: [(u8, u8, u8); 6] = [
-    (74, 222, 128),
-    (63, 208, 116),
-    (52, 194, 105),
-    (42, 180, 94),
-    (32, 168, 84),
-    (22, 163, 74),
-];
-
 /// Banner rows plus the leading blank, breathing room, and the subtitle.
 const EMPTY_ROWS: usize = 9;
 
@@ -267,7 +271,7 @@ const EMPTY_SUBTITLE: &str = "nexus-agent dev · fast to start · small by desig
 /// retired M0-TEST branding. Baked in at compile time from the crate
 /// version (`concat!` needs literals, so one const per shape).
 const HEADER_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"), " ");
-const FOOTER_TAG: &str = concat!(" v", env!("CARGO_PKG_VERSION"), " ");
+const FOOTER_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Small-terminal wordmark, centered when the banner does not fit.
 const WORDMARK: &str = "nexus-agent";
@@ -278,6 +282,7 @@ const MIN_WIDTH: u16 = 20;
 /// Reserved lines: header (1) + footer (1) + composer chrome (2).
 const CHROME_LINES: u16 = 4;
 /// Composer body lines, clamped so history keeps the frame.
+#[cfg(test)]
 const MAX_COMPOSER_BODY: u16 = 5;
 /// Smallest approval card: both borders plus one detail row.
 const APPROVAL_MIN_ROWS: u16 = 3;
@@ -343,12 +348,22 @@ fn split(area: Rect, composer_body: u16, approval_rows: u16) -> Regions {
 /// on demand, compact header/footer. Pure presentation: reads [`AppState`],
 /// writes cells, executes nothing.
 pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
+    let base = Style::default()
+        .fg(color(&state.settings().theme.foreground))
+        .bg(color(&state.settings().theme.background));
+    buf.set_style(area, base);
     if area.width < MIN_WIDTH || area.height < CHROME_LINES + 4 {
         let note = Paragraph::new("terminal too small for nexus-tui (M0 test build)");
         note.render(area, buf);
         return;
     }
-    let composer_body = (state.composer().lines().count().max(1) as u16).min(MAX_COMPOSER_BODY);
+    let composer_body = state
+        .composer()
+        .lines()
+        .count()
+        .max(1)
+        .min(state.settings().display.composer_max_rows as usize)
+        .min(area.height.saturating_sub(CHROME_LINES + 1) as usize) as u16;
     let approval = match state.pending_approval().cloned() {
         Some(card) => {
             let run = state.active_run().map(|run| run.as_str().to_owned());
@@ -380,7 +395,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
     render_header(state, regions.header, buf, focus);
     render_body(state, regions.body, buf);
     if let (Some(layout), Some(card_area)) = (approval.as_ref(), regions.approval) {
-        render_approval(layout, card_area, buf);
+        render_approval_with_theme(layout, card_area, buf, &state.settings().theme, focus);
     }
     render_composer(state, regions.composer, buf, focus);
     // Composer pointer geometry: origin plus the inner draft grid the
@@ -395,7 +410,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
             .lines()
             .count()
             .max(1)
-            .min(MAX_COMPOSER_BODY as usize),
+            .min(composer_body as usize),
         ..state.pointer_geometry()
     });
     render_footer(state, regions.footer, buf, focus);
@@ -407,6 +422,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
 /// suggestions sit immediately above the composer. This keeps both editable
 /// text areas and the footer unobscured.
 fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Buffer) {
+    let theme = &state.settings().theme;
     let items = state.completions();
     if items.is_empty() || area.width < 16 {
         return;
@@ -429,12 +445,19 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
     Clear.render(popup, buf);
     for y in popup.top()..popup.bottom() {
         for x in popup.left()..popup.right() {
-            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+            buf.get_mut(x, y)
+                .set_fg(color(&theme.foreground))
+                .set_bg(color(&theme.modal_background))
+                .set_symbol(" ");
         }
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray).bg(Color::Black))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.muted))
+                .bg(color(&theme.modal_background)),
+        )
         .title(if command_mode {
             " commands "
         } else {
@@ -447,17 +470,17 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
     for (row, (index, item)) in items.iter().enumerate().skip(first).take(rows).enumerate() {
         let selected = state.completion_is_selected(index);
         let background = if selected {
-            Color::DarkGray
+            color(&theme.selected_background)
         } else {
-            Color::Black
+            color(&theme.modal_background)
         };
         let mut spans = vec![Span::styled(
             item.label.as_str(),
             Style::default()
                 .fg(if selected {
-                    Color::LightYellow
+                    color(&theme.completion_match)
                 } else {
-                    Color::White
+                    color(&theme.completion_text)
                 })
                 .bg(background)
                 .add_modifier(if selected {
@@ -469,7 +492,7 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
         if !item.info.is_empty() {
             spans.push(Span::styled(
                 format!("  ·  {}", item.info),
-                Style::default().fg(Color::Gray).bg(background),
+                Style::default().fg(color(&theme.secondary)).bg(background),
             ));
         }
         Paragraph::new(Line::from(spans)).render(
@@ -482,6 +505,7 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
 /// Centered modal dialog, painted last so it sits above every region.
 /// Dialog geometry clamps to the frame on narrow or short terminals.
 fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
+    let theme = &state.settings().theme;
     if !state.overlay_open() {
         return;
     }
@@ -490,7 +514,17 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
         return;
     }
     let matches = state.picker_matches();
-    let visible = matches.len().min(MAX_PICKER_VISIBLE_ROWS);
+    let visible = matches
+        .len()
+        .min(state.settings().display.picker_visible_rows)
+        .min(area.height.saturating_sub(5).max(1) as usize);
+    state.record_picker_page_rows(
+        state
+            .settings()
+            .display
+            .picker_visible_rows
+            .min(area.height.saturating_sub(5).max(1) as usize),
+    );
     // Prefer a 24..=56-cell dialog, shrinking with the frame on tiny
     // terminals instead of overflowing it.
     let preferred_width = if state.session_picker_open() { 88 } else { 56 };
@@ -513,12 +547,19 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     // dialog, mixing it with the conversation behind it.
     for y in popup.top()..popup.bottom() {
         for x in popup.left()..popup.right() {
-            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+            buf.get_mut(x, y)
+                .set_fg(color(&theme.foreground))
+                .set_bg(color(&theme.modal_background))
+                .set_symbol(" ");
         }
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.accent))
+                .bg(color(&theme.modal_background)),
+        )
         .title(if state.session_picker_open() {
             " sessions · Ctrl+S "
         } else {
@@ -581,30 +622,36 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     Paragraph::new(rows).render(inner, buf);
 }
 
-fn help_section(title: &str) -> Line<'static> {
+fn help_section_with_theme(title: &str, theme: &ThemeSettings) -> Line<'static> {
     Line::from(Span::styled(
         format!(" {title} "),
         Style::default()
-            .fg(Color::Green)
+            .fg(color(&theme.accent))
             .add_modifier(Modifier::BOLD),
     ))
 }
 
-fn help_row(label: &str, description: &str) -> Line<'static> {
+fn help_row_with_theme(label: &str, description: &str, theme: &ThemeSettings) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("  {label:<28}"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(color(&theme.info))
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(description.to_owned(), Style::default().fg(Color::Gray)),
+        Span::styled(
+            description.to_owned(),
+            Style::default().fg(color(&theme.secondary)),
+        ),
     ])
 }
 
 /// One help surface for the full command set, keyboard reference, and the
 /// runtime/build context useful when reporting issues.
 fn help_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = &state.settings().theme;
+    let help_section = |title: &str| help_section_with_theme(title, theme);
+    let help_row = |label: &str, description: &str| help_row_with_theme(label, description, theme);
     let model = state.active_model().unwrap_or("not selected");
     let session = state.session_label().unwrap_or("default");
     let mut lines = vec![help_section("NEXUS AGENT")];
@@ -686,7 +733,10 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
         "Recall previous / next submitted draft",
     ));
     lines.push(help_row("Tab", "Cycle agent mode (plan / build / custom)"));
-    lines.push(help_row("Esc", "Step focus back one level"));
+    lines.push(help_row(
+        "Esc",
+        "Return to normal mode; i / o enter composer",
+    ));
     lines.push(help_row(
         "@<path>",
         "Suggest a project path; inserts a reference only",
@@ -711,6 +761,7 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
         "m  ·  Ctrl+T",
         "Cycle model / cycle model variant",
     ));
+    lines.push(help_row("Ctrl+R", "Show / hide provider reasoning (saved)"));
     lines.push(help_row(":", "Open the editable desktop command line"));
     lines.push(help_row(
         "Tab / Esc",
@@ -738,6 +789,7 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
 }
 
 fn render_help_dialog(state: &AppState, area: Rect, buf: &mut Buffer) {
+    let theme = &state.settings().theme;
     if area.width < 12 || area.height < 5 {
         return;
     }
@@ -752,12 +804,19 @@ fn render_help_dialog(state: &AppState, area: Rect, buf: &mut Buffer) {
     Clear.render(popup, buf);
     for y in popup.top()..popup.bottom() {
         for x in popup.left()..popup.right() {
-            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+            buf.get_mut(x, y)
+                .set_fg(color(&theme.foreground))
+                .set_bg(color(&theme.modal_background))
+                .set_symbol(" ");
         }
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.accent))
+                .bg(color(&theme.modal_background)),
+        )
         .title(format!(
             " Nexus Agent · Help · v{} ",
             env!("CARGO_PKG_VERSION")
@@ -775,11 +834,12 @@ fn render_help_dialog(state: &AppState, area: Rect, buf: &mut Buffer) {
         .take(inner.height as usize)
         .collect();
     Paragraph::new(visible)
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(color(&theme.modal_background)))
         .render(inner, buf);
 }
 
 fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
+    let theme = &state.settings().theme;
     let run = state
         .active_run()
         .map(|run| run.as_str())
@@ -787,22 +847,12 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
     let mut spans = vec![
         Span::styled(" nexus-tui ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(HEADER_TAG),
-        Span::styled(format!("run:{run} "), Style::default().fg(Color::Cyan)),
-        if matches!(state.status(), "running" | "executing tool") {
-            const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
-            Span::styled(
-                format!("{} {}", SPINNER[state.tool_spinner_frame()], state.status()),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw(state.status())
-        },
+        Span::styled(
+            format!("run:{run} "),
+            Style::default().fg(color(&theme.info)),
+        ),
     ];
-    // The directory trails every existing segment, so frames that never
-    // set it render byte-identically and narrow frames clip the path
-    // before any status marker.
+    // Keep the directory last so narrow frames preserve run/session identity.
     if let Some(label) = state.session_label() {
         spans.push(Span::raw(format!(" sess:{label}")));
     }
@@ -822,7 +872,9 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
             spans.push(Span::raw(" ".repeat(area.width as usize - used - mark)));
             spans.push(Span::styled(
                 text.to_owned(),
-                Style::default().fg(Color::Black).bg(Color::Green),
+                Style::default()
+                    .fg(color(&theme.selected_text))
+                    .bg(color(&theme.accent)),
             ));
         }
     }
@@ -880,9 +932,9 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
     // away naturally instead of competing for space.
     let used = view.lines.len() + usize::from(truncated);
     if !truncated && text_width >= LOGO_WIDTH as usize && used + EMPTY_ROWS <= content_height {
-        lines.extend(hero_lines());
+        lines.extend(hero_lines_with_theme(&state.settings().theme));
     } else if !truncated && text_width >= WORDMARK.len() && used + WORDMARK_ROWS <= content_height {
-        lines.extend(wordmark_lines());
+        lines.extend(wordmark_lines_with_theme(&state.settings().theme));
     }
     if truncated {
         lines.push(Line::from(Span::styled(
@@ -890,7 +942,7 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
             // itself never be clipped away.
             format!("… {}↑ presentation-truncated", view.hidden_above),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(color(&state.settings().theme.warning))
                 .add_modifier(Modifier::DIM),
         )));
     }
@@ -906,11 +958,15 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
     };
     for (index, (line, runs)) in view.lines.iter().zip(&view.styles).enumerate() {
         let mut rendered = match selected_row(index) {
-            Some((start, len)) => styled_line(line, &merge_selected(runs, start, len)),
-            None => styled_line(line, runs),
+            Some((start, len)) => styled_line_with_theme(
+                line,
+                &merge_selected(runs, start, len),
+                &state.settings().theme,
+            ),
+            None => styled_line_with_theme(line, runs, &state.settings().theme),
         };
         if let Some(kind) = view.titles[index] {
-            rendered = rendered.style(entry_title_style(kind));
+            rendered = rendered.style(entry_title_style_with_theme(kind, &state.settings().theme));
         }
         lines.push(rendered);
     }
@@ -1145,8 +1201,29 @@ fn push_wrapped(text: &str, width: usize, budget: usize, out: &mut Vec<String>) 
     }
 }
 
+#[cfg(test)]
 fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
-    let title = if layout.expanded {
+    render_approval_with_theme(
+        layout,
+        area,
+        buf,
+        &ThemeSettings::default(),
+        Focus::ApprovalCard,
+    );
+}
+
+fn render_approval_with_theme(
+    layout: &ApprovalLayout,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &ThemeSettings,
+    focus: Focus,
+) {
+    let title = if focus == Focus::Viewport {
+        " approval unfocused · Tab to focus ".to_owned()
+    } else if focus == Focus::Composer {
+        " approval unfocused · Esc then Tab to focus ".to_owned()
+    } else if layout.expanded {
         let end = layout
             .scroll
             .saturating_add(layout.view_rows)
@@ -1164,7 +1241,11 @@ fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.danger))
+                .add_modifier(Modifier::BOLD),
+        )
         .title(Line::from(title));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -1176,13 +1257,13 @@ fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
         .map(|(index, text)| {
             let hint_row = index == last && (layout.expanded || layout.clipped);
             let style = if hint_row && text.starts_with("[a] allow once") {
-                Style::default().fg(Color::Green)
+                Style::default().fg(color(&theme.accent))
             } else if hint_row {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(color(&theme.warning))
                     .add_modifier(Modifier::BOLD)
             } else if text.starts_with("[a] allow once") {
-                Style::default().fg(Color::Green)
+                Style::default().fg(color(&theme.accent))
             } else if text.starts_with("decisions go") {
                 Style::default().add_modifier(Modifier::DIM)
             } else {
@@ -1231,14 +1312,15 @@ fn composer_selected_line(draft: &str, start: usize, len: usize, focused: bool) 
 }
 
 fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
+    let theme = &state.settings().theme;
     // The composer border names the active agent mode: read-only modes
     // (plan and read-only customs) render amber, full-capability modes keep
     // the focused green. Unfocused keeps the plain border as before.
     let style = if focus == Focus::Composer {
         if state.mode().read_only {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(color(&theme.warning))
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(color(&theme.accent))
         }
     } else {
         Style::default()
@@ -1259,7 +1341,7 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
             title.push(Span::raw("("));
             title.push(Span::styled(
                 state.variant().to_owned(),
-                Style::default().fg(Color::LightYellow),
+                Style::default().fg(color(&theme.completion_match)),
             ));
             title.push(Span::raw(")"));
         }
@@ -1276,8 +1358,8 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
     block.render(area, buf);
     // An empty focused composer shows a dimmed invitation, but the caret
     // owns column zero either way: the hint never pushes it away.
-    // Anything typed replaces the hint, and other focuses render the
-    // draft (or nothing) exactly as before.
+    // In normal mode, an empty draft instead hints how to enter editing.
+    // A nonempty draft remains visible in either mode.
     let draft = state.composer().to_owned();
     let selected = state.composer_selection_range();
     let show_caret = focus == Focus::Composer && state.caret_visible();
@@ -1285,7 +1367,7 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         // The hint never moves: the caret covers its first character
         // instead of taking a cell of its own, so blinking cannot make
         // the invitation jump back and forth.
-        let hint = "Type a task · : commands · @ project files";
+        let hint = "Type a task or ask a question · @ project files";
         let dim = Style::default().add_modifier(Modifier::DIM);
         if show_caret {
             let mut chars = hint.chars();
@@ -1304,6 +1386,11 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         } else {
             Line::from(vec![Span::styled(hint, dim)])
         }
+    } else if draft.is_empty() && focus == Focus::Viewport {
+        Line::from(Span::styled(
+            "Type i / o to edit · : commands",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
     } else if let Some((start, len)) = selected {
         composer_selected_line(&draft, start, len, focus == Focus::Composer)
     } else if show_caret {
@@ -1332,23 +1419,66 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
 }
 
 fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
-    let status = if state.can_cancel() {
-        state.status()
+    let theme = &state.settings().theme;
+    let animated = matches!(state.status(), "running" | "executing tool");
+    let status = if animated {
+        const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        format!("{} {}", SPINNER[state.tool_spinner_frame()], state.status())
     } else {
-        "idle"
+        state.status().to_owned()
     };
-    let right_text = format!("{FOOTER_TAG}{status}");
-    let right_width = display_width(&right_text).min(area.width as usize) as u16;
-    Paragraph::new(right_text)
+    let status_style = if animated {
+        Style::default()
+            .fg(color(&theme.info))
+            .add_modifier(Modifier::BOLD)
+    } else if state.status() == "awaiting approval" {
+        Style::default().fg(color(&theme.warning))
+    } else {
+        Style::default().fg(color(&theme.muted))
+    };
+    let context = match state.context_estimate() {
+        Some((Some(tokens), window)) => {
+            let percent = window.filter(|window| *window > 0).map_or_else(
+                || "--".to_owned(),
+                |window| format!("{}", u128::from(tokens) * 100 / u128::from(window)),
+            );
+            format!("~{:.1}K ({percent}%)", tokens as f64 / 1000.0)
+        }
+        _ => "--.-K (--%)".to_owned(),
+    };
+    let version_width = display_width(FOOTER_TAG).min(area.width as usize) as u16;
+    let version_area = Rect::new(
+        area.x + area.width.saturating_sub(version_width),
+        area.y,
+        version_width,
+        area.height,
+    );
+    Paragraph::new(FOOTER_TAG)
         .alignment(Alignment::Right)
-        .render(area, buf);
+        .render(version_area, buf);
+    let info = format!("{status}  {context}  ");
+    let available = area.width.saturating_sub(version_width);
+    let info_width = (display_width(&info).min(available as usize)) as u16;
+    let info_area = Rect::new(
+        area.x + available.saturating_sub(info_width),
+        area.y,
+        info_width,
+        area.height,
+    );
+    Paragraph::new(Line::from(vec![
+        Span::styled(status, status_style),
+        Span::raw(format!("  {context}  ")),
+    ]))
+    .alignment(Alignment::Right)
+    .render(info_area, buf);
+    let right_width = info_width + version_width;
 
     if let Some(command) = state.command_line() {
         let text = format!(":{command}▊");
         let left_width = area.width.saturating_sub(right_width);
         if left_width > 0 {
             Paragraph::new(text)
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(color(&state.settings().theme.warning)))
                 .render(Rect::new(area.x, area.y, left_width, area.height), buf);
         }
     }
@@ -1356,6 +1486,34 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_composer_hints_insert_keys_only_in_normal_mode() {
+        let (mut state, mut terminal) = harness(100, 24);
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(screen(&terminal).contains("Type i / o to edit · : commands"));
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert!(!screen(&terminal).contains("Type i / o to edit"));
+        assert!(screen(&terminal).contains("Type a task or ask a question · @ project files"));
+        assert!(!screen(&terminal).contains(": commands"));
+        state.composer_type('x');
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(!screen(&terminal).contains("Type i / o to edit"));
+        assert!(screen(&terminal).contains('x'));
+    }
+
+    #[test]
+    fn parked_approval_explains_how_to_restore_focus() {
+        let (mut state, mut terminal) = harness(100, 30);
+        started(&mut state, 0);
+        assert!(state.apply_event(&approval_event(1, "run tool", "project")));
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(screen(&terminal).contains("approval unfocused · Tab to focus"));
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert!(screen(&terminal).contains("approval unfocused · Esc then Tab to focus"));
+        draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        assert!(screen(&terminal).contains("approval required"));
+    }
+
     #[test]
     fn frames_never_duplicate_the_composer_text_or_leave_stale_draft() {
         // Two consecutive frames through one backend (which keeps cells the
@@ -1411,6 +1569,91 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend).expect("test terminal builds");
         (AppState::new(), terminal)
+    }
+
+    #[test]
+    fn semantic_theme_colors_and_composer_geometry_are_configurable() {
+        let (mut state, mut terminal) = harness(100, 30);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.theme.foreground = "#123456".into();
+        settings.theme.background = "index:17".into();
+        settings.theme.accent = "magenta".into();
+        settings.theme.user_title = "index:200".into();
+        settings.theme.markdown_code = "blue".into();
+        settings.display.composer_max_rows = 2;
+        state.set_settings(settings).unwrap();
+        state.record_submitted("body");
+        for ch in "one\ntwo\nthree\nfour".chars() {
+            if ch == '\n' {
+                state.composer_newline();
+            } else {
+                state.composer_type(ch);
+            }
+        }
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert_eq!(state.pointer_geometry().composer_rows, 2);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.get(99, 29).bg, Color::Indexed(17));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.fg == Color::Indexed(200))
+        );
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.fg == Color::Rgb(18, 52, 86))
+        );
+        assert!(buffer.content.iter().any(|cell| cell.fg == Color::Magenta));
+        let styled = markdown_style_with_theme(MdStyle::CODE, &state.settings().theme);
+        assert_eq!(styled.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn modal_background_is_configurable() {
+        let (mut state, mut terminal) = harness(80, 24);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.theme.modal_background = "index:42".into();
+        state.set_settings(settings).unwrap();
+        state.open_help();
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.bg == Color::Indexed(42))
+        );
+    }
+
+    #[test]
+    fn picker_window_and_page_step_share_configured_and_clipped_geometry() {
+        let (mut state, mut terminal) = harness(80, 24);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.display.picker_visible_rows = 3;
+        state.set_settings(settings.clone()).unwrap();
+        state.open_model_picker(
+            (0..20)
+                .map(|index| crate::state::ModelChoice {
+                    id: format!("model-{index:02}"),
+                    provider: "provider".into(),
+                })
+                .collect(),
+        );
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert_eq!(state.picker_page_rows(), 3);
+        let text = screen(&terminal);
+        assert!(text.contains("model-02"));
+        assert!(!text.contains("model-03"));
+        settings.display.picker_visible_rows = 100;
+        state.set_settings(settings).unwrap();
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buffer = Buffer::empty(area);
+        render(&mut state, area, &mut buffer, Focus::Composer);
+        assert_eq!(state.picker_page_rows(), 3);
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {
@@ -1875,6 +2118,50 @@ mod tests {
     }
 
     #[test]
+    fn large_composer_does_not_hide_or_falsely_measure_approval_detail() {
+        let (mut state, mut terminal) = harness(60, 24);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.display.composer_max_rows = 100;
+        state.set_settings(settings).unwrap();
+        for _ in 0..19 {
+            state.composer_type('x');
+            state.composer_newline();
+        }
+        started(&mut state, 0);
+        assert!(state.apply_event(&approval_event(1, &"s".repeat(500), "project scope")));
+        let area = Rect::new(0, 0, 60, 24);
+        let requested = approval_layout(
+            state.pending_approval().unwrap(),
+            Some("run-1"),
+            None,
+            area,
+            19,
+            false,
+            0,
+        );
+        assert_eq!(
+            split(area, 19, requested.rows).approval.unwrap().height,
+            requested.rows
+        );
+        draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        assert!(screen(&terminal).contains("approval required"));
+        assert!(!state.approval_decision_allowed());
+        state.inspect_approval();
+        draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        assert!(screen(&terminal).contains("approval detail"));
+        assert!(!state.approval_decision_allowed());
+        for _ in 0..256 {
+            if state.approval_detail_seen_all() {
+                break;
+            }
+            state.approval_detail_page(1);
+            draw(&mut state, &mut terminal, Focus::ApprovalCard);
+        }
+        assert!(state.approval_detail_seen_all());
+        assert!(state.approval_decision_allowed());
+    }
+
+    #[test]
     fn long_operation_detail_is_readable_in_the_expanded_view() {
         let (mut state, mut terminal) = harness(60, 18);
         started(&mut state, 0);
@@ -2039,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_execution_header_animates_between_tick_frames() {
+    fn tool_execution_footer_animates_between_tick_frames() {
         let (mut state, mut terminal) = harness(100, 16);
         started(&mut state, 0);
         let tool_started = RunEvent::new(
@@ -2054,11 +2341,19 @@ mod tests {
         );
         assert!(state.apply_event(&tool_started));
         draw(&mut state, &mut terminal, Focus::Viewport);
-        assert!(screen(&terminal).contains("| executing tool"));
+        let frame = screen(&terminal);
+        assert!(!frame.lines().next().unwrap().contains("executing tool"));
+        assert!(frame.lines().last().unwrap().contains("⠋ executing tool"));
 
         assert!(state.tick_tool_animation());
         draw(&mut state, &mut terminal, Focus::Viewport);
-        assert!(screen(&terminal).contains("/ executing tool"));
+        assert!(
+            screen(&terminal)
+                .lines()
+                .last()
+                .unwrap()
+                .contains("⠙ executing tool")
+        );
     }
 }
 
@@ -2626,7 +2921,7 @@ mod cov_render_private {
     }
 
     #[test]
-    fn header_reports_the_run_status() {
+    fn header_reports_run_identity_without_duplicate_status() {
         let mut state = AppState::new();
         let area = Rect::new(0, 0, 80, 1);
         let header = rows_of(area, |buf| {
@@ -2639,7 +2934,7 @@ mod cov_render_private {
             "{header:?}"
         );
         assert!(header.contains("run:no run"), "{header:?}");
-        assert!(header.contains("idle"), "{header:?}");
+        assert!(!header.contains("idle"), "{header:?}");
         assert!(!header.contains("focus:"), "{header:?}");
 
         assert!(state.apply_event(&started(0)));
@@ -2648,8 +2943,36 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(header.contains("run:run-1"), "{header:?}");
-        assert!(header.contains("running"), "{header:?}");
+        assert!(!header.contains("running"), "{header:?}");
         assert!(!header.contains("focus:"), "{header:?}");
+    }
+
+    #[test]
+    fn footer_running_animation_is_colored_and_keeps_context_position() {
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let area = Rect::new(0, 0, 100, 1);
+        let mut first = Buffer::empty(area);
+        render_footer(&state, area, &mut first, Focus::Viewport);
+        let spinner_x = (0..area.width)
+            .find(|x| first.get(*x, 0).symbol() == "⠋")
+            .expect("running spinner is visible");
+        assert_eq!(
+            first.get(spinner_x, 0).fg,
+            color(&state.settings().theme.info)
+        );
+        assert_eq!(first.get(spinner_x + 2, 0).symbol(), "r");
+        assert_eq!(
+            first.get(spinner_x + 2, 0).fg,
+            color(&state.settings().theme.info)
+        );
+        assert!(state.tick_tool_animation());
+        let mut next = Buffer::empty(area);
+        render_footer(&state, area, &mut next, Focus::Viewport);
+        assert_eq!(next.get(spinner_x, 0).symbol(), "⠙");
+        for x in spinner_x + 1..area.width {
+            assert_eq!(first.get(x, 0), next.get(x, 0), "stable footer column {x}");
+        }
     }
 
     #[test]
@@ -2661,7 +2984,7 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(
-            footer.contains(format!(" {} ", concat!("v", env!("CARGO_PKG_VERSION"))).as_str()),
+            footer.ends_with(concat!("v", env!("CARGO_PKG_VERSION"))),
             "{footer:?}"
         );
         assert!(footer.contains("idle"), "{footer:?}");
@@ -2672,7 +2995,10 @@ mod cov_render_private {
         assert!(!footer.contains("[i]"), "{footer:?}");
         assert_eq!(
             footer.trim_start(),
-            format!("{} idle", concat!("v", env!("CARGO_PKG_VERSION"))),
+            format!(
+                "idle  --.-K (--%)  {}",
+                concat!("v", env!("CARGO_PKG_VERSION"))
+            ),
             "{footer:?}"
         );
 
@@ -2683,7 +3009,10 @@ mod cov_render_private {
             .clone();
         assert_eq!(
             footer.trim_start(),
-            format!("{} running", concat!("v", env!("CARGO_PKG_VERSION"))),
+            format!(
+                "⠋ running  --.-K (--%)  {}",
+                concat!("v", env!("CARGO_PKG_VERSION"))
+            ),
             "{footer:?}"
         );
 
@@ -2693,7 +3022,7 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(
-            footer.trim_end().ends_with("awaiting approval"),
+            footer.trim_start().starts_with("awaiting approval"),
             "{footer:?}"
         );
 
@@ -2703,9 +3032,74 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(
-            footer.trim_end().ends_with("awaiting approval"),
+            footer.trim_start().starts_with("awaiting approval"),
             "{footer:?}"
         );
+    }
+
+    #[test]
+    fn footer_shows_task_context_estimate_and_ignores_summary_requests() {
+        let mut state = AppState::new();
+        let area = Rect::new(0, 0, 80, 1);
+        assert!(state.apply_event(&started(0)));
+        let request = |seq, purpose, input, window| {
+            RunEvent::new(
+                SessionId::new("sess-1").unwrap(),
+                RunId::new("run-1").unwrap(),
+                seq,
+                EventPayload::ModelRequestStarted {
+                    turn: TurnId::new("t1-0").unwrap(),
+                    purpose,
+                    estimated_input_tokens: input,
+                    raw_estimated_input_tokens: input,
+                    estimate_scale_millis: 1000,
+                    context_window_tokens: window,
+                    context_trigger_percent: 65,
+                    context_target_percent: 10,
+                    compaction_strategy: nexus_core::ContextCompactionStrategy::Summarize,
+                    max_output_tokens: None,
+                    projected_tool_outputs: 0,
+                },
+            )
+        };
+        assert!(state.apply_event(&request(
+            1,
+            nexus_core::ModelRequestPurpose::Task,
+            Some(12_345),
+            Some(100_000)
+        )));
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(
+            footer.ends_with(concat!(
+                "running  ~12.3K (12%)  v",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{footer:?}"
+        );
+        assert!(state.apply_event(&request(
+            2,
+            nexus_core::ModelRequestPurpose::Summary,
+            Some(99),
+            Some(100)
+        )));
+        assert_eq!(
+            state.context_estimate(),
+            Some((Some(12_345), Some(100_000)))
+        );
+        assert!(state.apply_event(&request(
+            3,
+            nexus_core::ModelRequestPurpose::Task,
+            Some(1500),
+            None
+        )));
+        let footer = rows_of(area, |buf| {
+            render_footer(&state, area, buf, Focus::Viewport)
+        })[0]
+            .clone();
+        assert!(footer.contains("~1.5K (--%)"), "{footer:?}");
     }
 
     #[test]
@@ -2724,10 +3118,7 @@ mod cov_render_private {
             .clone();
         assert!(armed.trim_start().starts_with(":▊"), "{armed:?}");
         let version = concat!("v", env!("CARGO_PKG_VERSION"));
-        assert!(
-            armed.trim_end().ends_with(&format!("{version} idle")),
-            "{armed:?}"
-        );
+        assert!(armed.trim_end().ends_with(version), "{armed:?}");
         assert!(
             armed.find(":▊").expect("left command") < armed.find(version).expect("right status"),
             "command precedes version/status: {armed:?}"
@@ -2952,7 +3343,7 @@ mod cov_render_private {
             rows.iter().any(|row| row.contains("example-model")),
             "active model is included: {rows:?}"
         );
-        state.scroll_help(20);
+        state.scroll_help(24);
         let rows = rows_of(area, |buf| render_overlay(&state, area, buf));
         assert!(
             rows.iter().any(|row| row.contains("Ctrl+J / Alt+Enter")),
@@ -3302,7 +3693,7 @@ mod cov_render_private {
     }
 
     #[test]
-    fn header_shows_the_recorded_directory_after_the_status_markers() {
+    fn header_shows_the_recorded_directory_after_run_identity() {
         let mut state = AppState::new();
         state.set_project_dir("/Volumes/work/proj");
         let area = Rect::new(0, 0, 120, 1);
@@ -3313,8 +3704,8 @@ mod cov_render_private {
         assert!(!header.contains("focus:"), "{header:?}");
         assert!(header.contains("dir:/Volumes/work/proj"), "{header:?}");
         assert!(
-            header.find("idle").expect("marker") < header.find("dir:").expect("dir"),
-            "narrow frames clip the path before any status marker: {header:?}"
+            header.find("run:").expect("marker") < header.find("dir:").expect("dir"),
+            "narrow frames clip the path before run identity: {header:?}"
         );
     }
 
@@ -3512,12 +3903,12 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(shown.trim_end().ends_with("running"), "{shown:?}");
+        assert!(shown.contains("running  --.-K (--%)"), "{shown:?}");
         assert!(state.apply_event(&usage(2, Some(10), Some(3))));
         let shown = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(shown.trim_end().ends_with("running"), "{shown:?}");
+        assert!(shown.contains("running  --.-K (--%)"), "{shown:?}");
     }
 }

@@ -15,34 +15,45 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use nexus_config::{UserConfig, load, resolve_path};
-use nexus_core::Limits;
 use nexus_server::{Server, ToolsMode};
 
 /// Default loopback port.
 const DEFAULT_PORT: u16 = 8471;
+#[cfg(test)]
 const BENCHMARK_MAX_MODEL_TURNS: u32 = 500;
+#[cfg(test)]
 const BENCHMARK_MAX_TOOL_CALLS: u32 = 4_096;
+#[cfg(test)]
 const BENCHMARK_MAX_TOOL_CALLS_PER_TURN: u32 = 64;
+#[cfg(test)]
 const BENCHMARK_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-fn server_runtime_limits() -> Limits {
+#[cfg(test)]
+fn server_runtime_limits() -> nexus_core::Limits {
+    use nexus_core::Limits;
     let mut limits = Limits::m0_test();
     limits.run_duration = std::time::Duration::from_secs(60 * 60);
     limits.per_tool_timeout = std::time::Duration::from_secs(10 * 60);
     limits
 }
+#[cfg(test)]
 const BENCHMARK_RETAINED_CONTEXT_ITEMS: usize = 8_192;
 /// Maximum simultaneously serviced sockets; excess connections are closed
 /// immediately instead of creating another unbounded thread.
 const MAX_CONNECTIONS: usize = 64;
-const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--session-store DIRECTORY] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--base-config PATH] [--config-overlay PATH ...] [--check-config|--print-effective-config] [--session-store DIRECTORY] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
+    eprintln!(
+        "  --base-config and repeatable --config-overlay select operational settings layers; NEXUS_BASE_CONFIG overrides the machine base."
+    );
+    eprintln!(
+        "  --check-config validates all selected config; --print-effective-config prints resolved operational settings."
+    );
     eprintln!(
         "  --session-store opts into private original-source and tool-operation records in a dedicated directory; no session restore API."
     );
@@ -69,21 +80,28 @@ fn usage() -> ! {
 
 /// CLI outcome: run with a port, or print usage and exit. Splitting the
 /// decision from the exit keeps every rejection path unit-testable.
+// The startup parser constructs this once; boxing its owned arguments would
+// add allocation without reducing any steady-state footprint.
+#[allow(clippy::large_enum_variant)]
 enum CliAction {
     /// Serve on this loopback port with this optional explicit config path
     /// and tool wiring.
     Run {
-        port: u16,
+        port: Option<u16>,
         config: Option<String>,
-        tools_real: bool,
+        tools: Option<nexus_config::ServerToolsMode>,
         tools_root: Option<String>,
         strict_tools: bool,
-        execution: ExecutionMode,
+        execution: Option<ExecutionMode>,
         gateway_image: Option<String>,
         workload_image: Option<String>,
         auth_token_env: Option<String>,
         benchmark_pilot: bool,
         session_store: Option<String>,
+        base_config: Option<PathBuf>,
+        config_overlays: Vec<PathBuf>,
+        check_config: bool,
+        print_effective_config: bool,
     },
     /// Print usage and exit 2.
     Usage,
@@ -96,18 +114,21 @@ enum ExecutionMode {
 }
 
 fn parse_args(argv: &[String]) -> CliAction {
-    let mut port = DEFAULT_PORT;
+    let mut port = None;
     let mut config: Option<String> = None;
-    let mut tools_real = false;
+    let mut tools = None;
     let mut tools_root: Option<String> = None;
     let mut strict_tools = false;
-    let mut execution = ExecutionMode::Local;
-    let mut execution_set = false;
+    let mut execution = None;
     let mut gateway_image = None;
     let mut workload_image = None;
     let mut auth_token_env = None;
     let mut benchmark_pilot = false;
     let mut session_store = None;
+    let mut base_config = None;
+    let mut config_overlays = Vec::new();
+    let mut check_config = false;
+    let mut print_effective_config = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -131,13 +152,12 @@ fn parse_args(argv: &[String]) -> CliAction {
                 benchmark_pilot = true;
             }
             "--execution" => {
-                if execution_set {
+                if execution.is_some() {
                     return CliAction::Usage;
                 }
-                execution_set = true;
                 execution = match args.next().map(String::as_str) {
-                    Some("local") => ExecutionMode::Local,
-                    Some("container") => ExecutionMode::Container,
+                    Some("local") => Some(ExecutionMode::Local),
+                    Some("container") => Some(ExecutionMode::Container),
                     _ => return CliAction::Usage,
                 };
             }
@@ -164,7 +184,7 @@ fn parse_args(argv: &[String]) -> CliAction {
                 _ => return CliAction::Usage,
             },
             "--port" => match args.next().and_then(|value| value.parse().ok()) {
-                Some(value) => port = value,
+                Some(value) => port = Some(value),
                 None => return CliAction::Usage,
             },
             // An explicit empty value is accepted as a path the resolver
@@ -174,9 +194,28 @@ fn parse_args(argv: &[String]) -> CliAction {
                 Some(value) => config = Some(value.clone()),
                 None => return CliAction::Usage,
             },
+            "--base-config" => {
+                if base_config.is_some() {
+                    return CliAction::Usage;
+                }
+                base_config = match args.next() {
+                    Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                        Some(PathBuf::from(value))
+                    }
+                    _ => return CliAction::Usage,
+                };
+            }
+            "--config-overlay" => match args.next() {
+                Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                    config_overlays.push(PathBuf::from(value));
+                }
+                _ => return CliAction::Usage,
+            },
+            "--check-config" => check_config = true,
+            "--print-effective-config" => print_effective_config = true,
             "--tools" => match args.next().map(String::as_str) {
-                Some("real") => tools_real = true,
-                Some("fake") => tools_real = false,
+                Some("real") => tools = Some(nexus_config::ServerToolsMode::Real),
+                Some("fake") => tools = Some(nexus_config::ServerToolsMode::Fake),
                 _ => return CliAction::Usage,
             },
             "--tools-root" => match args.next() {
@@ -186,25 +225,10 @@ fn parse_args(argv: &[String]) -> CliAction {
             _ => return CliAction::Usage,
         }
     }
-    if execution == ExecutionMode::Container
-        && (!tools_real
-            || tools_root.as_deref().is_some_and(str::is_empty)
-            || strict_tools
-            || gateway_image.is_none()
-            || workload_image.is_none())
-    {
-        return CliAction::Usage;
-    }
-    if benchmark_pilot && (execution != ExecutionMode::Container || !tools_real || strict_tools) {
-        return CliAction::Usage;
-    }
-    if execution == ExecutionMode::Local && (gateway_image.is_some() || workload_image.is_some()) {
-        return CliAction::Usage;
-    }
     CliAction::Run {
         port,
         config,
-        tools_real,
+        tools,
         tools_root,
         strict_tools,
         execution,
@@ -213,6 +237,75 @@ fn parse_args(argv: &[String]) -> CliAction {
         auth_token_env,
         benchmark_pilot,
         session_store,
+        base_config,
+        config_overlays,
+        check_config,
+        print_effective_config,
+    }
+}
+
+fn valid_startup_selection(
+    execution: ExecutionMode,
+    tools_real: bool,
+    strict_tools: bool,
+    tools_root: Option<&str>,
+    gateway_image: Option<&str>,
+    workload_image: Option<&str>,
+    benchmark_pilot: bool,
+) -> bool {
+    if execution == ExecutionMode::Container
+        && (!tools_real
+            || strict_tools
+            || tools_root.is_some_and(str::is_empty)
+            || gateway_image.is_none()
+            || workload_image.is_none())
+    {
+        return false;
+    }
+    if benchmark_pilot && (execution != ExecutionMode::Container || !tools_real || strict_tools) {
+        return false;
+    }
+    !(execution == ExecutionMode::Local && (gateway_image.is_some() || workload_image.is_some()))
+}
+
+struct ServerLaunchOptions {
+    port: u16,
+    tools_real: bool,
+    strict_tools: bool,
+    tools_root: Option<String>,
+    auth_token_env: Option<String>,
+    session_store: Option<String>,
+    execution: ExecutionMode,
+}
+
+struct CliLaunchOptions {
+    port: Option<u16>,
+    tools: Option<nexus_config::ServerToolsMode>,
+    strict_tools: bool,
+    tools_root: Option<String>,
+    auth_token_env: Option<String>,
+    session_store: Option<String>,
+    execution: Option<ExecutionMode>,
+}
+
+fn resolve_launch_options(
+    cli: CliLaunchOptions,
+    launch: &nexus_config::LaunchSettings,
+) -> ServerLaunchOptions {
+    ServerLaunchOptions {
+        port: cli.port.or(launch.server_port).unwrap_or(DEFAULT_PORT),
+        tools_real: cli
+            .tools
+            .or(launch.server_tools)
+            .is_some_and(|mode| mode == nexus_config::ServerToolsMode::Real),
+        strict_tools: cli.strict_tools || launch.strict_tools.unwrap_or(false),
+        tools_root: cli.tools_root.or_else(|| launch.tools_root.clone()),
+        auth_token_env: cli.auth_token_env.or_else(|| launch.auth_token_env.clone()),
+        session_store: cli.session_store.or_else(|| launch.session_store.clone()),
+        execution: cli.execution.unwrap_or(match launch.execution {
+            Some(nexus_config::ExecutionMode::Container) => ExecutionMode::Container,
+            Some(nexus_config::ExecutionMode::Local) | None => ExecutionMode::Local,
+        }),
     }
 }
 
@@ -249,7 +342,7 @@ fn main() {
     let (
         port,
         explicit_config,
-        tools_real,
+        tools,
         tools_root,
         strict_tools,
         execution,
@@ -258,11 +351,15 @@ fn main() {
         auth_token_env,
         benchmark_pilot,
         session_store,
+        base_config,
+        config_overlays,
+        check_config,
+        print_effective_config,
     ) = match parse_args(&argv) {
         CliAction::Run {
             port,
             config,
-            tools_real,
+            tools,
             tools_root,
             strict_tools,
             execution,
@@ -271,10 +368,14 @@ fn main() {
             auth_token_env,
             benchmark_pilot,
             session_store,
+            base_config,
+            config_overlays,
+            check_config,
+            print_effective_config,
         } => (
             port,
             config,
-            tools_real,
+            tools,
             tools_root,
             strict_tools,
             execution,
@@ -283,9 +384,74 @@ fn main() {
             auth_token_env,
             benchmark_pilot,
             session_store,
+            base_config,
+            config_overlays,
+            check_config,
+            print_effective_config,
         ),
         CliAction::Usage => usage(),
     };
+    let (config, path) = load_user_config(explicit_config.as_deref());
+    let settings_profile = if benchmark_pilot {
+        nexus_config::SettingsProfile::Benchmark
+    } else {
+        nexus_config::SettingsProfile::Server
+    };
+    let settings =
+        nexus_config::load_settings(settings_profile, base_config.as_deref(), &config_overlays)
+            .unwrap_or_else(|error| {
+                eprintln!("nexus-server: invalid operational settings ({error})");
+                std::process::exit(2);
+            });
+    if check_config {
+        println!("Configuration is valid.");
+        std::process::exit(0);
+    }
+    if print_effective_config {
+        println!("{}", nexus_config::settings_json(&settings));
+        std::process::exit(0);
+    }
+    let ServerLaunchOptions {
+        port,
+        tools_real,
+        strict_tools,
+        tools_root,
+        auth_token_env,
+        session_store,
+        execution,
+    } = resolve_launch_options(
+        CliLaunchOptions {
+            port,
+            tools,
+            strict_tools,
+            tools_root,
+            auth_token_env,
+            session_store,
+            execution,
+        },
+        settings.launch(),
+    );
+    let gateway_image = gateway_image.or_else(|| {
+        (execution == ExecutionMode::Container)
+            .then(|| config.gateway_image().map(str::to_owned))
+            .flatten()
+    });
+    let workload_image = workload_image.or_else(|| {
+        (execution == ExecutionMode::Container)
+            .then(|| config.workload_image().map(str::to_owned))
+            .flatten()
+    });
+    if !valid_startup_selection(
+        execution,
+        tools_real,
+        strict_tools,
+        tools_root.as_deref(),
+        gateway_image.as_deref(),
+        workload_image.as_deref(),
+        benchmark_pilot,
+    ) {
+        usage();
+    }
     #[cfg(not(feature = "container"))]
     let _ = (&gateway_image, &workload_image);
     #[cfg(not(feature = "container"))]
@@ -306,7 +472,6 @@ fn main() {
             }
         }
     }
-    let (config, path) = load_user_config(explicit_config.as_deref());
     let needs_auth = tools_real || !config.providers().is_empty();
     let token = match auth_token_env.as_deref() {
         Some(name) => match std::env::var(name) {
@@ -347,27 +512,32 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
-    if let Err(error) = server.set_limits(server_runtime_limits()) {
+    if let Err(error) = server.set_limits(settings.limits()) {
         eprintln!("nexus-server: invalid runtime limits ({error})");
+        std::process::exit(2);
+    }
+    if let Err(error) = server.set_provider_settings(settings.provider()) {
+        eprintln!("nexus-server: invalid provider settings ({error})");
+        std::process::exit(2);
+    }
+    if let Err(error) = server.set_server_settings(settings.server()) {
+        eprintln!("nexus-server: invalid server settings ({error})");
+        std::process::exit(2);
+    }
+    if let Err(error) = server.set_tools_settings(settings.tools()) {
+        eprintln!("nexus-server: invalid tool settings ({error})");
         std::process::exit(2);
     }
     if let Some(store) = session_store {
         server.set_session_store(store);
     }
     if benchmark_pilot {
-        let mut limits = Limits::m0_test();
-        limits.max_model_turns_per_run = BENCHMARK_MAX_MODEL_TURNS;
-        limits.max_tool_calls_per_run = BENCHMARK_MAX_TOOL_CALLS;
-        limits.max_tool_calls_per_turn = BENCHMARK_MAX_TOOL_CALLS_PER_TURN;
-        limits.run_duration = Limits::M0_TEST_MAX_DURATION;
-        limits.per_tool_timeout = BENCHMARK_TOOL_TIMEOUT;
-        limits.retained_context_items = BENCHMARK_RETAINED_CONTEXT_ITEMS;
-        if let Err(error) = server.set_limits(limits) {
-            eprintln!("nexus-server: invalid benchmark pilot limits ({error})");
-            std::process::exit(2);
-        }
         eprintln!(
-            "nexus-server: finite benchmark pilot limits enabled (500 turns, 4096 tool calls, 24 hours, 1 hour per tool)"
+            "nexus-server: finite benchmark pilot limits enabled ({} turns, {} tool calls, {} seconds, {} seconds per tool)",
+            settings.limits().max_model_turns_per_run,
+            settings.limits().max_tool_calls_per_run,
+            settings.limits().run_duration.as_secs(),
+            settings.limits().per_tool_timeout.as_secs(),
         );
     }
     if let Some(token) = token.as_deref()
@@ -447,9 +617,12 @@ fn main() {
     }
     let server = Arc::new(server);
     let cleanup_server = Arc::downgrade(&server);
+    let cleanup_interval =
+        std::time::Duration::from_secs(settings.server().session_cleanup_interval_seconds);
+    let max_connections = settings.server().max_connections;
     thread::spawn(move || {
         loop {
-            thread::sleep(SESSION_CLEANUP_INTERVAL);
+            thread::sleep(cleanup_interval);
             let Some(server) = cleanup_server.upgrade() else {
                 break;
             };
@@ -460,7 +633,7 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if !try_acquire_connection(&connections) {
+                if !try_acquire_connection(&connections, max_connections) {
                     drop(stream);
                     continue;
                 }
@@ -483,10 +656,10 @@ fn main() {
     }
 }
 
-fn try_acquire_connection(connections: &AtomicUsize) -> bool {
+fn try_acquire_connection(connections: &AtomicUsize, max_connections: usize) -> bool {
     let mut current = connections.load(Ordering::Acquire);
     loop {
-        if current >= MAX_CONNECTIONS {
+        if current >= max_connections.min(MAX_CONNECTIONS) {
             return false;
         }
         match connections.compare_exchange_weak(
@@ -524,21 +697,59 @@ mod cov_main_args {
 
     use super::{
         BENCHMARK_MAX_MODEL_TURNS, BENCHMARK_MAX_TOOL_CALLS, BENCHMARK_MAX_TOOL_CALLS_PER_TURN,
-        BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, DEFAULT_PORT, ExecutionMode, Limits,
-        parse_args,
+        BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, CliLaunchOptions, DEFAULT_PORT, ExecutionMode,
+        parse_args, resolve_launch_options, valid_startup_selection,
     };
+    use nexus_core::Limits;
 
     #[test]
     fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {
         let active = std::sync::atomic::AtomicUsize::new(super::MAX_CONNECTIONS - 1);
-        assert!(super::try_acquire_connection(&active));
+        assert!(super::try_acquire_connection(
+            &active,
+            super::MAX_CONNECTIONS
+        ));
         assert_eq!(
             active.load(std::sync::atomic::Ordering::Acquire),
             super::MAX_CONNECTIONS
         );
-        assert!(!super::try_acquire_connection(&active));
+        assert!(!super::try_acquire_connection(
+            &active,
+            super::MAX_CONNECTIONS
+        ));
         active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        assert!(super::try_acquire_connection(&active));
+        assert!(super::try_acquire_connection(
+            &active,
+            super::MAX_CONNECTIONS
+        ));
+    }
+
+    #[test]
+    fn configured_connection_admission_reduces_but_never_raises_the_hard_cap() {
+        let settings = nexus_config::ServerSettings {
+            max_connections: 2,
+            ..Default::default()
+        };
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        assert!(super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        assert!(super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        assert!(!super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        active.store(super::MAX_CONNECTIONS, std::sync::atomic::Ordering::Release);
+        assert!(!super::try_acquire_connection(&active, usize::MAX));
     }
 
     /// Builds the full argv vector a process would receive. `parse_args`
@@ -552,22 +763,29 @@ mod cov_main_args {
     }
 
     /// Unwraps the `Run` variant, asserting the branch was taken.
-    fn run(args: &[&str]) -> (u16, Option<String>, bool, Option<String>) {
+    fn run(
+        args: &[&str],
+    ) -> (
+        Option<u16>,
+        Option<String>,
+        Option<nexus_config::ServerToolsMode>,
+        Option<String>,
+    ) {
         match parse_args(&argv(args)) {
             CliAction::Run {
                 port,
                 config,
-                tools_real,
+                tools,
                 tools_root,
                 ..
-            } => (port, config, tools_real, tools_root),
+            } => (port, config, tools, tools_root),
             CliAction::Usage => panic!("expected a run action for {args:?}"),
         }
     }
 
     /// The port half of a `Run` variant, for the port-only cases.
     fn port(args: &[&str]) -> u16 {
-        run(args).0
+        run(args).0.unwrap_or(DEFAULT_PORT)
     }
 
     /// The explicit `--config` value of a `Run` variant.
@@ -578,7 +796,10 @@ mod cov_main_args {
     /// The tool wiring of a `Run` variant: real reads plus optional root.
     fn tools(args: &[&str]) -> (bool, Option<String>) {
         let parsed = run(args);
-        (parsed.2, parsed.3)
+        (
+            parsed.2 == Some(nexus_config::ServerToolsMode::Real),
+            parsed.3,
+        )
     }
 
     /// Asserts the parser rejects the flags with usage.
@@ -603,11 +824,69 @@ mod cov_main_args {
     }
 
     #[test]
+    fn cli_values_override_launch_defaults_without_weakening_strict_tools() {
+        let launch = nexus_config::LaunchSettings {
+            execution: Some(nexus_config::ExecutionMode::Container),
+            strict_tools: Some(true),
+            tools_root: Some("configured-root".into()),
+            server_port: Some(9300),
+            server_tools: Some(nexus_config::ServerToolsMode::Real),
+            session_store: Some("configured-store".into()),
+            auth_token_env: Some("CONFIG_TOKEN".into()),
+        };
+        let configured = resolve_launch_options(
+            CliLaunchOptions {
+                port: None,
+                tools: None,
+                strict_tools: false,
+                tools_root: None,
+                auth_token_env: None,
+                session_store: None,
+                execution: None,
+            },
+            &launch,
+        );
+        assert_eq!(configured.port, 9300);
+        assert!(configured.tools_real);
+        assert!(configured.strict_tools);
+        assert_eq!(configured.tools_root.as_deref(), Some("configured-root"));
+        assert_eq!(configured.auth_token_env.as_deref(), Some("CONFIG_TOKEN"));
+        assert_eq!(
+            configured.session_store.as_deref(),
+            Some("configured-store")
+        );
+        assert_eq!(configured.execution, ExecutionMode::Container);
+
+        let explicit = resolve_launch_options(
+            CliLaunchOptions {
+                port: Some(9400),
+                tools: Some(nexus_config::ServerToolsMode::Fake),
+                strict_tools: false,
+                tools_root: Some("cli-root".into()),
+                auth_token_env: Some("CLI_TOKEN".into()),
+                session_store: Some("cli-store".into()),
+                execution: Some(ExecutionMode::Local),
+            },
+            &launch,
+        );
+        assert_eq!(explicit.port, 9400);
+        assert!(!explicit.tools_real);
+        assert!(
+            explicit.strict_tools,
+            "CLI/config strict mode must not be weakened"
+        );
+        assert_eq!(explicit.tools_root.as_deref(), Some("cli-root"));
+        assert_eq!(explicit.auth_token_env.as_deref(), Some("CLI_TOKEN"));
+        assert_eq!(explicit.session_store.as_deref(), Some("cli-store"));
+        assert_eq!(explicit.execution, ExecutionMode::Local);
+    }
+
+    #[test]
     fn real_tools_default_to_development_and_strict_is_explicit() {
         assert!(matches!(
             parse_args(&argv(&["--tools", "real"])),
             CliAction::Run {
-                tools_real: true,
+                tools: Some(nexus_config::ServerToolsMode::Real),
                 strict_tools: false,
                 ..
             }
@@ -615,7 +894,7 @@ mod cov_main_args {
         assert!(matches!(
             parse_args(&argv(&["--tools", "real", "--strict-tools"])),
             CliAction::Run {
-                tools_real: true,
+                tools: Some(nexus_config::ServerToolsMode::Real),
                 strict_tools: true,
                 ..
             }
@@ -637,32 +916,62 @@ mod cov_main_args {
         assert!(matches!(
             parse_args(&argv(&args)),
             CliAction::Run {
-                execution: ExecutionMode::Container,
-                tools_real: true,
+                execution: Some(ExecutionMode::Container),
+                tools: Some(nexus_config::ServerToolsMode::Real),
                 tools_root: None,
                 ..
             }
         ));
-        usage(&["--execution", "container"]);
+        assert!(matches!(
+            parse_args(&argv(&["--execution", "container"])),
+            CliAction::Run { .. }
+        ));
+        assert!(!valid_startup_selection(
+            ExecutionMode::Container,
+            false,
+            false,
+            None,
+            None,
+            None,
+            false,
+        ));
         #[cfg(feature = "container")]
         assert!(nexus_container::validate_image_reference("gateway:latest").is_err());
-        usage(&[
-            "--tools",
-            "real",
-            "--strict-tools",
-            "--execution",
-            "container",
-            "--gateway-image",
-            "gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--container-image",
-            "worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        ]);
+        assert!(!valid_startup_selection(
+            ExecutionMode::Container,
+            true,
+            true,
+            None,
+            Some("gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            false,
+        ));
     }
 
     #[test]
     fn benchmark_pilot_is_explicit_and_requires_container_tools() {
-        usage(&["--benchmark-pilot"]);
-        usage(&["--tools", "real", "--benchmark-pilot"]);
+        assert!(matches!(
+            parse_args(&argv(&["--benchmark-pilot"])),
+            CliAction::Run { .. }
+        ));
+        assert!(!valid_startup_selection(
+            ExecutionMode::Local,
+            false,
+            false,
+            None,
+            None,
+            None,
+            true,
+        ));
+        assert!(!valid_startup_selection(
+            ExecutionMode::Local,
+            true,
+            false,
+            None,
+            None,
+            None,
+            true,
+        ));
         let args = [
             "--tools",
             "real",
@@ -678,9 +987,18 @@ mod cov_main_args {
             parse_args(&argv(&args)),
             CliAction::Run {
                 benchmark_pilot: true,
-                execution: ExecutionMode::Container,
+                execution: Some(ExecutionMode::Container),
                 ..
             }
+        ));
+        assert!(valid_startup_selection(
+            ExecutionMode::Container,
+            true,
+            false,
+            None,
+            Some("gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            true,
         ));
         usage(&["--benchmark-pilot", "--benchmark-pilot"]);
     }
@@ -739,7 +1057,7 @@ mod cov_main_args {
         ));
         assert!(matches!(
             parse_args(&argv(&["--session-store", "run/private session-store", "--port", "9401"])),
-            CliAction::Run { session_store: Some(directory), port: 9401, .. }
+            CliAction::Run { session_store: Some(directory), port: Some(9401), .. }
                 if directory == "run/private session-store"
         ));
         usage(&["--session-store"]);
@@ -848,11 +1166,11 @@ mod cov_main_args {
     fn port_and_config_flags_combine_independently() {
         assert_eq!(
             run(&["--port", "9401", "--config", "/tmp/c.json"]),
-            (9401, Some("/tmp/c.json".to_owned()), false, None)
+            (Some(9401), Some("/tmp/c.json".to_owned()), None, None)
         );
         assert_eq!(
             run(&["--config", "/tmp/c.json", "--port", "9401"]),
-            (9401, Some("/tmp/c.json".to_owned()), false, None)
+            (Some(9401), Some("/tmp/c.json".to_owned()), None, None)
         );
     }
 

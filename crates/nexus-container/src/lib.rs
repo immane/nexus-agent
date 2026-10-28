@@ -21,7 +21,7 @@ pub use gateway::{
     ContainerEnvironment, ContainerError, GatewayIdentity, discover_host_ipv4_cidrs,
     validate_image_reference,
 };
-pub use workload::tool_registrations;
+pub use workload::{tool_registrations, tool_registrations_with_settings};
 
 /// Resolves a mutable local Docker reference to the immutable local image ID.
 /// This only inspects the local daemon; it never pulls or builds an image.

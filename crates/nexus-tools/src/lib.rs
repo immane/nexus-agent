@@ -41,13 +41,17 @@
 //! only decodes the already-validated argument object; schema validation
 //! stays at registration. `nexus-permissions` shares canonical directory and
 //! protected-path rules with runtime policy without a runtime/tools dependency.
+//! `nexus-config` supplies validated operational ceilings for listing and search.
 
 #![forbid(unsafe_code)]
 
 mod development;
 mod exec;
 mod fs_access;
-pub use development::{development_file_tools, development_tools, strict_tools};
+pub use development::{
+    development_file_tools, development_file_tools_with_settings, development_tools,
+    development_tools_with_settings, strict_tools, strict_tools_with_settings,
+};
 pub mod fs;
 
 pub use exec::SandboxedExecutor;

@@ -124,6 +124,7 @@ pub fn event_json(event: &RunEvent) -> Value {
             "assistant-text",
             json!({ "turn": fragment.turn.as_str(), "item": fragment.item_key, "text": fragment.text }),
         ),
+        EventPayload::AssistantReasoningDelta(_) => ("reasoning-redacted", json!({})),
         EventPayload::ContextReduced {
             method,
             removed_items,

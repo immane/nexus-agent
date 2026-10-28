@@ -47,6 +47,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use nexus_config::ToolsSettings;
+use nexus_config::settings::{ProviderSettings, ServerSettings};
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
     ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelInstructions,
@@ -78,9 +80,6 @@ use crate::json;
 
 /// Idle SSE window: a `: ping` comment keeps the stream alive.
 const SSE_IDLE: Duration = Duration::from_secs(15);
-/// Session-owned history/grants are retained for this idle window before
-/// admission pressure may reclaim a provably inactive session.
-const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
 /// Cross-run events retained while one SSE subscriber is filtering the shared
 /// session channels. One extra overflow event is retained as a reserve before
 /// the stream is closed, so pressure never silently discards a received event.
@@ -399,6 +398,9 @@ pub struct Server {
     config_path: Option<PathBuf>,
     /// Finite runtime limits applied to sessions created after startup.
     limits: Limits,
+    provider_settings: ProviderSettings,
+    server_settings: ServerSettings,
+    tools_settings: ToolsSettings,
     session_store: Option<SessionStoreHandle>,
     /// Accepted run id to the model id it was submitted with. Entries are
     /// consumed by the completion watcher, a terminal SSE event, a subsequent
@@ -472,6 +474,9 @@ impl Server {
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             limits: Limits::m0_test(),
+            provider_settings: ProviderSettings::default(),
+            server_settings: ServerSettings::default(),
+            tools_settings: ToolsSettings::default(),
             session_store: None,
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
@@ -510,6 +515,65 @@ impl Server {
     pub fn set_limits(&mut self, limits: Limits) -> Result<(), nexus_core::AgentError> {
         limits.validate()?;
         self.limits = limits;
+        Ok(())
+    }
+
+    /// Installs timeout and retry bounds for subsequently created providers.
+    /// Existing session adapters retain their settings.
+    pub fn set_provider_settings(
+        &mut self,
+        settings: &ProviderSettings,
+    ) -> Result<(), nexus_core::AgentError> {
+        nexus_openai::OpenAiProvider::validate_operational_settings(settings)?;
+        self.provider_settings = settings.clone();
+        Ok(())
+    }
+
+    /// Installs admission and idle settings before any sessions are admitted.
+    /// Invalid values or existing/pending sessions leave settings unchanged.
+    pub fn set_server_settings(
+        &mut self,
+        settings: &ServerSettings,
+    ) -> Result<(), nexus_core::AgentError> {
+        let invalid = || {
+            nexus_core::AgentError::new(
+                nexus_core::ErrorCategory::InvalidInput,
+                "server settings are invalid or sessions already exist",
+                nexus_core::RetryGuidance::DoNotRetry,
+            )
+            .expect("static safe settings message builds")
+        };
+        settings.validate().map_err(|_| invalid())?;
+        if !self.sessions.lock().expect("sessions lockable").is_empty()
+            || self.pending_sessions.load(Ordering::Acquire) != 0
+        {
+            return Err(invalid());
+        }
+        self.server_settings = settings.clone();
+        Ok(())
+    }
+
+    /// Installs tool bounds before any sessions are admitted.
+    /// Invalid values or existing/pending sessions leave settings unchanged.
+    pub fn set_tools_settings(
+        &mut self,
+        settings: &ToolsSettings,
+    ) -> Result<(), nexus_core::AgentError> {
+        let invalid = || {
+            nexus_core::AgentError::new(
+                nexus_core::ErrorCategory::InvalidInput,
+                "tool settings are invalid or sessions already exist",
+                nexus_core::RetryGuidance::DoNotRetry,
+            )
+            .expect("static safe settings message builds")
+        };
+        settings.validate().map_err(|_| invalid())?;
+        if !self.sessions.lock().expect("sessions lockable").is_empty()
+            || self.pending_sessions.load(Ordering::Acquire) != 0
+        {
+            return Err(invalid());
+        }
+        self.tools_settings = settings.clone();
         Ok(())
     }
 
@@ -553,7 +617,9 @@ impl Server {
         self.cleanup_idle_sessions();
         let admission = {
             let sessions = self.sessions.lock().expect("sessions lockable");
-            if sessions.len() + self.pending_sessions.load(Ordering::Acquire) >= MAX_SESSIONS {
+            if sessions.len() + self.pending_sessions.load(Ordering::Acquire)
+                >= self.server_settings.max_sessions.min(MAX_SESSIONS)
+            {
                 return Err(SessionError::new(503, "session capacity is full"));
             }
             self.pending_sessions.fetch_add(1, Ordering::AcqRel);
@@ -593,23 +659,31 @@ impl Server {
                 ToolRegistration::read(Arc::new(FakeTool::read_only())),
                 ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
             ],
-            ToolsMode::Development { root } => nexus_tools::development_tools(root)
-                .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?,
-            ToolsMode::RealFiles { root } => nexus_tools::strict_tools(root)
-                .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?,
+            ToolsMode::Development { root } => {
+                nexus_tools::development_tools_with_settings(root, &self.tools_settings)
+                    .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?
+            }
+            ToolsMode::RealFiles { root } => {
+                nexus_tools::strict_tools_with_settings(root, &self.tools_settings)
+                    .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?
+            }
             #[cfg(feature = "container")]
             ToolsMode::Container {
                 root,
                 gateway_image,
                 workload_image,
-            } => nexus_container::tool_registrations(root, gateway_image, workload_image).map_err(
-                |error| {
-                    // ContainerError contains fixed host-side diagnostics only,
-                    // never Docker output, environment values, or credentials.
-                    eprintln!("container environment preparation failed: {error}");
-                    SessionError::new(503, "container environment is unavailable")
-                },
-            )?,
+            } => nexus_container::tool_registrations_with_settings(
+                root,
+                gateway_image,
+                workload_image,
+                &self.tools_settings,
+            )
+            .map_err(|error| {
+                // ContainerError contains fixed host-side diagnostics only,
+                // never Docker output, environment values, or credentials.
+                eprintln!("container environment preparation failed: {error}");
+                SessionError::new(503, "container environment is unavailable")
+            })?,
         };
         let (runtime, streams): (Runtime, EventStreams) = match &self.session_store {
             Some(store) => Runtime::try_new_with_session_store_handle(
@@ -682,9 +756,10 @@ impl Server {
         resolve_credential(&profile.credential)
             .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
+            .and_then(|adapter| adapter.with_operational_settings(&self.provider_settings))
             .map(|adapter| {
                 let adapter = adapter.with_context_management(context_management);
-                if adapter.is_ollama_endpoint() {
+                if adapter.supports_context_discovery() {
                     adapter.discover_context_management()
                 } else {
                     adapter
@@ -708,7 +783,11 @@ impl Server {
     /// Performs bounded idle-session maintenance. The binary calls this from
     /// one housekeeping thread; embedders may call it on their own schedule.
     pub fn cleanup_idle_sessions(&self) {
-        let now = Instant::now();
+        self.cleanup_idle_sessions_at(Instant::now());
+    }
+
+    fn cleanup_idle_sessions_at(&self, now: Instant) {
+        let idle = Duration::from_secs(self.server_settings.session_idle_seconds);
         let candidates = {
             let sessions = self.sessions.lock().expect("sessions lockable");
             sessions
@@ -718,7 +797,7 @@ impl Server {
                         && !*session.streaming.lock().expect("stream flag lockable")
                         && now.saturating_duration_since(
                             *session.last_activity.lock().expect("activity lockable"),
-                        ) >= SESSION_IDLE
+                        ) >= idle
                 })
                 .map(|(token, session)| (token.clone(), Arc::clone(session)))
                 .collect::<Vec<_>>()
@@ -761,7 +840,7 @@ impl Server {
                         && !*current.streaming.lock().expect("stream flag lockable")
                         && now.saturating_duration_since(
                             *current.last_activity.lock().expect("activity lockable"),
-                        ) >= SESSION_IDLE
+                        ) >= idle
                 });
                 unchanged.then(|| sessions.remove(&token)).flatten()
             };
@@ -1693,6 +1772,194 @@ mod tests {
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
 
     #[test]
+    fn tools_settings_are_atomic_and_rejected_with_sessions_or_reservations() {
+        let (mut server, _runtime) = server_with_gated_config();
+        assert_eq!(server.tools_settings, ToolsSettings::default());
+        let settings = ToolsSettings {
+            list_entry_limit: 1,
+            search_file_bytes: 4,
+        };
+        server.set_tools_settings(&settings).unwrap();
+        for invalid in [
+            ToolsSettings {
+                list_entry_limit: 0,
+                ..settings.clone()
+            },
+            ToolsSettings {
+                list_entry_limit: 10_001,
+                ..settings.clone()
+            },
+            ToolsSettings {
+                search_file_bytes: 0,
+                ..settings.clone()
+            },
+            ToolsSettings {
+                search_file_bytes: 1_048_577,
+                ..settings.clone()
+            },
+        ] {
+            assert!(server.set_tools_settings(&invalid).is_err());
+            assert_eq!(server.tools_settings, settings);
+        }
+        server.pending_sessions.store(1, Ordering::Release);
+        assert!(
+            server
+                .set_tools_settings(&ToolsSettings::default())
+                .is_err()
+        );
+        assert_eq!(server.tools_settings, settings);
+        server.pending_sessions.store(0, Ordering::Release);
+        server.create_session().unwrap();
+        assert!(
+            server
+                .set_tools_settings(&ToolsSettings::default())
+                .is_err()
+        );
+        assert_eq!(server.tools_settings, settings);
+    }
+
+    #[test]
+    fn server_settings_are_atomic_and_rejected_with_sessions_or_reservations() {
+        let (mut server, _runtime) = server_with_gated_config();
+        assert_eq!(server.server_settings, ServerSettings::default());
+        let settings = ServerSettings {
+            max_connections: 2,
+            max_sessions: 2,
+            session_idle_seconds: 10,
+            session_cleanup_interval_seconds: 3,
+        };
+        server.set_server_settings(&settings).unwrap();
+        for invalid in [
+            ServerSettings {
+                max_connections: 65,
+                ..settings.clone()
+            },
+            ServerSettings {
+                max_sessions: 129,
+                ..settings.clone()
+            },
+            ServerSettings {
+                session_idle_seconds: 0,
+                ..settings.clone()
+            },
+            ServerSettings {
+                session_cleanup_interval_seconds: 86_401,
+                ..settings.clone()
+            },
+        ] {
+            assert!(server.set_server_settings(&invalid).is_err());
+            assert_eq!(server.server_settings, settings);
+        }
+        server.pending_sessions.store(1, Ordering::Release);
+        assert!(
+            server
+                .set_server_settings(&ServerSettings::default())
+                .is_err()
+        );
+        assert_eq!(server.server_settings, settings);
+        server.pending_sessions.store(0, Ordering::Release);
+        server.create_session().unwrap();
+        assert!(
+            server
+                .set_server_settings(&ServerSettings::default())
+                .is_err()
+        );
+        assert_eq!(server.server_settings, settings);
+    }
+
+    #[test]
+    fn reduced_session_admission_counts_pending_reservations_and_releases_failures() {
+        let (mut server, _runtime) = server_with_gated_config();
+        server
+            .set_server_settings(&ServerSettings {
+                max_sessions: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        server.create_session().unwrap();
+        assert_eq!(
+            server
+                .create_session_with(None, Some("invalid"))
+                .unwrap_err()
+                .status(),
+            400
+        );
+        assert_eq!(server.pending_sessions.load(Ordering::Acquire), 0);
+        server.pending_sessions.store(1, Ordering::Release);
+        assert_eq!(
+            server.create_session_with(None, None).unwrap_err().status(),
+            503
+        );
+        assert_eq!(server.sessions.lock().unwrap().len(), 1);
+        server.pending_sessions.store(0, Ordering::Release);
+        server.create_session().unwrap();
+        assert_eq!(
+            server.create_session_with(None, None).unwrap_err().status(),
+            503
+        );
+        assert_eq!(server.sessions.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn configured_idle_expiry_preserves_streams_and_external_owners() {
+        let (mut server, _runtime) = server_with_gated_config();
+        server
+            .set_server_settings(&ServerSettings {
+                session_idle_seconds: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let token = server.create_session().unwrap();
+        let session = server.session(&token).unwrap();
+        let activity = *session.last_activity.lock().unwrap();
+        drop(session);
+        server.cleanup_idle_sessions_at(activity + Duration::from_secs(9));
+        assert!(server.sessions.lock().unwrap().contains_key(&token));
+        let session = Arc::clone(server.sessions.lock().unwrap().get(&token).unwrap());
+        server.cleanup_idle_sessions_at(activity + Duration::from_secs(10));
+        assert!(server.sessions.lock().unwrap().contains_key(&token));
+        *session.streaming.lock().unwrap() = true;
+        drop(session);
+        server.cleanup_idle_sessions_at(activity + Duration::from_secs(10));
+        assert!(server.sessions.lock().unwrap().contains_key(&token));
+        *server
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&token)
+            .unwrap()
+            .streaming
+            .lock()
+            .unwrap() = false;
+        server.cleanup_idle_sessions_at(activity + Duration::from_secs(10));
+        assert!(!server.sessions.lock().unwrap().contains_key(&token));
+    }
+
+    #[test]
+    fn provider_settings_are_installed_atomically_and_defaults_are_preserved() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut server = Server::new(executor.handle().clone());
+        assert_eq!(server.provider_settings, ProviderSettings::default());
+        let settings = ProviderSettings {
+            connect_timeout_seconds: 4,
+            context_discovery_timeout_seconds: 3,
+            fallback_call_timeout_seconds: 90,
+            retry_backoff_seconds: vec![2, 4],
+        };
+        server.set_provider_settings(&settings).unwrap();
+        assert_eq!(server.provider_settings, settings);
+        let invalid = ProviderSettings {
+            retry_backoff_seconds: Vec::new(),
+            ..settings.clone()
+        };
+        assert!(server.set_provider_settings(&invalid).is_err());
+        assert_eq!(server.provider_settings, settings);
+    }
+
+    #[test]
     fn shared_session_store_retains_original_sources_from_every_server_runtime() {
         use nexus_core::{
             EventPayload, ModelContextItem, PersistenceState, RunOutcome, SessionStore,
@@ -2528,7 +2795,8 @@ mod tests {
         let (server, _runtime) = server_with_gated_config();
         let token = server.create_session().expect("demo session creates");
         let entry = server.session(&token).expect("session is registered");
-        let old = Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+        let old =
+            Instant::now() - Duration::from_secs(server.server_settings.session_idle_seconds + 1);
         *entry.last_activity.lock().expect("activity lockable") = old;
 
         server.cleanup_idle_sessions();
@@ -2573,7 +2841,13 @@ mod tests {
 
     #[test]
     fn idle_cleanup_retains_a_runtime_with_active_work() {
-        let (server, _runtime) = server_with_gated_config();
+        let (mut server, _runtime) = server_with_gated_config();
+        server
+            .set_server_settings(&ServerSettings {
+                session_idle_seconds: 10,
+                ..Default::default()
+            })
+            .unwrap();
         let token = server.create_session().expect("demo session creates");
         let session = server.session(&token).expect("session is registered");
         let command = SubmitCommand::new(
@@ -2590,7 +2864,7 @@ mod tests {
         drop(runtime);
         *session.last_run.lock().expect("last run lockable") = Some(run.clone());
         *session.last_activity.lock().expect("activity lockable") =
-            Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+            Instant::now() - Duration::from_secs(server.server_settings.session_idle_seconds + 1);
         drop(session);
 
         server.cleanup_idle_sessions();

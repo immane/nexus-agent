@@ -39,6 +39,13 @@ Adapters assemble bounded protocol fragments, preserve item and call identity, a
 
 Only complete, valid model turns become accepted conversation records. Visible partial text can remain in the frontend as incomplete output without being labeled a completed answer.
 
+The runtime's incremental provider bridge applies backpressure at its bounded
+event queue (64 events) and buffered-byte budget (1 MiB). A full buffer pauses
+the synchronous provider worker rather than cancelling a valid response.
+Cancellation and run deadlines close both waits before worker cleanup; a single
+event exceeding the byte capacity still fails explicitly. These buffering limits
+are separate from the total per-response output and event budgets.
+
 Tool schemas remain host-validated. Provider-specific schema conversion must not silently weaken runtime validation or advertise a tool the adapter cannot represent correctly.
 
 ## Continuation Fidelity
@@ -54,6 +61,21 @@ do not emit or consume opaque provider continuation state. Requests carrying
 opaque continuation data fail explicitly; protocol switching is distinguished
 by stable adapter identity. Reasoning traces that these protocols cannot
 faithfully replay are also rejected rather than silently dropped.
+
+An authorized OpenCode Go Muse Spark 1.3 Contributor probe observed a Responses
+reasoning item with `encrypted_content` and an empty summary before a message
+and function call. Replaying the exact output with a function result was
+accepted over HTTP, but its subsequent generation reached the output limit;
+this does not establish a complete successful continuation. The encrypted item
+is not a displayable reasoning trace. The runtime currently retains opaque
+continuation only within an active run, not across subsequent runs, and the
+normalized transcript does not preserve arbitrary Responses output items and
+their exact ordering. Consequently the Responses adapter still rejects these
+items, including before exposing a tool candidate. Supporting them requires a
+bounded, profile-scoped, ordered and persistable replay representation with
+explicit history reduction and provider-switch behavior; accepting or dropping
+the item in the adapter alone would not be faithful. This observation is scoped
+to that single probe, not a compatibility claim for other models or endpoints.
 
 ## Testing and Coverage Claims
 

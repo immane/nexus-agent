@@ -16,7 +16,7 @@
 //! | Composer | `Tab` | Cycle the agent mode (`plan`/`build`/customs) |
 //! | Composer | `Ctrl+T` | Cycle the model variant |
 //! | Viewport | `Ctrl+T` | Cycle the model variant |
-//! | Composer | `Esc` | Park focus in the viewport (never cancel) |
+//! | Composer | `Esc` | Return to normal mode in the viewport (never cancel) |
 //! | Composer | printable char | Type into the draft |
 //! | Composer | `Backspace` | Delete last draft char |
 //! | Composer | `Up`/`Down` | Previous/next submitted input (shown in the composer) |
@@ -24,21 +24,22 @@
 //! | Composer | `Left`/`Right` | Move the draft caret (focus stays) |
 //! | Viewport | `Up`/`k`, `Down`/`j` | Move selection (scrolls) |
 //! | Viewport | `PageUp`/`PageDown` | Scroll one page |
-//! | Viewport | `Esc` | Back to the composer (never cancels) |
+//! | Viewport | `Esc` | Stay in normal mode (never enters the composer) |
 //! | Viewport | `m` | Cycle the active model (admission order) |
 //! | Viewport | `i` | Edit in the composer (vim insert) |
 //! | Viewport | `o` | Edit in the composer on a fresh line (vim open-line) |
 //! | Viewport | `:` | Open the editable desktop command line |
-//! | Viewport | `Tab` | Switch focus |
+//! | Viewport | `Tab` | Focus a pending approval, otherwise stay in normal mode |
 //! | Approval | `a` | Allow once (exact live call only) |
 //! | Approval | `d` | Deny without executing |
 //! | Approval | `i` | Open/close the expanded detail (inspection only) |
 //! | Approval | `Up`/`k`, `Down`/`j` | Scroll the expanded detail |
 //! | Approval | `PageUp`/`PageDown` | Page the expanded detail |
 //! | Approval | `Tab` | Switch focus |
-//! | Approval | `Esc` | Close the expanded detail, else back to the composer |
+//! | Approval | `Esc` | Close the expanded detail, else return to normal mode |
 //! | Any | `Ctrl+C` | Clear the composer first; then cancel while cancellable (caller checks
 //! [`crate::AppState::can_cancel`]), else quit |
+//! | Any | `Ctrl+R` | Show/hide all provider reasoning (saved preference) |
 //!
 //! Approval/deny intents are only produced while [`Focus::ApprovalCard`]
 //! owns the keyboard; the DO-NOT-COPY list (always-approve toggles,
@@ -82,7 +83,7 @@ pub enum Action {
     /// Bound in the composer only, where the mode gates the next submit;
     /// the viewport and approval card keep `Tab` for focus switching.
     CycleMode,
-    /// Park focus in the viewport (never answers or cancels).
+    /// Return to normal-mode viewport focus (never enters edit mode, answers, or cancels).
     ParkFocus,
     /// Move the viewport selection up.
     ScrollUp,
@@ -111,6 +112,8 @@ pub enum Action {
     /// viewport (plain `t` still types); never in the approval card, whose
     /// keys decide.
     CycleVariant,
+    /// Show or hide all provider-returned reasoning entries.
+    ToggleReasoning,
     /// Allow the exact live approval once.
     ApproveOnce,
     /// Refuse the live approval without executing.
@@ -150,6 +153,7 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Cancel),
+            KeyCode::Char('r') => Some(Action::ToggleReasoning),
             KeyCode::Char('j') if focus == Focus::Composer => Some(Action::Newline),
             KeyCode::Char('t') if focus == Focus::Composer || focus == Focus::Viewport => {
                 Some(Action::CycleVariant)
@@ -198,20 +202,14 @@ pub fn map_key(focus: Focus, key: KeyEvent) -> Option<Action> {
     }
 }
 
-/// Cycles focus: composer, viewport, then the approval card only while a
-/// decision is actually pending.
+/// Moves focus toward normal mode; only a pending approval can take focus
+/// from the viewport. Keyboard focus navigation never enters the composer.
 #[must_use]
 pub fn next_focus(current: Focus, approval_pending: bool) -> Focus {
     match current {
         Focus::Composer => Focus::Viewport,
-        Focus::Viewport => {
-            if approval_pending {
-                Focus::ApprovalCard
-            } else {
-                Focus::Composer
-            }
-        }
-        Focus::ApprovalCard => Focus::Composer,
+        Focus::Viewport if approval_pending => Focus::ApprovalCard,
+        Focus::Viewport | Focus::ApprovalCard => Focus::Viewport,
     }
 }
 
@@ -344,6 +342,14 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_r_toggles_reasoning_in_every_focus() {
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        for focus in [Focus::Composer, Focus::Viewport, Focus::ApprovalCard] {
+            assert_eq!(map_key(focus, key), Some(Action::ToggleReasoning));
+        }
+    }
+
+    #[test]
     #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
     fn composer_typing_rejects_control_and_bidi_chars() {
         for char in [
@@ -398,10 +404,10 @@ mod tests {
 
     #[test]
     #[ignore = "covered by the cov_keys census contract (PUBLISHED_ROWS, focus partition, and the cov_keys_edges oracle)"]
-    fn focus_cycles_through_a_live_approval_card() {
+    fn focus_navigation_does_not_enter_the_composer() {
         assert_eq!(next_focus(Focus::Composer, false), Focus::Viewport);
-        assert_eq!(next_focus(Focus::Viewport, false), Focus::Composer);
+        assert_eq!(next_focus(Focus::Viewport, false), Focus::Viewport);
         assert_eq!(next_focus(Focus::Viewport, true), Focus::ApprovalCard);
-        assert_eq!(next_focus(Focus::ApprovalCard, true), Focus::Composer);
+        assert_eq!(next_focus(Focus::ApprovalCard, true), Focus::Viewport);
     }
 }

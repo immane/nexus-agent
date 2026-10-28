@@ -28,7 +28,7 @@
 //!   10, 30, then 60-second intervals (remaining at 60 seconds), until success,
 //!   cancellation, or the run deadline. Legacy contexts without a deadline
 //!   receive a ten-minute call bound. Numeric `Retry-After` is a minimum delay;
-//!   HTTP-date values are ignored. HTTP 300–599 responses retry except 400/422
+//!   HTTP-date values are ignored. HTTP 300–599 responses retry except 400/413/422/431
 //!   request validation failures; redirects are not followed. Locally invalid
 //!   requests, unavailable/unsafe credentials, TLS verification failures, and
 //!   resource/internal constraints remain terminal. Connection, write, read,
