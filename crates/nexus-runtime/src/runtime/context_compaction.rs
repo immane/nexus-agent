@@ -3349,7 +3349,18 @@ mod tests {
                 .contains("private unaccepted")
         );
         let mut failed_usage_recorded = false;
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        let mut final_usage = HashMap::new();
         while let Ok(event) = streams.control.try_recv() {
+            match event.payload() {
+                EventPayload::ModelRequestStarted { turn, .. } => started.push(turn.clone()),
+                EventPayload::ModelRequestFinished { turn, .. } => finished.push(turn.clone()),
+                EventPayload::UsageUpdated(usage) if usage.finality() == UsageFinality::Final => {
+                    final_usage.insert(started.last().unwrap().clone(), *usage);
+                }
+                _ => {}
+            }
             if let EventPayload::UsageUpdated(usage) = event.payload() {
                 failed_usage_recorded |=
                     usage.input_tokens() == Some(12) && usage.output_tokens() == Some(4);
@@ -3359,14 +3370,32 @@ mod tests {
             failed_usage_recorded,
             "failed summary usage remains accounted"
         );
+        assert_eq!(started.len(), 4);
+        assert_eq!(
+            started, finished,
+            "each attempt has paired lifecycle events"
+        );
+        assert_eq!(started.iter().collect::<HashSet<_>>().len(), 4);
+        assert_eq!(
+            final_usage.len(),
+            3,
+            "failed and successful usage remain separate"
+        );
+        assert_eq!(final_usage[&started[1]].input_tokens(), Some(12));
         assert!(
             streams.data.try_recv().is_err(),
             "partial summaries never become answer text"
         );
         let requests = provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[1], requests[2]);
+        assert_eq!(
+            requests[0].clone().with_turn(requests[1].turn().clone()),
+            requests[1]
+        );
+        assert_eq!(
+            requests[1].clone().with_turn(requests[2].turn().clone()),
+            requests[2]
+        );
         assert_ne!(
             requests[2], requests[3],
             "the final call derives the next chunk, not a failed-attempt replay"

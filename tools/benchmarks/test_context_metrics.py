@@ -432,6 +432,25 @@ class MetricsTests(unittest.TestCase):
         self.assertTrue(metrics["normal_completion"])
         self.assertTrue(metrics["evaluation"]["resolved"])
 
+    def test_summary_access_retry_preserves_each_invocation_usage(self):
+        events = [
+            event(0, "run-started", {}),
+            event(1, "model-request-started", {"turn": "t1", "purpose": "summary"}),
+            event(2, "model-request-finished", {"turn": "t1", "response_validated": True}),
+            event(3, "usage", {"finality": "Final", "input": 100, "output": 20}),
+            event(4, "model-request-started", {"turn": "t2", "purpose": "summary"}),
+            event(5, "model-request-finished", {"turn": "t2", "response_validated": True}),
+            event(6, "usage", {"finality": "Final", "input": 200, "output": 30}),
+            event(7, "run-finished", {"outcome": "completed"}),
+        ]
+        metrics = derive_metrics(events, self.manifest, self.result)
+        self.assertEqual(metrics["completeness"]["provider_invocations_observed"], 2)
+        self.assertEqual(metrics["compaction"]["summary_requests_started"], 2)
+        self.assertEqual(metrics["compaction"]["summary_responses_validated"], 2)
+        self.assertEqual(metrics["tokens"]["input_total"], 300)
+        self.assertEqual(metrics["tokens"]["output_total"], 50)
+        self.assertTrue(metrics["completeness"]["input_usage_complete"])
+
     def test_missing_usage_and_sequence_gaps_remain_explicit(self):
         events = [
             event(1, "model-request-started", {"turn": "t1", "purpose": "task", "estimated_input_tokens": 123}),

@@ -178,8 +178,10 @@ Surface safe authentication, rate-limit, transport, protocol, and capability err
 
 Remote access failures use increasing backoff until success, explicit user
 cancellation, or the absolute run deadline, rather than a fixed attempt count.
-Failed access attempts do not spend successful model turns. Retries retain the
-prepared request when no provisional event has been delivered; a recoverable
+Failed access attempts do not spend successful model turns. Each runtime retry
+has a fresh turn identity and paired request-started/request-finished events,
+so usage remains attributable to its invocation. Retries retain the
+prepared request payload when no provisional event has been delivered; a recoverable
 partial task response instead requires a fresh invocation with a bounded host
 recovery note.
 No failed response authorizes tool dispatch. Local invalid requests, unsafe
@@ -188,6 +190,9 @@ integrity failures, and hard resource bounds remain terminal. Explicit user
 cancellation takes precedence until finalization and stops new model requests,
 retry waits, and tool dispatch; it does not establish worker termination or
 rollback.
+
+HTTP 400/413/422/431 request-validation and request-size failures are terminal:
+waiting and replaying an unchanged request cannot repair them.
 
 After partial output, a retry MUST not silently concatenate a new attempt onto the previous turn, reuse ambiguous tool candidates, or replay already executed calls. Make the abandoned attempt and replacement turn explicit.
 

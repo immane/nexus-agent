@@ -553,6 +553,13 @@ impl ModelRequest {
         &self.turn
     }
 
+    /// Gives a prepared request a fresh invocation identity without changing its payload.
+    #[must_use]
+    pub fn with_turn(mut self, turn: TurnId) -> Self {
+        self.turn = turn;
+        self
+    }
+
     /// Returns the selected model profile name.
     #[must_use]
     pub fn profile(&self) -> &str {

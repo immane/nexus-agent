@@ -1419,7 +1419,7 @@ impl Runtime {
     }
 
     async fn on_calling_model(&self, run: &RunId) -> Result<RunState, Terminal> {
-        let (request, context, turn, deadline) = {
+        let (mut request, context, mut turn, deadline, mut started_payload) = {
             let mut state = self.shared.state.lock().await;
             let Some(active) = state.active.as_mut() else {
                 return Err(Terminal::cancelled());
@@ -1520,24 +1520,22 @@ impl Runtime {
             let raw_estimated_input_tokens = Some(estimator.raw_estimate(&request));
             let estimated_input_tokens = Some(estimator.estimate(&request));
             let estimate_scale_millis = estimator.scale_millis();
-            let outcome = emit_control(
-                &self.shared,
-                active,
-                run,
-                EventPayload::ModelRequestStarted {
-                    turn: turn.clone(),
-                    purpose,
-                    estimated_input_tokens,
-                    raw_estimated_input_tokens,
-                    estimate_scale_millis,
-                    context_window_tokens: window,
-                    context_trigger_percent: active.context_management.policy.trigger_percent(),
-                    context_target_percent: active.context_management.policy.target_percent(),
-                    compaction_strategy: active.context_management.policy.strategy(),
-                    max_output_tokens,
-                    projected_tool_outputs,
-                },
-            );
+            active.last_usage = None;
+            active.published_usage = None;
+            let started_payload = EventPayload::ModelRequestStarted {
+                turn: turn.clone(),
+                purpose,
+                estimated_input_tokens,
+                raw_estimated_input_tokens,
+                estimate_scale_millis,
+                context_window_tokens: window,
+                context_trigger_percent: active.context_management.policy.trigger_percent(),
+                context_target_percent: active.context_management.policy.target_percent(),
+                compaction_strategy: active.context_management.policy.strategy(),
+                max_output_tokens,
+                projected_tool_outputs,
+            };
+            let outcome = emit_control(&self.shared, active, run, started_payload.clone());
             apply_control_outcome(active, outcome);
             if let Some(outcome) = active.terminal {
                 return Err(Terminal {
@@ -1547,7 +1545,7 @@ impl Runtime {
             }
             let context = ProviderContext::new(active.started.elapsed(), active.cancelled, None)
                 .with_control(active.token.clone(), active.deadline);
-            (request, context, turn, active.deadline)
+            (request, context, turn, active.deadline, started_payload)
         };
         let (wake, token) = {
             let state = self.shared.state.lock().await;
@@ -1575,7 +1573,7 @@ impl Runtime {
             let stream_bytes = Arc::new(AtomicUsize::new(0));
             let producer_bytes = stream_bytes.clone();
             let worker_context = context.clone();
-            let request = request.clone();
+            let worker_request = request.clone();
             let mut handle = tokio::task::spawn_blocking(move || {
                 if incremental {
                     let sink = |event: ProviderEvent| {
@@ -1601,9 +1599,9 @@ impl Runtime {
                             producer_token.cancel();
                         }
                     };
-                    provider.stream_with_sink(&request, &worker_context, &sink)
+                    provider.stream_with_sink(&worker_request, &worker_context, &sink)
                 } else {
-                    provider.stream(&request, &worker_context)
+                    provider.stream(&worker_request, &worker_context)
                 }
             });
             let mut prefix = StreamedPrefix::default();
@@ -1734,6 +1732,39 @@ impl Runtime {
                         };
                         if summary || (events.len() == 1 && prefix.event_count == 0) {
                             self.wait_provider_recovery(run, error.category()).await?;
+                            let mut state = self.shared.state.lock().await;
+                            let active = state
+                                .active
+                                .as_mut()
+                                .filter(|active| &active.run == run)
+                                .ok_or_else(Terminal::cancelled)?;
+                            if active.cancelled || token.is_cancelled() {
+                                return Err(Terminal::cancelled());
+                            }
+                            if StdInstant::now() >= deadline {
+                                return Err(Terminal::limit(
+                                    "run duration exhausted while recovering provider access",
+                                ));
+                            }
+                            let turn_n = active.turn_seq;
+                            active.turn_seq += 1;
+                            turn = TurnId::new(format!(
+                                "t{:x}-{}-{turn_n}",
+                                self.shared.incarnation, active.run_n
+                            ))
+                            .map_err(|_| Terminal::failed_internal("turn identity is invalid"))?;
+                            request = request.with_turn(turn.clone());
+                            // Usage belongs to an invocation, not its replacement.
+                            active.last_usage = None;
+                            active.published_usage = None;
+                            if let EventPayload::ModelRequestStarted { turn: identity, .. } =
+                                &mut started_payload
+                            {
+                                *identity = turn.clone();
+                            }
+                            let outcome =
+                                emit_control(&self.shared, active, run, started_payload.clone());
+                            apply_control_outcome(active, outcome);
                             continue;
                         }
                     }
@@ -9430,8 +9461,16 @@ mod cov_runtime_topup_private {
         });
         let requests = bed.provider.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[1], requests[2]);
+        assert_ne!(requests[0].turn(), requests[1].turn());
+        assert_ne!(requests[1].turn(), requests[2].turn());
+        assert_eq!(
+            requests[0].clone().with_turn(requests[1].turn().clone()),
+            requests[1]
+        );
+        assert_eq!(
+            requests[1].clone().with_turn(requests[2].turn().clone()),
+            requests[2]
+        );
     }
 
     #[test]

@@ -1260,7 +1260,9 @@ fn missing_usage_stays_unknown_never_zero() {
 fn http_failures_map_to_typed_categories() {
     for (status, category) in [
         (400, ErrorCategory::InvalidInput),
+        (413, ErrorCategory::InvalidInput),
         (422, ErrorCategory::InvalidInput),
+        (431, ErrorCategory::InvalidInput),
     ] {
         let (base, _) = serve(status, r#"{"error":"nope"}"#, Duration::ZERO);
         let error = failed(provider(&base).stream(&base_request(), &live_context()));

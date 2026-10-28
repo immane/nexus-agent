@@ -83,7 +83,7 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
         match status {
             401 | 403 => ErrorCategory::Authentication,
             402 => ErrorCategory::PermissionDenied,
-            400 | 422 => ErrorCategory::InvalidInput,
+            400 | 413 | 422 | 431 => ErrorCategory::InvalidInput,
             429 => ErrorCategory::RateLimited,
             _ => ErrorCategory::Protocol,
         },
@@ -91,6 +91,8 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
             401 | 403 => "provider credentials were rejected",
             402 => "provider payment is required",
             400 | 422 => "provider request was rejected",
+            413 => "provider request body is too large",
+            431 => "provider request headers are too large",
             429 => "provider rate limit reached",
             _ => "provider request failed",
         },
@@ -99,9 +101,9 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
 
 fn status_retry_guidance(status: u16) -> RetryGuidance {
     // Remote access refusals (including auth, billing, routing and redirects)
-    // can recover without changing the local request. Body validation errors
-    // remain terminal; redirects are never followed with credentials.
-    if (300..=599).contains(&status) && !matches!(status, 400 | 422) {
+    // can recover without changing the local request. Request validation and
+    // size errors remain terminal; redirects are never followed with credentials.
+    if (300..=599).contains(&status) && !matches!(status, 400 | 413 | 422 | 431) {
         RetryGuidance::RetryAfterBackoff
     } else {
         RetryGuidance::DoNotRetry
@@ -3302,7 +3304,7 @@ mod retry_policy_tests {
                 "status {status}"
             );
         }
-        for status in [200, 400, 422, 600] {
+        for status in [200, 400, 413, 422, 431, 600] {
             assert_eq!(
                 status_retry_guidance(status),
                 RetryGuidance::DoNotRetry,
