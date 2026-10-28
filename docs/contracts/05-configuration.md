@@ -1,6 +1,6 @@
 # Configuration Contract
 
-Status: Draft contract, revision `draft-1`. Product defaults are accepted in [Decision 01](../design/decisions/01-first-release-defaults.md). No configuration parser, schema, environment-variable naming convention, or file format has been selected.
+Status: Implemented subset, revision `1` for operational settings. Provider/model configuration remains a separate revisioned document.
 
 ## Effective Configuration
 
@@ -28,7 +28,36 @@ These are product defaults, not names of implemented enum variants, config keys,
 
 ## Resolution and Validation
 
-The proposed precedence is built-in bounded defaults, selected configuration file, documented environment overrides, then explicit command-line options. Resolve this locally and deterministically, and distinguish absent values from invalid values.
+Operational settings resolve as profile built-ins, optional `/etc/nexus-agent/base.jsonc` (or `NEXUS_BASE_CONFIG`), then ordered repeatable `--config-overlay` files. `--base-config` replaces the base path. Shared profiles are only `tui` and `server`. A file such as `benchmark.jsonc` is an ordinary settings file with the same schema and can be passed through the existing base/overlay options; there is no benchmark-specific path, option, or environment variable. These settings are separate from the provider/model document and are never written back by the TUI. UserConfig remains strict JSON; its migration/save behavior is unchanged.
+
+Revision-1 operational JSONC is a JSON object with `"revision": 1` and optional `defaults`, `profiles`, and `tui` objects. `defaults` and each `profiles.tui` / `profiles.server` object may contain `runtime`, `provider`, and `tui` objects. Each layer is partial and omitted fields inherit preceding values, including nested frontend/theme fields. The same shape applies to every file name, including the checked-in [`config/benchmark.jsonc`](../../config/benchmark.jsonc) example; filename extensions do not select a parser. Plain operational JSON remains valid. Existing operational TOML must be converted to JSONC; operational settings have no TOML dependency.
+
+JSONC accepts only JSON plus `//` line comments and `/* */` block comments. Comment recognition is string-safe: comment markers inside JSON strings remain literal content, including escaped quotes and backslashes. Trailing commas and other JSON5 extensions are rejected. For example, a partial layer is:
+
+```jsonc
+{
+  "revision": 1,
+  "defaults": {
+    "runtime": {
+      "max_tool_output_bytes": 131072
+    }
+  },
+  "profiles": {
+    "tui": {
+      "runtime": {
+        // Override only the TUI turn budget.
+        "max_model_turns_per_run": 96
+      }
+    }
+  }
+}
+```
+
+Top-level `tui` is also supported for shared presentation settings. Within a layer, defaults apply first, then top-level TUI settings, then the selected profile. `tui.theme`, `tui.display`, `tui.input`, and `tui.render` objects are deeply merged with preceding settings before typed deserialization and validation. The checked-in [`config/base.jsonc`](../../config/base.jsonc) lists all default presentation fields.
+
+Every `Limits` field can be overridden: `max_model_turns_per_run`, `max_tool_calls_per_run`, `max_tool_calls_per_turn`, `run_timeout_seconds`, `tool_timeout_seconds`, `retained_context_items`, `max_arg_assembly_bytes`, `max_tool_output_bytes`, `event_data_capacity`, `event_control_capacity`, `max_concurrent_ops`, and `approval_expiry_seconds`. Provider settings include `connect_timeout_seconds` (10), `context_discovery_timeout_seconds` (2), `fallback_call_timeout_seconds` (600), and `retry_backoff_seconds` ([1, 2, 5, 10, 30, 60]). All provider deadlines must be between 1 and 86,400 seconds, matching adapter validation. Retry arrays contain 1–8 nondecreasing delays, each between 1 and 3,600 seconds. Other tool, server, and container settings are not configurable here yet.
+
+Both frontends accept `--check-config` and `--print-effective-config`. Effective output is plain JSON with `runtime`, `provider`, and `tui` objects, without comments. This diagnostic output is a resolved snapshot, not a revisioned input layer. Unknown keys, duplicate keys, unsupported revisions, malformed files, and invalid values (including inactive profiles) fail explicitly. Files are limited to 65,536 bytes, enforced during bounded reads before parsing. An absent conventional system base is allowed; an explicitly configured base or overlay that cannot be read is an error.
 
 Validate revisions, selected profiles, numeric bounds, references, and incompatible settings before dispatch. Unknown mandatory settings fail explicitly. Deferred secrets or integrations may report not-ready status, but startup must not pretend unsafe or invalid configuration is ready for execution.
 
@@ -44,7 +73,7 @@ A relay receives only the credential reference assigned to its profile. Do not e
 
 ## Limits
 
-Before the first implementation ships, document finite defaults for model turns, tool calls, active operations, run duration, context/stream assembly, output, queues, pending requests, retained presentation/history, and plugin processes.
+The implemented operational settings cover all runtime `Limits` fields listed above, provider deadlines/retry backoff, and typed frontend presentation settings. Omitted values retain their code-defined profile defaults.
 
 User overrides remain subject to host validation and policy. Zero, negative, overflowing, or incompatible values require defined semantics; they cannot accidentally disable a safety limit. Large legitimate workloads may use explicitly increased budgets without changing global defaults.
 

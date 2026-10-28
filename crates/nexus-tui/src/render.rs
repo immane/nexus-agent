@@ -17,7 +17,9 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+#[cfg(test)]
+use ratatui::style::Color;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -28,14 +30,16 @@ use crate::keys::Focus;
 use crate::markdown::{MdStyle, StyledRun};
 use crate::sanitize::sanitize;
 use crate::state::{
-    AppState, ApprovalGeometry, EntryKind, MAX_PICKER_VISIBLE_ROWS, PendingApprovalCard,
-    PointerGeometry, chunks, display_width, wrapped_height,
+    AppState, ApprovalGeometry, EntryKind, PendingApprovalCard, PointerGeometry, chunks,
+    display_width, wrapped_height,
 };
+use crate::theme::color;
+use nexus_config::ThemeSettings;
 
 /// Maps width-neutral Markdown style bits to terminal styling. Only color
 /// and modifiers change; the visible text (and its measured width) is
 /// untouched.
-fn markdown_style(style: MdStyle) -> Style {
+fn markdown_style_with_theme(style: MdStyle, theme: &ThemeSettings) -> Style {
     let mut out = Style::default();
     if style.contains(MdStyle::BOLD) || style.contains(MdStyle::HEADING) {
         out = out.add_modifier(Modifier::BOLD);
@@ -53,11 +57,11 @@ fn markdown_style(style: MdStyle) -> Style {
         out = out.add_modifier(Modifier::REVERSED);
     }
     if style.contains(MdStyle::CODE) {
-        out = out.fg(Color::Yellow);
+        out = out.fg(color(&theme.markdown_code));
     } else if style.contains(MdStyle::HEADING) {
-        out = out.fg(Color::LightBlue);
+        out = out.fg(color(&theme.markdown_heading));
     } else if style.contains(MdStyle::LINK) {
-        out = out.fg(Color::Cyan);
+        out = out.fg(color(&theme.markdown_link));
     } else if style.contains(MdStyle::LINK_URL) || style.contains(MdStyle::QUOTE) {
         out = out.add_modifier(Modifier::DIM);
     }
@@ -142,7 +146,12 @@ fn merge_selected(runs: &[StyledRun], start: usize, len: usize) -> Vec<StyledRun
     out
 }
 
+#[cfg(test)]
 fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
+    styled_line_with_theme(text, runs, &ThemeSettings::default())
+}
+
+fn styled_line_with_theme(text: &str, runs: &[StyledRun], theme: &ThemeSettings) -> Line<'static> {
     if runs.is_empty() {
         return Line::from(text.to_owned());
     }
@@ -165,7 +174,7 @@ fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
         if from < to {
             spans.push(Span::styled(
                 text[from..to].to_owned(),
-                markdown_style(run.style),
+                markdown_style_with_theme(run.style, theme),
             ));
         }
         cursor = cursor.max(run.start + run.len);
@@ -176,33 +185,37 @@ fn styled_line(text: &str, runs: &[StyledRun]) -> Line<'static> {
     Line::from(spans)
 }
 
+#[cfg(test)]
 fn entry_title_style(kind: EntryKind) -> Style {
+    entry_title_style_with_theme(kind, &ThemeSettings::default())
+}
+
+fn entry_title_style_with_theme(kind: EntryKind, theme: &ThemeSettings) -> Style {
     match kind {
         EntryKind::User => Style::default()
-            .fg(Color::LightGreen)
+            .fg(color(&theme.user_title))
             .add_modifier(Modifier::BOLD),
         EntryKind::Assistant => Style::default()
-            .fg(Color::LightCyan)
+            .fg(color(&theme.assistant_title))
             .add_modifier(Modifier::BOLD),
         EntryKind::Tool => Style::default()
-            .fg(Color::Yellow)
+            .fg(color(&theme.tool_title))
             .add_modifier(Modifier::BOLD),
-        EntryKind::System => Style::default().fg(Color::DarkGray),
+        EntryKind::System => Style::default().fg(color(&theme.system_title)),
     }
 }
 
 /// Welcome hero rows: the gradient banner plus breathing room and the
 /// subtitle, centered in a `width`-wide body. The caller guarantees the
 /// fit, so no row exceeds `width`.
-fn hero_lines() -> Vec<Line<'static>> {
+fn hero_lines_with_theme(theme: &ThemeSettings) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(EMPTY_ROWS);
     lines.push(Line::from(""));
     for (index, row) in LOGO.iter().enumerate() {
-        let (red, green, blue) = LOGO_GRADIENT[index];
         lines.push(Line::from(Span::styled(
             row.to_owned(),
             Style::default()
-                .fg(Color::Rgb(red, green, blue))
+                .fg(color(&theme.banner[index]))
                 .add_modifier(Modifier::BOLD),
         )));
     }
@@ -215,12 +228,12 @@ fn hero_lines() -> Vec<Line<'static>> {
 }
 
 /// Small-terminal hero: the wordmark plus subtitle, left-aligned. Two rows.
-fn wordmark_lines() -> Vec<Line<'static>> {
+fn wordmark_lines_with_theme(theme: &ThemeSettings) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
             WORDMARK.to_owned(),
             Style::default()
-                .fg(Color::Green)
+                .fg(color(&theme.accent))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -243,16 +256,6 @@ const LOGO: &[&str] = &[
 
 /// Banner width in cells (the widest row; shorter rows leave blanks).
 const LOGO_WIDTH: u16 = 91;
-
-/// Green gradient, one entry per banner row.
-const LOGO_GRADIENT: [(u8, u8, u8); 6] = [
-    (74, 222, 128),
-    (63, 208, 116),
-    (52, 194, 105),
-    (42, 180, 94),
-    (32, 168, 84),
-    (22, 163, 74),
-];
 
 /// Banner rows plus the leading blank, breathing room, and the subtitle.
 const EMPTY_ROWS: usize = 9;
@@ -278,6 +281,7 @@ const MIN_WIDTH: u16 = 20;
 /// Reserved lines: header (1) + footer (1) + composer chrome (2).
 const CHROME_LINES: u16 = 4;
 /// Composer body lines, clamped so history keeps the frame.
+#[cfg(test)]
 const MAX_COMPOSER_BODY: u16 = 5;
 /// Smallest approval card: both borders plus one detail row.
 const APPROVAL_MIN_ROWS: u16 = 3;
@@ -343,12 +347,22 @@ fn split(area: Rect, composer_body: u16, approval_rows: u16) -> Regions {
 /// on demand, compact header/footer. Pure presentation: reads [`AppState`],
 /// writes cells, executes nothing.
 pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
+    let base = Style::default()
+        .fg(color(&state.settings().theme.foreground))
+        .bg(color(&state.settings().theme.background));
+    buf.set_style(area, base);
     if area.width < MIN_WIDTH || area.height < CHROME_LINES + 4 {
         let note = Paragraph::new("terminal too small for nexus-tui (M0 test build)");
         note.render(area, buf);
         return;
     }
-    let composer_body = (state.composer().lines().count().max(1) as u16).min(MAX_COMPOSER_BODY);
+    let composer_body = state
+        .composer()
+        .lines()
+        .count()
+        .max(1)
+        .min(state.settings().display.composer_max_rows as usize)
+        .min(area.height.saturating_sub(CHROME_LINES + 1) as usize) as u16;
     let approval = match state.pending_approval().cloned() {
         Some(card) => {
             let run = state.active_run().map(|run| run.as_str().to_owned());
@@ -380,7 +394,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
     render_header(state, regions.header, buf, focus);
     render_body(state, regions.body, buf);
     if let (Some(layout), Some(card_area)) = (approval.as_ref(), regions.approval) {
-        render_approval(layout, card_area, buf);
+        render_approval_with_theme(layout, card_area, buf, &state.settings().theme);
     }
     render_composer(state, regions.composer, buf, focus);
     // Composer pointer geometry: origin plus the inner draft grid the
@@ -395,7 +409,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
             .lines()
             .count()
             .max(1)
-            .min(MAX_COMPOSER_BODY as usize),
+            .min(composer_body as usize),
         ..state.pointer_geometry()
     });
     render_footer(state, regions.footer, buf, focus);
@@ -407,6 +421,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
 /// suggestions sit immediately above the composer. This keeps both editable
 /// text areas and the footer unobscured.
 fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Buffer) {
+    let theme = &state.settings().theme;
     let items = state.completions();
     if items.is_empty() || area.width < 16 {
         return;
@@ -429,12 +444,19 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
     Clear.render(popup, buf);
     for y in popup.top()..popup.bottom() {
         for x in popup.left()..popup.right() {
-            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+            buf.get_mut(x, y)
+                .set_fg(color(&theme.foreground))
+                .set_bg(color(&theme.modal_background))
+                .set_symbol(" ");
         }
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray).bg(Color::Black))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.muted))
+                .bg(color(&theme.modal_background)),
+        )
         .title(if command_mode {
             " commands "
         } else {
@@ -447,17 +469,17 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
     for (row, (index, item)) in items.iter().enumerate().skip(first).take(rows).enumerate() {
         let selected = state.completion_is_selected(index);
         let background = if selected {
-            Color::DarkGray
+            color(&theme.selected_background)
         } else {
-            Color::Black
+            color(&theme.modal_background)
         };
         let mut spans = vec![Span::styled(
             item.label.as_str(),
             Style::default()
                 .fg(if selected {
-                    Color::LightYellow
+                    color(&theme.completion_match)
                 } else {
-                    Color::White
+                    color(&theme.completion_text)
                 })
                 .bg(background)
                 .add_modifier(if selected {
@@ -469,7 +491,7 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
         if !item.info.is_empty() {
             spans.push(Span::styled(
                 format!("  ·  {}", item.info),
-                Style::default().fg(Color::Gray).bg(background),
+                Style::default().fg(color(&theme.secondary)).bg(background),
             ));
         }
         Paragraph::new(Line::from(spans)).render(
@@ -482,6 +504,7 @@ fn render_completions(state: &AppState, area: Rect, composer: Rect, buf: &mut Bu
 /// Centered modal dialog, painted last so it sits above every region.
 /// Dialog geometry clamps to the frame on narrow or short terminals.
 fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
+    let theme = &state.settings().theme;
     if !state.overlay_open() {
         return;
     }
@@ -490,7 +513,17 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
         return;
     }
     let matches = state.picker_matches();
-    let visible = matches.len().min(MAX_PICKER_VISIBLE_ROWS);
+    let visible = matches
+        .len()
+        .min(state.settings().display.picker_visible_rows)
+        .min(area.height.saturating_sub(5).max(1) as usize);
+    state.record_picker_page_rows(
+        state
+            .settings()
+            .display
+            .picker_visible_rows
+            .min(area.height.saturating_sub(5).max(1) as usize),
+    );
     // Prefer a 24..=56-cell dialog, shrinking with the frame on tiny
     // terminals instead of overflowing it.
     let preferred_width = if state.session_picker_open() { 88 } else { 56 };
@@ -513,12 +546,19 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     // dialog, mixing it with the conversation behind it.
     for y in popup.top()..popup.bottom() {
         for x in popup.left()..popup.right() {
-            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+            buf.get_mut(x, y)
+                .set_fg(color(&theme.foreground))
+                .set_bg(color(&theme.modal_background))
+                .set_symbol(" ");
         }
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.accent))
+                .bg(color(&theme.modal_background)),
+        )
         .title(if state.session_picker_open() {
             " sessions · Ctrl+S "
         } else {
@@ -581,30 +621,36 @@ fn render_overlay(state: &AppState, area: Rect, buf: &mut Buffer) {
     Paragraph::new(rows).render(inner, buf);
 }
 
-fn help_section(title: &str) -> Line<'static> {
+fn help_section_with_theme(title: &str, theme: &ThemeSettings) -> Line<'static> {
     Line::from(Span::styled(
         format!(" {title} "),
         Style::default()
-            .fg(Color::Green)
+            .fg(color(&theme.accent))
             .add_modifier(Modifier::BOLD),
     ))
 }
 
-fn help_row(label: &str, description: &str) -> Line<'static> {
+fn help_row_with_theme(label: &str, description: &str, theme: &ThemeSettings) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("  {label:<28}"),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(color(&theme.info))
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(description.to_owned(), Style::default().fg(Color::Gray)),
+        Span::styled(
+            description.to_owned(),
+            Style::default().fg(color(&theme.secondary)),
+        ),
     ])
 }
 
 /// One help surface for the full command set, keyboard reference, and the
 /// runtime/build context useful when reporting issues.
 fn help_lines(state: &AppState) -> Vec<Line<'static>> {
+    let theme = &state.settings().theme;
+    let help_section = |title: &str| help_section_with_theme(title, theme);
+    let help_row = |label: &str, description: &str| help_row_with_theme(label, description, theme);
     let model = state.active_model().unwrap_or("not selected");
     let session = state.session_label().unwrap_or("default");
     let mut lines = vec![help_section("NEXUS AGENT")];
@@ -738,6 +784,7 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
 }
 
 fn render_help_dialog(state: &AppState, area: Rect, buf: &mut Buffer) {
+    let theme = &state.settings().theme;
     if area.width < 12 || area.height < 5 {
         return;
     }
@@ -752,12 +799,19 @@ fn render_help_dialog(state: &AppState, area: Rect, buf: &mut Buffer) {
     Clear.render(popup, buf);
     for y in popup.top()..popup.bottom() {
         for x in popup.left()..popup.right() {
-            buf.get_mut(x, y).set_bg(Color::Black).set_symbol(" ");
+            buf.get_mut(x, y)
+                .set_fg(color(&theme.foreground))
+                .set_bg(color(&theme.modal_background))
+                .set_symbol(" ");
         }
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green).bg(Color::Black))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.accent))
+                .bg(color(&theme.modal_background)),
+        )
         .title(format!(
             " Nexus Agent · Help · v{} ",
             env!("CARGO_PKG_VERSION")
@@ -775,11 +829,12 @@ fn render_help_dialog(state: &AppState, area: Rect, buf: &mut Buffer) {
         .take(inner.height as usize)
         .collect();
     Paragraph::new(visible)
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(color(&theme.modal_background)))
         .render(inner, buf);
 }
 
 fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
+    let theme = &state.settings().theme;
     let run = state
         .active_run()
         .map(|run| run.as_str())
@@ -787,13 +842,16 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
     let mut spans = vec![
         Span::styled(" nexus-tui ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(HEADER_TAG),
-        Span::styled(format!("run:{run} "), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("run:{run} "),
+            Style::default().fg(color(&theme.info)),
+        ),
         if matches!(state.status(), "running" | "executing tool") {
             const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
             Span::styled(
                 format!("{} {}", SPINNER[state.tool_spinner_frame()], state.status()),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(color(&theme.warning))
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -822,7 +880,9 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
             spans.push(Span::raw(" ".repeat(area.width as usize - used - mark)));
             spans.push(Span::styled(
                 text.to_owned(),
-                Style::default().fg(Color::Black).bg(Color::Green),
+                Style::default()
+                    .fg(color(&theme.selected_text))
+                    .bg(color(&theme.accent)),
             ));
         }
     }
@@ -880,9 +940,9 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
     // away naturally instead of competing for space.
     let used = view.lines.len() + usize::from(truncated);
     if !truncated && text_width >= LOGO_WIDTH as usize && used + EMPTY_ROWS <= content_height {
-        lines.extend(hero_lines());
+        lines.extend(hero_lines_with_theme(&state.settings().theme));
     } else if !truncated && text_width >= WORDMARK.len() && used + WORDMARK_ROWS <= content_height {
-        lines.extend(wordmark_lines());
+        lines.extend(wordmark_lines_with_theme(&state.settings().theme));
     }
     if truncated {
         lines.push(Line::from(Span::styled(
@@ -890,7 +950,7 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
             // itself never be clipped away.
             format!("… {}↑ presentation-truncated", view.hidden_above),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(color(&state.settings().theme.warning))
                 .add_modifier(Modifier::DIM),
         )));
     }
@@ -906,11 +966,15 @@ fn render_body(state: &mut AppState, area: Rect, buf: &mut Buffer) {
     };
     for (index, (line, runs)) in view.lines.iter().zip(&view.styles).enumerate() {
         let mut rendered = match selected_row(index) {
-            Some((start, len)) => styled_line(line, &merge_selected(runs, start, len)),
-            None => styled_line(line, runs),
+            Some((start, len)) => styled_line_with_theme(
+                line,
+                &merge_selected(runs, start, len),
+                &state.settings().theme,
+            ),
+            None => styled_line_with_theme(line, runs, &state.settings().theme),
         };
         if let Some(kind) = view.titles[index] {
-            rendered = rendered.style(entry_title_style(kind));
+            rendered = rendered.style(entry_title_style_with_theme(kind, &state.settings().theme));
         }
         lines.push(rendered);
     }
@@ -1145,7 +1209,17 @@ fn push_wrapped(text: &str, width: usize, budget: usize, out: &mut Vec<String>) 
     }
 }
 
+#[cfg(test)]
 fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
+    render_approval_with_theme(layout, area, buf, &ThemeSettings::default());
+}
+
+fn render_approval_with_theme(
+    layout: &ApprovalLayout,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &ThemeSettings,
+) {
     let title = if layout.expanded {
         let end = layout
             .scroll
@@ -1164,7 +1238,11 @@ fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .border_style(
+            Style::default()
+                .fg(color(&theme.danger))
+                .add_modifier(Modifier::BOLD),
+        )
         .title(Line::from(title));
     let inner = block.inner(area);
     block.render(area, buf);
@@ -1176,13 +1254,13 @@ fn render_approval(layout: &ApprovalLayout, area: Rect, buf: &mut Buffer) {
         .map(|(index, text)| {
             let hint_row = index == last && (layout.expanded || layout.clipped);
             let style = if hint_row && text.starts_with("[a] allow once") {
-                Style::default().fg(Color::Green)
+                Style::default().fg(color(&theme.accent))
             } else if hint_row {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(color(&theme.warning))
                     .add_modifier(Modifier::BOLD)
             } else if text.starts_with("[a] allow once") {
-                Style::default().fg(Color::Green)
+                Style::default().fg(color(&theme.accent))
             } else if text.starts_with("decisions go") {
                 Style::default().add_modifier(Modifier::DIM)
             } else {
@@ -1231,14 +1309,15 @@ fn composer_selected_line(draft: &str, start: usize, len: usize, focused: bool) 
 }
 
 fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
+    let theme = &state.settings().theme;
     // The composer border names the active agent mode: read-only modes
     // (plan and read-only customs) render amber, full-capability modes keep
     // the focused green. Unfocused keeps the plain border as before.
     let style = if focus == Focus::Composer {
         if state.mode().read_only {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(color(&theme.warning))
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(color(&theme.accent))
         }
     } else {
         Style::default()
@@ -1259,7 +1338,7 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
             title.push(Span::raw("("));
             title.push(Span::styled(
                 state.variant().to_owned(),
-                Style::default().fg(Color::LightYellow),
+                Style::default().fg(color(&theme.completion_match)),
             ));
             title.push(Span::raw(")"));
         }
@@ -1348,7 +1427,7 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
         let left_width = area.width.saturating_sub(right_width);
         if left_width > 0 {
             Paragraph::new(text)
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(color(&state.settings().theme.warning)))
                 .render(Rect::new(area.x, area.y, left_width, area.height), buf);
         }
     }
@@ -1411,6 +1490,91 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend).expect("test terminal builds");
         (AppState::new(), terminal)
+    }
+
+    #[test]
+    fn semantic_theme_colors_and_composer_geometry_are_configurable() {
+        let (mut state, mut terminal) = harness(100, 30);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.theme.foreground = "#123456".into();
+        settings.theme.background = "index:17".into();
+        settings.theme.accent = "magenta".into();
+        settings.theme.user_title = "index:200".into();
+        settings.theme.markdown_code = "blue".into();
+        settings.display.composer_max_rows = 2;
+        state.set_settings(settings).unwrap();
+        state.record_submitted("body");
+        for ch in "one\ntwo\nthree\nfour".chars() {
+            if ch == '\n' {
+                state.composer_newline();
+            } else {
+                state.composer_type(ch);
+            }
+        }
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert_eq!(state.pointer_geometry().composer_rows, 2);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.get(99, 29).bg, Color::Indexed(17));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.fg == Color::Indexed(200))
+        );
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.fg == Color::Rgb(18, 52, 86))
+        );
+        assert!(buffer.content.iter().any(|cell| cell.fg == Color::Magenta));
+        let styled = markdown_style_with_theme(MdStyle::CODE, &state.settings().theme);
+        assert_eq!(styled.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn modal_background_is_configurable() {
+        let (mut state, mut terminal) = harness(80, 24);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.theme.modal_background = "index:42".into();
+        state.set_settings(settings).unwrap();
+        state.open_help();
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.bg == Color::Indexed(42))
+        );
+    }
+
+    #[test]
+    fn picker_window_and_page_step_share_configured_and_clipped_geometry() {
+        let (mut state, mut terminal) = harness(80, 24);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.display.picker_visible_rows = 3;
+        state.set_settings(settings.clone()).unwrap();
+        state.open_model_picker(
+            (0..20)
+                .map(|index| crate::state::ModelChoice {
+                    id: format!("model-{index:02}"),
+                    provider: "provider".into(),
+                })
+                .collect(),
+        );
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert_eq!(state.picker_page_rows(), 3);
+        let text = screen(&terminal);
+        assert!(text.contains("model-02"));
+        assert!(!text.contains("model-03"));
+        settings.display.picker_visible_rows = 100;
+        state.set_settings(settings).unwrap();
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buffer = Buffer::empty(area);
+        render(&mut state, area, &mut buffer, Focus::Composer);
+        assert_eq!(state.picker_page_rows(), 3);
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {

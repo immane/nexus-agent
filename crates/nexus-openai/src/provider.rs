@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use nexus_config::settings::ProviderSettings;
 use nexus_config::{CredentialRef, ProtocolKind, ProviderProfile};
 use nexus_core::{
     AgentError, CallCandidate, CorrelationData, ErrorCategory, FinishReason, Limits,
@@ -27,9 +28,6 @@ const MAX_STREAM_WIRE_BYTES: usize = 64 * 1_024 * 1_024;
 const MAX_SSE_RECORD_BYTES: usize = MAX_RESPONSE_BYTES;
 /// Maximum vendor model name in bytes, matching the configuration bound.
 pub const MAX_MODEL_LEN: usize = 128;
-/// Socket connect timeout. Reads use the remaining run deadline.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONTEXT_METADATA_BYTES: usize = 256 * 1024;
 /// Maximum response head (status line plus headers) in bytes. Anything
 /// larger fails instead of accumulating unboundedly while the head is still
@@ -38,17 +36,6 @@ const MAX_HEAD_BYTES: usize = 16_384;
 /// Read poll quantum: cancellation and deadlines are re-checked between
 /// quanta so a stalled peer cannot park the worker past its bound.
 const READ_QUANTUM: Duration = Duration::from_secs(1);
-/// Access failures back off to one minute, then keep that interval until the
-/// live deadline or cancellation. Standalone callers also have a time bound.
-const FALLBACK_CALL_TIMEOUT: Duration = Duration::from_secs(600);
-const PROVIDER_RETRY_DELAYS: [Duration; 6] = [
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(5),
-    Duration::from_secs(10),
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-];
 /// The TLS stdout pump retains at most this many fixed-size chunks while the
 /// parser is behind (128 KiB total). A closed consumer releases a blocked send.
 const TLS_PUMP_CHUNKS: usize = 16;
@@ -149,6 +136,7 @@ fn status_error_with_head(status: u16, head: &str) -> ProviderEvent {
 /// `openssl s_client` TLS bridge. The profile selects Chat Completions,
 /// Responses, or Anthropic Messages; see [`OpenAiProvider::from_profile`].
 pub struct OpenAiProvider {
+    operational_settings: ProviderSettings,
     context_management: nexus_core::ContextManagementSettings,
     host: String,
     port: u16,
@@ -287,6 +275,7 @@ impl OpenAiProvider {
             ));
         }
         Ok(Self {
+            operational_settings: ProviderSettings::default(),
             context_management: nexus_core::ContextManagementSettings::default(),
             host,
             port,
@@ -315,6 +304,44 @@ impl OpenAiProvider {
             model,
             profile.protocol,
         )
+    }
+
+    /// Binds timeout and retry settings without performing any network I/O.
+    /// Apply this before context discovery so its timeout also takes effect.
+    ///
+    /// # Errors
+    /// Rejects zero, excessive, empty, or decreasing operational bounds.
+    pub fn with_operational_settings(
+        mut self,
+        settings: &ProviderSettings,
+    ) -> Result<Self, AgentError> {
+        Self::validate_operational_settings(settings)?;
+        self.operational_settings = settings.clone();
+        Ok(self)
+    }
+
+    /// Checks public operational settings defensively before installing them.
+    pub fn validate_operational_settings(settings: &ProviderSettings) -> Result<(), AgentError> {
+        if !(1..=86_400).contains(&settings.connect_timeout_seconds)
+            || !(1..=86_400).contains(&settings.context_discovery_timeout_seconds)
+            || !(1..=86_400).contains(&settings.fallback_call_timeout_seconds)
+            || settings.retry_backoff_seconds.is_empty()
+            || settings.retry_backoff_seconds.len() > 8
+            || settings
+                .retry_backoff_seconds
+                .iter()
+                .any(|seconds| !(1..=3_600).contains(seconds))
+            || settings
+                .retry_backoff_seconds
+                .windows(2)
+                .any(|pair| pair[0] > pair[1])
+        {
+            return Err(provider_error_inner(
+                ErrorCategory::InvalidInput,
+                "provider operational settings are invalid",
+            ));
+        }
+        Ok(())
     }
 
     /// Binds validated host settings. This does not perform discovery or enable
@@ -471,11 +498,11 @@ impl OpenAiProvider {
                 "provider call was cancelled",
             )];
         }
-        let deadline = Some(
-            context
-                .deadline()
-                .unwrap_or_else(|| Instant::now() + FALLBACK_CALL_TIMEOUT),
-        );
+        let deadline = Some(call_deadline(
+            context.deadline(),
+            &self.operational_settings,
+            Instant::now(),
+        ));
         if deadline.is_some_and(|at| Instant::now() >= at) {
             return vec![provider_error(
                 ErrorCategory::Timeout,
@@ -517,6 +544,7 @@ impl OpenAiProvider {
             body.len(),
         );
         retry_exchange(
+            &self.operational_settings,
             context,
             deadline,
             sink,
@@ -529,6 +557,7 @@ impl OpenAiProvider {
                         body,
                         context,
                         deadline,
+                        Duration::from_secs(self.operational_settings.connect_timeout_seconds),
                     ) {
                         Ok(mut source) => stream_response(
                             &mut source,
@@ -540,7 +569,13 @@ impl OpenAiProvider {
                         Err(failure) => vec![failure],
                     }
                 } else {
-                    match connect_plain(&self.host, self.port, context, deadline) {
+                    match connect_plain(
+                        &self.host,
+                        self.port,
+                        context,
+                        deadline,
+                        Duration::from_secs(self.operational_settings.connect_timeout_seconds),
+                    ) {
                         Ok(mut stream) => {
                             if let Err(failure) =
                                 write_request(&mut stream, head.as_bytes(), body, context, deadline)
@@ -568,6 +603,7 @@ impl OpenAiProvider {
 }
 
 fn retry_exchange(
+    settings: &ProviderSettings,
     context: &ProviderContext,
     deadline: Option<Instant>,
     sink: &(dyn Fn(ProviderEvent) + Send + Sync),
@@ -576,7 +612,7 @@ fn retry_exchange(
 ) -> Vec<ProviderEvent> {
     // Keep this guard here as well as at the public entry point: no caller of
     // the retry driver can accidentally create an unbounded deadline-free loop.
-    let deadline = Some(deadline.unwrap_or_else(|| Instant::now() + FALLBACK_CALL_TIMEOUT));
+    let deadline = Some(call_deadline(deadline, settings, Instant::now()));
     let mut retry = 0usize;
     loop {
         if let Err(failure) = check_live(context, deadline) {
@@ -592,7 +628,7 @@ fn retry_exchange(
             return vec![failure];
         }
         let will_retry = !emitted.load(Ordering::Relaxed) && has_retryable_terminal(&events);
-        let mut delay = retry_delay(retry);
+        let mut delay = retry_delay(settings, retry);
         if let Some(ProviderEvent::Failed(error)) = events.last() {
             if let Some(seconds) = error
                 .correlation()
@@ -643,8 +679,17 @@ fn log_provider_failure(error: &AgentError, attempt: usize, delay: Option<Durati
     );
 }
 
-fn retry_delay(retry: usize) -> Duration {
-    PROVIDER_RETRY_DELAYS[retry.min(PROVIDER_RETRY_DELAYS.len() - 1)]
+fn call_deadline(deadline: Option<Instant>, settings: &ProviderSettings, now: Instant) -> Instant {
+    deadline.unwrap_or_else(|| now + Duration::from_secs(settings.fallback_call_timeout_seconds))
+}
+
+fn retry_delay(settings: &ProviderSettings, retry: usize) -> Duration {
+    let delays = &settings.retry_backoff_seconds;
+    Duration::from_secs(delays[retry.min(delays.len() - 1)])
+}
+
+fn connect_timeout_for(timeout: Duration, deadline: Option<Instant>, now: Instant) -> Duration {
+    deadline.map_or(timeout, |at| timeout.min(at.saturating_duration_since(now)))
 }
 
 fn wait_before_retry(
@@ -874,15 +919,14 @@ fn connect_plain(
     port: u16,
     context: &ProviderContext,
     deadline: Option<Instant>,
+    connect_timeout: Duration,
 ) -> Result<TcpStream, ProviderEvent> {
     check_live(context, deadline)?;
     let address = join_host_port(host, port);
     if let Ok(addresses) = address.to_socket_addrs() {
         for address in addresses {
             check_live(context, deadline)?;
-            let timeout = deadline.map_or(CONNECT_TIMEOUT, |at| {
-                CONNECT_TIMEOUT.min(at.saturating_duration_since(Instant::now()))
-            });
+            let timeout = connect_timeout_for(connect_timeout, deadline, Instant::now());
             match TcpStream::connect_timeout(&address, timeout.max(Duration::from_millis(1))) {
                 Ok(stream) => {
                     check_live(context, deadline)?;
@@ -975,7 +1019,13 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
     // terminator so the verified TLS helper can write the exact wire bytes.
     let boundary = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")? + 4;
     let (request_head, request_body) = request.split_at(boundary);
-    let deadline = Instant::now().checked_add(CONTEXT_DISCOVERY_TIMEOUT)?;
+    let deadline = Instant::now().checked_add(Duration::from_secs(
+        provider
+            .operational_settings
+            .context_discovery_timeout_seconds,
+    ))?;
+    let connect_timeout =
+        Duration::from_secs(provider.operational_settings.connect_timeout_seconds);
     let context = ProviderContext::new(Duration::ZERO, false, None);
     let mut response = Vec::new();
     if provider.use_tls {
@@ -986,6 +1036,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
             request_body,
             &context,
             Some(deadline),
+            connect_timeout,
         )
         .ok()?;
         while Instant::now() < deadline {
@@ -1010,7 +1061,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
     } else {
         let address = join_host_port(&provider.host, provider.port);
         let mut stream = address.to_socket_addrs().ok()?.find_map(|address| {
-            let timeout = deadline.saturating_duration_since(Instant::now());
+            let timeout = connect_timeout_for(connect_timeout, Some(deadline), Instant::now());
             (!timeout.is_zero())
                 .then(|| TcpStream::connect_timeout(&address, timeout))
                 .and_then(Result::ok)
@@ -1087,6 +1138,7 @@ fn spawn_tls(
     body: &[u8],
     context: &ProviderContext,
     deadline: Option<Instant>,
+    connect_timeout: Duration,
 ) -> Result<TlsSource, ProviderEvent> {
     check_live(context, deadline)?;
     let target = join_host_port(host, port);
@@ -1193,6 +1245,7 @@ fn spawn_tls(
         child,
         started: Instant::now(),
         first_byte: true,
+        connect_timeout,
         security_receiver,
     })
 }
@@ -1296,6 +1349,7 @@ struct TlsSource {
     child: Child,
     started: Instant,
     first_byte: bool,
+    connect_timeout: Duration,
     security_receiver: mpsc::Receiver<bool>,
 }
 
@@ -1327,7 +1381,7 @@ impl ChunkSource for TlsSource {
             )),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 check_live(context, deadline)?;
-                if self.first_byte && self.started.elapsed() >= CONNECT_TIMEOUT {
+                if self.first_byte && self.started.elapsed() >= self.connect_timeout {
                     return Err(retryable_provider_error(
                         ErrorCategory::Protocol,
                         "provider is unreachable",
@@ -3278,10 +3332,144 @@ mod retry_policy_tests {
     use nexus_core::CancellationToken;
 
     #[test]
-    fn retry_schedule_increases_then_stays_at_one_minute() {
+    fn custom_settings_select_timeouts_without_overriding_a_run_deadline() {
+        let settings = ProviderSettings {
+            connect_timeout_seconds: 7,
+            context_discovery_timeout_seconds: 11,
+            fallback_call_timeout_seconds: 19,
+            retry_backoff_seconds: vec![3, 9],
+        };
+        let provider = OpenAiProvider::new(
+            "http://localhost/v1",
+            CredentialRef::env_var("NEXUS_TEST_UNUSED_TOKEN").unwrap(),
+            "model",
+        )
+        .unwrap()
+        .with_operational_settings(&settings)
+        .unwrap();
+        assert_eq!(provider.operational_settings, settings);
+        let now = Instant::now();
         assert_eq!(
-            PROVIDER_RETRY_DELAYS,
-            [
+            call_deadline(None, &settings, now),
+            now + Duration::from_secs(19)
+        );
+        for seconds in [2, 30] {
+            let deadline = now + Duration::from_secs(seconds);
+            assert_eq!(call_deadline(Some(deadline), &settings, now), deadline);
+            assert_eq!(
+                connect_timeout_for(Duration::from_secs(7), Some(deadline), now),
+                Duration::from_secs(seconds.min(7))
+            );
+        }
+        assert_eq!(
+            connect_timeout_for(Duration::from_secs(7), None, now),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            connect_timeout_for(Duration::from_secs(7), Some(now), now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn custom_retry_schedule_is_used_and_last_delay_repeats() {
+        let settings = ProviderSettings {
+            retry_backoff_seconds: vec![3, 9],
+            fallback_call_timeout_seconds: 17,
+            ..ProviderSettings::default()
+        };
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let events = retry_exchange(
+            &settings,
+            &context,
+            None,
+            &|_| {},
+            |_| {
+                attempts += 1;
+                if attempts <= 4 {
+                    vec![status_error(503)]
+                } else {
+                    Vec::new()
+                }
+            },
+            |_, _, delay| {
+                waits.push(delay);
+                Ok(())
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(attempts, 5);
+        assert_eq!(waits, [3, 9, 9, 9].map(Duration::from_secs));
+        assert_eq!(retry_delay(&settings, usize::MAX), Duration::from_secs(9));
+    }
+
+    #[test]
+    fn public_operational_settings_are_validated_defensively() {
+        let defaults = ProviderSettings::default();
+        assert_eq!(defaults.connect_timeout_seconds, 10);
+        assert_eq!(defaults.context_discovery_timeout_seconds, 2);
+        assert_eq!(defaults.fallback_call_timeout_seconds, 600);
+        assert!(OpenAiProvider::validate_operational_settings(&defaults).is_ok());
+        for settings in [
+            ProviderSettings {
+                connect_timeout_seconds: 0,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                connect_timeout_seconds: 86_401,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                context_discovery_timeout_seconds: 0,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                context_discovery_timeout_seconds: 86_401,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                fallback_call_timeout_seconds: 0,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                fallback_call_timeout_seconds: 86_401,
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![0],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![3_601],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![2, 1],
+                ..defaults.clone()
+            },
+            ProviderSettings {
+                retry_backoff_seconds: vec![1; 9],
+                ..defaults.clone()
+            },
+        ] {
+            assert!(OpenAiProvider::validate_operational_settings(&settings).is_err());
+        }
+    }
+
+    #[test]
+    fn retry_schedule_increases_then_stays_at_one_minute() {
+        let settings = ProviderSettings::default();
+        assert_eq!(
+            (0..6)
+                .map(|retry| retry_delay(&settings, retry))
+                .collect::<Vec<_>>(),
+            vec![
                 std::time::Duration::from_secs(1),
                 std::time::Duration::from_secs(2),
                 std::time::Duration::from_secs(5),
@@ -3291,7 +3479,7 @@ mod retry_policy_tests {
             ]
         );
         for index in [6, 7, 100, usize::MAX] {
-            assert_eq!(retry_delay(index), Duration::from_secs(60));
+            assert_eq!(retry_delay(&settings, index), Duration::from_secs(60));
         }
     }
 
@@ -3332,6 +3520,7 @@ mod retry_policy_tests {
             port,
             &context,
             Some(Instant::now() + Duration::from_secs(1)),
+            Duration::from_secs(10),
         )
         .expect_err("closed port refuses connections");
         assert!(matches!(
@@ -3368,6 +3557,7 @@ mod retry_policy_tests {
         let mut attempts = 0;
         let mut waits = Vec::new();
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},
@@ -3390,7 +3580,12 @@ mod retry_policy_tests {
         );
         assert!(events.is_empty());
         assert_eq!(attempts, 11);
-        assert_eq!(waits, (0..10).map(retry_delay).collect::<Vec<_>>());
+        assert_eq!(
+            waits,
+            (0..10)
+                .map(|retry| retry_delay(&ProviderSettings::default(), retry))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3398,6 +3593,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},
@@ -3425,6 +3621,7 @@ mod retry_policy_tests {
             .with_control(token.clone(), Instant::now() + Duration::from_secs(10));
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             context.deadline(),
             &|_| {},
@@ -3472,6 +3669,7 @@ mod retry_policy_tests {
             .with_control(token.clone(), Instant::now() + Duration::from_secs(10));
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             context.deadline(),
             &|_| {},
@@ -3493,6 +3691,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},
@@ -3539,6 +3738,7 @@ mod retry_policy_tests {
             let context = ProviderContext::new(Duration::ZERO, false, None);
             let mut attempts = 0;
             let events = retry_exchange(
+                &ProviderSettings::default(),
                 &context,
                 None,
                 &|_| {},
@@ -3573,6 +3773,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| panic!("metadata must not publish provisional output"),
@@ -3609,6 +3810,7 @@ mod retry_policy_tests {
         let context = ProviderContext::new(Duration::ZERO, false, None);
         let mut attempts = 0;
         let events = retry_exchange(
+            &ProviderSettings::default(),
             &context,
             None,
             &|_| {},

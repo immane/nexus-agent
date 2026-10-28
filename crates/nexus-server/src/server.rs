@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use nexus_config::settings::ProviderSettings;
 use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
 use nexus_core::{
     ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelInstructions,
@@ -399,6 +400,7 @@ pub struct Server {
     config_path: Option<PathBuf>,
     /// Finite runtime limits applied to sessions created after startup.
     limits: Limits,
+    provider_settings: ProviderSettings,
     session_store: Option<SessionStoreHandle>,
     /// Accepted run id to the model id it was submitted with. Entries are
     /// consumed by the completion watcher, a terminal SSE event, a subsequent
@@ -472,6 +474,7 @@ impl Server {
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             limits: Limits::m0_test(),
+            provider_settings: ProviderSettings::default(),
             session_store: None,
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
@@ -510,6 +513,17 @@ impl Server {
     pub fn set_limits(&mut self, limits: Limits) -> Result<(), nexus_core::AgentError> {
         limits.validate()?;
         self.limits = limits;
+        Ok(())
+    }
+
+    /// Installs timeout and retry bounds for subsequently created providers.
+    /// Existing session adapters retain their settings.
+    pub fn set_provider_settings(
+        &mut self,
+        settings: &ProviderSettings,
+    ) -> Result<(), nexus_core::AgentError> {
+        nexus_openai::OpenAiProvider::validate_operational_settings(settings)?;
+        self.provider_settings = settings.clone();
         Ok(())
     }
 
@@ -682,6 +696,7 @@ impl Server {
         resolve_credential(&profile.credential)
             .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
+            .and_then(|adapter| adapter.with_operational_settings(&self.provider_settings))
             .map(|adapter| {
                 let adapter = adapter.with_context_management(context_management);
                 if adapter.is_ollama_endpoint() {
@@ -1691,6 +1706,30 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    #[test]
+    fn provider_settings_are_installed_atomically_and_defaults_are_preserved() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut server = Server::new(executor.handle().clone());
+        assert_eq!(server.provider_settings, ProviderSettings::default());
+        let settings = ProviderSettings {
+            connect_timeout_seconds: 4,
+            context_discovery_timeout_seconds: 3,
+            fallback_call_timeout_seconds: 90,
+            retry_backoff_seconds: vec![2, 4],
+        };
+        server.set_provider_settings(&settings).unwrap();
+        assert_eq!(server.provider_settings, settings);
+        let invalid = ProviderSettings {
+            retry_backoff_seconds: Vec::new(),
+            ..settings.clone()
+        };
+        assert!(server.set_provider_settings(&invalid).is_err());
+        assert_eq!(server.provider_settings, settings);
+    }
 
     #[test]
     fn shared_session_store_retains_original_sources_from_every_server_runtime() {

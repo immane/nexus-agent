@@ -153,7 +153,8 @@ variable **before starting the TUI in the same shell**. No server is needed.
 Configuration lookup uses `NEXUS_CONFIG` when nonempty, otherwise
 `$XDG_CONFIG_HOME/nexus-agent/config.json`, falling back to
 `$HOME/.config/nexus-agent/config.json` (also on macOS). The server additionally
-accepts `--config PATH`, which takes precedence. The TUI has no `--config` flag:
+accepts `--config PATH`, which takes precedence. The TUI intentionally has no
+provider `--config` flag:
 
 ```sh
 export NEXUS_CONFIG=/path/to/config.json
@@ -166,6 +167,74 @@ implemented plugin system. Revision-1 files without `protocol` remain readable
 as Chat Completions; saving writes revision 2. Missing config starts empty;
 invalid config fails startup explicitly. Config saves do not create missing
 parent directories, so create the chosen directory first.
+
+### Layered operational settings
+
+Runtime budgets are configured separately from the provider/model file, so TUI
+usage saves cannot flatten operational overrides. Both TUI and server accept an
+optional machine base (`/etc/nexus-agent/base.jsonc`, or `NEXUS_BASE_CONFIG`),
+`--base-config PATH` to select a different base, and repeatable
+`--config-overlay PATH` flags. Layers merge built-in profile defaults → base →
+overlays in command-line order. Use `--check-config` to validate or
+`--print-effective-config` to inspect resolved values without starting the UI or
+server. Operational input uses JSONC (JSON with `//` and `/* */` comments);
+effective output is plain JSON. Comments are recognized only outside strings,
+so string contents are preserved. Trailing commas and other JSON5 syntax are
+not supported. The separate provider/model `config.json` remains strict JSON
+and is unchanged.
+
+Complete example: [`config/base.jsonc`](config/base.jsonc). It lists every
+configurable runtime budget, provider deadline/retry default, and TUI preference. Its values
+match the existing TUI and ordinary server defaults. Choose it explicitly:
+
+```sh
+cargo run -p nexus-tui --locked --offline -- --base-config config/base.jsonc
+```
+
+For example, a partial overlay can contain:
+
+```jsonc
+{
+  "revision": 1,
+  "defaults": {
+    "runtime": {
+      "max_tool_output_bytes": 131072
+    }
+  },
+  "profiles": {
+    "tui": {
+      "runtime": {
+        // Override only the TUI turn budget.
+        "max_model_turns_per_run": 96
+      }
+    }
+  }
+}
+```
+
+The TUI and server profiles list every configurable core budget: turn and tool-call
+limits, run/tool/approval timeouts, retained context, argument assembly and
+tool output byte limits, event channel capacities, and concurrent operations.
+Only `tui` and `server` profiles belong in the shared `base.jsonc`.
+[`config/benchmark.jsonc`](config/benchmark.jsonc) is an ordinary settings file
+with the same schema, provided as an example for benchmark runs. Pass any file
+name using the existing `--base-config PATH` or `--config-overlay PATH`; for
+example, use `--benchmark-pilot --base-config config/benchmark.jsonc`. There is
+no benchmark-specific config option, environment variable, or reserved file
+name. Provider sections include `connect_timeout_seconds` (10),
+`context_discovery_timeout_seconds` (2), `fallback_call_timeout_seconds` (600),
+and `retry_backoff_seconds` ([1, 2, 5, 10, 30, 60]). Frontend presentation
+overrides belong in top-level `tui`, `defaults.tui`, or `profiles.tui.tui`; nested partial
+overrides inherit previous values. Unknown fields, invalid types, duplicate
+keys, and invalid inactive profiles fail validation. Each file is limited to
+65,536 bytes, with bounded reads. Plain operational JSON remains valid;
+existing operational TOML must be converted to JSONC. Filename extensions do
+not select the parser; operational settings have no TOML dependency.
+Within each layer, defaults apply first, then top-level `tui`, then the selected
+profile. Theme colors accept `default`, snake-case ANSI names, `#RRGGBB`, or
+`index:0` through `index:255`; see `config/base.jsonc` for all presentation keys.
+The effective snapshot reports merged settings, not a relaxation of existing
+tool/runtime safety caps (for example, the core 262,144-byte tool-output cap).
 
 ```sh
 cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project

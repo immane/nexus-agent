@@ -15,22 +15,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use nexus_config::{UserConfig, load, resolve_path};
-use nexus_core::Limits;
 use nexus_server::{Server, ToolsMode};
 
 /// Default loopback port.
 const DEFAULT_PORT: u16 = 8471;
+#[cfg(test)]
 const BENCHMARK_MAX_MODEL_TURNS: u32 = 500;
+#[cfg(test)]
 const BENCHMARK_MAX_TOOL_CALLS: u32 = 4_096;
+#[cfg(test)]
 const BENCHMARK_MAX_TOOL_CALLS_PER_TURN: u32 = 64;
+#[cfg(test)]
 const BENCHMARK_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-fn server_runtime_limits() -> Limits {
+#[cfg(test)]
+fn server_runtime_limits() -> nexus_core::Limits {
+    use nexus_core::Limits;
     let mut limits = Limits::m0_test();
     limits.run_duration = std::time::Duration::from_secs(60 * 60);
     limits.per_tool_timeout = std::time::Duration::from_secs(10 * 60);
     limits
 }
+#[cfg(test)]
 const BENCHMARK_RETAINED_CONTEXT_ITEMS: usize = 8_192;
 /// Maximum simultaneously serviced sockets; excess connections are closed
 /// immediately instead of creating another unbounded thread.
@@ -39,10 +45,16 @@ const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--session-store DIRECTORY] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--base-config PATH] [--config-overlay PATH ...] [--check-config|--print-effective-config] [--session-store DIRECTORY] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
+    eprintln!(
+        "  --base-config and repeatable --config-overlay select operational settings layers; NEXUS_BASE_CONFIG overrides the machine base."
+    );
+    eprintln!(
+        "  --check-config validates all selected config; --print-effective-config prints resolved operational settings."
+    );
     eprintln!(
         "  --session-store opts into private original-source and tool-operation records in a dedicated directory; no session restore API."
     );
@@ -84,6 +96,10 @@ enum CliAction {
         auth_token_env: Option<String>,
         benchmark_pilot: bool,
         session_store: Option<String>,
+        base_config: Option<PathBuf>,
+        config_overlays: Vec<PathBuf>,
+        check_config: bool,
+        print_effective_config: bool,
     },
     /// Print usage and exit 2.
     Usage,
@@ -108,6 +124,10 @@ fn parse_args(argv: &[String]) -> CliAction {
     let mut auth_token_env = None;
     let mut benchmark_pilot = false;
     let mut session_store = None;
+    let mut base_config = None;
+    let mut config_overlays = Vec::new();
+    let mut check_config = false;
+    let mut print_effective_config = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -174,6 +194,25 @@ fn parse_args(argv: &[String]) -> CliAction {
                 Some(value) => config = Some(value.clone()),
                 None => return CliAction::Usage,
             },
+            "--base-config" => {
+                if base_config.is_some() {
+                    return CliAction::Usage;
+                }
+                base_config = match args.next() {
+                    Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                        Some(PathBuf::from(value))
+                    }
+                    _ => return CliAction::Usage,
+                };
+            }
+            "--config-overlay" => match args.next() {
+                Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                    config_overlays.push(PathBuf::from(value));
+                }
+                _ => return CliAction::Usage,
+            },
+            "--check-config" => check_config = true,
+            "--print-effective-config" => print_effective_config = true,
             "--tools" => match args.next().map(String::as_str) {
                 Some("real") => tools_real = true,
                 Some("fake") => tools_real = false,
@@ -213,6 +252,10 @@ fn parse_args(argv: &[String]) -> CliAction {
         auth_token_env,
         benchmark_pilot,
         session_store,
+        base_config,
+        config_overlays,
+        check_config,
+        print_effective_config,
     }
 }
 
@@ -258,6 +301,10 @@ fn main() {
         auth_token_env,
         benchmark_pilot,
         session_store,
+        base_config,
+        config_overlays,
+        check_config,
+        print_effective_config,
     ) = match parse_args(&argv) {
         CliAction::Run {
             port,
@@ -271,6 +318,10 @@ fn main() {
             auth_token_env,
             benchmark_pilot,
             session_store,
+            base_config,
+            config_overlays,
+            check_config,
+            print_effective_config,
         } => (
             port,
             config,
@@ -283,6 +334,10 @@ fn main() {
             auth_token_env,
             benchmark_pilot,
             session_store,
+            base_config,
+            config_overlays,
+            check_config,
+            print_effective_config,
         ),
         CliAction::Usage => usage(),
     };
@@ -307,6 +362,25 @@ fn main() {
         }
     }
     let (config, path) = load_user_config(explicit_config.as_deref());
+    let settings_profile = if benchmark_pilot {
+        nexus_config::SettingsProfile::Benchmark
+    } else {
+        nexus_config::SettingsProfile::Server
+    };
+    let settings =
+        nexus_config::load_settings(settings_profile, base_config.as_deref(), &config_overlays)
+            .unwrap_or_else(|error| {
+                eprintln!("nexus-server: invalid operational settings ({error})");
+                std::process::exit(2);
+            });
+    if check_config {
+        println!("Configuration is valid.");
+        std::process::exit(0);
+    }
+    if print_effective_config {
+        println!("{}", nexus_config::settings_json(&settings));
+        std::process::exit(0);
+    }
     let needs_auth = tools_real || !config.providers().is_empty();
     let token = match auth_token_env.as_deref() {
         Some(name) => match std::env::var(name) {
@@ -347,27 +421,24 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
-    if let Err(error) = server.set_limits(server_runtime_limits()) {
+    if let Err(error) = server.set_limits(settings.limits()) {
         eprintln!("nexus-server: invalid runtime limits ({error})");
+        std::process::exit(2);
+    }
+    if let Err(error) = server.set_provider_settings(settings.provider()) {
+        eprintln!("nexus-server: invalid provider settings ({error})");
         std::process::exit(2);
     }
     if let Some(store) = session_store {
         server.set_session_store(store);
     }
     if benchmark_pilot {
-        let mut limits = Limits::m0_test();
-        limits.max_model_turns_per_run = BENCHMARK_MAX_MODEL_TURNS;
-        limits.max_tool_calls_per_run = BENCHMARK_MAX_TOOL_CALLS;
-        limits.max_tool_calls_per_turn = BENCHMARK_MAX_TOOL_CALLS_PER_TURN;
-        limits.run_duration = Limits::M0_TEST_MAX_DURATION;
-        limits.per_tool_timeout = BENCHMARK_TOOL_TIMEOUT;
-        limits.retained_context_items = BENCHMARK_RETAINED_CONTEXT_ITEMS;
-        if let Err(error) = server.set_limits(limits) {
-            eprintln!("nexus-server: invalid benchmark pilot limits ({error})");
-            std::process::exit(2);
-        }
         eprintln!(
-            "nexus-server: finite benchmark pilot limits enabled (500 turns, 4096 tool calls, 24 hours, 1 hour per tool)"
+            "nexus-server: finite benchmark pilot limits enabled ({} turns, {} tool calls, {} seconds, {} seconds per tool)",
+            settings.limits().max_model_turns_per_run,
+            settings.limits().max_tool_calls_per_run,
+            settings.limits().run_duration.as_secs(),
+            settings.limits().per_tool_timeout.as_secs(),
         );
     }
     if let Some(token) = token.as_deref()
@@ -524,9 +595,9 @@ mod cov_main_args {
 
     use super::{
         BENCHMARK_MAX_MODEL_TURNS, BENCHMARK_MAX_TOOL_CALLS, BENCHMARK_MAX_TOOL_CALLS_PER_TURN,
-        BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, DEFAULT_PORT, ExecutionMode, Limits,
-        parse_args,
+        BENCHMARK_RETAINED_CONTEXT_ITEMS, CliAction, DEFAULT_PORT, ExecutionMode, parse_args,
     };
+    use nexus_core::Limits;
 
     #[test]
     fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {

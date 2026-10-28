@@ -123,6 +123,7 @@ struct HeightCache {
 /// One foldable conversation entry with pre-sanitized lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    preview_lines: usize,
     /// Grouping kind.
     pub kind: EntryKind,
     /// One-line header shown even when folded. Sanitized, one line, and
@@ -130,7 +131,7 @@ pub struct Entry {
     pub title: String,
     /// Sanitized body lines (no embedded newlines).
     pub lines: Vec<String>,
-    /// Folded tool outputs retain their parameters and last ten output lines;
+    /// Folded tool outputs retain their parameters and configured output tail;
     /// other folded entries render as their title plus a marker only.
     pub folded: bool,
     /// True when title or body text was cut to [`MAX_ENTRY_BYTES`].
@@ -156,6 +157,7 @@ impl Entry {
         let title = bounded_title(title);
         let bytes = title.len();
         Self {
+            preview_lines: TOOL_PREVIEW_LINES,
             kind,
             title,
             lines: Vec::new(),
@@ -450,7 +452,7 @@ impl Entry {
     fn visible_body(&self) -> impl Iterator<Item = &String> {
         let prefix = self.compact_prefix.unwrap_or(0).min(self.lines.len());
         let start = if self.folded && self.compact_prefix.is_some() {
-            prefix.max(self.lines.len().saturating_sub(TOOL_PREVIEW_LINES))
+            prefix.max(self.lines.len().saturating_sub(self.preview_lines))
         } else {
             prefix
         };
@@ -462,7 +464,7 @@ impl Entry {
     fn display_title(&self) -> String {
         match self.compact_prefix {
             Some(prefix) if self.folded => {
-                let hidden = self.lines.len().saturating_sub(prefix + TOOL_PREVIEW_LINES);
+                let hidden = self.lines.len().saturating_sub(prefix + self.preview_lines);
                 format!(
                     "{}  [▸ preview · {hidden} earlier lines · click to expand]",
                     self.title
@@ -866,14 +868,16 @@ pub struct CompletionList {
 /// The full frontend presentation model.
 #[derive(Debug)]
 pub struct AppState {
+    settings: nexus_config::TuiSettings,
+    picker_page_rows: Cell<usize>,
     entries: VecDeque<Entry>,
     /// Sum of retained per-entry bytes, bounded by [`MAX_RETAINED_BYTES`].
     retained_bytes: usize,
     /// Presentation-only drops; accepted records are unaffected.
     pub dropped_entries: usize,
     composer: String,
-    /// Caret blink clock, advanced once per UI tick. The caret is visible
-    /// for [`CARET_BLINK_TICKS`] ticks, then hidden for the same span.
+    /// Caret blink clock, advanced once per 50ms UI tick. The configured
+    /// interval determines the visible and hidden half-periods.
     /// Counter-based (never wall-clock), so renders stay deterministic.
     caret_ticks: u64,
     /// Caret as a draft character offset (`0` is before the first char).
@@ -983,6 +987,8 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            settings: nexus_config::TuiSettings::default(),
+            picker_page_rows: Cell::new(MAX_PICKER_VISIBLE_ROWS),
             entries: VecDeque::new(),
             retained_bytes: 0,
             dropped_entries: 0,
@@ -1030,6 +1036,37 @@ impl AppState {
             command_line: None,
             completion: None,
         }
+    }
+
+    /// Installs validated presentation preferences and invalidates wrapped heights.
+    pub fn set_settings(
+        &mut self,
+        settings: nexus_config::TuiSettings,
+    ) -> Result<(), nexus_config::ConfigError> {
+        settings.validate()?;
+        for entry in &mut self.entries {
+            entry.preview_lines = settings.display.tool_preview_lines;
+            entry.height_cache.set(None);
+        }
+        self.picker_page_rows
+            .set(settings.display.picker_visible_rows);
+        self.settings = settings;
+        self.caret_ticks = 0;
+        Ok(())
+    }
+
+    /// Active presentation preferences.
+    pub fn settings(&self) -> &nexus_config::TuiSettings {
+        &self.settings
+    }
+
+    /// Picker page size measured by the last frame, clamped to available space.
+    pub fn picker_page_rows(&self) -> usize {
+        self.picker_page_rows.get()
+    }
+
+    pub(crate) fn record_picker_page_rows(&self, rows: usize) {
+        self.picker_page_rows.set(rows.max(1));
     }
 
     /// Records the project directory for the header. Accepts the
@@ -1414,7 +1451,9 @@ impl AppState {
         }
     }
 
-    fn push_entry(&mut self, entry: Entry) {
+    fn push_entry(&mut self, mut entry: Entry) {
+        entry.preview_lines = self.settings.display.tool_preview_lines;
+        entry.height_cache.set(None);
         self.retained_bytes += entry.retained_bytes();
         self.entries.push_back(entry);
         self.trim_retention();
@@ -1998,7 +2037,7 @@ impl AppState {
     /// with nothing else, so pausing the UI cannot desync it.
     #[must_use]
     pub fn caret_visible(&self) -> bool {
-        (self.caret_ticks / CARET_BLINK_TICKS).is_multiple_of(2)
+        (self.caret_ticks / (self.settings.render.caret_blink_interval_ms / 50)).is_multiple_of(2)
     }
 
     /// Advances the caret blink clock one UI tick. Returns true when the
@@ -2189,7 +2228,10 @@ impl AppState {
     /// Publishes completion rows with display descriptions.
     pub fn set_completion_items(&mut self, items: Vec<CompletionItem>) {
         self.completion = (!items.is_empty()).then_some(CompletionList {
-            items: items.into_iter().take(MAX_PICKER_VISIBLE_ROWS).collect(),
+            items: items
+                .into_iter()
+                .take(self.settings.display.picker_visible_rows)
+                .collect(),
             selected: 0,
         });
     }
@@ -3081,6 +3123,54 @@ mod tests {
         assert_eq!(compact[1].trim(), r#"host_exec {"argv":["cargo","test"]}"#);
         assert!(compact[2].contains("output-15:"));
         assert!(compact[11].contains("output-24:"));
+    }
+
+    #[test]
+    fn configured_preview_applies_to_existing_and_future_entries_and_cached_heights() {
+        let mut state = AppState::new();
+        let mut entry = Entry::new(EntryKind::Tool, "tool");
+        entry.push_line("parameters");
+        entry.compact_prefix = Some(1);
+        entry.folded = true;
+        for index in 0..20 {
+            entry.push_line(&format!("output-{index}"));
+        }
+        state.push_entry(entry.clone());
+        let previous_height = state.entry(0).unwrap().wrapped_len(120);
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.display.tool_preview_lines = 2;
+        state.set_settings(settings).unwrap();
+        state.push_entry(entry);
+        for index in 0..2 {
+            let entry = state.entry(index).unwrap();
+            let lines = render_entry_lines(entry, 120);
+            assert_eq!(entry.wrapped_len(120), lines.len());
+            assert!(entry.wrapped_len(120) < previous_height);
+            assert!(lines[0].contains("18 earlier lines"));
+            assert!(lines.iter().any(|line| line.trim() == "parameters"));
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.trim().starts_with("output-"))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn configured_blink_uses_the_requested_half_period_and_rejects_invalid_settings() {
+        let mut state = AppState::new();
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.render.caret_blink_interval_ms = 100;
+        state.set_settings(settings.clone()).unwrap();
+        assert!(state.caret_visible());
+        assert!(!state.tick_caret());
+        assert!(state.tick_caret());
+        assert!(!state.caret_visible());
+        settings.render.caret_blink_interval_ms = 0;
+        assert!(state.set_settings(settings).is_err());
+        assert_eq!(state.settings().render.caret_blink_interval_ms, 100);
     }
 
     #[test]

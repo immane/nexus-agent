@@ -56,9 +56,9 @@ use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsum
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig, SessionStoreHandle};
 use nexus_tui::decisions::{approve_notice_command, deny_notice_command};
 use nexus_tui::{
-    Action, AppState, CompletionItem, Focus, MAX_PICKER_VISIBLE_ROWS, ModelChoice, RefreshGate,
-    SessionArgs, SlashCommand, TOAST_TTL, TextSelection, cancel_command, cell_to_char_col,
-    install_panic_hook, map_key, next_focus, render, submit_command,
+    Action, AppState, CompletionItem, Focus, ModelChoice, RefreshGate, SessionArgs, SlashCommand,
+    TOAST_TTL, TextSelection, cancel_command, cell_to_char_col, install_panic_hook, map_key,
+    next_focus, render, submit_command,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -129,9 +129,14 @@ fn tui_runtime_limits() -> Limits {
 /// Fallible production composition: the runtime validates limits, provider
 /// capabilities, and every tool registration before any run can start, so an
 /// invalid demo wiring is an explicit startup error, never a hung run.
+#[cfg(test)]
 fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
+    build_demo_runtime(tui_runtime_limits())
+}
+
+fn build_demo_runtime(limits: Limits) -> io::Result<(Runtime, EventStreams)> {
     let config = RuntimeConfig {
-        limits: tui_runtime_limits(),
+        limits,
         policy: Policy::m0_test(),
         has_approval_handler: true,
     };
@@ -147,12 +152,9 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 /// from (so every session writes back to the same document) and the model the
 /// session boots with. The document itself has one shared owner across slots.
 ///
-/// The TUI takes no `--config` flag: the document's location is
-/// [`nexus_config`]'s documented precedence (CLI path, then `NEXUS_CONFIG`,
-/// then the platform default), and this binary has no argument parser to
-/// receive a path. Adding a second, TUI-local way to choose the file would
-/// duplicate that precedence with no consumer here, and would risk writing
-/// model usage back to a file the user did not mean to write.
+/// The provider/model document's location remains [`nexus_config`]'s
+/// `NEXUS_CONFIG` / platform default. Operational base and overlay files are
+/// resolved separately and never become the TUI's writeback target.
 ///
 /// The shared document is process-owned; each slot keeps its own runtime,
 /// active model, and history.
@@ -160,6 +162,7 @@ fn build_runtime() -> io::Result<(Runtime, EventStreams)> {
 struct SessionConfig {
     diagnostics: Option<diagnostics::DiagnosticLog>,
     user_config: SharedUserConfig,
+    settings: nexus_config::EffectiveSettings,
     active_model: Option<String>,
     /// Project root for real file reads/writes: `--tools-root`, else the working
     /// directory. `None` (tests only) keeps every tool scripted. Cloned
@@ -215,7 +218,21 @@ fn load_session_config() -> io::Result<SessionConfig> {
         StartupAction::Help => startup_usage(true),
         StartupAction::Usage => startup_usage(false),
     };
-    let mut session = session_config_at(resolve_path(None))?;
+    let settings = nexus_config::load_settings(
+        nexus_config::SettingsProfile::Tui,
+        args.base_config.as_deref(),
+        &args.config_overlays,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut session = session_config_at_with_settings(resolve_path(None), settings)?;
+    if args.check_config {
+        println!("Configuration is valid.");
+        std::process::exit(0);
+    }
+    if args.print_effective_config {
+        println!("{}", nexus_config::settings_json(&session.settings));
+        std::process::exit(0);
+    }
     let config = user_config_snapshot(&session.user_config);
     let (effective_gateway, effective_workload) = merge_startup_images(&args, &config);
     let mut effective_args = args.clone();
@@ -301,7 +318,17 @@ fn resolve_tools_root(cli: Option<std::path::PathBuf>) -> Option<std::path::Path
 /// Same contract as [`load_session_config`] with the resolved path supplied
 /// directly, so both the missing-file and invalid-file branches are testable
 /// without mutating the process environment.
+#[cfg(test)]
 fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConfig> {
+    let settings = nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    session_config_at_with_settings(path, settings)
+}
+
+fn session_config_at_with_settings(
+    path: Option<std::path::PathBuf>,
+    settings: nexus_config::EffectiveSettings,
+) -> io::Result<SessionConfig> {
     let config = match path.as_deref() {
         Some(path) => load_config(path)
             .map_err(|error| {
@@ -319,6 +346,7 @@ fn session_config_at(path: Option<std::path::PathBuf>) -> io::Result<SessionConf
     Ok(SessionConfig {
         diagnostics: None,
         user_config: shared_user_config(config, path),
+        settings,
         active_model,
         tools_root: None,
         strict_tools: false,
@@ -359,9 +387,9 @@ fn boot_model(config: &UserConfig) -> Option<String> {
         .cloned()
 }
 
-/// Startup arguments. The TUI takes no `--config` flag (see
-/// [`SessionConfig`]); flags select the project root, strict permissions,
-/// or the scripted demo.
+/// Startup arguments select operational-settings layers, the project root,
+/// strict permissions, or the scripted demo. Provider/model configuration
+/// remains selected by `NEXUS_CONFIG` or the platform config path.
 /// Without `--demo` nothing scripted ever serves: unconfigured runs fail
 /// with a not-configured diagnostic instead of a silent fake.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +405,10 @@ struct StartupArgs {
     execution: ExecutionMode,
     gateway_image: Option<String>,
     workload_image: Option<String>,
+    base_config: Option<std::path::PathBuf>,
+    config_overlays: Vec<std::path::PathBuf>,
+    check_config: bool,
+    print_effective_config: bool,
 }
 
 /// Argument-parser outcome: run with the parsed jail, or print usage.
@@ -401,6 +433,10 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     let mut execution_set = false;
     let mut gateway_image = None;
     let mut workload_image = None;
+    let mut base_config = None;
+    let mut config_overlays = Vec::new();
+    let mut check_config = false;
+    let mut print_effective_config = false;
     let mut args = argv.iter().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -436,6 +472,25 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
                     _ => return StartupAction::Usage,
                 };
             }
+            "--base-config" => {
+                if base_config.is_some() {
+                    return StartupAction::Usage;
+                }
+                base_config = match args.next() {
+                    Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                        Some(std::path::PathBuf::from(value))
+                    }
+                    _ => return StartupAction::Usage,
+                };
+            }
+            "--config-overlay" => match args.next() {
+                Some(value) if !value.is_empty() && !value.starts_with("--") => {
+                    config_overlays.push(std::path::PathBuf::from(value));
+                }
+                _ => return StartupAction::Usage,
+            },
+            "--check-config" => check_config = true,
+            "--print-effective-config" => print_effective_config = true,
             "--tools-root" => match args.next() {
                 Some(value) if !value.is_empty() => {
                     tools_root = Some(std::path::PathBuf::from(value));
@@ -452,6 +507,10 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
         execution,
         gateway_image,
         workload_image,
+        base_config,
+        config_overlays,
+        check_config,
+        print_effective_config,
     })
 }
 
@@ -468,6 +527,11 @@ fn startup_usage(help: bool) -> ! {
             "Workspace and tools:\n",
             "  --tools-root <PATH> Workspace jail; defaults to the current directory\n",
             "  --strict-tools      Use the strict jailed-tools policy\n\n",
+            "Operational settings:\n",
+            "  --base-config <PATH>       Replace the optional system base file\n",
+            "  --config-overlay <PATH>    Apply a partial overlay (repeatable)\n",
+            "  --check-config             Validate configuration and exit\n",
+            "  --print-effective-config   Print resolved runtime settings and exit\n\n",
             "Container images:\n",
             "  --gateway-image <IMAGE>    Gateway image (overrides configured image)\n",
             "  --container-image <IMAGE>  Workload image (overrides configured image)\n\n",
@@ -507,6 +571,7 @@ fn startup_usage(help: bool) -> ! {
 #[derive(Debug, Clone)]
 struct LiveSelection {
     config: UserConfig,
+    provider_settings: nexus_config::settings::ProviderSettings,
     active_model: Option<String>,
     /// Scripted demo explicitly requested. The resolver serves fakes only
     /// through this flag; an unconfigured selection without it fails
@@ -610,7 +675,9 @@ fn resolve_live_adapter(
             "selected model context configuration is invalid",
         );
     };
-    match OpenAiProvider::from_profile(profile, &entry.name) {
+    match OpenAiProvider::from_profile(profile, &entry.name)
+        .and_then(|adapter| adapter.with_operational_settings(&selection.provider_settings))
+    {
         Ok(adapter) => {
             let adapter = adapter.with_context_management(context_management);
             let capabilities = adapter.capabilities();
@@ -851,6 +918,7 @@ impl PerRunProvider {
     fn new() -> Self {
         Self::live(Arc::new(Mutex::new(LiveSelection {
             config: UserConfig::default_config(),
+            provider_settings: Default::default(),
             active_model: None,
             demo: true,
             pending_run: None,
@@ -901,9 +969,10 @@ impl ProviderPort for PerRunProvider {
                 format!("{}:{}:{}", entry.provider, entry.id, entry.name),
                 profile.clone(),
                 entry.name.clone(),
+                selection.provider_settings.clone(),
             )
         };
-        let (mut settings, cache_key, profile, model_name) = selection_info;
+        let (mut settings, cache_key, profile, model_name, provider_settings) = selection_info;
         if settings.window.is_some() {
             return settings;
         }
@@ -917,7 +986,9 @@ impl ProviderPort for PerRunProvider {
             settings.window = Some(window);
             return settings;
         }
-        let Ok(adapter) = OpenAiProvider::from_profile(&profile, &model_name) else {
+        let Ok(adapter) = OpenAiProvider::from_profile(&profile, &model_name)
+            .and_then(|adapter| adapter.with_operational_settings(&provider_settings))
+        else {
             return settings;
         };
         let adapter = adapter.with_context_management(settings);
@@ -1062,7 +1133,7 @@ fn build_live_runtime_with_store(
         }
     };
     let config = RuntimeConfig {
-        limits: tui_runtime_limits(),
+        limits: session_config.settings.limits(),
         policy,
         has_approval_handler: true,
     };
@@ -1128,6 +1199,7 @@ fn runtime_with_tools(
 ) -> io::Result<(Runtime, EventStreams, LiveHandle)> {
     let binding = Arc::new(Mutex::new(LiveSelection {
         config: user_config_snapshot(&session_config.user_config),
+        provider_settings: session_config.settings.provider().clone(),
         active_model: session_config.active_model.clone(),
         demo: session_config.demo,
         pending_run: None,
@@ -1234,7 +1306,9 @@ async fn run() -> io::Result<()> {
         );
     }
     if io::stdout().is_terminal() {
-        match nexus_tui::TerminalGuard::setup() {
+        match nexus_tui::TerminalGuard::setup_with_mouse(
+            session_config.settings.tui().input.mouse_capture,
+        ) {
             Ok(mut guard) => {
                 let report = interactive(session_config).await;
                 // Retryable restoration: a step that fails stays owned and is
@@ -1281,7 +1355,7 @@ async fn run() -> io::Result<()> {
                     )));
                 }
                 eprintln!("terminal setup failed ({error}); demo transcript fallback");
-                let (runtime, streams) = build_runtime()?;
+                let (runtime, streams) = build_demo_runtime(session_config.settings.limits())?;
                 headless(runtime, streams, session_config).await
             }
         }
@@ -1296,7 +1370,7 @@ async fn run() -> io::Result<()> {
                 "no terminal attached; relaunch with --demo for the scripted transcript fallback",
             ));
         }
-        let (runtime, streams) = build_runtime()?;
+        let (runtime, streams) = build_demo_runtime(session_config.settings.limits())?;
         headless(runtime, streams, session_config).await
     }
 }
@@ -1461,6 +1535,10 @@ impl Frontend {
             demo: config.demo,
             ..Self::new(session)
         };
+        front
+            .state
+            .set_settings(config.settings.tui().clone())
+            .expect("validated startup preferences");
         front.sync_model_display();
         // Composer modes: built-ins first, then configuration customs, with
         // the configured default (or `build`) selected.
@@ -1487,8 +1565,10 @@ impl Frontend {
             let mut binding = binding.lock().expect("live selection lockable");
             let pending_run = binding.pending_run.take();
             let pending_run_id = binding.pending_run_id.take();
+            let provider_settings = binding.provider_settings.clone();
             *binding = LiveSelection {
                 config,
+                provider_settings,
                 active_model: self.active_model.clone(),
                 demo: self.demo,
                 pending_run,
@@ -2028,10 +2108,6 @@ enum Input {
     Mouse(MouseEvent),
 }
 
-/// Mouse wheel notches per scroll step (M0-test choice: a few wrapped lines
-/// per notch, never a full page jump).
-const WHEEL_LINES: usize = 3;
-
 /// Applies one mouse report. Wheel notches scroll the expanded approval
 /// detail while it is open, else the conversation viewport; a left press
 /// starts a drag selection (body rows or the composer draft), dragging
@@ -2125,19 +2201,32 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Copies text to the system clipboard, silently on every path: no
-/// notice, no diagnostic. A platform helper goes first (`pbcopy` on macOS,
-/// `wl-copy`/`xclip`/`xsel` on Linux), because helpers work in every
-/// terminal while OSC 52 is honored only by some. OSC 52 stays as the
-/// fallback for the rest. Empty text never copies.
-fn yank_to_clipboard(text: &str) -> bool {
+/// Copies according to the selected backend, without diagnostics. Auto tries
+/// a platform helper before OSC 52; explicit backends never fall back.
+/// Disabled mode and empty text never invoke either backend.
+fn yank_to_clipboard(text: &str, mode: nexus_config::tui_settings::ClipboardMode) -> bool {
     if text.is_empty() {
         return false;
     }
-    if write_clipboard_helper(text) {
-        return true;
+    copy_with(text, mode, write_clipboard_helper, write_osc52)
+}
+
+fn copy_with(
+    text: &str,
+    mode: nexus_config::tui_settings::ClipboardMode,
+    system: impl FnOnce(&str) -> bool,
+    osc52: impl FnOnce(&str) -> bool,
+) -> bool {
+    use nexus_config::tui_settings::ClipboardMode;
+    if text.is_empty() {
+        return false;
     }
-    write_osc52(text)
+    match mode {
+        ClipboardMode::Auto => system(text) || osc52(text),
+        ClipboardMode::System => system(text),
+        ClipboardMode::Osc52 => osc52(text),
+        ClipboardMode::Disabled => false,
+    }
 }
 
 /// Selects the platform clipboard helper (program plus argv), or `None`
@@ -2333,6 +2422,10 @@ fn find_project_paths(root: &std::path::Path, query: &str) -> Vec<String> {
 }
 
 fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
+    if !front.state.settings().input.mouse_capture {
+        return false;
+    }
+    let wheel_lines = front.state.settings().input.scroll_lines;
     // The mouse never completes a `:` command: a press disarms it so a
     // later letter cannot fire behind a click.
     if matches!(mouse.kind, MouseEventKind::Down(_)) {
@@ -2342,18 +2435,18 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
         MouseEventKind::ScrollUp => {
             front.pointer_press = None;
             if front.state.approval_detail_open() {
-                front.state.approval_detail_scroll(-(WHEEL_LINES as isize));
+                front.state.approval_detail_scroll(-(wheel_lines as isize));
             } else {
-                front.state.scroll_up(WHEEL_LINES);
+                front.state.scroll_up(wheel_lines);
             }
             true
         }
         MouseEventKind::ScrollDown => {
             front.pointer_press = None;
             if front.state.approval_detail_open() {
-                front.state.approval_detail_scroll(WHEEL_LINES as isize);
+                front.state.approval_detail_scroll(wheel_lines as isize);
             } else {
-                front.state.scroll_down(WHEEL_LINES);
+                front.state.scroll_down(wheel_lines);
             }
             true
         }
@@ -2404,7 +2497,13 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
                 Some(text) if !text.is_empty() => text,
                 _ => return false,
             };
-            yank_to_clipboard(&text);
+            if !front.state.settings().input.copy_on_select {
+                return true;
+            }
+            let copied = yank_to_clipboard(&text, front.state.settings().input.clipboard);
+            if !copied {
+                return true;
+            }
             front.state.clear_text_selection();
             front
                 .state
@@ -3011,8 +3110,14 @@ fn handle_overlay_key(front: &mut Frontend, key: KeyEvent) -> bool {
         KeyCode::Enter => confirm_model_picker(front),
         KeyCode::Up => move_picker(front, -1),
         KeyCode::Down => move_picker(front, 1),
-        KeyCode::PageUp => move_picker(front, -(MAX_PICKER_VISIBLE_ROWS as isize)),
-        KeyCode::PageDown => move_picker(front, MAX_PICKER_VISIBLE_ROWS as isize),
+        KeyCode::PageUp => {
+            let rows = front.state.picker_page_rows() as isize;
+            move_picker(front, -rows);
+        }
+        KeyCode::PageDown => {
+            let rows = front.state.picker_page_rows() as isize;
+            move_picker(front, rows);
+        }
         KeyCode::Home => {
             let count = front.state.picker_matches().len();
             front.state.picker_move(isize::MIN, count);
@@ -3478,11 +3583,13 @@ async fn handle_key_with_runtime(
             // press falls through instead of swallowing it.
             match selection_text(&front.state) {
                 Some(text) if !text.is_empty() => {
-                    yank_to_clipboard(&text);
+                    let copied = yank_to_clipboard(&text, front.state.settings().input.clipboard);
                     front.state.clear_text_selection();
-                    front
-                        .state
-                        .set_toast(format!("copied {} chars", text.chars().count()), TOAST_TTL);
+                    if copied {
+                        front
+                            .state
+                            .set_toast(format!("copied {} chars", text.chars().count()), TOAST_TTL);
+                    }
                     return false;
                 }
                 _ => front.state.clear_text_selection(),
@@ -3602,7 +3709,15 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
         session_config,
         session_store,
     );
-    let mut gate = RefreshGate::m0_test();
+    let mut gate = RefreshGate::new(Duration::from_millis(
+        sessions
+            .active()
+            .front
+            .state
+            .settings()
+            .render
+            .redraw_interval_ms,
+    ));
     let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -5886,6 +6001,8 @@ mod cov_main_topup {
         SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model: None,
             tools_root: None,
             demo: false,
@@ -5931,6 +6048,8 @@ mod cov_main_topup {
         SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(config, None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model,
             tools_root: None,
             demo: false,
@@ -6778,6 +6897,10 @@ mod cov_main_topup {
         let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
         let binding = Arc::new(Mutex::new(LiveSelection {
             config: front.config_snapshot(),
+            provider_settings: nexus_config::settings::ProviderSettings {
+                fallback_call_timeout_seconds: 123,
+                ..Default::default()
+            },
             active_model: Some("m0".to_owned()),
             demo: false,
             pending_run: None,
@@ -6797,6 +6920,11 @@ mod cov_main_topup {
         let captured = binding.pending_run.take().expect("submit snapshot");
         assert_eq!(captured.active_model.as_deref(), Some("m0"));
         assert_eq!(binding.active_model.as_deref(), Some("m1"));
+        assert_eq!(
+            captured.provider_settings.fallback_call_timeout_seconds,
+            123
+        );
+        assert_eq!(binding.provider_settings, captured.provider_settings);
     }
 
     #[test]
@@ -6804,6 +6932,7 @@ mod cov_main_topup {
         let mut front = Frontend::with_config(session(), configured(2, &[], &[]));
         let binding = Arc::new(Mutex::new(LiveSelection {
             config: front.config_snapshot(),
+            provider_settings: Default::default(),
             active_model: Some("m0".to_owned()),
             demo: false,
             pending_run: None,
@@ -6838,6 +6967,7 @@ mod cov_main_topup {
     fn provider_discards_snapshot_owned_by_a_different_run() {
         let mut selection = LiveSelection {
             config: user_config_snapshot(&configured(2, &[], &[]).user_config),
+            provider_settings: Default::default(),
             active_model: Some("m1".to_owned()),
             demo: false,
             pending_run: None,
@@ -8636,6 +8766,7 @@ mod cov_live_wiring {
         config.add_model(entry).expect("model admits");
         LiveSelection {
             config,
+            provider_settings: Default::default(),
             active_model: active_model.map(str::to_owned),
             demo: true,
             pending_run: None,
@@ -8687,6 +8818,7 @@ mod cov_live_wiring {
     fn no_selection_without_demo_fails_instead_of_serving_fakes() {
         let mut selection = LiveSelection {
             config: UserConfig::default_config(),
+            provider_settings: Default::default(),
             active_model: None,
             demo: false,
             pending_run: None,
@@ -8712,6 +8844,7 @@ mod cov_live_wiring {
     fn no_selection_serves_the_demo_script() {
         let selection = LiveSelection {
             config: UserConfig::default_config(),
+            provider_settings: Default::default(),
             active_model: None,
             demo: true,
             pending_run: None,
@@ -8896,6 +9029,7 @@ mod cov_live_wiring {
         config.add_model(entry).expect("model admits");
         let selection = LiveSelection {
             config,
+            provider_settings: Default::default(),
             active_model: Some("m0".to_owned()),
             demo: true,
             pending_run: None,
@@ -8932,6 +9066,8 @@ mod cov_live_wiring {
         let session = SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model: None,
             tools_root: Some(missing),
             demo: false,
@@ -8960,6 +9096,8 @@ mod cov_live_wiring {
         let session = SessionConfig {
             diagnostics: None,
             user_config: shared_user_config(UserConfig::default_config(), None),
+            settings: nexus_config::load_settings(nexus_config::SettingsProfile::Tui, None, &[])
+                .unwrap(),
             active_model: None,
             tools_root: None,
             demo: false,
@@ -8995,5 +9133,96 @@ mod cov_live_wiring {
                 ..
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+    use nexus_config::tui_settings::ClipboardMode;
+    use std::cell::Cell;
+
+    #[test]
+    fn clipboard_modes_call_only_the_selected_backends() {
+        for (mode, system_ok, expected_system, expected_osc, expected_result) in [
+            (ClipboardMode::Auto, true, true, false, true),
+            (ClipboardMode::Auto, false, true, true, true),
+            (ClipboardMode::System, false, true, false, false),
+            (ClipboardMode::Osc52, false, false, true, true),
+            (ClipboardMode::Disabled, true, false, false, false),
+        ] {
+            let system_called = Cell::new(false);
+            let osc_called = Cell::new(false);
+            let result = copy_with(
+                "selection",
+                mode,
+                |_| {
+                    system_called.set(true);
+                    system_ok
+                },
+                |_| {
+                    osc_called.set(true);
+                    true
+                },
+            );
+            assert_eq!(result, expected_result);
+            assert_eq!(system_called.get(), expected_system);
+            assert_eq!(osc_called.get(), expected_osc);
+        }
+        assert!(!copy_with(
+            "",
+            ClipboardMode::Auto,
+            |_| panic!("empty copy"),
+            |_| panic!("empty copy")
+        ));
+    }
+
+    #[test]
+    fn disabled_mouse_leaves_presentation_untouched() {
+        let mut front = Frontend::new(SessionId::new("preferences").unwrap());
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.input.mouse_capture = false;
+        front.state.set_settings(settings).unwrap();
+        front.state.composer_type('x');
+        assert!(!handle_mouse(
+            &mut front,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }
+        ));
+        assert_eq!(front.state.composer(), "x");
+    }
+
+    #[test]
+    fn wheel_distance_and_copy_on_select_are_configurable() {
+        let mut front = Frontend::new(SessionId::new("preferences").unwrap());
+        let mut settings = nexus_config::TuiSettings::default();
+        settings.input.scroll_lines = 7;
+        settings.input.copy_on_select = false;
+        front.state.set_settings(settings).unwrap();
+        for _ in 0..30 {
+            front.state.notice("history");
+        }
+        front.state.set_viewport(80, 5);
+        let event = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(handle_mouse(&mut front, event(MouseEventKind::ScrollUp)));
+        assert_eq!(front.state.scrollback(), 7);
+        front.state.composer_type('x');
+        front.state.begin_composer_selection(0);
+        front.state.extend_composer_selection(1);
+        assert!(handle_mouse(
+            &mut front,
+            event(MouseEventKind::Up(MouseButton::Left))
+        ));
+        assert!(front.state.text_selection().is_some());
+        assert!(front.state.toast().is_none());
     }
 }

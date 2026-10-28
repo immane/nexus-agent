@@ -1,10 +1,11 @@
 //! `nexus-config`: typed user configuration with file persistence.
 //!
-//! This crate owns exactly one of the representations
+//! This crate owns the user and operational representations
 //! [05-configuration](../docs/contracts/05-configuration.md) requires:
 //! provider profiles, model entries, favourite models, and recently used
-//! models, stored as one versioned JSON document. It does NOT cover tool
-//! registrations, plugin profiles, runtime policy, or session policy; those
+//! models, stored as one versioned JSON document. Operational settings use
+//! separate layered JSONC documents (see [`settings`]). It does NOT cover tool
+//! registrations, plugin profiles, or session policy; those
 //! stay with their owning slices until each selects its representation.
 //!
 //! # Secrets
@@ -64,22 +65,29 @@
 //! # Dependency justification
 //!
 //! `nexus-core` supplies validated context-management types. `nexus-validation`
-//! supplies the strict duplicate-rejecting parse. `serde_json` owns lexing
-//! and the in-memory value model. Filesystem access is confined to
-//! [`load`]/[`save`] with atomic writes; no network, no discovery, no
-//! plugin launch during loading.
+//! supplies strict duplicate-rejecting user-JSON parsing. `serde_json` owns
+//! the JSON representation; typed operational settings also accept JSON comments.
+//! Filesystem access is confined to loading and saving; user saves are atomic.
+//! No network, discovery, or plugin launch occurs during loading.
 
 #![forbid(unsafe_code)]
 
 pub mod model;
+pub mod settings;
 pub mod store;
+pub mod tui_settings;
 
 pub use model::{
     AdapterKind, AgentMode, CredentialRef, MODE_BUILD, MODE_PLAN, ModelEntry, ProtocolKind,
     ProviderProfile, UserConfig,
+};
+pub use settings::{
+    EffectiveSettings, ProviderSettings, SettingsProfile, default_base_path, load_settings,
+    settings_json,
 };
 pub use store::{
     CONFIG_ENV_VAR, CONFIG_FILE_NAME, ConfigError, ConfigErrorKind, default_path,
     default_path_with, load, resolve_credential, resolve_path, resolve_path_with, resolve_with,
     save, summary,
 };
+pub use tui_settings::{ThemeSettings, TuiSettings};
