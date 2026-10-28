@@ -759,7 +759,7 @@ impl Server {
             .and_then(|adapter| adapter.with_operational_settings(&self.provider_settings))
             .map(|adapter| {
                 let adapter = adapter.with_context_management(context_management);
-                if adapter.is_ollama_endpoint() {
+                if adapter.supports_context_discovery() {
                     adapter.discover_context_management()
                 } else {
                     adapter

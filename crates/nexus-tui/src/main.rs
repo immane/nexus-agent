@@ -986,7 +986,16 @@ impl ProviderPort for PerRunProvider {
             };
             (
                 settings,
-                format!("{}:{}:{}", entry.provider, entry.id, entry.name),
+                format!(
+                    "{:?}",
+                    (
+                        &entry.provider,
+                        &entry.id,
+                        &entry.name,
+                        &profile.endpoint,
+                        profile.protocol
+                    )
+                ),
                 profile.clone(),
                 entry.name.clone(),
                 selection.provider_settings.clone(),
@@ -1013,7 +1022,7 @@ impl ProviderPort for PerRunProvider {
         };
         let adapter = adapter.with_context_management(settings);
         if let Some(window) = adapter
-            .is_ollama_endpoint()
+            .supports_context_discovery()
             .then(|| {
                 adapter
                     .discover_context_management()

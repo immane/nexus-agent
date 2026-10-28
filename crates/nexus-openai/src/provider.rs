@@ -29,6 +29,7 @@ const MAX_SSE_RECORD_BYTES: usize = MAX_RESPONSE_BYTES;
 /// Maximum vendor model name in bytes, matching the configuration bound.
 pub const MAX_MODEL_LEN: usize = 128;
 const MAX_CONTEXT_METADATA_BYTES: usize = 256 * 1024;
+const MAX_CATALOG_BYTES: usize = 12 * 1024 * 1024;
 /// Maximum response head (status line plus headers) in bytes. Anything
 /// larger fails instead of accumulating unboundedly while the head is still
 /// incomplete.
@@ -355,18 +356,26 @@ impl OpenAiProvider {
         self
     }
 
-    /// Best-effort Ollama model metadata discovery. Explicit configuration
-    /// wins; unsupported endpoints, malformed metadata, and transient failures
-    /// leave the window unknown. This is a bounded, read-only `/api/show`
-    /// request to the already-configured origin, not model-name inference.
+    /// Best-effort model metadata discovery. Explicit configuration wins;
+    /// malformed metadata and transient failures leave the window unknown.
+    /// Frontends should use `supports_context_discovery` before calling this.
     #[must_use]
-    pub fn discover_context_management(mut self) -> Self {
+    pub fn discover_context_management(self) -> Self {
         if self.context_management.window.is_some()
             || self.protocol != ProtocolKind::ChatCompletions
         {
             return self;
         }
-        if let Some(tokens) = self.discover_ollama_context_window()
+        let tokens = if self.is_opencode_go_endpoint() {
+            self.discover_opencode_go_context_window()
+        } else {
+            self.discover_ollama_context_window()
+        };
+        self.apply_discovered_context(tokens)
+    }
+
+    fn apply_discovered_context(mut self, tokens: Option<u32>) -> Self {
+        if let Some(tokens) = tokens
             && let Ok(window) = nexus_core::ContextWindow::new(
                 tokens,
                 nexus_core::ContextWindowSource::ModelMetadata,
@@ -383,6 +392,41 @@ impl OpenAiProvider {
     pub fn is_ollama_endpoint(&self) -> bool {
         self.protocol == ProtocolKind::ChatCompletions
             && (self.port == 11_434 || self.host.to_ascii_lowercase().contains("ollama"))
+    }
+
+    /// Whether this is the official OpenCode Go Chat Completions endpoint.
+    #[must_use]
+    pub fn is_opencode_go_endpoint(&self) -> bool {
+        self.protocol == ProtocolKind::ChatCompletions
+            && self.use_tls
+            && self.host.eq_ignore_ascii_case("opencode.ai")
+            && self.port == 443
+            && self.base_path == "/inference/go/openai/v1"
+    }
+
+    /// Whether the frontend should attempt automatic metadata discovery.
+    #[must_use]
+    pub fn supports_context_discovery(&self) -> bool {
+        self.is_ollama_endpoint() || self.is_opencode_go_endpoint()
+    }
+
+    fn discover_opencode_go_context_window(&self) -> Option<u32> {
+        let catalog = Self::new("https://models.dev", self.credential.clone(), &self.model)
+            .ok()?
+            .with_operational_settings(&self.operational_settings)
+            .ok()?;
+        self.discover_opencode_go_from(&catalog)
+    }
+
+    fn discover_opencode_go_from(&self, catalog: &Self) -> Option<u32> {
+        let address = join_host_port(&catalog.host, catalog.port);
+        let request = format!(
+            "GET /api.json HTTP/1.1\r\nhost: {address}\r\nuser-agent: nexus-agent/{}\r\naccept: application/json\r\nconnection: close\r\n\r\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let response =
+            read_context_metadata_response(catalog, request.as_bytes(), MAX_CATALOG_BYTES)?;
+        parse_opencode_go_context_window(&response, &self.model)
     }
 
     fn discover_ollama_context_window(&self) -> Option<u32> {
@@ -403,7 +447,7 @@ impl OpenAiProvider {
         );
         let mut request = head.into_bytes();
         request.extend_from_slice(&body);
-        let response = read_context_metadata_response(self, &request)?;
+        let response = read_context_metadata_response(self, &request, MAX_CONTEXT_METADATA_BYTES)?;
         parse_ollama_context_window(&response)
     }
 
@@ -1041,7 +1085,11 @@ fn write_request(
 
 /// Sends one tightly bounded metadata request using the provider's configured
 /// origin. Discovery is deliberately not retried and never changes run state.
-fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> Option<Vec<u8>> {
+fn read_context_metadata_response(
+    provider: &OpenAiProvider,
+    request: &[u8],
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
     // The request is already assembled and bounded. Split at the HTTP header
     // terminator so the verified TLS helper can write the exact wire bytes.
     let boundary = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")? + 4;
@@ -1078,7 +1126,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
             {
                 Some(chunk) => {
                     response.extend_from_slice(&chunk);
-                    if response.len() > MAX_CONTEXT_METADATA_BYTES {
+                    if response.len() > max_bytes {
                         return None;
                     }
                 }
@@ -1103,7 +1151,7 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
                 Ok(0) => break,
                 Ok(read) => {
                     response.extend_from_slice(&buffer[..read]);
-                    if response.len() > MAX_CONTEXT_METADATA_BYTES {
+                    if response.len() > max_bytes {
                         return None;
                     }
                 }
@@ -1125,8 +1173,140 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
     {
         return None;
     }
-    let body = decode_body(head, &response[boundary + 4..]);
-    (body.len() <= MAX_CONTEXT_METADATA_BYTES).then_some(body)
+    let body = if head.to_ascii_lowercase().contains("chunked") {
+        dechunk_bounded(&response[boundary + 4..], max_bytes)?
+    } else {
+        response[boundary + 4..].to_vec()
+    };
+    (body.len() <= max_bytes).then_some(body)
+}
+
+fn parse_opencode_go_context_window(response: &[u8], model: &str) -> Option<u32> {
+    let value: Value = serde_json::from_slice(response).ok()?;
+    value
+        .get("opencode-go")?
+        .get("models")?
+        .get(model)?
+        .get("limit")?
+        .get("context")?
+        .as_u64()
+        .and_then(|tokens| u32::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use nexus_core::{ContextWindow, ContextWindowSource, ProviderPort};
+    use std::net::TcpListener;
+
+    fn adapter(endpoint: &str, protocol: ProtocolKind) -> OpenAiProvider {
+        OpenAiProvider::new_for_protocol(
+            endpoint,
+            CredentialRef::env_var("CATALOG_TEST_UNUSED").unwrap(),
+            "model-a",
+            protocol,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_requires_exact_provider_model_and_positive_u32_limit() {
+        let json = br#"{"opencode-go":{"models":{"model-a":{"limit":{"context":1000000}},"zero":{"limit":{"context":0}},"huge":{"limit":{"context":4294967296}}}},"other":{"models":{"missing":{"limit":{"context":123}}}}}"#;
+        assert_eq!(
+            parse_opencode_go_context_window(json, "model-a"),
+            Some(1_000_000)
+        );
+        for model in ["Model-a", "missing", "zero", "huge"] {
+            assert_eq!(parse_opencode_go_context_window(json, model), None);
+        }
+        assert_eq!(
+            parse_opencode_go_context_window(b"not json", "model-a"),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_and_configured_precedence() {
+        let official = adapter(
+            "https://opencode.ai/inference/go/openai/v1",
+            ProtocolKind::ChatCompletions,
+        );
+        assert!(official.supports_context_discovery());
+        for endpoint in [
+            "http://opencode.ai/inference/go/openai/v1",
+            "https://opencode.ai:444/inference/go/openai/v1",
+            "https://opencode.ai.example/inference/go/openai/v1",
+            "https://opencode.ai/inference/go/openai/v2",
+        ] {
+            assert!(!adapter(endpoint, ProtocolKind::ChatCompletions).supports_context_discovery());
+        }
+        assert!(
+            !adapter(
+                "https://opencode.ai/inference/go/openai/v1",
+                ProtocolKind::OpenAiResponses
+            )
+            .supports_context_discovery()
+        );
+        let settings = nexus_core::ContextManagementSettings {
+            window: Some(ContextWindow::new(42_000, ContextWindowSource::Configured).unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            official
+                .with_context_management(settings)
+                .discover_context_management()
+                .context_management(),
+            settings
+        );
+    }
+
+    #[test]
+    fn catalog_request_is_unauthenticated_and_worker_finishes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let body = r#"{"opencode-go":{"models":{"model-a":{"limit":{"context":1000000}}}}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let official = adapter(
+            "https://opencode.ai/inference/go/openai/v1",
+            ProtocolKind::ChatCompletions,
+        );
+        let catalog = adapter(&format!("http://{address}"), ProtocolKind::ChatCompletions);
+        let tokens = official.discover_opencode_go_from(&catalog);
+        let window = official
+            .apply_discovered_context(tokens)
+            .context_management()
+            .window
+            .unwrap();
+        assert_eq!(window.tokens(), 1_000_000);
+        assert_eq!(window.source(), ContextWindowSource::ModelMetadata);
+        let request = worker.join().unwrap();
+        assert!(request.starts_with("GET /api.json HTTP/1.1\r\n"));
+        assert!(!request.to_ascii_lowercase().contains("authorization"));
+        assert!(request.contains(concat!(
+            "user-agent: nexus-agent/",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
 }
 
 /// Reads the positive context limit exposed by Ollama's model-details API.
@@ -2442,6 +2622,10 @@ fn decode_body(head: &str, body: &[u8]) -> Vec<u8> {
 /// Byte-level `Transfer-Encoding: chunked` decoder. Returns `None` on any
 /// framing violation.
 fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
+    dechunk_bounded(body, MAX_RESPONSE_BYTES)
+}
+
+fn dechunk_bounded(body: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(body.len());
     let mut cursor = 0;
     loop {
@@ -2453,7 +2637,7 @@ fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
         if size == 0 {
             return Some(out);
         }
-        if out.len().saturating_add(size) > MAX_RESPONSE_BYTES {
+        if out.len().saturating_add(size) > max_bytes {
             return None;
         }
         let end = cursor.checked_add(size)?;

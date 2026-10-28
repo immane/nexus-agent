@@ -457,8 +457,15 @@ that object use the built-in defaults, not individual global fields.
 A model entry may set `context_window_tokens`, for example `94208` for a
 92 × 1024-token window. A provider may set the same field for its
 `default_model` only; selecting another model does not inherit that limit.
-Explicit model limits take precedence. Missing windows remain unknown;
-zero, explicit null, and invalid types are rejected.
+Explicit model limits take precedence. For the official OpenCode Go endpoint,
+Nexus can also discover the selected model's context window from the public
+models.dev catalog, without sending provider credentials to the catalog. This
+requires network access and catalog metadata can change; a failed lookup or an
+unknown model leaves the window unknown. Discovered limits are held in memory,
+not written into the user config; catalog metadata does not guarantee the
+serving instance's effective limit. Set an explicit limit when the service
+requires a different one. Ollama uses its own model metadata.
+Zero, explicit null, and invalid types are rejected.
 
 TUI/server pass these settings through the provider interface; the runtime
 snapshots them at admission. A known window enables automatic reduction before
