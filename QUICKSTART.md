@@ -218,11 +218,32 @@ limits, run/tool/approval timeouts, retained context, argument assembly and
 tool output byte limits, event channel capacities, and concurrent operations.
 Only `tui` and `server` profiles belong in the shared `base.jsonc`.
 [`config/benchmark.jsonc`](config/benchmark.jsonc) is an ordinary settings file
-with the same schema, provided as an example for benchmark runs. Pass any file
-name using the existing `--base-config PATH` or `--config-overlay PATH`; for
-example, use `--benchmark-pilot --base-config config/benchmark.jsonc`. There is
-no benchmark-specific config option, environment variable, or reserved file
-name. Provider sections include `connect_timeout_seconds` (10),
+with the same schema, provided as an example for benchmark budgets. Use it with
+`--benchmark-pilot --base-config config/benchmark.jsonc`; the benchmark profile
+also supplies these runtime limits by default. This file does **not** select
+container execution, real tools, images, or credentials. A benchmark pilot
+requires a container-enabled build, explicit container/real-tool selection,
+immutable gateway and workload image references, and an auth-token environment
+variable. For example, after preparing the images and provider config:
+
+```sh
+cargo run -p nexus-server --features container --locked --offline -- \
+  --benchmark-pilot \
+  --base-config config/benchmark.jsonc \
+  --config /path/to/provider-config.json \
+  --execution container --tools real \
+  --gateway-image 'GATEWAY@sha256:DIGEST' \
+  --container-image 'WORKLOAD@sha256:DIGEST' \
+  --auth-token-env NEXUS_BENCH_SMOKE_TOKEN
+```
+
+Set `NEXUS_BENCH_SMOKE_TOKEN` and the provider credential referenced by the
+selected user config in the environment of the server process; never put secret
+values in config files or command arguments. Replace the image placeholders
+with valid immutable references. See the [benchmark run notes](docs/research/agent-benchmarks.md)
+for image preparation and workspace requirements. There is no benchmark-specific
+config option, environment variable, or reserved file name. Provider sections
+include `connect_timeout_seconds` (10),
 `context_discovery_timeout_seconds` (2), `fallback_call_timeout_seconds` (600),
 and `retry_backoff_seconds` ([1, 2, 5, 10, 30, 60]). Frontend presentation
 overrides belong in top-level `tui`, `defaults.tui`, or `profiles.tui.tui`; nested partial
