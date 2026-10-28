@@ -11,7 +11,7 @@
 //!   `Alt`-decorated approval letters, which must not reach `ApproveOnce`,
 //!   `Deny`, or `InspectApproval`;
 //! - focus cycling reaches the approval card only while a decision is
-//!   actually pending, and cycles are closed;
+//!   actually pending, and navigation never implicitly enters the composer;
 //! - approve/deny/inspect intents require the approval card focus, and a
 //!   held key (`Repeat`/`Release`) produces no second decision.
 //!
@@ -332,12 +332,12 @@ fn q_is_prompt_text_or_unbound_never_a_quit_shortcut() {
 
 #[test]
 fn control_combos_outside_the_table_map_to_none() {
-    // Only `Ctrl+c` (cancel), Composer `Ctrl+j` (newline), and `Ctrl+t`
-    // (variant) are bound, so every other control chord must be dropped
+    // Only `Ctrl+c` (cancel), `Ctrl+r` (reasoning), Composer `Ctrl+j`
+    // (newline), and `Ctrl+t` (variant) are bound, so other chords must be dropped
     // rather than aliased onto one of them.
     let stray_controls = [
         control('a'),
-        control('r'),
+        control('R'),
         control('i'),
         control('q'),
         control('n'),
@@ -352,8 +352,12 @@ fn control_combos_outside_the_table_map_to_none() {
     ];
     for focus in ALL_FOCUSES {
         for event in stray_controls {
-            expect_none(focus, event, "Ctrl is only bound to c, Composer j, and t");
-            expect_no_escape_hatch(focus, event, "Ctrl is only bound to c, j, and t");
+            expect_none(
+                focus,
+                event,
+                "Ctrl is only bound to c, r, Composer j, and t",
+            );
+            expect_no_escape_hatch(focus, event, "Ctrl is only bound to c, r, j, and t");
         }
     }
     // `Ctrl+J` (uppercase, i.e. a real held Ctrl) is not the newline binding;
@@ -648,10 +652,10 @@ fn focus_cycle_reaches_the_approval_card_only_while_a_decision_is_pending() {
     for (focus, pending, expected) in [
         (Focus::Composer, false, Focus::Viewport),
         (Focus::Composer, true, Focus::Viewport),
-        (Focus::Viewport, false, Focus::Composer),
+        (Focus::Viewport, false, Focus::Viewport),
         (Focus::Viewport, true, Focus::ApprovalCard),
-        (Focus::ApprovalCard, false, Focus::Composer),
-        (Focus::ApprovalCard, true, Focus::Composer),
+        (Focus::ApprovalCard, false, Focus::Viewport),
+        (Focus::ApprovalCard, true, Focus::Viewport),
     ] {
         assert_eq!(
             next_focus(focus, pending),
@@ -671,43 +675,37 @@ fn approval_card_is_unreachable_without_a_pending_decision() {
         );
     }
     // A parked approval card (the decision already answered) also steps to
-    // the composer instead of trapping focus on a stale card.
-    assert_eq!(next_focus(Focus::ApprovalCard, false), Focus::Composer);
+    // the viewport instead of trapping focus on a stale card.
+    assert_eq!(next_focus(Focus::ApprovalCard, false), Focus::Viewport);
 }
 
 #[test]
-fn focus_cycles_are_closed_with_and_without_a_pending_approval() {
-    // With a pending decision the three cards form one closed cycle of
-    // period three, from every starting point.
+fn focus_navigation_stays_in_normal_mode_with_and_without_a_pending_approval() {
+    // A pending decision cycles only between viewport and approval. Composer
+    // focus is transient and cannot be re-entered through focus navigation.
     for start in ALL_FOCUSES {
-        let mut focus = start;
-        for _ in 0..3 {
+        let settled = next_focus(start, true);
+        let mut focus = settled;
+        for _ in 0..2 {
             focus = next_focus(focus, true);
+            assert_ne!(focus, Focus::Composer);
         }
         assert_eq!(
-            focus, start,
+            focus, settled,
             "the pending-approval cycle is closed from {start:?}"
         );
     }
-    // Without one, the approval card is transient rather than cyclic: a
-    // parked card steps out to the composer and can never be returned to,
-    // so focus settles onto the composer/viewport cycle of period two.
-    assert_eq!(next_focus(Focus::ApprovalCard, false), Focus::Composer);
-    for start in [Focus::Composer, Focus::Viewport] {
+    // Without a decision every starting point settles in the viewport.
+    for start in ALL_FOCUSES {
         let mut focus = start;
         for _ in 0..2 {
             focus = next_focus(focus, false);
-            assert_ne!(
+            assert_eq!(
                 focus,
-                Focus::ApprovalCard,
-                "step from {start:?} entered the approval card with no pending \
-                 decision"
+                Focus::Viewport,
+                "idle navigation from {start:?} must stay in normal mode"
             );
         }
-        assert_eq!(
-            focus, start,
-            "the idle focus cycle is closed from {start:?}"
-        );
     }
 }
 
@@ -724,13 +722,13 @@ fn tab_cycling_respects_the_pending_gate_before_any_decision_key() {
         Some(Action::Type('a'))
     );
 
-    // Outside the composer Tab still hands the keyboard over.
+    // Without a pending decision Tab outside the composer stays in normal mode.
     for focus in [Focus::Viewport, Focus::ApprovalCard] {
         assert_eq!(map_key(focus, key(KeyCode::Tab)), Some(Action::FocusSwitch));
-        assert_ne!(
+        assert_eq!(
             next_focus(focus, false),
-            focus,
-            "a focus switch from {focus:?} must change cards"
+            Focus::Viewport,
+            "idle navigation from {focus:?} must return to normal mode"
         );
     }
 
@@ -754,11 +752,21 @@ fn tab_cycling_respects_the_pending_gate_before_any_decision_key() {
     }
     // Esc steps back out of the approval card without deciding.
     assert_eq!(map_key(focus, key(KeyCode::Esc)), Some(Action::ParkFocus));
-    assert_eq!(next_focus(focus, true), Focus::Composer);
+    let parked = next_focus(focus, true);
+    assert_eq!(parked, Focus::Viewport);
+    assert_eq!(
+        map_key(parked, key(KeyCode::Char('d'))),
+        None,
+        "after parking, d neither types nor denies"
+    );
+    assert_eq!(
+        map_key(parked, key(KeyCode::Char('i'))),
+        Some(Action::Insert)
+    );
     assert_eq!(
         map_key(Focus::Composer, key(KeyCode::Char('d'))),
         Some(Action::Type('d')),
-        "after parking, d is text again, never a deny"
+        "after explicitly entering the composer, d is text again, never a deny"
     );
 }
 

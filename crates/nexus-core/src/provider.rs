@@ -1592,12 +1592,16 @@ mod tests {
         let seen = seen.lock().expect("sink log readable");
         assert_eq!(
             seen.len(),
-            1,
-            "only the non-terminal prefix travels the default sink"
+            2,
+            "reasoning and text travel the default sink, but candidates and terminals do not"
         );
+        assert!(matches!(
+            &seen[0],
+            ProviderEvent::ReasoningDelta { text } if text == "hidden trace"
+        ));
         assert!(
             matches!(
-                &seen[0],
+                &seen[1],
                 ProviderEvent::TextDelta { item_key, text }
                 if item_key == "item-0" && text == "hi"
             ),

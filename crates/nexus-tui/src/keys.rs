@@ -39,6 +39,7 @@
 //! | Approval | `Esc` | Close the expanded detail, else return to normal mode |
 //! | Any | `Ctrl+C` | Clear the composer first; then cancel while cancellable (caller checks
 //! [`crate::AppState::can_cancel`]), else quit |
+//! | Any | `Ctrl+R` | Show/hide all provider reasoning (saved preference) |
 //!
 //! Approval/deny intents are only produced while [`Focus::ApprovalCard`]
 //! owns the keyboard; the DO-NOT-COPY list (always-approve toggles,

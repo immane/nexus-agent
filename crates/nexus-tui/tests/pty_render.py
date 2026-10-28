@@ -105,7 +105,14 @@ def check(binary, width, height, config):
         assert row(height - 2).startswith("└") and row(height - 2).endswith("┘"), label
 
     try:
-        initial = drain(1)
+        initial = b""
+        deadline = time.monotonic() + 10
+        # Wait for a complete first frame, not a fixed startup sleep: fresh
+        # binaries and loaded CI runners can take longer to enter the TUI.
+        while b"\x1b[?25l" not in initial:
+            initial += drain(0.1)
+            assert proc.poll() is None, ("TUI exited before its first frame", initial)
+            assert time.monotonic() < deadline, ("TUI startup timed out", initial)
         # Discard the pre-TUI banner on the primary screen.
         alternate = initial.index(b"\x1b[?1049h")
         feed(initial[alternate:])
