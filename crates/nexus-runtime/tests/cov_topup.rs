@@ -20,7 +20,8 @@
 //!   next valid submit;
 //! - a provider-reported cancellation ends the run as `Cancelled`, an
 //!   incompatible continuation state fails the run instead of being applied,
-//!   and repeated `OutputLimit` turns terminate after one fresh request;
+//!   and repeated `OutputLimit` turns terminate after one fresh request unless
+//!   an accepted tool round resets the allowance;
 //! - a control consumer that disconnects mid-run is classified, never
 //!   silently dropped: an approval-required call is cancelled before any
 //!   dispatch, a dispatch already authorized still runs and records its actual
@@ -755,12 +756,31 @@ fn context_settings_are_snapshotted_per_run_without_enabling_compaction() {
 }
 
 #[test]
-fn repeated_output_limit_turns_stop_after_one_fresh_request() {
+fn repeated_output_limit_turns_stop_after_one_recovery_without_admitting_candidates() {
+    let mut limits = Limits::m0_test();
+    limits.max_model_turns_per_run = 3;
+    let truncated = || {
+        let mut events = vec![
+            ProviderEvent::TextDelta {
+                item_key: "partial".into(),
+                text: "discarded partial response".into(),
+            },
+            ProviderEvent::ToolCallReady(candidate(
+                "discarded-call",
+                "discarded-ref",
+                "host_read",
+                "{}",
+            )),
+        ];
+        events.extend(terminal_turn(FinishReason::OutputLimit, None));
+        events
+    };
     let mut bed = make_bed(
-        config(Limits::m0_test(), Policy::m0_test(), false),
+        config(limits, Policy::m0_test(), false),
         vec![
-            terminal_turn(FinishReason::OutputLimit, None),
-            terminal_turn(FinishReason::OutputLimit, None),
+            truncated(),
+            truncated(),
+            truncated(),
             stop_turn("unreachable"),
         ],
     );
@@ -782,9 +802,20 @@ fn repeated_output_limit_turns_stop_after_one_fresh_request() {
         assert_eq!(error.category(), ErrorCategory::ResourceLimit);
         assert_eq!(error.message(), "model output limit reached");
         assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
-        assert_eq!(bed.provider.call_count(), 2, "only one recovery is allowed");
+        assert_eq!(
+            bed.provider.call_count(),
+            2,
+            "only one consecutive output-limit recovery is allowed"
+        );
+        assert_eq!(bed.read.execution_count(), 0);
         assert_eq!(terminal_count(&control), 1);
         assert!(recorded_outcomes(&control).is_empty());
+        {
+            let requests = bed.provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].conversation(), requests[1].conversation());
+            assert!(requests[1].context_note().contains("output limit"));
+        }
 
         let (_, snapshot) = bed
             .runtime
@@ -800,6 +831,49 @@ fn repeated_output_limit_turns_stop_after_one_fresh_request() {
             RunLifecycle::Finalized(RunOutcome::LimitReached)
         );
     });
+}
+
+#[test]
+fn accepted_tool_turn_resets_the_task_output_limit_recovery_allowance() {
+    let truncated = || {
+        let mut events = vec![ProviderEvent::TextDelta {
+            item_key: "partial".into(),
+            text: "discarded partial response".into(),
+        }];
+        events.extend(terminal_turn(FinishReason::OutputLimit, None));
+        events
+    };
+    let mut bed = make_bed(
+        config(Limits::m0_test(), Policy::m0_test(), true),
+        vec![
+            truncated(),
+            tool_turn(vec![candidate(
+                "read-1",
+                "read-ref-1",
+                "host_read",
+                r#"{"path":"src"}"#,
+            )]),
+            truncated(),
+            stop_turn("completed after the accepted tool round"),
+        ],
+    );
+    test_rt().block_on(async {
+        let accepted = bed.runtime.submit(submit_cmd("output-reset")).await;
+        assert_eq!(accepted.reply(), CommandReply::Accepted);
+        let (_, control, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert_eq!(terminal_count(&control), 1);
+    });
+    assert_eq!(
+        bed.provider.call_count(),
+        4,
+        "a second output limit after an accepted tool turn is a fresh recovery"
+    );
+    assert_eq!(
+        bed.read.execution_count(),
+        1,
+        "the accepted tool round dispatches once"
+    );
 }
 
 #[test]

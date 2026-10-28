@@ -184,6 +184,9 @@ pub fn event_json(event: &RunEvent) -> Value {
             "model-request-finished",
             json!({ "turn": turn.as_str(), "response_validated": response_validated }),
         ),
+        EventPayload::ModelResponseDiscarded { turn } => {
+            ("model-response-discarded", json!({ "turn": turn.as_str() }))
+        }
         EventPayload::ToolCallPreview { item_key } => {
             ("tool-call-preview", json!({ "item": item_key }))
         }

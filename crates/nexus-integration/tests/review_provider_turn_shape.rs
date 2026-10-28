@@ -200,21 +200,25 @@ fn duplicate_terminal_never_dispatches() {
 }
 
 #[test]
-fn incomplete_finish_reason_never_dispatches() {
+fn incomplete_finish_reason_recovers_without_dispatching_abandoned_calls() {
     let rt = common::test_rt();
     rt.block_on(async {
-        let script = vec![vec![
-            ready("item-0", "prov-ref-0", "host_read", r#"{"path":"a"}"#),
-            ProviderEvent::TurnFinished(TurnFinished::new(
-                FinishReason::Incomplete,
-                Usage::new(None, None, UsageFinality::Final),
-                None,
-            )),
-        ]];
+        let script = vec![
+            vec![
+                ready("item-0", "prov-ref-0", "host_read", r#"{"path":"a"}"#),
+                ProviderEvent::TurnFinished(TurnFinished::new(
+                    FinishReason::Incomplete,
+                    Usage::new(None, None, UsageFinality::Final),
+                    None,
+                )),
+            ],
+            stop_turn("recovered"),
+        ];
         let mut bed = common::make_bed(script, common::quick_config());
         let response = bed.runtime.submit(common::submit_cmd("incomplete")).await;
         assert_eq!(response.reply(), nexus_core::CommandReply::Accepted);
 
-        assert_no_dispatch(&mut bed, RunOutcome::Failed).await;
+        assert_no_dispatch(&mut bed, RunOutcome::Completed).await;
+        assert_eq!(bed.provider.call_count(), 2);
     });
 }

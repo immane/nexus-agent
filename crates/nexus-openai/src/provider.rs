@@ -38,8 +38,9 @@ const MAX_HEAD_BYTES: usize = 16_384;
 /// Read poll quantum: cancellation and deadlines are re-checked between
 /// quanta so a stalled peer cannot park the worker past its bound.
 const READ_QUANTUM: Duration = Duration::from_secs(1);
-/// OpenCode V2 documents bounded provider retries; use a longer, explicit
-/// schedule for transient model-service failures.
+/// Access failures back off to one minute, then keep that interval until the
+/// live deadline or cancellation. Standalone callers also have a time bound.
+const FALLBACK_CALL_TIMEOUT: Duration = Duration::from_secs(600);
 const PROVIDER_RETRY_DELAYS: [Duration; 6] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -48,7 +49,6 @@ const PROVIDER_RETRY_DELAYS: [Duration; 6] = [
     Duration::from_secs(30),
     Duration::from_secs(60),
 ];
-const MAX_PROVIDER_RETRIES: usize = PROVIDER_RETRY_DELAYS.len();
 /// The TLS stdout pump retains at most this many fixed-size chunks while the
 /// parser is behind (128 KiB total). A closed consumer releases a blocked send.
 const TLS_PUMP_CHUNKS: usize = 16;
@@ -98,7 +98,10 @@ fn status_class(status: u16) -> (ErrorCategory, &'static str) {
 }
 
 fn status_retry_guidance(status: u16) -> RetryGuidance {
-    if matches!(status, 408 | 425 | 429 | 500..=599) {
+    // Remote access refusals (including auth, billing, routing and redirects)
+    // can recover without changing the local request. Body validation errors
+    // remain terminal; redirects are never followed with credentials.
+    if (300..=599).contains(&status) && !matches!(status, 400 | 422) {
         RetryGuidance::RetryAfterBackoff
     } else {
         RetryGuidance::DoNotRetry
@@ -108,11 +111,27 @@ fn status_retry_guidance(status: u16) -> RetryGuidance {
 /// Vendor bodies can echo prompts, paths, or credentials without any secret
 /// marker. Only the status classification crosses the diagnostic boundary.
 fn status_error(status: u16) -> ProviderEvent {
+    status_error_with_head(status, "")
+}
+
+fn status_error_with_head(status: u16, head: &str) -> ProviderEvent {
     let (category, fallback) = status_class(status);
     let mut correlation = CorrelationData::new();
     correlation
         .push("http_status", status.to_string())
         .expect("numeric status is safe");
+    // Support delta-seconds without adding a date parser dependency. Values
+    // stay numeric and never expose untrusted header contents in diagnostics.
+    if let Some(seconds) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("retry-after")
+            .then(|| value.trim().parse::<u64>().ok())
+            .flatten()
+    }) {
+        correlation
+            .push("retry_after_seconds", seconds.to_string())
+            .expect("numeric retry delay is safe");
+    }
     ProviderEvent::Failed(
         AgentError::with_correlation(
             category,
@@ -450,7 +469,11 @@ impl OpenAiProvider {
                 "provider call was cancelled",
             )];
         }
-        let deadline = context.deadline();
+        let deadline = Some(
+            context
+                .deadline()
+                .unwrap_or_else(|| Instant::now() + FALLBACK_CALL_TIMEOUT),
+        );
         if deadline.is_some_and(|at| Instant::now() >= at) {
             return vec![provider_error(
                 ErrorCategory::Timeout,
@@ -491,72 +514,101 @@ impl OpenAiProvider {
             address,
             body.len(),
         );
-        for retry in 0..=MAX_PROVIDER_RETRIES {
-            let emitted = AtomicBool::new(false);
-            let tracked_sink = |event: ProviderEvent| {
-                emitted.store(true, Ordering::Relaxed);
-                sink(event);
-            };
-            let events = if self.use_tls {
-                match spawn_tls(&self.host, self.port, head.as_bytes(), body) {
-                    Ok(mut source) => stream_response(
-                        &mut source,
-                        deadline,
+        retry_exchange(
+            context,
+            deadline,
+            sink,
+            |tracked_sink| {
+                if self.use_tls {
+                    match spawn_tls(
+                        &self.host,
+                        self.port,
+                        head.as_bytes(),
+                        body,
                         context,
-                        &tracked_sink,
-                        self.protocol,
-                    ),
-                    Err(failure) => vec![failure],
-                }
-            } else {
-                match connect_plain(&self.host, self.port) {
-                    Ok(mut stream) => {
-                        if stream.write_all(head.as_bytes()).is_err()
-                            || stream.write_all(body).is_err()
-                        {
-                            return vec![provider_error(
-                                ErrorCategory::Protocol,
-                                "provider request failed",
-                            )];
-                        }
-                        if context.is_cancelled() {
-                            return vec![provider_error(
-                                ErrorCategory::Cancelled,
-                                "provider call was cancelled",
-                            )];
-                        }
-                        let mut source = TcpSource {
-                            stream: &mut stream,
-                        };
-                        stream_response(
+                        deadline,
+                    ) {
+                        Ok(mut source) => stream_response(
                             &mut source,
                             deadline,
                             context,
-                            &tracked_sink,
+                            tracked_sink,
                             self.protocol,
-                        )
+                        ),
+                        Err(failure) => vec![failure],
                     }
-                    Err(failure) => vec![failure],
+                } else {
+                    match connect_plain(&self.host, self.port, context, deadline) {
+                        Ok(mut stream) => {
+                            if let Err(failure) =
+                                write_request(&mut stream, head.as_bytes(), body, context, deadline)
+                            {
+                                return vec![failure];
+                            }
+                            let mut source = TcpSource {
+                                stream: &mut stream,
+                            };
+                            stream_response(
+                                &mut source,
+                                deadline,
+                                context,
+                                tracked_sink,
+                                self.protocol,
+                            )
+                        }
+                        Err(failure) => vec![failure],
+                    }
                 }
-            };
+            },
+            wait_before_retry,
+        )
+    }
+}
 
-            let will_retry = retry < MAX_PROVIDER_RETRIES
-                && !emitted.load(Ordering::Relaxed)
-                && has_retryable_terminal(&events);
-            if let Some(ProviderEvent::Failed(error)) = events.last() {
-                log_provider_failure(error, retry + 1, will_retry.then(|| retry_delay(retry)));
-            }
-            if !will_retry {
-                return events;
-            }
-            if let Err(failure) = wait_before_retry(context, deadline, retry) {
-                if let ProviderEvent::Failed(error) = &failure {
-                    log_provider_failure(error, retry + 1, None);
-                }
-                return vec![failure];
-            }
+fn retry_exchange(
+    context: &ProviderContext,
+    deadline: Option<Instant>,
+    sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    mut exchange: impl FnMut(&(dyn Fn(ProviderEvent) + Send + Sync)) -> Vec<ProviderEvent>,
+    mut wait: impl FnMut(&ProviderContext, Option<Instant>, Duration) -> Result<(), ProviderEvent>,
+) -> Vec<ProviderEvent> {
+    // Keep this guard here as well as at the public entry point: no caller of
+    // the retry driver can accidentally create an unbounded deadline-free loop.
+    let deadline = Some(deadline.unwrap_or_else(|| Instant::now() + FALLBACK_CALL_TIMEOUT));
+    let mut retry = 0usize;
+    loop {
+        if let Err(failure) = check_live(context, deadline) {
+            return vec![failure];
         }
-        unreachable!("bounded retry loop always returns")
+        let emitted = AtomicBool::new(false);
+        let tracked_sink = |event| {
+            emitted.store(true, Ordering::Relaxed);
+            sink(event);
+        };
+        let events = exchange(&tracked_sink);
+        if let Err(failure) = check_live(context, deadline) {
+            return vec![failure];
+        }
+        let will_retry = !emitted.load(Ordering::Relaxed) && has_retryable_terminal(&events);
+        let mut delay = retry_delay(retry);
+        if let Some(ProviderEvent::Failed(error)) = events.last() {
+            if let Some(seconds) = error
+                .correlation()
+                .iter()
+                .find(|(key, _)| key == "retry_after_seconds")
+                .and_then(|(_, value)| value.parse::<u64>().ok())
+            {
+                delay = delay.max(Duration::from_secs(seconds));
+            }
+            log_provider_failure(error, retry.saturating_add(1), will_retry.then_some(delay));
+        }
+        if !will_retry {
+            return events;
+        }
+        if let Err(failure) = wait(context, deadline, delay) {
+            return vec![failure];
+        }
+        retry = retry.saturating_add(1);
     }
 }
 
@@ -582,8 +634,7 @@ fn log_provider_failure(error: &AgentError, attempt: usize, delay: Option<Durati
         |delay| format!("in {delay:?}"),
     );
     eprintln!(
-        "nexus-openai: provider attempt {attempt}/{} failed: category={:?}, retry={:?} ({retry}), http_status={http_status}, message={}",
-        MAX_PROVIDER_RETRIES + 1,
+        "nexus-openai: provider attempt {attempt} failed: category={:?}, retry={:?} ({retry}), http_status={http_status}, message={}",
         error.category(),
         error.retry(),
         error.message(),
@@ -591,22 +642,26 @@ fn log_provider_failure(error: &AgentError, attempt: usize, delay: Option<Durati
 }
 
 fn retry_delay(retry: usize) -> Duration {
-    PROVIDER_RETRY_DELAYS[retry]
+    PROVIDER_RETRY_DELAYS[retry.min(PROVIDER_RETRY_DELAYS.len() - 1)]
 }
 
 fn wait_before_retry(
     context: &ProviderContext,
     deadline: Option<Instant>,
-    retry: usize,
+    delay: Duration,
 ) -> Result<(), ProviderEvent> {
-    let until = Instant::now() + retry_delay(retry);
+    let started = Instant::now();
     loop {
         check_live(context, deadline)?;
-        let remaining = until.saturating_duration_since(Instant::now());
+        let remaining = delay.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Ok(());
         }
-        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+        std::thread::sleep(
+            remaining
+                .min(Duration::from_millis(50))
+                .min(quantum_for(deadline)),
+        );
     }
 }
 
@@ -812,15 +867,103 @@ fn protocol_request_body(
 }
 
 /// Opens a plain-HTTP connection with a bounded connect timeout.
-fn connect_plain(host: &str, port: u16) -> Result<TcpStream, ProviderEvent> {
+fn connect_plain(
+    host: &str,
+    port: u16,
+    context: &ProviderContext,
+    deadline: Option<Instant>,
+) -> Result<TcpStream, ProviderEvent> {
+    check_live(context, deadline)?;
     let address = join_host_port(host, port);
-    address
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addresses| {
-            addresses.find_map(|address| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).ok())
-        })
-        .ok_or_else(|| retryable_provider_error(ErrorCategory::Protocol, "provider is unreachable"))
+    if let Ok(addresses) = address.to_socket_addrs() {
+        for address in addresses {
+            check_live(context, deadline)?;
+            let timeout = deadline.map_or(CONNECT_TIMEOUT, |at| {
+                CONNECT_TIMEOUT.min(at.saturating_duration_since(Instant::now()))
+            });
+            match TcpStream::connect_timeout(&address, timeout.max(Duration::from_millis(1))) {
+                Ok(stream) => {
+                    check_live(context, deadline)?;
+                    return Ok(stream);
+                }
+                Err(error) if retryable_connection_error(&error) => {}
+                Err(_) => {
+                    check_live(context, deadline)?;
+                    return Err(provider_error(
+                        ErrorCategory::Protocol,
+                        "provider socket creation failed locally",
+                    ));
+                }
+            }
+        }
+    }
+    check_live(context, deadline)?;
+    Err(retryable_provider_error(
+        ErrorCategory::Protocol,
+        "provider is unreachable",
+    ))
+}
+
+fn retryable_connection_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::NetworkDown
+    )
+}
+
+fn write_request(
+    stream: &mut TcpStream,
+    head: &[u8],
+    body: &[u8],
+    context: &ProviderContext,
+    deadline: Option<Instant>,
+) -> Result<(), ProviderEvent> {
+    for mut bytes in [head, body] {
+        while !bytes.is_empty() {
+            check_live(context, deadline)?;
+            stream
+                .set_write_timeout(Some(quantum_for(deadline).max(Duration::from_millis(1))))
+                .map_err(|_| {
+                    provider_error(
+                        ErrorCategory::Protocol,
+                        "provider socket configuration failed",
+                    )
+                })?;
+            match stream.write(bytes) {
+                Ok(0) => {
+                    return Err(retryable_provider_error(
+                        ErrorCategory::Protocol,
+                        "provider request failed",
+                    ));
+                }
+                Ok(written) => bytes = &bytes[written..],
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => {
+                    return Err(retryable_provider_error(
+                        ErrorCategory::Protocol,
+                        "provider request failed",
+                    ));
+                }
+            }
+        }
+    }
+    check_live(context, deadline)
 }
 
 /// Sends one tightly bounded metadata request using the provider's configured
@@ -834,8 +977,15 @@ fn read_context_metadata_response(provider: &OpenAiProvider, request: &[u8]) -> 
     let context = ProviderContext::new(Duration::ZERO, false, None);
     let mut response = Vec::new();
     if provider.use_tls {
-        let mut source =
-            spawn_tls(&provider.host, provider.port, request_head, request_body).ok()?;
+        let mut source = spawn_tls(
+            &provider.host,
+            provider.port,
+            request_head,
+            request_body,
+            &context,
+            Some(deadline),
+        )
+        .ok()?;
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match source
@@ -928,7 +1078,15 @@ fn parse_ollama_context_window(response: &[u8]) -> Option<u32> {
 /// pipe, and returns the stdout pump source. The bearer credential travels
 /// inside the pipe (argv carries only host and port, never the secret).
 /// Dropping the source terminates the helper.
-fn spawn_tls(host: &str, port: u16, head: &[u8], body: &[u8]) -> Result<TlsSource, ProviderEvent> {
+fn spawn_tls(
+    host: &str,
+    port: u16,
+    head: &[u8],
+    body: &[u8],
+    context: &ProviderContext,
+    deadline: Option<Instant>,
+) -> Result<TlsSource, ProviderEvent> {
+    check_live(context, deadline)?;
     let target = join_host_port(host, port);
     let mut command = std::process::Command::new("openssl");
     command
@@ -949,20 +1107,55 @@ fn spawn_tls(host: &str, port: u16, head: &[u8], body: &[u8]) -> Result<TlsSourc
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
+    check_live(context, deadline)?;
     let mut child: Child = command
         .spawn()
         .map_err(|_| provider_error(ErrorCategory::Protocol, "TLS helper is unavailable"))?;
     let request: Vec<u8> = head.iter().chain(body.iter()).copied().collect();
-    if let Some(mut stdin) = child.stdin.take() {
+    let stderr = child.stderr.take().ok_or_else(|| {
+        kill_child(&mut child);
+        provider_error(ErrorCategory::Protocol, "TLS helper pipe is unavailable")
+    })?;
+    let (security_sender, security_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = security_sender.send(tls_terminal_diagnostic(stderr));
+    });
+    let Some(mut stdin) = child.stdin.take() else {
+        kill_child(&mut child);
+        return Err(provider_error(
+            ErrorCategory::Protocol,
+            "TLS helper pipe is unavailable",
+        ));
+    };
+    {
         // `-quiet` implies `-ign_eof`: dropping stdin after the request
         // does not close the connection from our side.
-        if stdin.write_all(&request).is_err() {
-            kill_child(&mut child);
-            return Err(provider_error(
-                ErrorCategory::Protocol,
-                "provider request failed",
-            ));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(stdin.write_all(&request));
+        });
+        loop {
+            if let Err(failure) = check_live(context, deadline) {
+                kill_child(&mut child);
+                return Err(failure);
+            }
+            match receiver.recv_timeout(quantum_for(deadline).max(Duration::from_millis(1))) {
+                Ok(Ok(())) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                _ => {
+                    kill_child(&mut child);
+                    let security = security_receiver
+                        .recv_timeout(quantum_for(deadline).max(Duration::from_millis(1)))
+                        .unwrap_or(true);
+                    check_live(context, deadline)?;
+                    return Err(if security {
+                        provider_error(ErrorCategory::Protocol, "TLS verification failed")
+                    } else {
+                        retryable_provider_error(ErrorCategory::Protocol, "provider request failed")
+                    });
+                }
+            }
         }
     }
     drop(child.stdin.take());
@@ -998,7 +1191,51 @@ fn spawn_tls(host: &str, port: u16, head: &[u8], body: &[u8]) -> Result<TlsSourc
         child,
         started: Instant::now(),
         first_byte: true,
+        security_receiver,
     })
+}
+
+fn tls_terminal_diagnostic(mut reader: impl Read) -> bool {
+    // Drain without retaining/logging diagnostics. Only a terminal-failure bit
+    // crosses this boundary, with bounded rolling storage across reads.
+    let mut tail = String::new();
+    let mut terminal = false;
+    let mut bytes = [0u8; 1024];
+    loop {
+        match reader.read(&mut bytes) {
+            Ok(0) => return terminal,
+            Ok(read) => {
+                tail.push_str(&String::from_utf8_lossy(&bytes[..read]).to_ascii_lowercase());
+                terminal |= [
+                    "verify error",
+                    "verification error",
+                    "certificate verify failed",
+                    "hostname mismatch",
+                    "ip address mismatch",
+                    "no protocols available",
+                    "no shared cipher",
+                    "unknown option",
+                    "unrecognized option",
+                    "invalid command",
+                    "error setting certificate",
+                    "error setting verify",
+                    "unable to load",
+                ]
+                .iter()
+                .any(|marker| tail.contains(marker));
+                tail = tail
+                    .chars()
+                    .rev()
+                    .take(128)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return true,
+        }
+    }
 }
 
 /// One pollable response-byte source behind either transport.
@@ -1041,7 +1278,7 @@ impl ChunkSource for TcpSource<'_> {
                 check_live(context, deadline)?;
                 Ok(Some(Vec::new()))
             }
-            Err(_) => Err(provider_error(
+            Err(_) => Err(retryable_provider_error(
                 ErrorCategory::Protocol,
                 "provider response failed",
             )),
@@ -1057,6 +1294,7 @@ struct TlsSource {
     child: Child,
     started: Instant,
     first_byte: bool,
+    security_receiver: mpsc::Receiver<bool>,
 }
 
 impl Drop for TlsSource {
@@ -1081,7 +1319,7 @@ impl ChunkSource for TlsSource {
                 self.first_byte = false;
                 Ok(Some(chunk))
             }
-            Ok(Err(_)) => Err(provider_error(
+            Ok(Err(_)) => Err(retryable_provider_error(
                 ErrorCategory::Protocol,
                 "provider response failed",
             )),
@@ -1095,7 +1333,28 @@ impl ChunkSource for TlsSource {
                 }
                 Ok(Some(Vec::new()))
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => loop {
+                check_live(context, deadline)?;
+                match self
+                    .security_receiver
+                    .recv_timeout(quantum_for(deadline).max(Duration::from_millis(1)))
+                {
+                    Ok(true) => {
+                        return Err(provider_error(
+                            ErrorCategory::Protocol,
+                            "TLS verification failed",
+                        ));
+                    }
+                    Ok(false) => return Ok(None),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(_) => {
+                        return Err(provider_error(
+                            ErrorCategory::Protocol,
+                            "TLS helper diagnostics failed",
+                        ));
+                    }
+                }
+            },
         }
     }
 }
@@ -1147,7 +1406,7 @@ fn stream_response(
         match source.next_chunk(quantum_for(deadline), deadline, context) {
             Err(failure) => return vec![failure],
             Ok(None) => {
-                return vec![provider_error(
+                return vec![retryable_provider_error(
                     ErrorCategory::Protocol,
                     "provider response failed",
                 )];
@@ -1175,7 +1434,7 @@ fn stream_response(
         }
     };
     if !(200..300).contains(&status) {
-        return vec![status_error(status)];
+        return vec![status_error_with_head(status, &head)];
     }
     if !head.to_ascii_lowercase().contains("text/event-stream") {
         let mut body = body_start;
@@ -1194,7 +1453,29 @@ fn stream_response(
                 }
             }
         }
-        return events_for_protocol(status, &head, &decode_body(&head, &body), protocol);
+        if let Some(length) = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        }) && body.len() < length
+        {
+            return vec![retryable_provider_error(
+                ErrorCategory::Protocol,
+                "provider response ended early",
+            )];
+        }
+        let body = decode_body(&head, &body);
+        let events = events_for_protocol(status, &head, &body, protocol);
+        if matches!(events.as_slice(), [ProviderEvent::Failed(error)] if error.category() == ErrorCategory::Protocol)
+            && serde_json::from_slice::<Value>(&body).is_err_and(|error| error.is_eof())
+        {
+            return vec![retryable_provider_error(
+                ErrorCategory::Protocol,
+                "provider response ended early",
+            )];
+        }
+        return events;
     }
     let chunked = head.to_ascii_lowercase().contains("chunked");
     if protocol != ProtocolKind::ChatCompletions {
@@ -1210,7 +1491,7 @@ fn stream_response(
             match source.next_chunk(quantum_for(deadline), deadline, context) {
                 Err(failure) => return vec![failure],
                 Ok(None) => {
-                    return vec![provider_error(
+                    return vec![retryable_provider_error(
                         ErrorCategory::Protocol,
                         "provider stream ended without termination",
                     )];
@@ -1235,7 +1516,7 @@ fn stream_response(
         match source.next_chunk(quantum_for(deadline), deadline, context) {
             Err(failure) => return vec![failure],
             Ok(None) => {
-                return vec![provider_error(
+                return vec![retryable_provider_error(
                     ErrorCategory::Protocol,
                     "provider stream ended without termination",
                 )];
@@ -2991,15 +3272,11 @@ mod reasoning_effort_tests {
 
 #[cfg(test)]
 mod retry_policy_tests {
-    use super::{
-        MAX_PROVIDER_RETRIES, PROVIDER_RETRY_DELAYS, connect_plain, status_class,
-        status_retry_guidance,
-    };
-    use nexus_core::{ErrorCategory, ProviderEvent, RetryGuidance};
+    use super::*;
+    use nexus_core::CancellationToken;
 
     #[test]
-    fn retry_schedule_is_bounded_and_increases_to_one_minute() {
-        assert_eq!(MAX_PROVIDER_RETRIES, 6);
+    fn retry_schedule_increases_then_stays_at_one_minute() {
         assert_eq!(
             PROVIDER_RETRY_DELAYS,
             [
@@ -3011,18 +3288,21 @@ mod retry_policy_tests {
                 std::time::Duration::from_secs(60),
             ]
         );
+        for index in [6, 7, 100, usize::MAX] {
+            assert_eq!(retry_delay(index), Duration::from_secs(60));
+        }
     }
 
     #[test]
-    fn only_transient_http_statuses_are_retryable() {
-        for status in [408, 425, 429, 500, 503, 599] {
+    fn remote_access_refusals_retry_but_invalid_requests_do_not() {
+        for status in [301, 401, 402, 403, 404, 408, 425, 429, 500, 503, 599] {
             assert_eq!(
                 status_retry_guidance(status),
                 RetryGuidance::RetryAfterBackoff,
                 "status {status}"
             );
         }
-        for status in [400, 401, 403, 404, 422] {
+        for status in [200, 400, 422, 600] {
             assert_eq!(
                 status_retry_guidance(status),
                 RetryGuidance::DoNotRetry,
@@ -3030,14 +3310,354 @@ mod retry_policy_tests {
             );
         }
         assert_eq!(status_class(429).0, ErrorCategory::RateLimited);
+        assert_eq!(status_class(401).0, ErrorCategory::Authentication);
+        assert_eq!(status_class(403).0, ErrorCategory::Authentication);
+        assert_eq!(status_class(402).0, ErrorCategory::PermissionDenied);
+        assert!(matches!(status_error(402), ProviderEvent::Failed(error)
+            if error.category() == ErrorCategory::PermissionDenied
+                && error.message() == "provider payment is required"
+                && error.retry() == RetryGuidance::RetryAfterBackoff));
     }
 
     #[test]
     fn connection_refusal_is_retryable_before_a_request_is_sent() {
-        let error = connect_plain("127.0.0.1", 9).expect_err("port 9 refuses connections");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let error = connect_plain(
+            "127.0.0.1",
+            port,
+            &context,
+            Some(Instant::now() + Duration::from_secs(1)),
+        )
+        .expect_err("closed port refuses connections");
         assert!(matches!(
             error,
             ProviderEvent::Failed(error) if error.retry() == RetryGuidance::RetryAfterBackoff
         ));
+    }
+
+    #[test]
+    fn local_socket_failures_are_not_misclassified_as_remote_outages() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::OutOfMemory,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(!retryable_connection_error(&std::io::Error::from(kind)));
+        }
+        assert!(retryable_connection_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+    }
+
+    fn assert_category(events: &[ProviderEvent], category: ErrorCategory) {
+        assert!(
+            matches!(events, [ProviderEvent::Failed(error)] if error.category() == category),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn success_after_more_than_six_failures_uses_capped_schedule() {
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let events = retry_exchange(
+            &context,
+            None,
+            &|_| {},
+            |_| {
+                attempts += 1;
+                if attempts <= 10 {
+                    vec![status_error(401)]
+                } else {
+                    Vec::new()
+                }
+            },
+            |_, deadline, delay| {
+                assert!(
+                    deadline.is_some(),
+                    "deadline-free callers receive a fallback bound"
+                );
+                waits.push(delay);
+                Ok(())
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(attempts, 11);
+        assert_eq!(waits, (0..10).map(retry_delay).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn emitted_events_prevent_replay_even_for_retryable_failures() {
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        let events = retry_exchange(
+            &context,
+            None,
+            &|_| {},
+            |sink| {
+                attempts += 1;
+                sink(ProviderEvent::TextDelta {
+                    item_key: "item-0".to_owned(),
+                    text: "provisional".to_owned(),
+                });
+                vec![retryable_provider_error(
+                    ErrorCategory::Protocol,
+                    "provider response failed",
+                )]
+            },
+            |_, _, _| panic!("must not retry after provisional delivery"),
+        );
+        assert_eq!(attempts, 1);
+        assert_category(&events, ErrorCategory::Protocol);
+    }
+
+    #[test]
+    fn cancellation_during_retry_wait_prevents_another_attempt() {
+        let token = CancellationToken::new();
+        let context = ProviderContext::new(Duration::ZERO, false, None)
+            .with_control(token.clone(), Instant::now() + Duration::from_secs(10));
+        let mut attempts = 0;
+        let events = retry_exchange(
+            &context,
+            context.deadline(),
+            &|_| {},
+            |_| {
+                attempts += 1;
+                vec![status_error(503)]
+            },
+            |context, deadline, delay| {
+                let token = token.clone();
+                let canceller = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(5));
+                    token.cancel();
+                });
+                let result = wait_before_retry(context, deadline, delay);
+                canceller.join().unwrap();
+                result
+            },
+        );
+        assert_eq!(attempts, 1);
+        assert_category(&events, ErrorCategory::Cancelled);
+    }
+
+    #[test]
+    fn deadline_interrupts_a_one_minute_wait() {
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let deadline = Some(Instant::now() + Duration::from_millis(10));
+        let started = Instant::now();
+        let events = wait_before_retry(&context, deadline, Duration::from_secs(60)).unwrap_err();
+        assert_category(&[events], ErrorCategory::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancellation_takes_priority_over_an_elapsed_deadline() {
+        let context = ProviderContext::new(Duration::ZERO, true, None);
+        let error =
+            wait_before_retry(&context, Some(Instant::now()), Duration::from_secs(60)).unwrap_err();
+        assert_category(&[error], ErrorCategory::Cancelled);
+    }
+
+    #[test]
+    fn liveness_is_rechecked_after_wait_even_if_wait_returns_success() {
+        let token = CancellationToken::new();
+        let context = ProviderContext::new(Duration::ZERO, false, None)
+            .with_control(token.clone(), Instant::now() + Duration::from_secs(10));
+        let mut attempts = 0;
+        let events = retry_exchange(
+            &context,
+            context.deadline(),
+            &|_| {},
+            |_| {
+                attempts += 1;
+                vec![status_error(503)]
+            },
+            |_, _, _| {
+                token.cancel();
+                Ok(())
+            },
+        );
+        assert_eq!(attempts, 1);
+        assert_category(&events, ErrorCategory::Cancelled);
+    }
+
+    #[test]
+    fn retry_after_delta_seconds_is_a_minimum_not_an_attempt_limit() {
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        retry_exchange(
+            &context,
+            None,
+            &|_| {},
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    vec![status_error_with_head(
+                        429,
+                        "HTTP/1.1 429 Test\r\nRetry-After: 120\r\n\r\n",
+                    )]
+                } else {
+                    Vec::new()
+                }
+            },
+            |_, _, delay| {
+                assert_eq!(delay, Duration::from_secs(120));
+                Ok(())
+            },
+        );
+        assert_eq!(attempts, 2);
+    }
+
+    struct ScriptedSource(std::collections::VecDeque<Vec<u8>>);
+
+    impl ChunkSource for ScriptedSource {
+        fn next_chunk(
+            &mut self,
+            _: Duration,
+            _: Option<Instant>,
+            _: &ProviderContext,
+        ) -> Result<Option<Vec<u8>>, ProviderEvent> {
+            Ok(self.0.pop_front())
+        }
+    }
+
+    #[test]
+    fn premature_eof_before_delivery_retries_and_can_complete() {
+        for first in [
+            "",
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"choices\":",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{}",
+        ] {
+            let context = ProviderContext::new(Duration::ZERO, false, None);
+            let mut attempts = 0;
+            let events = retry_exchange(
+                &context,
+                None,
+                &|_| {},
+                |sink| {
+                    attempts += 1;
+                    let response = if attempts == 1 {
+                        first
+                    } else {
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}"
+                    };
+                    let mut source = ScriptedSource([response.as_bytes().to_vec()].into());
+                    stream_response(
+                        &mut source,
+                        None,
+                        &context,
+                        sink,
+                        ProtocolKind::ChatCompletions,
+                    )
+                },
+                |_, _, _| Ok(()),
+            );
+            assert_eq!(attempts, 2, "{first}");
+            assert!(matches!(
+                events.last(),
+                Some(ProviderEvent::TurnFinished(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn message_start_without_provisional_delivery_does_not_block_retry() {
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        let events = retry_exchange(
+            &context,
+            None,
+            &|_| panic!("metadata must not publish provisional output"),
+            |sink| {
+                attempts += 1;
+                if attempts == 2 {
+                    return vec![ProviderEvent::TurnFinished(TurnFinished::new(
+                        FinishReason::Stop,
+                        Usage::new(None, None, UsageFinality::Final),
+                        None,
+                    ))];
+                }
+                let response = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n";
+                let mut source = ScriptedSource([response.to_vec()].into());
+                stream_response(
+                    &mut source,
+                    None,
+                    &context,
+                    sink,
+                    ProtocolKind::AnthropicMessages,
+                )
+            },
+            |_, _, _| Ok(()),
+        );
+        assert_eq!(attempts, 2);
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::TurnFinished(_))
+        ));
+    }
+
+    #[test]
+    fn transport_eof_after_provisional_text_never_replays() {
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        let events = retry_exchange(
+            &context,
+            None,
+            &|_| {},
+            |sink| {
+                attempts += 1;
+                let response = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+                let mut source = ScriptedSource([response.to_vec()].into());
+                stream_response(
+                    &mut source,
+                    None,
+                    &context,
+                    sink,
+                    ProtocolKind::ChatCompletions,
+                )
+            },
+            |_, _, _| panic!("must not replay provisional text"),
+        );
+        assert_eq!(attempts, 1);
+        assert_category(&events, ErrorCategory::Protocol);
+    }
+
+    #[test]
+    fn tls_security_and_local_configuration_diagnostics_are_terminal() {
+        for diagnostic in [
+            "verify error:num=20:unable to get local issuer certificate",
+            "certificate verify failed",
+            "Verification error: hostname mismatch",
+            "s_client: Unknown option: -verify_hostname",
+            "no shared cipher",
+        ] {
+            assert!(tls_terminal_diagnostic(diagnostic.as_bytes()));
+        }
+        for diagnostic in [
+            "connect:errno=61",
+            "unexpected eof while reading",
+            "Connection refused",
+        ] {
+            assert!(!tls_terminal_diagnostic(diagnostic.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn failed_request_write_is_retryable_before_delivery() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let deadline = Some(Instant::now() + Duration::from_secs(1));
+        let error =
+            write_request(&mut stream, b"request", b"body", &context, deadline).unwrap_err();
+        assert!(has_retryable_terminal(&[error]));
     }
 }

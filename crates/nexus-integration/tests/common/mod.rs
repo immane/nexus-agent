@@ -91,7 +91,15 @@ pub fn make_bed_with_tools(
     read: FakeTool,
     write: FakeTool,
 ) -> Bed {
-    let provider = Arc::new(FakeProvider::new(script));
+    make_bed_with_provider(Arc::new(FakeProvider::new(script)), config, read, write)
+}
+
+fn make_bed_with_provider(
+    provider: Arc<FakeProvider>,
+    config: RuntimeConfig,
+    read: FakeTool,
+    write: FakeTool,
+) -> Bed {
     let read_tool = Arc::new(read);
     let write_tool = Arc::new(write);
     let tools = vec![
@@ -107,6 +115,17 @@ pub fn make_bed_with_tools(
         read_tool,
         write_tool,
     }
+}
+
+/// Builds a runtime bed whose provider blocks at its gate until released, so
+/// a test can prove a run is still active before issuing a conflicting submit.
+pub fn make_gated_bed(script: Vec<Vec<ProviderEvent>>, config: RuntimeConfig) -> Bed {
+    make_bed_with_provider(
+        Arc::new(FakeProvider::gated(script)),
+        config,
+        FakeTool::read_only(),
+        FakeTool::mutation(),
+    )
 }
 
 /// One model turn of `fragments` alternating-item text deltas (an output

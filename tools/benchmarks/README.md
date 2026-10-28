@@ -156,6 +156,25 @@ a hung test; silence alone never triggers automatic cancellation or retry.
 
 ## Task test execution guidance
 
+Benchmark-pilot and ordinary TUI/server calls share the runtime's timeout
+handling. A per-tool deadline leaves up to two seconds for cooperative cleanup,
+clamped to the remaining run budget; it does not extend execution authority.
+A returned timeout is recorded as a tool result so the model can continue.
+An unreturned worker after per-tool cleanup grace is quarantined and recorded as
+`TimedOut` / `Unknown` / `Uncertain`, allowing the model to continue. New tool
+dispatch is denied (`NotStarted`) while any quarantined worker remains;
+background ownership is retained until completion. Cancellation and run-budget
+exhaustion still end the run. Container transport expiry remains conservative:
+the shared session is poisoned and owned
+workload cleanup is requested, not silently replaced or declared reusable.
+The runner follows the authoritative run terminal event; an intermediate
+`tool-finished` with `TimedOut` does not itself cancel or fail a benchmark.
+Provider access failures likewise back off until success, explicit cancellation,
+or the runtime deadline, without a fixed retry-count cutoff. Retries do not
+replay executed tools or turn partial responses into accepted predictions.
+The runner's own wall-clock bound still applies, and a completed model answer
+is not an official benchmark resolution score.
+
 The task prompt follows each checkout's documented test runner, not an assumed
 framework. It directs the agent to run the targeted regression first, then the
 related suite, and the full suite only when justified by the change and remaining

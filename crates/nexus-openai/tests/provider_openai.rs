@@ -1116,13 +1116,13 @@ fn responses_and_messages_replay_tool_calls_with_their_results() {
 }
 
 #[test]
-fn responses_and_messages_errors_are_static_and_truncated_streams_fail() {
+fn responses_and_messages_errors_are_static_and_partial_streams_never_replay() {
     for protocol in [
         nexus_config::ProtocolKind::OpenAiResponses,
         nexus_config::ProtocolKind::AnthropicMessages,
     ] {
         let (base, _) = serve(
-            401,
+            400,
             r#"{"error":"private vendor response containing sensitive text"}"#,
             Duration::ZERO,
         );
@@ -1133,24 +1133,35 @@ fn responses_and_messages_errors_are_static_and_truncated_streams_fail() {
             &base_request(),
             &ProviderContext::new(Duration::from_millis(1_500), false, None),
         );
-        assert_eq!(failed(events).0, ErrorCategory::Authentication);
+        assert_eq!(failed(events).0, ErrorCategory::InvalidInput);
 
-        let (base, _) = match protocol {
+        let (base, served) = match protocol {
             nexus_config::ProtocolKind::OpenAiResponses => serve_raw(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
             ),
             nexus_config::ProtocolKind::AnthropicMessages => serve_raw(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                ),
             ),
             nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
         };
         let adapter =
             OpenAiProvider::new_for_protocol(&base, present_credential(), "model", protocol)
                 .expect("protocol adapter builds");
-        let events = adapter.stream(&base_request(), &live_context());
-        assert_eq!(failed(events).0, ErrorCategory::Protocol);
+        let context = live_context().with_control(
+            CancellationToken::new(),
+            Instant::now() + Duration::from_millis(250),
+        );
+        let events = adapter.stream(&base_request(), &context);
+        let (category, retry) = failed(events);
+        assert_eq!(category, ErrorCategory::Protocol);
+        assert_eq!(retry, RetryGuidance::RetryAfterBackoff);
+        assert_eq!(served.hits.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -1248,8 +1259,8 @@ fn missing_usage_stays_unknown_never_zero() {
 #[test]
 fn http_failures_map_to_typed_categories() {
     for (status, category) in [
-        (401, ErrorCategory::Authentication),
-        (403, ErrorCategory::Authentication),
+        (400, ErrorCategory::InvalidInput),
+        (422, ErrorCategory::InvalidInput),
     ] {
         let (base, _) = serve(status, r#"{"error":"nope"}"#, Duration::ZERO);
         let error = failed(provider(&base).stream(&base_request(), &live_context()));
@@ -1267,19 +1278,31 @@ fn http_failures_map_to_typed_categories() {
 #[test]
 fn transient_http_failure_retries_before_nonretryable_status() {
     let (base, served) = serve_sequence(
-        &[503, 401],
+        &[503, 400],
         r#"{"error":"temporarily unavailable"}"#,
         Duration::ZERO,
     );
     let started = Instant::now();
     let error = failed(provider(&base).stream(&base_request(), &live_context()));
-    assert_eq!(error.0, ErrorCategory::Authentication);
+    assert_eq!(error.0, ErrorCategory::InvalidInput);
     assert_eq!(
         served.hits.load(Ordering::SeqCst),
         2,
         "the retry follows the first transient response"
     );
     assert!(started.elapsed() >= Duration::from_millis(1_000));
+}
+
+#[test]
+fn authentication_access_failure_retries_then_succeeds() {
+    let (base, served) = serve_sequence(&[401, 200], &stop_body("recovered"), Duration::ZERO);
+    let context = live_context().with_control(
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(5),
+    );
+    let events = provider(&base).stream(&base_request(), &context);
+    assert_eq!(finished(&events).reason(), FinishReason::Stop);
+    assert_eq!(served.hits.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -1649,11 +1672,27 @@ fn https_construction_accepts_explicit_and_default_ports() {
 }
 
 #[test]
-fn https_unreachable_peers_fail_protocol_not_unsupported() {
-    let provider = OpenAiProvider::new("https://127.0.0.1:9/", present_credential(), "m")
-        .expect("https provider builds");
-    let error = failed(provider.stream(&base_request(), &live_context()));
-    assert_eq!(error.0, ErrorCategory::Protocol);
+fn https_unreachable_peers_retry_until_deadline_not_unsupported() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let provider = OpenAiProvider::new(
+        &format!("https://127.0.0.1:{port}/"),
+        present_credential(),
+        "m",
+    )
+    .expect("https provider builds");
+    let context = live_context().with_control(
+        CancellationToken::new(),
+        Instant::now() + Duration::from_millis(150),
+    );
+    let error = failed(provider.stream(&base_request(), &context));
+    // Missing openssl is a local terminal Protocol error; installed openssl
+    // retries a refused connection until the explicit short deadline.
+    assert!(matches!(
+        error.0,
+        ErrorCategory::Timeout | ErrorCategory::Protocol
+    ));
 }
 
 #[test]
@@ -1848,11 +1887,6 @@ fn http_status_classes_point_in_different_directions() {
             ErrorCategory::InvalidInput,
             "provider request was rejected",
         ),
-        (
-            402,
-            ErrorCategory::PermissionDenied,
-            "provider payment is required",
-        ),
     ] {
         let (base, _) = serve(status, r#"{"error":"nope"}"#, Duration::ZERO);
         let events = provider(&base).stream(&base_request(), &live_context());
@@ -1865,6 +1899,18 @@ fn http_status_classes_point_in_different_directions() {
             other => panic!("expected a failure for {status}, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn payment_access_failure_retries_then_succeeds() {
+    let (base, served) = serve_sequence(&[402, 200], &stop_body("recovered"), Duration::ZERO);
+    let context = live_context().with_control(
+        CancellationToken::new(),
+        Instant::now() + Duration::from_secs(5),
+    );
+    let events = provider(&base).stream(&base_request(), &context);
+    assert_eq!(finished(&events).reason(), FinishReason::Stop);
+    assert_eq!(served.hits.load(Ordering::SeqCst), 2);
 }
 
 #[test]

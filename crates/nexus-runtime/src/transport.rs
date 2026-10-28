@@ -42,6 +42,7 @@ pub fn is_control_payload(payload: &EventPayload) -> bool {
             | EventPayload::ToolFinished(_)
             | EventPayload::ModelRequestStarted { .. }
             | EventPayload::ModelRequestFinished { .. }
+            | EventPayload::ModelResponseDiscarded { .. }
             | EventPayload::UsageUpdated(_)
             | EventPayload::RunFinished(_)
     )
@@ -519,6 +520,10 @@ mod cov_transport_private {
                 },
             ),
             (
+                "ModelResponseDiscarded",
+                EventPayload::ModelResponseDiscarded { turn: turn.clone() },
+            ),
+            (
                 "ToolCallPreview",
                 EventPayload::ToolCallPreview {
                     item_key: "item-0".to_owned(),
@@ -568,7 +573,7 @@ mod cov_transport_private {
     #[test]
     fn control_classification_covers_every_payload_variant() {
         let payloads = all_payloads();
-        assert_eq!(payloads.len(), 12, "one fixture per EventPayload variant");
+        assert_eq!(payloads.len(), 13, "one fixture per EventPayload variant");
 
         let mut control = Vec::new();
         let mut data = Vec::new();
@@ -584,6 +589,7 @@ mod cov_transport_private {
                 | EventPayload::ToolFinished(_)
                 | EventPayload::ModelRequestStarted { .. }
                 | EventPayload::ModelRequestFinished { .. }
+                | EventPayload::ModelResponseDiscarded { .. }
                 | EventPayload::UsageUpdated(_)
                 | EventPayload::RunFinished(_) => true,
                 EventPayload::AssistantTextDelta(_)
@@ -607,6 +613,7 @@ mod cov_transport_private {
                 "ContextReduced",
                 "ModelRequestStarted",
                 "ModelRequestFinished",
+                "ModelResponseDiscarded",
                 "ApprovalRequired",
                 "ToolStarted",
                 "ToolFinished",

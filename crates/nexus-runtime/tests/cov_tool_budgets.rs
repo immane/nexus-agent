@@ -31,12 +31,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nexus_core::{
-    AgentError, CallCandidate, CommandReply, EffectState, ErrorCategory, EventPayload, Evidence,
-    ExecutionStatus, FinishReason, Limits, M0_REVISION, ModelContextItem, ModelRequest,
-    PersistenceState, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort,
-    RequestId, RetryGuidance, RunEvent, RunFinished, RunOutcome, SessionId, SubmitCommand,
-    ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec, TurnFinished,
-    Usage, UsageFinality,
+    AgentError, CallCandidate, CancelCommand, CommandReply, EffectState, ErrorCategory,
+    EventPayload, Evidence, ExecutionStatus, FinishReason, Limits, M0_REVISION, ModelContextItem,
+    ModelRequest, PersistenceState, ProviderCapabilities, ProviderContext, ProviderEvent,
+    ProviderPort, RequestId, RetryGuidance, RunEvent, RunFinished, RunOutcome, SessionId,
+    SubmitCommand, ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration,
+    ToolSpec, TurnFinished, Usage, UsageFinality,
 };
 use nexus_runtime::{Policy, Runtime, RuntimeConfig};
 use tokio::sync::mpsc;
@@ -253,6 +253,113 @@ impl ToolPort for BlockingTool {
             false,
         )
         .expect("late outcome builds")
+    }
+}
+
+/// Reports a real timeout after cleanup; later calls succeed without replaying
+/// the first call. Tests may hold cleanup open to exercise runtime interrupts.
+struct CooperativeTimeoutTool {
+    spec: ToolSpec,
+    cleanup_entered: mpsc::UnboundedSender<()>,
+    cleanup_release: Option<Mutex<std::sync::mpsc::Receiver<()>>>,
+    executions: AtomicUsize,
+}
+
+impl ToolPort for CooperativeTimeoutTool {
+    fn describe(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn execute(&self, _call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+        if self.executions.fetch_add(1, Ordering::SeqCst) != 0 {
+            return ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                "next call completed",
+                false,
+            )
+            .unwrap();
+        }
+        let deadline = context.deadline().expect("runtime supplies a deadline");
+        std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        assert!(
+            context.check_active().is_err(),
+            "execution authority expired"
+        );
+        self.cleanup_entered.send(()).unwrap();
+        if let Some(release) = &self.cleanup_release {
+            let _ = release.lock().unwrap().recv_timeout(Duration::from_secs(5));
+        } else {
+            // Ensure the runtime sees an expired call before cleanup completes.
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            context.deadline(),
+            Some(deadline),
+            "cleanup cannot extend authority"
+        );
+        ToolOutcome::new(
+            ExecutionStatus::TimedOut,
+            EffectState::KnownNotApplied,
+            Evidence::HostObserved,
+            "cooperative cleanup completed",
+            false,
+        )
+        .unwrap()
+    }
+}
+
+struct TimeoutBed {
+    runtime: Runtime,
+    data: mpsc::Receiver<RunEvent>,
+    control: mpsc::Receiver<RunEvent>,
+    provider: Arc<ScriptedProvider>,
+    tool: Arc<CooperativeTimeoutTool>,
+    cleanup_entered: mpsc::UnboundedReceiver<()>,
+    cleanup_release: std::sync::mpsc::Sender<()>,
+}
+
+fn timeout_bed(run_duration: Duration, block_cleanup: bool) -> TimeoutBed {
+    let mut limits = Limits::m0_test();
+    limits.per_tool_timeout = Duration::from_millis(50);
+    limits.run_duration = run_duration;
+    let (cleanup_entered, entered) = mpsc::unbounded_channel();
+    let (cleanup_release, release) = std::sync::mpsc::channel();
+    let tool = Arc::new(CooperativeTimeoutTool {
+        spec: BudgetTool::new("host_read").describe(),
+        cleanup_entered,
+        cleanup_release: block_cleanup.then(|| Mutex::new(release)),
+        executions: AtomicUsize::new(0),
+    });
+    let provider = Arc::new(ScriptedProvider::new(
+        vec![
+            ScriptedProvider::tool_turn(vec![
+                read_candidate("item-0", "prov-0", "first"),
+                read_candidate("item-1", "prov-1", "second"),
+            ]),
+            ScriptedProvider::stop_turn("continued after timeout"),
+        ],
+        None,
+    ));
+    let (runtime, streams) = Runtime::try_new(
+        RuntimeConfig {
+            limits,
+            policy: Policy::m0_test(),
+            has_approval_handler: false,
+        },
+        provider.clone(),
+        vec![ToolRegistration::read(tool.clone())],
+    )
+    .unwrap();
+    TimeoutBed {
+        runtime,
+        data: streams.data,
+        control: streams.control,
+        provider,
+        tool,
+        cleanup_entered: entered,
+        cleanup_release,
     }
 }
 
@@ -816,20 +923,153 @@ fn per_turn_tool_call_budget_exhaustion_maps_to_limit_reached() {
     });
 }
 
-/// Exhausting the per-tool deadline maps to `LimitReached` and records an
-/// explicit `TimedOut`/`Unknown`/`Uncertain` outcome: an execution timeout is
-/// never a truncation and never a fabricated success. The quarantined worker
-/// is released afterwards so ownership clears before the runtime shuts down.
 #[test]
-fn per_tool_timeout_maps_to_limit_reached_with_an_unknown_effect_outcome() {
+fn cooperative_tool_timeout_records_actual_outcome_and_continues_without_replay() {
+    let mut bed = timeout_bed(Duration::from_secs(10), false);
+    test_rt().block_on(async {
+        assert_eq!(
+            bed.runtime
+                .submit(submit_cmd("cooperative-timeout"))
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (collected, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        let outcomes = tool_finished_outcomes(&collected);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].status(), ExecutionStatus::TimedOut);
+        assert_eq!(outcomes[0].effect(), EffectState::KnownNotApplied);
+        assert_eq!(outcomes[0].evidence(), Evidence::HostObserved);
+        assert_eq!(outcomes[0].content(), "cooperative cleanup completed");
+        assert_eq!(outcomes[1].status(), ExecutionStatus::Succeeded);
+        assert_eq!(bed.tool.executions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            bed.provider.seen_budgets().len(),
+            2,
+            "model receives the results and continues"
+        );
+        assert_eq!(terminal_events(&collected), 1);
+        assert!(!bed.runtime.has_unconfirmed_work().await);
+        let requests = bed.provider.requests.lock().unwrap();
+        let results = requests[1]
+            .conversation()
+            .iter()
+            .filter_map(|item| match item {
+                ModelContextItem::ToolResult { outcome, .. } => Some(outcome),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, outcomes, "model receives the actual tool outcomes");
+    });
+}
+
+async fn assert_cleanup_interrupt(cancel: bool) {
+    let mut bed = timeout_bed(
+        if cancel {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_millis(500)
+        },
+        true,
+    );
+    let submit = bed.runtime.submit(submit_cmd("cleanup-interrupt")).await;
+    assert_eq!(submit.reply(), CommandReply::Accepted);
+    tokio::time::timeout(Duration::from_secs(1), bed.cleanup_entered.recv())
+        .await
+        .unwrap()
+        .expect("tool reaches cleanup");
+    let started = std::time::Instant::now();
+    if cancel {
+        assert_eq!(
+            bed.runtime
+                .cancel(CancelCommand {
+                    request: RequestId::new("req-cancel-cleanup").unwrap(),
+                    run: submit.run().unwrap().clone(),
+                })
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+    }
+    let (collected, finished) = tokio::time::timeout(
+        Duration::from_millis(1500),
+        collect_until_finished(&mut bed.data, &mut bed.control),
+    )
+    .await
+    .expect("run control interrupts the two-second cleanup grace");
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert_eq!(
+        finished.outcome(),
+        if cancel {
+            RunOutcome::Cancelled
+        } else {
+            RunOutcome::LimitReached
+        }
+    );
+    let outcomes = tool_finished_outcomes(&collected);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0].status(),
+        if cancel {
+            ExecutionStatus::Cancelled
+        } else {
+            ExecutionStatus::TimedOut
+        }
+    );
+    assert_eq!(outcomes[0].effect(), EffectState::Unknown);
+    assert_eq!(outcomes[0].evidence(), Evidence::Uncertain);
+    assert_eq!(bed.tool.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(bed.provider.seen_budgets().len(), 1);
+    assert_eq!(
+        bed.runtime.submit(submit_cmd("cleanup-busy")).await.reply(),
+        CommandReply::Busy
+    );
+    bed.cleanup_release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while bed.runtime.has_unconfirmed_work().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quarantine clears only after cleanup terminates");
+    assert_eq!(
+        bed.tool.executions.load(Ordering::SeqCst),
+        1,
+        "no automatic replay"
+    );
+}
+
+#[test]
+fn cancellation_during_tool_cleanup_is_prompt_and_quarantines_worker() {
+    test_rt().block_on(assert_cleanup_interrupt(true));
+}
+
+#[test]
+fn run_deadline_caps_tool_cleanup_and_quarantines_worker() {
+    test_rt().block_on(assert_cleanup_interrupt(false));
+}
+
+/// Exhausting the per-tool deadline and cleanup grace records an
+/// explicit `TimedOut`/`Unknown`/`Uncertain` outcome: an execution timeout is
+/// never a truncation or fabricated success. Pending and subsequent model-requested
+/// tools are denied while the worker stays owned in quarantine, but the model
+/// can complete. Only worker termination permits a new submit; nothing replays.
+#[test]
+fn unconfirmed_tool_timeout_reaches_model_and_denies_tools_until_worker_returns() {
     let mut limits = Limits::m0_test();
     limits.per_tool_timeout = Duration::from_millis(50);
     let (tool, release) = BlockingTool::new();
     let tool = Arc::new(tool);
     let provider = Arc::new(ScriptedProvider::new(
-        vec![ScriptedProvider::tool_turn(vec![read_candidate(
-            "item-0", "prov-0", "src",
-        )])],
+        vec![
+            ScriptedProvider::tool_turn(vec![
+                read_candidate("item-0", "prov-0", "src"),
+                read_candidate("item-1", "prov-1", "pending"),
+            ]),
+            ScriptedProvider::tool_turn(vec![read_candidate("item-2", "prov-2", "next-turn")]),
+            ScriptedProvider::stop_turn("completed despite quarantine"),
+        ],
         None,
     ));
     let tools = vec![ToolRegistration::read(tool.clone())];
@@ -839,7 +1079,7 @@ fn per_tool_timeout_maps_to_limit_reached_with_an_unknown_effect_outcome() {
             policy: Policy::m0_test(),
             has_approval_handler: false,
         },
-        provider,
+        provider.clone(),
         tools,
     )
     .expect("valid runtime wiring");
@@ -850,21 +1090,58 @@ fn per_tool_timeout_maps_to_limit_reached_with_an_unknown_effect_outcome() {
         let submit = runtime.submit(submit_cmd("tool-timeout")).await;
         assert_eq!(submit.reply(), CommandReply::Accepted);
         let (collected, finished) = collect_until_finished(&mut data, &mut control).await;
-        assert_eq!(finished.outcome(), RunOutcome::LimitReached);
-        if let Some(error) = finished.error() {
-            assert_eq!(error.category(), ErrorCategory::ResourceLimit);
-            assert_eq!(error.retry(), RetryGuidance::DoNotRetry);
-        }
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(finished.error().is_none());
         let outcomes = tool_finished_outcomes(&collected);
-        assert_eq!(outcomes.len(), 1, "the timed-out call keeps one outcome");
+        assert_eq!(outcomes.len(), 3, "one timeout and two quarantine denials");
         assert_eq!(outcomes[0].status(), ExecutionStatus::TimedOut);
         assert_eq!(outcomes[0].effect(), EffectState::Unknown);
         assert_eq!(outcomes[0].evidence(), Evidence::Uncertain);
+        assert!(
+            outcomes[0]
+                .content()
+                .contains("termination and effects are unconfirmed")
+        );
+        assert!(
+            outcomes[0]
+                .content()
+                .contains("do not retry this operation")
+        );
         assert!(
             !outcomes[0].is_truncated(),
             "a timeout is not an output cut"
         );
         assert_eq!(terminal_events(&collected), 1);
+        for denied in &outcomes[1..] {
+            assert_eq!(denied.status(), ExecutionStatus::Denied);
+            assert_eq!(denied.effect(), EffectState::NotStarted);
+            assert_eq!(denied.evidence(), Evidence::HostObserved);
+            assert!(denied.content().contains("quarantin"));
+        }
+        assert_eq!(tool.executions.load(Ordering::SeqCst), 1);
+        assert!(runtime.has_unconfirmed_work().await);
+        assert_eq!(
+            runtime
+                .submit(submit_cmd("while-quarantined"))
+                .await
+                .reply(),
+            CommandReply::Busy
+        );
+        {
+            let requests = provider.requests.lock().expect("requests readable");
+            assert_eq!(requests.len(), 3, "the model continues after timeout");
+            for (turn, expected) in [(1, 2), (2, 3)] {
+                let results = requests[turn]
+                    .conversation()
+                    .iter()
+                    .filter_map(|item| match item {
+                        ModelContextItem::ToolResult { outcome, .. } => Some(outcome),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(results, outcomes[..expected]);
+            }
+        }
 
         // Release the quarantined worker and wait (bounded) for ownership to
         // clear so the blocking thread terminates before the runtime drops.

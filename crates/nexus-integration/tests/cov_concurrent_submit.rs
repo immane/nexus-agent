@@ -436,12 +436,13 @@ fn submit_during_quarantine_is_busy_and_dispatches_nothing_extra() {
 /// host-issued run, same originating request, sequence zero, exactly once.
 /// A submit racing that window cannot open a second run, so the reconciled run
 /// stays the only run in the stream, and the terminal plus the snapshot agree
-/// on its final sequence.
+/// on its final sequence. The provider gate holds the run open so the race is
+/// deterministic.
 #[test]
 fn submit_reply_reconciles_with_run_started_and_stays_unique() {
     let rt = common::test_rt();
     rt.block_on(async {
-        let mut bed = common::make_bed(vec![stop_turn("done")], common::quick_config());
+        let mut bed = common::make_gated_bed(vec![stop_turn("done")], common::quick_config());
         let command = common::submit_cmd("reconcile");
         let request = command.request.clone();
         let response = bed.runtime.submit(command).await;
@@ -455,6 +456,16 @@ fn submit_reply_reconciles_with_run_started_and_stays_unique() {
             .run()
             .cloned()
             .expect("accepted submit issues a run");
+        // Hold the provider at its gate so the run is provably still active
+        // when the conflicting submit arrives.
+        let gate = bed
+            .provider
+            .gate()
+            .expect("gated provider exposes its gate");
+        assert!(
+            gate.wait_entered(BACKSTOP),
+            "the run is held open at its provider"
+        );
 
         let opened = common::collect_control_until(&mut bed.control, |event| {
             matches!(event.payload(), EventPayload::RunStarted { .. })
@@ -488,6 +499,7 @@ fn submit_reply_reconciles_with_run_started_and_stays_unique() {
         assert_eq!(busy.reply(), CommandReply::Busy);
         assert_eq!(busy.run(), Some(&run));
 
+        gate.release();
         let (data, mut control, finished) =
             common::drain_until_finished(&mut bed.data, &mut bed.control).await;
         control.extend(opened);

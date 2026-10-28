@@ -372,6 +372,31 @@ The TUI and ordinary server CLI allow up to 10 minutes per tool call within a
 one-hour run budget; each tool deadline is clamped to the remaining run budget.
 Benchmark-pilot mode allows one hour per tool within a 24-hour run budget.
 Timeouts do not bypass uncertain-effect handling or worker quarantine.
+Per-tool expiry is not, by itself, a run-budget failure. The runtime allows a
+bounded cleanup grace (up to two seconds, within the remaining run budget)
+without extending the tool's execution deadline. If the worker returns, its
+result is recorded and the model can continue; cancellation or an exhausted run
+budget still stops the run. A worker that remains live after per-tool cleanup
+grace is quarantined and records `TimedOut` / `Unknown` / `Uncertain`; the model
+can continue, but new tool dispatch is denied (`NotStarted`) while any
+quarantined worker remains. Background ownership is retained until the worker
+completes. Container transport timeouts can poison the session even after the
+host worker returns: killing the
+Docker CLI does not establish remote termination, and poisoned tools remain
+unavailable. No automatic command retry or container replacement is performed.
+
+Recoverable failures are inputs to the model loop, not automatic run terminals.
+Tool failures and denials retain their actual effects and evidence. Provider
+access failures use increasing backoff (1, 2, 5, 10, 30, then 60 seconds)
+until a response succeeds, the user cancels, or the run deadline expires; failed
+access attempts do not consume successful model turns. Numeric `Retry-After`
+headers can extend the wait, but never the run deadline. Partial responses never
+authorize tools or silently merge into replacement attempts. Explicit user
+cancellation stops further model requests, retries, and tool dispatch, including
+during backoff. Hard resource limits, unsafe or inconsistent protocol state,
+and persistence/integrity failures still stop the run rather than bypassing
+safety checks. Stopping a run does not imply that an outstanding worker has
+stopped or that its effects were rolled back.
 
 Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Local-backend `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Container-backed execution uses the separate prototype boundary described above. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
 
@@ -392,7 +417,7 @@ artifacts outside this repository; they are not available in a standalone clone.
 
 ### Local inference: Qwen3.8-27B via Ollama
 
-The `ollama-local/qwen3-27b` pilot has four scored task runs: **three resolved
+The `ollama-local/qwen3-27b` pilot has five scored task runs: **four resolved
 and one did not**. Interrupted attempts remain unscored.
 
 **Inference environment:** Qwen3.8-27B, **IQ3_M quantization**, with a configured
@@ -406,8 +431,16 @@ comparisons should account for quantization, context budget, and agent harness.
 | `sympy__sympy-20590` (summary-fix v2, latest) | 2026-10-25 | 14m 11s | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
 | `astropy__astropy-12907` (correctness regression rerun) | 2026-10-26 | 14m 36s | Preserve separability matrices in nested compound models. | Resolved | Completed |
 | `django__django-11099` | 2026-10-24 | 34m 02s | Reject trailing newlines in username validators. | Resolved | Completed |
+| `django__django-11099` (post-rebuild regression rerun) | 2026-10-28 | 25m 17s | Reject trailing newlines in username validators. | Resolved (official SWE-bench 5.0.2, 1/1) | Completed |
 | `pallets__flask-4992` (harness validation) | 2026-10-26 | 1h 09m 00s | Pass `open()` keyword arguments through `Config.from_file`. | **Unresolved** | Completed |
 | `pylint-dev__pylint-6506` (background attempt 2) | 2026-10-26 | 2h 09m 33s | No patch produced. | Not scored (Ollama server crashed under load; confirmed) | Interrupted |
+
+The 2026-10-28 Django run is a regression rerun of a previously evaluated
+task, not a blind sample. It used 42 model requests (including 11 context
+summaries), 40 tool calls, and 335,333 input / 49,898 output tokens. The
+official evaluator resolved it in 82 seconds with no infrastructure failures.
+See the [launch record](../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/launch.json)
+and [official evaluation report](../nexus-benchmark-work/run-django__django-11099-20261028T020338Z-8c59e82b/official-evaluation/qwen-django-20261028T023105Z-899b2d2e/ollama-local__qwen3-27b.qwen-django-20261028T023105Z-899b2d2e.json).
 
 The Flask run produced a patch that applied cleanly and kept all 19
 `PASS_TO_PASS` tests passing. It failed `test_config_from_file_toml` because the

@@ -92,6 +92,42 @@ fn argv_runs_inside_the_configured_sandbox_root() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn expired_command_cleans_up_and_executor_accepts_the_next_call() {
+    let root = TempRoot::new();
+    let executor = SandboxedExecutor::with_root(&root.0).expect("valid root binds");
+    assert!(executor.sandbox_available());
+    let started = std::time::Instant::now();
+    let context = context().with_control(
+        nexus_core::CancellationToken::new(),
+        started + Duration::from_millis(100),
+    );
+    let result = executor.execute(
+        &call(r#"{"argv":["/bin/sh","-c","printf started; exec /bin/sleep 30"]}"#),
+        &context,
+    );
+    assert_eq!(
+        result.status(),
+        ExecutionStatus::TimedOut,
+        "{}",
+        result.content()
+    );
+    assert_eq!(result.effect(), nexus_core::EffectState::Unknown);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let next = executor.execute(
+        &call(r#"{"argv":["/usr/bin/printf","sandbox-ok"]}"#),
+        &context_with_scope("command:/usr/bin/printf sandbox-ok"),
+    );
+    assert_eq!(
+        next.status(),
+        ExecutionStatus::Succeeded,
+        "{}",
+        next.content()
+    );
+    assert_eq!(next.content(), "sandbox-ok");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn descendant_holding_output_pipe_does_not_extend_cleanup_unboundedly() {
     let root = TempRoot::new();
     let executor = SandboxedExecutor::with_root(&root.0).expect("valid root binds");
