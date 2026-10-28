@@ -1,6 +1,6 @@
 [package]
 name = "nexus-integration"
-version = "0.2.3-alpha"
+version = "0.2.4-alpha"
 edition = "2024"
 
 [lib]
