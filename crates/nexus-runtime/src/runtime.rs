@@ -53,7 +53,7 @@ use nexus_core::{
 use nexus_session::recover_session;
 use nexus_validation::CompiledSchema;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::policy::Policy;
@@ -1608,17 +1608,21 @@ impl Runtime {
             let provider = self.shared.provider.clone();
             let incremental = provider.supports_incremental_streaming();
             let (stream_tx, mut stream_rx) =
-                mpsc::channel::<ProviderEvent>(PROVISIONAL_STREAM_CAPACITY);
+                mpsc::channel::<(ProviderEvent, OwnedSemaphorePermit)>(PROVISIONAL_STREAM_CAPACITY);
             let stream_overflow = Arc::new(AtomicBool::new(false));
             let producer_overflow = stream_overflow.clone();
             let producer_token = token.clone();
-            let stream_bytes = Arc::new(AtomicUsize::new(0));
+            let stream_bytes = Arc::new(Semaphore::new(PROVISIONAL_STREAM_BYTE_CAPACITY));
             let producer_bytes = stream_bytes.clone();
+            let executor = tokio::runtime::Handle::current();
             let worker_context = context.clone();
             let worker_request = request.clone();
             let mut handle = tokio::task::spawn_blocking(move || {
                 if incremental {
                     let sink = |event: ProviderEvent| {
+                        if worker_context.check_active().is_err() {
+                            return;
+                        }
                         if !matches!(
                             &event,
                             ProviderEvent::TextDelta { .. }
@@ -1629,19 +1633,24 @@ impl Runtime {
                             return;
                         }
                         let bytes = provisional_event_bytes(&event);
-                        let previous = producer_bytes.fetch_add(bytes, Ordering::SeqCst);
-                        if previous.saturating_add(bytes) > PROVISIONAL_STREAM_BYTE_CAPACITY {
-                            producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
+                        if bytes > PROVISIONAL_STREAM_BYTE_CAPACITY {
                             producer_overflow.store(true, Ordering::SeqCst);
                             producer_token.cancel();
                             return;
                         }
-                        if let Err(error) = stream_tx.try_send(event) {
-                            producer_bytes.fetch_sub(bytes, Ordering::SeqCst);
-                            drop(error);
-                            producer_overflow.store(true, Ordering::SeqCst);
-                            producer_token.cancel();
-                        }
+                        // This sink runs on the blocking provider worker. Apply
+                        // backpressure at both bounds instead of cancelling a
+                        // valid response when the consumer briefly falls behind.
+                        executor.block_on(async {
+                            let Ok(permit) = producer_bytes
+                                .clone()
+                                .acquire_many_owned(bytes as u32)
+                                .await
+                            else {
+                                return;
+                            };
+                            let _ = stream_tx.send((event, permit)).await;
+                        });
                     };
                     provider.stream_with_sink(&worker_request, &worker_context, &sink)
                 } else {
@@ -1659,9 +1668,9 @@ impl Runtime {
                     biased;
                     joined = &mut handle => break Some(joined),
                     streamed = stream_rx.recv() => {
-                            if let Some(event) = streamed {
-                                stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
-                                self.publish_provisional(run, &turn, event, &mut prefix)
+                        if let Some((event, permit)) = streamed {
+                            drop(permit);
+                            self.publish_provisional(run, &turn, event, &mut prefix)
                                 .await;
                         }
                     }
@@ -1674,6 +1683,11 @@ impl Runtime {
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break None,
                 }
             };
+            // Wake producers waiting on either bound before joining or
+            // quarantining them on cancellation/deadline. Buffered events can
+            // still be drained after a successful provider join.
+            stream_rx.close();
+            stream_bytes.close();
             return match joined {
                 Some(Ok(events)) => {
                     let mut effective_limits = self.shared.limits;
@@ -1731,7 +1745,7 @@ impl Runtime {
                     // The join may win the race while provisional events are
                     // still buffered: drain them first so every streamed prefix
                     // publishes before the authoritative batch ingests.
-                    self.drain_stream(run, &turn, &mut stream_rx, &stream_bytes, &mut prefix)
+                    self.drain_stream(run, &turn, &mut stream_rx, &mut prefix)
                         .await;
                     self.check_completed_stream_limits(
                         run,
@@ -1859,7 +1873,7 @@ impl Runtime {
                         return Err(Terminal::limit(if prefix.exceeded {
                             "provisional output budget exhausted"
                         } else {
-                            "provisional provider stream exceeded its bound"
+                            "provisional provider event exceeded its byte bound"
                         }));
                     }
                     let forced = {
@@ -1997,7 +2011,7 @@ impl Runtime {
         overflow: bool,
     ) -> Result<(), Terminal> {
         let message = if overflow {
-            "provisional provider stream exceeded its bound"
+            "provisional provider event exceeded its byte bound"
         } else if prefix.exceeded {
             "provisional output budget exhausted"
         } else {
@@ -2134,12 +2148,11 @@ impl Runtime {
         &self,
         run: &RunId,
         turn: &TurnId,
-        stream_rx: &mut mpsc::Receiver<ProviderEvent>,
-        stream_bytes: &AtomicUsize,
+        stream_rx: &mut mpsc::Receiver<(ProviderEvent, OwnedSemaphorePermit)>,
         prefix: &mut StreamedPrefix,
     ) {
-        while let Ok(event) = stream_rx.try_recv() {
-            stream_bytes.fetch_sub(provisional_event_bytes(&event), Ordering::SeqCst);
+        while let Ok((event, permit)) = stream_rx.try_recv() {
+            drop(permit);
             self.publish_provisional(run, turn, event, prefix).await;
         }
     }

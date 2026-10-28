@@ -3007,15 +3007,21 @@ mod tests {
             )),
         ];
         let (sender, mut receiver) = mpsc::channel(PROVISIONAL_STREAM_CAPACITY);
-        let bytes = AtomicUsize::new(0);
+        let bytes = Arc::new(Semaphore::new(PROVISIONAL_STREAM_BYTE_CAPACITY));
         for event in &events[..2] {
-            bytes.fetch_add(provisional_event_bytes(event), Ordering::SeqCst);
-            sender.try_send(event.clone()).expect("buffered prefix");
+            let permit = bytes
+                .clone()
+                .try_acquire_many_owned(provisional_event_bytes(event) as u32)
+                .expect("buffered byte capacity");
+            sender
+                .try_send((event.clone(), permit))
+                .expect("buffered prefix");
         }
         let mut prefix = StreamedPrefix::default();
         runtime
-            .drain_stream(&run, &turn(), &mut receiver, &bytes, &mut prefix)
+            .drain_stream(&run, &turn(), &mut receiver, &mut prefix)
             .await;
+        assert_eq!(bytes.available_permits(), PROVISIONAL_STREAM_BYTE_CAPACITY);
         assert!(
             prefix.exceeded,
             "the queued second fragment exceeds the output bound during drain"

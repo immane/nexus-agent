@@ -39,6 +39,13 @@ Adapters assemble bounded protocol fragments, preserve item and call identity, a
 
 Only complete, valid model turns become accepted conversation records. Visible partial text can remain in the frontend as incomplete output without being labeled a completed answer.
 
+The runtime's incremental provider bridge applies backpressure at its bounded
+event queue (64 events) and buffered-byte budget (1 MiB). A full buffer pauses
+the synchronous provider worker rather than cancelling a valid response.
+Cancellation and run deadlines close both waits before worker cleanup; a single
+event exceeding the byte capacity still fails explicitly. These buffering limits
+are separate from the total per-response output and event budgets.
+
 Tool schemas remain host-validated. Provider-specific schema conversion must not silently weaken runtime validation or advertise a tool the adapter cannot represent correctly.
 
 ## Continuation Fidelity
