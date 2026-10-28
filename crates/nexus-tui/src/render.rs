@@ -732,7 +732,10 @@ fn help_lines(state: &AppState) -> Vec<Line<'static>> {
         "Recall previous / next submitted draft",
     ));
     lines.push(help_row("Tab", "Cycle agent mode (plan / build / custom)"));
-    lines.push(help_row("Esc", "Step focus back one level"));
+    lines.push(help_row(
+        "Esc",
+        "Return to normal mode; i / o enter composer",
+    ));
     lines.push(help_row(
         "@<path>",
         "Suggest a project path; inserts a reference only",
@@ -1355,8 +1358,8 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
     block.render(area, buf);
     // An empty focused composer shows a dimmed invitation, but the caret
     // owns column zero either way: the hint never pushes it away.
-    // Anything typed replaces the hint, and other focuses render the
-    // draft (or nothing) exactly as before.
+    // In normal mode, an empty draft instead hints how to enter editing.
+    // A nonempty draft remains visible in either mode.
     let draft = state.composer().to_owned();
     let selected = state.composer_selection_range();
     let show_caret = focus == Focus::Composer && state.caret_visible();
@@ -1383,6 +1386,11 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         } else {
             Line::from(vec![Span::styled(hint, dim)])
         }
+    } else if draft.is_empty() && focus == Focus::Viewport {
+        Line::from(Span::styled(
+            "Type i / o to edit",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
     } else if let Some((start, len)) = selected {
         composer_selected_line(&draft, start, len, focus == Focus::Composer)
     } else if show_caret {
@@ -1435,6 +1443,19 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_composer_hints_insert_keys_only_in_normal_mode() {
+        let (mut state, mut terminal) = harness(100, 24);
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(screen(&terminal).contains("Type i / o to edit"));
+        draw(&mut state, &mut terminal, Focus::Composer);
+        assert!(!screen(&terminal).contains("Type i / o to edit"));
+        state.composer_type('x');
+        draw(&mut state, &mut terminal, Focus::Viewport);
+        assert!(!screen(&terminal).contains("Type i / o to edit"));
+        assert!(screen(&terminal).contains('x'));
+    }
+
     #[test]
     fn frames_never_duplicate_the_composer_text_or_leave_stale_draft() {
         // Two consecutive frames through one backend (which keeps cells the

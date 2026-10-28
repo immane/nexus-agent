@@ -3484,15 +3484,15 @@ async fn handle_key_with_runtime(
             front.state.clear_colon();
             // Step back one rung, never cancelling or deciding: an open
             // detail just closes (the card keeps focus so allow/deny stay
-            // one keypress away), the composer parks in the viewport for
-            // the viewport-only shortcuts, and anywhere else returns to
-            // the composer, where most work happens.
+            // one keypress away), the composer returns to normal mode in
+            // the viewport, and leaving approval also returns to normal
+            // mode. Esc never enters composer edit mode.
             if front.state.approval_detail_open() {
                 front.state.close_approval_detail();
             } else {
                 front.focus = match front.focus {
                     Focus::Composer => Focus::Viewport,
-                    _ => Focus::Composer,
+                    Focus::Viewport | Focus::ApprovalCard => Focus::Viewport,
                 };
             }
         }
@@ -7406,8 +7406,8 @@ mod cov_main_topup {
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
         assert_eq!(
             front.focus,
-            Focus::Composer,
-            "Esc in the viewport returns home to the composer"
+            Focus::Viewport,
+            "Esc in normal mode must not enter composer edit mode"
         );
         assert!(!front.state.approval_detail_open(), "Esc never decides");
         assert_eq!(front.request_counter, 0, "no focus key issues a command");
@@ -7487,7 +7487,7 @@ mod cov_main_topup {
             "the card keeps focus so allow/deny stay one keypress away"
         );
         assert!(!handle_key(&mut front, &runtime, press(KeyCode::Esc)).await);
-        assert_eq!(front.focus, Focus::Composer, "Esc then returns home");
+        assert_eq!(front.focus, Focus::Viewport, "Esc returns to normal mode");
         assert!(
             front.live_approval.is_some(),
             "stepping back decides nothing"
