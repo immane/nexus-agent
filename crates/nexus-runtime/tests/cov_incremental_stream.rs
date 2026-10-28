@@ -96,6 +96,72 @@ struct BatchProvider {
     batch: Mutex<Option<Vec<ProviderEvent>>>,
 }
 
+struct GatedReasoningProvider {
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ProviderPort for GatedReasoningProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        StreamingProvider::new(Vec::new(), Vec::new()).capabilities()
+    }
+
+    fn stream(&self, _: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
+        unreachable!()
+    }
+
+    fn supports_incremental_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_with_sink(
+        &self,
+        _: &ModelRequest,
+        _: &ProviderContext,
+        sink: &(dyn Fn(ProviderEvent) + Send + Sync),
+    ) -> Vec<ProviderEvent> {
+        let trace = ProviderEvent::ReasoningDelta {
+            text: "live".into(),
+        };
+        sink(trace.clone());
+        self.release.lock().unwrap().recv_timeout(WAIT).unwrap();
+        vec![trace, stop_turn(final_usage(None, None))]
+    }
+}
+
+#[tokio::test]
+async fn reasoning_arrives_before_the_provider_finishes() {
+    let (release, gate) = std::sync::mpsc::channel();
+    let provider = Arc::new(GatedReasoningProvider {
+        release: Mutex::new(gate),
+    });
+    let (runtime, mut streams) = Runtime::new(config(), provider, Vec::new());
+    runtime.enable_local_reasoning();
+    assert_eq!(
+        runtime.submit(submit_cmd("live-reasoning")).await.reply(),
+        CommandReply::Accepted
+    );
+    let event = tokio::time::timeout(WAIT, streams.data.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(event.payload(), EventPayload::AssistantReasoningDelta(fragment) if fragment.text == "live")
+    );
+    release.send(()).unwrap();
+    let finished = tokio::time::timeout(WAIT, async {
+        loop {
+            if let EventPayload::RunFinished(done) = streams.control.recv().await.unwrap().payload()
+            {
+                break done.clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert!(streams.data.try_recv().is_err());
+}
+
 impl ProviderPort for BatchProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -169,7 +235,19 @@ async fn run_turn(
     tag: &str,
     expected_data: usize,
 ) -> (Vec<RunEvent>, Vec<RunEvent>, RunFinished) {
+    run_turn_with_reasoning(provider, tag, expected_data, false).await
+}
+
+async fn run_turn_with_reasoning(
+    provider: Arc<dyn ProviderPort + Send + Sync>,
+    tag: &str,
+    expected_data: usize,
+    enabled: bool,
+) -> (Vec<RunEvent>, Vec<RunEvent>, RunFinished) {
     let (runtime, mut streams) = Runtime::new(config(), provider, Vec::new());
+    if enabled {
+        runtime.enable_local_reasoning();
+    }
     let response = runtime.submit(submit_cmd(tag)).await;
     assert_eq!(response.reply(), CommandReply::Accepted);
     let run = response
@@ -228,6 +306,54 @@ async fn run_turn(
         "every delivered event belongs to the submitted run"
     );
     (data, control, finished)
+}
+
+#[tokio::test]
+async fn reasoning_is_opt_in_and_streamed_prefix_is_not_replayed() {
+    for enabled in [false, true] {
+        let provider = Arc::new(StreamingProvider::new(
+            vec![ProviderEvent::ReasoningDelta {
+                text: "first ".into(),
+            }],
+            vec![
+                ProviderEvent::ReasoningDelta {
+                    text: "first second".into(),
+                },
+                stop_turn(final_usage(None, None)),
+            ],
+        ));
+        let (data, _, finished) =
+            run_turn_with_reasoning(provider, "reasoning", if enabled { 2 } else { 0 }, enabled)
+                .await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        let traces: Vec<_> = data
+            .iter()
+            .filter_map(|event| match event.payload() {
+                EventPayload::AssistantReasoningDelta(fragment) => Some(fragment.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(traces.concat(), if enabled { "first second" } else { "" });
+    }
+}
+
+#[tokio::test]
+async fn mismatched_reasoning_prefix_fails_the_turn() {
+    let provider = Arc::new(StreamingProvider::new(
+        vec![ProviderEvent::ReasoningDelta { text: "one".into() }],
+        vec![
+            ProviderEvent::ReasoningDelta {
+                text: "different".into(),
+            },
+            stop_turn(final_usage(None, None)),
+        ],
+    ));
+    let (_, _, finished) = run_turn_with_reasoning(provider, "reasoning-mismatch", 1, true).await;
+    assert_eq!(finished.outcome(), RunOutcome::Failed);
+    assert_eq!(
+        finished.error().unwrap().category(),
+        ErrorCategory::Protocol
+    );
 }
 
 fn data_texts(data: &[RunEvent]) -> Vec<&str> {

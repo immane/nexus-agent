@@ -75,6 +75,44 @@ const TRUNCATION_MARKER: &str = "[output truncated to presentation bound]";
 /// Default compact tool output, counted in logical lines before wrapping.
 pub const TOOL_PREVIEW_LINES: usize = 10;
 
+fn is_path_only_tool(name: &str) -> bool {
+    matches!(name, "host_read" | "host_list")
+}
+
+/// Only the structured path is displayable, never arbitrary argument fields
+/// or result text. Live previews carry a tool-name prefix; saved args do not.
+fn tool_path(name: &str, args: Option<&str>) -> String {
+    let path = args
+        .and_then(|args| {
+            let json = args
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .unwrap_or(args);
+            serde_json::from_str::<serde_json::Value>(json).ok()
+        })
+        .and_then(|value| value.get("path")?.as_str().map(str::to_owned))
+        .filter(|path| !path.is_empty());
+    let Some(path) = path else {
+        return "path: [unavailable]".to_owned();
+    };
+    let clean = sanitize_approval(&path)
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    let suffix = if clean.len() > MAX_TITLE_BYTES {
+        " [path truncated]"
+    } else {
+        ""
+    };
+    format!("path: {}{suffix}", safe_prefix(&clean, MAX_TITLE_BYTES))
+}
+
+#[derive(Debug)]
+struct FileToolPresentation {
+    call: CallId,
+    tool: nexus_core::ToolId,
+    path: String,
+}
+
 /// Conversation entry kind for grouping and rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -82,6 +120,8 @@ pub enum EntryKind {
     User,
     /// Streamed assistant text.
     Assistant,
+    /// Provider-returned reasoning, hidden until explicitly opened.
+    Reasoning,
     /// Tool previews, status, and outcomes.
     Tool,
     /// Run lifecycle and frontend notices.
@@ -94,9 +134,17 @@ pub enum EntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamKey {
     /// Assistant text for one turn-local item.
-    Assistant { turn: TurnId, item: String },
+    Assistant {
+        turn: TurnId,
+        item: String,
+    },
+    Reasoning {
+        turn: TurnId,
+    },
     /// Progress preview for one executing call.
-    ToolOutput { call: CallId },
+    ToolOutput {
+        call: CallId,
+    },
 }
 
 /// Cheap fingerprint of everything that affects a wrapped height. Direct
@@ -120,7 +168,7 @@ struct HeightCache {
     height: usize,
 }
 
-/// One foldable conversation entry with pre-sanitized lines.
+/// One conversation entry with pre-sanitized lines and optional folding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     preview_lines: usize,
@@ -150,6 +198,8 @@ pub struct Entry {
     /// Run-scoped identity prevents repeated call IDs in later runs aliasing.
     tool_call: Option<(RunId, CallId)>,
     tool_name: Option<nexus_core::ToolId>,
+    /// Path/status cards have no hidden body and cannot be folded.
+    path_only_tool: bool,
 }
 
 impl Entry {
@@ -170,6 +220,7 @@ impl Entry {
             compact_prefix: None,
             tool_call: None,
             tool_name: None,
+            path_only_tool: false,
         }
     }
 
@@ -871,6 +922,10 @@ pub struct AppState {
     settings: nexus_config::TuiSettings,
     picker_page_rows: Cell<usize>,
     entries: VecDeque<Entry>,
+    /// Run-local classification survives transcript eviction. Both count and
+    /// path bytes are bounded; overflow hides unidentified output fail-closed.
+    file_tools: Vec<FileToolPresentation>,
+    file_tools_overflowed: bool,
     /// Sum of retained per-entry bytes, bounded by [`MAX_RETAINED_BYTES`].
     retained_bytes: usize,
     /// Presentation-only drops; accepted records are unaffected.
@@ -992,6 +1047,8 @@ impl AppState {
             settings: nexus_config::TuiSettings::default(),
             picker_page_rows: Cell::new(MAX_PICKER_VISIBLE_ROWS),
             entries: VecDeque::new(),
+            file_tools: Vec::new(),
+            file_tools_overflowed: false,
             retained_bytes: 0,
             dropped_entries: 0,
             composer: String::new(),
@@ -1221,6 +1278,8 @@ impl AppState {
         self.clear_text_selection();
         match event.payload() {
             EventPayload::RunStarted { .. } => {
+                self.file_tools.clear();
+                self.file_tools_overflowed = false;
                 self.streaming = true;
                 self.finished = None;
                 self.last_usage = None;
@@ -1237,6 +1296,12 @@ impl AppState {
                         item: fragment.item_key.clone(),
                     };
                     self.push_stream_fragment(EntryKind::Assistant, "assistant", key, &clean);
+                }
+            }
+            EventPayload::AssistantReasoningDelta(fragment) => {
+                let clean = sanitize(&fragment.text);
+                if !clean.is_empty() {
+                    self.push_stream_fragment(EntryKind::Reasoning, "thinking", StreamKey::Reasoning { turn: fragment.turn.clone() }, &clean);
                 }
             }
             EventPayload::ContextReduced { removed_items, .. } => {
@@ -1321,18 +1386,32 @@ impl AppState {
                 );
                 entry.tool_call = Some((event.run().clone(), info.call.clone()));
                 entry.tool_name = Some(info.tool.clone());
-                let preview = info
-                    .args_preview
-                    .as_deref()
-                    .unwrap_or("[parameters unavailable for safe display]");
-                for line in sanitize_approval(preview).lines() {
-                    entry.push_line(line);
+                if is_path_only_tool(info.tool.name()) {
+                    let path = tool_path(info.tool.name(), info.args_preview.as_deref());
+                    entry.push_line(&path);
+                    entry.path_only_tool = true;
+                    if self.file_tools.len() < MAX_RETAINED_ENTRIES {
+                        self.file_tools.push(FileToolPresentation {
+                            call: info.call.clone(),
+                            tool: info.tool.clone(),
+                            path,
+                        });
+                    } else {
+                        self.file_tools_overflowed = true;
+                    }
+                } else {
+                    let preview = info
+                        .args_preview
+                        .as_deref()
+                        .unwrap_or("[parameters unavailable for safe display]");
+                    for line in sanitize_approval(preview).lines() {
+                        entry.push_line(line);
+                    }
                 }
-                entry.folded = true;
+                entry.folded = !entry.path_only_tool;
                 self.push_entry(entry);
             }
             EventPayload::ToolOutput(progress) => {
-                let clean = sanitize(&progress.preview);
                 let name =
                     self.entries
                         .iter()
@@ -1344,6 +1423,13 @@ impl AppState {
                         })
                         .and_then(|entry| entry.tool_name.as_ref())
                         .map(|tool| tool.name());
+                if self.file_tools.iter().any(|tool| tool.call == progress.call)
+                    || name.is_some_and(is_path_only_tool)
+                    || (name.is_none() && self.file_tools_overflowed)
+                {
+                    return true;
+                }
+                let clean = sanitize(&progress.preview);
                 let title = name.map_or_else(
                     || format!("tool {} output", progress.call.as_str()),
                     |name| format!("{name} · {} · output", progress.call.as_str()),
@@ -1364,8 +1450,6 @@ impl AppState {
                 }
             }
             EventPayload::ToolFinished(info) => {
-                let output = sanitize(info.outcome.content());
-                let output_lines: Vec<String> = output.lines().map(str::to_owned).collect();
                 let truncated = if info.outcome.is_truncated() {
                     " · truncated"
                 } else {
@@ -1377,35 +1461,69 @@ impl AppState {
                         .as_ref()
                         .is_some_and(|(run, call)| run == event.run() && call == &info.call)
                 });
-                let name = source
-                    .and_then(|entry| entry.tool_name.as_ref())
-                    .map_or_else(
-                        || format!("tool {}", info.call.as_str()),
-                        |tool| format!("{} · {}", tool.name(), info.call.as_str()),
-                    );
-                let mut lines = source.map(|entry| entry.lines.clone()).unwrap_or_default();
-                let title = format!(
-                    "{name} · {:?} · {} lines / {} chars{truncated}",
-                    info.outcome.status(),
-                    output_lines.len(),
-                    output.chars().count(),
+                let file_tool = self
+                    .file_tools
+                    .iter()
+                    .rev()
+                    .find(|tool| tool.call == info.call);
+                let tool = file_tool
+                    .map(|tool| &tool.tool)
+                    .or_else(|| source.and_then(|entry| entry.tool_name.as_ref()));
+                let path_only = tool.is_some_and(|tool| is_path_only_tool(tool.name()))
+                    || (tool.is_none() && self.file_tools_overflowed);
+                let name = tool.map_or_else(
+                    || format!("tool {}", info.call.as_str()),
+                    |tool| format!("{} · {}", tool.name(), info.call.as_str()),
                 );
-                lines.push(format!(
-                    "{:?} · {:?} · {} lines · {} chars",
-                    info.outcome.effect(),
-                    info.outcome.evidence(),
-                    output_lines.len(),
-                    output.chars().count(),
-                ));
-                let mut entry = Entry::new(EntryKind::Tool, &title);
-                for line in lines {
-                    entry.push_line(&line);
-                }
-                entry.compact_prefix = Some(entry.lines.len());
-                for line in output_lines {
-                    entry.push_line(&line);
-                }
-                entry.folded = true;
+                let entry = if path_only {
+                    let mut entry = Entry::new(
+                        EntryKind::Tool,
+                        &format!("{name} · {:?}{truncated}", info.outcome.status()),
+                    );
+                    let path = file_tool
+                        .map(|tool| tool.path.as_str())
+                        .or_else(|| {
+                            source
+                                .filter(|entry| entry.tool_name.as_ref().is_some_and(|tool| is_path_only_tool(tool.name())))
+                                .and_then(|entry| entry.lines.first().map(String::as_str))
+                        })
+                        .unwrap_or("path: [unavailable]");
+                    entry.push_line(path);
+                    entry.push_line(&format!(
+                        "{:?} · {:?}",
+                        info.outcome.effect(),
+                        info.outcome.evidence()
+                    ));
+                    entry.path_only_tool = true;
+                    entry
+                } else {
+                    let output = sanitize(info.outcome.content());
+                    let output_lines: Vec<String> = output.lines().map(str::to_owned).collect();
+                    let mut lines = source.map(|entry| entry.lines.clone()).unwrap_or_default();
+                    let title = format!(
+                        "{name} · {:?} · {} lines / {} chars{truncated}",
+                        info.outcome.status(),
+                        output_lines.len(),
+                        output.chars().count(),
+                    );
+                    lines.push(format!(
+                        "{:?} · {:?} · {} lines · {} chars",
+                        info.outcome.effect(),
+                        info.outcome.evidence(),
+                        output_lines.len(),
+                        output.chars().count(),
+                    ));
+                    let mut entry = Entry::new(EntryKind::Tool, &title);
+                    for line in lines {
+                        entry.push_line(&line);
+                    }
+                    entry.compact_prefix = Some(entry.lines.len());
+                    for line in output_lines {
+                        entry.push_line(&line);
+                    }
+                    entry.folded = true;
+                    entry
+                };
                 self.push_entry(entry);
                 if self
                     .pending_approval
@@ -1495,13 +1613,16 @@ impl AppState {
     fn ensure_stream_entry(&mut self, kind: EntryKind, title: &str, stream: StreamKey) {
         let adjacent = self.entries.back().is_some_and(|tail| {
             tail.kind == kind
-                && (!tail.folded || tail.compact_prefix.is_some())
+                && (!tail.folded || tail.compact_prefix.is_some() || kind == EntryKind::Reasoning)
                 && tail.stream.as_ref() == Some(&stream)
         });
         if !adjacent {
             let mut entry = Entry::new_stream(kind, title, stream);
             if kind == EntryKind::Tool {
                 entry.compact_prefix = Some(0);
+                entry.folded = true;
+            }
+            if kind == EntryKind::Reasoning {
                 entry.folded = true;
             }
             self.push_entry(entry);
@@ -1580,11 +1701,19 @@ impl AppState {
     }
 
     /// Displays restored records through the normal sanitized retention path.
-    /// No live events, approvals, reasoning traces, or tool execution are restored.
+    /// No live events, approvals, or tool execution are restored.
     pub fn record_restored_history(&mut self, items: &[nexus_core::provider::ModelContextItem]) {
         use nexus_core::provider::ModelContextItem;
 
-        for item in items {
+        for (index, item) in items.iter().enumerate() {
+            if let Some(reasoning) = item.reasoning().filter(|text| !text.is_empty()) {
+                let mut entry = Entry::new(EntryKind::Reasoning, "thinking · saved");
+                for line in sanitize(reasoning).split('\n') {
+                    entry.push_line(line);
+                }
+                entry.folded = true;
+                self.push_entry(entry);
+            }
             let (kind, title, text, folded) = match item {
                 ModelContextItem::UserText(text) => {
                     self.record_submitted(text.as_str());
@@ -1596,6 +1725,55 @@ impl AppState {
                     text.as_str().to_owned(),
                     false,
                 ),
+                ModelContextItem::ToolResult {
+                    call,
+                    item_key,
+                    provider_ref,
+                    tool,
+                    outcome,
+                } if is_path_only_tool(tool.name()) => {
+                    // Search preceding records, not retained presentation entries.
+                    // All correlation fields must agree; repeated call IDs in a
+                    // later run must not borrow an older call's path.
+                    let args = items[..index]
+                        .iter()
+                        .rev()
+                        .find(|item| match item {
+                            ModelContextItem::UserText(_) => true,
+                            ModelContextItem::AssistantCall {
+                                call: candidate, ..
+                            } => candidate.call() == call,
+                            ModelContextItem::AssistantDeniedCall {
+                                call: candidate, ..
+                            } => candidate == call,
+                            _ => false,
+                        })
+                        .and_then(|item| match item {
+                            ModelContextItem::AssistantCall {
+                                call: candidate,
+                                item_key: key,
+                                provider_ref: reference,
+                                ..
+                            } if candidate.tool() == tool
+                                && key == item_key
+                                && reference == provider_ref =>
+                            {
+                                Some(candidate.args().as_str())
+                            }
+                            _ => None,
+                        });
+                    (
+                        EntryKind::Tool,
+                        format!(
+                            "{} · saved · {:?} · {:?}",
+                            tool.name(),
+                            outcome.status(),
+                            outcome.effect()
+                        ),
+                        tool_path(tool.name(), args),
+                        false,
+                    )
+                }
                 ModelContextItem::ToolResult { tool, outcome, .. } => (
                     EntryKind::Tool,
                     format!(
@@ -1618,6 +1796,11 @@ impl AppState {
             entry.folded = folded;
             if let ModelContextItem::ToolResult { outcome, .. } = item {
                 entry.truncated |= outcome.is_truncated();
+            }
+            if let ModelContextItem::ToolResult { tool, .. } = item
+                && is_path_only_tool(tool.name())
+            {
+                entry.path_only_tool = true;
             }
             self.push_entry(entry);
         }
@@ -1824,9 +2007,10 @@ impl AppState {
     }
 
     /// Toggles folding for entry `index` (0 is the oldest). Returns false
-    /// for out-of-range indices.
+    /// for out-of-range indices and path/status-only tool cards.
     pub fn toggle_fold(&mut self, index: usize) -> bool {
         match self.entries.get_mut(index) {
+            Some(entry) if entry.path_only_tool => false,
             Some(entry) => {
                 entry.folded = !entry.folded;
                 self.clear_text_selection();
@@ -1853,7 +2037,8 @@ impl AppState {
             } else {
                 entry.display_title()
             };
-            if entry.kind == EntryKind::Tool
+            if matches!(entry.kind, EntryKind::Tool | EntryKind::Reasoning)
+                && !entry.path_only_tool
                 && (start..start + wrapped_height(&header, width)).contains(&position)
             {
                 return Some(index);
@@ -1877,8 +2062,14 @@ impl AppState {
         let mut start = 0;
         for (index, entry) in self.entries.iter().enumerate() {
             let len = entry.wrapped_len(width);
-            if entry.kind == EntryKind::Tool
-                && (start..start + len.saturating_sub(1)).contains(&position)
+            let clickable_len = if entry.kind == EntryKind::Reasoning {
+                entry.title_height(width)
+            } else {
+                len.saturating_sub(1)
+            };
+            if matches!(entry.kind, EntryKind::Tool | EntryKind::Reasoning)
+                && !entry.path_only_tool
+                && (start..start + clickable_len).contains(&position)
             {
                 return Some(index);
             }
@@ -1915,11 +2106,11 @@ impl AppState {
         true
     }
 
-    /// Folds every retained entry; manual folds are separate per entry.
+    /// Folds all foldable entries; path/status-only cards remain visible.
     pub fn fold_all(&mut self) {
         self.clear_text_selection();
         for entry in &mut self.entries {
-            entry.folded = true;
+            entry.folded = !entry.path_only_tool;
         }
     }
 
@@ -2662,17 +2853,17 @@ impl AppState {
         &self.status
     }
 
-    /// Advances the tool-execution spinner when a tool is active.
+    /// Advances the footer spinner while the model or a tool is running.
     /// Returns true when a redraw can show a different frame.
     pub fn tick_tool_animation(&mut self) -> bool {
         if !matches!(self.status.as_str(), "running" | "executing tool") {
             return false;
         }
-        self.tool_spinner_frame = (self.tool_spinner_frame + 1) % 4;
+        self.tool_spinner_frame = (self.tool_spinner_frame + 1) % 10;
         true
     }
 
-    /// Current tool spinner frame, in the range `0..4`.
+    /// Current footer spinner frame, in the range `0..10`.
     #[must_use]
     pub fn tool_spinner_frame(&self) -> usize {
         self.tool_spinner_frame
@@ -2946,6 +3137,9 @@ impl AppState {
         let mut out = Vec::new();
         for entry in &self.entries {
             out.push(format!("[{:?}] {}", entry.kind, entry.title));
+            if entry.kind == EntryKind::Reasoning && entry.folded {
+                continue;
+            }
             out.extend(entry.lines.iter().cloned());
             if entry.truncated {
                 out.push("[output truncated to presentation bound]".to_owned());
@@ -3044,17 +3238,19 @@ mod tests {
     use nexus_core::{ApprovalNotice, RequestId, SessionId};
 
     #[test]
-    fn tool_spinner_advances_only_while_a_tool_executes() {
+    fn footer_spinner_advances_only_while_model_or_tool_runs() {
         let mut state = AppState::new();
         assert!(!state.tick_tool_animation());
         assert_eq!(state.tool_spinner_frame(), 0);
         state.status = "running".to_owned();
-        for expected in 1..=4 {
+        for expected in 1..=10 {
             assert!(state.tick_tool_animation());
-            assert_eq!(state.tool_spinner_frame(), expected % 4);
+            assert_eq!(state.tool_spinner_frame(), expected % 10);
         }
         state.status = "executing tool".to_owned();
         assert!(state.tick_tool_animation());
+        state.status = "awaiting approval".to_owned();
+        assert!(!state.tick_tool_animation());
         state.status = "finished: Completed".to_owned();
         assert!(!state.tick_tool_animation());
         assert_eq!(state.tool_spinner_frame(), 1);
@@ -3600,6 +3796,82 @@ mod tests {
         assert!(state.pending_approval.is_none());
         state.recall_prev();
         assert_eq!(state.composer(), "saved question");
+    }
+
+    #[test]
+    fn restored_reasoning_is_hidden_until_clicked_and_sanitized() {
+        use nexus_core::provider::ModelContextItem;
+
+        let mut state = AppState::new();
+        state.record_restored_history(&[
+            ModelContextItem::assistant_text_with_reasoning(
+                "answer",
+                "visible",
+                Some("secret\x1b[2J thought".to_owned()),
+            )
+            .unwrap(),
+            ModelContextItem::assistant_reasoning("another thought".to_owned()).unwrap(),
+            ModelContextItem::assistant_text("no-trace", "plain").unwrap(),
+        ]);
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::Reasoning)
+                .count(),
+            2
+        );
+        assert!(state.entries[0].folded);
+        assert!(!state.transcript().join("\n").contains("secret"));
+        assert!(!state.entries[0].lines.join("\n").contains('\x1b'));
+        state.set_viewport(80, 30);
+        let row = (0..30)
+            .find(|row| state.tool_header_at(*row) == Some(0))
+            .unwrap();
+        assert!(state.toggle_tool_at_row(row));
+        assert!(state.transcript().join("\n").contains("secret"));
+        assert!(state.toggle_tool_at_row(row));
+        assert!(!state.transcript().join("\n").contains("secret"));
+    }
+
+    #[test]
+    fn live_reasoning_fragments_are_folded_and_expandable() {
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let (session, run) = session_run();
+        for (seq, body) in [(1, "private\u{1b}[2J "), (2, "thought")] {
+            let fragment =
+                nexus_core::AssistantText::new(TurnId::new("t1-0").unwrap(), "reasoning", body)
+                    .unwrap();
+            assert!(state.apply_event(&RunEvent::new(
+                session.clone(),
+                run.clone(),
+                seq,
+                EventPayload::AssistantReasoningDelta(fragment)
+            )));
+        }
+        let index = state
+            .entries
+            .iter()
+            .position(|entry| entry.kind == EntryKind::Reasoning)
+            .unwrap();
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::Reasoning)
+                .count(),
+            1
+        );
+        assert!(state.entries[index].folded);
+        assert!(!state.transcript().join("\n").contains("private"));
+        assert!(!state.entries[index].lines.join("\n").contains('\u{1b}'));
+        state.set_viewport(80, 30);
+        let row = (0..30)
+            .find(|row| state.tool_header_at(*row) == Some(index))
+            .unwrap();
+        assert!(state.toggle_tool_at_row(row));
+        assert!(state.transcript().join("\n").contains("thought"));
     }
 
     #[test]

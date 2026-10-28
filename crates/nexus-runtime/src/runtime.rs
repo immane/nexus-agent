@@ -107,6 +107,7 @@ pub struct Runtime {
 }
 
 struct Shared {
+    local_reasoning: AtomicBool,
     diagnostic_writer: StdMutex<Option<Box<dyn std::io::Write + Send>>>,
     instructions: ModelInstructions,
     limits: Limits,
@@ -249,6 +250,7 @@ struct StreamedPrefix {
     /// Text already published per item, used to validate and append the
     /// authoritative batch suffix without replaying or hiding mismatches.
     text: HashMap<String, String>,
+    reasoning: String,
     /// Preview item keys already announced as `ToolCallPreview`.
     preview_keys: HashSet<String>,
     retained_bytes: usize,
@@ -693,6 +695,7 @@ impl Runtime {
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
+            local_reasoning: AtomicBool::new(false),
             diagnostic_writer: StdMutex::new(None),
             instructions,
             limits: config.limits,
@@ -748,6 +751,12 @@ impl Runtime {
     ) -> (Self, EventStreams) {
         Self::try_new(config, provider, tools)
             .expect("test-only runtime wiring must be valid; use Runtime::try_new in production")
+    }
+
+    /// Opt in to sensitive reasoning events on this runtime's local data stream.
+    /// Call only when that stream is owned by a trusted local presentation.
+    pub fn enable_local_reasoning(&self) {
+        self.shared.local_reasoning.store(true, Ordering::SeqCst);
     }
 
     /// Handles one typed frontend command, including explicit bounded history
@@ -1361,6 +1370,7 @@ impl Runtime {
         // The operation owns its admission snapshot. Retain the run until it
         // returns so cancellation cannot release a slot with work still active.
         if let Some(discovery) = discovery {
+            let started = StdInstant::now();
             let window = match tokio::task::spawn_blocking(discovery).await {
                 Ok(settings) => settings,
                 Err(_) => {
@@ -1370,6 +1380,16 @@ impl Runtime {
                     return;
                 }
             };
+            self.shared.diagnostic(format_args!(
+                "nexus-runtime: context discovery outcome={} elapsed_ms={} window_tokens={:?}",
+                if window.is_some() {
+                    "discovered"
+                } else {
+                    "unknown"
+                },
+                started.elapsed().as_millis(),
+                window.map(|window| window.tokens()),
+            ));
             let mut state = self.shared.state.lock().await;
             let Some(active) = state.active.as_mut().filter(|active| active.run == run) else {
                 return;
@@ -1601,7 +1621,9 @@ impl Runtime {
                     let sink = |event: ProviderEvent| {
                         if !matches!(
                             &event,
-                            ProviderEvent::TextDelta { .. } | ProviderEvent::ToolCallDelta { .. }
+                            ProviderEvent::TextDelta { .. }
+                                | ProviderEvent::ReasoningDelta { .. }
+                                | ProviderEvent::ToolCallDelta { .. }
                         ) && !matches!(&event, ProviderEvent::Usage(usage) if usage.finality() == UsageFinality::Provisional)
                         {
                             return;
@@ -1997,9 +2019,9 @@ impl Runtime {
     }
 
     /// Publishes one provisional provider event while its turn is still in
-    /// flight. Only presentation-safe prefixes publish here: text fragments
-    /// (flushed at once so the frontend updates now, not at the terminal),
-    /// call previews, and usage estimates. Candidates and terminals are
+    /// flight. Text, call previews and usage estimates publish immediately;
+    /// sensitive reasoning publishes only with explicit local opt-in.
+    /// Candidates and terminals are
     /// withheld by contract and arrive through the validated batch, so
     /// nothing streamed can dispatch work or conclude a turn early. Events
     /// for a stale, cancelled, or finished run publish nothing.
@@ -2036,6 +2058,18 @@ impl Runtime {
             return;
         }
         match event {
+            ProviderEvent::ReasoningDelta { text } => {
+                if !record_provisional(prefix, text.len(), self.shared.effective_output_budget) {
+                    active.data_dropped = true;
+                    prefix.exceeded = true;
+                    active.token.cancel();
+                    return;
+                }
+                prefix.reasoning.push_str(&text);
+                if active.pending_compaction.is_none() {
+                    emit_reasoning(&self.shared, active, run, turn, &text);
+                }
+            }
             ProviderEvent::TextDelta { item_key, text } => {
                 if !record_provisional(prefix, text.len(), self.shared.effective_output_budget)
                     || !record_identity(prefix, item_key.len())
@@ -2087,7 +2121,6 @@ impl Runtime {
             }
             ProviderEvent::ToolCallReady(_)
             | ProviderEvent::TurnFinished(_)
-            | ProviderEvent::ReasoningDelta { .. }
             | ProviderEvent::Failed(_) => {}
         }
     }
@@ -2228,6 +2261,19 @@ impl Runtime {
             )));
         }
         if successful_turn {
+            let authoritative_reasoning: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::ReasoningDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !authoritative_reasoning.starts_with(&prefix.reasoning) {
+                return Err(Terminal::failed(runtime_error(
+                    ErrorCategory::Protocol,
+                    "authoritative provider reasoning does not match its streamed prefix",
+                )));
+            }
             for (item_key, streamed) in &prefix.text {
                 if !text_items.iter().any(|(key, _)| key == item_key) && !streamed.is_empty() {
                     return Err(Terminal::failed(runtime_error(
@@ -2251,10 +2297,14 @@ impl Runtime {
             .iter()
             .map(|(key, text)| (key.clone(), text.len()))
             .collect();
-        // Thinking trace for this turn, echoed back on later turns when
-        // present. Accumulated silently: reasoning is never presented and
-        // never previewed, only recorded into the turn's assistant items.
+        // Keep the authoritative trace for replay, while publishing only the
+        // suffix not already delivered provisionally.
         let mut reasoning = String::new();
+        let mut reasoning_skip = if successful_turn || prefix.reasoning.is_empty() {
+            prefix.reasoning.len()
+        } else {
+            usize::MAX
+        };
         for event in &events {
             if active.terminal.is_some() {
                 break;
@@ -2262,6 +2312,14 @@ impl Runtime {
             match event {
                 ProviderEvent::ReasoningDelta { text } => {
                     reasoning.push_str(text);
+                    let mut skip = reasoning_skip.min(text.len());
+                    while !text.is_char_boundary(skip) {
+                        skip -= 1;
+                    }
+                    reasoning_skip = reasoning_skip.saturating_sub(skip);
+                    if skip < text.len() {
+                        emit_reasoning(&self.shared, active, run, turn, &text[skip..]);
+                    }
                 }
                 ProviderEvent::TextDelta { item_key, text } => {
                     let skip = if successful_turn {
@@ -4632,7 +4690,7 @@ fn provisional_event_bytes(event: &ProviderEvent) -> usize {
 fn control_event_bytes(event: &RunEvent) -> usize {
     let payload_bytes = match event.payload() {
         EventPayload::RunStarted { request } => request.as_str().len(),
-        EventPayload::AssistantTextDelta(text) => {
+        EventPayload::AssistantTextDelta(text) | EventPayload::AssistantReasoningDelta(text) => {
             text.turn.as_str().len() + text.item_key.len() + text.text.len()
         }
         EventPayload::ContextReduced {
@@ -4750,6 +4808,37 @@ fn emit_data(shared: &Arc<Shared>, active: &mut ActiveRun, run: &RunId, payload:
             commit_sequence(active, seq);
         }
         Err(_) => active.data_dropped = true,
+    }
+}
+
+fn emit_reasoning(
+    shared: &Arc<Shared>,
+    active: &mut ActiveRun,
+    run: &RunId,
+    turn: &TurnId,
+    text: &str,
+) {
+    if !shared.local_reasoning.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + MAX_TEXT_FRAGMENT_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if let Ok(fragment) = AssistantText::new(turn.clone(), "reasoning", &text[start..end]) {
+            emit_data(
+                shared,
+                active,
+                run,
+                EventPayload::AssistantReasoningDelta(fragment),
+            );
+        } else {
+            active.data_dropped = true;
+            return;
+        }
+        start = end;
     }
 }
 

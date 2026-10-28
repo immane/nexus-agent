@@ -759,6 +759,18 @@ fn context_settings_are_snapshotted_per_run_without_enabling_compaction() {
 fn discovery_uses_admission_selection_and_preserves_policy_snapshot() {
     use nexus_core::{ContextManagementSettings, ContextWindow, ContextWindowSource};
 
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct DiscoveringProvider {
         inner: ScriptedProvider,
         window: StdMutex<ContextWindow>,
@@ -812,6 +824,8 @@ fn discovery_uses_admission_selection_and_preserves_policy_snapshot() {
         provider.clone(),
         vec![],
     );
+    let log = LogCapture::default();
+    let runtime = runtime.with_diagnostic_writer(log.clone());
     test_rt().block_on(async {
         assert_eq!(
             runtime
@@ -839,6 +853,12 @@ fn discovery_uses_admission_selection_and_preserves_policy_snapshot() {
         provider.inner.requested_context_management.lock().unwrap()[0].max_output_tokens,
         Some(2048)
     );
+    let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.contains("context discovery outcome=discovered"),
+        "{output}"
+    );
+    assert!(output.contains("window_tokens=Some(94208)"), "{output}");
 }
 
 #[test]

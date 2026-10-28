@@ -868,10 +868,9 @@ pub enum ProviderEvent {
         /// Fragment text.
         text: String,
     },
-    /// Thinking-trace fragment for the current turn. Withheld from
-    /// provisional sinks like tool previews: it is recorded for echo on
-    /// later turns (vendors running a thinking mode reject follow-ups that
-    /// drop it), never presented as an answer and never dispatched.
+    /// Sensitive thinking-trace fragment for the current turn. Providers may
+    /// stream it provisionally; it is also recorded for later-turn echo. It is
+    /// not an answer or an executable action.
     ReasoningDelta {
         /// Fragment text.
         text: String,
@@ -943,8 +942,9 @@ pub trait ProviderPort {
     fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent>;
 
     /// Performs one model turn while offering provisional events to `sink`
-    /// as they arrive. Only presentation-safe prefixes travel the sink:
-    /// `TextDelta`, `ToolCallDelta`, and `Usage`. Candidates
+    /// as they arrive. `TextDelta`, sensitive `ReasoningDelta`,
+    /// `ToolCallDelta`, and `Usage` may travel the sink. Consumers must keep
+    /// reasoning private unless explicitly configured for local presentation. Candidates
     /// (`ToolCallReady`) and terminal events are withheld from the sink and
     /// arrive only in the returned batch, so nothing streamed can dispatch
     /// or conclude a turn before the full batch validates. Callers must
@@ -967,6 +967,7 @@ pub trait ProviderPort {
             matches!(
                 event,
                 ProviderEvent::TextDelta { .. }
+                    | ProviderEvent::ReasoningDelta { .. }
                     | ProviderEvent::ToolCallDelta { .. }
                     | ProviderEvent::Usage(_)
             )

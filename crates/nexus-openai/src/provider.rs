@@ -2,7 +2,7 @@
 //! with streaming SSE parsing and an `openssl s_client` TLS bridge.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -436,13 +436,13 @@ impl OpenAiProvider {
             (Some(_), Some(_)) => "discovered",
         };
         // Log only bounded metadata: never credentials, response bodies or URLs.
-        eprintln!(
+        diagnostic(format_args!(
             "nexus-openai: context discovery source=models.dev/opencode-go outcome={outcome} elapsed_ms={} timeout_seconds={} window_tokens={window:?}",
             started.elapsed().as_millis(),
             catalog
                 .operational_settings
                 .context_discovery_timeout_seconds,
-        );
+        ));
         window
     }
 
@@ -759,12 +759,48 @@ fn log_provider_failure(error: &AgentError, attempt: usize, delay: Option<Durati
         || "not-scheduled".to_owned(),
         |delay| format!("in {delay:?}"),
     );
-    eprintln!(
+    diagnostic(format_args!(
         "nexus-openai: provider attempt {attempt} failed: category={:?}, retry={:?} ({retry}), http_status={http_status}, message={}",
         error.category(),
         error.retry(),
         error.message(),
-    );
+    ));
+}
+
+fn diagnostic(message: std::fmt::Arguments<'_>) {
+    let stderr = std::io::stderr();
+    diagnostic_to(message, &mut stderr.lock(), stderr.is_terminal());
+}
+
+// The full-screen frontend owns terminal output. Only redirected stderr may
+// receive provider diagnostics; run-scoped discovery metadata uses its logger.
+fn diagnostic_to(message: std::fmt::Arguments<'_>, writer: &mut impl Write, terminal: bool) {
+    if !terminal {
+        let _ = writeln!(writer, "{message}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn provider_diagnostics_never_write_to_a_terminal() {
+        let mut output = Vec::new();
+        diagnostic_to(
+            format_args!("nexus-openai: context discovery"),
+            &mut output,
+            true,
+        );
+        diagnostic_to(
+            format_args!("nexus-openai: provider attempt failed"),
+            &mut output,
+            true,
+        );
+        assert!(output.is_empty());
+        diagnostic_to(format_args!("metadata"), &mut output, false);
+        assert_eq!(output, b"metadata\n");
+    }
 }
 
 fn call_deadline(deadline: Option<Instant>, settings: &ProviderSettings, now: Instant) -> Instant {
@@ -1836,8 +1872,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 #[derive(Default)]
 struct SseAccum {
     text: String,
-    /// Thinking trace to echo on later turns. Withheld from the provisional
-    /// sink: it is recorded for the batch only, never presented.
+    /// Thinking trace to echo on later turns and include in the final batch.
     reasoning: String,
     fragments: BTreeMap<u64, SseCall>,
     reason: String,
@@ -1848,6 +1883,7 @@ struct SseAccum {
 /// What one `data:` JSON chunk contributed, for provisional sink delivery.
 struct SseApplied {
     content: String,
+    reasoning: String,
     usage_present: bool,
     usage: (Option<u64>, Option<u64>),
 }
@@ -1877,6 +1913,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
     }
     let mut applied = SseApplied {
         content: String::new(),
+        reasoning: String::new(),
         usage_present: chunk.get("usage").is_some(),
         usage: (input, output),
     };
@@ -1905,8 +1942,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
         acc.text.push_str(fragment);
         applied.content.push_str(fragment);
     }
-    // Thinking-mode trace. Accumulated for echo on later turns; unlike
-    // text it never reaches the provisional sink. Vendors disagree on the
+    // Thinking-mode trace. Vendors disagree on the
     // field name (DeepSeek `reasoning_content`, Ollama `reasoning`), so
     // both feed the same accumulator.
     if let Some(trace) = delta
@@ -1915,6 +1951,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
         .and_then(Value::as_str)
     {
         acc.reasoning.push_str(trace);
+        applied.reasoning.push_str(trace);
     }
     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -1949,7 +1986,7 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
 }
 
 /// Builds the authoritative batch from aggregated SSE state: at most one
-/// text delta at `item-0`, the withheld thinking trace (when the vendor
+/// text delta at `item-0`, the complete thinking trace (when the vendor
 /// sent one), calls numbered from `item-1`, then exactly one terminal.
 fn finalize_sse(acc: &SseAccum) -> Vec<ProviderEvent> {
     if acc.text.len()
@@ -2401,7 +2438,7 @@ impl ProtocolSseLive {
 
 /// Incremental SSE parser: de-chunks when the head declares chunked framing,
 /// splits complete lines, folds them into [`SseAccum`], and delivers
-/// provisional text plus usage through the sink as chunks arrive. Tool-call
+/// provisional text, reasoning, and usage through the sink as chunks arrive. Tool-call
 /// fragments never touch the sink: previews only make sense against the
 /// finalized item keys. Returns the authoritative batch once `[DONE]`
 /// completes the turn; a strict terminator is required, EOF without one is
@@ -2413,6 +2450,56 @@ struct SseLive {
     last_usage: (Option<u64>, Option<u64>),
     raw_bytes: usize,
     records: usize,
+}
+
+#[cfg(test)]
+mod live_reasoning_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn streams_both_vendor_fields_and_keeps_one_complete_batch_trace() {
+        let mut parser = SseLive::new(false);
+        let seen = Mutex::new(Vec::new());
+        let sink = |event| seen.lock().unwrap().push(event);
+        assert!(
+            parser
+                .feed(
+                    b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"first \"}}]}\n",
+                    &sink
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parser
+                .feed(
+                    b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"second\"}}]}\n",
+                    &sink
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ProviderEvent::ReasoningDelta {
+                    text: "first ".into()
+                },
+                ProviderEvent::ReasoningDelta {
+                    text: "second".into()
+                },
+            ]
+        );
+        parser
+            .feed(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+                &sink,
+            )
+            .unwrap();
+        let batch = parser.feed(b"data: [DONE]\n", &sink).unwrap().unwrap();
+        assert!(batch.iter().any(|event| matches!(event, ProviderEvent::ReasoningDelta { text } if text == "first second")));
+    }
 }
 
 impl SseLive {
@@ -2509,6 +2596,11 @@ impl SseLive {
                 sink(ProviderEvent::TextDelta {
                     item_key: "item-0".to_owned(),
                     text: applied.content,
+                });
+            }
+            if !applied.reasoning.is_empty() {
+                sink(ProviderEvent::ReasoningDelta {
+                    text: applied.reasoning,
                 });
             }
             if applied.usage_present && applied.usage != self.last_usage {

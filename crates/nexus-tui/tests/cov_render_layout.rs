@@ -470,7 +470,7 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     assert_eq!(
         footer.trim_start(),
         format!(
-            "running  --.-K (--%)  {}",
+            "⠋ running  --.-K (--%)  {}",
             concat!("v", env!("CARGO_PKG_VERSION"))
         ),
         "{footer}"
@@ -487,7 +487,7 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     assert_eq!(
         footer.trim_start(),
         format!(
-            "running  --.-K (--%)  {}",
+            "awaiting approval  --.-K (--%)  {}",
             concat!("v", env!("CARGO_PKG_VERSION"))
         ),
         "{footer}"
@@ -503,7 +503,7 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     assert_eq!(
         footer.trim_start(),
         format!(
-            "running  --.-K (--%)  {}",
+            "awaiting approval  --.-K (--%)  {}",
             concat!("v", env!("CARGO_PKG_VERSION"))
         ),
         "{footer}"
@@ -514,7 +514,7 @@ fn footer_names_the_inspect_key_while_an_approval_is_pending() {
     assert_eq!(
         footer_row(&frame_rows(&terminal)).trim_start(),
         format!(
-            "running  --.-K (--%)  {}",
+            "awaiting approval  --.-K (--%)  {}",
             concat!("v", env!("CARGO_PKG_VERSION"))
         )
     );

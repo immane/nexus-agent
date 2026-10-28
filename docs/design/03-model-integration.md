@@ -55,6 +55,21 @@ opaque continuation data fail explicitly; protocol switching is distinguished
 by stable adapter identity. Reasoning traces that these protocols cannot
 faithfully replay are also rejected rather than silently dropped.
 
+An authorized OpenCode Go Muse Spark 1.3 Contributor probe observed a Responses
+reasoning item with `encrypted_content` and an empty summary before a message
+and function call. Replaying the exact output with a function result was
+accepted over HTTP, but its subsequent generation reached the output limit;
+this does not establish a complete successful continuation. The encrypted item
+is not a displayable reasoning trace. The runtime currently retains opaque
+continuation only within an active run, not across subsequent runs, and the
+normalized transcript does not preserve arbitrary Responses output items and
+their exact ordering. Consequently the Responses adapter still rejects these
+items, including before exposing a tool candidate. Supporting them requires a
+bounded, profile-scoped, ordered and persistable replay representation with
+explicit history reduction and provider-switch behavior; accepting or dropping
+the item in the adapter alone would not be faithful. This observation is scoped
+to that single probe, not a compatibility claim for other models or endpoints.
+
 ## Testing and Coverage Claims
 
 Use recorded synthetic fixtures for fragmented streams, multiple calls, malformed arguments, truncation, usage, errors, and continuation round trips. Keep fixtures free of credentials and private conversation data.

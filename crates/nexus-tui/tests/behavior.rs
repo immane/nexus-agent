@@ -10,4 +10,5 @@ mod cov_state_sequences;
 mod cov_state_viewport;
 mod cov_terminal;
 mod discovery_footer;
+mod file_tool_presentation;
 mod pty_render;

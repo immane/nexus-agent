@@ -17,9 +17,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-#[cfg(test)]
-use ratatui::style::Color;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -197,6 +195,9 @@ fn entry_title_style_with_theme(kind: EntryKind, theme: &ThemeSettings) -> Style
             .add_modifier(Modifier::BOLD),
         EntryKind::Assistant => Style::default()
             .fg(color(&theme.assistant_title))
+            .add_modifier(Modifier::BOLD),
+        EntryKind::Reasoning => Style::default()
+            .fg(Color::Rgb(192, 132, 252))
             .add_modifier(Modifier::BOLD),
         EntryKind::Tool => Style::default()
             .fg(color(&theme.tool_title))
@@ -849,21 +850,8 @@ fn render_header(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
             format!("run:{run} "),
             Style::default().fg(color(&theme.info)),
         ),
-        if matches!(state.status(), "running" | "executing tool") {
-            const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
-            Span::styled(
-                format!("{} {}", SPINNER[state.tool_spinner_frame()], state.status()),
-                Style::default()
-                    .fg(color(&theme.warning))
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw(state.status())
-        },
     ];
-    // The directory trails every existing segment, so frames that never
-    // set it render byte-identically and narrow frames clip the path
-    // before any status marker.
+    // Keep the directory last so narrow frames preserve run/session identity.
     if let Some(label) = state.session_label() {
         spans.push(Span::raw(format!(" sess:{label}")));
     }
@@ -1430,10 +1418,22 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
 }
 
 fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
-    let status = if state.can_cancel() {
-        "running"
+    let theme = &state.settings().theme;
+    let animated = matches!(state.status(), "running" | "executing tool");
+    let status = if animated {
+        const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        format!("{} {}", SPINNER[state.tool_spinner_frame()], state.status())
     } else {
-        "idle"
+        state.status().to_owned()
+    };
+    let status_style = if animated {
+        Style::default()
+            .fg(color(&theme.info))
+            .add_modifier(Modifier::BOLD)
+    } else if state.status() == "awaiting approval" {
+        Style::default().fg(color(&theme.warning))
+    } else {
+        Style::default().fg(color(&theme.muted))
     };
     let context = match state.context_estimate() {
         Some((Some(tokens), window)) => {
@@ -1464,9 +1464,12 @@ fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) 
         info_width,
         area.height,
     );
-    Paragraph::new(info)
-        .alignment(Alignment::Right)
-        .render(info_area, buf);
+    Paragraph::new(Line::from(vec![
+        Span::styled(status, status_style),
+        Span::raw(format!("  {context}  ")),
+    ]))
+    .alignment(Alignment::Right)
+    .render(info_area, buf);
     let right_width = info_width + version_width;
 
     if let Some(command) = state.command_line() {
@@ -2322,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_execution_header_animates_between_tick_frames() {
+    fn tool_execution_footer_animates_between_tick_frames() {
         let (mut state, mut terminal) = harness(100, 16);
         started(&mut state, 0);
         let tool_started = RunEvent::new(
@@ -2337,11 +2340,19 @@ mod tests {
         );
         assert!(state.apply_event(&tool_started));
         draw(&mut state, &mut terminal, Focus::Viewport);
-        assert!(screen(&terminal).contains("| executing tool"));
+        let frame = screen(&terminal);
+        assert!(!frame.lines().next().unwrap().contains("executing tool"));
+        assert!(frame.lines().last().unwrap().contains("⠋ executing tool"));
 
         assert!(state.tick_tool_animation());
         draw(&mut state, &mut terminal, Focus::Viewport);
-        assert!(screen(&terminal).contains("/ executing tool"));
+        assert!(
+            screen(&terminal)
+                .lines()
+                .last()
+                .unwrap()
+                .contains("⠙ executing tool")
+        );
     }
 }
 
@@ -2909,7 +2920,7 @@ mod cov_render_private {
     }
 
     #[test]
-    fn header_reports_the_run_status() {
+    fn header_reports_run_identity_without_duplicate_status() {
         let mut state = AppState::new();
         let area = Rect::new(0, 0, 80, 1);
         let header = rows_of(area, |buf| {
@@ -2922,7 +2933,7 @@ mod cov_render_private {
             "{header:?}"
         );
         assert!(header.contains("run:no run"), "{header:?}");
-        assert!(header.contains("idle"), "{header:?}");
+        assert!(!header.contains("idle"), "{header:?}");
         assert!(!header.contains("focus:"), "{header:?}");
 
         assert!(state.apply_event(&started(0)));
@@ -2931,8 +2942,36 @@ mod cov_render_private {
         })[0]
             .clone();
         assert!(header.contains("run:run-1"), "{header:?}");
-        assert!(header.contains("running"), "{header:?}");
+        assert!(!header.contains("running"), "{header:?}");
         assert!(!header.contains("focus:"), "{header:?}");
+    }
+
+    #[test]
+    fn footer_running_animation_is_colored_and_keeps_context_position() {
+        let mut state = AppState::new();
+        assert!(state.apply_event(&started(0)));
+        let area = Rect::new(0, 0, 100, 1);
+        let mut first = Buffer::empty(area);
+        render_footer(&state, area, &mut first, Focus::Viewport);
+        let spinner_x = (0..area.width)
+            .find(|x| first.get(*x, 0).symbol() == "⠋")
+            .expect("running spinner is visible");
+        assert_eq!(
+            first.get(spinner_x, 0).fg,
+            color(&state.settings().theme.info)
+        );
+        assert_eq!(first.get(spinner_x + 2, 0).symbol(), "r");
+        assert_eq!(
+            first.get(spinner_x + 2, 0).fg,
+            color(&state.settings().theme.info)
+        );
+        assert!(state.tick_tool_animation());
+        let mut next = Buffer::empty(area);
+        render_footer(&state, area, &mut next, Focus::Viewport);
+        assert_eq!(next.get(spinner_x, 0).symbol(), "⠙");
+        for x in spinner_x + 1..area.width {
+            assert_eq!(first.get(x, 0), next.get(x, 0), "stable footer column {x}");
+        }
     }
 
     #[test]
@@ -2970,7 +3009,7 @@ mod cov_render_private {
         assert_eq!(
             footer.trim_start(),
             format!(
-                "running  --.-K (--%)  {}",
+                "⠋ running  --.-K (--%)  {}",
                 concat!("v", env!("CARGO_PKG_VERSION"))
             ),
             "{footer:?}"
@@ -2981,14 +3020,20 @@ mod cov_render_private {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.trim_start().starts_with("running"), "{footer:?}");
+        assert!(
+            footer.trim_start().starts_with("awaiting approval"),
+            "{footer:?}"
+        );
 
         state.inspect_approval();
         let footer = rows_of(area, |buf| {
             render_footer(&state, area, buf, Focus::Viewport)
         })[0]
             .clone();
-        assert!(footer.trim_start().starts_with("running"), "{footer:?}");
+        assert!(
+            footer.trim_start().starts_with("awaiting approval"),
+            "{footer:?}"
+        );
     }
 
     #[test]
@@ -3647,7 +3692,7 @@ mod cov_render_private {
     }
 
     #[test]
-    fn header_shows_the_recorded_directory_after_the_status_markers() {
+    fn header_shows_the_recorded_directory_after_run_identity() {
         let mut state = AppState::new();
         state.set_project_dir("/Volumes/work/proj");
         let area = Rect::new(0, 0, 120, 1);
@@ -3658,8 +3703,8 @@ mod cov_render_private {
         assert!(!header.contains("focus:"), "{header:?}");
         assert!(header.contains("dir:/Volumes/work/proj"), "{header:?}");
         assert!(
-            header.find("idle").expect("marker") < header.find("dir:").expect("dir"),
-            "narrow frames clip the path before any status marker: {header:?}"
+            header.find("run:").expect("marker") < header.find("dir:").expect("dir"),
+            "narrow frames clip the path before run identity: {header:?}"
         );
     }
 

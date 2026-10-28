@@ -888,6 +888,7 @@ fn format_event(event: &RunEvent) -> String {
             text.text.len(),
             sanitize(&text.text),
         ),
+        EventPayload::AssistantReasoningDelta(_) => format!("{head}reasoning-redacted"),
         EventPayload::ContextReduced {
             method,
             removed_items,

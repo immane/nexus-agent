@@ -559,7 +559,9 @@ fn failed_and_over_budget_runs_do_not_poison_retained_context() {
         for (input, expected) in [
             ("baseline", RunOutcome::Completed),
             ("failed", RunOutcome::Failed),
-            ("over", RunOutcome::Failed),
+            // Reasoning now streams provisionally, so its output budget is
+            // enforced before authoritative batch validation.
+            ("over", RunOutcome::LimitReached),
             ("next", RunOutcome::Completed),
         ] {
             runtime.submit(submit("s", input)).await;

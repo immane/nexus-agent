@@ -1265,6 +1265,7 @@ fn runtime_with_tools(
         None => Runtime::try_new(config, provider, tools),
     }
     .map_err(io::Error::other)?;
+    runtime.enable_local_reasoning();
     let runtime = match &session_config.diagnostics {
         Some(log) => runtime.with_diagnostic_writer(log.clone()),
         None => runtime,

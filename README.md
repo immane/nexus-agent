@@ -360,6 +360,8 @@ Coverage is organized by protocol family rather than by a growing list of vendor
 
 Protocol selection is explicit in revision-2 provider configuration and separate from `direct`/`relay` routing. Revision-1 files remain readable as Chat Completions profiles; saves write revision 2. HTTPS uses the system `openssl` TLS bridge with certificate/hostname verification. Responses and Messages coverage is backed by offline fixtures, **not universal live service/model compatibility**. Unsupported continuation/thinking context fails explicitly; a configurable base URL alone does not establish support.
 
+When a Chat Completions provider returns `reasoning_content` or `reasoning`, the local TUI shows it in a collapsed thinking entry; click its header to expand or collapse it. Streaming providers can update it before the response finishes, and saved reasoning may be shown on history restoration. Reasoning can contain sensitive information: it is not emitted to headless or server clients, and expanded content is visible to anyone viewing the terminal. Not all providers or protocols expose a readable trace.
+
 First-release authentication uses API profiles with external credential references. Existing relay services integrate as provider plugins; local relay execution is optional and on demand.
 
 See [model integration](docs/design/03-model-integration.md), [API relay](docs/design/08-api-relay.md), and the [provider contract](docs/contracts/01-provider.md).

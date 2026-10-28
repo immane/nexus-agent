@@ -828,6 +828,38 @@ fn responses_and_messages_reject_unreplayable_reasoning_in_replies() {
 }
 
 #[test]
+fn responses_encrypted_reasoning_never_exposes_tool_candidates_without_replay() {
+    let reply = r#"{"status":"completed","output":[{"id":"reasoning-1","type":"reasoning","status":"completed","encrypted_content":"synthetic-opaque-data","summary":[]},{"type":"function_call","call_id":"call-1","name":"host_read","arguments":"{}"}]}"#;
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"reasoning-1\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"reasoning-1\",\"type\":\"reasoning\",\"status\":\"completed\",\"encrypted_content\":\"synthetic-opaque-data\",\"summary\":[]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"reasoning-1\",\"type\":\"reasoning\",\"status\":\"completed\",\"encrypted_content\":\"synthetic-opaque-data\",\"summary\":[]},{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"host_read\",\"arguments\":\"{}\"}]}}\n\n"
+    );
+    for (streaming, body) in [(false, reply), (true, sse)] {
+        let (base, _) = if streaming {
+            serve_raw(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                body,
+            )
+        } else {
+            serve(200, body, Duration::ZERO)
+        };
+        let adapter = OpenAiProvider::new_for_protocol(
+            &base,
+            present_credential(),
+            "model",
+            nexus_config::ProtocolKind::OpenAiResponses,
+        )
+        .expect("Responses adapter builds");
+        let events = adapter.stream(&base_request(), &live_context());
+        assert!(matches!(
+            events.as_slice(),
+            [ProviderEvent::Failed(error)] if error.category() == ErrorCategory::UnsupportedCapability
+        ));
+    }
+}
+
+#[test]
 fn responses_and_messages_sse_reject_unreplayable_reasoning() {
     for (protocol, body) in [
         (
@@ -1916,7 +1948,7 @@ fn payment_access_failure_retries_then_succeeds() {
 }
 
 #[test]
-fn sse_reasoning_fragments_accumulate_withheld_from_sink() {
+fn sse_reasoning_fragments_accumulate_in_authoritative_batch() {
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"again\"},\"finish_reason\":null}]}\n\n",

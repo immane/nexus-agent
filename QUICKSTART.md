@@ -49,7 +49,8 @@ cargo run -p nexus-tui --locked --offline
 
 ### Experimental container mode
 
-An explicit prototype path is available with container-enabled builds. This
+An explicit prototype path is available with container-enabled builds, including
+the TUI and server installed by `scripts/install.sh`. This
 does **not** provide a validated isolation boundary: native Linux host/LAN,
 metadata, IPv6/DNS, and public-egress checks remain outstanding. Do not use it
 with secrets or valuable workspace data. The workspace is live-mounted and
@@ -385,6 +386,11 @@ cursor still refers to the original page; re-read that page's original offset
 to recover omitted middle content rather than treating the preview as complete.
 Existing path scopes, protected-path restrictions, and jail checks still apply.
 
+The TUI shows `host_read` and `host_list` as non-collapsible path/status rows,
+including restored history. File contents and directory listings are not
+displayed; the model still receives tool results and source-history persistence
+is unchanged.
+
 Changing the environment in another shell does not change a running TUI's
 credentials; restart it after changing credentials.
 
@@ -404,7 +410,10 @@ the TUI. Headless defaults to `build` unless a leading `--mode` is supplied.
 `:help` shows commands and keys; `:q` exits. Slash-prefixed text is not a session
 command.
 
-The footer shows `idle` or `running`, the latest task request's estimated input
+The footer is the only run-status indicator: `idle`, `running`, tool execution,
+approval waiting or the final outcome. Active model/tool work uses a cyan dot
+spinner; waiting and finished states do not animate. It also shows the latest
+task request's estimated input
 tokens and percentage of its known context window (for example `~12.3K (12%)`),
 then the version at the right edge. `~` marks an estimate, not a live token
 count; missing input or window information is shown as `--`. Summary requests
@@ -468,7 +477,8 @@ requires a different one. Ollama uses its own model metadata.
 Catalog discovery uses `context_discovery_timeout_seconds` (10 seconds by
 default); an explicit shorter timeout remains in effect. TUI diagnostics record
 the lookup outcome, elapsed time and discovered window, without credentials or
-response contents.
+response contents. Provider diagnostics never write directly to an interactive
+terminal; additional request details are available when stderr is redirected.
 Zero, explicit null, and invalid types are rejected.
 
 TUI/server pass these settings through the provider interface; the runtime

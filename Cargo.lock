@@ -343,6 +343,7 @@ dependencies = [
  "nexus-tools",
  "pulldown-cmark",
  "ratatui",
+ "serde_json",
  "tokio",
  "unicode-width",
 ]
