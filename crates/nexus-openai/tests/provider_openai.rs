@@ -1142,7 +1142,11 @@ fn responses_and_messages_errors_are_static_and_partial_streams_never_replay() {
             ),
             nexus_config::ProtocolKind::AnthropicMessages => serve_raw(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                ),
             ),
             nexus_config::ProtocolKind::ChatCompletions => unreachable!(),
         };
@@ -1156,7 +1160,7 @@ fn responses_and_messages_errors_are_static_and_partial_streams_never_replay() {
         let events = adapter.stream(&base_request(), &context);
         let (category, retry) = failed(events);
         assert_eq!(category, ErrorCategory::Protocol);
-        assert_eq!(retry, RetryGuidance::DoNotRetry);
+        assert_eq!(retry, RetryGuidance::RetryAfterBackoff);
         assert_eq!(served.hits.load(Ordering::SeqCst), 1);
     }
 }

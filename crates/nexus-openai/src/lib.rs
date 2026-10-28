@@ -32,9 +32,8 @@
 //!   request validation failures; redirects are not followed. Locally invalid
 //!   requests, unavailable/unsafe credentials, TLS verification failures, and
 //!   resource/internal constraints remain terminal. Connection, write, read,
-//!   and premature-EOF failures retry only while no response stream record has
-//!   arrived; a stream that already began is reported as `Protocol` and never
-//!   replayed. Subsequent recovery belongs to the runtime, not request replay.
+//!   and premature EOF failures retry only before any provisional event was
+//!   delivered; subsequent recovery belongs to the runtime, not request replay.
 //!   System DNS resolution and an in-flight TCP connect are blocking: runtime
 //!   cancellation/deadline watchdogs retain ownership until that worker returns.
 //! - Response bodies are capped; oversize replies fail `ResourceLimit`

@@ -1491,21 +1491,10 @@ fn stream_response(
             match source.next_chunk(quantum_for(deadline), deadline, context) {
                 Err(failure) => return vec![failure],
                 Ok(None) => {
-                    // Once any SSE record arrived the server already owned a
-                    // response stream. Replaying it risks duplicate work and a
-                    // second billed invocation, so only an empty stream is
-                    // retryable; a truncated one is terminal.
-                    return vec![if live.records == 0 {
-                        retryable_provider_error(
-                            ErrorCategory::Protocol,
-                            "provider stream ended without termination",
-                        )
-                    } else {
-                        provider_error(
-                            ErrorCategory::Protocol,
-                            "provider stream ended without termination",
-                        )
-                    }];
+                    return vec![retryable_provider_error(
+                        ErrorCategory::Protocol,
+                        "provider stream ended without termination",
+                    )];
                 }
                 Ok(Some(bytes)) => match live.feed(&bytes, sink) {
                     Ok(Some(batch)) => return batch,
@@ -1527,19 +1516,10 @@ fn stream_response(
         match source.next_chunk(quantum_for(deadline), deadline, context) {
             Err(failure) => return vec![failure],
             Ok(None) => {
-                // Same rule as the protocol-specific path: a stream that
-                // already emitted records is never replayed.
-                return vec![if live.records == 0 {
-                    retryable_provider_error(
-                        ErrorCategory::Protocol,
-                        "provider stream ended without termination",
-                    )
-                } else {
-                    provider_error(
-                        ErrorCategory::Protocol,
-                        "provider stream ended without termination",
-                    )
-                }];
+                return vec![retryable_provider_error(
+                    ErrorCategory::Protocol,
+                    "provider stream ended without termination",
+                )];
             }
             Ok(Some(bytes)) => match live.feed(&bytes, sink) {
                 Ok(Some(batch)) => return batch,
@@ -3584,6 +3564,42 @@ mod retry_policy_tests {
                 Some(ProviderEvent::TurnFinished(_))
             ));
         }
+    }
+
+    #[test]
+    fn message_start_without_provisional_delivery_does_not_block_retry() {
+        let context = ProviderContext::new(Duration::ZERO, false, None);
+        let mut attempts = 0;
+        let events = retry_exchange(
+            &context,
+            None,
+            &|_| panic!("metadata must not publish provisional output"),
+            |sink| {
+                attempts += 1;
+                if attempts == 2 {
+                    return vec![ProviderEvent::TurnFinished(TurnFinished::new(
+                        FinishReason::Stop,
+                        Usage::new(None, None, UsageFinality::Final),
+                        None,
+                    ))];
+                }
+                let response = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n";
+                let mut source = ScriptedSource([response.to_vec()].into());
+                stream_response(
+                    &mut source,
+                    None,
+                    &context,
+                    sink,
+                    ProtocolKind::AnthropicMessages,
+                )
+            },
+            |_, _, _| Ok(()),
+        );
+        assert_eq!(attempts, 2);
+        assert!(matches!(
+            events.last(),
+            Some(ProviderEvent::TurnFinished(_))
+        ));
     }
 
     #[test]

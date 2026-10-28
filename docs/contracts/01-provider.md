@@ -179,10 +179,9 @@ Surface safe authentication, rate-limit, transport, protocol, and capability err
 Remote access failures use increasing backoff until success, explicit user
 cancellation, or the absolute run deadline, rather than a fixed attempt count.
 Failed access attempts do not spend successful model turns. Retries retain the
-prepared request only while no response stream record has arrived; once a
-provider stream begins, a truncation is a terminal `Protocol` failure, not a
-replay. A recoverable partial task response instead requires a fresh invocation
-with a bounded host recovery note.
+prepared request when no provisional event has been delivered; a recoverable
+partial task response instead requires a fresh invocation with a bounded host
+recovery note.
 No failed response authorizes tool dispatch. Local invalid requests, unsafe
 credentials, untrusted continuation or identity/usage inconsistencies, storage
 integrity failures, and hard resource bounds remain terminal. Explicit user
