@@ -184,7 +184,8 @@ not supported. The separate provider/model `config.json` remains strict JSON
 and is unchanged.
 
 Complete example: [`config/base.jsonc`](config/base.jsonc). It lists every
-configurable runtime budget, provider deadline/retry default, and TUI preference. Its values
+configurable runtime budget, provider deadline/retry default, server lifecycle setting,
+and TUI preference. Its values
 match the existing TUI and ordinary server defaults. Choose it explicitly:
 
 ```sh
@@ -235,6 +236,14 @@ profile. Theme colors accept `default`, snake-case ANSI names, `#RRGGBB`, or
 `index:0` through `index:255`; see `config/base.jsonc` for all presentation keys.
 The effective snapshot reports merged settings, not a relaxation of existing
 tool/runtime safety caps (for example, the core 262,144-byte tool-output cap).
+
+Server lifecycle settings belong in `defaults.server` or `profiles.server.server`:
+`max_connections` defaults to 64 (range 1–64), `max_sessions` to 128 (1–128),
+`session_idle_seconds` to 1800, and `session_cleanup_interval_seconds` to 60
+(both durations accept 1–86,400 seconds). Settings are applied at startup;
+they do not change bind/authentication policy or tool permissions. Idle cleanup
+still retains sessions with active work, streams, or external owners. Expiry is
+checked periodically, so an eligible idle session may remain until the next pass.
 
 ```sh
 cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project

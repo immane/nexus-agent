@@ -82,8 +82,8 @@ pub use model::{
     ProviderProfile, UserConfig,
 };
 pub use settings::{
-    EffectiveSettings, ProviderSettings, SettingsProfile, default_base_path, load_settings,
-    settings_json,
+    EffectiveSettings, ProviderSettings, ServerSettings, SettingsProfile, default_base_path,
+    load_settings, settings_json,
 };
 pub use store::{
     CONFIG_ENV_VAR, CONFIG_FILE_NAME, ConfigError, ConfigErrorKind, default_path,

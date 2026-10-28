@@ -8,6 +8,14 @@
       "context_discovery_timeout_seconds": 2,
       "fallback_call_timeout_seconds": 600,
       "retry_backoff_seconds": [1, 2, 5, 10, 30, 60]
+    },
+    // Server admission caps: 1..64 connections, 1..128 sessions.
+    // Idle expiry and cleanup intervals are seconds (1..86400).
+    "server": {
+      "max_connections": 64,
+      "max_sessions": 128,
+      "session_idle_seconds": 1800,
+      "session_cleanup_interval_seconds": 60
     }
   },
   "tui": {

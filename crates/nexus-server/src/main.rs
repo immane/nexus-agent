@@ -41,7 +41,6 @@ const BENCHMARK_RETAINED_CONTEXT_ITEMS: usize = 8_192;
 /// Maximum simultaneously serviced sockets; excess connections are closed
 /// immediately instead of creating another unbounded thread.
 const MAX_CONNECTIONS: usize = 64;
-const SESSION_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn usage() -> ! {
     eprintln!(
@@ -429,6 +428,10 @@ fn main() {
         eprintln!("nexus-server: invalid provider settings ({error})");
         std::process::exit(2);
     }
+    if let Err(error) = server.set_server_settings(settings.server()) {
+        eprintln!("nexus-server: invalid server settings ({error})");
+        std::process::exit(2);
+    }
     if let Some(store) = session_store {
         server.set_session_store(store);
     }
@@ -518,9 +521,12 @@ fn main() {
     }
     let server = Arc::new(server);
     let cleanup_server = Arc::downgrade(&server);
+    let cleanup_interval =
+        std::time::Duration::from_secs(settings.server().session_cleanup_interval_seconds);
+    let max_connections = settings.server().max_connections;
     thread::spawn(move || {
         loop {
-            thread::sleep(SESSION_CLEANUP_INTERVAL);
+            thread::sleep(cleanup_interval);
             let Some(server) = cleanup_server.upgrade() else {
                 break;
             };
@@ -531,7 +537,7 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if !try_acquire_connection(&connections) {
+                if !try_acquire_connection(&connections, max_connections) {
                     drop(stream);
                     continue;
                 }
@@ -554,10 +560,10 @@ fn main() {
     }
 }
 
-fn try_acquire_connection(connections: &AtomicUsize) -> bool {
+fn try_acquire_connection(connections: &AtomicUsize, max_connections: usize) -> bool {
     let mut current = connections.load(Ordering::Acquire);
     loop {
-        if current >= MAX_CONNECTIONS {
+        if current >= max_connections.min(MAX_CONNECTIONS) {
             return false;
         }
         match connections.compare_exchange_weak(
@@ -602,14 +608,51 @@ mod cov_main_args {
     #[test]
     fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {
         let active = std::sync::atomic::AtomicUsize::new(super::MAX_CONNECTIONS - 1);
-        assert!(super::try_acquire_connection(&active));
+        assert!(super::try_acquire_connection(
+            &active,
+            super::MAX_CONNECTIONS
+        ));
         assert_eq!(
             active.load(std::sync::atomic::Ordering::Acquire),
             super::MAX_CONNECTIONS
         );
-        assert!(!super::try_acquire_connection(&active));
+        assert!(!super::try_acquire_connection(
+            &active,
+            super::MAX_CONNECTIONS
+        ));
         active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        assert!(super::try_acquire_connection(&active));
+        assert!(super::try_acquire_connection(
+            &active,
+            super::MAX_CONNECTIONS
+        ));
+    }
+
+    #[test]
+    fn configured_connection_admission_reduces_but_never_raises_the_hard_cap() {
+        let settings = nexus_config::ServerSettings {
+            max_connections: 2,
+            ..Default::default()
+        };
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        assert!(super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        assert!(super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        assert!(!super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(super::try_acquire_connection(
+            &active,
+            settings.max_connections
+        ));
+        active.store(super::MAX_CONNECTIONS, std::sync::atomic::Ordering::Release);
+        assert!(!super::try_acquire_connection(&active, usize::MAX));
     }
 
     /// Builds the full argv vector a process would receive. `parse_args`

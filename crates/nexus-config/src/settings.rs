@@ -57,6 +57,7 @@ impl SettingsProfile {
         EffectiveSettings {
             limits,
             provider: ProviderSettings::default(),
+            server: ServerSettings::default(),
             tui: TuiSettings::default(),
         }
     }
@@ -73,6 +74,7 @@ fn benchmark_defaults() -> EffectiveSettings {
     EffectiveSettings {
         limits,
         provider: ProviderSettings::default(),
+        server: ServerSettings::default(),
         tui: TuiSettings::default(),
     }
 }
@@ -119,11 +121,47 @@ impl ProviderSettings {
     }
 }
 
+/// Server admission ceilings and idle maintenance, in seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSettings {
+    pub max_connections: usize,
+    pub max_sessions: usize,
+    pub session_idle_seconds: u64,
+    pub session_cleanup_interval_seconds: u64,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_sessions: 128,
+            session_idle_seconds: 1_800,
+            session_cleanup_interval_seconds: 60,
+        }
+    }
+}
+
+impl ServerSettings {
+    /// Validates reductions of the hard admission caps and bounded idle timing.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=64).contains(&self.max_connections)
+            || !(1..=128).contains(&self.max_sessions)
+            || !(1..=86_400).contains(&self.session_idle_seconds)
+            || !(1..=86_400).contains(&self.session_cleanup_interval_seconds)
+        {
+            return Err(invalid("server settings are invalid"));
+        }
+        Ok(())
+    }
+}
+
 /// Validated settings after built-in defaults, system base, and overlays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveSettings {
     limits: Limits,
     provider: ProviderSettings,
+    server: ServerSettings,
     tui: TuiSettings,
 }
 
@@ -145,6 +183,12 @@ impl EffectiveSettings {
     #[must_use]
     pub fn provider(&self) -> &ProviderSettings {
         &self.provider
+    }
+
+    /// Returns server admission and idle maintenance settings.
+    #[must_use]
+    pub fn server(&self) -> &ServerSettings {
+        &self.server
     }
 
     /// Returns frontend presentation settings.
@@ -229,6 +273,7 @@ pub fn settings_json(settings: &EffectiveSettings) -> String {
             "approval_expiry_seconds": settings.limits.approval_expiry.as_secs(),
         },
         "provider": settings.provider,
+        "server": settings.server,
         "tui": settings.tui,
     }))
     .expect("validated operational settings are JSON serializable")
@@ -340,7 +385,7 @@ fn apply_profile(
     settings: &mut EffectiveSettings,
     object: &Map<String, Value>,
 ) -> Result<(), ConfigError> {
-    reject_unknown(object, &["runtime", "provider", "tui"])?;
+    reject_unknown(object, &["runtime", "provider", "server", "tui"])?;
     if let Some(runtime) = object.get("runtime") {
         let runtime = section(runtime)?;
         reject_unknown(
@@ -461,6 +506,15 @@ fn apply_profile(
             settings.provider.retry_backoff_seconds = parsed;
         }
         settings.provider.validate()?;
+    }
+    if let Some(server) = object.get("server") {
+        let mut merged = serde_json::to_value(&settings.server)
+            .map_err(|_| invalid("server settings are invalid"))?;
+        merge_partial(&mut merged, server)?;
+        let server: ServerSettings =
+            serde_json::from_value(merged).map_err(|_| invalid("server settings are invalid"))?;
+        server.validate()?;
+        settings.server = server;
     }
     if let Some(tui) = object.get("tui") {
         apply_tui(settings, tui)?;
@@ -665,6 +719,7 @@ mod tests {
         assert_eq!(benchmark.limits.max_tool_calls_per_run, 4096);
         for settings in [tui, server, benchmark] {
             assert_eq!(settings.provider(), &ProviderSettings::default());
+            assert_eq!(settings.server(), &ServerSettings::default());
             assert_eq!(settings.tui(), &TuiSettings::default());
             assert_eq!(settings.provider_retry_backoff(), &[1, 2, 5, 10, 30, 60]);
         }
@@ -745,6 +800,7 @@ mod tests {
                 printed["runtime"]
             );
             assert_eq!(layer["defaults"]["provider"], printed["provider"]);
+            assert_eq!(layer["defaults"]["server"], printed["server"]);
             assert_eq!(layer["tui"], printed["tui"]);
         }
     }
@@ -814,7 +870,116 @@ mod tests {
             serde_json::to_value(settings.provider()).unwrap()
         );
         assert_eq!(output["tui"], serde_json::to_value(settings.tui()).unwrap());
+        assert_eq!(
+            output["server"],
+            serde_json::to_value(settings.server()).unwrap()
+        );
         assert_eq!(output["runtime"].as_object().unwrap().len(), 12);
+    }
+
+    #[test]
+    fn server_layers_merge_all_fields_in_profile_and_overlay_order() {
+        let mut settings = SettingsProfile::Server.defaults();
+        assert_eq!(
+            settings.server(),
+            &ServerSettings {
+                max_connections: 64,
+                max_sessions: 128,
+                session_idle_seconds: 1_800,
+                session_cleanup_interval_seconds: 60,
+            }
+        );
+        apply_layer(&mut settings, r#"{"revision":1,"defaults":{"server":{"max_connections":32,"max_sessions":64,"session_idle_seconds":900,"session_cleanup_interval_seconds":30}},"profiles":{"server":{"server":{"max_connections":16,"session_idle_seconds":600}},"tui":{"server":{"max_sessions":2}}}}"#, SettingsProfile::Server).unwrap();
+        assert_eq!(
+            settings.server(),
+            &ServerSettings {
+                max_connections: 16,
+                max_sessions: 64,
+                session_idle_seconds: 600,
+                session_cleanup_interval_seconds: 30,
+            }
+        );
+        apply_layer(&mut settings, r#"{"revision":1,"defaults":{"server":{"max_sessions":8}},"profiles":{"server":{"server":{"session_cleanup_interval_seconds":5}}}}"#, SettingsProfile::Server).unwrap();
+        assert_eq!(
+            settings.server(),
+            &ServerSettings {
+                max_connections: 16,
+                max_sessions: 8,
+                session_idle_seconds: 600,
+                session_cleanup_interval_seconds: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn server_bounds_types_and_unknown_fields_are_checked_in_inactive_profiles() {
+        for (key, upper) in [
+            ("max_connections", 64),
+            ("max_sessions", 128),
+            ("session_idle_seconds", 86_400),
+            ("session_cleanup_interval_seconds", 86_400),
+        ] {
+            for value in [
+                "0".to_owned(),
+                (upper + 1).to_string(),
+                "-1".into(),
+                "1.5".into(),
+                "true".into(),
+                "null".into(),
+                "\"1\"".into(),
+            ] {
+                for location in ["defaults", "active", "inactive"] {
+                    let server =
+                        serde_json::from_str::<Value>(&format!(r#"{{"{key}":{value}}}"#)).unwrap();
+                    let document = match location {
+                        "defaults" => {
+                            serde_json::json!({"revision":1,"defaults":{"server":server}})
+                        }
+                        "active" => {
+                            serde_json::json!({"revision":1,"profiles":{"tui":{"server":server}}})
+                        }
+                        _ => {
+                            serde_json::json!({"revision":1,"profiles":{"server":{"server":server}}})
+                        }
+                    };
+                    assert!(
+                        apply_layer(
+                            &mut SettingsProfile::Tui.defaults(),
+                            &document.to_string(),
+                            SettingsProfile::Tui
+                        )
+                        .is_err(),
+                        "accepted {document}"
+                    );
+                }
+            }
+            for value in [1, upper] {
+                let document =
+                    format!(r#"{{"revision":1,"defaults":{{"server":{{"{key}":{value}}}}}}}"#);
+                apply_layer(
+                    &mut SettingsProfile::Tui.defaults(),
+                    &document,
+                    SettingsProfile::Tui,
+                )
+                .unwrap();
+            }
+        }
+        for server in [
+            serde_json::json!({"unknown":1}),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let document =
+                serde_json::json!({"revision":1,"profiles":{"server":{"server":server}}});
+            assert!(
+                apply_layer(
+                    &mut SettingsProfile::Tui.defaults(),
+                    &document.to_string(),
+                    SettingsProfile::Tui
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
