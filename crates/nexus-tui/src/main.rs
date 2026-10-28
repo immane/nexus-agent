@@ -1546,6 +1546,8 @@ struct Frontend {
     pointer_press: Option<usize>,
     /// First `g` in a viewport `gg` jump is waiting for its second key.
     g_pending: bool,
+    /// Clipboard I/O boundary; input tests inject a writer without a desktop session.
+    clipboard_writer: fn(&str, nexus_config::tui_settings::ClipboardMode) -> bool,
 }
 
 impl Frontend {
@@ -1571,6 +1573,7 @@ impl Frontend {
             storage_busy: false,
             pointer_press: None,
             g_pending: false,
+            clipboard_writer: yank_to_clipboard,
         }
     }
 
@@ -2574,7 +2577,7 @@ fn handle_mouse(front: &mut Frontend, mouse: MouseEvent) -> bool {
             if !front.state.settings().input.copy_on_select {
                 return true;
             }
-            let copied = yank_to_clipboard(&text, front.state.settings().input.clipboard);
+            let copied = (front.clipboard_writer)(&text, front.state.settings().input.clipboard);
             if !copied {
                 return true;
             }
@@ -3670,7 +3673,8 @@ async fn handle_key_with_runtime(
             // press falls through instead of swallowing it.
             match selection_text(&front.state) {
                 Some(text) if !text.is_empty() => {
-                    let copied = yank_to_clipboard(&text, front.state.settings().input.clipboard);
+                    let copied =
+                        (front.clipboard_writer)(&text, front.state.settings().input.clipboard);
                     front.state.clear_text_selection();
                     if copied {
                         front
@@ -7763,6 +7767,10 @@ mod cov_main_topup {
     async fn ctrl_c_copies_a_live_selection_silently_before_the_draft() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "hello");
+            true
+        };
         type_draft(&mut front, "hello world");
         let mut terminal = fixed_terminal();
         draw(&mut terminal, &mut front).expect("frame draws");
@@ -7941,6 +7949,10 @@ mod cov_main_topup {
     #[test]
     fn mouse_drag_selects_body_text_and_release_toasts_silently() {
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "selectable");
+            true
+        };
         front.state.notice("selectable words here");
         let mut terminal = fixed_terminal();
         draw(&mut terminal, &mut front).expect("frame draws");
@@ -7993,6 +8005,10 @@ mod cov_main_topup {
         // "  \u{4e2d}\u{6587}\u{6d4b}\u{8bd5}\u{5185}\u{5bb9}": cells 2-3, 4-5, 6-7,
         // 8-9, 10-11, 12-13. A cell drag 4..10 must yank chars 1..4.
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "文测试");
+            true
+        };
         front
             .state
             .notice("\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}\u{5185}\u{5bb9}");
@@ -8028,6 +8044,10 @@ mod cov_main_topup {
     #[test]
     fn mouse_drag_selects_the_composer_draft_and_release_toasts() {
         let mut front = Frontend::new(session());
+        front.clipboard_writer = |text, _| {
+            assert_eq!(text, "hello");
+            true
+        };
         type_draft(&mut front, "hello world");
         let mut terminal = fixed_terminal();
         draw(&mut terminal, &mut front).expect("frame draws");

@@ -105,17 +105,41 @@ fn configured_list_cap_is_exact_and_reports_only_overflow_as_truncated() {
         .unwrap()
         .with_settings(&settings)
         .unwrap();
-    for name in ["a", "b"] {
+    let empty = tool.execute(&call("host_list", r#"{"path":"."}"#), &context(100));
+    assert_eq!(empty.status(), ExecutionStatus::Succeeded);
+    assert_eq!(empty.content(), "");
+    assert!(!empty.is_truncated());
+    for (name, expected) in [("a", "a\n"), ("b", "a\nb\n")] {
         std::fs::write(root.0.join(name), "").unwrap();
+        let result = tool.execute(&call("host_list", r#"{"path":"."}"#), &context(100));
+        assert_eq!(result.status(), ExecutionStatus::Succeeded);
+        assert_eq!(result.content(), expected);
+        assert!(!result.is_truncated());
     }
-    let exact = tool.execute(&call("host_list", r#"{"path":"."}"#), &context(100));
-    assert_eq!(exact.status(), ExecutionStatus::Succeeded);
-    assert_eq!(exact.content(), "a\nb\n");
-    assert!(!exact.is_truncated());
     std::fs::write(root.0.join("c"), "").unwrap();
     let over = tool.execute(&call("host_list", r#"{"path":"."}"#), &context(100));
+    assert_eq!(over.status(), ExecutionStatus::Succeeded);
     assert_eq!(over.content().lines().count(), 2);
     assert!(over.is_truncated());
+}
+
+#[test]
+fn configured_list_cap_counts_hidden_files_and_directories_as_children() {
+    let root = Root::new();
+    std::fs::write(root.0.join(".hidden"), "").unwrap();
+    std::fs::create_dir(root.0.join("sub")).unwrap();
+    let settings = ToolsSettings {
+        list_entry_limit: 2,
+        ..ToolsSettings::default()
+    };
+    let tool = ScopedLister::with_root(&root.0)
+        .unwrap()
+        .with_settings(&settings)
+        .unwrap();
+    let exact = tool.execute(&call("host_list", r#"{"path":"."}"#), &context(100));
+    assert_eq!(exact.status(), ExecutionStatus::Succeeded);
+    assert_eq!(exact.content(), ".hidden\nsub/\n");
+    assert!(!exact.is_truncated());
 }
 
 #[test]

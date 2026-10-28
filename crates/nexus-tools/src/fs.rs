@@ -423,26 +423,23 @@ impl ScopedLister {
             .access
             .open_directory(path)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
-        let mut iterator = rustix::fs::Dir::read_from(&directory)
+        let iterator = rustix::fs::Dir::read_from(&directory)
             .map_err(|_| tool_error(ErrorCategory::ToolFailure, "directory cannot be listed"))?;
-        while entries.len() < self.entry_limit {
-            match iterator.read() {
-                Some(Ok(entry)) => {
-                    if entry.file_name().to_bytes() != b"." && entry.file_name().to_bytes() != b".."
-                    {
-                        entries.push(entry);
-                    }
-                }
-                Some(Err(_)) => {
-                    return Err(tool_error(
-                        ErrorCategory::ToolFailure,
-                        "directory cannot be listed",
-                    ));
-                }
-                None => break,
+        let mut truncated = false;
+        for entry in iterator {
+            let entry = entry.map_err(|_| {
+                tool_error(ErrorCategory::ToolFailure, "directory cannot be listed")
+            })?;
+            if entry.file_name().to_bytes() == b"." || entry.file_name().to_bytes() == b".." {
+                continue;
             }
+            // Native enumeration can place dot entries after real children.
+            if entries.len() == self.entry_limit {
+                truncated = true;
+                break;
+            }
+            entries.push(entry);
         }
-        let mut truncated = entries.len() == self.entry_limit && iterator.read().is_some();
         entries.sort_by_key(|entry| entry.file_name().to_owned());
         let mut output = String::new();
         for entry in entries {
