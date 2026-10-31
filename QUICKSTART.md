@@ -136,7 +136,18 @@ cargo run -p nexus-tui --features demo --locked --offline -- --demo
 
 Headless uses scripted provider/tools, has no approval handler, and emits
 percent-encoded `key=value` records, not JSON. A leading `--mode plan` selects
-read-only mode; the default is `build`.
+read-only mode; the default is `build`. If runtime event delivery or report
+retention truncates presentation data, headless reports the limitation on
+stderr. If the finalized runtime snapshot cannot establish completeness, it
+returns an operation error instead of presenting a complete report.
+The TUI also warns when the finalized runtime snapshot reports potentially
+incomplete content, or when completeness cannot be confirmed. A new submission
+is deferred until the preceding run's terminal event and snapshot check have
+been handled; the draft is retained. If the event stream closes before a run
+reaches its terminal outcome, the TUI reports an error rather than claiming a
+complete transcript. An incomplete or unconfirmed run is also summarized on
+stderr after terminal restoration, even if its earlier notice was scrolled out
+of view.
 
 The TUI `demo` Cargo feature is disabled by default, including in release builds;
 without it `--demo` is rejected. For performance measurements it can also be

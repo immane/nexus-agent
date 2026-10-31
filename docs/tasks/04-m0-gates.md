@@ -24,6 +24,85 @@ Checked items are verified for the scoped M0 fake paths and the platform runs
 documented below, not a production security certification. Unchecked items
 remain blockers; measurements have not been accepted as a P7 baseline.
 
+The data-channel saturation gap is addressed in the current frontend changes:
+headless and TUI query the finalized runtime snapshot and surface potentially
+incomplete content; an unavailable or inconsistent snapshot is an explicit
+error or unknown-completeness notice. TUI preserves the draft and defers a new
+submission until the previous terminal has been applied and checked. Separate
+tests exercise real bounded-channel saturation and the non-truncated case.
+This does not establish that every other buffer or control-delivery failure is
+visible in every frontend, so the broader buffer checklist remains open.
+The TUI now also retains a session-level incompleteness summary for frontend
+merge gaps or rejected presentation events, waits for both event channels to
+close, and initiates cancellation of active sessions concurrently before
+reconciling them. Reconciliation and snapshot queries are still processed per
+session with individual timeouts, not one global exit deadline; total exit
+latency can grow with the number of sessions.
+If a terminal event never arrives, an interactive session can remain responsive
+while further submissions remain gated and their drafts retained indefinitely.
+In an artificially half-closed stream the same applies while the other channel
+stays open; the normal runtime holds both senders, so that particular closure
+scenario has not been established as reachable in production. A safe recovery
+protocol for missing terminal outcomes remains unverified; a short timeout alone
+could misclassify legitimate long-running work or discard a late terminal event.
+
+`history_startup::interactive_startup_does_not_restore_historical_body` passed
+on Linux and macOS against a private PTY fixture with a valid metadata index and
+an invalid, sentinel-bearing saved body. Startup succeeded without displaying
+the sentinel or opening the credential FIFO. This covers that clean-start case;
+it does not prove that no low-level file reads occur or cover every recovery
+and terminal failure path.
+`startup_failure::corrupt_session_metadata_fails_without_recovery_or_provider_access`
+also passed on both platforms for corrupt index and journal fixtures: startup
+failed explicitly, kept the staged and saved fixture files intact, and the
+credential FIFO/loopback listener observed no access. FIFO polling cannot rule
+out every short nonblocking open; other startup failures and destinations are
+not covered by those fixtures.
+
+After these frontend changes, the serialized default workspace suite, all-target
+workspace Clippy and formatting passed on both platforms: Linux 2,620 passed,
+25 ignored; macOS 2,626 passed, 19 ignored. Headless and TUI targeted tests and
+Clippy also passed on each platform. The Linux demo PTY regression passed at
+all three recorded sizes, as did the macOS rerun. These checks do not include
+all optional features.
+
+After the workspace run, a real-TUI historical-body fixture and explicit
+closed-stream completeness handling were added. On each platform, default TUI
+tests passed 572 with 11 ignored; demo-feature tests passed 572 with 12 ignored;
+both variants' all-target Clippy and the three-size demo PTY regression passed.
+The headless package passed 122 tests and all-target Clippy on each platform.
+The full workspace suite was not rerun after those last TUI test additions.
+
+After the later closed-stream and exit-warning fixes, the default workspace
+suite, all-target workspace Clippy and formatting were rerun: Linux 2,624
+passed/25 ignored and macOS 2,630 passed/19 ignored. Default/demo TUI tests and
+Clippy passed separately on both systems, as did the three-size demo PTY
+regression. These do not include the optional/all-features suite.
+
+After the subsequent per-session cancellation, channel closure, and sticky
+presentation-gap fixes, each platform reran one strictly sequential Cargo
+validation sequence: default workspace tests and all-target Clippy, demo TUI
+tests and all-target Clippy, the opt-in three-size demo PTY test, then format
+check. Linux workspace: 2,629 passed/25 ignored; macOS: 2,635 passed/19 ignored.
+The demo TUI suite passed 579 with 12 ignored on each platform; both PTY runs
+passed. An earlier overlapping pair of Cargo sequences caused PTY failures
+when a default binary replaced the demo binary; those failed runs are not used
+as evidence. This does not include the optional/all-features suite.
+
+Before the later closed-stream change, the default-feature release TUI was
+measured with the
+warm-cache composer probe: all 30 samples produced observed responses on each
+platform. Spawn-to-response p50/p95/max were 77.533/90.184/838.002 ms on macOS
+and 58.556/59.546/59.740 ms on Linux. The first macOS sample remains included;
+  the probe's observation and cache-method limits below still apply.
+For that Linux release binary (SHA-256
+`8ef6566e0451334a596b88ccc43d8870b85ec4c40a672e5f0a8ddd4b435cfff4`),
+20/20 observations after per-sample `sync` and `drop_caches` preparation used
+the unprivileged `setpriv` launcher: p50/p95/max were
+149.089/152.454/218.027 ms, including that launcher. Preparation succeeded in
+all samples, but cache state was not independently verified; these are not
+directly comparable to the direct-launch warm samples or a proven cold baseline.
+
 - [x] One model/tool/model cycle completes with fake integrations.
 - [x] Read-like fake calls proceed under scoped policy; mutation/command-like calls require approval or headless denial.
 - [x] Cancellation stops dispatch, reports uncertain effects honestly, and never claims rollback.
@@ -133,8 +212,16 @@ default production configuration.
   were 4.375/6.500/6.500 µs; fake execution was 0.209/0.875/0.875 µs. These
   are not independent process samples and include scheduler and probe effects;
   they exclude earlier validation/policy, event delivery, and actual I/O. The
-  test-only hook is absent from production builds. Linux measurement and a
-  representative multi-run workload remain outstanding.
+  test-only hook is absent from production builds. Linux and multi-run results
+  were subsequently recorded below; a representative workload remains open.
+- A follow-up ran the same release-mode test in 20 separate processes on each
+  platform, with 16 sequential calls per process and no failed runs. Across
+  the resulting 320 correlated call samples, submission-to-worker-entry
+  p50/p95/max were 3.125/7.584/32.250 µs on macOS and
+  14.558/36.110/207.226 µs on Linux. Fake execution p50/p95/max were
+  0.084/0.459/1.292 µs on macOS and 0.262/1.158/2.187 µs on Linux. Calls
+  within each process are not independent; these figures retain probe and
+  scheduler overhead and do not measure policy validation or real tool I/O.
 - The release-mode integration test
   `backpressure::paused_receivers_measure_queue_peaks_at_approval_gate` passed
   on both platforms. With 1,500 alternating 64-byte fragments and both receivers
@@ -152,6 +239,8 @@ high-water, attributable dispatch overhead, first-interactive
 timing, and representative performance workloads remain open. Raw measurement
 records are held in the temporary validation environment and must be retained
 or reproduced before accepting a baseline.
+The owner declined a macOS system-cache purge during this review; macOS cold
+startup remains unverified and must not be inferred from warm observations.
 
 Following the history amendment, the macOS `nexus-session` suite passed 25 tests
 and all-target Clippy. `opening_a_clean_directory_reads_index_without_loading_session_bodies`

@@ -34,8 +34,9 @@
 //! mandatory record. Every line is formatted on receipt and memory is exactly
 //! the sum of the retained encoded lines, including approval args previews
 //! and error correlation diagnostics. Dropped presentation sets
-//! [`HeadlessReport::truncated`]; counters still describe every observed
-//! event.
+//! [`HeadlessReport::truncated`], as does upstream runtime content truncation. Counters
+//! describe observed events only. A finalized snapshot is required to establish
+//! upstream completeness; an unavailable or invalid snapshot refuses the report.
 //!
 //! Lifecycle bounds: the consume watchdog is the runtime's remaining
 //! run-duration budget plus [`WATCHDOG_SLACK`]. If it expires, the library
@@ -71,8 +72,9 @@ use std::time::{Duration, Instant};
 
 use nexus_core::commands::EventSequence;
 use nexus_core::{
-    CancelCommand, CommandReply, CorrelationData, EventPayload, Limits, RequestId, RunEvent,
-    RunFinished, RunId, RunOutcome, SessionId, SubmitCommand, ToolRegistration,
+    CancelCommand, CommandReply, CorrelationData, EventPayload, GetSnapshotCommand, Limits,
+    RequestId, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome, SessionId, SubmitCommand,
+    ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool, candidate, stop_turn, tool_turn};
 use nexus_runtime::transport::{ORDERED_EVENT_BUFFER_CAPACITY, OrderedEventConsumer};
@@ -152,8 +154,9 @@ pub struct HeadlessReport {
     pub approval_required: usize,
     /// `ToolFinished` events observed.
     pub tool_finished: usize,
-    /// True when presentation records were dropped or evicted to keep the
-    /// report within [`MAX_REPORT_EVENTS`]/[`MAX_REPORT_BYTES`]. Mandatory
+    /// True when the runtime reported content truncation or presentation records
+    /// were dropped or evicted to keep the report within
+    /// [`MAX_REPORT_EVENTS`]/[`MAX_REPORT_BYTES`]. Mandatory
     /// control records are never dropped; exceeding their reserve refuses
     /// the report with [`HeadlessError::Operation`] instead. The counters
     /// and outcome still describe every observed event.
@@ -680,13 +683,21 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
         .run()
         .cloned()
         .expect("accepted submit issues a run");
-
-    let mut consumer = RunConsumer::new();
-    consumer.ordering.adopt(&run);
     let watchdog = watchdog_budget(limits.run_duration.saturating_sub(started.elapsed()));
+    finish_run(&runtime, &mut streams, &run, watchdog).await
+}
+
+async fn finish_run(
+    runtime: &Runtime,
+    streams: &mut EventStreams,
+    run: &RunId,
+    watchdog: Duration,
+) -> Result<HeadlessReport, HeadlessError> {
+    let mut consumer = RunConsumer::new();
+    consumer.ordering.adopt(run);
     let terminal = match tokio::time::timeout(
         watchdog,
-        consume_until_terminal(&mut streams, &mut consumer),
+        consume_until_terminal(streams, &mut consumer),
     )
     .await
     {
@@ -695,7 +706,7 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
             // The control channel closed without a terminal record. Request
             // cancellation so the runtime can stop dispatch and record
             // honest outcomes before its driver is dropped.
-            request_cancel(&runtime, &run, RECONCILE_TIMEOUT).await;
+            request_cancel(runtime, run, RECONCILE_TIMEOUT).await;
             return Err(HeadlessError::Operation(
                 "control channel closed before terminal outcome".to_owned(),
             ));
@@ -704,8 +715,8 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
             // Watchdog expiry: request cancellation before dropping the
             // driver, then reconcile within a small finite window. The error
             // path must not skip the requested cancellation.
-            request_cancel(&runtime, &run, RECONCILE_TIMEOUT).await;
-            let _ = reconcile(&mut streams, &mut consumer, RECONCILE_TIMEOUT).await;
+            request_cancel(runtime, run, RECONCILE_TIMEOUT).await;
+            let _ = reconcile(streams, &mut consumer, RECONCILE_TIMEOUT).await;
             return Err(HeadlessError::Operation(
                 "run did not reach a terminal outcome within the watchdog budget".to_owned(),
             ));
@@ -716,6 +727,7 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
     }
     consumer.flush_ordered();
     consumer.ensure_report_complete()?;
+    let upstream_truncated = finalized_snapshot_truncated(runtime, run, terminal.outcome()).await?;
 
     let RunConsumer {
         retention,
@@ -751,9 +763,41 @@ async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessRepor
         tool_started,
         approval_required,
         tool_finished,
-        truncated: retention.truncated,
+        truncated: retention.truncated || upstream_truncated,
         exit_code,
     })
+}
+
+async fn finalized_snapshot_truncated(
+    runtime: &Runtime,
+    run: &RunId,
+    outcome: RunOutcome,
+) -> Result<bool, HeadlessError> {
+    let request = RequestId::new("req-headless-snapshot")
+        .map_err(|_| HeadlessError::Operation("snapshot request id invalid".to_owned()))?;
+    let (response, snapshot) = tokio::time::timeout(
+        RECONCILE_TIMEOUT,
+        runtime.get_snapshot(GetSnapshotCommand {
+            request,
+            run: run.clone(),
+        }),
+    )
+    .await
+    .map_err(|_| HeadlessError::Operation("finalized snapshot query timed out".to_owned()))?;
+    let snapshot = snapshot.filter(|snapshot| {
+        response.reply() == CommandReply::Accepted
+            && response.run() == Some(run)
+            && snapshot.run() == run
+            && snapshot.lifecycle() == RunLifecycle::Finalized(outcome)
+    });
+    snapshot
+        .map(|snapshot| snapshot.is_content_truncated())
+        .ok_or_else(|| {
+            HeadlessError::Operation(
+                "finalized snapshot unavailable or inconsistent; report completeness unknown"
+                    .to_owned(),
+            )
+        })
 }
 
 /// Drains both channels until the terminal record arrives or the control
@@ -1123,6 +1167,105 @@ mod tests {
                 .expect("result")
                 .contains("outcome=completed")
         );
+    }
+
+    #[test]
+    fn real_runtime_data_saturation_marks_report_truncated() {
+        block_on_with_shutdown(
+            async {
+                for (event_count, expected_truncated) in [(16, true), (4, false)] {
+                    const DATA_CAPACITY: usize = 8;
+                    let mut events: Vec<_> = (0..event_count)
+                        .map(|index| nexus_core::ProviderEvent::TextDelta {
+                            item_key: format!("item-{}", index % 2),
+                            text: "x".to_owned(),
+                        })
+                        .collect();
+                    events.extend(stop_turn("end").into_iter().skip(1));
+                    let mut limits = Limits::m0_test();
+                    limits.event_data_capacity = DATA_CAPACITY;
+                    let (runtime, mut streams) =
+                        build_runtime(limits, Arc::new(FakeProvider::new(vec![events])), vec![])
+                            .expect("runtime");
+                    let submit = SubmitCommand::new(
+                        RequestId::new("req-saturation").unwrap(),
+                        SessionId::new("sess-saturation").unwrap(),
+                        "test",
+                        "m0-test",
+                    )
+                    .unwrap();
+                    let response = runtime.submit(submit).await;
+                    let run = response.run().expect("accepted run").clone();
+                    // Do not drain data until the real runtime has finalized, forcing
+                    // its bounded data channel to overflow independently of retention.
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let (_, snapshot) = runtime
+                                .get_snapshot(GetSnapshotCommand {
+                                    request: RequestId::new("req-poll").unwrap(),
+                                    run: run.clone(),
+                                })
+                                .await;
+                            if snapshot.is_some_and(|s| {
+                                matches!(s.lifecycle(), RunLifecycle::Finalized(_))
+                            }) {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("run finalizes");
+                    assert_eq!(
+                        finalized_snapshot_truncated(&runtime, &run, RunOutcome::Completed)
+                            .await
+                            .expect("finalized snapshot"),
+                        expected_truncated,
+                        "snapshot must reflect actual upstream loss"
+                    );
+                    let report = finish_run(&runtime, &mut streams, &run, Duration::from_secs(5))
+                        .await
+                        .expect("report");
+                    assert_eq!(report.outcome, RunOutcome::Completed);
+                    assert_eq!(report.truncated, expected_truncated);
+                    let text_count = report
+                        .lines
+                        .iter()
+                        .filter(|line| line.contains("kind=text "))
+                        .count();
+                    assert_eq!(text_count, event_count.min(DATA_CAPACITY));
+                    assert!(text_count < MAX_REPORT_EVENTS);
+                    assert!(report.lines.iter().map(String::len).sum::<usize>() < MAX_REPORT_BYTES);
+                }
+            },
+            SHUTDOWN_TIMEOUT,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_snapshot_is_an_operation_error() {
+        block_on_with_shutdown(
+            async {
+                let (runtime, _streams) = build_runtime(
+                    Limits::m0_test(),
+                    Arc::new(FakeProvider::new(vec![])),
+                    vec![],
+                )
+                .unwrap();
+                let error = finalized_snapshot_truncated(
+                    &runtime,
+                    &RunId::new("run-unknown").unwrap(),
+                    RunOutcome::Completed,
+                )
+                .await
+                .expect_err("unknown snapshot must not imply completeness");
+                assert!(matches!(error, HeadlessError::Operation(_)));
+                assert!(error.message().contains("completeness unknown"));
+            },
+            SHUTDOWN_TIMEOUT,
+        )
+        .unwrap();
     }
 
     #[test]
