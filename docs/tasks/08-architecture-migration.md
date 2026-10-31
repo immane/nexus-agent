@@ -2,6 +2,35 @@
 
 Status: Proposed implementation plan based on the [architecture review](../review/ARCHITECTURE_REVIEW.md). No task is implemented or validated by this document. This is consolidation of the working agent, not a rewrite, a new M0 lock, or evidence of production security readiness.
 
+## Linux validation update — 2026-10-31
+
+The references below to Linux being blocked for lack of an environment describe
+the earlier status. On an Ubuntu 26.04.1 LTS x86_64 VM (Linux 7.0.0-38,
+4 vCPUs, 7.3 GiB RAM), commit `938a9059ff6ce5f3fd7083c8e4843b42afd08420`
+plus the Linux sandbox regression tests was checked as an unprivileged user
+with Rust 1.99.0 and Bubblewrap 0.11.1:
+
+- `cargo +1.99.0 test --workspace --locked -- --test-threads=1`: 2,607
+  passed, 19 ignored, no failures (including doc tests).
+- `cargo +1.99.0 clippy --workspace --all-targets --locked -- -D warnings`
+  and `cargo +1.99.0 fmt --all --check`: passed.
+- `cargo +1.99.0 test -p nexus-tools --locked --offline --test behavior linux_ --
+  --ignored --test-threads=1`: four required-backend tests passed. They exercise
+  strict project writes, outside read/write denial, loopback TCP denial, and
+  development project `.env` masking and external write authorization, plus
+  timeout followed by another command. They require an actual working backend.
+  The last two tests were added after the workspace run; tools all-target Clippy
+  and formatting were rerun successfully afterward.
+
+An earlier root run from `/root` failed ten container workload tests because
+that location is explicitly protected as a container workspace; the
+unprivileged run from `/home/nexus-test/project` passed. These results provide
+partial Linux evidence only. Credential variants, adversarial file/metadata
+races, cancellation and descendant cleanup, injected
+exec failures, container networking, and M0 performance baselines still need
+their respective targeted evidence. The M1.4 escaped-descendant limitation
+remains unresolved; no full Linux security or M0–M4 acceptance is claimed.
+
 ## Goal and scope
 
 Fix execution-contract and lifecycle defects first, then reduce duplicated ownership and implicit contracts without adding a framework. Preserve the existing crate graph, synchronous provider/tool ports where practical, one authoritative runtime execution path, and the working frontend behavior.

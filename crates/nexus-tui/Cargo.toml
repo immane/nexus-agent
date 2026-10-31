@@ -5,6 +5,7 @@ edition = "2024"
 autotests = false
 
 [features]
+demo = []
 # Redundant coverage of the test-only keymap, not the binary's real keymap.
 low-value-tests = []
 container = [
@@ -49,10 +50,8 @@ nexus-config = { path = "../nexus-config" }
 # Scripted fakes, used ONLY by the `nexus-tui` binary demo wiring
 # (self-identifying M0-test stand-in, never real configuration).
 nexus-fakes = { path = "../nexus-fakes" }
-# Real OpenAI-compatible adapter, used ONLY when the active model resolves
-# to a configured provider with an available credential; otherwise the
-# binary serves the scripted demo above. Same adapter crate the server
-# binds provider-selected sessions to.
+# Real OpenAI-compatible adapter for a configured provider with an available
+# credential. Scripted provider fallback requires the demo feature and flag.
 nexus-openai = { path = "../nexus-openai" }
 # Real root-jailed file tools, used ONLY under an explicit `--tools-root`
 # jail (mirrors the server's `--tools real`); otherwise file tools stay

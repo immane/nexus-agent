@@ -9,6 +9,9 @@ mod cov_state_retention;
 mod cov_state_sequences;
 mod cov_state_viewport;
 mod cov_terminal;
+mod credential_startup;
+mod demo_startup;
 mod discovery_footer;
 mod file_tool_presentation;
+#[cfg(feature = "demo")]
 mod pty_render;

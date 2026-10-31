@@ -8,7 +8,7 @@
 //!
 //! - The tick interval is persistent: continuously ready events cannot
 //!   starve keyboard polling or stalled-reorder handling.
-//! - Keyboard handling per tick is bounded, so an input flood cannot starve
+//! - Keyboard handling per input poll is bounded, so an input flood cannot starve
 //!   event application or redraws.
 //! - A `Submit` clears and records the draft and adopts the run identity
 //!   only on an `Accepted` reply; `Busy` keeps the draft untouched. A new
@@ -68,17 +68,17 @@ mod diagnostics;
 
 const DEMO_PROFILE: &str = "m0-test";
 const DEMO_INPUT: &str = "m0 test-only demo submission";
-/// Persistent tick: keyboard polling and stalled-reorder handling happen at
-/// this cadence even while events are continuously ready.
+/// Persistent maintenance cadence, even while events are continuously ready.
 const TICK: Duration = Duration::from_millis(50);
+/// Poll input without blocking the current-thread runtime or owning it on another thread.
+const INPUT_POLL: Duration = Duration::from_millis(20);
 const HEADLESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounded window for cancellation reconciliation before terminal restore.
 const RECONCILE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Explicit Tokio teardown bound: native blocking provider/tool work is never
 /// awaited indefinitely.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Keyboard events read per tick; a paste or autorepeat burst is drained
-/// across later ticks instead of starving events and redraws.
+/// Input events read per poll; bursts cannot starve events and redraws.
 const MAX_KEYS_PER_TICK: usize = 32;
 /// Finite cross-channel reorder buffer. Beyond this, missing sequences are
 /// skipped as explicitly counted presentation gaps, never reordered.
@@ -460,7 +460,8 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return StartupAction::Help,
-            "--demo" => demo = true,
+            "--demo" if cfg!(feature = "demo") => demo = true,
+            "--demo" => return StartupAction::Usage,
             "--strict-tools" => strict_tools = true,
             "--execution" | "--run" => {
                 if execution_set {
@@ -543,7 +544,7 @@ fn startup_usage(help: bool) -> ! {
             "Modes:\n",
             "  --execution <MODE>  Select local (default) or container execution\n",
             "  --run <MODE>        Alias for --execution\n",
-            "  --demo              Run the scripted demo (fake provider/tools; submits a canned task)\n\n",
+            "{}\n",
             "Workspace and tools:\n",
             "  --tools-root <PATH> Workspace jail; defaults to the current directory\n",
             "  --strict-tools      Use the strict jailed-tools policy\n\n",
@@ -558,7 +559,7 @@ fn startup_usage(help: bool) -> ! {
             "Other:\n",
             "  -h, --help          Print this help\n\n",
             "Behavior:\n",
-            "  Without --demo, live provider wiring is used when configured; otherwise\n",
+            "  Live provider wiring is used when configured; otherwise\n",
             "  task submission reports that no provider is configured. Local mode is default.\n",
             "  Container mode is experimental, needs a container-enabled build, both images\n",
             "  (flags or user config), and a workspace. It does not establish isolation.\n",
@@ -569,6 +570,11 @@ fn startup_usage(help: bool) -> ! {
             "  See QUICKSTART.md and docs/design/11-container-execution.md.\n\n",
             "{}\n",
         ),
+        if cfg!(feature = "demo") {
+            "  --demo              Run the scripted demo (may use live models and real tools)\n"
+        } else {
+            "  Demo support: disabled; rebuild with --features demo to use --demo.\n"
+        },
         if cfg!(feature = "container") {
             "Container support: enabled in this build."
         } else {
@@ -666,12 +672,16 @@ fn resolve_live_adapter(
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> LiveResolve {
     let Some(model_id) = selection.active_model.as_deref() else {
-        if selection.demo {
+        if cfg!(any(test, feature = "demo")) && selection.demo {
             return LiveResolve::Demo;
         }
         return LiveResolve::Failed(
             ErrorCategory::InvalidInput,
-            "no model configured: add a model or relaunch with --demo for the scripted demo",
+            if cfg!(feature = "demo") {
+                "no model configured: add a model or relaunch with --demo for the scripted demo"
+            } else {
+                "no model configured: add a model"
+            },
         );
     };
     let Some(entry) = selection.config.model(model_id) else {
@@ -954,7 +964,10 @@ impl PerRunProvider {
             discovered_context: Arc::new(Mutex::new(HashMap::new())),
             current: Mutex::new(PerRunState {
                 run: None,
-                provider: ActiveProvider::Fake(FakeProvider::demo_two_turn()),
+                provider: ActiveProvider::Unavailable(
+                    ErrorCategory::InvalidInput,
+                    "no run selected",
+                ),
             }),
         }
     }
@@ -1209,10 +1222,11 @@ fn build_live_runtime_with_store(
             }
         }
         ExecutionMode::Local => match &session_config.tools_root {
-            None => vec![
+            None if cfg!(test) || (cfg!(feature = "demo") && session_config.demo) => vec![
                 ToolRegistration::read(Arc::new(FakeTool::read_only())),
                 ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
             ],
+            None => return Err(io::Error::other("workspace root is unavailable")),
             Some(root) => {
                 let canonical = std::fs::canonicalize(root).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "tools root is unusable")
@@ -1273,18 +1287,16 @@ fn runtime_with_tools(
     Ok((runtime, streams, binding))
 }
 
-/// One-line wiring report for the transcript: which provider (if any) the
-/// next run resolves to, and whether file tools are real. Only counts and the
-/// operator's own identities appear; values never do.
+/// Reports the selection without resolving credentials or claiming it is usable.
 fn wiring_notice(
     selection: &LiveSelection,
     tools_root: Option<&std::path::Path>,
     execution: ExecutionMode,
 ) -> String {
-    let provider = match resolve_live_adapter(selection, env_credential) {
-        LiveResolve::Demo => "demo script".to_owned(),
-        LiveResolve::Live(adapter) => format!("live adapter ({})", adapter.model()),
-        LiveResolve::Failed(_, message) => format!("unavailable ({message})"),
+    let provider = match selection.active_model.as_deref() {
+        Some(model) => format!("selected model ({model}); provider validated on submission"),
+        None if selection.demo => "demo script".to_owned(),
+        None => "no model selected".to_owned(),
     };
     let tools = match (execution, tools_root) {
         (ExecutionMode::Container, Some(root)) => format!(
@@ -1345,7 +1357,12 @@ async fn run() -> io::Result<()> {
            jailed file tools + sandboxed exec (writes/exec require approval). \
            --execution container is experimental and does not establish isolation. \
            Without a configured provider, runs fail as not-configured; \
-           relaunch with --demo for the scripted ephemeral demo."
+           {}",
+        if cfg!(feature = "demo") {
+            "Relaunch with --demo for the scripted ephemeral demo."
+        } else {
+            "Demo support is disabled in this build."
+        }
     );
     if session_config.execution == ExecutionMode::Container {
         eprintln!(
@@ -1400,7 +1417,12 @@ async fn run() -> io::Result<()> {
                 }
                 if !session_config.demo {
                     return Err(io::Error::other(format!(
-                        "terminal setup failed ({error}); relaunch with --demo for the scripted transcript fallback"
+                        "terminal setup failed ({error}); {}",
+                        if cfg!(feature = "demo") {
+                            "relaunch with --demo for the scripted transcript fallback"
+                        } else {
+                            "an interactive terminal is required"
+                        }
                     )));
                 }
                 eprintln!("terminal setup failed ({error}); demo transcript fallback");
@@ -1415,9 +1437,11 @@ async fn run() -> io::Result<()> {
             ));
         }
         if !session_config.demo {
-            return Err(io::Error::other(
-                "no terminal attached; relaunch with --demo for the scripted transcript fallback",
-            ));
+            return Err(io::Error::other(if cfg!(feature = "demo") {
+                "no terminal attached; relaunch with --demo for the scripted transcript fallback"
+            } else {
+                "no terminal attached; an interactive terminal is required"
+            }));
         }
         let (runtime, streams) = build_demo_runtime(session_config.settings.limits())?;
         headless(runtime, streams, session_config).await
@@ -1722,20 +1746,9 @@ impl Frontend {
         self.state.notice(&message);
     }
 
-    /// True when the next run resolves to a real adapter (selection known,
-    /// credential present, endpoint valid). The interactive canned demo
-    /// submission is gated on the negation: auto-firing a real network
-    /// call on every launch would bill the operator for a transcript
-    /// nobody asked for. No handle (unit tests) counts as demo.
-    fn is_live(&self) -> bool {
-        let Some(binding) = &self.live else {
-            return false;
-        };
-        let selection = binding.lock().expect("live selection lockable");
-        matches!(
-            resolve_live_adapter(&selection, env_credential),
-            LiveResolve::Live(_)
-        )
+    /// Only an unselected demo can safely submit the canned prompt at startup.
+    fn should_auto_submit_demo(&self) -> bool {
+        self.demo && self.active_model.is_none()
     }
 
     /// Advances the active model through the configured models in admission
@@ -2162,16 +2175,27 @@ async fn next_loop_step(
     }
 }
 
-/// Non-blocking next input event; resize traffic is drained and ignored so
-/// it cannot stall the loop, while mouse wheel notches surface as scroll
-/// input beside key presses.
+async fn next_interactive_step(
+    interval: &mut tokio::time::Interval,
+    input_interval: &mut tokio::time::Interval,
+    data: &mut mpsc::Receiver<RunEvent>,
+    control: &mut mpsc::Receiver<RunEvent>,
+) -> Option<LoopStep> {
+    tokio::select! {
+        step = next_loop_step(interval, data, control) => Some(step),
+        _ = input_interval.tick() => None,
+    }
+}
+
+/// Non-blocking next input event; ignored traffic consumes at most one event
+/// per poll, while mouse wheel notches surface beside key presses.
 fn read_input() -> io::Result<Option<Input>> {
-    while poll(Duration::ZERO)? {
-        match read()? {
-            Event::Key(key) => return Ok(Some(Input::Key(key))),
-            Event::Mouse(mouse) => return Ok(Some(Input::Mouse(mouse))),
-            _ => {}
-        }
+    if poll(Duration::ZERO)? {
+        return Ok(match read()? {
+            Event::Key(key) => Some(Input::Key(key)),
+            Event::Mouse(mouse) => Some(Input::Mouse(mouse)),
+            _ => None,
+        });
     }
     Ok(None)
 }
@@ -3789,7 +3813,6 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
         session_config.tools_root.as_deref(),
         session_config.execution,
     );
-    let demo = session_config.demo;
     let mut sessions = SessionRegistry::new_with_store(
         SessionSlot {
             label: "s1".to_owned(),
@@ -3813,11 +3836,9 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Canned submission through the same command path as typed input. The
-    // draft is recorded and the run adopted only after `Accepted`. Doubly
-    // gated: explicit `--demo` (never silent fakes in the dev version), and
-    // not-live (a live adapter would fire a real billable network call on
-    // every launch for a transcript nobody asked for).
-    if demo && !sessions.active().front.is_live() {
+    // draft is recorded and the run adopted only after `Accepted`. A selected
+    // model must never be auto-submitted, even if its credentials are missing.
+    if sessions.active().front.should_auto_submit_demo() {
         let slot = sessions.active_mut();
         let submit = submit_command(
             slot.front.next_request(),
@@ -4064,6 +4085,9 @@ async fn interactive_loop(
     interval: &mut tokio::time::Interval,
 ) -> io::Result<()> {
     let mut event_since_tick = false;
+    let mut input_interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + INPUT_POLL, INPUT_POLL);
+    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let mut dirty = false;
         if sessions
@@ -4081,15 +4105,24 @@ async fn interactive_loop(
         // buffering in their bounded channels until switched back to. The
         // borrow ends before the step is handled so a session switch inside
         // key handling can move the active index freely.
+        draw_pending(gate, Instant::now(), || {
+            draw(terminal, &mut sessions.active_mut().front)
+        })?;
         let step = {
             let slot = sessions.active_mut();
-            next_loop_step(interval, &mut slot.streams.data, &mut slot.streams.control).await
+            next_interactive_step(
+                interval,
+                &mut input_interval,
+                &mut slot.streams.data,
+                &mut slot.streams.control,
+            )
+            .await
         };
         match step {
             // A closed channel ends input, but the other one may still hold
             // queued events: apply everything already committed before exit
             // so a close racing the terminal cannot drop the outcome.
-            LoopStep::Closed => {
+            Some(LoopStep::Closed) => {
                 let slot = sessions.active_mut();
                 let drained = drain_available(
                     &mut slot.streams.data,
@@ -4103,7 +4136,7 @@ async fn interactive_loop(
                 draw(terminal, &mut slot.front)?;
                 return Ok(());
             }
-            LoopStep::Event(event) => {
+            Some(LoopStep::Event(event)) => {
                 event_since_tick = true;
                 // A terminal outcome stays on screen and the loop keeps
                 // serving: the next `Accepted` submit adopts a new run.
@@ -4115,7 +4148,7 @@ async fn interactive_loop(
                 absorb(&mut slot.front, *event, &mut slot.streams);
                 dirty = true;
             }
-            LoopStep::Tick => {
+            None => {
                 dirty |= sessions.poll_maintenance();
                 let storage_busy = sessions.maintenance.is_some();
                 let batch = {
@@ -4133,19 +4166,19 @@ async fn interactive_loop(
                     return Ok(());
                 }
                 dirty |= batch.handled > 0;
-                // A just-expired copy toast needs one last frame to vanish;
-                // without input the loop would otherwise hold it forever.
-                dirty |= sessions.active_mut().front.state.poll_toast_expired();
-                dirty |= sessions.active_mut().front.state.tick_tool_animation();
-                dirty |= sessions.active_mut().front.state.tick_caret();
-                // Drain queued session intents against the registry in
-                // recording order: creation moves the active slot, so later
-                // intents resolve after earlier ones.
                 let cmds = sessions.active_mut().front.take_session_cmds();
                 for cmd in &cmds {
                     execute_session_command(sessions, cmd).await;
                     dirty = true;
                 }
+            }
+            Some(LoopStep::Tick) => {
+                dirty |= sessions.poll_maintenance();
+                // A just-expired copy toast needs one last frame to vanish;
+                // without input the loop would otherwise hold it forever.
+                dirty |= sessions.active_mut().front.state.poll_toast_expired();
+                dirty |= sessions.active_mut().front.state.tick_tool_animation();
+                dirty |= sessions.active_mut().front.state.tick_caret();
                 let slot = sessions.active_mut();
                 if !event_since_tick && slot.front.merger.has_pending() {
                     let flushed = slot.front.merger.flush();
@@ -4164,11 +4197,95 @@ async fn interactive_loop(
         if dirty {
             gate.request();
         }
+        draw_pending(gate, Instant::now(), || {
+            draw(terminal, &mut sessions.active_mut().front)
+        })?;
+    }
+}
+
+fn draw_pending(
+    gate: &mut RefreshGate,
+    now: Instant,
+    draw_frame: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if gate.ready(now) {
+        draw_frame()?;
+        gate.mark_drawn(now);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod refresh_loop_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn input_poll_is_independent_of_maintenance_tick() {
+        let (_data_tx, mut data) = mpsc::channel(1);
+        let (_control_tx, mut control) = mpsc::channel(1);
+        let mut maintenance = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
+        let mut input = tokio::time::interval(INPUT_POLL);
+        assert!(
+            next_interactive_step(&mut maintenance, &mut input, &mut data, &mut control)
+                .await
+                .is_none()
+        );
+        assert!(INPUT_POLL < TICK);
+    }
+
+    #[tokio::test]
+    async fn maintenance_tick_does_not_wait_for_input_poll() {
+        let (_data_tx, mut data) = mpsc::channel(1);
+        let (_control_tx, mut control) = mpsc::channel(1);
+        let mut maintenance = tokio::time::interval(TICK);
+        let mut input = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            INPUT_POLL,
+        );
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                next_interactive_step(&mut maintenance, &mut input, &mut data, &mut control)
+            )
+            .await,
+            Ok(Some(LoopStep::Tick))
+        ));
+    }
+
+    #[test]
+    fn initial_frame_is_immediate_and_later_frames_are_coalesced() {
         let now = Instant::now();
-        if gate.ready(now) {
-            draw(terminal, &mut sessions.active_mut().front)?;
-            gate.mark_drawn(now);
-        }
+        let mut gate = RefreshGate::new(Duration::from_millis(33));
+        let mut frames = 0;
+        gate.request();
+        draw_pending(&mut gate, now, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 1);
+        gate.request();
+        draw_pending(&mut gate, now + Duration::from_millis(5), || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 1);
+        draw_pending(&mut gate, now + Duration::from_millis(33), || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 2);
+    }
+
+    #[test]
+    fn failed_frame_remains_pending() {
+        let now = Instant::now();
+        let mut gate = RefreshGate::new(TICK);
+        gate.request();
+        assert!(draw_pending(&mut gate, now, || Err(io::Error::other("draw failed"))).is_err());
+        assert!(gate.ready(now));
     }
 }
 
@@ -8929,6 +9046,10 @@ mod cov_live_wiring {
     #[test]
     fn demo_mode_is_an_explicit_opt_in_flag() {
         assert!(!demo_flag(&[]), "the dev default serves no fakes");
+        if !cfg!(feature = "demo") {
+            usage(&["--demo"]);
+            return;
+        }
         assert!(demo_flag(&["--demo"]), "--demo opts in");
         assert!(demo_flag(&["--demo", "--tools-root", "/srv/root"]));
         assert!(demo_flag(&["--tools-root", "/srv/root", "--demo"]));
@@ -9072,7 +9193,8 @@ mod cov_live_wiring {
             "unconfigured dev runs fail instead of demoing"
         );
         if let LiveResolve::Failed(_, message) = resolved {
-            assert!(message.contains("--demo"), "the failure names the opt-in");
+            assert!(message.contains("no model configured"));
+            assert_eq!(message.contains("--demo"), cfg!(feature = "demo"));
         }
         // The same selection with the flag serves the scripted demo.
         selection.demo = true;
@@ -9114,13 +9236,13 @@ mod cov_live_wiring {
     }
 
     #[test]
-    fn wiring_notice_distinguishes_unavailable_provider_and_real_writes() {
+    fn wiring_notice_defers_provider_validation_and_reports_real_writes() {
         let notice = wiring_notice(
             &selection_with(Some("ghost")),
             Some(std::path::Path::new("/project")),
             ExecutionMode::Local,
         );
-        assert!(notice.contains("unavailable"));
+        assert!(notice.contains("selected model (ghost); provider validated on submission"));
         assert!(!notice.contains("demo script"));
         assert!(notice.contains("real file tools + sandboxed exec"));
         assert!(notice.contains("writes/exec require approval"));
@@ -9498,11 +9620,12 @@ mod cov_live_wiring {
             workload_image: None,
         };
         let (_runtime, _streams, live) = build_live_runtime(&session).expect("demo wiring builds");
-        assert!(
-            !Frontend::new(SessionId::new("sess-test-live").expect("test session id is valid"))
-                .is_live(),
-            "no handle means demo, even beside a live-capable runtime"
-        );
+        let mut front = Frontend::new(SessionId::new("sess-test-live").unwrap());
+        assert!(!front.should_auto_submit_demo());
+        front.demo = true;
+        assert!(front.should_auto_submit_demo());
+        front.active_model = Some("m0".to_owned());
+        assert!(!front.should_auto_submit_demo());
         drop(live);
     }
 

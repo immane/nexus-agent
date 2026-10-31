@@ -281,7 +281,7 @@ cargo run -p nexus-headless --locked --offline -- "hello"
 cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project
 ```
 
-Configure a model before submitting in the TUI; an unconfigured launch does not silently return fake replies. `--demo` permits demo fallback but does not disable real tools or override a selected live model. Cargo's `--offline` does not disable runtime API requests. See the [Quickstart](QUICKSTART.md).
+Configure a model before submitting in the TUI; an unconfigured launch does not silently return fake replies. Provider credentials are resolved on submission, not at startup. The TUI's `demo` Cargo feature is off by default, including in release builds; enable it explicitly to use `--demo`. This permits demo fallback but does not disable real tools or override a selected live model. Its interactive canned prompt runs automatically only when no model is selected. Cargo's `--offline` does not disable runtime API requests. See the [Quickstart](QUICKSTART.md).
 
 ### Agent modes
 

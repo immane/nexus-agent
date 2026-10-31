@@ -121,7 +121,7 @@ the full optional suite is documented in [Testing](docs/testing.md).
 | `crates/nexus-openai` | Streaming Chat Completions, Responses, and Messages adapters over HTTP/HTTPS |
 | `crates/nexus-runtime` | Single-active-run loop: policy, cancellation, quarantine, ordered events |
 | `crates/nexus-server` | Loopback HTTP frontend: sessions, SSE streams, config-gated selection |
-| `crates/nexus-tui` | TUI with configured live providers or scripted demo wiring |
+| `crates/nexus-tui` | TUI with configured live providers and opt-in scripted demo wiring |
 | `crates/nexus-headless` | One-shot machine-output runner over scripted fakes |
 | `crates/nexus-integration` | Cross-crate behavior and regression tests |
 | `tools/perf` | stdlib-only startup/readiness measurement harnesses + their tests |
@@ -131,19 +131,27 @@ the full optional suite is documented in [Testing](docs/testing.md).
 
 ```sh
 cargo run -p nexus-headless --locked --offline -- "hello"
-cargo run -p nexus-tui --locked --offline -- --demo
+cargo run -p nexus-tui --features demo --locked --offline -- --demo
 ```
 
 Headless uses scripted provider/tools, has no approval handler, and emits
 percent-encoded `key=value` records, not JSON. A leading `--mode plan` selects
 read-only mode; the default is `build`.
 
+The TUI `demo` Cargo feature is disabled by default, including in release builds;
+without it `--demo` is rejected. For performance measurements it can also be
+enabled in a release build with `cargo build -p nexus-tui --release --features demo`.
+
 The TUI uses real development tools rooted at the working directory, even with
 `--demo`: project/temp operations apply for real. Demo fallback is available
 only when no configured model is selected; `--demo` does not override a live
 model or guarantee a side-effect-free run. Without `--demo`, an unconfigured
-submission fails explicitly instead of returning a fake reply. Neither
-frontend has durable conversation storage.
+submission fails explicitly instead of returning a fake reply. Interactive live
+TUI sessions use private local history storage; demo sessions are ephemeral.
+Startup does not resolve provider credentials; the selected provider is validated
+when a run is submitted. The interactive canned demo runs automatically only
+when no model is selected. A selected model is never submitted automatically,
+even if its credential is missing; manually submitting it can use the network.
 
 ## Use a configured model in the TUI
 

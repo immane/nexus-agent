@@ -90,6 +90,170 @@ fn argv_runs_inside_the_configured_sandbox_root() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an explicitly provisioned Linux sandbox and curl"]
+fn linux_sandbox_confines_files_and_network() {
+    let root = TempRoot::new();
+    let outside = TempRoot::new();
+    let secret = outside.0.join("secret.txt");
+    std::fs::write(&secret, "outside-secret").unwrap();
+    let executor = SandboxedExecutor::with_root(&root.0).unwrap();
+    assert!(
+        executor.sandbox_available(),
+        "Linux sandbox backend is required"
+    );
+    let run = |argv: Vec<String>| {
+        executor.execute(
+            &call(&serde_json::json!({"argv": argv}).to_string()),
+            &context(),
+        )
+    };
+
+    let written = run(vec!["/usr/bin/touch".into(), "created.txt".into()]);
+    assert_eq!(
+        written.status(),
+        ExecutionStatus::Succeeded,
+        "{}",
+        written.content()
+    );
+    assert!(root.0.join("created.txt").exists());
+
+    let read = run(vec!["/bin/cat".into(), secret.display().to_string()]);
+    assert_eq!(read.status(), ExecutionStatus::Failed);
+    assert!(!read.content().contains("outside-secret"));
+    let refused = outside.0.join("refused.txt");
+    let write = run(vec!["/usr/bin/touch".into(), refused.display().to_string()]);
+    assert_eq!(write.status(), ExecutionStatus::Failed);
+    assert!(!refused.exists());
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert!(std::path::Path::new("/usr/bin/curl").is_file());
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let network = run(vec![
+        "/usr/bin/curl".into(),
+        "--noproxy".into(),
+        "*".into(),
+        "--max-time".into(),
+        "1".into(),
+        url,
+    ]);
+    assert_eq!(network.status(), ExecutionStatus::Failed);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an explicitly provisioned Linux sandbox"]
+fn linux_development_sandbox_masks_project_credentials() {
+    let root = TempRoot::new();
+    std::fs::write(root.0.join(".env"), "sandbox-secret").unwrap();
+    let executor = SandboxedExecutor::development(&root.0).unwrap();
+    assert!(
+        executor.sandbox_available(),
+        "Linux sandbox backend is required"
+    );
+    let result = executor.execute(
+        &call(r#"{"argv":["/bin/cat",".env"]}"#),
+        &context_with_scope("exec:workspace"),
+    );
+    match result.status() {
+        ExecutionStatus::Succeeded => assert!(result.content().is_empty()),
+        ExecutionStatus::Failed => assert!(result.content().contains("Permission denied")),
+        status => panic!("unexpected credential read status: {status:?}"),
+    }
+    assert!(
+        !result.content().contains("sandbox-secret"),
+        "credential was exposed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an explicitly provisioned Linux sandbox"]
+fn linux_development_external_write_requires_approved_scope() {
+    let root = TempRoot::new();
+    let outside = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .canonicalize()
+        .unwrap();
+    let file = outside.join(format!("nexus-sandbox-write-{}", std::process::id()));
+    assert!(!file.exists());
+    let executor = SandboxedExecutor::development(&root.0).unwrap();
+    assert!(executor.sandbox_available());
+    let args = serde_json::json!({"argv":["/usr/bin/touch",file]});
+    let denied = executor.execute(
+        &call(&args.to_string()),
+        &context_with_scope("exec:workspace"),
+    );
+    assert_eq!(
+        denied.status(),
+        ExecutionStatus::Failed,
+        "{}",
+        denied.content()
+    );
+    assert!(!file.exists());
+    let args = serde_json::json!({"argv":["/usr/bin/touch",file], "write_dir":outside});
+    let denied = executor.execute(
+        &call(&args.to_string()),
+        &context_with_scope("exec:workspace"),
+    );
+    assert_eq!(denied.status(), ExecutionStatus::Denied);
+    let approved = context_with_scope(&format!("exec-directory:{}", outside.display()));
+    let result = executor.execute(&call(&args.to_string()), &approved);
+    let exists = file.exists();
+    if exists {
+        std::fs::remove_file(&file).unwrap();
+    }
+    assert_eq!(
+        result.status(),
+        ExecutionStatus::Succeeded,
+        "{}",
+        result.content()
+    );
+    assert!(exists);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an explicitly provisioned Linux sandbox"]
+fn linux_sandbox_timeout_cleans_up_and_accepts_another_call() {
+    let root = TempRoot::new();
+    let executor = SandboxedExecutor::with_root(&root.0).unwrap();
+    assert!(executor.sandbox_available());
+    let started = std::time::Instant::now();
+    let context = context().with_control(
+        nexus_core::CancellationToken::new(),
+        started + Duration::from_millis(100),
+    );
+    let result = executor.execute(
+        &call(r#"{"argv":["/bin/sh","-c","printf started; exec /bin/sleep 30"]}"#),
+        &context,
+    );
+    assert_eq!(
+        result.status(),
+        ExecutionStatus::TimedOut,
+        "{}",
+        result.content()
+    );
+    assert_eq!(result.effect(), nexus_core::EffectState::Unknown);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let next = executor.execute(
+        &call(r#"{"argv":["/usr/bin/printf","sandbox-ok"]}"#),
+        &context_with_scope("command:/usr/bin/printf sandbox-ok"),
+    );
+    assert_eq!(
+        next.status(),
+        ExecutionStatus::Succeeded,
+        "{}",
+        next.content()
+    );
+    assert_eq!(next.content(), "sandbox-ok");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn expired_command_cleans_up_and_executor_accepts_the_next_call() {

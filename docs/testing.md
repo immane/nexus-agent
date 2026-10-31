@@ -19,11 +19,13 @@ TUI, server, tools, and container integration tests share one `behavior` target
 per package instead of linking an executable for every source file. New
 integration modules in these packages must be added to `tests/behavior.rs`;
 automatic test target discovery is disabled in their manifests.
+The default Unix TUI suite also requires Python 3 for its pseudo-terminal
+credential-startup regression; it uses an isolated FIFO and loopback listener.
 
 The TUI has an opt-in real-terminal rendering regression (Unix and Python 3):
 
 ```sh
-cargo nextest run -j 1 -p nexus-tui session_commands_preserve_the_terminal_screen --run-ignored all --locked --offline
+cargo nextest run -j 1 -p nexus-tui --features demo session_commands_preserve_the_terminal_screen --run-ignored all --locked --offline
 ```
 
 It connects stdout and stderr to the same pseudo-terminal and checks incremental
@@ -34,6 +36,9 @@ diagnostics must not write directly to a terminal owned by the TUI. Interactive
 non-demo runs write bounded, metadata-only local logs automatically (see
 [Quickstart diagnostics](../QUICKSTART.md#tui-diagnostics)). Demo runs do not open
 the user's log directory; redirect stderr to retain their runtime diagnostics.
+The `demo` feature is disabled by default. Run `cargo nextest run -p nexus-tui
+--features demo --locked --offline` as well when changing demo behavior; the
+default suite separately checks that `--demo` is rejected without the feature.
 
 Development/test builds retain line-table debug information, debug assertions,
 overflow checks, and incremental compilation. Dependencies omit debug information.

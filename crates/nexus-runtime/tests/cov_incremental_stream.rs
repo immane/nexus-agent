@@ -232,6 +232,65 @@ async fn cancellation_releases_a_provider_waiting_for_stream_capacity() {
     finished_rx.recv_timeout(WAIT).unwrap();
 }
 
+/// Local wall-clock samples, not a benchmark of a real provider. Run with
+/// `cargo test -p nexus-runtime --test cov_incremental_stream local_perf -- --ignored --nocapture`.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "opt-in local performance measurement"]
+async fn local_perf_stream_and_backpressure_cancel() {
+    use std::time::Instant;
+
+    const SAMPLES: usize = 10;
+    let expected = burst_text();
+    println!(
+        "workload: samples={SAMPLES} fragments={BURST_FRAGMENTS} bytes={} failures cause test failure",
+        expected.len()
+    );
+    for sample in 0..SAMPLES {
+        let (runtime, mut streams) = Runtime::new(config(), Arc::new(burst_provider()), Vec::new());
+        let start = Instant::now();
+        assert_eq!(
+            runtime.submit(submit_cmd("perf-stream")).await.reply(),
+            CommandReply::Accepted
+        );
+        let (observed, finished) = burst_terminal(&mut streams).await;
+        let elapsed = start.elapsed();
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert_eq!(observed, expected);
+        println!(
+            "stream sample={sample} elapsed_us={} bytes_per_sec={:.0}",
+            elapsed.as_micros(),
+            expected.len() as f64 / elapsed.as_secs_f64()
+        );
+    }
+    for sample in 0..SAMPLES {
+        let (runtime, mut streams, run, finished_rx) =
+            start_backpressured_response(config(), burst_provider(), Duration::from_millis(30))
+                .await;
+        let start = Instant::now();
+        assert_eq!(
+            runtime
+                .cancel(CancelCommand {
+                    request: RequestId::new("perf-cancel").unwrap(),
+                    run,
+                })
+                .await
+                .reply(),
+            CommandReply::Accepted
+        );
+        let (observed, finished) = burst_terminal(&mut streams).await;
+        let elapsed = start.elapsed();
+        assert_eq!(finished.outcome(), RunOutcome::Cancelled);
+        assert!(expected.starts_with(&observed));
+        finished_rx.recv_timeout(WAIT).unwrap();
+        println!(
+            "cancel sample={sample} terminal_us={} delivered_bytes={}",
+            elapsed.as_micros(),
+            observed.len()
+        );
+    }
+    println!("failures=0; queue high-water mark not instrumented");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn deadline_releases_a_provider_waiting_for_stream_capacity() {
     let mut runtime_config = config();

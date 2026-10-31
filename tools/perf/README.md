@@ -160,6 +160,57 @@ kernel, CPU, and build profile with every result. The purge command above
 is user-supplied; the harness enforces its exit status and timeout but
 does not require or embed `sudo`.
 
+## PTY input response probe
+
+For an initially focused composer, the no-fixed-delay probe is:
+
+```sh
+python3 tools/perf/readiness.py /path/to/nexus-tui --mode ready --runs 20 --require composer --probe-composer --json readiness.json -- --demo
+```
+
+After the required frame output, it samples PTY `ECHO`, sends a fresh random
+16-character token only if ECHO is off, and observes the complete token on one
+reconstructed screen row. A token already present in prior or queued output is
+rejected. ECHO must also be off when sampled after observation; unavailable or
+enabled ECHO produces no response timing. The probe modifies the composer draft
+but does not submit it. Check every `input_probe.status`: only
+`observed-composer-response` supplies `spawn_to_response_ms`, measured from
+spawn through observation; `ms` measures from token write to observation.
+Missing or unconfirmed probes do not make the harness exit nonzero.
+
+This is **not a strict real-time startup measurement** or proof of causal
+handling: ECHO is sampled, not monitored continuously, so a mode change between
+samples can confound the result. Delayed output, screen emulation limitations,
+scheduling, marker choice, readiness threshold, input focus, terminal size,
+and PTY buffering also matter. The token may not be visible if the composer
+is not focused or the screen is too small; a missing response is not proof of
+unresponsiveness. The harness inherits the target environment: isolate HOME and
+configuration yourself, and avoid sensitive or persistent target sessions.
+
+For the current TUI, `readiness.py` can additionally send Esc after the
+initial frame, wait 350 ms for the standalone key, then send `:` and observe
+the command-completion panel text:
+
+```sh
+python3 tools/perf/readiness.py /path/to/nexus-tui --mode ready --runs 10 --probe-command --json readiness.json
+```
+
+`input_probe.spawn_to_response_ms` measures spawn to observed panel text;
+`ms` measures from the `:` write to observation. The timeout includes the
+Esc wait. The marker `Enter/Tab insert` is not an echo of the keys, and a
+marker observed before `:` is rejected. A bounded partial terminal screen
+tracks cursor moves and erasures so incremental redraws can complete the
+marker; it is not a full terminal emulator.
+This remains external observational evidence: unrelated or delayed output
+can coincide with the probe, and output may still be queued at the write.
+The probe assumes Esc reaches the viewport, a large enough terminal for
+completions, and the current TUI's command panel; failure to observe is not proof of
+unresponsiveness. It does not change exit status on a missing probe marker;
+inspect each run's `input_probe.status`. The older `--probe-input` sentinel
+probe remains available and cannot establish input handling. These probes
+are mutually exclusive and available only in ready mode. The harness inherits
+the target environment; isolate HOME and configuration yourself if needed.
+
 ## Tests
 
 ```sh

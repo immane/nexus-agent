@@ -13,6 +13,69 @@ use nexus_core::{
 };
 use nexus_fakes::{FakeTool, stop_turn};
 
+/// Exact receiver-queue peaks from submission until the first approval gate,
+/// not peaks for the remainder of the run or for the internal control outbox.
+#[test]
+fn paused_receivers_measure_queue_peaks_at_approval_gate() {
+    const FRAGMENTS: usize = 1_500;
+    let rt = common::test_rt();
+    rt.block_on(async {
+        let script = vec![common::flood_turn(
+            FRAGMENTS,
+            vec![common::candidate_with(
+                "item-2", "prov-ref-2", "host_write", r#"{"path":"a"}"#,
+            )],
+        ), stop_turn("done")];
+        let mut bed = common::make_bed(script, common::quick_config());
+        let response = bed.runtime.submit(common::submit_cmd("queue-peak")).await;
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        let run = response.run().cloned().expect("run issued");
+
+        // Neither receiver is consumed during this phase. The snapshot is
+        // taken after the approval notice is emitted under the runtime lock;
+        // the driver then waits for a decision. The single-threaded executor
+        // cannot run another sender between these lengths and the drains.
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (reply, snapshot) = bed.runtime.get_snapshot(nexus_core::GetSnapshotCommand {
+                    request: RequestId::new("req-queue-peak-snapshot").expect("valid"),
+                    run: run.clone(),
+                }).await;
+                assert_eq!(reply.reply(), CommandReply::Accepted);
+                if let Some(snapshot) = snapshot
+                    && !snapshot.pending_approvals().is_empty()
+                {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("approval gate reached");
+        assert!(snapshot.is_content_truncated(), "flood dropped presentation events");
+        let data_peak = bed.data.len();
+        let control_peak = bed.control.len();
+        let mut data = Vec::new();
+        let mut control = Vec::new();
+        while let Ok(event) = bed.data.try_recv() { data.push(event); }
+        while let Ok(event) = bed.control.try_recv() { control.push(event); }
+        assert_eq!(data.len(), data_peak);
+        assert_eq!(control.len(), control_peak);
+        assert!(data_peak > 0);
+        let (approval, call) = common::find_approval(&control)
+            .expect("approval notice delivered before measurement");
+        println!("workload: fragments={FRAGMENTS} bytes_per_fragment=64 alternating_items=2 approval_gate=1 paused_data_and_control=true");
+        println!("receiver_queue_peak_until_approval: data={data_peak} control={control_peak}; excludes control outbox and later run phases");
+
+        assert_eq!(bed.runtime.deny(DenyCommand {
+            request: RequestId::new("req-queue-peak-deny").expect("valid"),
+            approval,
+            run,
+            call,
+        }).await.reply(), CommandReply::Accepted);
+        let (_, _, finished) = common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+    });
+}
+
 /// The control path stays responsive while the data channel saturates: a
 /// 1,500-fragment output flood (over the 1,024-event data bound) is driven
 /// without draining data, yet the denial and the later approval are both
@@ -315,5 +378,80 @@ fn prompt_cancellation_under_output_load() {
             )),
             1
         );
+    });
+}
+
+/// Measures observation of the runtime call events, including scheduling and
+/// channel delivery, not the isolated execution time inside the fake tool.
+#[test]
+#[ignore = "opt-in local performance measurement"]
+fn local_perf_fake_call() {
+    use std::time::Instant;
+
+    const SAMPLES: usize = 10;
+    let rt = common::test_rt();
+    rt.block_on(async {
+        println!(
+            "workload: samples={SAMPLES} calls_per_run=1 args_bytes=14 failures cause test failure"
+        );
+        for sample in 0..SAMPLES {
+            let script = vec![
+                common::flood_turn(0, vec![common::candidate("host_read", r#"{"path":"src"}"#)]),
+                stop_turn("done"),
+            ];
+            let mut bed = common::make_bed(script, common::auto_config());
+            assert_eq!(
+                bed.runtime
+                    .submit(common::submit_cmd("perf-call"))
+                    .await
+                    .reply(),
+                CommandReply::Accepted
+            );
+            let start = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = bed.control.recv().await.unwrap();
+                    if let EventPayload::ToolStarted(info) = event.payload() {
+                        break (Instant::now(), info.call.clone());
+                    }
+                    assert!(!event.is_terminal(), "call must start before terminal");
+                }
+            })
+            .await
+            .unwrap();
+            let elapsed = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let event = bed.control.recv().await.unwrap();
+                    if let EventPayload::ToolFinished(info) = event.payload() {
+                        assert_eq!(info.call, start.1);
+                        assert_eq!(info.outcome.status(), ExecutionStatus::Succeeded);
+                        break start.0.elapsed();
+                    }
+                    assert!(!event.is_terminal(), "call must finish before terminal");
+                }
+            })
+            .await
+            .unwrap();
+            let (data, control, finished) =
+                common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+            assert_eq!(bed.read_tool.execution_count(), 1);
+            let output: String = data
+                .iter()
+                .filter_map(|event| match event.payload() {
+                    EventPayload::AssistantTextDelta(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(output, "done");
+            assert_eq!(
+                control.iter().filter(|event| event.is_terminal()).count(),
+                1
+            );
+            println!(
+                "call sample={sample} observed_started_to_finished_us={}",
+                elapsed.as_micros()
+            );
+        }
+        println!("failures=0; timings include event delivery and scheduling");
     });
 }
