@@ -31,6 +31,13 @@ Source: P0 consistency review of all draft contracts, designs, decisions, and ta
    are never accessed at startup, which still requires evidence or a further
    explicit decision. The original restriction is retained here as historical
    context, not represented as satisfied by current TUI startup.
+   **Startup history amendment (project owner, 2026-10-31):** opening the
+   persistent store may load its bounded metadata index and recover an unfinished
+   transaction. Recovery may read a referenced session body to verify it exists
+   and may publish a staged body; it must not automatically restore a prior
+   conversation into a new session. Ordinary startup does not enumerate or
+   decode every saved conversation body. This is not a waiver of the separate
+   no-network, no-credential-access, or no-plugin-startup requirements.
 3. **Headless output:** unstable test-only revision. Data/events go to stdout, diagnostics to stderr, never mixed; no escape codes in data.
 4. **Tool validation subset:** object-root JSON with a closed minimal validator (objects with bounded properties, strings/numbers/booleans/null/arrays with size bounds, `required`; no `$ref`, no remote fetch, no other keywords). Anything outside the subset fails registration explicitly.
 5. **Session store:** in-memory ephemeral only, self-identifying as non-durable. The persistent intent-durability-before-dispatch gate is disabled for M0 and returns in the post-M0 gate with file-durability tests.

@@ -1,6 +1,10 @@
 # M0 Gates and Evidence
 
-Status: Draft acceptance gates, documentation repair in progress. Gate checks were executed historically during the M0 pipeline (workspace lint/format/test runs and spawn-to-exit measurement runs); those results are historical evidence, not accepted M0 completion. The acceptance checklist below remains incomplete, P7 baselines are pending (PTY first-interactive, idle CPU, streaming, event-buffer high-water marks, dispatch overhead), recorded RSS evidence is confounded, and nothing is verified until the coordinator completes review.
+Status: Acceptance review in progress; **M0 is not complete**. Functional and
+platform checks below have current evidence. Startup side-effect coverage,
+complete buffer-limit evidence, and accepted P7 reference methodology and
+measurements remain open. Historical RSS evidence is confounded and must not be
+promoted to a baseline.
 
 ## Per-Stage Exit Criteria
 
@@ -16,21 +20,23 @@ Status: Draft acceptance gates, documentation repair in progress. Gate checks we
 
 ## M0 Acceptance Checklist
 
-All items remain unchecked: coordinator verification is incomplete. The
-implementation and historical check runs provide partial evidence for some
-items, but none is accepted yet.
+Checked items are verified for the scoped M0 fake paths and the platform runs
+documented below, not a production security certification. Unchecked items
+remain blockers; measurements have not been accepted as a P7 baseline.
 
-- [ ] One model/tool/model cycle completes with fake integrations.
-- [ ] Read-like fake calls proceed under scoped policy; mutation/command-like calls require approval or headless denial.
-- [ ] Cancellation stops dispatch, reports uncertain effects honestly, and never claims rollback.
+- [x] One model/tool/model cycle completes with fake integrations.
+- [x] Read-like fake calls proceed under scoped policy; mutation/command-like calls require approval or headless denial.
+- [x] Cancellation stops dispatch, reports uncertain effects honestly, and never claims rollback.
 - [ ] Bounded queues, output, context, and event buffers have finite defaults and visible truncation.
 - [ ] Startup performs bounded local work only, including the local configuration
   loading accepted in the 2026-10-31 amendment to the [M0 lock](06-m0-lock.md);
-  no network, credentials, plugin processes, or history scan. Credential access
-  remains unverified and was not waived by the configuration amendment.
-- [ ] TUI and headless paths share one runtime and policy boundary.
-- [ ] Linux and macOS validation recorded separately.
-- [ ] Limitations of the M0 fake validation path are documented, including its
+  no network, credentials, plugin processes, or automatic conversation restore.
+  A bounded session metadata index and unfinished-transaction recovery are
+  allowed by the 2026-10-31 history amendment; recovery may access the affected
+  session body. Credential access remains unverified and was not waived.
+- [x] TUI and headless paths share one runtime and policy boundary.
+- [x] Linux and macOS validation recorded separately.
+- [x] Limitations of the M0 fake validation path are documented, including its
   ephemeral store and scripted provider. Current product capabilities are stated
   separately: configured live providers and optional persistent storage exist;
   external plugins remain unsupported.
@@ -119,6 +125,16 @@ default production configuration.
   delivery. The fake-call event interval is not isolated dispatch overhead, and
   internal queue high-water marks are not instrumented. The runs overlapped
   other work and are not a baseline.
+- A subsequent macOS release-mode opt-in test,
+  `cargo test --release -p nexus-runtime --lib measure_fake_tool_dispatch
+  --locked --offline -- --ignored --nocapture --test-threads=1`, instrumented
+  the blocking-worker submission and entry inside the test build. For 16
+  sequential fake tool calls in one run, submission-to-worker-entry p50/p95/max
+  were 4.375/6.500/6.500 µs; fake execution was 0.209/0.875/0.875 µs. These
+  are not independent process samples and include scheduler and probe effects;
+  they exclude earlier validation/policy, event delivery, and actual I/O. The
+  test-only hook is absent from production builds. Linux measurement and a
+  representative multi-run workload remain outstanding.
 - The release-mode integration test
   `backpressure::paused_receivers_measure_queue_peaks_at_approval_gate` passed
   on both platforms. With 1,500 alternating 64-byte fragments and both receivers
@@ -136,6 +152,85 @@ high-water, attributable dispatch overhead, first-interactive
 timing, and representative performance workloads remain open. Raw measurement
 records are held in the temporary validation environment and must be retained
 or reproduced before accepting a baseline.
+
+Following the history amendment, the macOS `nexus-session` suite passed 25 tests
+and all-target Clippy. `opening_a_clean_directory_reads_index_without_loading_session_bodies`
+checks that an invalid saved body is not decoded while opening a clean store,
+but is rejected when explicitly loaded. The separate
+`directory_transactions_recover_create_update_and_delete_without_loading_bodies`
+covers recovery cases. These tests do not prove absence of every filesystem read;
+the new test was subsequently included in the Linux workspace run below.
+
+### Subsequent Linux re-verification
+
+On a newly provisioned Ubuntu 26.04.1 x86_64 VM (Linux 7.0.0-38, 4 vCPUs,
+7.3 GiB RAM, ext4, Rust 1.99.0, Bubblewrap 0.11.1), the snapshot of commit
+`be006dd` plus the current `nexus-session` and `nexus-runtime` test changes
+passed `cargo +1.99.0 test --workspace --locked -- --test-threads=1` (2,615
+passed, 23 ignored); all-target workspace Clippy and formatting passed. The
+demo-feature TUI suite passed 567 tests with 12 ignored; its real PTY regression
+passed at 80x24, 120x32, and 174x40. Four ignored Linux Bubblewrap tests and
+the release-mode gated queue peak test also passed. The new session-body test
+was included in the workspace run.
+
+The release-mode `measure_fake_tool_dispatch` test recorded 16 sequential
+calls in a single run: submission-to-worker-entry p50/p95/max
+12.697/22.996/22.996 µs and fake execution 0.243/1.336/1.336 µs. These are
+instrumented observations, not independent runs or total dispatch cost; they
+exclude preceding validation/policy, event delivery, and real I/O. Repeated
+independent runs and an accepted reference methodology remain necessary.
+
+Two subsequently added, explicitly run Linux filesystem tests passed on ext4:
+`linux_replacements_preserve_user_xattrs_and_metadata` and
+`linux_replacement_refuses_unrepresentable_xattr_without_mutation`. They cover
+user xattrs, uid/gid/mode, and one fail-closed path, not ACLs or all metadata.
+Tools all-target Clippy passed after their addition. Raw logs are copied to the
+local temporary validation directory; the full workspace run preceded these
+two ignored test additions.
+
+After registering those filesystem tests, the default-feature workspace suite,
+all-target workspace Clippy and formatting were rerun on both platforms:
+Linux 2,615 passed/25 ignored; macOS 2,621 passed/19 ignored. The two Linux
+xattr tests remain explicitly ignored by default and were separately run as
+described above. These results do not run the complete optional/all-features
+suite and are not evidence for real providers or experimental containers.
+
+An attempted Linux cache-preparation run wrote `3` to `drop_caches` before
+each of 20 harness invocations. It is **invalid as cold-start evidence**:
+the PTY harness subsequently hashed the executable before spawning it, which
+read and potentially warmed the target. All 20 observed a composer response,
+but their timings must not be used as cold measurements. Cache preparation
+must happen after all harness reads of the target and still needs independent
+verification of cache state.
+
+An opt-in preparation hook was then run after harness provenance collection
+and before each target launch, using root to execute `sync` and write `3` to
+`drop_caches`. All 20 preparation commands succeeded and all 20 composer
+responses were observed. The target was launched as the unprivileged test
+user through `/usr/bin/setpriv`; spawn-to-response p50/p95/max were
+148.799/163.446/194.896 ms, including the privilege-drop launcher. The target
+SHA-256 was `34120443f45ec22dc59d685a6b9f94bae2a75e3e1b39d49c1390cbbcfc1f55c2`.
+`setpriv` and its dependencies execute after cache preparation, so this is not
+directly comparable to the previous direct launch. No independent cache-state
+probe was performed: report these as prepared-cache observations, not verified
+cold-start evidence. The observed p95 exceeds the proposed 100 ms gate.
+A subsequent warm-cache run with the same `setpriv` launcher observed 30/30
+composer responses, with p50/p95/max 60.855/62.599/74.125 ms. These are separate
+small samples, not an attribution of the difference to any single cause.
+
+On the same VM, an isolated tracefs instance filtered `sched_wakeup` by the
+TUI thread IDs present after the default release TUI's composer appeared. Three
+3-second idle samples observed 216, 227, and 226 events (72.0, 75.7, and
+75.3 events/s); no new TIDs were seen at the end of the sample and the trace
+overrun/dropped counters did not increase. This counts scheduler wakeup events
+for the observed TUI threads, not whole-system wakeups, all possible short-lived
+threads, or wakeups caused by the TUI. Tracefs filtering and sampling have
+overhead; no reference budget or before-change comparison was accepted.
+The reproducible `tools/perf/tracefs_wakeup.py` experiment was then run on the
+same VM against the default release TUI as the non-root test user. Three more
+3-second samples reported 226, 225, and 225 events (75.32, 74.99, and 74.99
+events/s), unchanged observed thread sets, unchanged loss counters, and removed
+its private tracefs instance. The same scope limitations apply.
 
 ### Functional test mapping
 

@@ -160,6 +160,41 @@ kernel, CPU, and build profile with every result. The purge command above
 is user-supplied; the harness enforces its exit status and timeout but
 does not require or embed `sudo`.
 
+## Readiness pre-launch preparation
+
+`readiness.py` hashes the executable and collects provenance before any sample.
+An external cache drop before starting the harness is therefore not a cold-start
+procedure. For an explicitly authorized, isolated environment, an optional
+trusted helper can run once per sample after all provenance reads and before
+target spawn:
+
+```sh
+python3 tools/perf/readiness.py /path/to/binary --runs 10 \
+  --prepare-arg=/path/to/trusted-helper --prepare-arg=argument --json results.json
+```
+
+Repeat `--prepare-arg=VALUE` for each argv element, including arguments starting
+with `-`. There is no shell interpretation; the helper is responsible for its
+own actions. Nothing is run by default and the harness does not automatically
+elevate privileges. Never include secrets in arguments: argv is recorded in JSON.
+Helper stdin, stdout and stderr are disconnected; failures retain status, exit
+code or launch error, and elapsed time, but not helper output. The positive
+finite `--prepare-timeout` defaults to 30 seconds, separately from target timing.
+An error, nonzero exit, or timeout skips that sample's target and produces
+`preparation-error`, a nonzero harness exit, and no readiness timing for it;
+subsequent samples are still attempted. Preparation time includes cleanup and
+is not included in spawn-to-ready timing.
+
+Helpers run in a new process group; on timeout the harness requests SIGKILL
+before reaping the direct child. After normal completion it does not signal the
+possibly recycled process group, and descendant termination is unverified. Escaped
+sessions, uninterruptible processes, and cleanup after abrupt harness termination
+are not guaranteed; use a trusted synchronous helper and independently clean up
+any escaped processes. Even exit zero **never verifies a cache reset**: JSON
+sets `cache_reset_verified` to false and cache state to unknown. Subsequent
+helper activity, filesystem access, other workloads, and the target itself can
+warm caches. Report these as user-prepared observations, not proven cold runs.
+
 ## PTY input response probe
 
 For an initially focused composer, the no-fixed-delay probe is:
@@ -210,6 +245,26 @@ inspect each run's `input_probe.status`. The older `--probe-input` sentinel
 probe remains available and cannot establish input handling. These probes
 are mutually exclusive and available only in ready mode. The harness inherits
 the target environment; isolate HOME and configuration yourself if needed.
+
+## Linux scheduler wakeup experiment
+
+`tracefs_wakeup.py` is an explicit root-only experiment for a dedicated Linux
+test VM and trusted target, not a general sandbox. It runs the target as the
+specified non-root account with a temporary home and working directory, and
+uses its own tracefs instance without changing global tracing settings:
+
+```sh
+sudo python3 tools/perf/tracefs_wakeup.py --user nexus-test \
+  --binary /absolute/path/to/nexus-tui --runs 3
+```
+
+It reports `sched_wakeup` events for the target TIDs observed after the composer
+frame, thread-set changes, trace loss counters, and cleanup. These are not
+whole-machine wakeups, wakeups caused by the target, or a census of threads
+that start and stop between snapshots. Temporary HOME and cwd do not confine
+the target's filesystem or network access; use a dedicated user and VM.
+Interruptions such as SIGKILL or machine failure can prevent cleanup. Results
+are not comparable to the readiness harness's unsupported wakeup field.
 
 ## Tests
 

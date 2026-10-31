@@ -106,7 +106,12 @@ pub struct Runtime {
     shared: Arc<Shared>,
 }
 
+#[cfg(test)]
+type DispatchSample = (RunId, CallId, StdInstant, StdInstant);
+
 struct Shared {
+    #[cfg(test)]
+    dispatch_probe: StdMutex<Option<std::sync::mpsc::Sender<DispatchSample>>>,
     local_reasoning: AtomicBool,
     diagnostic_writer: StdMutex<Option<Box<dyn std::io::Write + Send>>>,
     instructions: ModelInstructions,
@@ -695,6 +700,8 @@ impl Runtime {
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            dispatch_probe: StdMutex::new(None),
             local_reasoning: AtomicBool::new(false),
             diagnostic_writer: StdMutex::new(None),
             instructions,
@@ -3334,7 +3341,24 @@ impl Runtime {
                 current.dispatched = true;
             }
         }
-        let mut handle = tokio::task::spawn_blocking(move || tool.execute(&call, &context));
+        #[cfg(test)]
+        let probe = self
+            .shared
+            .dispatch_probe
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|sender| (sender, call.run().clone(), call.call().clone()));
+        #[cfg(test)]
+        let submitted = probe.as_ref().map(|_| StdInstant::now());
+        let mut handle = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some((sender, run, call_id)) = probe {
+                let entered = StdInstant::now();
+                let _ = sender.send((run, call_id, submitted.unwrap(), entered));
+            }
+            tool.execute(&call, &context)
+        });
         // The context retains the original deadline. A cooperative tool may
         // need bounded time to stop its work and report the actual effects.
         let cleanup_deadline = tool_deadline
@@ -5749,6 +5773,83 @@ mod tests {
             limits: Limits::m0_test(),
             policy: Policy::m0_test(),
             has_approval_handler: true,
+        }
+    }
+
+    // Run explicitly with --release --ignored --nocapture, without other load.
+    #[test]
+    #[ignore = "opt-in local dispatch measurement"]
+    fn measure_fake_tool_dispatch() {
+        struct MeasuredTool {
+            inner: FakeTool,
+            samples: std::sync::mpsc::Sender<(RunId, CallId, StdInstant, StdInstant)>,
+        }
+        impl ToolPort for MeasuredTool {
+            fn describe(&self) -> ToolSpec {
+                self.inner.describe()
+            }
+
+            fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+                let start = StdInstant::now();
+                let outcome = self.inner.execute(call, context);
+                let end = StdInstant::now();
+                self.samples
+                    .send((call.run().clone(), call.call().clone(), start, end))
+                    .unwrap();
+                outcome
+            }
+        }
+
+        const SAMPLES: usize = 16;
+        let candidates = (0..SAMPLES)
+            .map(|n| {
+                CallCandidate::new(
+                    format!("item-{n}"),
+                    format!("ref-{n}"),
+                    "host_read",
+                    r#"{"path":"src"}"#,
+                )
+                .unwrap()
+            })
+            .collect();
+        let provider = Arc::new(FakeProvider::new(vec![
+            FakeProvider::tool_turn(candidates),
+            FakeProvider::stop_turn("done"),
+        ]));
+        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::channel();
+        let (fake_tx, fake_rx) = std::sync::mpsc::channel();
+        let tool = Arc::new(MeasuredTool {
+            inner: FakeTool::succeeding("host_read", nexus_core::M0_REVISION),
+            samples: fake_tx,
+        });
+        let mut config = quick_config();
+        config.limits.max_tool_calls_per_run = SAMPLES as u32;
+        let (runtime, mut streams) =
+            Runtime::new(config, provider, vec![ToolRegistration::read(tool)]);
+        *runtime.shared.dispatch_probe.lock().unwrap() = Some(dispatch_tx);
+        test_rt().block_on(async {
+            assert_eq!(
+                runtime.submit(submit_cmd("dispatch-measure")).await.reply(),
+                CommandReply::Accepted
+            );
+            let (_, finished) =
+                collect_until_finished(&mut streams.data, &mut streams.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+        });
+        let dispatch: Vec<_> = dispatch_rx.try_iter().collect();
+        let fake: Vec<_> = fake_rx.try_iter().collect();
+        assert_eq!(dispatch.len(), SAMPLES);
+        assert_eq!(fake.len(), SAMPLES);
+        for (index, ((run, call, submitted, entered), (fake_run, fake_call, start, end))) in
+            dispatch.iter().zip(&fake).enumerate()
+        {
+            assert_eq!((run, call), (fake_run, fake_call));
+            assert!(*submitted <= *entered && *entered <= *start && *start <= *end);
+            println!(
+                "sample={index} run={run:?} call={call:?} submit_to_worker_ns={} fake_execute_ns={}",
+                entered.duration_since(*submitted).as_nanos(),
+                end.duration_since(*start).as_nanos()
+            );
         }
     }
 

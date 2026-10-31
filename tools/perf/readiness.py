@@ -33,8 +33,8 @@ Measured, in this harness's own vocabulary:
   is "skipped"/"unconfirmed"/"timeout" and no latency is fabricated.
 
 Honesty rules:
-- warm cache only: this harness never runs sudo, docker, installs, or
-  cache resets, and never claims cold-cache numbers.
+- No cache reset is verified or cold-cache numbers claimed. An optional
+  caller-supplied preparation command runs only when explicitly requested.
 - machine JSON evidence records source commit, Cargo.lock SHA-256, binary
   SHA-256, build profile, platform, uname, compiler, command, and
   user-supplied labels.
@@ -94,7 +94,7 @@ COMMAND_PROBE_MARKER = "Enter/Tab insert"
 COMMAND_ESCAPE_SETTLE = 0.35
 DEFAULT_CANCEL_EVIDENCE = ("run cancelled", "status: cancelled")
 ALT_SCREEN_SEQUENCE = "\x1b[?1049h"
-FAILURE_OUTCOMES = ("spawn-error", "ready-timeout", "run-timeout", "wait-error")
+FAILURE_OUTCOMES = ("preparation-error", "spawn-error", "ready-timeout", "run-timeout", "wait-error")
 POSIX_FORK = os.name == "posix" and hasattr(os, "fork") and hasattr(os, "wait4")
 PIPE_READ_SIZE = 65536
 MARKER_TAIL_BYTES = 65536
@@ -825,6 +825,47 @@ class RunConfig:
     header_marker: str = DEFAULT_HEADER_MARKER
     quit_keys: bytes = b"\x04"
     cancel_keys: bytes = b"\x03"
+    prepare_argv: tuple = ()
+    prepare_timeout: float = 30.0
+
+
+def prepare_sample(argv, timeout):
+    """Run caller-supplied argv without a shell; discard output and bound cleanup."""
+    started = time.monotonic_ns()
+    result = {"argv": list(argv), "status": "error", "elapsed_ms": None,
+              "exit_code": None, "error": None, "cleanup": "not-started"}
+    process = None
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            result["exit_code"] = process.wait(timeout=timeout)
+            result["status"] = "ok" if result["exit_code"] == 0 else "nonzero"
+            result["cleanup"] = "leader-reaped; descendants-unverified"
+        except subprocess.TimeoutExpired:
+            result["status"] = "timeout"
+            # The unreaped leader still reserves its PID, so the process group
+            # cannot have been recycled for an unrelated process.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                result["cleanup"] = "group-sigkill-requested"
+            except ProcessLookupError:
+                result["cleanup"] = "group-not-found"
+            except OSError as exc:
+                result["cleanup"] = f"group-signal-error: {exc}"
+                result["status"] = "error"
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                result["cleanup"] += "; direct-child-unreaped"
+                result["status"] = "error"
+    except (OSError, ValueError) as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        if process is not None:
+            result["cleanup"] = "unverified-after-wait-error"
+    finally:
+        result["elapsed_ms"] = (time.monotonic_ns() - started) / 1e6
+    return result
 
 
 def _context_switch_delta(first, second):
@@ -863,6 +904,12 @@ def run_measurement(cfg, argv, run_index=0):
         "capture": None,
         "outcome": "ok",
     }
+    if cfg.prepare_argv:
+        result["preparation"] = prepare_sample(cfg.prepare_argv, cfg.prepare_timeout)
+        if result["preparation"]["status"] != "ok":
+            result["spawn"] = {"status": "not-attempted", "error": None}
+            result["outcome"] = "preparation-error"
+            return result
     try:
         target = spawn_pty(argv, cols=cfg.cols, rows=cfg.rows)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1460,10 +1507,14 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description=(
             "Observe PTY frame readiness, idle CPU/RSS, and external cancellation "
-            "for an unmodified target (stdlib only; warm cache; no privileged actions)."
+            "for an unmodified target (stdlib only; optional caller-supplied preparation)."
         )
     )
     parser.add_argument("binary", help="Path to the target binary (or interpreter).")
+    parser.add_argument("--prepare-arg", action="append", metavar="ARG",
+                        help="Preparation argv element; repeat in order (no shell).")
+    parser.add_argument("--prepare-timeout", type=positive_seconds, default=30.0,
+                        help="Per-sample preparation timeout in seconds (default: 30).")
     parser.add_argument(
         "--mode",
         choices=["ready", "idle", "cancel"],
@@ -1638,6 +1689,8 @@ def main(argv=None):
         own, binary_args = raw, []
     parser = build_parser()
     args = parser.parse_args(own)
+    if args.prepare_arg and not args.prepare_arg[0]:
+        parser.error("the preparation executable must not be empty")
     if args.probe_input and args.mode != "ready":
         parser.error("--probe-input is only supported with --mode ready")
     if args.probe_command and (args.mode != "ready" or args.probe_input):
@@ -1677,6 +1730,8 @@ def main(argv=None):
         header_marker=args.header_marker,
         quit_keys=args.quit_hex,
         cancel_keys=args.cancel_hex,
+        prepare_argv=tuple(args.prepare_arg or ()),
+        prepare_timeout=args.prepare_timeout,
     )
     command = [args.binary] + binary_args
     evidence_binary = (
@@ -1689,6 +1744,14 @@ def main(argv=None):
         provenance = collect_provenance(args.lockfile)
         for key in ("lockfile", "lockfile_sha256"):
             methodology[key] = provenance[key]
+    methodology["cache_reset_verified"] = False
+    if cfg.prepare_argv:
+        methodology["cache_state"] = "unknown"
+        methodology["cache_note"] = "user-supplied preparation; cache reset never verified"
+        methodology["cold_measurements"] = "not verified"
+        methodology["preparation"] = {"argv": list(cfg.prepare_argv),
+                                      "timeout_s": cfg.prepare_timeout,
+                                      "method": "direct argv execution without shell, once per sample"}
     runs = [run_measurement(cfg, command, index) for index in range(runs_requested)]
     record = {
         "schema": SCHEMA,
@@ -1728,8 +1791,8 @@ def main(argv=None):
         print(
             f"[{cfg.mode}] run {run['run_index'] + 1}/{runs_requested} "
             f"{ready_text} outcome={run['outcome']} "
-            f"capture={run['capture']['retained_bytes']}B "
-            f"dropped={run['capture']['dropped_bytes']}B",
+            f"capture={run['capture']['retained_bytes'] if run['capture'] else 0}B "
+            f"dropped={run['capture']['dropped_bytes'] if run['capture'] else 0}B",
             file=report_stream,
         )
         if run["idle"] is not None:

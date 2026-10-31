@@ -31,6 +31,15 @@ exec failures, container networking, and M0 performance baselines still need
 their respective targeted evidence. The M1.4 escaped-descendant limitation
 remains unresolved; no full Linux security or M0–M4 acceptance is claimed.
 
+Later on 2026-10-31, a fresh Ubuntu 26.04.1 x86_64 VM with ext4 and Bubblewrap
+0.11.1 reran the current workspace and the four required-backend sandbox tests
+as an unprivileged user. Two additional Linux filesystem acceptance tests
+verified preservation of user xattrs, uid/gid, and mode through write/patch,
+and refusal without mutation for a non-UTF-8 xattr name. The filesystem tests
+were run explicitly after the workspace run; tools all-target Clippy passed.
+These checks do not establish ACL preservation, all inode flags, complete
+filesystem race guarantees, or descendant cleanup. M1.4 remains open.
+
 ## Goal and scope
 
 Fix execution-contract and lifecycle defects first, then reduce duplicated ownership and implicit contracts without adding a framework. Preserve the existing crate graph, synchronous provider/tool ports where practical, one authoritative runtime execution path, and the working frontend behavior.
