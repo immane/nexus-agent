@@ -545,6 +545,7 @@ validation of every subsequent revision.
 - [ ] Universal live compatibility is not established; individual services/models need their own evidence. Gemini native APIs are not implemented.
 - [ ] **M5.2, deferred:** External tool transport/plugins and their bounded lifecycle/trust contract.
 - [ ] **M5.3, deferred:** HTTP/TLS transport replacement evaluation; the current OpenSSL bridge remains in use.
+- [ ] **M5.4, deferred from M0:** macOS cold-cache interactive startup evidence, using an authorized isolated environment and accepted methodology. Warm-cache results do not establish cold performance.
 
 ### Additional delivered capabilities
 

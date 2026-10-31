@@ -6,6 +6,29 @@ complete buffer-limit evidence, and accepted P7 reference methodology and
 measurements remain open. Historical RSS evidence is confounded and must not be
 promoted to a baseline.
 
+**Owner-approved scope adjustment, 2026-11-01:** macOS cold-cache startup
+measurement is deferred from M0 acceptance to M5; it remains unverified and is
+not a passing result. This does not defer Linux cold-cache evidence, macOS or
+Linux warm-cache interactive startup, reference-method acceptance, or any other
+M0 buffer, startup-side-effect, or performance requirement.
+
+## Acceptance decision — 2026-11-01
+
+**Not accepted.** The macOS cold-cache deferral is in effect and is not a
+remaining M0 blocker. The following independent gates remain open:
+
+| Gate | Current evidence | Remaining requirement |
+| --- | --- | --- |
+| Buffer bounds and visible loss | Data-channel/frontend tests and synthetic control-outbox count/byte saturation, including finalized snapshot checks | Whole-run high-water evidence and visibility for the remaining retention and control-delivery paths |
+| Startup side effects | Isolated PTY tests on both platforms; Linux file/network/process traces for one normal and two corrupt-metadata cases | Sufficient evidence for the other startup/recovery and credential-access paths, including macOS |
+| P7 reference and measurements | Two-platform warm composer observations, limited queue/dispatch and idle observations | Accepted reference environments and methodology; verified Linux cold-cache startup and remaining representative resource, throughput and buffer measurements |
+
+Default workspace tests, Clippy and format checks were last run on both
+platforms before the latest runtime **test-only** additions; the affected
+runtime suite and Clippy were then rerun on both. This evidence is not a
+full optional-feature run or a production security certification. A passing
+warm-cache sample is not a cold-cache result or an accepted baseline.
+
 ## Per-Stage Exit Criteria
 
 - P0: accepted M0 semantic subset recorded; deferred items listed; no code reviewed against unaccepted semantics.
@@ -32,6 +55,34 @@ submission until the previous terminal has been applied and checked. Separate
 tests exercise real bounded-channel saturation and the non-truncated case.
 This does not establish that every other buffer or control-delivery failure is
 visible in every frontend, so the broader buffer checklist remains open.
+On macOS, `runtime::tests::control_outbox_exhaustion_still_reserves_and_delivers_terminal`
+also verifies the outbox's accounted bytes after every buffered usage event and
+at the 256-event peak, including the reserved terminal. Its accounting stays
+within the 1,048,576-byte budget and the terminal is delivered after draining.
+This is a deterministic synthetic saturation case, not a measurement of actual
+heap consumption, every payload shape, or the high-water mark over a full run.
+The updated count-saturation assertion and runtime suite passed on both macOS
+and Linux. A further synthetic test uses maximum-size tool outcomes to exhaust
+the byte budget before the event-count limit, then verifies that the reserved
+terminal is retained and delivered in sequence. The updated default runtime
+suite passed 377 tests with 2 skipped or ignored on each platform, and runtime
+all-target Clippy passed on both; the workspace format check passed on macOS.
+
+Control-delivery evidence remains layered rather than end-to-end for every
+consumer: the outbox saturation tests inject events directly into the transport;
+`control_budget_exhaustion_marks_active_snapshot_truncated` checks the active
+snapshot separately. On Linux and macOS, `control_byte_exhaustion_is_visible_in_finalized_run_snapshot`
+pauses a provider and injects synthetic control events into a live run; it
+verifies byte exhaustion, a `LimitReached` terminal, and a finalized snapshot
+marked truncated. This does not establish that a normal tool workload generates
+the same pressure or that a frontend displays it. The updated runtime suite
+passed 378 tests with 2 skipped or ignored, all-target Clippy and formatting
+passed on each platform. Runtime integration tests in `cov_topup` also establish that
+control-consumer disconnection is reflected in finalized snapshots. Server snapshot
+JSON exposes `content_truncated`, and `json_encoding` checks both flag values;
+the existing HTTP flow checks the untruncated case. SSE clients must request the
+snapshot themselves; no end-to-end HTTP/SSE test currently proves visibility of
+an outbox-exhaustion truncation. These observations do not close the buffer gate.
 The TUI now also retains a session-level incompleteness summary for frontend
 merge gaps or rejected presentation events, waits for both event channels to
 close, and initiates cancellation of active sessions concurrently before
@@ -52,12 +103,31 @@ an invalid, sentinel-bearing saved body. Startup succeeded without displaying
 the sentinel or opening the credential FIFO. This covers that clean-start case;
 it does not prove that no low-level file reads occur or cover every recovery
 and terminal failure path.
+On the Linux VM, the same isolated historical-body fixture was additionally run
+against a default debug TUI under `strace -f -e trace=%file,%network,%process`,
+from process launch through roughly one second after the first frame. The trace
+contained no calls naming the synthetic credential FIFO or historical body, no
+`connect`/network socket calls, and no additional exec or process creation. It
+did contain one `AF_UNIX` socketpair, plus expected index and lock-file access.
+The trace and fixture cover this successful startup only, not environment reads,
+other recovery/failure paths, macOS, or all possible indirect file access.
+That fixture does not set `PATH`, so it does not exercise an available `bwrap`.
+A later Linux trace with the normal VM PATH did observe the default TUI launching
+`bwrap` and `/usr/bin/true` for the exec-sandbox initialization probe before
+the first composer frame. This is an OS-sandbox probe, not an external plugin,
+but it is startup process activity and is outside the earlier no-process fixture.
 `startup_failure::corrupt_session_metadata_fails_without_recovery_or_provider_access`
 also passed on both platforms for corrupt index and journal fixtures: startup
 failed explicitly, kept the staged and saved fixture files intact, and the
 credential FIFO/loopback listener observed no access. FIFO polling cannot rule
 out every short nonblocking open; other startup failures and destinations are
 not covered by those fixtures.
+The two Linux corrupt-index/journal fixtures were also traced with
+`strace -f -e trace=%file,%network,%process`. Both failed as expected; neither
+trace named the synthetic credential FIFO or saved body, nor contained a socket,
+connect, additional exec, or clone call. This strengthens only these failure
+fixtures and does not establish absence of environment reads or cover other
+startup paths. The raw synthetic trace logs are retained with the Linux evidence.
 
 After these frontend changes, the serialized default workspace suite, all-target
 workspace Clippy and formatting passed on both platforms: Linux 2,620 passed,
@@ -89,6 +159,25 @@ passed. An earlier overlapping pair of Cargo sequences caused PTY failures
 when a default binary replaced the demo binary; those failed runs are not used
 as evidence. This does not include the optional/all-features suite.
 
+On 2026-11-01, a rebuilt default-feature release TUI was measured on macOS in
+an isolated HOME and config environment, with no cache purge. All 30 composer
+probes observed a response; spawn-to-response p50/p95/max were
+64.381/86.575/171.700 ms. All 30 cleanup sequences escalated beyond the quit
+key after the input probe; the numbers do not validate graceful exit. The
+observation and cache-method limitations below remain, and reference hardware
+and methodology have not been accepted. A preceding run with inherited user
+environment did not reach the composer and is invalid, not a performance pass.
+The corresponding isolated Linux run observed 30/30 responses with
+spawn-to-response p50/p95/max 59.169/60.859/61.046 ms; its 30 cleanup sequences
+also escalated after the default quit key. Both runs are warm-cache observations,
+not accepted reference or cold measurements. The performance harness's Python
+unittest suite passed 278 tests with one
+skipped on macOS; this is harness coverage, not performance acceptance.
+The harness default quit key is Ctrl+D, which is not the TUI's quit sequence.
+A separate three-sample probe on each platform used `--quit-hex 0303` to clear
+the probe draft and then quit with Ctrl+C; all six exited zero without cleanup
+escalation. These small samples check that cleanup path, not startup percentiles.
+
 Before the later closed-stream change, the default-feature release TUI was
 measured with the
 warm-cache composer probe: all 30 samples produced observed responses on each
@@ -103,6 +192,35 @@ the unprivileged `setpriv` launcher: p50/p95/max were
 all samples, but cache state was not independently verified; these are not
 directly comparable to the direct-launch warm samples or a proven cold baseline.
 
+On 2026-11-01, a further Linux default-release run used an isolated HOME,
+`sync` plus VM-wide `drop_caches` before each launch, then checked the target
+executable with `mincore` without touching its mapped pages. All 20 preparations
+reported zero resident pages out of 1,445 immediately after preparation, and
+20/20 composer responses were observed. Spawn-to-response p50/p95/max were
+148.954/155.225/168.831 ms, including `/usr/bin/setpriv` to launch as the
+unprivileged user; all runs exited normally with the explicit Ctrl+C sequence.
+The target SHA-256 was
+`297019f1010281e85be8e2aaab33405aad504202c8913a56430adaec78663b6b`.
+The probe verifies only that file's reported page residency at that instant,
+not dynamic libraries, filesystem metadata, subsequent cache activity, or a
+genuinely cold full system. The helper and `setpriv` may warm dependencies.
+This is not an accepted reference baseline; the observed p95 exceeds the
+proposed 100 ms regression gate and must not be reported as passing it.
+
+For a same-launcher warm comparison, 20/20 observations using `setpriv` and the
+same isolated environment yielded spawn-to-response p50/p95/max
+61.224/63.841/65.269 ms; these separate batches are observational, not an
+accepted controlled baseline. One subsequent prepared-cache `strace -f -ttt
+-T` run including terminal writes observed `setpriv` exec at 1793467341.594520,
+TUI exec at 1793467341.646370, sandbox-probe `bwrap` exec at 1793467341.757601,
+successful probe reap at 1793467341.821216, and composer-frame output at
+1793467341.824875. Thus this traced run confirms probe ordering, not the probe's
+untraced cost: tracing and privilege handling materially alter timings. The
+TUI input poll is 20 ms and the observed probe-write-to-screen response was
+roughly 39–40 ms in these samples, but those observations do not independently
+attribute delay to input polling or drawing. Raw synthetic traces and samples
+are retained with the Linux evidence.
+
 - [x] One model/tool/model cycle completes with fake integrations.
 - [x] Read-like fake calls proceed under scoped policy; mutation/command-like calls require approval or headless denial.
 - [x] Cancellation stops dispatch, reports uncertain effects honestly, and never claims rollback.
@@ -112,7 +230,7 @@ directly comparable to the direct-launch warm samples or a proven cold baseline.
   no network, credentials, plugin processes, or automatic conversation restore.
   A bounded session metadata index and unfinished-transaction recovery are
   allowed by the 2026-10-31 history amendment; recovery may access the affected
-  session body. Credential access remains unverified and was not waived.
+session body. Credential access remains unverified and was not waived.
 - [x] TUI and headless paths share one runtime and policy boundary.
 - [x] Linux and macOS validation recorded separately.
 - [x] Limitations of the M0 fake validation path are documented, including its
@@ -226,8 +344,16 @@ default production configuration.
   `backpressure::paused_receivers_measure_queue_peaks_at_approval_gate` passed
   on both platforms. With 1,500 alternating 64-byte fragments and both receivers
   paused until the approval gate, it observed receiver queue peaks of 1,024 data
-  events and 5 control events. This is an exact peak for that gated phase only;
-  it excludes the internal control outbox and all later run phases.
+   events and 5 control events. This is an exact peak for that gated phase only;
+   it excludes the internal control outbox and all later run phases.
+- Subsequent Linux and macOS debug-mode runs of the same workload assert that its data
+  receiver reaches its fixed 1,024-event capacity before approval. Since that
+  bounded channel cannot exceed its capacity, 1,024 is also the exact data
+  receiver event-count peak for this complete run, not merely the gated phase.
+  The control receiver's five-event observation remains limited to the gated
+  phase; the internal outbox and other workloads are not measured. The Linux
+  integration package and all-target Clippy passed on both platforms; macOS
+  nextest reported 154 passed and one skipped. Formatting passed on macOS.
 
 The cache was not purged or independently verified as cold. TUI startup now
 defers credential resolution until run submission. Isolated PTY tests cover
@@ -240,7 +366,8 @@ timing, and representative performance workloads remain open. Raw measurement
 records are held in the temporary validation environment and must be retained
 or reproduced before accepting a baseline.
 The owner declined a macOS system-cache purge during this review; macOS cold
-startup remains unverified and must not be inferred from warm observations.
+startup remains unverified, is deferred to M5, and must not be inferred from
+warm observations.
 
 Following the history amendment, the macOS `nexus-session` suite passed 25 tests
 and all-target Clippy. `opening_a_clean_directory_reads_index_without_loading_session_bodies`

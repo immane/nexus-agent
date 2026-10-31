@@ -32,7 +32,7 @@ Re-run the profiles and validation plan below once the implementation stabilizes
 | Coding TUI | Shipped coding tools, provider adapters, and terminal setup |
 | External plugin enabled | Host overhead plus startup, idle, and peak usage of the plugin process tree |
 
-Report both warm-cache fresh-process startup and genuinely cold-cache measurements. A new process does not imply a cold filesystem cache. Document cache preparation rather than silently using privileged cache resets.
+Report both warm-cache fresh-process startup and genuinely cold-cache measurements. A new process does not imply a cold filesystem cache. Document cache preparation rather than silently using privileged cache resets. **Owner-approved M0 scope adjustment (2026-11-01):** macOS cold-cache measurement is deferred to M5 and remains unverified; Linux cold-cache evidence and both platforms' warm-cache interactive measurements remain in M0. This does not waive reference-method acceptance or the first-release startup target.
 
 ## Required Metrics
 

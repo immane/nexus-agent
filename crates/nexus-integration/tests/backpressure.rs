@@ -13,8 +13,8 @@ use nexus_core::{
 };
 use nexus_fakes::{FakeTool, stop_turn};
 
-/// Exact receiver-queue peaks from submission until the first approval gate,
-/// not peaks for the remainder of the run or for the internal control outbox.
+/// The data queue reaches its capacity before approval, establishing its exact
+/// whole-run peak; the control observation covers only the first gated phase.
 #[test]
 fn paused_receivers_measure_queue_peaks_at_approval_gate() {
     const FRAGMENTS: usize = 1_500;
@@ -59,11 +59,11 @@ fn paused_receivers_measure_queue_peaks_at_approval_gate() {
         while let Ok(event) = bed.control.try_recv() { control.push(event); }
         assert_eq!(data.len(), data_peak);
         assert_eq!(control.len(), control_peak);
-        assert!(data_peak > 0);
+        assert_eq!(data_peak, bed.data.max_capacity());
         let (approval, call) = common::find_approval(&control)
             .expect("approval notice delivered before measurement");
         println!("workload: fragments={FRAGMENTS} bytes_per_fragment=64 alternating_items=2 approval_gate=1 paused_data_and_control=true");
-        println!("receiver_queue_peak_until_approval: data={data_peak} control={control_peak}; excludes control outbox and later run phases");
+        println!("data_receiver_peak_whole_run={data_peak} (reached channel capacity); control_receiver_peak_until_approval={control_peak}; excludes control outbox");
 
         assert_eq!(bed.runtime.deny(DenyCommand {
             request: RequestId::new("req-queue-peak-deny").expect("valid"),
