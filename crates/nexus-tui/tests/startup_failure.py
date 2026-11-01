@@ -1,4 +1,4 @@
-"""Exercise corrupt metadata using only isolated files and a loopback listener."""
+"""Exercise corrupt metadata and recovery with isolated files and a listener."""
 
 import errno
 import fcntl
@@ -6,6 +6,7 @@ import json
 import os
 import pty
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -15,7 +16,7 @@ import termios
 import time
 
 
-def check(binary, corrupt_index):
+def check(binary, corrupt_index, recovery=None):
     with tempfile.TemporaryDirectory(prefix="nexus-startup-failure-") as root:
         home = os.path.join(root, "home")
         state = os.path.join(root, "state")
@@ -38,6 +39,16 @@ def check(binary, corrupt_index):
             staging: b"staging sentinel: do not publish or discard",
             body: b"historical body sentinel: do not restore",
         }
+        if recovery is not None:
+            entries = [] if recovery == "create" else [{"session": "history", "logical_revision": 1}]
+            fixtures[index] = json.dumps({"revision": 1, "sessions": entries}).encode()
+            fixtures[journal] = json.dumps({
+                "session": "history", "revision": None if recovery == "delete" else 2,
+            }).encode()
+            if recovery == "create":
+                del fixtures[body]
+            if recovery == "delete":
+                del fixtures[staging]
         for path, contents in fixtures.items():
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as file:
@@ -69,11 +80,12 @@ def check(binary, corrupt_index):
             try:
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 32, 120, 0, 0))
                 proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave,
-                                        env=env, cwd=root)
+                                        env=env, cwd=root, start_new_session=True)
                 os.close(slave)
                 slave = None
                 output = b""
                 deadline = time.monotonic() + 15
+                observed_frame_at = None
                 while True:
                     try:
                         writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
@@ -92,9 +104,33 @@ def check(binary, corrupt_index):
                                 raise
                             chunk = b""
                         output += chunk
+                    if recovery is not None and b"\x1b[?25l" in output:
+                        if observed_frame_at is None:
+                            observed_frame_at = time.monotonic()
+                        assert proc.poll() is None, ("recovered startup exited", output)
+                        if time.monotonic() - observed_frame_at >= 1:
+                            break
                     if proc.poll() is not None and (master not in ready or not chunk):
                         break
                     assert time.monotonic() < deadline, ("startup timed out", output)
+                if recovery is not None:
+                    assert observed_frame_at is not None, ("no recovered startup frame", output)
+                    assert b"historical body sentinel" not in output, output
+                    assert b"staging sentinel" not in output, output
+                    assert not os.path.exists(journal), "recovery journal remains"
+                    assert not os.path.exists(staging), "staged body was not consumed"
+                    with open(index, "r", encoding="utf-8") as file:
+                        assert json.load(file) == {"revision": 1, "sessions": (
+                            [] if recovery == "delete" else [{"session": "history", "logical_revision": 2}]
+                        )}
+                    if recovery == "delete":
+                        assert not os.path.exists(body), "deleted body remains"
+                        assert not os.listdir(bodies)
+                    else:
+                        with open(body, "rb") as file:
+                            assert file.read() == fixtures[staging], "staged body changed"
+                        assert os.listdir(bodies) == [os.path.basename(body)]
+                    return
                 assert proc.returncode != 0, ("startup unexpectedly succeeded", output)
                 expected = b"session index is invalid" if corrupt_index else b"session transaction is invalid"
                 assert expected in output, (expected, output)
@@ -108,14 +144,25 @@ def check(binary, corrupt_index):
                 if slave is not None:
                     os.close(slave)
                 if proc is not None and proc.poll() is None:
-                    proc.terminate()
+                    # Also stop a traced target when a wrapper owns the child PID.
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     try:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         proc.wait(timeout=5)
                 os.close(master)
 
 
-for corrupt_index in (True, False):
-    check(sys.argv[1], corrupt_index)
+if sys.argv[2:] == ["--recover"]:
+    for recovery in ("create", "update", "delete"):
+        check(sys.argv[1], False, recovery)
+else:
+    for corrupt_index in (True, False):
+        check(sys.argv[1], corrupt_index)

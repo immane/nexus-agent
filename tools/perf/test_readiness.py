@@ -523,6 +523,9 @@ class IdleTests(PtyTestCase):
         self.assertIsNotNone(idle["idle_cpu_percent"])
         self.assertGreaterEqual(idle["idle_cpu_percent"], 0.0)
         self.assertEqual(idle["wakeups"]["status"], "unsupported")
+        self.assertGreater(idle["rss_samples"], 0)
+        self.assertLessEqual(idle["rss_min_sampled_bytes"], idle["rss_median_sampled_bytes"])
+        self.assertLessEqual(idle["rss_median_sampled_bytes"], idle["rss_max_sampled_bytes"])
         self.assertGreater(result["resources"]["ru_maxrss"], 0)
 
     def test_rss_high_water_from_wait4(self):

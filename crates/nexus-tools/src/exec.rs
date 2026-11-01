@@ -3,6 +3,7 @@
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +26,7 @@ const EXEC_SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"arra
 pub struct SandboxedExecutor {
     root: PathBuf,
     backend: Backend,
+    probe: OnceLock<Result<(), SandboxFailure>>,
     spec: ToolSpec,
     development: Option<nexus_permissions::DirectoryPolicy>,
     path: std::ffi::OsString,
@@ -60,9 +62,7 @@ impl SandboxFailure {
 
 impl SandboxedExecutor {
     pub fn with_root(root: &Path) -> Result<Self, nexus_core::AgentError> {
-        let mut executor = Self::unprobed(root)?;
-        executor.probe();
-        Ok(executor)
+        Self::unprobed(root)
     }
 
     fn unprobed(root: &Path) -> Result<Self, nexus_core::AgentError> {
@@ -81,6 +81,7 @@ impl SandboxedExecutor {
         Ok(Self {
             root,
             backend,
+            probe: OnceLock::new(),
             spec,
             development: None,
             path: "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
@@ -100,81 +101,83 @@ impl SandboxedExecutor {
             "Run argv in the development OS sandbox, no shell or network. Project and temporary writes are automatic; declare write_dir to request an external writable directory. Other files are broadly readable except protected paths.",
             r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"write_dir":{"type":"string","minLength":1}},"required":["argv"],"additionalProperties":false}"#)
             .map_err(|_| error(ErrorCategory::Internal, "exec description is invalid"))?;
-        executor.probe();
         Ok(executor)
     }
 
     // Verify only the selected profile. No fallback to another mode or to
     // unsandboxed execution if isolation fails.
-    fn probe(&mut self) {
-        if self.sandbox_available() {
-            let Some(probe_slot) = ProbeSlot::acquire() else {
-                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
-                return;
-            };
-            let mut probe_slot = Some(probe_slot);
-            let mut probe = self.command(&["/usr/bin/true"], None);
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                probe.process_group(0);
-            }
-            self.configure_environment(&mut probe);
-            match probe
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let deadline = Instant::now() + PROBE_TIMEOUT;
-                    loop {
-                        match child.try_wait() {
-                            Ok(Some(status)) if status.success() => {
-                                drop(probe_slot.take());
-                                break;
-                            }
-                            Ok(Some(_)) => {
-                                drop(probe_slot.take());
-                                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
-                                break;
-                            }
-                            Err(_) => {
-                                terminate_process_group(&mut child);
-                                let slot = probe_slot.take().expect("probe slot is owned");
-                                thread::spawn(move || {
-                                    let _slot = slot;
-                                    retain_probe_child_until_reaped(child);
-                                });
-                                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
-                                break;
-                            }
-                            Ok(None) if Instant::now() < deadline => {
-                                thread::sleep(Duration::from_millis(10))
-                            }
-                            Ok(None) => {
-                                terminate_process_group(&mut child);
-                                if wait_bounded(&mut child, CLEANUP_GRACE).is_none() {
+    fn probe(&self) -> Result<(), SandboxFailure> {
+        if let Backend::Unavailable(reason) = self.backend {
+            return Err(reason);
+        }
+        self.probe
+            .get_or_init(|| {
+                let Some(probe_slot) = ProbeSlot::acquire() else {
+                    return Err(SandboxFailure::ProbeFailed);
+                };
+                let mut probe_slot = Some(probe_slot);
+                let mut probe = self.command(&["/usr/bin/true"], None);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    probe.process_group(0);
+                }
+                self.configure_environment(&mut probe);
+                match probe
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        let deadline = Instant::now() + PROBE_TIMEOUT;
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(status)) if status.success() => {
+                                    drop(probe_slot.take());
+                                    return Ok(());
+                                }
+                                Ok(Some(_)) => {
+                                    drop(probe_slot.take());
+                                    return Err(SandboxFailure::ProbeFailed);
+                                }
+                                Err(_) => {
+                                    terminate_process_group(&mut child);
                                     let slot = probe_slot.take().expect("probe slot is owned");
                                     thread::spawn(move || {
                                         let _slot = slot;
                                         retain_probe_child_until_reaped(child);
                                     });
-                                } else {
-                                    drop(probe_slot.take());
+                                    return Err(SandboxFailure::ProbeFailed);
                                 }
-                                self.backend = Backend::Unavailable(SandboxFailure::ProbeFailed);
-                                break;
+                                Ok(None) if Instant::now() < deadline => {
+                                    thread::sleep(Duration::from_millis(10))
+                                }
+                                Ok(None) => {
+                                    terminate_process_group(&mut child);
+                                    if wait_bounded(&mut child, CLEANUP_GRACE).is_none() {
+                                        let slot = probe_slot.take().expect("probe slot is owned");
+                                        thread::spawn(move || {
+                                            let _slot = slot;
+                                            retain_probe_child_until_reaped(child);
+                                        });
+                                    } else {
+                                        drop(probe_slot.take());
+                                    }
+                                    return Err(SandboxFailure::ProbeFailed);
+                                }
                             }
                         }
                     }
+                    Err(_) => {
+                        drop(probe_slot.take());
+                        Err(SandboxFailure::LaunchFailed)
+                    }
                 }
-                Err(_) => {
-                    drop(probe_slot.take());
-                    self.backend = Backend::Unavailable(SandboxFailure::LaunchFailed);
-                }
-            }
-        }
+            })
+            .as_ref()
+            .map(|_| ())
+            .map_err(|reason| *reason)
     }
 
     fn configure_environment(&self, command: &mut Command) {
@@ -188,9 +191,10 @@ impl SandboxedExecutor {
         }
     }
 
+    /// Checks sandbox availability, running the initialization probe on first use.
     #[must_use]
     pub fn sandbox_available(&self) -> bool {
-        !matches!(self.backend, Backend::Unavailable(_))
+        self.probe().is_ok()
     }
 
     fn run(&self, call: &ToolCall, context: &ToolContext) -> Result<(String, bool), Failure> {
@@ -247,6 +251,14 @@ impl SandboxedExecutor {
             }
             None
         };
+        self.probe().map_err(Failure::Unavailable)?;
+        context.check_active().map_err(|_| {
+            if context.is_cancelled() {
+                Failure::Cancelled
+            } else {
+                Failure::TimedOut
+            }
+        })?;
         let mut command = self.command(&strings, write_dir.as_deref());
         #[cfg(unix)]
         {
@@ -815,9 +827,211 @@ impl ToolPort for SandboxedExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapturedOutput, abort_unreadable_pipes, cleanup_complete, drain_pipe};
+    use super::{
+        CapturedOutput, SandboxedExecutor, abort_unreadable_pipes, cleanup_complete, drain_pipe,
+    };
     use std::io::{self, Cursor, Read};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn executor_construction_defers_sandbox_probe() {
+        let root = std::env::temp_dir().join(format!(
+            "nexus-exec-lazy-probe-{}-{}",
+            std::process::id(),
+            TEST_ROOTS.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("test root is created");
+        let executor = SandboxedExecutor::with_root(&root).expect("valid test root");
+        assert!(executor.probe.get().is_none());
+        drop(executor);
+        std::fs::remove_dir_all(&root).expect("test root is removed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_probe_failure_is_cached_and_fails_closed() {
+        use super::{Backend, SandboxFailure};
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!(
+            "nexus-exec-probe-failure-{}-{}",
+            std::process::id(),
+            TEST_ROOTS.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let program = root.join("fake-bwrap");
+        let marker = root.join("probes");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho probe >> '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut executor = SandboxedExecutor::with_root(&root).unwrap();
+        executor.backend = Backend::Linux(program);
+        let executor = Arc::new(executor);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let executor = Arc::clone(&executor);
+                scope.spawn(move || {
+                    assert!(matches!(executor.probe(), Err(SandboxFailure::ProbeFailed)))
+                });
+            }
+        });
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        assert!(!executor.sandbox_available());
+        drop(executor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_timeout_is_cached_and_child_is_stopped() {
+        use super::{Backend, SandboxFailure};
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "nexus-exec-probe-timeout-{}-{}",
+            std::process::id(),
+            TEST_ROOTS.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let program = root.join("fake-bwrap");
+        let marker = root.join("finished");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n/bin/sleep 3\n/usr/bin/touch '{}'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut executor = SandboxedExecutor::with_root(&root).unwrap();
+        executor.backend = Backend::Linux(program);
+        assert!(matches!(executor.probe(), Err(SandboxFailure::ProbeFailed)));
+        assert!(!executor.sandbox_available());
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deadline_during_probe_prevents_command_spawn() {
+        use super::Backend;
+        use nexus_core::{
+            ApprovedScope, CallId, CancellationToken, ExecutionStatus, M0_REVISION, NormalizedArgs,
+            RunId, ToolCall, ToolContext, ToolId, ToolPort, TurnId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "nexus-exec-probe-deadline-{}-{}",
+            std::process::id(),
+            TEST_ROOTS.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let program = root.join("fake-bwrap");
+        let marker = root.join("launches");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho launch >> '{}'\n/bin/sleep 0.3\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut executor = SandboxedExecutor::with_root(&root).unwrap();
+        executor.backend = Backend::Linux(program);
+        let call = ToolCall::new(
+            RunId::new("run").unwrap(),
+            TurnId::new("turn").unwrap(),
+            CallId::new("call").unwrap(),
+            ToolId::new("host_exec", M0_REVISION).unwrap(),
+            NormalizedArgs::new(r#"{"argv":["/usr/bin/true"]}"#).unwrap(),
+        );
+        let context = ToolContext::new(
+            4096,
+            std::time::Duration::ZERO,
+            false,
+            ApprovedScope::new("command:test").unwrap(),
+        )
+        .unwrap()
+        .with_control(
+            CancellationToken::new(),
+            std::time::Instant::now() + std::time::Duration::from_millis(100),
+        );
+        let result = executor.execute(&call, &context);
+        assert_eq!(result.status(), ExecutionStatus::TimedOut);
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cancellation_during_probe_prevents_command_spawn() {
+        use super::Backend;
+        use nexus_core::{
+            ApprovedScope, CallId, CancellationToken, ExecutionStatus, M0_REVISION, NormalizedArgs,
+            RunId, ToolCall, ToolContext, ToolId, ToolPort, TurnId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "nexus-exec-probe-cancel-{}-{}",
+            std::process::id(),
+            TEST_ROOTS.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let program = root.join("fake-bwrap");
+        let marker = root.join("launches");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho launch >> '{}'\n/bin/sleep 0.3\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut executor = SandboxedExecutor::with_root(&root).unwrap();
+        executor.backend = Backend::Linux(program);
+        let call = ToolCall::new(
+            RunId::new("run").unwrap(),
+            TurnId::new("turn").unwrap(),
+            CallId::new("call").unwrap(),
+            ToolId::new("host_exec", M0_REVISION).unwrap(),
+            NormalizedArgs::new(r#"{"argv":["/usr/bin/true"]}"#).unwrap(),
+        );
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let context = ToolContext::new(
+            4096,
+            std::time::Duration::ZERO,
+            false,
+            ApprovedScope::new("command:test").unwrap(),
+        )
+        .unwrap()
+        .with_control(
+            token,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        let result = executor.execute(&call, &context);
+        canceller.join().unwrap();
+        assert_eq!(result.status(), ExecutionStatus::Cancelled);
+        assert_eq!(std::fs::read_to_string(marker).unwrap().lines().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn output_limit_caps_retention_but_drain_continues_to_eof() {

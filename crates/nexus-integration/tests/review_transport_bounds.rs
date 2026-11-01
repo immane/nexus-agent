@@ -14,10 +14,10 @@ mod common;
 use std::time::Duration;
 
 use nexus_core::{
-    CommandReply, EventPayload, FinishReason, GetSnapshotCommand, ProviderEvent, RequestId,
+    CommandReply, EventPayload, FinishReason, GetSnapshotCommand, Limits, ProviderEvent, RequestId,
     RunLifecycle, RunOutcome, TurnFinished, Usage, UsageFinality,
 };
-use nexus_runtime::DATA_CAPACITY;
+use nexus_runtime::{CONTROL_CAPACITY, DATA_CAPACITY};
 
 fn stop_terminal() -> ProviderEvent {
     ProviderEvent::TurnFinished(TurnFinished::new(
@@ -56,6 +56,10 @@ fn provisional_usage_burst_is_bounded_and_terminal_survives_resume() {
 
         // Deliberately do not drain while usage publication is bounded.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // This workload completes while the receiver is paused. Its exact
+        // terminal-inclusive queue length is therefore also its whole-run peak.
+        let control_receiver_peak = bed.control.len();
+        assert_eq!(control_receiver_peak, 21);
 
         // Consumer resumes. The terminal is required and must arrive.
         let (control, finished) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -126,9 +130,8 @@ fn provisional_usage_burst_is_bounded_and_terminal_survives_resume() {
         );
         assert_eq!(
             control.len(),
-            21,
-            "RunStarted, request/response metadata, 17 usage records, RunFinished: {}",
-            control.len()
+            control_receiver_peak,
+            "terminal-inclusive drain matches the paused receiver peak"
         );
         assert_eq!(
             common::terminal_count(&[], &control),
@@ -152,6 +155,81 @@ fn provisional_usage_burst_is_bounded_and_terminal_survives_resume() {
             snapshot.expect("finalized snapshot").lifecycle(),
             RunLifecycle::Finalized(RunOutcome::Completed)
         );
+    });
+}
+
+/// A full control receiver retains a multi-turn run's later control events in
+/// the runtime outbox. The terminal remains available after the consumer
+/// resumes, and the finalized snapshot reports no invented truncation.
+#[test]
+fn paused_control_receiver_reaches_capacity_over_the_complete_run() {
+    const UPDATES_PER_TURN: u64 = 16;
+    let turns = Limits::M0_TEST_MODEL_TURNS_PER_RUN as usize;
+    let script = (0..turns)
+        .map(|turn| {
+            let mut events = Vec::with_capacity(UPDATES_PER_TURN as usize + 1);
+            for update in 0..UPDATES_PER_TURN {
+                let count = (turn as u64) * UPDATES_PER_TURN + update + 1;
+                events.push(ProviderEvent::Usage(Usage::new(
+                    Some(count),
+                    Some(count),
+                    UsageFinality::Provisional,
+                )));
+            }
+            let reason = if turn + 1 == turns {
+                FinishReason::Stop
+            } else {
+                FinishReason::ToolCalls
+            };
+            if turn + 1 < turns {
+                events.push(ProviderEvent::ToolCallReady(common::candidate_with(
+                    &format!("item-{turn}"),
+                    &format!("prov-ref-{turn}"),
+                    "host_read",
+                    r#"{"path":"src"}"#,
+                )));
+            }
+            events.push(ProviderEvent::TurnFinished(TurnFinished::new(
+                reason,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )));
+            events
+        })
+        .collect();
+    let rt = common::test_rt();
+    rt.block_on(async {
+        let mut bed = common::make_bed(script, common::quick_config());
+        let response = bed.runtime.submit(common::submit_cmd("control-full-run-peak")).await;
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        let run = response.run().cloned().expect("run issued");
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (reply, snapshot) = bed.runtime.get_snapshot(GetSnapshotCommand {
+                    request: RequestId::new("req-control-full-run-snapshot").unwrap(),
+                    run: run.clone(),
+                }).await;
+                assert_eq!(reply.reply(), CommandReply::Accepted);
+                if let Some(snapshot) = snapshot
+                    && snapshot.lifecycle() != RunLifecycle::Active
+                {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("full run finalizes with receiver paused");
+
+        let control_peak = bed.control.len();
+        assert_eq!(control_peak, CONTROL_CAPACITY);
+        assert!(!snapshot.is_content_truncated());
+        let (_, control, finished) = common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::Completed);
+        assert!(control.len() > control_peak, "later control events were retained for delivery");
+        assert!(control.last().expect("terminal event").is_terminal());
+        let usage_events = control.iter().filter(|event| matches!(event.payload(), EventPayload::UsageUpdated(_))).count();
+        assert_eq!(usage_events, turns * (UPDATES_PER_TURN as usize + 1));
+        println!("paused_control_receiver_peak_whole_run={control_peak}; drained_control_events={}; usage_events={usage_events}; outbox_retained_events={}", control.len(), control.len() - control_peak);
     });
 }
 

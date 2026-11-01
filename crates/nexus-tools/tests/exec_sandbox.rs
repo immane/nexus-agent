@@ -90,6 +90,44 @@ fn argv_runs_inside_the_configured_sandbox_root() {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[ignore = "P7 measurement: requires the real OS sandbox backend"]
+fn measure_first_command_with_deferred_sandbox_probe() {
+    const SAMPLES: usize = 20;
+    let mut elapsed_ms = Vec::with_capacity(SAMPLES);
+    for index in 0..SAMPLES {
+        let root = TempRoot::new();
+        let executor = SandboxedExecutor::with_root(&root.0).expect("valid root binds");
+        let started = std::time::Instant::now();
+        let result = executor.execute(
+            &call(r#"{"argv":["/usr/bin/printf","first-command-ok"]}"#),
+            &context(),
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result.status(),
+            ExecutionStatus::Succeeded,
+            "{}",
+            result.content()
+        );
+        assert_eq!(result.content(), "first-command-ok");
+        elapsed_ms.push(elapsed.as_secs_f64() * 1000.0);
+        println!(
+            "first_command_sample={index} elapsed_ms={:.3}",
+            elapsed_ms[index]
+        );
+    }
+    elapsed_ms.sort_by(f64::total_cmp);
+    let percentile = |q: f64| elapsed_ms[((SAMPLES as f64 * q).ceil() as usize).saturating_sub(1)];
+    println!(
+        "first_command_probe_latency_ms n={SAMPLES} p50={:.3} p95={:.3} max={:.3}",
+        percentile(0.50),
+        percentile(0.95),
+        elapsed_ms[SAMPLES - 1]
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires an explicitly provisioned Linux sandbox and curl"]

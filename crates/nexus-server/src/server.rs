@@ -2892,6 +2892,8 @@ mod tests {
         let session = SessionId::new("pending-session").expect("valid session");
         let request = RequestId::new("pending-request").expect("valid request");
         let mut pending = PendingEvents::default();
+        let mut peak_events = 0;
+        let mut peak_bytes = 0;
         for seq in 0..MAX_PENDING_EVENTS as u64 {
             let event = nexus_core::RunEvent::new(
                 session.clone(),
@@ -2902,12 +2904,21 @@ mod tests {
                 },
             );
             assert!(pending.push(event), "ordinary event {seq} fits");
+            peak_events = peak_events.max(pending.events.len());
+            peak_bytes = peak_bytes.max(pending.bytes);
         }
         let reserve = nexus_core::RunEvent::new(
             session,
-            run,
+            run.clone(),
             MAX_PENDING_EVENTS as u64,
-            nexus_core::EventPayload::RunStarted { request },
+            nexus_core::EventPayload::RunFinished(
+                nexus_core::RunFinished::new(
+                    nexus_core::RunOutcome::Completed,
+                    nexus_core::PersistenceState::Ephemeral,
+                    None,
+                )
+                .expect("valid terminal"),
+            ),
         );
         assert!(
             !pending.push(reserve),
@@ -2926,6 +2937,137 @@ mod tests {
             !pending.can_receive_more(),
             "no more channel reads are permitted"
         );
+        let reserve_bytes = pending.overflow.as_ref().unwrap().1;
+        peak_events = peak_events.max(pending.events.len() + 1);
+        peak_bytes = peak_bytes.max(pending.bytes + reserve_bytes);
+        assert_eq!(peak_events, MAX_PENDING_EVENTS + 1);
+        assert!(peak_bytes <= MAX_PENDING_BYTES + MAX_PENDING_OVERFLOW_BYTES);
+        println!("pending_count_pressure_peak_events={peak_events} peak_bytes={peak_bytes}");
+
+        let mut delivery = SseDelivery::new(&run);
+        let mut wire = Vec::new();
+        for expected in 0..=MAX_PENDING_EVENTS as u64 {
+            let event = pending
+                .pop_run(&run)
+                .expect("every retained event survives");
+            assert_eq!(event.seq(), expected);
+            if event.is_terminal() {
+                delivery.terminal = Some(event);
+            } else {
+                delivery.retain(event);
+            }
+            delivery.write_ready(&mut wire).expect("SSE writer drains");
+            assert!(pending.events.len() + usize::from(pending.overflow.is_some()) <= peak_events);
+            assert!(
+                pending.bytes + pending.overflow.as_ref().map_or(0, |(_, bytes)| *bytes)
+                    <= peak_bytes
+            );
+        }
+        assert_eq!(
+            written_sequences(&wire),
+            (0..=MAX_PENDING_EVENTS as u64).collect::<Vec<_>>()
+        );
+        assert!(delivery.ordering.is_finalized());
+        assert_eq!(delivery.ordering.gaps(), 0);
+        assert_eq!(delivery.bytes, 0);
+        assert!(pending.pop_run(&run).is_none());
+        assert_eq!(pending.bytes, 0);
+        assert!(pending.can_receive_more());
+    }
+
+    #[test]
+    fn http_snapshot_surfaces_real_runtime_data_saturation() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        for (fragments, expected_truncated) in [(16, false), (1_300, true)] {
+            let (mut server, executor) = server_with_gated_config();
+            server.set_config(UserConfig::default_config(), None);
+            let token = server.create_session().expect("fake session created");
+            let session = server.session(&token).expect("session exists");
+            let mut events = Vec::with_capacity(fragments + 1);
+            for index in 0..fragments {
+                events.push(ProviderEvent::TextDelta {
+                    item_key: format!("item-{}", index % 2),
+                    text: "x".repeat(64),
+                });
+            }
+            events.push(ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
+                FinishReason::Stop,
+                nexus_core::Usage::new(None, None, nexus_core::UsageFinality::Final),
+                None,
+            )));
+            let (runtime, streams) = executor.block_on(async {
+                Runtime::new(
+                    RuntimeConfig {
+                        limits: Limits::m0_test(),
+                        policy: Policy::m0_test(),
+                        has_approval_handler: true,
+                    },
+                    Arc::new(FakeProvider::new(vec![events])),
+                    Vec::new(),
+                )
+            });
+            *session.runtime.lock().unwrap() = runtime;
+            *session.data.lock().unwrap() = streams.data;
+            *session.control.lock().unwrap() = streams.control;
+            let command = SubmitCommand::new(
+                session.request_id(),
+                session.session.clone(),
+                "bounded synthetic output",
+                "m0-test",
+            )
+            .unwrap();
+            let response = executor.block_on(session.runtime.lock().unwrap().submit(command));
+            assert_eq!(response.reply(), CommandReply::Accepted);
+            let run = response.run().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let response = server.snapshot(&session, run.as_str()).unwrap();
+                assert_eq!(response.status, 200);
+                let snapshot: Value = serde_json::from_slice(&response.body).unwrap();
+                if snapshot["lifecycle"] != "active" {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "paused-consumer run finalizes");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if expected_truncated {
+                assert_eq!(
+                    session.data.lock().unwrap().len(),
+                    nexus_runtime::DATA_CAPACITY
+                );
+            }
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = Arc::new(server);
+            let worker = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                server.handle_connection(stream);
+            });
+            let mut client = TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            client
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            write!(
+                client,
+                "GET /sessions/{token}/snapshot?run={} HTTP/1.1\r\nhost: {address}\r\n\r\n",
+                run.as_str()
+            )
+            .unwrap();
+            let mut wire = String::new();
+            client.read_to_string(&mut wire).unwrap();
+            worker.join().unwrap();
+            let (headers, body) = wire.split_once("\r\n\r\n").expect("HTTP response");
+            assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+            let snapshot: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(snapshot["content_truncated"], expected_truncated);
+            assert_eq!(snapshot["outcome"], "completed");
+        }
     }
 
     #[test]
@@ -2954,6 +3096,28 @@ mod tests {
         assert!(pending.bytes <= MAX_PENDING_BYTES);
         assert!(pending.overflow.is_some(), "overflow event remains owned");
         assert!(!pending.can_receive_more());
+        let peak_events = pending.events.len() + 1;
+        let peak_bytes = pending.bytes + pending.overflow.as_ref().unwrap().1;
+        assert!(peak_events < MAX_PENDING_EVENTS);
+        assert!(peak_bytes <= MAX_PENDING_BYTES + MAX_PENDING_OVERFLOW_BYTES);
+        println!("pending_byte_pressure_peak_events={peak_events} peak_bytes={peak_bytes}");
+        let mut delivery = SseDelivery::new(&run);
+        let mut wire = Vec::new();
+        for expected in 0..peak_events as u64 {
+            let event = pending.pop_run(&run).expect("byte-pressure event retained");
+            assert_eq!(event.seq(), expected);
+            delivery.retain(event);
+            delivery.write_ready(&mut wire).expect("SSE writer drains");
+        }
+        assert_eq!(
+            written_sequences(&wire),
+            (0..peak_events as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(delivery.ordering.gaps(), 0);
+        assert_eq!(delivery.bytes, 0);
+        assert!(pending.pop_run(&run).is_none());
+        assert_eq!(pending.bytes, 0);
+        assert!(pending.can_receive_more());
     }
 
     /// The favourites handlers answer with the resulting list, so a client

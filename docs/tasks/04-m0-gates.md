@@ -2,9 +2,9 @@
 
 Status: Acceptance review in progress; **M0 is not complete**. Functional and
 platform checks below have current evidence. Startup side-effect coverage,
-complete buffer-limit evidence, and accepted P7 reference methodology and
-measurements remain open. Historical RSS evidence is confounded and must not be
-promoted to a baseline.
+complete buffer-limit evidence, and portions of the accepted P7 measurement set
+remain open. Historical RSS evidence is confounded and must not be promoted to
+a baseline.
 
 **Owner-approved scope adjustment, 2026-11-01:** macOS cold-cache startup
 measurement is deferred from M0 acceptance to M5; it remains unverified and is
@@ -20,12 +20,33 @@ remaining M0 blocker. The following independent gates remain open:
 | Gate | Current evidence | Remaining requirement |
 | --- | --- | --- |
 | Buffer bounds and visible loss | Data-channel/frontend tests and synthetic control-outbox count/byte saturation, including finalized snapshot checks | Whole-run high-water evidence and visibility for the remaining retention and control-delivery paths |
-| Startup side effects | Isolated PTY tests on both platforms; Linux file/network/process traces for one normal and two corrupt-metadata cases | Sufficient evidence for the other startup/recovery and credential-access paths, including macOS |
-| P7 reference and measurements | Two-platform warm composer observations, limited queue/dispatch and idle observations | Accepted reference environments and methodology; verified Linux cold-cache startup and remaining representative resource, throughput and buffer measurements |
+| Startup side effects | Isolated PTY tests on both platforms, including create/update/delete recovery; Linux traces for normal, corrupt-metadata and successful recovery fixtures | Remaining startup/credential-access evidence, including macOS observation limitations |
+| P7 reference and measurements | Owner-approved reference profile; two-platform warm observations, idle/queue/dispatch samples, Linux executable-page cache verification | Linux cache-prepared response exceeds 100 ms; complete cold-cache scope and remaining representative resource, throughput and buffer measurements |
 
-Default workspace tests, Clippy and format checks were last run on both
-platforms before the latest runtime **test-only** additions; the affected
-runtime suite and Clippy were then rerun on both. This evidence is not a
+The bounded-buffer inventory has finite limits in the implementation, but that
+alone is not acceptance evidence: runtime data/control receivers are 1,024/128
+events; the control outbox is capped at 256 entries and 1 MiB with terminal
+reserve; provisional usage publication is separately rate/count bounded; HTTP
+pending SSE delivery is capped at 4,096 events/1 MiB with a bounded oversized
+event slot, and each session retains at most two stream delivery records; TUI
+reordering is bounded to the combined channel capacities plus 256 and retained
+presentation has per-entry and total-item limits. Existing tests cover many
+individual limits and loss notices. Full-run high-water evidence across these
+paths and proof that every transport/frontend surfaces each loss mode remain
+open.
+
+Owner approval (2026-11-01) now accepts the reference machines and methodology
+in `docs/design/05-performance.md`. The owner confirmed the Linux ED25519
+fingerprint through a trusted channel; the reference VM presented the matching
+key and strict host verification succeeded. Root public-key authentication
+initially failed, then succeeded after the owner installed the local public key.
+Remote validation has resumed against a separate current-source snapshot,
+preserving the previous project and evidence. No password was written to a file
+or used in a command.
+
+Default workspace tests, all-target Clippy, formatting and release rebuilds
+passed on both platforms after the experimental policy reuse was withdrawn,
+including the current startup and transport regression tests. This evidence is not a
 full optional-feature run or a production security certification. A passing
 warm-cache sample is not a cold-cache result or an accepted baseline.
 
@@ -129,6 +150,33 @@ connect, additional exec, or clone call. This strengthens only these failure
 fixtures and does not establish absence of environment reads or cover other
 startup paths. The raw synthetic trace logs are retained with the Linux evidence.
 
+The TUI startup fixture now additionally exercises valid pending create, update,
+and delete transactions on macOS. Each case reaches an interactive startup
+frame and remains alive for a one-second observation window without contacting
+the synthetic loopback provider or opening the credential FIFO as observed by
+the fixture's nonblocking writer checks. It verifies the recovered metadata,
+published/deleted body, removed staging/journal, and absence of historical or
+staged body sentinels from terminal output. Both startup tests passed via
+`cargo test -p nexus-tui --test behavior startup_failure --locked --offline --
+--test-threads=1`; TUI all-target Clippy and formatting passed. The subsequent
+serialized default TUI nextest run passed 580 tests with 11 skipped. This covers these
+three successful recovery paths, not every credential read or startup effect;
+the FIFO observation cannot exclude brief nonblocking opens. Both startup tests
+then passed on Linux, along with TUI all-target Clippy and formatting, using
+the resumed snapshot and the same commands.
+Linux `strace -f -ttt -T -e trace=%file,%network,%process` observations of all
+three recovery fixtures subsequently found no credential-file mentions, network
+connects, additional execs, or clone/fork calls, and no `openat` of the saved
+body. Create/update used the expected staged-body rename and delete unlinked
+the affected body. AF_UNIX socketpairs remained present. These fixtures omit
+PATH and do not establish absence of credential-environment lookups or every
+indirect access. The first traced fixture batch exposed wrapper-only teardown
+leaving three TUI children alive; those exact children were terminated and the
+fixture now starts a dedicated process group and terminates that group. Both
+startup tests passed again on macOS, and Linux corrupt-metadata plus all three
+traced recovery cases passed with no surviving TUI processes. The completed
+Linux traces are `m0-resume-recovery.149178/149181/149184.trace` under `evidence`.
+
 After these frontend changes, the serialized default workspace suite, all-target
 workspace Clippy and formatting passed on both platforms: Linux 2,620 passed,
 25 ignored; macOS 2,626 passed, 19 ignored. Headless and TUI targeted tests and
@@ -171,7 +219,7 @@ The corresponding isolated Linux run observed 30/30 responses with
 spawn-to-response p50/p95/max 59.169/60.859/61.046 ms; its 30 cleanup sequences
 also escalated after the default quit key. Both runs are warm-cache observations,
 not accepted reference or cold measurements. The performance harness's Python
-unittest suite passed 278 tests with one
+unittest suite passed 279 tests with one
 skipped on macOS; this is harness coverage, not performance acceptance.
 The harness default quit key is Ctrl+D, which is not the TUI's quit sequence.
 A separate three-sample probe on each platform used `--quit-hex 0303` to clear
@@ -220,6 +268,232 @@ TUI input poll is 20 ms and the observed probe-write-to-screen response was
 roughly 39–40 ms in these samples, but those observations do not independently
 attribute delay to input polling or drawing. Raw synthetic traces and samples
 are retained with the Linux evidence.
+
+An experimental deferred sandbox probe was subsequently measured using the
+same VM, isolated environment and `setpriv` launcher. In 20 warm launches,
+20/20 responses were observed; spawn-to-response p50/p95/max were
+50.708/51.563/52.423 ms, versus 61.224/63.841/65.269 ms in the earlier
+warm batch. These are separate observational batches, not an accepted baseline.
+In a prepared-cache batch, only 18/20 launches occurred: the helper reported
+4 and 128 resident executable pages on the other two preparations and refused
+to launch. The 18 observed responses had p50/p95/max
+126.424/140.861/140.861 ms. The failures are retained, not excluded from a
+claim of successful cold measurement; the helper does not verify full-system
+cache state. The optimization's first-command cost is measured on macOS below;
+Linux first-command latency and the full release-mode comparison remain open.
+On the experimental code, Linux default workspace tests passed 2,635 with 25
+ignored and workspace all-target Clippy passed. Four explicitly selected Linux
+Bubblewrap confinement, protected-credential, external-write and timeout tests
+also passed. The tools tests include concurrent probe failure, probe timeout,
+and cancellation/deadline during a successful probe; these do not measure
+Linux first-command latency or independently characterize every cancellation
+race.
+One warm isolated startup trace of the experimental release build with the
+normal PATH observed only the launcher and TUI execs and no clone/fork calls
+through the harness's response and exit. This confirms the absence of the
+previous startup probe in that fixture, not in every startup configuration or
+after a command is submitted; tracing is not a performance measurement.
+An attempted macOS default workspace nextest run on the experimental code
+stopped after two `nexus-container` worker transport tests timed out; 2,153
+tests did not run and workspace Clippy was not reached. A lower-concurrency
+rerun passed 2,637 tests with 19 skipped; workspace all-target Clippy and
+formatting also passed. The cause of the earlier failures has not been
+established; a successful serial rerun does not prove the original cause.
+After adding the deferred-probe measurement and whole-run control-queue sample,
+the macOS serialized default workspace rerun passed 2,638 tests with 20 skipped;
+all-target workspace Clippy and formatting passed. Separately, the performance
+harness unittest suite passed 279 tests with one skipped after adding sampled
+RSS summary statistics. The owner has now approved the reference profile in
+`docs/design/05-performance.md`.
+After SSH access was restored, the Linux current-source snapshot passed
+`cargo test --workspace --locked --offline -- --test-threads=1`: 2,636 ordinary
+tests plus one doctest passed, with 26 ignored. Workspace all-target Clippy and
+formatting passed. The source archive SHA-256 was
+`ef563fc165297cb634cb31e62550df588b664ed777001c0992f08448e8dc1950`;
+the remote log is `evidence/m0-resume-workspace-20261101.log`. This snapshot
+includes the latest control receiver and server pending-store pressure tests,
+but predates the subsequently added successful TUI recovery fixture; that
+fixture is being validated separately.
+On macOS Darwin 25.3 arm64, a current default-feature release TUI built from the
+deferred-probe code was measured with the isolated PTY harness (30 warm launches,
+first launch included): 30/30 composer responses, frame-ready p50/p95/max
+10.116/16.221/1,662.615 ms, and spawn-to-composer-response
+52.856/60.053/1,703.186 ms. The startup outlier is retained. A separate ignored
+release-mode tools measurement ran 20 sandboxed `/usr/bin/printf` commands with
+a fresh executor each time; first-command elapsed p50/p95/max were
+29.347/31.044/31.624 ms. This includes probe plus actual command, is a short
+single-process sequence rather than independent startup samples, and is not a
+baseline. Resumed Linux first-command observations follow.
+After access resumed, the same ignored release-mode tools measurement on Linux
+completed 20/20 first commands with probe-plus-command p50/p95/max
+21.172/23.059/32.683 ms. Like the macOS sequence, it uses fresh executors in one
+test process, not independent fresh host launches.
+The same macOS executable is 5,111,168 bytes (uncompressed file size), SHA-256
+`bef2923c62ea1dde5e5415e3f88b320e8028a6d53a14233b3dbb52e6f02ce10f`; the
+distribution/archive size is not measured. This is one host/build, not a
+cross-platform size budget or accepted reference.
+The same macOS release TUI had 10/10 observed three-second idle windows after
+the composer frame. Sampled process CPU was 0.000–0.333% (median 0.166%); 118
+live RSS samples had a median of per-run medians of 4,014,080 bytes and a
+maximum sample of 4,505,600 bytes. These are sampled idle working-set points,
+not peak startup or peak workload memory. Context switches were unavailable
+and wakeups are `unsupported`. All ten sessions exited without cleanup
+escalation after the explicit Ctrl+C sequence. The new sampled RSS summary
+fields are covered by a performance-harness unit test.
+A preliminary idle invocation that retained the harness's default extra
+`m0-test` marker timed out 10/10 and is invalid, not counted as idle evidence.
+The valid rerun required only the actual composer marker.
+
+Additional opt-in macOS release-profile fake measurements on the current source
+completed without failed samples: 16 worker submissions in one run had
+submission-to-worker-entry p50/p95/max 1.834/3.000/3.000 µs and fake execution
+0.083/0.333/0.333 µs; 10 independent 1,938-byte/512-fragment streams completed
+in 331/671/671 µs (p50/p95/max), and 10 cancellation-to-terminal observations
+were 98/196/196 µs. A separate 10-call fake integration run observed
+ToolStarted-to-ToolFinished p50/p95/max 20/51/51 µs. These include runtime,
+scheduling and event delivery as described by each harness; they are synthetic
+and do not close a representative real-I/O workload, full queue high-water, or
+Linux/macOS paired baseline requirement.
+
+The new multi-turn fake-run integration test pauses the control receiver for the
+entire run, polls until finalization, and observes its exact 128-event channel
+capacity. Resuming drains 168 control events total (40 retained in the runtime
+outbox), including all 136 usage updates and the terminal event; the finalized
+snapshot does not claim content truncation for these control events. This is
+direct end-to-end evidence for runtime control-channel saturation/outbox drain
+and terminal delivery under this synthetic workload. It does not measure
+outbox byte high-water or prove visibility through HTTP SSE and every frontend.
+
+The server pending-store count/byte pressure tests now drain every retained
+event through `SseDelivery` and inspect the resulting SSE sequence IDs. The
+count workload peaks at 4,097 retained events / 511,048 bytes (4,096 ordinary
+slots plus the single reserve), with a real terminal event in the reserve; every sequence and
+the terminal reach the writer, no ordering gaps are reported, and retained byte
+accounting returns to zero. The byte-pressure workload peaks at 16 events /
+1,050,982 bytes and likewise drains its oversized reserve without a sequence
+gap. Both assert the total retained byte
+ceiling, including the reserve. On macOS, `cargo nextest run -p nexus-server
+--locked --offline` passed all 175 tests; package all-target Clippy, workspace
+formatting, and `git diff --check` passed. These are synthetic pending-store to
+SSE-writer tests, not a complete runtime-to-HTTP-client pressure measurement.
+
+`server::tests::http_snapshot_surfaces_real_runtime_data_saturation` additionally
+runs the real runtime with a paused data consumer, contrasting 16-fragment
+clean output against 1,300 alternating-item fragments. The latter fills the
+1,024-event receiver and drops presentation traffic. A real loopback HTTP GET
+then returns `content_truncated: true` with the completed outcome, whereas the
+clean control returns `false`. macOS server tests passed 176/176 plus all-target
+Clippy and formatting. Linux subsequently passed all 176 server tests, package
+all-target Clippy and formatting as well. This
+closes the runtime-to-HTTP snapshot truncation visibility fixture, not every
+SSE reconnect, frontend rendering, or buffer retention mode.
+
+Resumed Linux default-release observations used executable size 5,920,424 bytes,
+SHA-256 `78495b0f7ad32ae96592bcd7815b8492f98f37f444a4cb32bc0f9e409feddc37`,
+an isolated HOME/XDG environment, 120x40 PTY, and a root harness launching the
+target unprivileged via named-user `setpriv --init-groups`. Warm runs observed
+30/30 composer responses with spawn-to-response p50/p95/max
+50.859/52.528/52.580 ms; frame-ready was 11.203/12.615/12.663 ms. Ten three-second
+idle windows had CPU 0.333–0.667% (median 0.667%); 120 RSS samples had median of
+per-run medians 6,062,080 bytes and maximum sampled RSS 6,119,424 bytes. Wakeups
+were unsupported. All sessions exited without cleanup escalation.
+
+In a separate 30-attempt cache-prepared batch, a privileged dedicated-VM helper
+ran `sync`, wrote `3` to `drop_caches`, and verified zero resident pages out of
+1,446 executable pages with `mincore` before every attempt. All 30 preparations
+and composer responses succeeded. Frame-ready p50/p95/max were
+93.415/98.569/100.249 ms, but spawn-to-composer-response was
+132.762/138.432/140.041 ms: this does not pass the 100 ms response target. The
+verification covers executable page residency only, not shared libraries,
+metadata, CPU or storage-device caches; privilege-launcher cost remains included.
+Raw JSON, preparation logs and helpers are retained under Linux
+`evidence/m0-resume-measurements`, with a local copy in the session's approved
+temporary evidence directory. A separate numeric-UID/GID launcher comparison
+using `--reuid=1000 --regid=1000 --clear-groups` yielded 30/30 warm responses
+p50/p95/max 50.147/51.379/51.780 ms and 30/30 prepared-cache responses
+131.044/137.391/141.336 ms. All 30 executable-page preparation checks again
+reported zero resident pages, and no cleanup escalation occurred. This variant
+also exceeds 100 ms after cache preparation; these separate batches do not
+establish named-user/group lookup as the dominant delay. Both raw batches are
+retained, not replaced by a selected faster result.
+
+A third diagnostic launcher permanently clears supplementary groups and sets
+real/effective/saved UID/GID to the verified nexus-test IDs (1,000), then execs
+the same unmodified target. It is an evidence-only C helper with no setuid bit,
+not a product change. Identity checks passed and it refuses non-root callers.
+It avoids the larger `setpriv` initialization path; it does not bypass sandbox
+checks. Its 30 warm responses were p50/p95/max 49.195/50.808/51.482 ms, and
+30 prepared-cache responses were 106.543/112.380/118.886 ms; frame-ready for the
+latter was 66.665/72.764/79.543 ms. All 30 executable-residency checks again
+reported zero pages resident, and cleanup never escalated. The approximately
+38–40 ms post-frame composer response remains visible in both warm/prepared
+batches. This launcher changes methodology and does not establish a product
+speedup; its prepared-cache response still does not pass 100 ms. The original
+two batches remain part of the evidence. Files are retained under
+`evidence/m0-resume-measurements-minimal` and copied to the local session
+temporary evidence directory.
+
+The resumed Linux release fake measurements also completed without failed
+samples: 16 submissions in one run had submission-to-worker-entry p50/p95/max
+17.932/601.017/601.017 µs and fake execution 0.531/1.244/1.244 µs. Ten
+1,938-byte/512-fragment streams completed in 826/1,515/1,515 µs, ten blocked-
+stream cancellation-to-terminal observations were 148/181/181 µs, and the
+separate ten-call ToolStarted-to-ToolFinished observations were 44/72/72 µs.
+The dispatch outlier is retained; these short synthetic workloads do not
+establish peak workload memory or full-run queue high-water.
+
+The existing opt-in isolated-instance tracefs helper was run on the same Linux
+release executable (`--user nexus-test --runs 3`). Each three-second idle
+window recorded 225 `sched_wakeup` events for the initial target TID (about
+74.99 events/s), unchanged before/after thread sets, and no trace-loss-counter
+increments. Targets were reaped, temporary homes removed, tracing disabled,
+and the unique trace instance removed. This is a scheduler-wakeup observation
+for those TIDs, not system wakeups, wakeups caused by the target, or evidence
+about short-lived threads missed between snapshots. Raw output is
+`evidence/m0-resume-wakeups.json`, also copied locally. macOS wakeups remain
+unmeasured.
+
+An additional experiment reuses one immutable validated `DirectoryPolicy`
+snapshot for the development file and command tool set instead of resolving
+the same protected aliases twice. Standalone constructors still validate their
+own policy, and sandbox probing/fail-closed execution was unchanged. In that
+experimental snapshot, the tools construction test verified that root,
+protected paths, temporary paths and the deferred-probe state survived policy
+installation. macOS affected-package tests
+passed 828 with 12 skipped, followed by all-target Clippy and formatting. Linux
+affected-package tests passed 826 with 18 ignored, followed by six explicitly
+selected exec-sandbox tests (including real confinement, credential masking,
+approved external writes and timeout cleanup); package Clippy and formatting
+passed. The Linux experimental executable was 5,920,728 bytes, SHA-256
+`f488c5825641b6909c660777f530c131357104536df5955dd9cad497b4aaf894`.
+Named-user-launcher warm p50/p95/max were 50.354/57.594/59.015 ms and prepared
+132.929/139.101/141.248 ms (30/30 each). Minimal-launcher warm observations were
+48.685/49.338/49.411 ms and prepared 105.543/115.963/116.701 ms (30/30 each).
+No cleanup escalation occurred. These separate batches do not demonstrate a
+material prepared-cache improvement or close the 100 ms response gate.
+The macOS default release warm rerun observed 30/30 responses with
+spawn-to-response p50/p95/max 50.640/88.414/1,495.904 ms and frame-ready
+6.709/58.353/1,453.288 ms, with zero cleanup escalation. All outliers remain.
+Executable size was 5,111,024 bytes, SHA-256
+`9047e8df145b22f9bd7e7260bd33ea9ad849c734c5ed6f932e3f1b3a65183138`.
+This separate batch does not establish a speedup versus the earlier macOS
+observations. The shared-policy experiment and its policy-installation-only
+assertions were therefore withdrawn using targeted edits; the original
+deferred-probe implementation and its regression tests remain. Experimental
+binaries, affected sources and raw samples were retained separately. Linux
+restored-source workspace validation passed 2,638 ordinary tests plus one
+doctest, with 26 ignored; the separately selected six exec-sandbox tests passed
+again. Workspace all-target Clippy, formatting and the default release rebuild
+passed. macOS restored-source validation passed 2,640 tests with 20 skipped;
+workspace all-target Clippy, formatting, diff checks and the default release
+rebuild passed. No performance improvement or acceptance is claimed.
+
+An earlier macOS serialized default workspace run including the HTTP
+snapshot and successful-recovery tests passed 2,640 tests with 20 skipped;
+workspace all-target Clippy, formatting and diff checks passed. The later
+Python-only process-group cleanup adjustment was rerun via both startup tests
+on macOS and the Linux corrupt-metadata/traced-recovery fixtures before the
+restored-source complete workspace runs recorded above.
 
 - [x] One model/tool/model cycle completes with fake integrations.
 - [x] Read-like fake calls proceed under scoped policy; mutation/command-like calls require approval or headless denial.
@@ -354,6 +628,13 @@ default production configuration.
   phase; the internal outbox and other workloads are not measured. The Linux
   integration package and all-target Clippy passed on both platforms; macOS
   nextest reported 154 passed and one skipped. Formatting passed on macOS.
+- `review_transport_bounds::provisional_usage_burst_is_bounded_and_terminal_survives_resume`
+  now records the paused control receiver length after the bounded usage burst
+  has completed, then checks that the terminal-inclusive drain matches it: an
+  exact whole-run peak of 21 control events for this workload. It exercises the
+  16-update provisional usage cap, not a full control-channel saturation or
+  internal outbox peak. The integration package passed 154 tests with one
+  skipped, plus Clippy and formatting on macOS.
 
 The cache was not purged or independently verified as cold. TUI startup now
 defers credential resolution until run submission. Isolated PTY tests cover

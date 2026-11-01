@@ -1223,6 +1223,7 @@ def run_measurement(cfg, argv, run_index=0):
             idle_percent = None
             if cpu_seconds is not None and window_s > 0:
                 idle_percent = (cpu_seconds / window_s) * 100.0
+            sorted_rss = sorted(rss_samples)
             short_window = exited_during_window or window_s < cfg.idle_window * 0.9
             result["idle"] = {
                 "status": "short" if short_window else "observed",
@@ -1232,6 +1233,17 @@ def run_measurement(cfg, argv, run_index=0):
                 "cpu_method": cpu_second.get("method"),
                 "idle_cpu_percent": idle_percent,
                 "rss_samples": len(rss_samples),
+                "rss_min_sampled_bytes": sorted_rss[0] if sorted_rss else None,
+                "rss_median_sampled_bytes": (
+                    (
+                        sorted_rss[(len(sorted_rss) - 1) // 2]
+                        + sorted_rss[len(sorted_rss) // 2]
+                    )
+                    // 2
+                    if sorted_rss
+                    else None
+                ),
+                "rss_max_sampled_bytes": sorted_rss[-1] if sorted_rss else None,
                 "rss_peak_sampled_bytes": peak_sampled,
                 "context_switches": _context_switch_delta(cpu_first, cpu_second),
                 "wakeups": _idle_supported_note(),

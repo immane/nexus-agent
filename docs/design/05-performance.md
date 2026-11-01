@@ -1,6 +1,6 @@
 # Performance and Measurement
 
-Status: Draft measurement design, documentation repair in progress. The 100 ms first-release startup target is confirmed; no accepted baseline or resource budget exists. Historical spawn-to-exit characterization runs are recorded in the [documentation index](../index.md), but they are not readiness evidence: they do not measure the first-interactive definition below, their RSS method is confounded, and PTY, idle-CPU, streaming, buffer high-water, and dispatch measurements remain unrun. See Evidence Status below.
+Status: Draft measurement design; M0 acceptance review in progress. The 100 ms first-release startup target is confirmed; no accepted baseline or resource budget exists. Historical spawn-to-exit characterization runs are recorded in the [documentation index](../index.md), but they are not readiness evidence: they do not measure the first-interactive definition below and their RSS method is confounded. New PTY, idle-CPU, synthetic streaming, queue-pressure, and dispatch observations are recorded in the [M0 gate evidence](../tasks/04-m0-gates.md); they are not accepted baselines and do not yet satisfy the complete P7 set.
 
 ## Startup Definition
 
@@ -19,12 +19,32 @@ The recorded macOS and Linux runs characterize spawn-to-exit and must not be pro
 - The harness measures wall time to process exit, not the first-interactive definition above, so results are not comparable with the 100 ms target.
 - RSS is a cumulative `RUSAGE_CHILDREN` high-water mark that includes other harness children such as the cache-purge command; it cannot be attributed to the binary. The unreproduced 514 MB reading is retained as an unresolved anomaly, not dismissed.
 - The macOS "cold" runs used no cache purge and are unprepared-cache runs. Linux `drop_caches` runs exist, but with small samples and high variance.
-- PTY first-interactive, idle CPU, streaming throughput, event-buffer high-water marks, and local dispatch overhead are still unmeasured.
+- Current-source PTY first-interactive, idle CPU, synthetic streaming throughput, runtime control-channel high-water, and fake dispatch have observations under the owner-approved reference profile below, but complete representative/full-path coverage and accepted baselines remain open. See the M0 evidence record.
 - Compiler versions were whatever each environment had; no exact compiler pin has been selected yet (the toolchain choice is still pending).
 
 Re-run the profiles and validation plan below once the implementation stabilizes; do not record any number as a baseline before then.
 
 ## Measurement Profiles
+
+### Accepted reference profile (owner-approved 2026-11-01)
+
+For review, use this reproducible default-build PTY profile rather than
+comparing unqualified launch timings: Linux VM Ubuntu 26.04.1 x86_64 (4 vCPUs,
+7.3 GiB RAM, kernel 7.0.0-38) and this macOS host Darwin 25.3.0 arm64 (Apple
+M4, 10 logical CPUs, 16 GiB); rustc 1.99.0; locked default features and the
+release profile; 120x40 PTY; isolated empty HOME/XDG/config; no credentials,
+network, cache purge, demo feature, or provider call. Run 30 fresh processes,
+retain every attempt and cleanup outcome, and report spawn-to-observed composer
+response plus frame-ready and input-response times. Report warm-cache and
+prepared-cache separately; preparation is not “cold” unless the relevant cache
+state is verified, and macOS cold preparation remains deferred by owner decision.
+Keep idle/resource, fake streaming, queue pressure, and dispatch as distinct
+profiles. The owner accepted this reference profile and confirmed the candidate
+Linux ED25519 fingerprint through a trusted channel on 2026-11-01. The reference
+VM presented that exact key. After the owner installed the local
+public key, strict-host-verified public-key login succeeded and remote
+validation resumed. Acceptance does not authorize bypassing SSH host-key
+verification.
 
 | Profile | What it isolates |
 | --- | --- |
