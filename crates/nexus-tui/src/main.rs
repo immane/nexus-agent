@@ -66,12 +66,15 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 mod diagnostics;
+mod input_ready;
+
+use input_ready::InputReady;
 
 const DEMO_PROFILE: &str = "m0-test";
 const DEMO_INPUT: &str = "m0 test-only demo submission";
 /// Persistent maintenance cadence, even while events are continuously ready.
 const TICK: Duration = Duration::from_millis(50);
-/// Poll input without blocking the current-thread runtime or owning it on another thread.
+/// Periodic parser draining and burst cadence; Linux also observes input readiness.
 const INPUT_POLL: Duration = Duration::from_millis(20);
 const HEADLESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounded window for cancellation reconciliation before terminal restore.
@@ -1320,7 +1323,7 @@ fn wiring_notice(
 fn main() {
     install_panic_hook();
     let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
@@ -2300,10 +2303,19 @@ async fn next_interactive_step(
     input_interval: &mut tokio::time::Interval,
     data: &mut mpsc::Receiver<RunEvent>,
     control: &mut mpsc::Receiver<RunEvent>,
-) -> Option<LoopStep> {
+    input_ready: &mut InputReady,
+) -> io::Result<Option<LoopStep>> {
     tokio::select! {
-        step = next_loop_step(interval, data, control) => Some(step),
-        _ = input_interval.tick() => None,
+        step = next_loop_step(interval, data, control) => Ok(Some(step)),
+        _ = input_interval.tick() => {
+            input_ready.arm();
+            Ok(None)
+        },
+        ready = input_ready.ready() => {
+            ready?;
+            input_ready.defer(input_interval);
+            Ok(None)
+        },
     }
 }
 
@@ -4267,6 +4279,17 @@ async fn interactive_loop(
     let mut input_interval =
         tokio::time::interval_at(tokio::time::Instant::now() + INPUT_POLL, INPUT_POLL);
     input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input_ready = match InputReady::new() {
+        Ok(input_ready) => input_ready,
+        Err(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("native input readiness unavailable; using periodic terminal polling");
+            InputReady::default()
+        }
+    };
     loop {
         let mut dirty = false;
         if sessions
@@ -4294,8 +4317,9 @@ async fn interactive_loop(
                 &mut input_interval,
                 &mut slot.streams.data,
                 &mut slot.streams.control,
+                &mut input_ready,
             )
-            .await
+            .await?
         };
         match step {
             // Both channels have reached their final closure.
@@ -4351,6 +4375,7 @@ async fn interactive_loop(
                 if batch.handled > 0 {
                     dirty = true;
                     gate.request_input();
+                    input_ready.defer(&mut input_interval);
                 }
                 let cmds = sessions.active_mut().front.take_session_cmds();
                 for cmd in &cmds {
@@ -4416,16 +4441,25 @@ mod refresh_loop_tests {
         let (_control_tx, mut control) = mpsc::channel(1);
         let mut maintenance = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
         let mut input = tokio::time::interval(INPUT_POLL);
+        let mut input_ready = InputReady::default();
         assert!(
-            next_interactive_step(&mut maintenance, &mut input, &mut data, &mut control)
-                .await
-                .is_none()
+            next_interactive_step(
+                &mut maintenance,
+                &mut input,
+                &mut data,
+                &mut control,
+                &mut input_ready
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         assert!(INPUT_POLL < TICK);
     }
 
     #[tokio::test]
     async fn maintenance_tick_does_not_wait_for_input_poll() {
+        let mut input_ready = InputReady::default();
         let (_data_tx, mut data) = mpsc::channel(1);
         let (_control_tx, mut control) = mpsc::channel(1);
         let mut maintenance = tokio::time::interval(TICK);
@@ -4436,10 +4470,16 @@ mod refresh_loop_tests {
         assert!(matches!(
             tokio::time::timeout(
                 Duration::from_secs(1),
-                next_interactive_step(&mut maintenance, &mut input, &mut data, &mut control)
+                next_interactive_step(
+                    &mut maintenance,
+                    &mut input,
+                    &mut data,
+                    &mut control,
+                    &mut input_ready
+                )
             )
             .await,
-            Ok(Some(LoopStep::Tick))
+            Ok(Ok(Some(LoopStep::Tick)))
         ));
     }
 
@@ -5148,6 +5188,87 @@ mod tests {
                 .any(|line| line.contains("runtime content was truncated"))
         );
         assert!(!front.check_finalized(&runtime).await);
+    }
+
+    #[tokio::test]
+    async fn real_control_outbox_exhaustion_shows_limit_and_truncation() {
+        use nexus_core::{CallCandidate, FinishReason, TurnFinished, Usage, UsageFinality};
+        let mut limits = Limits::m0_test();
+        limits.event_control_capacity = 4;
+        let mut script = (0..8)
+            .map(|index| {
+                ProviderEvent::ToolCallReady(
+                    CallCandidate::new(
+                        format!("item-{index}"),
+                        format!("prov-ref-{index}"),
+                        "host_read",
+                        r#"{"path":"src"}"#,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        script.push(ProviderEvent::TurnFinished(TurnFinished::new(
+            FinishReason::ToolCalls,
+            Usage::new(None, None, UsageFinality::Final),
+            None,
+        )));
+        let config = RuntimeConfig {
+            limits,
+            policy: Policy::m0_test(),
+            has_approval_handler: true,
+        };
+        let tools = vec![ToolRegistration::read(Arc::new(FakeTool::oversized(
+            "host_read",
+            4 * Limits::M0_TEST_TOOL_OUTPUT_BYTES,
+        )))];
+        let (runtime, mut streams) =
+            Runtime::try_new(config, Arc::new(FakeProvider::new(vec![script])), tools).unwrap();
+        let mut front = Frontend::new(session());
+        let command = submit_command(
+            front.next_request(),
+            front.session.clone(),
+            "task",
+            DEMO_PROFILE,
+            false,
+        )
+        .unwrap();
+        let reply = runtime.handle(command).await.0;
+        assert!(front.adopt_accepted(&reply));
+        let run = reply.run().unwrap().clone();
+        // The frontend is paused (e.g. a background slot) until the run ends.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, snapshot) = runtime
+                    .get_snapshot(GetSnapshotCommand {
+                        request: front.next_request(),
+                        run: run.clone(),
+                    })
+                    .await;
+                if snapshot.is_some_and(|s| s.lifecycle() != RunLifecycle::Active) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if absorb(&mut front, event, &mut streams) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(front.merger.is_finalized());
+        assert!(front.check_finalized(&runtime).await);
+        let transcript = front.state.transcript().join("\n");
+        assert!(transcript.contains("LimitReached"), "{transcript}");
+        assert!(transcript.contains("runtime content was truncated"));
+        assert!(exit_warning(&front).unwrap().contains("truncated"));
     }
 
     #[tokio::test]

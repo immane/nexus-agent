@@ -27,6 +27,21 @@ one input batch) appears intact while output continues, then checks draft
 clearing and cancellation. Its ten-second watchdog is a functional deadlock
 bound, not the 100 ms performance acceptance threshold. No live service or
 user credentials are used.
+On Linux the fixture also rejects native-readiness fallback and checks that the
+observer does not change stdin's `O_NONBLOCK` bit. Linux-only `input_ready` unit
+tests cover cancelled waits, stale readiness, later input, batch cooldown and
+hangup errors. Native readiness requires the Linux Tokio I/O driver; other
+platforms retain the periodic input path.
+
+The default `credential_env` regression (macOS and Linux) also needs `cc`,
+which Rust already requires as its linker. It compiles a temporary shim and
+preloads it into the TUI (`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`) to record
+the names, never the values, passed to libc `getenv`. Startup must not look up
+the selected or an unselected provider's credential variable; a submission to
+a loopback listener must look up the selected one. On macOS the shim also
+records `open`, `connect` and process-creation calls: startup must open the
+configuration but no `credentials.json`, internet connection or process. Calls
+that bypass these libc entry points are not observed.
 
 The TUI has an opt-in real-terminal rendering regression (Unix and Python 3):
 

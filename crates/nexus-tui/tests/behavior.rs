@@ -9,6 +9,7 @@ mod cov_state_retention;
 mod cov_state_sequences;
 mod cov_state_viewport;
 mod cov_terminal;
+mod credential_env;
 mod credential_startup;
 mod demo_startup;
 mod discovery_footer;

@@ -34,7 +34,7 @@ def stop_target(proc):
         proc.wait(timeout=5)
 
 
-def check(binary):
+def check(binary, controlling=False):
     stop = threading.Event()
     sent = []
     errors = []
@@ -95,8 +95,17 @@ def check(binary):
                    "TERM": "xterm-256color", "TEST_PROVIDER_KEY": "synthetic",
                    "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
             master, slave = pty.openpty()
+            # A readiness observer must not change the stdin file description
+            # used by Crossterm. Keep an alias to detect flag changes in-child.
+            input_monitor = os.dup(slave)
+            cleanup.callback(os.close, input_monitor)
+            input_flags = fcntl.fcntl(input_monitor, fcntl.F_GETFL)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-            proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave,
+            # The helper acquires the controlling terminal after exec, avoiding
+            # Python preexec_fn in this multithreaded fixture.
+            command = ([sys.executable, __file__, "--controlling-child", binary]
+                       if controlling else [binary])
+            proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
                                     env=env, cwd=root, start_new_session=True)
             cleanup.callback(stop_target, proc)
             os.close(slave)
@@ -122,6 +131,13 @@ def check(binary):
                         del captured[:-65536]
 
             await_condition(lambda: screen.contains("composer (fixed)"), "first frame")
+            observed_flags = fcntl.fcntl(input_monitor, fcntl.F_GETFL)
+            # macOS may add private tty flags during terminal setup. Compare
+            # the shared NONBLOCK bit that reopening/dup-based observers affect.
+            assert observed_flags & os.O_NONBLOCK == input_flags & os.O_NONBLOCK, (
+                "stdin NONBLOCK changed", input_flags, observed_flags)
+            if sys.platform.startswith("linux"):
+                assert not screen.contains("native input readiness unavailable"), "native input fallback"
             assert not termios.tcgetattr(master)[3] & termios.ECHO, "PTY echo must be off"
             os.write(master, b"exercise streaming pressure\r")
             await_condition(lambda: len(sent) >= 32 and screen.contains("stream-"),
@@ -145,6 +161,7 @@ def check(binary):
             assert not errors, errors
             print(json.dumps({"burst_chars": len(marker), "burst_response_ms": elapsed,
                               "provider_fragments": len(sent), "cancelled": True,
+                              "controlling_terminal": controlling,
                               "cancel_response_ms": (time.monotonic() - cancel_started) * 1000}),
                   flush=True)
     finally:
@@ -159,4 +176,9 @@ def check(binary):
 
 
 if __name__ == "__main__":
+    if sys.argv[1] == "--controlling-child":
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        os.execv(sys.argv[2], [sys.argv[2]])
     check(sys.argv[1])
+    if sys.argv[2:] == ["--both"]:
+        check(sys.argv[1], controlling=True)
