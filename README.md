@@ -524,7 +524,7 @@ progress and verified readiness are tracked separately.
 | **M1 — Correctness and lifecycle** | Linux and macOS suites pass for covered paths; escaped-descendant cleanup remains unresolved, so M1 is open. |
 | **M2 — Permissions and platform boundaries** | Linux and macOS filesystem/sandbox reference tests pass; evidence is profile-specific, not a universal guarantee for all Linux filesystems/distributions. |
 | **M3 — Configuration and composition** | Consolidation slices recorded as verified. |
-| **M4 — Internal consolidation** | M4.1–M4.3 implemented, with passing macOS default-feature workspace evidence; the overall gate remains open. |
+| **M4 — Internal consolidation** | M4.1–M4.3 implemented, with passing macOS and Linux default-feature workspace evidence; the overall gate remains open. |
 | **M5 — On-demand extensions** | Additional provider protocols implemented with offline fixtures; external-tool transport and HTTP/TLS replacement remain deferred. |
 
 M1–M5 refer to the [architecture migration stages](docs/tasks/08-architecture-migration.md),

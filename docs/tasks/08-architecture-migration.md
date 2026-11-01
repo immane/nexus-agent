@@ -42,12 +42,12 @@ filesystem race guarantees, or descendant cleanup. M1.4 remains open.
 
 ## Current Linux revalidation — 2026-11-02
 
-The exact PR source commit `b824b2eed446607245935afd198cff25813bc8d2` was
+The exact PR source commit `473019982bb4d1d7ff438ccff313a88281ae10de` was
 exported to a new isolated directory on the Linux reference VM and tested as the
 unprivileged `nexus-test` account. The pre-existing `/home/nexus-test/project`
 snapshot was not modified. Environment: Ubuntu 26.04.1 x86_64, Linux
 `7.0.0-38-generic`, ext4, rustc 1.99.0, cargo 1.99.0, Bubblewrap 0.11.1.
-Machine-readable summary: [`evidence/migration-linux-validation-20261102.json`](evidence/migration-linux-validation-20261102.json).
+Machine-readable summary: [`evidence/migration-linux-validation-20261102.json`](evidence/migration-linux-validation-20261102.json). Logs for this final HEAD run are retained in the isolated directory recorded in that evidence file.
 
 - `cargo fmt --all --check`: passed.
 - `cargo test --workspace --locked --offline -- --test-threads=1`: 2,653

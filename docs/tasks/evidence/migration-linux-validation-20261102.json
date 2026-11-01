@@ -1,8 +1,9 @@
 {
   "schema": "nexus.migration.linux-validation/1",
   "date": "2026-11-02",
-  "source_commit": "b824b2eed446607245935afd198cff25813bc8d2",
-  "remote_work_directory": "/home/nexus-test/linux-m1-m2-20261102-b824b2e",
+  "source_commit": "473019982bb4d1d7ff438ccff313a88281ae10de",
+  "remote_work_directory": "/home/nexus-test/linux-m1-m2-20261102-4730199",
+  "target_directory": "/home/nexus-test/linux-m1-m2-20261102-b824b2e/target",
   "logs_retained": [
     "workspace-tests.log",
     "linux-ignored-tests.log",
