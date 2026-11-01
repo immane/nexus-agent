@@ -3070,6 +3070,151 @@ mod tests {
         }
     }
 
+    /// Serves one request on a loopback socket and returns the raw response.
+    fn loopback_exchange(server: &Arc<Server>, request: &str) -> String {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker_server = Arc::clone(server);
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            worker_server.handle_connection(stream);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(client, "{request} HTTP/1.1\r\nhost: {address}\r\n\r\n").unwrap();
+        let mut wire = String::new();
+        client.read_to_string(&mut wire).unwrap();
+        worker.join().unwrap();
+        wire
+    }
+
+    /// Real tool outcomes exhaust the runtime control outbox while no client is
+    /// attached. An SSE client attaching afterwards receives the contiguous
+    /// retained events and a `limit-reached` terminal naming the control
+    /// budget; the snapshot GET then reports `content_truncated: true`.
+    #[test]
+    fn http_sse_and_snapshot_surface_real_control_outbox_exhaustion() {
+        let (mut server, executor) = server_with_gated_config();
+        server.set_config(UserConfig::default_config(), None);
+        let token = server.create_session().expect("fake session created");
+        let session = server.session(&token).expect("session exists");
+        let mut turn: Vec<ProviderEvent> = (0..8)
+            .map(|index| {
+                ProviderEvent::ToolCallReady(
+                    nexus_core::CallCandidate::new(
+                        format!("item-{index}"),
+                        format!("prov-ref-{index}"),
+                        "host_read",
+                        r#"{"path":"src"}"#,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        turn.push(ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
+            FinishReason::ToolCalls,
+            nexus_core::Usage::new(None, None, nexus_core::UsageFinality::Final),
+            None,
+        )));
+        let mut limits = Limits::m0_test();
+        limits.event_control_capacity = 4;
+        let (runtime, streams) = executor.block_on(async {
+            Runtime::new(
+                RuntimeConfig {
+                    limits,
+                    policy: Policy::m0_test(),
+                    has_approval_handler: true,
+                },
+                Arc::new(FakeProvider::new(vec![turn])),
+                vec![ToolRegistration::read(Arc::new(FakeTool::oversized(
+                    "host_read",
+                    4 * Limits::M0_TEST_TOOL_OUTPUT_BYTES,
+                )))],
+            )
+        });
+        *session.runtime.lock().unwrap() = runtime;
+        *session.data.lock().unwrap() = streams.data;
+        *session.control.lock().unwrap() = streams.control;
+        let command = SubmitCommand::new(
+            session.request_id(),
+            session.session.clone(),
+            "bounded synthetic tool output",
+            "m0-test",
+        )
+        .unwrap();
+        let response = executor.block_on(session.runtime.lock().unwrap().submit(command));
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        let run = response.run().unwrap().clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = server.snapshot(&session, run.as_str()).unwrap();
+            assert_eq!(response.status, 200);
+            let snapshot: Value = serde_json::from_slice(&response.body).unwrap();
+            if snapshot["lifecycle"] != "active" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "paused-consumer run finalizes");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.control.lock().unwrap().len(), 4);
+
+        let server = Arc::new(server);
+        let wire = loopback_exchange(
+            &server,
+            &format!("GET /sessions/{token}/runs/{}/events", run.as_str()),
+        );
+        let (headers, body) = wire.split_once("\r\n\r\n").expect("SSE response");
+        assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+        let sequences = written_sequences(body.as_bytes());
+        assert!(!sequences.is_empty());
+        assert_eq!(
+            sequences,
+            (0..sequences.len() as u64).collect::<Vec<_>>(),
+            "retained outbox events are delivered without gaps"
+        );
+        let frames: Vec<Value> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        let terminal = frames.last().expect("terminal frame");
+        assert_eq!(terminal["kind"], "run-finished");
+        assert_eq!(terminal["detail"]["outcome"], "limit-reached");
+        assert_eq!(
+            terminal["detail"]["error"]["message"],
+            "control event budget exhausted"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["terminal"] == true)
+                .count(),
+            1
+        );
+
+        let wire = loopback_exchange(
+            &server,
+            &format!("GET /sessions/{token}/snapshot?run={}", run.as_str()),
+        );
+        let (headers, body) = wire.split_once("\r\n\r\n").expect("HTTP response");
+        assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+        let snapshot: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(snapshot["outcome"], "limit-reached");
+        assert_eq!(snapshot["content_truncated"], true);
+        println!(
+            "http_control_outbox_exhaustion: sse_frames={} outcome=limit-reached content_truncated=true",
+            frames.len()
+        );
+    }
+
     #[test]
     fn pending_event_bytes_respect_the_byte_budget_and_retain_the_overflow() {
         let run = RunId::new("pending-bytes").expect("valid run");

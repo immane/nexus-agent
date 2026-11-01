@@ -1244,6 +1244,92 @@ mod tests {
     }
 
     #[test]
+    fn real_tool_outputs_exhausting_the_control_outbox_report_a_truncated_limit() {
+        block_on_with_shutdown(
+            async {
+                let mut turn: Vec<_> = (0..8)
+                    .map(|index| {
+                        nexus_core::ProviderEvent::ToolCallReady(
+                            nexus_core::CallCandidate::new(
+                                format!("item-{index}"),
+                                format!("prov-ref-{index}"),
+                                "host_read",
+                                r#"{"path":"src"}"#,
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect();
+                turn.push(nexus_core::ProviderEvent::TurnFinished(
+                    nexus_core::TurnFinished::new(
+                        nexus_core::FinishReason::ToolCalls,
+                        nexus_core::Usage::new(None, None, nexus_core::UsageFinality::Final),
+                        None,
+                    ),
+                ));
+                let mut limits = Limits::m0_test();
+                limits.event_control_capacity = 4;
+                let (runtime, mut streams) = build_runtime(
+                    limits,
+                    Arc::new(FakeProvider::new(vec![turn])),
+                    vec![ToolRegistration::read(Arc::new(FakeTool::oversized(
+                        "host_read",
+                        4 * Limits::M0_TEST_TOOL_OUTPUT_BYTES,
+                    )))],
+                )
+                .expect("runtime");
+                let submit = SubmitCommand::new(
+                    RequestId::new("req-outbox").unwrap(),
+                    SessionId::new("sess-outbox").unwrap(),
+                    "test",
+                    "m0-test",
+                )
+                .unwrap();
+                let run = runtime
+                    .submit(submit)
+                    .await
+                    .run()
+                    .expect("accepted run")
+                    .clone();
+                // Both receivers stay paused until the real runtime finalizes.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let (_, snapshot) = runtime
+                            .get_snapshot(GetSnapshotCommand {
+                                request: RequestId::new("req-poll").unwrap(),
+                                run: run.clone(),
+                            })
+                            .await;
+                        if snapshot
+                            .is_some_and(|s| matches!(s.lifecycle(), RunLifecycle::Finalized(_)))
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("run finalizes");
+                let report = finish_run(&runtime, &mut streams, &run, Duration::from_secs(5))
+                    .await
+                    .expect("report");
+                assert_eq!(report.outcome, RunOutcome::LimitReached);
+                assert_eq!(report.exit_code, 5);
+                assert!(report.truncated, "outbox loss reaches the headless report");
+                assert!(
+                    report
+                        .lines
+                        .last()
+                        .expect("result line")
+                        .contains("outcome=limit-reached")
+                );
+            },
+            SHUTDOWN_TIMEOUT,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn missing_snapshot_is_an_operation_error() {
         block_on_with_shutdown(
             async {

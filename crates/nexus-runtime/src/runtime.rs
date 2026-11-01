@@ -7875,6 +7875,39 @@ mod cov_runtime_private {
         assert!(!control_outbox_fits(CONTROL_OUTBOX_EVENT_LIMIT, 0, 1, true,));
     }
 
+    /// The terminal reserve can always hold the largest representable
+    /// terminal, so outbox exhaustion by non-terminal events can never strand
+    /// a run without its `RunFinished` while the consumer remains attached.
+    #[test]
+    fn largest_terminal_fits_the_reserved_outbox_capacity() {
+        let message = "m".repeat(nexus_core::error::MAX_MESSAGE_LEN);
+        let error = |category| {
+            AgentError::new(category, message.clone(), RetryGuidance::DoNotRetry)
+                .expect("maximum safe message builds")
+        };
+        let terminal = RunFinished::new(
+            RunOutcome::LimitReached,
+            PersistenceState::SaveFailed,
+            Some(error(ErrorCategory::Internal)),
+        )
+        .expect("terminal builds")
+        .with_error(error(ErrorCategory::ResourceLimit));
+        let event = RunEvent::new(
+            SessionId::new("sess-max-terminal").expect("valid"),
+            RunId::new("run-max-terminal").expect("valid"),
+            u64::MAX,
+            EventPayload::RunFinished(terminal),
+        );
+        let bytes = control_event_bytes(&event);
+        assert!(bytes <= CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES, "{bytes}");
+        assert!(control_outbox_fits(
+            CONTROL_OUTBOX_EVENT_LIMIT - 1,
+            CONTROL_OUTBOX_BYTE_LIMIT - CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES,
+            bytes,
+            true,
+        ));
+    }
+
     #[test]
     fn configured_event_capacities_are_the_effective_channel_bounds() {
         let mut limits = Limits::m0_test();

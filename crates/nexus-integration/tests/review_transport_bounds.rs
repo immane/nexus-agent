@@ -288,3 +288,102 @@ fn delivered_sequences_stay_contiguous_under_data_channel_drops() {
         );
     });
 }
+
+/// Real tool outcomes, not injected transport events, exhaust the control
+/// outbox byte budget while the control receiver is paused. The run must end
+/// `LimitReached` with the static budget diagnostic, still deliver exactly one
+/// terminal after the consumer resumes, keep delivered sequences contiguous,
+/// and report the loss through the finalized snapshot.
+#[test]
+fn real_tool_outputs_exhaust_the_control_outbox_with_a_visible_limit() {
+    const CONTROL_CHANNEL: usize = 4;
+    const CALLS: usize = 8;
+    let mut turn: Vec<ProviderEvent> = (0..CALLS)
+        .map(|index| {
+            ProviderEvent::ToolCallReady(common::candidate_with(
+                &format!("item-{index}"),
+                &format!("prov-ref-{index}"),
+                "host_read",
+                r#"{"path":"src"}"#,
+            ))
+        })
+        .collect();
+    turn.push(ProviderEvent::TurnFinished(TurnFinished::new(
+        FinishReason::ToolCalls,
+        Usage::new(None, None, UsageFinality::Final),
+        None,
+    )));
+    let mut config = common::quick_config();
+    config.limits.event_control_capacity = CONTROL_CHANNEL;
+    let rt = common::test_rt();
+    rt.block_on(async {
+        let mut bed = common::make_bed_with_tools(
+            vec![turn, vec![stop_terminal()]],
+            config,
+            nexus_fakes::FakeTool::oversized("host_read", 4 * Limits::M0_TEST_TOOL_OUTPUT_BYTES),
+            nexus_fakes::FakeTool::mutation(),
+        );
+        let response = bed
+            .runtime
+            .submit(common::submit_cmd("outbox-real-tools"))
+            .await;
+        assert_eq!(response.reply(), CommandReply::Accepted);
+        let run = response.run().cloned().expect("run issued");
+
+        // Neither receiver is drained until the run has finalized.
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (reply, snapshot) = bed
+                    .runtime
+                    .get_snapshot(GetSnapshotCommand {
+                        request: RequestId::new("req-outbox-real-poll").unwrap(),
+                        run: run.clone(),
+                    })
+                    .await;
+                assert_eq!(reply.reply(), CommandReply::Accepted);
+                if let Some(snapshot) = snapshot
+                    && snapshot.lifecycle() != RunLifecycle::Active
+                {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("run finalizes with the control receiver paused");
+        assert_eq!(
+            snapshot.lifecycle(),
+            RunLifecycle::Finalized(RunOutcome::LimitReached)
+        );
+        assert!(snapshot.is_content_truncated(), "outbox loss is reported");
+        let control_peak = bed.control.len();
+        assert_eq!(control_peak, CONTROL_CHANNEL);
+
+        let (data, control, finished) =
+            common::drain_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+        assert_eq!(
+            finished.error().map(|error| error.message()),
+            Some("control event budget exhausted")
+        );
+        common::assert_single_terminal(&data, &control);
+        common::assert_contiguous(&data, &control);
+        assert!(control.last().expect("terminal").is_terminal());
+        let delivered_outputs = common::count_payload(&data, &control, |payload| {
+            matches!(payload, EventPayload::ToolFinished(info)
+                if info.outcome.content().len() == Limits::M0_TEST_TOOL_OUTPUT_BYTES)
+        });
+        let executed = bed.read_tool.execution_count();
+        assert!(
+            delivered_outputs < executed && executed < CALLS,
+            "the budget stops dispatch: delivered={delivered_outputs} executed={executed}"
+        );
+        println!(
+            "control_outbox_real_tool_exhaustion: channel_peak={control_peak} \
+             drained_control_events={} outbox_retained_events={} delivered_full_outputs={delivered_outputs} \
+             executed_calls={executed} outcome=limit-reached content_truncated=true",
+            control.len(),
+            control.len() - control_peak,
+        );
+    });
+}
