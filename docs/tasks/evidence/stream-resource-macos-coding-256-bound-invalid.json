@@ -1,0 +1,17 @@
+{
+  "binary": "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui",
+  "binary_sha256": "adcec2e3fb2b8d24751185195f6ddaa2132b43561041c9c1640d1486ce3c2c91",
+  "platform": "macOS /bin/ps process sampling",
+  "workload": "loopback HTTP SSE; finite coding payload through final rendered marker",
+  "finite_chunks": 256,
+  "valid_samples": 0,
+  "invalid_samples": 1,
+  "samples": [
+    {
+      "run": 0,
+      "valid": false,
+      "outcome": "measurement-error",
+      "error": "AssertionError: finite stream did not render its final marker before the window deadline"
+    }
+  ]
+}

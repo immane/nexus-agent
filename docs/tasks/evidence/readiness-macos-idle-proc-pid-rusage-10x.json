@@ -1,0 +1,869 @@
+{
+  "schema": "nexus.perf.readiness/1",
+  "methodology": {
+    "schema": "nexus.perf.readiness/1",
+    "timestamp_utc": "2026-11-01T18:52:48.251701+00:00",
+    "binary": "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui",
+    "binary_sha256": "adcec2e3fb2b8d24751185195f6ddaa2132b43561041c9c1640d1486ce3c2c91",
+    "build_profile": "release-default",
+    "command": [
+      "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+    ],
+    "user_supplied": {
+      "workload": "idle-after-composer",
+      "environment": "isolated-home-and-xdg"
+    },
+    "platform": {
+      "system": "Darwin",
+      "release": "25.3.0",
+      "version": "Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:55 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T8132",
+      "machine": "arm64",
+      "processor": "arm"
+    },
+    "uname": {
+      "sysname": "Darwin",
+      "nodename": "Lams-Mac-mini.local",
+      "release": "25.3.0",
+      "version": "Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:55 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T8132",
+      "machine": "arm64"
+    },
+    "python": "3.9.6",
+    "compiler": {
+      "rustc": null,
+      "rustc_commit": null,
+      "cargo": null
+    },
+    "required_markers": [
+      "composer (fixed)"
+    ],
+    "terminal": {
+      "cols": 120,
+      "rows": 40
+    },
+    "observation": "external PTY output plus OS process facts; no target instrumentation",
+    "cache_state": "warm",
+    "cache_note": "no cache reset attempted; this harness never runs sudo, docker, package installs, or drop_caches",
+    "cold_measurements": "unsupported by design in this harness",
+    "binary_bytes": 5111728,
+    "source_commit": "29c3dfb2c8f2344417a922eba462c6d909361557",
+    "source_dirty": true,
+    "lockfile": "/Volumes/Nayuki/Development/Rust/nexus-agent/Cargo.lock",
+    "lockfile_sha256": "9f2e84476c6562e64809e76e200882b323b1b2a84784ec33e48854692f43fd60",
+    "cache_reset_verified": false
+  },
+  "config": {
+    "mode": "idle",
+    "runs": 10,
+    "timeout_s": 30.0,
+    "ready_timeout_s": 10.0,
+    "idle_window_s": 3.0,
+    "probe_input": false,
+    "probe_command": false,
+    "probe_composer": false,
+    "cancel_timeout_s": 5.0,
+    "cancel_settle_s": 0.15,
+    "cancel_evidence": [
+      "run cancelled",
+      "status: cancelled"
+    ],
+    "cancel_evidence_regex": []
+  },
+  "runs": [
+    {
+      "run_index": 0,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 19.913125,
+        "first_visible_ms": 19.661125,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.003660875,
+        "exited_during_window": false,
+        "cpu_seconds": 0.0,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.0,
+        "rss_samples": 28,
+        "rss_min_sampled_bytes": 3817472,
+        "rss_median_sampled_bytes": 4440064,
+        "rss_max_sampled_bytes": 4538368,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 17,
+          "interrupt_wkups": 364,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3036.181666,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4538368,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54086
+    },
+    {
+      "run_index": 1,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 14.696125,
+        "first_visible_ms": 9.305292,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.011657333,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.33204308771870494,
+        "rss_samples": 27,
+        "rss_min_sampled_bytes": 3817472,
+        "rss_median_sampled_bytes": 3932160,
+        "rss_max_sampled_bytes": 4587520,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 27,
+          "interrupt_wkups": 363,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3056.346917,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4587520,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54203
+    },
+    {
+      "run_index": 2,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 12.852833,
+        "first_visible_ms": 9.446958,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.010956125,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.33212041573671225,
+        "rss_samples": 28,
+        "rss_min_sampled_bytes": 4030464,
+        "rss_median_sampled_bytes": 4063232,
+        "rss_max_sampled_bytes": 4571136,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 15,
+          "interrupt_wkups": 357,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3037.842708,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4571136,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54269
+    },
+    {
+      "run_index": 3,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 12.272375,
+        "first_visible_ms": 7.003542,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.008824291,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.33235573210147284,
+        "rss_samples": 27,
+        "rss_min_sampled_bytes": 3932160,
+        "rss_median_sampled_bytes": 4603904,
+        "rss_max_sampled_bytes": 4685824,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 13,
+          "interrupt_wkups": 360,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3036.981292,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4685824,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54325
+    },
+    {
+      "run_index": 4,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 12.0055,
+        "first_visible_ms": 7.885583,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.0029005,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.33301136684349014,
+        "rss_samples": 27,
+        "rss_min_sampled_bytes": 3932160,
+        "rss_median_sampled_bytes": 4554752,
+        "rss_max_sampled_bytes": 4603904,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 26,
+          "interrupt_wkups": 363,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3035.829417,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4603904,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54379
+    },
+    {
+      "run_index": 5,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 6.771125,
+        "first_visible_ms": 3.571333,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.0054965,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.332723728009665,
+        "rss_samples": 27,
+        "rss_min_sampled_bytes": 4341760,
+        "rss_median_sampled_bytes": 4587520,
+        "rss_max_sampled_bytes": 4653056,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 11,
+          "interrupt_wkups": 361,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3028.1775,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4653056,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54448
+    },
+    {
+      "run_index": 6,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 7.148084,
+        "first_visible_ms": 4.031917,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.000189166,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.3333123162141303,
+        "rss_samples": 27,
+        "rss_min_sampled_bytes": 3883008,
+        "rss_median_sampled_bytes": 4571136,
+        "rss_max_sampled_bytes": 4653056,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 28,
+          "interrupt_wkups": 364,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3012.61875,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4653056,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54501
+    },
+    {
+      "run_index": 7,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 10.78725,
+        "first_visible_ms": 5.902375,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.011918083,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.3320143418389244,
+        "rss_samples": 27,
+        "rss_min_sampled_bytes": 3948544,
+        "rss_median_sampled_bytes": 3981312,
+        "rss_max_sampled_bytes": 4571136,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 29,
+          "interrupt_wkups": 358,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3035.940959,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4571136,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54574
+    },
+    {
+      "run_index": 8,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 12.55275,
+        "first_visible_ms": 7.632334,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.012729875,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.33192487925921343,
+        "rss_samples": 28,
+        "rss_min_sampled_bytes": 3932160,
+        "rss_median_sampled_bytes": 4046848,
+        "rss_max_sampled_bytes": 4554752,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 26,
+          "interrupt_wkups": 364,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3056.390125,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4587520,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54626
+    },
+    {
+      "run_index": 9,
+      "argv": [
+        "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "observed-frame-ready",
+        "ms": 19.088209,
+        "first_visible_ms": 10.863875,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": {
+        "status": "observed",
+        "window_s": 3.004429583,
+        "exited_during_window": false,
+        "cpu_seconds": 0.01,
+        "cpu_method": "ps -o time= (cumulative)",
+        "idle_cpu_percent": 0.33284188308433393,
+        "rss_samples": 27,
+        "rss_min_sampled_bytes": 3915776,
+        "rss_median_sampled_bytes": 3997696,
+        "rss_max_sampled_bytes": 4636672,
+        "rss_peak_sampled_bytes": null,
+        "context_switches": null,
+        "wakeups": {
+          "status": "observed",
+          "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+          "pkg_idle_wkups": 23,
+          "interrupt_wkups": 363,
+          "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events"
+        }
+      },
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 0,
+        "signal": null,
+        "elapsed_ms": 3039.411042,
+        "cleanup": {
+          "method": "quit-keys",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 4636672,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 3815,
+        "total_bytes": 3815,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 54695
+    }
+  ],
+  "summary": {
+    "runs": 10,
+    "outcomes": {
+      "ok": 10
+    },
+    "ready_ms": {
+      "n": 10,
+      "p50_ms": 12.272375,
+      "p95_ms": 19.913125,
+      "max_ms": 19.913125
+    },
+    "cleanup_escalations": 0,
+    "scope_note": "PTY-observed startup readiness plus live idle/RSS and external cancellation observation only; not the full P7 evidence set",
+    "idle": [
+      {
+        "run_index": 0,
+        "status": "observed",
+        "idle_cpu_percent": 0.0,
+        "window_s": 3.003660875
+      },
+      {
+        "run_index": 1,
+        "status": "observed",
+        "idle_cpu_percent": 0.33204308771870494,
+        "window_s": 3.011657333
+      },
+      {
+        "run_index": 2,
+        "status": "observed",
+        "idle_cpu_percent": 0.33212041573671225,
+        "window_s": 3.010956125
+      },
+      {
+        "run_index": 3,
+        "status": "observed",
+        "idle_cpu_percent": 0.33235573210147284,
+        "window_s": 3.008824291
+      },
+      {
+        "run_index": 4,
+        "status": "observed",
+        "idle_cpu_percent": 0.33301136684349014,
+        "window_s": 3.0029005
+      },
+      {
+        "run_index": 5,
+        "status": "observed",
+        "idle_cpu_percent": 0.332723728009665,
+        "window_s": 3.0054965
+      },
+      {
+        "run_index": 6,
+        "status": "observed",
+        "idle_cpu_percent": 0.3333123162141303,
+        "window_s": 3.000189166
+      },
+      {
+        "run_index": 7,
+        "status": "observed",
+        "idle_cpu_percent": 0.3320143418389244,
+        "window_s": 3.011918083
+      },
+      {
+        "run_index": 8,
+        "status": "observed",
+        "idle_cpu_percent": 0.33192487925921343,
+        "window_s": 3.012729875
+      },
+      {
+        "run_index": 9,
+        "status": "observed",
+        "idle_cpu_percent": 0.33284188308433393,
+        "window_s": 3.004429583
+      }
+    ]
+  }
+}

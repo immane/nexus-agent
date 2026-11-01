@@ -1,4 +1,4 @@
-# Startup measurement harness
+# Performance measurement tools
 
 Generic, dependency-free (Python 3 stdlib only) harness that measures
 fresh-process startup for **any** binary path passed as an argument. It
@@ -27,6 +27,49 @@ Options: `binary [-- args...]`, `-n/--runs` (launches per mode),
 `--build-profile` (a label recorded in the methodology header; the script
 cannot detect it). These original flags keep their names and meanings.
 `--json PATH` is additive and writes the machine-readable record.
+
+## Loopback streaming TUI resources
+
+`measure_tui_stream_resources.py` runs a local Chat Completions-compatible SSE
+fixture and samples a TUI process while it streams, then verifies cancellation.
+It supports Linux and macOS and never contacts a live provider:
+
+```sh
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --window 3 --sample-interval 0.1 --output stream-resources.json
+
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --finite-chunks 128 --sample-interval 0.05 --output finite-stream.json
+
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --finite-chunks 128 --payload-profile coding \
+  --sample-interval 0.05 --output coding-stream.json
+```
+
+RSS samples are platform-qualified: Linux reads `/proc` RSS and `VmHWM`; macOS
+samples `/bin/ps` RSS, so its maximum is a sampled peak, not a kernel high-water
+mark. Linux CPU is a `/proc` tick delta over the stream window. macOS retains
+OS-reported `ps %cpu` readings but does not interpret them as a window CPU
+delta. The fixture's chunks-per-second value is the local server emission rate,
+not a claim about application-consumed token or render throughput. The harness
+also observes increasing numbered content on the rendered PTY screen and reports
+the observed visible-marker advance rate separately. That rate covers only the
+first-to-last observed advance; if presentation reaches a configured retention
+bound, it is not sustained throughput. This is a rendered-output signal for the
+visible viewport, not proof that every generated chunk was consumed or rendered.
+The JSON distinguishes `viewport_scrollback_visible` (content above the current
+screen viewport) from `entry_output_truncation_visible` (the per-entry byte-cap
+marker); the former alone does not mean retained content was dropped.
+With `--finite-chunks N` (N >= 32), the fixture sends one finite response and
+the harness waits for its final numbered marker to appear in the PTY. It reports
+`visible_completion_chunks_per_s` from first fixture chunk to that rendered
+marker; this is a measured end-to-end rate for that finite test payload. Every
+run is retained; invalid runs are recorded and make the command exit nonzero.
+The `coding` profile emits a deterministic Rust patch-review response split
+across the requested chunks; it exercises multiline markdown/code rendering,
+not tool execution or a real model response.
+
+## Startup harness
 
 `--timeout` must be positive and finite; zero, negative, NaN, and infinite
 values are rejected. It bounds both each target launch and each purge run.
@@ -264,7 +307,9 @@ whole-machine wakeups, wakeups caused by the target, or a census of threads
 that start and stop between snapshots. Temporary HOME and cwd do not confine
 the target's filesystem or network access; use a dedicated user and VM.
 Interruptions such as SIGKILL or machine failure can prevent cleanup. Results
-are not comparable to the readiness harness's unsupported wakeup field.
+are not comparable to the readiness harness's macOS-only
+`proc_pid_rusage` package-idle and interrupt counters. Linux readiness wakeups
+remain unsupported; the tracefs event count is a separate privileged measure.
 
 ## Tests
 

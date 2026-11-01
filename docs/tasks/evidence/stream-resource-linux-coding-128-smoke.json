@@ -1,0 +1,41 @@
+{
+  "binary": "/home/nexus-test/m0-resume-20261101-1307/target/release/nexus-tui",
+  "binary_sha256": "e167381a61ede02e3aff791093acfa98803244165b918bf6a76552417485191a",
+  "platform": "Linux /proc process sampling",
+  "workload": "loopback HTTP SSE; finite coding payload through final rendered marker",
+  "finite_chunks": 128,
+  "valid_samples": 1,
+  "invalid_samples": 0,
+  "samples": [
+    {
+      "run": 0,
+      "valid": true,
+      "outcome": "final-marker-rendered",
+      "window_s": 0.159701081,
+      "provider_chunks_sent": 128,
+      "provider_requests": 1,
+      "payload_profile": "coding",
+      "payload_bytes": 4470,
+      "sample_count": 4,
+      "sample_interval_s": 0.05,
+      "rss_min_kib": 6868,
+      "rss_median_kib": 6896,
+      "rss_max_sampled_kib": 6908,
+      "rss_peak_method": "/proc VmHWM; current RSS sampling paced by monotonic interval",
+      "first_chunk_to_final_marker_s": 0.159701081,
+      "visible_completion_chunks_per_s": 801.4973924941686,
+      "visible_progress_observations": 1,
+      "viewport_scrollback_visible": true,
+      "entry_output_truncation_visible": false,
+      "visible_progress_method": "insufficient distinct numbered content observations",
+      "sample_gap_min_ms": 0.289588,
+      "sample_gap_median_ms": 50.69531,
+      "sample_gap_max_ms": 50.792687,
+      "vm_hwm_max_sampled_kib": 6908,
+      "cpu_seconds_sampled": 0.01,
+      "cpu_percent_sampled": 6.261698378860691,
+      "cpu_measurement_method": "delta of /proc CPU ticks over stream window",
+      "cpu_clock_ticks_per_second": 100
+    }
+  ]
+}

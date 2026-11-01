@@ -1,0 +1,17 @@
+{
+  "binary": "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui",
+  "binary_sha256": "adcec2e3fb2b8d24751185195f6ddaa2132b43561041c9c1640d1486ce3c2c91",
+  "platform": "macOS /bin/ps process sampling",
+  "workload": "loopback HTTP SSE; finite coding payload through final rendered marker",
+  "finite_chunks": 64,
+  "valid_samples": 0,
+  "invalid_samples": 1,
+  "samples": [
+    {
+      "run": 0,
+      "valid": false,
+      "outcome": "measurement-error",
+      "error": "AssertionError: ('finite stream did not render its final marker before the window deadline', None, (1696413811133083, 63), bytearray(b'     \\x1b[29;28H \\x1b[29;30H      \\x1b[29;37H                        \\x1b[29;62H \\x1b[30;3H// Validate\\x1b[30;15Hgenerated\\x1b[30;25Hpatch\\x1b[30;31Hsection\\x1b[30;39H14\\x1b[30;42Hbefore\\x1b[30;49Hstaging.\\x1b[31;3Hpub\\x1b[31;7Hfn\\x1b[31;10Hvalidate_section_14(path:\\x1b[31;36H&str)\\x1b[31;42H->\\x1b[31;45HResult<(),\\x1b[31;56HTargetError>\\x1b[31;69H{\\x1b[32;3H[output\\x1b[32;11Htruncated\\x1b[32;21Hto\\x1b[32;24Hpresentation\\x1b[32;37Hbound]\\x1b[33;3H  \\x1b[33;6H        \\x1b[33;15H         \\x1b[33;25H     \\x1b[33;31H       \\x1b[33;39H  \\x1b[33;42H      \\x1b[33;49H        \\x1b[34;1H\\x1b[38;5;8m\\x1b[49msystem\\x1b[39m\\x1b[49m  \\x1b[34;10H                         \\x1b[34;36H     \\x1b[34;42H  \\x1b[34;45H          \\x1b[34;56H            \\x1b[34;69H \\x1b[35;3Hrun rff9d00d1b60031c7-1 fi\\x1b[35;30Hished:\\x1b[35;37HC\\x1b[35;39Hmpleted\\x1b[35;47H(source\\x1b[35;55Hhistory\\x1b[35;63Hsaved)\\x1b[40;75H\\x1b[38;5;8m\\x1b[49mfinished: Completed\\x1b[39m\\x1b[49m\\x1b[0m\\x1b[?25l\\x1b[38;2H\\x1b[2mT\\x1b[39m\\x1b[49m\\x1b[0m\\x1b[?25l\\x1b[38;2H\\x1b[7m\\x1b[2mT\\x1b[39m\\x1b[49m\\x1b[0m\\x1b[?25l\\x1b[38;2H\\x1b[2mT\\x1b[39m\\x1b[49m\\x1b[0m\\x1b[?25l\\x1b[38;2H\\x1b[7m\\x1b[2mT\\x1b[39m\\x1b[49m\\x1b[0m\\x1b[?25l\\x1b[38;2H\\x1b[2mT\\x1b[39m\\x1b[49m\\x1b[0m\\x1b[?25l\\x1b[38;2H\\x1b[7m\\x1b[2mT\\x1b[39m\\x1b[49m\\x1b[0m\\x1b[?25l'))"
+    }
+  ]
+}

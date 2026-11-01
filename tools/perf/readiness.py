@@ -20,8 +20,9 @@ Measured, in this harness's own vocabulary:
 - idle CPU / RSS high-water: sampled only while the target stays alive
   after observed-frame-ready. RSS high-water comes from os.wait4 rusage on
   the directly waited child; live RSS sampling uses /proc on Linux and ps
-  on macOS. Wakeup accounting is explicitly unsupported: no privileged
-  tooling (no root, no powermetrics) is used.
+  on macOS. macOS wakeups use unprivileged per-process counters from
+  proc_pid_rusage; Linux scheduler wakeups remain unsupported here (the
+  separate tracefs experiment requires privilege).
 - cancellation observation: only if the target is still alive after
   observed-frame-ready. A marker time is reported only when explicit
   post-cancel evidence appears: by default the case-insensitive terminal
@@ -61,6 +62,7 @@ unreaped target), 2 usage error.
 
 import argparse
 import codecs
+import ctypes
 import errno
 import hashlib
 import json
@@ -879,13 +881,56 @@ def _context_switch_delta(first, second):
     }
 
 
-def _idle_supported_note():
+def _idle_unsupported_note(reason):
     return {
         "status": "unsupported",
-        "reason": (
-            "unprivileged wakeup counting is not implemented; this harness never "
-            "uses root or privileged tooling"
-        ),
+        "reason": reason,
+    }
+
+
+def sample_darwin_wakeups(pid):
+    """Read Apple per-process package-idle and interrupt wakeup counters."""
+    if sys.platform != "darwin":
+        return _idle_unsupported_note("Apple proc_pid_rusage is macOS-only")
+    # rusage_info_v4 is 16 bytes of UUID followed by 36 uint64 fields (304 B).
+    # The two counters are fields 3 and 4, immediately after user/system time.
+    info_size = 16 + 36 * ctypes.sizeof(ctypes.c_uint64)
+    info = ctypes.create_string_buffer(info_size)
+    try:
+        proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        query = proc.proc_pid_rusage
+        query.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+        query.restype = ctypes.c_int
+        if query(pid, 4, ctypes.cast(info, ctypes.c_void_p)) != 0:
+            error = ctypes.get_errno()
+            detail = os.strerror(error) if error else "system error unavailable"
+            return _idle_unsupported_note(
+                f"proc_pid_rusage(RUSAGE_INFO_V4) failed: {detail}"
+            )
+    except (AttributeError, OSError) as exc:
+        return _idle_unsupported_note(f"proc_pid_rusage unavailable: {exc}")
+    values = (ctypes.c_uint64 * 2).from_buffer(info, 16 + 2 * 8)
+    return {
+        "status": "observed",
+        "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+        "pkg_idle_wkups": int(values[0]),
+        "interrupt_wkups": int(values[1]),
+    }
+
+
+def _idle_wakeup_delta(first, second):
+    if first.get("status") != "observed" or second.get("status") != "observed":
+        return second if second.get("status") != "observed" else first
+    package = second["pkg_idle_wkups"] - first["pkg_idle_wkups"]
+    interrupt = second["interrupt_wkups"] - first["interrupt_wkups"]
+    if package < 0 or interrupt < 0:
+        return _idle_unsupported_note("per-process counters decreased during sample")
+    return {
+        "status": "observed",
+        "method": second["method"],
+        "pkg_idle_wkups": package,
+        "interrupt_wkups": interrupt,
+        "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events",
     }
 
 
@@ -1186,6 +1231,7 @@ def run_measurement(cfg, argv, run_index=0):
         if ready_ms is not None and cfg.mode == "idle":
             wall_start_ns = time.monotonic_ns()
             cpu_first = sample_cpu(target.pid)
+            wakeups_first = sample_darwin_wakeups(target.pid)
             rss_samples = []
             peak_sampled = None
             window_end_ns = min(
@@ -1216,6 +1262,7 @@ def run_measurement(cfg, argv, run_index=0):
                     peak_sampled = max(peak_sampled or 0, rss["peak_rss_bytes"])
             wall_end_ns = time.monotonic_ns()
             cpu_second = sample_cpu(target.pid)
+            wakeups_second = sample_darwin_wakeups(target.pid)
             window_s = (wall_end_ns - wall_start_ns) / 1e9
             cpu_seconds = None
             if cpu_first.get("available") and cpu_second.get("available"):
@@ -1246,7 +1293,7 @@ def run_measurement(cfg, argv, run_index=0):
                 "rss_max_sampled_bytes": sorted_rss[-1] if sorted_rss else None,
                 "rss_peak_sampled_bytes": peak_sampled,
                 "context_switches": _context_switch_delta(cpu_first, cpu_second),
-                "wakeups": _idle_supported_note(),
+                "wakeups": _idle_wakeup_delta(wakeups_first, wakeups_second),
             }
 
         if ready_ms is not None and cfg.mode == "cancel":
