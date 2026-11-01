@@ -74,6 +74,18 @@ Measure the accepted default: a new conversation, no automatic restoration, no b
 
 Reuse connections and immutable configuration. Prefer direct built-in tool calls, bounded buffers, and ownership transfer over repeated whole-history cloning. Batch presentation deltas without losing text or delaying control traffic.
 
+TUI streaming and maintenance redraws use the configured minimum redraw
+interval (33 ms by default). Processed terminal input batches and newly applied
+terminal outcomes request an immediate frame instead of waiting for that stream
+budget. Terminal outcomes are merged/drained in order before presentation;
+completion and cancellation feedback must not wait behind a preceding input
+frame. Input is still
+polled every 20 ms with a bounded batch; there is no extra timer or input thread.
+After an input frame, the normal stream budget starts from that frame, avoiding
+a duplicate stream redraw in the same iteration. A busy input source can
+therefore cause more frames than the stream-only rate; measure that workload
+separately from idle and output-only rendering.
+
 Do not introduce a dependency per model vendor, a runtime per component, or an internal service to connect built-in modules. Avoid full-history parsing or layout for every token. Establish a regression baseline before changing allocator, dispatch, or compiler strategies.
 
 Evaluate stripping, link-time optimization, feature reduction, allocator choices, and dispatch representation with measurements. A smaller binary is not automatically faster, and aggressive compiler settings can increase development cost or regress runtime behavior.

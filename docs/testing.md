@@ -21,6 +21,12 @@ integration modules in these packages must be added to `tests/behavior.rs`;
 automatic test target discovery is disabled in their manifests.
 The default Unix TUI suite also requires Python 3 for its pseudo-terminal
 credential-startup regression; it uses an isolated FIFO and loopback listener.
+The default `input_pressure` regression also uses Python 3, a real PTY and a
+loopback-only SSE provider. It verifies that an 80-character burst (larger than
+one input batch) appears intact while output continues, then checks draft
+clearing and cancellation. Its ten-second watchdog is a functional deadlock
+bound, not the 100 ms performance acceptance threshold. No live service or
+user credentials are used.
 
 The TUI has an opt-in real-terminal rendering regression (Unix and Python 3):
 

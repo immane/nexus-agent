@@ -3197,22 +3197,27 @@ pub enum ViewportLandmark {
 /// Event-driven redraw gate with a maximum rate: stream deltas call
 /// [`RefreshGate::request`], and [`RefreshGate::ready`] stays false until
 /// the frame budget elapsed, so saturated output coalesces instead of
-/// forcing a full-history relayout per delta.
+/// forcing a full-history relayout per delta. Bounded terminal input batches
+/// use [`RefreshGate::request_input`] to avoid delaying local feedback, and
+/// newly applied terminal outcomes use [`RefreshGate::request_terminal`].
 #[derive(Debug)]
 pub struct RefreshGate {
     min_interval: Duration,
     last_draw: Option<Instant>,
     pending: bool,
+    immediate: bool,
 }
 
 impl RefreshGate {
-    /// Builds a gate redrawing at most once per `min_interval`.
+    /// Coalesces ordinary redraws to `min_interval`; input/terminal requests
+    /// may bypass that interval without changing the following frame budget.
     #[must_use]
     pub fn new(min_interval: Duration) -> Self {
         Self {
             min_interval,
             last_draw: None,
             pending: false,
+            immediate: false,
         }
     }
 
@@ -3227,18 +3232,34 @@ impl RefreshGate {
         self.pending = true;
     }
 
-    /// True when a redraw is both requested and within budget.
+    /// Presents a processed input batch without waiting for streaming redraws.
+    /// Callers must bound input processing separately from event ingestion.
+    pub fn request_input(&mut self) {
+        self.pending = true;
+        self.immediate = true;
+    }
+
+    /// Presents a newly applied terminal outcome without delaying completion
+    /// or cancellation feedback behind the preceding input/stream frame.
+    pub fn request_terminal(&mut self) {
+        self.pending = true;
+        self.immediate = true;
+    }
+
+    /// True for a requested input/terminal frame, or an ordinary frame within budget.
     pub fn ready(&mut self, now: Instant) -> bool {
         if !self.pending {
             return false;
         }
-        !matches!(self.last_draw, Some(last) if now.duration_since(last) < self.min_interval)
+        self.immediate
+            || !matches!(self.last_draw, Some(last) if now.duration_since(last) < self.min_interval)
     }
 
     /// Records a completed redraw.
     pub fn mark_drawn(&mut self, now: Instant) {
         self.last_draw = Some(now);
         self.pending = false;
+        self.immediate = false;
     }
 }
 

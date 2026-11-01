@@ -50,6 +50,176 @@ including the current startup and transport regression tests. This evidence is n
 full optional-feature run or a production security certification. A passing
 warm-cache sample is not a cold-cache result or an accepted baseline.
 
+### Linux input-feedback optimization — 2026-11-01
+
+The current TUI separates processed terminal input feedback from stream redraw
+coalescing. Input batches request an immediate frame; streaming/maintenance
+updates retain the configured 33 ms default interval. Input polling remains
+20 ms, with the existing per-batch bound and no new timer or thread. A successful
+input frame restarts the stream budget, and a failed draw retains its immediate
+request. Sandbox probing, authorization and default build features are unchanged.
+This shared frontend behavior also applies on macOS.
+
+Before the additional sustained-pressure regression, affected config/TUI suites
+passed 643 tests with 11 skipped/ignored on each platform; all-target package
+Clippy and formatting passed, and Linux default release built successfully.
+The added deterministic regression models 1,001 stream updates and 51 processed
+input batches over one second: exactly 51 frames are drawn, no duplicate frame
+remains ready, and stream-only throttling resumes after input stops. This models
+gate behavior, not measured scheduler cadence or end-to-end typing under load.
+The latest macOS affected-package rerun passed 644 tests with 11 skipped;
+all seven refresh-loop tests and all-target package Clippy passed.
+Linux subsequently passed all seven refresh-loop tests, including the new
+pressure model, followed by affected-package all-target Clippy and formatting.
+
+Linux default release is 5,920,400 bytes, SHA-256
+`fd8f9cb6993086baa8765859c6ef03318dda652725effc6f58f7a506633e37c4`.
+The same-method serial comparison retained both launchers and all samples:
+
+| Launcher/profile | Responses | Spawn-to-response p50/p95/max (ms) | Frame-ready p50/p95/max (ms) |
+| --- | --- | --- | --- |
+| Named-user `setpriv`, warm | 30/30 | 30.711/33.109/39.867 | 11.118/13.559/19.202 |
+| Named-user `setpriv`, cache-prepared | 30/30 | 113.911/121.130/122.358 | 94.110/101.473/102.281 |
+| Minimal permanent-drop helper, warm | 30/30 | 28.774/30.013/30.961 | 9.169/10.310/11.417 |
+| Minimal permanent-drop helper, cache-prepared | 30/30 | 85.372/98.104/103.149 | 65.508/78.441/84.341 |
+
+Named-user warm p95 improved from 52.528 to 33.109 ms; cache-prepared p95
+improved from 138.432 to 121.130 ms, but all 30 prepared responses still exceed
+100 ms. Minimal-launcher prepared p95 improved from 112.380 to 98.104 ms, with
+one response still above 100 ms. This diagnostic method does not replace the
+original launcher or establish M0 acceptance. Observed input-response p95 was
+19.800–20.589 ms across the four batches, versus the prior approximately
+38–40 ms post-frame response. Frame-ready changes between separate batches are
+not attributed to this input-only scheduling change.
+
+Each prepared batch verified all 1,446 executable pages nonresident before each
+of 30 attempts. This remains executable-page verification, not proof of every
+library, metadata, CPU or device cache state. All 140 startup/idle sessions
+reported successful outcomes and no cleanup escalation. Raw JSON, logs and
+residency records are retained under Linux
+`evidence/m0-resume-measurements-input-priority{,-minimal}` and copied to the
+local session temporary evidence directory; preceding baselines are preserved.
+
+Ten three-second idle windows per launcher sampled 120 RSS values each.
+Named-user CPU ranged 0.333–1.329% (median 0.333%); RSS median of per-run medians
+was 6,027,264 bytes, maximum sample 6,123,520 bytes. Minimal-launcher CPU ranged
+0.333–0.667% (median 0.500%); corresponding RSS values were 5,992,448 and
+6,139,904 bytes. The CPU outlier is retained. These short coarse-resolution
+observations do not establish a resource improvement or peak-workload budget.
+An isolated tracefs rerun recorded 225 target-TID scheduler wakeups in each of
+three three-second idle windows (74.989–74.991/s), consistent with the preceding
+approximately 74.99/s observation. Thread snapshots were unchanged, trace-loss
+counters did not increase, all targets were reaped, and temporary homes and the
+trace instance were removed. Raw `evidence/m0-input-priority-wakeups.json` is
+also copied locally. This is not a whole-system or short-lived-thread census.
+Representative peak resources and the independent buffer/startup-side-effect
+gates remain unverified. A subsequent bounded PTY pressure fixture is recorded
+below; it does not cover every sustained workload.
+
+### Follow-up startup and input-pressure checks — 2026-11-01
+
+An instrumented named-user-launcher prepared-cache run used the input-priority
+default executable above. It completed with no cleanup escalation; observed
+frame/response were 218.820/239.510 ms. Tracing itself adds substantial overhead,
+so these are diagnostic observations, not acceptance timings. In that trace,
+target `execve` began about 45.969 ms after launcher `execve`; the target's first
+configuration-file open occurred about 32.757 ms later. Those intervals include
+instrumentation, page faults and scheduling, not just measured CPU work. The
+trace and sample remain under `evidence/m0-resume-measurements-input-priority-trace`
+and were copied locally; a recursive copy timed out, but the local trace contains
+the final successful process exit and the JSON/log records are present.
+
+An evidence-only build tried `CARGO_PROFILE_RELEASE_LTO=thin` and
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`, leaving dependencies, features, panic
+handling and security behavior unchanged. It built in 56 seconds and reduced
+the executable from 5,920,400 to 4,636,696 bytes (SHA-256
+`ff14df47f5499694d76591e97dbefb0c2e56221698f2af0b9504e93b44e468eb`).
+
+| ThinLTO diagnostic profile | Responses | Spawn-to-response p50/p95/max (ms) |
+| --- | --- | --- |
+| Named-user launcher, warm | 30/30 | 31.041/34.659/37.100 |
+| Named-user launcher, cache-prepared | 30/30 | 109.430/116.502/120.108 |
+| Minimal launcher, warm | 30/30 | 28.966/31.213/31.260 |
+| Minimal launcher, cache-prepared | 30/30 | 81.795/99.444/99.996 |
+
+All 140 startup/idle sessions succeeded without cleanup escalation. Each
+prepared batch verified 1,133 executable pages nonresident in all 30 attempts;
+this does not verify all other cache state. This does
+not close the original launcher timing gate: prepared p95 remains 116.502 ms,
+and the diagnostic minimal-launcher p95 did not improve versus 98.104 ms.
+The release-profile experiment was **not adopted**. The experimental executable
+and raw samples are preserved under `evidence/m0-input-priority-thin-lto-nexus-tui`
+and `evidence/m0-resume-measurements-input-priority-lto{,-minimal}`, with the
+measurement directories copied locally. The default release was rebuilt after
+the additional test-only source changes.
+
+`input_pressure::composer_input_and_cancel_progress_under_streaming_output`
+now runs in the registered default TUI behavior target on Unix. Its isolated
+loopback SSE provider emits bounded traffic while a real 120x40 PTY receives an
+80-character random burst, exceeding the 32-key batch limit. It verifies the
+whole ordered token with PTY echo disabled, subsequent visible stream progress,
+draft clearing and a visible `Cancelled` outcome. The provider is a local test
+double, not a live-model call. The watchdog is a functional bound, not a 100 ms
+performance assertion. macOS affected-package nextest passed 645 tests with
+11 skipped; Linux affected-package tests passed 645 with 11 ignored. Both
+all-target package Clippy and format checks passed. Linux default-release PTY
+pressure also passed (one burst 51.764 ms, cancellation feedback 59.680 ms), not
+an accepted latency percentile. Full workspace/optional-feature suites have not
+been rerun for these additional test-only changes.
+
+An alternating ten-attempt-per-profile Linux default-release comparison then
+confirmed intact input and visible cancellation for all 20 attempts, but exposed
+a presentation tradeoff: input-only priority improved the 80-character burst
+from roughly 67 ms to 51 ms while typical cancellation feedback changed from
+roughly 35 ms to 60 ms. Raw `evidence/m0-input-pressure-comparison.json` is
+retained remotely and locally. The input-only binary in that comparison was
+5,920,448 bytes, SHA-256
+`6195ecbdffabc222a263e9078f0891ac2b2be69eacabd5bbe165684661f11a52`;
+the preceding default build was rebuilt after test-only source line changes.
+
+To avoid that regression, newly merged terminal outcomes now request an
+immediate frame as well, both on event absorption and maintenance gap flushing.
+Preceding events are still drained/merged first, normal streaming keeps its
+33 ms budget, and no extra timer/thread or channel bypass is introduced. A
+deterministic regression covers a terminal frame immediately following input,
+failed-frame retry, no duplicate draw and resumption of ordinary throttling.
+macOS affected config/TUI tests passed 646 with 11 skipped, followed by package
+all-target Clippy and diff checks.
+Linux subsequently passed the same 646 affected-package tests with 11 ignored,
+all-target package Clippy, formatting and the default release rebuild. macOS
+default release built and its PTY pressure fixture passed as well (one burst
+59.621 ms, cancellation feedback 26.177 ms).
+
+The subsequent Linux alternating three-profile comparison retained ten attempts
+per profile, all passing:
+
+| Default-release profile | 80-character burst median/max (ms) | Cancellation feedback median/max (ms) |
+| --- | --- | --- |
+| Before input priority | 67.280/67.825 | 35.944/54.514 |
+| Input priority only | 51.643/52.903 | 59.956/60.559 |
+| Input and terminal priority | 51.531/52.201 | 21.937/22.546 |
+
+These are bounded loopback-traffic observations, not a universal throughput or
+latency guarantee. Raw `evidence/m0-input-pressure-comparison-terminal-priority.json`
+contains all 30 attempts and executable hashes, and is copied locally. A final
+Linux process-name check found no surviving `nexus-tui` processes.
+
+The latest Linux default executable is 5,920,392 bytes, SHA-256
+`f8f79fc74c916943505a87c4f2c25019fa25e87c7f42b9bf47e8bd2de4e3f150`.
+Named-user-launcher warm startup observed 30/30 responses with spawn-to-response
+p50/p95/max 30.900/32.986/39.652 ms, frame-ready 11.349/13.154/19.177 ms.
+Prepared-cache startup observed 30/30 responses with corresponding times
+114.099/119.654/122.309 ms and 94.476/101.065/102.635 ms. Every preparation again
+verified zero resident pages out of 1,446 executable pages. Ten three-second
+idle windows had CPU 0.333–0.667% (median 0.667%); 120 RSS samples had median of
+per-run medians 5,982,208 bytes and maximum 6,037,504 bytes. All 70 sessions
+succeeded with no cleanup escalation. Raw files under
+`evidence/m0-resume-measurements-input-priority-terminal-priority` are copied
+locally. **The prepared response still exceeds 100 ms; M0 remains not accepted.**
+These reruns do not close complete cold-cache scope, representative peak resource
+coverage, or independent buffer/startup-side-effect gates. Full workspace and
+optional-feature suites have not been rerun after the terminal-priority change.
+
 ## Per-Stage Exit Criteria
 
 - P0: accepted M0 semantic subset recorded; deferred items listed; no code reviewed against unaccepted semantics.

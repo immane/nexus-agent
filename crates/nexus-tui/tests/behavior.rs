@@ -14,6 +14,7 @@ mod demo_startup;
 mod discovery_footer;
 mod file_tool_presentation;
 mod history_startup;
+mod input_pressure;
 #[cfg(feature = "demo")]
 mod pty_render;
 mod startup_failure;

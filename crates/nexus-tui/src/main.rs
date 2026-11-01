@@ -4326,7 +4326,9 @@ async fn interactive_loop(
                 // iteration: drawing here as well would paint terminal
                 // outcomes twice in one pass under output load.
                 let slot = sessions.active_mut();
-                absorb(&mut slot.front, *event, &mut slot.streams);
+                if absorb(&mut slot.front, *event, &mut slot.streams) {
+                    gate.request_terminal();
+                }
                 dirty = true;
             }
             None => {
@@ -4346,7 +4348,10 @@ async fn interactive_loop(
                 if batch.quit {
                     return Ok(());
                 }
-                dirty |= batch.handled > 0;
+                if batch.handled > 0 {
+                    dirty = true;
+                    gate.request_input();
+                }
                 let cmds = sessions.active_mut().front.take_session_cmds();
                 for cmd in &cmds {
                     execute_session_command(sessions, cmd).await;
@@ -4368,7 +4373,10 @@ async fn interactive_loop(
                         // As above: leave the actual frame to the gate so a
                         // terminal outcome behind a reorder gap is painted
                         // once, not twice.
-                        slot.front.apply_events(flushed);
+                        let terminal = slot.front.apply_events(flushed);
+                        if terminal {
+                            gate.request_terminal();
+                        }
                         dirty = true;
                     }
                 }
@@ -4469,6 +4477,121 @@ mod refresh_loop_tests {
         gate.request();
         assert!(draw_pending(&mut gate, now, || Err(io::Error::other("draw failed"))).is_err());
         assert!(gate.ready(now));
+    }
+
+    #[test]
+    fn input_frame_is_immediate_and_restarts_the_streaming_budget() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(33);
+        let mut gate = RefreshGate::new(interval);
+        let mut frames = 0;
+        gate.request();
+        draw_pending(&mut gate, now, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        let input_at = now + INPUT_POLL;
+        gate.request();
+        assert!(!gate.ready(input_at), "stream updates remain coalesced");
+        gate.request_input();
+        gate.request();
+        draw_pending(&mut gate, input_at, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 2);
+        assert!(
+            !gate.ready(input_at),
+            "input never leaves a duplicate frame"
+        );
+
+        gate.request();
+        assert!(!gate.ready(now + interval));
+        assert!(gate.ready(input_at + interval));
+    }
+
+    #[test]
+    fn terminal_feedback_does_not_wait_for_the_preceding_input_frame() {
+        let start = Instant::now();
+        let mut gate = RefreshGate::new(Duration::from_millis(33));
+        gate.request_input();
+        draw_pending(&mut gate, start, || Ok(())).unwrap();
+        let terminal_at = start + Duration::from_millis(1);
+        gate.request_terminal();
+        gate.request();
+        assert!(
+            draw_pending(&mut gate, terminal_at, || Err(io::Error::other(
+                "draw failed"
+            )))
+            .is_err()
+        );
+        assert!(
+            gate.ready(terminal_at),
+            "failed terminal frames remain urgent"
+        );
+        let mut frames = 0;
+        draw_pending(&mut gate, terminal_at, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        draw_pending(&mut gate, terminal_at, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 1, "terminal outcomes draw once");
+        gate.request();
+        assert!(!gate.ready(terminal_at + Duration::from_millis(32)));
+        assert!(gate.ready(terminal_at + Duration::from_millis(33)));
+    }
+
+    #[test]
+    fn sustained_input_and_output_do_not_duplicate_frames() {
+        let start = Instant::now();
+        let mut gate = RefreshGate::new(Duration::from_millis(33));
+        let mut frames = Vec::new();
+        // Model one stream update per millisecond and a processed input batch
+        // at each poll. This checks frame coalescing, not scheduler timing.
+        for ms in 0..=1000 {
+            gate.request();
+            if ms % INPUT_POLL.as_millis() as u64 == 0 {
+                gate.request_input();
+            }
+            let now = start + Duration::from_millis(ms);
+            draw_pending(&mut gate, now, || {
+                frames.push(ms);
+                Ok(())
+            })
+            .unwrap();
+            assert!(!gate.ready(now));
+        }
+        assert_eq!(frames, (0..=1000).step_by(20).collect::<Vec<_>>());
+
+        // Once input stops, pending streaming updates resume the normal budget.
+        gate.request();
+        assert!(!gate.ready(start + Duration::from_millis(1032)));
+        assert!(gate.ready(start + Duration::from_millis(1033)));
+    }
+
+    #[test]
+    fn failed_input_frame_remains_immediate_until_drawn() {
+        let now = Instant::now();
+        let mut gate = RefreshGate::new(TICK);
+        gate.mark_drawn(now);
+        gate.request_input();
+        let input_at = now + INPUT_POLL;
+        assert!(
+            draw_pending(&mut gate, input_at, || Err(io::Error::other("draw failed"))).is_err()
+        );
+        assert!(gate.ready(input_at));
+        draw_pending(&mut gate, input_at, || Ok(())).unwrap();
+        assert!(!gate.ready(input_at));
+        gate.request();
+        assert!(!gate.ready(input_at + INPUT_POLL));
     }
 }
 
