@@ -1388,8 +1388,8 @@ async fn run() -> io::Result<()> {
                 let restored = guard.restore();
                 match report {
                     Ok(report) => {
-                        for (label, warning) in report.close_warnings {
-                            eprintln!("nexus-tui [{label}]: {warning}");
+                        for (_label, _warning) in report.close_warnings {
+                            eprintln!("nexus-tui: close warning emitted (details redacted)");
                         }
                         if report.unresolved_blocking {
                             eprintln!(
