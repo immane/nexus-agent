@@ -64,6 +64,15 @@ Report warm-cache fresh-process startup and cold-cache measurements as distinct 
 - Input responsiveness, streaming throughput, event-buffer high-water marks, and cancellation latency under output load.
 - Local model/tool dispatch overhead with deterministic fake integrations.
 
+For distribution size, record uncompressed installed-file payload and a
+compressed archive/image separately only when an actual release artifact and
+its packaging format exist; do not synthesize a compression format to fill the
+metric. If the default profile has no external plugin enabled, mark plugin
+process-tree memory not applicable for that profile rather than substituting
+the frontend's RSS. Deterministic loopback provider/tool workflows are useful
+composed integration evidence, but must remain labeled synthetic and do not
+replace real-model or complete-session measurements.
+
 Record OS, architecture, hardware, terminal or PTY setup, compiler, build profile, enabled features, configuration size, and workload. Compare like-for-like results; platform memory metrics may not be directly interchangeable.
 
 ## Optimization Rules

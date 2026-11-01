@@ -44,11 +44,17 @@ python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
 python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
   --runs 10 --finite-chunks 128 --payload-profile coding \
   --sample-interval 0.05 --output coding-stream.json
+
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --finite-chunks 128 --payload-profile coding-workflow \
+  --sample-interval 0.05 --output coding-workflow.json
 ```
 
 RSS samples are platform-qualified: Linux reads `/proc` RSS and `VmHWM`; macOS
-samples `/bin/ps` RSS, so its maximum is a sampled peak, not a kernel high-water
-mark. Linux CPU is a `/proc` tick delta over the stream window. macOS retains
+uses `/bin/ps` for sustained profiles and `proc_pid_rusage
+RUSAGE_INFO_V4.ri_resident_size` for the short coding workflow. Both macOS
+values are sampled maxima, not a kernel high-water mark. Linux CPU is a `/proc`
+tick delta over the stream window. macOS retains
 OS-reported `ps %cpu` readings but does not interpret them as a window CPU
 delta. The fixture's chunks-per-second value is the local server emission rate,
 not a claim about application-consumed token or render throughput. The harness
@@ -68,6 +74,15 @@ run is retained; invalid runs are recorded and make the command exit nonzero.
 The `coding` profile emits a deterministic Rust patch-review response split
 across the requested chunks; it exercises multiline markdown/code rendering,
 not tool execution or a real model response.
+The `coding-workflow` profile adds a scripted Chat Completions tool-call turn:
+the TUI invokes read-only `host_read` on a Rust fixture inside its temporary
+workspace, the fixture verifies that the actual tool result is replayed to the
+second provider request, and a final patch-shaped response is streamed. It also
+types a sentinel while that response is streaming and records when it becomes
+visible. This is a composed local integration workload, not a real model, tool
+I/O, or complete coding session. It reports submission-to-final-marker latency,
+tool-result provenance, TUI RSS, and input-to-visible latency; the existing
+sustained-stream profile remains the cancellation-under-load observation.
 
 ## Startup harness
 

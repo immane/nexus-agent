@@ -58,29 +58,64 @@ remaining M0 blocker. The following independent gates remain open:
 | --- | --- | --- |
 | Buffer bounds and visible loss | Owner-accepted scoped pass (2026-11-02): implemented per-layer logical caps, individual/whole-run queue peaks, terminal reserve, and real-tool outbox loss visible through runtime, HTTP SSE+snapshot, headless, and TUI on Linux/macOS | No further requirement for the scoped M0 gate; allocator-level memory and simultaneous all-layer high-water were not measured and are not claimed |
 | Startup side effects | Owner-accepted scoped pass (2026-11-02): isolated PTY tests and recovery on both platforms; Linux credential fixture and current-release traces with/without `--tools-root`; macOS libc hooks with submission positive control | No further requirement for the scoped M0 gate; raw syscall/environment enumeration, tool-submission behavior, and every config/profile are not claimed |
-| P7 reference and measurements | Owner-approved reference profile; two-platform warm observations, idle CPU/RSS, macOS per-process wakeup counters, queue/dispatch samples; Linux ordinary prepared-cache batches below 150 ms; strict Linux cold ELF gate accepted by owner exception; Linux and macOS loopback-stream resource observations, including paired finite 480-chunk and Rust patch-style visible-completion measurements; per-layer buffer high-water evidence accepted within the scoped buffer gate; macOS uncompressed installed payload measured | Remaining representative workload resource/throughput coverage and complete P7 baseline review, including a compressed release artifact size (no archive currently exists); patch-style fixture is synthetic and does not exercise tool execution or a real model; simultaneous all-layer buffer peaks, cold filesystem metadata, and default-host-launcher equivalence are accepted limitations of the scoped evidence |
+| P7 reference and measurements | Owner-approved reference profile; two-platform warm observations, idle CPU/RSS, macOS per-process wakeup counters, queue/dispatch samples; Linux ordinary prepared-cache batches below 150 ms; strict Linux cold ELF gate accepted by owner exception; paired Linux/macOS loopback streaming plus composed read-only-tool coding workflow, input responsiveness and cleanup; Linux/macOS installer-aligned uncompressed payloads; per-layer buffer high-water evidence accepted within the scoped buffer gate | Complete P7 baseline review remains open: there is no actual compressed release artifact to measure; composed workflow is deterministic/synthetic and is not a real model or full coding session; Linux payload was built from a source snapshot without Git provenance. Simultaneous all-layer buffer peaks, cold filesystem metadata, and default-host-launcher equivalence are accepted limitations |
 
 ### P7 closure work versus accepted limitations
 
-The remaining P7 work is to assemble a comparable, reviewable baseline from
-evidence that is currently split across independent probes, and to fill the
-following gaps without treating fixtures as production traffic:
+P7 evidence is now assembled from independent probes plus a composed local
+workflow. The following evidence was added on 2026-11-02:
 
-- Run a bounded, deterministic coding workflow that combines the TUI, a local
-  provider fixture, at least one read-only local-tool dispatch, and the final
-  streamed response. Record the workflow outcome and timing plus TUI RSS on both
-  reference platforms. The current Rust patch-shaped stream exercises rendering
-  only; separate fake-dispatch tests do not measure the composed workflow.
-- Measure input responsiveness and cancellation as part of that output-loaded
-  workflow (or explicitly identify a paired existing observation); current
-  stream completion and cancellation probes are separate profiles.
-- Record the install payload for Linux using the actual installer build feature
-  set. macOS currently has an uncompressed installed-file total; the repository
-  has no compressed release artifact, so report that metric as unavailable
-  unless a real artifact is produced rather than inventing an archive format.
-- Assemble per-platform provenance and the required P7 metrics into one baseline
-  review, preserving platform-specific RSS/wakeup methods and declaring metrics
-  that do not apply to the default shipped profile.
+- A deterministic loopback Chat Completions workflow performs `host_read` on a
+  temporary Rust fixture, verifies the actual 118-byte result is replayed in the
+  follow-up request, streams a 128-chunk Rust patch-style response, and types an
+  input sentinel while output is active. Linux and macOS each have 10/10 valid
+  runs with no entry truncation. Linux submission-to-final-marker time was
+  190.5–205.7 ms (median 192.3 ms), final-response visible completion rate
+  812.6–825.5 chunks/s (median 816.0), sampled `/proc`/kernel RSS high-water
+  6,940–7,060 KiB, and input-to-visible 1.92–2.65 ms (median 2.18 ms). macOS
+  time was 421.9–524.2 ms (median 463.6 ms), final-response visible completion
+  rate 615.6–783.7 chunks/s (median 672.0), sampled `proc_pid_rusage
+  RUSAGE_INFO_V4 ri_resident_size` 5,888–6,560 KiB, and input-to-visible
+  0.78–21.27 ms (median 6.72 ms). The RSS sampler was requested at 50 ms; actual
+  maximum gaps were 79 ms Linux and 380 ms macOS, so macOS results are sampled
+  resident-size maxima, not a process/kernel peak. The maximum latency and input
+  outlier are retained. Cleanup was recorded for every run. These are
+  deterministic synthetic integration measurements, not real-model/tool-I/O
+  throughput or a complete coding session; they are not directly comparable
+  across unlike hosts. Output-load cancellation remains the paired existing
+  sustained-stream cancellation observation, not a cancellation during this
+  finite workflow. Raw batches:
+  `evidence/stream-resource-linux-coding-workflow-10x.json` (SHA-256
+  `05d4469aaa691ca9d725199a629f14c5a98c9bcb111cb7e818aa798fe65eafc8`) and
+  `evidence/stream-resource-macos-coding-workflow-default-10x.json` (SHA-256
+  `9dea96c225b455405a9aebbfcd6c3c7fc00a0011d1997d2185cc9c7019020668`). Linux
+  used default workspace features, rustc 1.99.0, and binary SHA-256
+  `e167381a61ede02e3aff791093acfa98803244165b918bf6a76552417485191a`; its
+  remote source snapshot had no `.git` metadata, so commit provenance is
+  unavailable. macOS used a default-feature release binary SHA-256
+  `688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99`.
+- Installer-aligned release/container-feature uncompressed installed-file
+  totals are 14,575,775 bytes on Linux and 12,665,391 bytes on macOS. The Linux
+  manifest explicitly records missing Git provenance rather than inventing a
+  commit. Neither number is an archive/image size. No compressed release
+  artifact or approved archive format exists, so compressed distribution size
+  is unavailable. Evidence:
+  `evidence/distribution-install-payload-linux-release-container.json` (SHA-256
+  `51e0e3c2e5c3f697658875b7dcbbca18a097874e7aeb46deeff98e0fd28fcf6c`) and
+  `evidence/distribution-install-payload-macos-release-container.json` (SHA-256
+  `9c12cccd178d12c693334c4291c3dac48518c40fec7f833b32fdf27347d0d87f`).
+- For the accepted default profile, external-plugin process-tree memory is not
+  applicable: no external plugin is enabled or shipped in this profile. No
+  plugin-tree number is inferred from TUI process RSS. Platform-specific idle
+  CPU/wakeup evidence and the separate output-load cancellation and dispatch
+  observations remain their own measurements; the short composed workflow does
+  not provide a useful macOS CPU delta or a dispatch-only timing.
+
+This closes the previously listed composed-workflow and Linux payload recording
+tasks, but not all P7 requirements. P7/M0 remain unaccepted until the owner has
+reviewed the assembled baseline and decided how the required distribution-size
+metric is to be satisfied without fabricating a release artifact. The workflow
+and install manifests preserve the stated provenance and measurement limits.
 
 These do not reopen the owner-accepted buffer and startup-side-effect gates.
 Simultaneous all-layer buffer peaks, allocator high-water, macOS cold-cache
