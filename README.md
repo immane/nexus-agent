@@ -19,7 +19,7 @@ not an ever-growing engine. External plugins remain planned.
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.4-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Scoped M0 acceptance is complete (2026-11-02); cross-platform production/security readiness is not.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.4-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; escaped-descendant cleanup remains unresolved. **Scoped M0 acceptance is complete (2026-11-02); cross-platform production/security readiness is not.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -509,9 +509,10 @@ server from current source.
 
 ## Project Status
 
-**Current position: scoped M0 accepted; M4 consolidation slices implemented,
-with selected M5 capabilities already delivered. M1/M2/M4 acceptance work
-remains open.**
+**Current position: scoped M0 accepted; Linux and macOS M2 reference-platform
+tests pass; M4 consolidation slices are implemented, with selected M5
+capabilities already delivered. M1.4 cleanup and dependent M1/M4 acceptance
+remain open.**
 Development has been capability-driven rather than strictly milestone-ordered:
 the real model/tool/container loop and complex task repairs were exercised before
 all baseline measurements and acceptance reviews were finished. Implementation
@@ -520,8 +521,8 @@ progress and verified readiness are tracked separately.
 | Stage | Implementation and remaining acceptance work |
 | --- | --- |
 | **M0 — Minimal execution baseline** | Accepted for the owner-approved scope on 2026-11-02; cross-platform evidence, separate first-security-scan profile and M5 cold-cache deferral are recorded in the M0 gates. Not production/security certification. |
-| **M1 — Correctness and lifecycle** | Multiple slices implemented and verified; descendant cleanup limitations and Linux validation remain unresolved. |
-| **M2 — Permissions and platform boundaries** | Host-owned policy and scope handling implemented; filesystem and sandbox evidence covers macOS, with Linux validation blocked. |
+| **M1 — Correctness and lifecycle** | Linux and macOS suites pass for covered paths; escaped-descendant cleanup remains unresolved, so M1 is open. |
+| **M2 — Permissions and platform boundaries** | Linux and macOS filesystem/sandbox reference tests pass; evidence is profile-specific, not a universal guarantee for all Linux filesystems/distributions. |
 | **M3 — Configuration and composition** | Consolidation slices recorded as verified. |
 | **M4 — Internal consolidation** | M4.1–M4.3 implemented, with passing macOS default-feature workspace evidence; the overall gate remains open. |
 | **M5 — On-demand extensions** | Additional provider protocols implemented with offline fixtures; external-tool transport and HTTP/TLS replacement remain deferred. |
@@ -555,19 +556,19 @@ validation of every subsequent revision.
 - [x] **M1.2:** Treat closed control transport as terminal rather than repeatedly scheduling delivery.
 - [x] **M1.3:** Bound provisional streaming and control retention, validate usage updates, and preserve terminal-delivery accounting.
 - [x] **M1.4, implemented portion:** Nonblocking exec pipe draining, capped retained output, bounded cleanup checks, and ownership/quarantine for uncertain workers.
-- [ ] **M1.4, remaining:** Resolve escaped-descendant cleanup limitations and validate Linux exec/sandbox failure paths.
+- [ ] **M1.4, remaining:** Resolve escaped-descendant cleanup limitations. Linux exec/sandbox and injected probe/pipe-failure tests passed on the recorded reference VM; escaped-descendant termination is still not proven.
 - [x] **M1.5:** Attribute TUI usage to the accepted run's model despite later picker changes.
 - [x] **M1.6:** Bound server connections, sessions, SSE retention, and completion/usage bookkeeping.
 - [x] **M1.7:** Enforce the loopback real-tool server trust boundary with bearer authentication and Host/Origin checks.
-- [ ] **M1 gate:** Close remaining cleanup and Linux validation blockers.
+- [ ] **M1 gate:** Close the remaining escaped-descendant cleanup limitation; Linux validation for covered paths is recorded.
 
 #### M2 — Permissions and platform boundaries
 
 - [x] **M2.1:** Host-owned tool access classification, including conservative unknown/read-only handling.
 - [x] **M2.2:** Shared file/exec scope construction and exact authorization matching.
-- [x] **M2.3, macOS scope:** Descriptor-bound file access, staged replacement, no-clobber creation, hardlink refusal, and supported metadata preservation.
-- [x] **M2.4, macOS scope:** Actual sandbox tests recorded separately from backend-unavailable denial tests.
-- [ ] **M2 gate:** Linux file-race/metadata and sandbox-isolation validation; macOS evidence is not cross-platform acceptance.
+- [x] **M2.3:** Descriptor-bound file access, staged replacement, no-clobber creation, hardlink refusal, tested file-race cases, and supported metadata preservation on macOS and the recorded Linux filesystem.
+- [x] **M2.4:** Actual sandbox isolation tests passed on macOS and Linux; backend-unavailable denial tests remain distinct.
+- [x] **M2 gate:** Linux file-race/metadata and sandbox-isolation tests passed on the recorded Ubuntu reference VM; this does not claim every Linux distribution or filesystem.
 
 #### M3 — Configuration and composition
 
@@ -581,8 +582,8 @@ validation of every subsequent revision.
 - [x] **M4.1:** Shared bounded ordered-event consumption across TUI, headless, and server, retaining frontend-specific presentation/reconnect policies.
 - [x] **M4.2:** Direct reuse of concrete development file operations without per-call tool reconstruction or JSON redispatch.
 - [x] **M4.3:** Public-contract/consumer review, compatibility-preserving API retention, and correction of stale provider-event documentation.
-- [x] Default-feature workspace regression evidence recorded on macOS, with affected-package formatting and Clippy checks.
-- [ ] **M4 gate:** Full closure remains dependent on the M1/M2 cleanup and Linux blockers; continued macOS development is not a security waiver for release.
+- [x] Default-feature workspace regression evidence recorded on macOS and Linux, with formatting and all-target Clippy checks.
+- [ ] **M4 gate:** Full closure remains dependent on the unresolved M1.4 escaped-descendant cleanup limitation; Linux M2 blockers were validated on the recorded reference VM. This is not production security readiness.
 
 #### M5 — Extensions on concrete demand
 
