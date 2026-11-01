@@ -14,7 +14,10 @@
   the project root and temp directories are automatic; other paths need
   approval, and `--strict-tools` restores project-jailed reads with per-call
   confirmation. No plugins, no durable history.
-  **M0 acceptance is NOT complete** (see `docs/tasks/04-m0-gates.md`).
+  **Scoped M0 acceptance is complete (2026-11-02)**; see
+  `docs/tasks/04-m0-gates.md` for first-execution separation, cold-cache deferral,
+  and measurement limitations. This does not certify real-provider security or
+  subsequent milestones.
 - The [migration record](docs/tasks/08-architecture-migration.md) documents
   implemented M4 consolidation slices and passing default-feature macOS
   workspace tests. Linux filesystem/metadata and sandbox-isolation validation
@@ -46,6 +49,54 @@ cargo run -p nexus-headless --locked --offline -- "hello"
 # Interactive terminal; configure a provider/model below before submitting:
 cargo run -p nexus-tui --locked --offline
 ```
+
+### Build and install a native release archive
+
+Packaging requires Python 3.11+ and the normal Rust build prerequisites. It
+builds the current host target on Linux or macOS (no cross compilation), with
+the same container features as `scripts/install.sh`, in a separate
+`target/release-package` directory:
+
+```sh
+python3 scripts/package-release.py --offline
+python3 scripts/test-release.py
+```
+
+Omit `--offline` only when dependency downloads are intended. The output is
+`dist/nexus-agent-<version>-<rust-host-target>.tar.gz` plus `.tar.gz.sha256`.
+Existing output files are never overwritten; use `--output-dir PATH` for a new
+build. Packaging rejects mismatched Python/Rust architectures (including mixed
+Rosetta/native tooling) before building; platform labels come from the Rust
+target. The archive contains three executables, `nexus-config`, `LICENSE`,
+`install.py`, and `manifest.json` with per-file checksums and build provenance.
+The manifest records commit, dirty state, tracked-diff hash, a content hash of
+existing tracked files plus the release scripts, lockfile hash, compiler and
+features. A dirty or untracked tree is explicitly marked and is
+not a claim of an exact reproducible source snapshot. No publication, signing,
+notarization, container images, or automatic downloads are performed.
+
+After obtaining an archive from a trusted source, change into the directory
+containing both the archive and its sidecar, then verify its checksum (macOS:
+`shasum -a 256 -c FILE.tar.gz.sha256`; Linux: `sha256sum -c FILE.tar.gz.sha256`),
+then extract and install without Cargo or root:
+
+```sh
+tar -xzf nexus-agent-<version>-<rust-host-target>.tar.gz
+cd nexus-agent-<version>-<rust-host-target>
+python3 install.py "$HOME/.local/bin"
+```
+
+The installer checks host OS/architecture and all four command checksums before
+copying; it refuses symlink command destinations. It replaces existing regular
+command files, but does not change configuration or history. Installation is
+not transactional: a filesystem error during copying can leave a partial
+installation. Python 3 is also needed by `nexus-config`. Native runtime
+dependencies (system OpenSSL and OS sandbox support, and compatible Linux
+glibc) still apply. Checksums detect corruption, not authenticity. These local
+artifacts are not signed or security-certified releases; container support
+remains experimental and local execution remains the default. Extracted-install
+smoke checks have been run on macOS arm64 and Linux x86_64 reference hosts;
+other architectures and older OS/glibc versions have not been validated.
 
 ### Experimental container mode
 
@@ -184,8 +235,8 @@ export NEXUS_CONFIG=/path/to/config.json
 From the repository root, build and install the TUI, server, headless binary,
 and interactive config helper to `~/.local/bin` (or pass another install
 directory). Installation requires Cargo, Python 3, and the locked dependencies;
-Cargo may use the network if they are not cached. The installed binaries use
-default features; experimental container support is not included.
+Cargo may use the network if they are not cached. The installed TUI and server
+include experimental container support; local execution remains the default.
 
 ```sh
 ./scripts/install.sh

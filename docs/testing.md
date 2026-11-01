@@ -2,6 +2,13 @@
 
 ## Normal workflow
 
+Release packaging has offline stdlib-only regression tests:
+`python3 scripts/test-release.py`. These cover archive determinism, checksums,
+installation, tampering and symlink rejection without compiling Rust. An actual
+native artifact requires `python3 scripts/package-release.py --offline` and
+an extracted-install smoke test on each intended platform; unit tests alone
+do not establish binary compatibility.
+
 Run checks for the affected packages, **sequentially**. Concurrent Cargo builds,
 tests, and clippy commands share the target directory lock and do not accelerate
 validation. Avoid checking the same code immediately before clippy (which already

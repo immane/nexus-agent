@@ -1,0 +1,105 @@
+{
+  "schema": "nexus.release.measurement/1",
+  "archive": "nexus-agent-0.2.4-alpha-x86_64-unknown-linux-gnu.tar.gz",
+  "archive_bytes": 5174215,
+  "archive_sha256": "03a03b9812ea5edde07151eb9152c2af6a16a797f566d2c20070d0ec1cc2885f",
+  "uncompressed_installed_bytes": 14576631,
+  "manifest": {
+    "schema": "nexus.release/1",
+    "version": "0.2.4-alpha",
+    "target": "x86_64-unknown-linux-gnu",
+    "system": "Linux",
+    "machine": "x86_64",
+    "build": {
+      "source_commit": "68858877772cf03b5cfa0d820d253f1b42733bb2",
+      "source_dirty": true,
+      "source_files_sha256": "a276f189e32fd3e783598db3a54dc2a04d079922b268951dd681b4e566171fd9",
+      "source_files_scope": "existing tracked files plus the three release scripts; excludes other untracked files",
+      "tracked_diff_sha256": "2d8ac3fcdbdc9f46aecd43397e6eafa9e651dc854f01e88efa230efd0b389cda",
+      "untracked_files_present": true,
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1",
+      "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+      "lockfile_sha256": "9f2e84476c6562e64809e76e200882b323b1b2a84784ec33e48854692f43fd60",
+      "profile": "release",
+      "features": [
+        "nexus-tui/container",
+        "nexus-server/container"
+      ],
+      "locked": true,
+      "offline": true
+    },
+    "files": {
+      "bin/nexus-tui": {
+        "bytes": 6936512,
+        "sha256": "dc65d49d1c9a50c5611f571a9833435b6f52df44b84fca5c3be4cb36669b0956",
+        "mode": "0755"
+      },
+      "bin/nexus-server": {
+        "bytes": 4805176,
+        "sha256": "3fee797b1e3aad279b69155e5b2fb0a53add906e5d7be33721bea2cda9453376",
+        "mode": "0755"
+      },
+      "bin/nexus-headless": {
+        "bytes": 2808752,
+        "sha256": "45b23f89132ec85defc3381c2b8768926c259e87539c3c96ec7acf3ca654886d",
+        "mode": "0755"
+      },
+      "bin/nexus-config": {
+        "bytes": 26191,
+        "sha256": "b64cf56b6093029a1cb3fd79fd67019638ebf2ab305cbb4b471b20d22f6ed09a",
+        "mode": "0755"
+      },
+      "install.py": {
+        "bytes": 2415,
+        "sha256": "e735c9f39c71dc3ef4ba2933f81cd2aa0fda0f08f96750f4e2cffd690354c0f5",
+        "mode": "0755"
+      },
+      "LICENSE": {
+        "bytes": 1063,
+        "sha256": "d3696d3efc2517c37a98f8016fab09aea04167705375e93d504ab2c4012a8ba5",
+        "mode": "0644"
+      }
+    }
+  },
+  "smoke": [
+    {
+      "command": [
+        "nexus-tui",
+        "--help"
+      ],
+      "returncode": 0,
+      "stdout_bytes": 1565,
+      "stderr_bytes": 0
+    },
+    {
+      "command": [
+        "nexus-server",
+        "--check-config"
+      ],
+      "returncode": 0,
+      "stdout_bytes": 24,
+      "stderr_bytes": 129
+    },
+    {
+      "command": [
+        "nexus-headless",
+        "release smoke"
+      ],
+      "returncode": 0,
+      "stdout_bytes": 1689,
+      "stderr_bytes": 626
+    },
+    {
+      "command": [
+        "nexus-config",
+        "--help"
+      ],
+      "returncode": 0,
+      "stdout_bytes": 397,
+      "stderr_bytes": 0
+    }
+  ],
+  "limitations": [
+    "native CLI and extracted install only; headless is scripted; no live model, sandbox isolation, signing or notarization validation"
+  ]
+}
