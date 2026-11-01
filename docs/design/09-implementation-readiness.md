@@ -1,6 +1,6 @@
 # Implementation Readiness
 
-Status: Draft engineering gates based on accepted [project direction](decisions/00-project-foundation.md) and [first-release defaults](decisions/01-first-release-defaults.md). A test-only M0 workspace and historical measurements exist; correctness repairs and acceptance re-verification are in progress. See the [implementation status](../index.md#implementation-status) for evidence and outstanding gates.
+Status: Draft engineering gates based on accepted [project direction](decisions/00-project-foundation.md) and [first-release defaults](decisions/01-first-release-defaults.md). Scoped M0 acceptance completed on 2026-11-02; see [M0 gates](../tasks/04-m0-gates.md) for the accepted measurements, first-security-scan separation and deferred limitations. This does not accept subsequent milestones or production/security readiness. Historical measurements below are not automatically accepted baselines.
 
 ## What Is Settled
 

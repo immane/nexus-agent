@@ -1,11 +1,13 @@
 # M0 Gates and Evidence
 
-Status: Acceptance review in progress; **M0 is not complete**. Functional and
-platform checks below have current evidence. The scoped buffer bounds/visible-
-loss and startup side-effect gates were accepted by the owner on 2026-11-02 with
-stated measurement limitations. Portions of the accepted P7 measurement set
-remain open. Historical RSS evidence is confounded and must not be promoted to
-a baseline.
+Status: **M0 accepted and closed for the owner-approved scope, 2026-11-02.**
+P7 final review corrections and the post-security-scan warm validation are
+complete. First-execution security scanning is reported separately under the
+explicit owner scope adjustment below; the 815.573 ms sample remains valid and
+retained, not silently discarded or called a sub-150-ms launch. This is scoped
+M0 acceptance, not production/security certification, live-model validation,
+or acceptance of subsequent milestones. Historical confounded RSS evidence is
+not promoted to a baseline.
 
 **Owner-approved scope adjustment, 2026-11-01:** macOS cold-cache startup
 measurement is deferred from M0 acceptance to M5; it remains unverified and is
@@ -49,30 +51,223 @@ recovery cases. This does not claim coverage of raw syscalls, direct environment
 enumeration, every configuration/profile, or effects after tool submission;
 those are accepted scope limitations, not evidence of absence.
 
+**Owner-approved first-execution scope adjustment, 2026-11-02:** after reviewing
+the exact-path/PID Gatekeeper/XProtect evidence, the owner approved retaining
+the 815.573 ms first-execution security-scan sample as a separate profile,
+outside the ordinary warm baseline. It is valid first-execution evidence, not
+an invalid measurement, a statistical-outlier deletion, or proof that initial
+execution meets 150 ms. No scan time is subtracted. Ordinary warm/prepared
+launches still have the unchanged 150 ms per-sample ceiling. Isolated slowness
+alone does not qualify a sample for this separation; this adjustment applies
+to the documented scanner-correlated first execution. No security control or
+executable attribute was disabled or removed, and no signing/notarization work
+was authorized. The macOS cold-cache deferral to M5 is independent.
+
 ## Acceptance decision — 2026-11-02
 
-**Not accepted.** The macOS cold-cache deferral is in effect and is not a
-remaining M0 blocker. The following independent gates remain open:
+**Accepted and closed for scoped M0.** The owner authorized closure after the
+review findings were corrected and approved the first-execution separation.
+The independent post-scan warm batch passed 30/30 below 150 ms with normal
+cleanup, fulfilling that conditional authorization. The earlier mixed-profile
+batch and its over-limit first execution remain unchanged. Prior buffer/startup
+acceptances, Linux strict-cold exception, and M5 deferral remain in force.
 
 | Gate | Current evidence | Remaining requirement |
 | --- | --- | --- |
 | Buffer bounds and visible loss | Owner-accepted scoped pass (2026-11-02): implemented per-layer logical caps, individual/whole-run queue peaks, terminal reserve, and real-tool outbox loss visible through runtime, HTTP SSE+snapshot, headless, and TUI on Linux/macOS | No further requirement for the scoped M0 gate; allocator-level memory and simultaneous all-layer high-water were not measured and are not claimed |
 | Startup side effects | Owner-accepted scoped pass (2026-11-02): isolated PTY tests and recovery on both platforms; Linux credential fixture and current-release traces with/without `--tools-root`; macOS libc hooks with submission positive control | No further requirement for the scoped M0 gate; raw syscall/environment enumeration, tool-submission behavior, and every config/profile are not claimed |
-| P7 reference and measurements | Owner-approved reference profile; two-platform warm observations, idle CPU/RSS, macOS per-process wakeup counters, queue/dispatch samples; Linux ordinary prepared-cache batches below 150 ms; strict Linux cold ELF gate accepted by owner exception; paired Linux/macOS loopback streaming plus composed read-only-tool coding workflow, input responsiveness and cleanup; Linux/macOS installer-aligned uncompressed payloads; per-layer buffer high-water evidence accepted within the scoped buffer gate | Complete P7 baseline review remains open: there is no actual compressed release artifact to measure; composed workflow is deterministic/synthetic and is not a real model or full coding session; Linux payload was built from a source snapshot without Git provenance. Simultaneous all-layer buffer peaks, cold filesystem metadata, and default-host-launcher equivalence are accepted limitations |
+| P7 reference and measurements | Accepted scoped baseline: Linux/macOS startup, executable/archive size and features, idle/resource/wakeup observations, synthetic workflow/input/cancellation, per-layer queue high-water, and fake dispatch; final warm macOS batch 30/30 below 150 ms with verified build association | No remaining scoped M0 requirement. The 815.573 ms first security-scan execution is separately retained by owner decision; real-model/full-session, tool-child peaks, allocator/simultaneous-all-layer peaks, and untested platforms/configurations are not claimed |
+
+### Final ordinary warm baseline after security-scan separation
+
+Without rebuilding, copying or modifying the already-scanned default-feature
+binary, a fresh isolated HOME/XDG run observed 30/30 composer/input responses
+and 30 normal quit-key exits without escalation. The full 30-attempt batch,
+including its first attempt, is retained. No security check was bypassed and no
+attempt was excluded from this batch.
+
+| macOS ordinary warm metric | n | p50 (ms) | p95 (ms) | Maximum (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Spawn-to-composer-response | 30 | 32.326 | 37.895 | 38.804 |
+| Frame-ready | 30 | 9.476 | 12.279 | 17.184 |
+| Post-ready input response | 30 | 23.748 | 26.014 | 26.582 |
+
+These summaries use the arithmetic median and nearest-rank p95 from raw samples;
+the harness's own nearest-rank p50 field is separately retained, not overwritten.
+Raw evidence: `evidence/readiness-macos-post-scan-warm-default-30.json` (SHA-256
+`2b22fe8f8348547d837b18f995ed320afcaead00f18876d079a91febade33d44`).
+Compiler metadata is non-null rustc/cargo 1.99.0; binary SHA-256 is
+`688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99`,
+linked to `evidence/readiness-macos-final-build-provenance.json`. The prior
+815.573 ms sample and filtered scanner logs remain in their original evidence
+files. This is a post-scan warm baseline, not a fresh-install first-execution
+or macOS cold-cache guarantee. The machine-readable profile decision, including
+source hashes and the unchanged ordinary ceiling, is
+`evidence/readiness-macos-first-scan-profile-decision.json`.
+
+Final closure checks: `python3 -m unittest discover -s tools/perf -p
+'test_*.py'` ran 282 tests with one platform skip and no failures;
+`python3 scripts/test-release.py` passed 9/9; Python syntax compilation and
+`git diff --check` passed. Evidence checks verified all linked hashes, all 244
+build-input hashes, unchanged original samples, and the current binary hash.
+No Rust implementation changed in this closure step, so the full Rust workspace
+suite was not rerun; its prior platform runs remain the recorded evidence.
+
+### Final review corrections and initially blocked closure — 2026-11-02
+
+The owner requested correction of all final-review findings followed by M0
+closure. The findings were corrected without changing the acceptance thresholds:
+
+- Linux composed-workflow statistics were recomputed from the cited raw JSON:
+  submission-to-final-marker 190.747–193.536 ms (median 192.295 ms), process
+  RSS maxima 6,960–7,060 KiB. Earlier prose mixed ranges from different batches;
+  the raw JSON and its checksum were not changed.
+- The native packager derives OS/architecture from the Rust target and rejects
+  a mismatch with Python's platform before building or producing an archive.
+  Tests cover mixed Rosetta/native tooling and all four supported native target
+  mappings. The stale source-install paragraph now correctly identifies the
+  enabled container features; local execution remains the default.
+- A fresh default-feature TUI build explicitly used rustc/cargo 1.99.0 with
+  `cargo +1.99.0 build --release --locked --offline -p nexus-tui --target-dir
+  target/m0-final-default`. `evidence/readiness-macos-final-build-provenance.json`
+  records compiler, command, commit/dirty state and content hashes of all 244
+  tracked build-input files. Its binary SHA-256 is identical to the earlier
+  measured default-feature binary:
+  `688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99`.
+  This supplies a verified build association; it does not retroactively change
+  the older raw JSON's null compiler fields. The provenance file SHA-256 is
+  `054cdfd57755a4831b36519b61e4771cfe508dc2fd0b65ddb5166a5cbaa6e2f6`.
+
+Both platforms passed the expanded 9-test release suite and regenerated native
+archives with the architecture guard, explicitly selecting rustc/cargo 1.99.0.
+These are distribution measurements, not the default-feature performance
+binaries. Earlier Linux packaging used 1.99.1 and remains separate historical
+evidence; no performance equivalence is inferred from either archive's smoke.
+The corrected archives are retained under `dist/m0-close/` on their respective
+hosts. Extracted installation and all four command smoke checks passed again:
+
+| Platform | Compressed bytes | Installed command bytes | Archive SHA-256 | Evidence |
+| --- | ---: | ---: | --- | --- |
+| macOS arm64 | 4,700,780 | 12,671,647 | `211d57cca7dae2699e29f207cabf044529328a936f776386af99fce4b6609311` | `evidence/distribution-release-macos-m0-close.json` |
+| Linux x86_64 | 5,173,727 | 14,575,823 | `70592f5ebe36991c8ef8318169be4e9f43a7bff1ab0cededd29bbe0f15110f8c` | `evidence/distribution-release-linux-m0-close.json` |
+
+The new isolated-environment 30-run warm batch retains every attempt and records
+non-null rustc/cargo 1.99.0 metadata. All 30 observed the composer/input response
+and exited normally without cleanup escalation, but the first valid response
+was **815.573 ms**, with frame-ready **792.339 ms**. Spawn-to-response
+p50/p95/max were **34.166/114.635/815.573 ms**; frame-ready was
+**10.855/90.031/792.339 ms**. One of thirty valid samples exceeds 150 ms. Raw
+JSON: `evidence/readiness-macos-final-warm-default-30.json` (SHA-256
+`a71a0cb3798f7dbfa4eafd4ad04263c08b4ed164629c8768842ba7b204db5b22`).
+Read-only system-log correlation subsequently identified Gatekeeper/XProtect
+scanning this exact output path during the failed launch: scan queued at local
+03:38:05.182 and completed at 03:38:05.923 (about 741 ms); the process record
+identifies PID 91485. First PTY output was observed at 786.883 ms. The filtered
+target-only evidence is
+`evidence/readiness-macos-final-security-scan-diagnostic.json`. This explains
+most delay but does not isolate every launch phase: system-log timestamps and
+PTY monotonic measurements use distinct clocks. No security controls, provenance
+attributes or scan policies were changed. This is not grounds to exclude the
+valid sample or subtract scan time from the startup definition.
+No rerun replaces it, and neither its passing p95 nor the earlier passing batch
+waives the per-sample ceiling. Therefore the conditional closure was **not
+performed**. M0 remains unaccepted pending a demonstrated fix or an explicit
+owner exception for this ordinary macOS startup failure at that point. The owner initially selected
+continued diagnosis/fix rather than an exception. An application input/render
+optimization is not demonstrated to address this pre-output scan delay.
+Evaluating Developer ID signing/notarization would require separately approved
+scope, credentials and external-service use; it was excluded from native
+packaging scope and is not claimed to guarantee sub-150-ms initial launch.
+The subsequent explicit first-execution scope decision and independent warm
+validation above supersede this historical blocked status without rewriting
+the raw batch or pretending the first execution passed 150 ms.
 
 ### P7 closure work versus accepted limitations
+
+#### Native release packaging follow-up — 2026-11-02
+
+The owner selected native Linux/macOS `.tar.gz` packaging without publication,
+release CI, signing, notarization, or container images. The implementation is
+`scripts/package-release.py`; it uses locked installer-aligned container-feature
+release builds in a separate target directory and emits a SHA-256 sidecar.
+Each archive contains the three frontend executables, `nexus-config`, an offline
+checksum/platform-checking installer, license, and build/file manifest. Dirty
+source trees are identified explicitly, not represented as clean commits.
+
+The validated macOS arm64 archive is 4,700,784 bytes (SHA-256
+`1e6a90f53b090f582e8e9c1a0beef47a747a190535af5dc71bba444b191f3618`);
+its four installed command files total 12,671,647 bytes. It was extracted into
+a temporary directory, installed without Cargo, and all four command smoke
+checks succeeded (`nexus-tui --help`, `nexus-server --check-config`, scripted
+headless run, `nexus-config --help`). Per-file provenance and results are in
+`evidence/distribution-release-macos-tar-gz.json`. An initial smoke incorrectly
+expected `nexus-server --help` to exit zero; that command prints usage and exits
+2 in the existing CLI, so the actual server smoke uses `--check-config` instead.
+This does not validate live providers, sandbox isolation, or universal binary
+compatibility. The local archive is retained in `dist/final/`, not published
+or committed.
+
+The Linux x86_64 archive is 5,174,215 bytes (SHA-256
+`03a03b9812ea5edde07151eb9152c2af6a16a797f566d2c20070d0ec1cc2885f`);
+its four installed commands total 14,576,631 bytes. The same extracted-install
+and four command smoke checks succeeded on the reference VM. The build used a
+Git bundle of commit `68858877772cf03b5cfa0d820d253f1b42733bb2` plus the
+recorded working-tree changes, rather than a snapshot without Git metadata.
+Both native builds explicitly record dirty source, compiler, lockfile hash,
+tracked-diff and scoped source-content hashes, and features. This is provenance,
+not a claim of a clean tagged or reproducible build. Linux evidence is
+`evidence/distribution-release-linux-tar-gz.json`; the archive remains under
+`/home/nexus-test/p7-release-20261102.wjKnf2/dist/final/` on the VM.
+
+`python3 scripts/test-release.py` passed 7 tests on each platform, covering
+deterministic archive metadata, sidecar checksums/no-overwrite, installation,
+tampering, OS/architecture mismatch, symlinks, hardlink-safe replacement and
+installing the exact verified bytes. Both real archive sidecars verified.
+These results superseded the historical missing-archive blocker below and added
+traceable Linux release evidence without rewriting the old manifest. The final
+review section above records corrected archives and the initially blocking
+first-execution observation; the acceptance decision now separates it under
+the owner's explicit scope adjustment.
 
 P7 evidence is now assembled from independent probes plus a composed local
 workflow. The following evidence was added on 2026-11-02:
 
+- The accepted warm default-feature startup profile now has a current 30-run
+  macOS batch using the approved 120x40 PTY, isolated empty HOME/XDG/config,
+  composer readiness, and a random composer input sentinel. All 30 runs reached
+  readiness and observed input, and all exited normally via the explicit
+  two-Ctrl+C quit sequence without cleanup escalation. Spawn-to-composer-response
+  p50/p95/max was 30.735/34.680/36.723 ms; frame-ready was
+  6.761/9.897/11.402 ms; post-ready input response was
+  23.652/25.297/25.574 ms. The binary was the default-feature release TUI,
+  SHA-256 `688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99`.
+  The measured binary hash is recorded in the raw evidence; its compiler fields
+  are null, so this file alone is not complete build provenance. The later
+  explicit 1.99.0 rebuild produced the identical binary hash, as recorded in the
+  final-build provenance file above. The final accepted ordinary warm sample
+  is the separate post-scan batch with non-null compiler metadata.
+  All valid spawn-to-response samples are below the 150 ms ceiling. Raw JSON is
+  `evidence/readiness-macos-warm-default-30.json` (SHA-256
+  `a05bd637c09612eb196b50a87030009522cdc755bcb527ef551258e59629020f`). Three
+  preceding setup batches are retained separately and excluded: one used the
+  demo-only `m0-test` readiness marker and shared a live session store; one had
+  the same store conflict; a third used isolated storage but the harness's
+  default Ctrl+D cleanup escalated to SIGTERM. They are not timing failures and
+  are not pooled with this valid batch:
+  `readiness-macos-warm-invalid-default-markers-store-lock-30.json` (SHA-256
+  `26e63387ab875a1139bedc54027c6df19f830c64808c419cb96c09f63124b2e3`),
+  `readiness-macos-warm-invalid-store-lock-30.json` (SHA-256
+  `50b322a887829009a2c6f118d1a96f5296e1ba1b7fc33d36b004fea6957f68e5`), and
+  `readiness-macos-warm-invalid-sigterm-cleanup-30.json` (SHA-256
+  `769400184f1b9f7acfd32fb0c4de18623e3c93b7e62286954ca078e5486ea731`).
 - A deterministic loopback Chat Completions workflow performs `host_read` on a
   temporary Rust fixture, verifies the actual 118-byte result is replayed in the
   follow-up request, streams a 128-chunk Rust patch-style response, and types an
   input sentinel while output is active. Linux and macOS each have 10/10 valid
   runs with no entry truncation. Linux submission-to-final-marker time was
-  190.5–205.7 ms (median 192.3 ms), final-response visible completion rate
+  190.747–193.536 ms (median 192.295 ms), final-response visible completion rate
   812.6–825.5 chunks/s (median 816.0), sampled `/proc`/kernel RSS high-water
-  6,940–7,060 KiB, and input-to-visible 1.92–2.65 ms (median 2.18 ms). macOS
+  6,960–7,060 KiB, and input-to-visible 1.92–2.65 ms (median 2.18 ms). macOS
   time was 421.9–524.2 ms (median 463.6 ms), final-response visible completion
   rate 615.6–783.7 chunks/s (median 672.0), sampled `proc_pid_rusage
   RUSAGE_INFO_V4 ri_resident_size` 5,888–6,560 KiB, and input-to-visible
@@ -94,12 +289,21 @@ workflow. The following evidence was added on 2026-11-02:
   remote source snapshot had no `.git` metadata, so commit provenance is
   unavailable. macOS used a default-feature release binary SHA-256
   `688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99`.
+  The sustained-resource sampler confirms cancellation but does not measure its
+  latency. Actual visible cancellation latency is recorded separately in the
+  PTY pressure observations (Linux 22.508/22.843 ms and macOS 26.177 ms); those
+  are observations, not newly invented percentiles or thresholds. macOS composed
+  workflow cleanup includes SIGTERM fallback, even where its `escalated` field
+  is false (that field only indicates whether SIGKILL was needed); it is not a
+  uniformly graceful-quit result.
 - Installer-aligned release/container-feature uncompressed installed-file
   totals are 14,575,775 bytes on Linux and 12,665,391 bytes on macOS. The Linux
   manifest explicitly records missing Git provenance rather than inventing a
   commit. Neither number is an archive/image size. No compressed release
-  artifact or approved archive format exists, so compressed distribution size
-  is unavailable. Evidence:
+  artifact or approved archive format existed at that measurement, so compressed
+  distribution size was unavailable. Repository inspection found no release workflow or archive
+  definition; `scripts/install.sh` builds and installs the four files directly
+  into the destination. Evidence:
   `evidence/distribution-install-payload-linux-release-container.json` (SHA-256
   `51e0e3c2e5c3f697658875b7dcbbca18a097874e7aeb46deeff98e0fd28fcf6c`) and
   `evidence/distribution-install-payload-macos-release-container.json` (SHA-256
@@ -111,17 +315,23 @@ workflow. The following evidence was added on 2026-11-02:
   observations remain their own measurements; the short composed workflow does
   not provide a useful macOS CPU delta or a dispatch-only timing.
 
-This closes the previously listed composed-workflow and Linux payload recording
-tasks, but not all P7 requirements. P7/M0 remain unaccepted until the owner has
-reviewed the assembled baseline and decided how the required distribution-size
-metric is to be satisfied without fabricating a release artifact. The workflow
-and install manifests preserve the stated provenance and measurement limits.
+The native release packaging follow-up above closes the missing compressed
+distribution-size measurement and adds Git-backed Linux build provenance;
+the old snapshot manifest remains historical evidence with missing provenance.
+P7/M0 are accepted within the final scope decision above. The
+macOS cold-cache deferral remains in force through M5. The workflow and install
+manifests preserve the stated provenance and measurement limits.
 
 These do not reopen the owner-accepted buffer and startup-side-effect gates.
 Simultaneous all-layer buffer peaks, allocator high-water, macOS cold-cache
 startup, Linux cold filesystem metadata, and default-host-launcher equivalence
 remain explicit accepted limitations/deferred scope, not hidden claims of this
 baseline.
+
+The remaining sections preserve the chronological evidence history. Statements
+that M0/P7 remained open or earlier criteria failed describe the decisions at
+that time; they do not supersede the final scoped acceptance and profile
+decisions above. Their samples, outliers and original limitations are retained.
 
 The bounded-buffer inventory has finite limits in the implementation, but that
 alone is not acceptance evidence: runtime data/control receivers are 1,024/128
@@ -886,8 +1096,8 @@ and had 30/30 ready and input responses.
 ## M0 Acceptance Checklist
 
 Checked items are verified for the scoped M0 fake paths and the platform runs
-documented below, not a production security certification. Unchecked items
-remain blockers; a complete P7 baseline has not been accepted.
+documented below, not a production security certification. The final scoped
+P7 baseline is accepted under the decisions at the top of this document.
 
 The data-channel saturation gap is addressed in the current frontend changes:
 headless and TUI query the finalized runtime snapshot and surface potentially
@@ -1353,15 +1563,21 @@ restored-source complete workspace runs recorded above.
 - [x] One model/tool/model cycle completes with fake integrations.
 - [x] Read-like fake calls proceed under scoped policy; mutation/command-like calls require approval or headless denial.
 - [x] Cancellation stops dispatch, reports uncertain effects honestly, and never claims rollback.
-- [ ] Bounded queues, output, context, and event buffers have finite defaults and visible truncation.
-- [ ] Startup performs bounded local work only, including the local configuration
-  loading accepted in the 2026-10-31 amendment to the [M0 lock](06-m0-lock.md);
-  no network, credentials, plugin processes, or automatic conversation restore.
+- [x] Bounded queues, output, context, and event buffers have finite defaults and visible truncation (owner-accepted scoped pass, 2026-11-02; allocator-level and simultaneous all-layer high-water are not claimed).
+- [x] In the exercised startup configurations, startup performed bounded local
+  work only, including the local configuration loading accepted in the
+  2026-10-31 amendment to the [M0 lock](06-m0-lock.md); no network/credential
+  access, plugin processes, or automatic conversation restore was observed.
   A bounded session metadata index and unfinished-transaction recovery are
   allowed by the 2026-10-31 history amendment; recovery may access the affected
-session body. Credential access remains unverified and was not waived.
+  session body. This is the owner-accepted scoped pass dated 2026-11-02; its
+ remaining observation limits are listed in the acceptance table above and are
+ not a claim of universal absence for every startup path.
 - [x] TUI and headless paths share one runtime and policy boundary.
 - [x] Linux and macOS validation recorded separately.
+- [x] P7 assembled baseline reviewed and accepted under the explicit scope,
+  first-security-scan separation and cold-cache deferral recorded above;
+  ordinary warm startup still requires every valid sample to meet 150 ms.
 - [x] Limitations of the M0 fake validation path are documented, including its
   ephemeral store and scripted provider. Current product capabilities are stated
   separately: configured live providers and optional persistent storage exist;
@@ -1503,8 +1719,11 @@ scoped tracefs observation below; macOS wakeups use separate per-process
 measurement attributes causality to the TUI. Fake-worker dispatch timing is
 available, but full validation/policy/event-delivery attribution remains open.
 Simultaneous whole-run/internal buffer high-water was not measured but is an
-accepted limitation of the scoped buffer gate. The first-interactive reference
-baseline and representative performance workload coverage remain open.
+accepted limitation of the scoped buffer gate. At this point in the historical
+record, the first-interactive reference baseline and representative workload
+coverage remained open. The current warm startup batch is recorded in the P7
+closure section above; macOS cold-cache preparation remains deferred to M5 and
+synthetic-workload limitations remain documented.
 Historical raw records are held in the temporary validation environment;
 newer streaming evidence is retained under `docs/tasks/evidence/`.
 The owner declined a macOS system-cache purge during this review; macOS cold

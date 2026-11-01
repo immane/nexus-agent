@@ -1,0 +1,1713 @@
+{
+  "schema": "nexus.perf.readiness/1",
+  "methodology": {
+    "schema": "nexus.perf.readiness/1",
+    "timestamp_utc": "2026-11-01T19:13:31.272090+00:00",
+    "binary": "target/p7-default/release/nexus-tui",
+    "binary_sha256": "688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99",
+    "build_profile": "release-default",
+    "command": [
+      "target/p7-default/release/nexus-tui"
+    ],
+    "user_supplied": {
+      "features": "workspace-default",
+      "cache-state": "warm-no-purge"
+    },
+    "platform": {
+      "system": "Darwin",
+      "release": "25.3.0",
+      "version": "Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:55 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T8132",
+      "machine": "arm64",
+      "processor": "arm"
+    },
+    "uname": {
+      "sysname": "Darwin",
+      "nodename": "Lams-Mac-mini.local",
+      "release": "25.3.0",
+      "version": "Darwin Kernel Version 25.3.0: Wed Jan 28 20:54:55 PST 2026; root:xnu-12377.91.3~2/RELEASE_ARM64_T8132",
+      "machine": "arm64"
+    },
+    "python": "3.14.6",
+    "compiler": {
+      "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "rustc_commit": "b940084d7eb6a299eb4bfeb8e34901bc051e7ac4",
+      "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)"
+    },
+    "required_markers": [
+      "composer (fixed)"
+    ],
+    "terminal": {
+      "cols": 120,
+      "rows": 40
+    },
+    "observation": "external PTY output plus OS process facts; no target instrumentation",
+    "cache_state": "warm",
+    "cache_note": "no cache reset attempted; this harness never runs sudo, docker, package installs, or drop_caches",
+    "cold_measurements": "unsupported by design in this harness",
+    "binary_bytes": 5111728,
+    "source_commit": "68858877772cf03b5cfa0d820d253f1b42733bb2",
+    "source_dirty": true,
+    "lockfile": "/Volumes/Nayuki/Development/Rust/nexus-agent/Cargo.lock",
+    "lockfile_sha256": "9f2e84476c6562e64809e76e200882b323b1b2a84784ec33e48854692f43fd60",
+    "cache_reset_verified": false
+  },
+  "config": {
+    "mode": "ready",
+    "runs": 30,
+    "timeout_s": 30.0,
+    "ready_timeout_s": 10.0,
+    "idle_window_s": 2.0,
+    "probe_input": false,
+    "probe_command": false,
+    "probe_composer": true,
+    "cancel_timeout_s": 5.0,
+    "cancel_settle_s": 0.15,
+    "cancel_evidence": [
+      "run cancelled",
+      "status: cancelled"
+    ],
+    "cancel_evidence_regex": []
+  },
+  "runs": [
+    {
+      "run_index": 0,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 4.742125,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 5.097125,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72058
+    },
+    {
+      "run_index": 1,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 3.10425,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.24225,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72059
+    },
+    {
+      "run_index": 2,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 3.653625,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.781583,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72060
+    },
+    {
+      "run_index": 3,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.90325,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.028458,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72061
+    },
+    {
+      "run_index": 4,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.885875,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.013958,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72062
+    },
+    {
+      "run_index": 5,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.729583,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.856875,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72063
+    },
+    {
+      "run_index": 6,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.564542,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.666125,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72064
+    },
+    {
+      "run_index": 7,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.5645,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.652083,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72065
+    },
+    {
+      "run_index": 8,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.570208,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.673417,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72066
+    },
+    {
+      "run_index": 9,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.679,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.792125,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72067
+    },
+    {
+      "run_index": 10,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.609292,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.736125,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72068
+    },
+    {
+      "run_index": 11,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.627375,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.759083,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72069
+    },
+    {
+      "run_index": 12,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.552167,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.653667,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72070
+    },
+    {
+      "run_index": 13,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.621959,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.7135,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72071
+    },
+    {
+      "run_index": 14,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.512958,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.625958,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72072
+    },
+    {
+      "run_index": 15,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.603167,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.7125,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72073
+    },
+    {
+      "run_index": 16,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.520167,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.656625,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72074
+    },
+    {
+      "run_index": 17,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.562833,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.671875,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72075
+    },
+    {
+      "run_index": 18,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.615917,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.725334,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72076
+    },
+    {
+      "run_index": 19,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.749833,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.88675,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72077
+    },
+    {
+      "run_index": 20,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 3.3375,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.437875,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72078
+    },
+    {
+      "run_index": 21,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.97225,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.104792,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72079
+    },
+    {
+      "run_index": 22,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 3.027041,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.146708,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72080
+    },
+    {
+      "run_index": 23,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.627833,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 2.733333,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72081
+    },
+    {
+      "run_index": 24,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 3.00525,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.090166,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72082
+    },
+    {
+      "run_index": 25,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.977458,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.123208,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72083
+    },
+    {
+      "run_index": 26,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 3.318125,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.409875,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72084
+    },
+    {
+      "run_index": 27,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.921958,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.063292,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72085
+    },
+    {
+      "run_index": 28,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.900709,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.025834,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72086
+    },
+    {
+      "run_index": 29,
+      "argv": [
+        "target/p7-default/release/nexus-tui"
+      ],
+      "spawn": {
+        "status": "ok",
+        "error": null
+      },
+      "ready": {
+        "status": "exited-before-ready",
+        "ms": null,
+        "first_visible_ms": 2.969125,
+        "required": [
+          "composer (fixed)"
+        ],
+        "missing": [
+          "composer (fixed)"
+        ],
+        "header_seen": true,
+        "alt_screen_seen": true,
+        "definition": "spawn to ANSI-filtered PTY output containing all required markers",
+        "note": "observed frame output, not proof that input handling is live"
+      },
+      "input_probe": null,
+      "idle": null,
+      "cancel": null,
+      "exit": {
+        "status": "exited",
+        "exit_code": 1,
+        "signal": null,
+        "elapsed_ms": 3.083792,
+        "cleanup": {
+          "method": "already-exited",
+          "escalated": false,
+          "reaped": true
+        },
+        "read_error": null
+      },
+      "resources": {
+        "ru_maxrss": 3260416,
+        "ru_maxrss_unit": "bytes (macOS ru_maxrss)",
+        "method": "os.wait4 rusage of the directly waited child"
+      },
+      "capture": {
+        "retained_bytes": 672,
+        "total_bytes": 672,
+        "dropped_bytes": 0,
+        "max_capture_bytes": 2000000,
+        "alt_screen_seen": true
+      },
+      "outcome": "ok",
+      "pid": 72087
+    }
+  ],
+  "summary": {
+    "runs": 30,
+    "outcomes": {
+      "ok": 30
+    },
+    "ready_ms": {
+      "n": 0,
+      "p50_ms": null,
+      "p95_ms": null,
+      "max_ms": null
+    },
+    "cleanup_escalations": 0,
+    "scope_note": "PTY-observed startup readiness plus live idle/RSS and external cancellation observation only; not the full P7 evidence set",
+    "composer_response_ms": {
+      "n": 0,
+      "p50_ms": null,
+      "p95_ms": null,
+      "max_ms": null
+    }
+  }
+}

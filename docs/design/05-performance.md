@@ -1,6 +1,6 @@
 # Performance and Measurement
 
-Status: Draft measurement design; M0 acceptance review in progress. First-release startup should be around 100 ms; ordinary observed launches have a 150 ms hard ceiling, with the owner-approved 200 ms ceiling applying only to verified Linux strict cold ELF-page samples. No complete accepted baseline exists. Owner-approved resource budget (2026-11-02): Linux TUI-process RSS must remain at or below 128 MiB for the scoped process; this is not an allocator-specific limit, excludes tool child processes, and does not define a macOS budget. Historical spawn-to-exit characterization runs are recorded in the [documentation index](../index.md), but they are not readiness evidence: they do not measure the first-interactive definition below and their RSS method is confounded. New PTY, idle-CPU, synthetic streaming, queue-pressure, and dispatch observations are recorded in the [M0 gate evidence](../tasks/04-m0-gates.md); they are not accepted baselines and do not yet satisfy the complete P7 set.
+Status: Scoped M0/P7 baseline accepted on 2026-11-02; broader measurement design remains draft. Ordinary warm/prepared launches retain a 150 ms per-sample ceiling; verified Linux strict cold ELF has its separate 200 ms criterion and recorded owner exception. The documented macOS first-execution security-scan sample is separately retained by owner scope adjustment, not claimed to pass 150 ms. Linux TUI-process RSS has a 128 MiB cap, excluding tool children; no macOS cap or allocator-specific guarantee is implied. See the [M0 acceptance record](../tasks/04-m0-gates.md) for exact profiles, artifacts, methods and limitations. Historical confounded spawn-to-exit/RSS measurements are not accepted readiness baselines. Acceptance is not production/security certification or real-model/full-session validation.
 
 ## Startup Definition
 
@@ -14,15 +14,39 @@ On the documented Linux and macOS reference environments, aim for first-interact
 
 ## Evidence Status
 
-The recorded macOS and Linux runs characterize spawn-to-exit and must not be promoted to baselines or acceptance evidence:
+Final review on 2026-11-02 corrected the numerical summary, verified default-build
+provenance and produced native archives with architecture validation. The new
+30-run macOS batch initially classified as ordinary warm has one valid 815.573 ms composer response
+against the 150 ms ceiling (p50/p95 34.166/114.635 ms). All samples remain in
+`docs/tasks/evidence/readiness-macos-final-warm-default-30.json`; build provenance
+is recorded beside it. M0 closure was requested conditionally on successful
+correction and verification; this failure initially prevented closure. It is not
+covered by the Linux strict-cold exception or the macOS cold-cache deferral.
+That describes the initially blocked review. After exact-path/PID scanner logs
+identified about 741 ms of Gatekeeper/XProtect scanning, the owner explicitly
+approved reporting this first execution separately from ordinary warm startup.
+The 815.573 ms sample remains valid and unchanged, not an invalid/outlier-deleted
+sample. A subsequent independent 30-run batch of the same already-scanned
+binary passed the unchanged 150 ms ceiling for every attempt (p50/p95/max
+32.326/37.895/38.804 ms), with normal cleanup and compiler/build provenance.
+This fulfills the owner's conditional M0 closure authorization. Ordinary
+over-limit launches cannot be excluded merely because they are isolated;
+the separation applies to the documented scanner-correlated first execution.
+No security controls were bypassed, and initial execution remains without a
+sub-150-ms guarantee. Raw post-scan evidence is
+`docs/tasks/evidence/readiness-macos-post-scan-warm-default-30.json`.
+
+The historical macOS and Linux spawn-to-exit runs below must not be promoted to
+baselines or acceptance evidence:
 
 - The harness measures wall time to process exit, not the first-interactive definition above, so results are not comparable with the 100 ms target.
 - RSS is a cumulative `RUSAGE_CHILDREN` high-water mark that includes other harness children such as the cache-purge command; it cannot be attributed to the binary. The unreproduced 514 MB reading is retained as an unresolved anomaly, not dismissed.
 - The macOS "cold" runs used no cache purge and are unprepared-cache runs. Linux `drop_caches` runs exist, but with small samples and high variance.
-- Current-source PTY first-interactive, idle CPU/RSS (plus macOS per-process wakeup counters), synthetic streaming throughput, runtime control-channel high-water, and fake dispatch have observations under the owner-approved reference profile below, but complete representative/full-path coverage and accepted baselines remain open. See the M0 evidence record.
+- The scoped current PTY, idle/resource/wakeup, synthetic streaming, per-layer queue and fake-dispatch observations are now accepted in the M0 record; broader real-model/full-session and complete full-path coverage are not claimed.
 - Compiler versions were whatever each environment had; no exact compiler pin has been selected yet (the toolchain choice is still pending).
 
-Re-run the profiles and validation plan below once the implementation stabilizes; do not record any number as a baseline before then.
+Re-run relevant profiles when the measured implementation or environment changes;
+do not promote the historical confounded numbers to the accepted M0 baseline.
 
 ## Measurement Profiles
 
@@ -35,7 +59,10 @@ M4, 10 logical CPUs, 16 GiB); rustc 1.99.0; locked default features and the
 release profile; 120x40 PTY; isolated empty HOME/XDG/config; no credentials,
 network, cache purge, demo feature, or provider call. Run 30 fresh processes,
 retain every attempt and cleanup outcome, and report spawn-to-observed composer
-response plus frame-ready and input-response times. Report warm-cache and
+response plus frame-ready and input-response times. The 2026-11-02 owner
+adjustment reports the documented first-execution security scan separately;
+the ordinary warm baseline uses the same already-scanned binary without
+disabling security checks. Retain both profiles and every attempt. Report warm-cache and
 prepared-cache separately; preparation is not “cold” unless the relevant cache
 state is verified, and macOS cold preparation remains deferred by owner decision.
 Keep idle/resource, fake streaming, queue pressure, and dispatch as distinct

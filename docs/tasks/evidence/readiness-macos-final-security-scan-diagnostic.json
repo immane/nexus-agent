@@ -1,0 +1,27 @@
+{
+  "schema": "nexus.perf.macos-startup-diagnostic/1",
+  "profile": "read-only historical system-log correlation; not acceptance timing",
+  "target_pid": 91485,
+  "target_binary_sha256": "688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99",
+  "related_measurement": "readiness-macos-final-warm-default-30.json",
+  "events_local_timezone_utc_plus_8": [
+    "2026-11-02 03:38:05.182 I  syspolicyd[766:48dd3e1] [com.apple.syspolicy.exec:default] queueing up scan for code: PST: (path: cee43691a6fd2f9), (team: (null)), (id: (null)), (bundle_id: (null))",
+    "2026-11-02 03:38:05.182 I  syspolicyd[766:48dd3f3] [com.apple.syspolicy.exec:default] starting work for scan for code: PST: (path: cee43691a6fd2f9), (team: (null)), (id: (null)), (bundle_id: (null))",
+    "2026-11-02 03:38:05.182 Df syspolicyd[766:48dd3f3] [com.apple.syspolicy.exec:default] GK performScan: PST: (path: cee43691a6fd2f9), (team: (null)), (id: (null)), (bundle_id: (null))",
+    "2026-11-02 03:38:05.923 I  syspolicyd[766:48de30d] [com.apple.syspolicy.exec:default] GK Xprotect results: PST: (path: cee43691a6fd2f9), (team: (null)), (id: (null)), (bundle_id: (null)), XPScan: 0,4700360306302799431,2026-11-01 19:38:05 +0000,(null),(null),file:///Volumes/Nayuki/Development/Rust/nexus-agent/target/m0-final-default/release/nexus-tui",
+    "2026-11-02 03:38:05.923 I  syspolicyd[766:48dd3f3] [com.apple.syspolicy.exec:default] GK scan complete: PST: (path: cee43691a6fd2f9), (team: (null)), (id: (null)), (bundle_id: (null)), 0, 0, 0",
+    "2026-11-02 03:38:05.923 I  syspolicyd[766:48dd3f3] [com.apple.syspolicy.exec:default] scan finished, waking up any waiters: PST: (path: cee43691a6fd2f9), (team: (null)), (id: nexus_tui-becb4884e5dee392), (bundle_id: NOT_A_BUNDLE)",
+    "2026-11-02 03:38:05.926 I  syspolicyd[766:48de30d] [com.apple.syspolicy.exec:default] Found provenance data on process: TA(7e2b01217cae57b6, 2), 91485"
+  ],
+  "scan_queue_to_complete_ms_from_log": 741,
+  "first_visible_ms_from_pty": 786.883458,
+  "frame_ready_ms_from_pty": 792.338875,
+  "spawn_to_response_ms_from_pty": 815.572917,
+  "interpretation": "Gatekeeper/XProtect scan of this exact output path completed during the delayed first launch; scan queue-to-complete was about 741ms. This explains most observed delay but does not measure all launch phases or waive the ordinary 150ms ceiling.",
+  "security_controls_changed": false,
+  "limitations": [
+    "Log timestamps have millisecond resolution; PTY timings use a separate monotonic clock.",
+    "No claim that signing/notarization guarantees the startup ceiling.",
+    "Only filtered target scan/process events retained; unrelated process and origin records omitted."
+  ]
+}
