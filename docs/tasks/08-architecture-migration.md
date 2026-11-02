@@ -28,8 +28,8 @@ unprivileged run from `/home/nexus-test/project` passed. These results provide
 partial Linux evidence only. Credential variants, adversarial file/metadata
 races, cancellation and descendant cleanup, injected
 exec failures, container networking, and M0 performance baselines still need
-their respective targeted evidence. The M1.4 escaped-descendant limitation
-remains unresolved; no full Linux security or M0–M4 acceptance is claimed.
+their respective targeted evidence. Later records below supersede this
+historical validation snapshot.
 
 Later on 2026-10-31, a fresh Ubuntu 26.04.1 x86_64 VM with ext4 and Bubblewrap
 0.11.1 reran the current workspace and the four required-backend sandbox tests
@@ -38,7 +38,8 @@ verified preservation of user xattrs, uid/gid, and mode through write/patch,
 and refusal without mutation for a non-UTF-8 xattr name. The filesystem tests
 were run explicitly after the workspace run; tools all-target Clippy passed.
 These checks do not establish ACL preservation, all inode flags, complete
-filesystem race guarantees, or descendant cleanup. M1.4 remains open.
+filesystem race guarantees, or detached-descendant cleanup. M1.4's supported
+process-group contract and non-goals are recorded below.
 
 ## Current Linux revalidation — 2026-11-02
 
@@ -145,7 +146,7 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.4 — Own exec cleanup on every exit path
 
-**Implementation status: In progress.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If a descendant keeps a pipe open beyond cleanup, the exec worker retains ownership rather than returning; runtime timeout/cancellation quarantines that worker. The original process group is signalled, but escaped descendants that close inherited pipes cannot be proven terminated by this mechanism (**cross-platform cleanup limitation; unresolved**). Linux tests for sandbox execution, probe failure/timeout, pipe draining and deadline/cancellation passed on the recorded reference VM; see the 2026-11-02 evidence above. Linux validation does not resolve the escaped-descendant limitation.
+**Implementation status: Complete within the supported process-lifecycle contract.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If pipe reads remain unconfirmed, ownership stays with the worker; the runtime may quarantine it rather than claim cleanup. A one-sided nonblocking-setup failure terminates the original process group, closes read ends without a potentially blocking read, and retains direct-child ownership until reaped. Injected setup/read/wait-error tests verify that failures are not treated as EOF or reaping. Deliberately detached descendants and sandbox escapes are explicitly outside the guarantee, as specified in [tool execution security](../design/06-security.md); their effects remain `Unknown/Uncertain`, and the executor does not claim they were terminated. The Linux and macOS descendant-held-pipe regressions and platform exec tests are recorded below.
 
 **Findings:** P1.4. **Paths:** `crates/nexus-tools/src/exec.rs`, tool exec tests. **Dependencies:** none; validate together with M1.3 when both are integrated.
 
@@ -239,10 +240,12 @@ passed.
 
 ### M1 gate
 
-**Implementation status: In progress — escaped-descendant cleanup unresolved.**
-M1.7's trust decision is resolved, and Linux exec/sandbox tests for the covered
-paths are recorded above. M1.4 still cannot prove termination of escaped
-descendants that close inherited pipes, so the lifecycle gate remains open.
+**Implementation status: Complete within the documented support boundary.**
+M1.1–M1.7 behavior and Linux/macOS reference checks for covered paths are
+recorded above. M1.4 does not guarantee termination of deliberately detached
+descendants or sandbox escapes; those outcomes remain uncertain and are not
+automatically retried. This explicit non-goal does not imply process-group
+signaling proves process-tree termination or production security readiness.
 
 ## M2 — Tighten permissions and concrete platform boundaries
 
@@ -545,15 +548,15 @@ terminal variants. API retirement is explicitly out of scope for this migration.
 
 ### M4 gate
 
-**Implementation status: In progress.** M4.1–M4.3 are implemented; the default-
-feature workspace regression suite passes on macOS and Linux reference hosts.
-Linux M2.3/M2.4 validation is now recorded above, but does not generalize to all
-Linux environments. M1.4 still has an unresolved escaped-descendant cleanup
-limitation, which keeps the dependent M1/M4 gate open. The unused public
-`InvocationOutcome` contract is retained by the
-explicit compatibility decision above, not silently retired. The migration
-gate remains open until the M1.4 cleanup limitation is resolved or explicitly
-scoped; this record is not production security readiness.
+**Implementation status: Verified for M4.1–M4.3 on the recorded macOS/Linux
+reference environments.** The shared event-consumption, development file-tool
+reuse, and compatibility-preserving contract review slices meet their recorded
+acceptance criteria. Linux M2.3/M2.4 validation does not generalize to all Linux
+environments. M1.4 is complete within its documented process-group support
+boundary; deliberately detached descendants remain outside the contract. The
+unused public `InvocationOutcome` contract is retained by the explicit
+compatibility decision above, not silently retired. This gate closure is not
+production security readiness.
 
 **Current validation evidence:** `cargo nextest run --workspace --locked
 --offline` (2,151 passed, 15 skipped) on macOS; Linux commands and results are
