@@ -72,8 +72,10 @@ impl Limits {
     /// M0-TEST: concurrent active operations. Not a product default.
     pub const M0_TEST_MAX_CONCURRENT_OPS: usize = 8;
     /// Maximum known tool outcomes a run snapshot can represent. This is an
-    /// API representation bound, independent of the M0-test run budget.
-    pub const MAX_SNAPSHOT_KNOWN_OUTCOMES: usize = 128;
+    /// API representation bound sized to the default TUI/server per-run call
+    /// budget, so every admitted call remains reportable. Benchmark pilots may
+    /// exceed it and report snapshot truncation.
+    pub const MAX_SNAPSHOT_KNOWN_OUTCOMES: usize = 512;
     /// M0-TEST: default approval expiry in seconds. Not a product default.
     pub const M0_TEST_APPROVAL_EXPIRY_SECS: u64 = 120;
     /// M0-TEST: practical ceiling for any single validated duration (run,

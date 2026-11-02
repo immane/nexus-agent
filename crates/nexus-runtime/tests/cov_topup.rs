@@ -1345,7 +1345,11 @@ fn the_retained_snapshot_bounds_known_outcomes_by_the_representation_limit() {
     let mut limits = Limits::m0_test();
     limits.max_tool_calls_per_run = admitted as u32;
     limits.max_tool_calls_per_turn = admitted as u32;
-    limits.retained_context_items = 512;
+    limits.retained_context_items = 2048;
+    // This stress case admits more calls than the default buffer can hold
+    // while the run task is scheduled ahead of the consumer.
+    limits.event_data_capacity = 4096;
+    limits.event_control_capacity = 1024;
     let candidates: Vec<CallCandidate> = (0..admitted)
         .map(|index| {
             candidate(
@@ -1410,6 +1414,103 @@ fn the_retained_snapshot_bounds_known_outcomes_by_the_representation_limit() {
             bounded[0].call, outcomes[1].0,
             "the oldest recorded outcome is the one dropped"
         );
+    });
+}
+
+#[test]
+fn frontend_call_budget_allows_512_calls_and_rejects_the_next() {
+    for extra_call in [false, true] {
+        let mut limits = Limits::m0_test();
+        limits.max_model_turns_per_run = 256;
+        limits.max_tool_calls_per_run = 512;
+        limits.max_tool_calls_per_turn = 64;
+        limits.retained_context_items = 512;
+        let mut script: Vec<_> = (0..8)
+            .map(|turn| {
+                tool_turn(
+                    (0..64)
+                        .map(|index| {
+                            candidate(
+                                &format!("item-{turn}-{index}"),
+                                &format!("ref-{turn}-{index}"),
+                                "host_missing",
+                                "{}",
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        if extra_call {
+            script.push(tool_turn(vec![candidate(
+                "extra",
+                "extra",
+                "host_missing",
+                "{}",
+            )]));
+        } else {
+            script.push(stop_turn("done"));
+        }
+        let mut bed = make_bed(config(limits, Policy::m0_test(), false), script);
+        test_rt().block_on(async {
+            let accepted = bed.runtime.submit(submit_cmd("frontend-calls")).await;
+            let run = accepted.run().unwrap().clone();
+            let (_, control, finished) =
+                collect_until_finished(&mut bed.data, &mut bed.control).await;
+            assert_eq!(
+                finished.outcome(),
+                if extra_call {
+                    RunOutcome::LimitReached
+                } else {
+                    RunOutcome::Completed
+                }
+            );
+            if extra_call {
+                assert_eq!(
+                    finished.error().unwrap().message(),
+                    "tool call budget for run exhausted"
+                );
+            }
+            assert_eq!(recorded_outcomes(&control).len(), 512);
+            let (_, snapshot) = bed
+                .runtime
+                .get_snapshot(GetSnapshotCommand {
+                    request: RequestId::new("req-frontend-snapshot").unwrap(),
+                    run,
+                })
+                .await;
+            assert_eq!(snapshot.unwrap().known_outcomes().len(), 512);
+        });
+    }
+}
+
+#[test]
+fn frontend_turn_budget_rejects_turn_257() {
+    let mut limits = Limits::m0_test();
+    limits.max_model_turns_per_run = 256;
+    limits.max_tool_calls_per_run = 512;
+    limits.max_tool_calls_per_turn = 64;
+    limits.retained_context_items = 512;
+    let script = (0..256)
+        .map(|turn| {
+            tool_turn(vec![candidate(
+                &format!("item-{turn}"),
+                &format!("ref-{turn}"),
+                "host_missing",
+                "{}",
+            )])
+        })
+        .collect();
+    let mut bed = make_bed(config(limits, Policy::m0_test(), false), script);
+    test_rt().block_on(async {
+        bed.runtime.submit(submit_cmd("frontend-turns")).await;
+        let (_, _, finished) = collect_until_finished(&mut bed.data, &mut bed.control).await;
+        assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+        assert_eq!(
+            finished.error().unwrap().message(),
+            "model turn budget exhausted"
+        );
+        assert_eq!(bed.provider.call_count(), 256);
     });
 }
 
