@@ -34,6 +34,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import startup  # noqa: E402
+from test_helpers import isolated_measurement  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "startup.py")
@@ -67,30 +68,6 @@ def rss_bytes(raw):
     if MAC_RSS:
         return raw
     return raw * 1024
-
-
-def isolated_measurement(operation, argv, **kwargs):
-    """Measure from a small, freshly exec'd harness, not the discovery process.
-
-    Linux wait4 includes the child's pre-exec RSS: a fork from the full unittest
-    runner can exceed the benign target's budget before the target even starts.
-    Keep the real measurement and the existing thresholds, but isolate the
-    measurement parent from unrelated tests' allocations.
-    """
-    worker = (
-        "import json, sys, startup\n"
-        "request = json.load(sys.stdin)\n"
-        "result = getattr(startup, request['operation'])(request['argv'], **request['kwargs'])\n"
-        "json.dump(result, sys.stdout)\n"
-    )
-    proc = subprocess.run(
-        [sys.executable, "-c", worker], cwd=HERE,
-        input=json.dumps({"operation": operation, "argv": argv, "kwargs": kwargs}),
-        capture_output=True, text=True,
-        timeout=kwargs.get("timeout", 60) * (kwargs.get("n", 1) * 2 + 1) + 30,
-        check=True,
-    )
-    return json.loads(proc.stdout)
 
 
 def measure_rss(argv, timeout):

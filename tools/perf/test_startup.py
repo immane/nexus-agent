@@ -24,6 +24,7 @@ import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import startup  # noqa: E402
+from test_helpers import isolated_measurement  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "startup.py")
@@ -286,7 +287,9 @@ class TargetRssTests(unittest.TestCase):
         hog = startup.measure_once(HOG, timeout=30)
         self.assertEqual(hog["outcome"], "ok", hog)
         purge_cmd = f"{shlex.quote(sys.executable)} -c \"b = b'x' * (128 << 20)\""
-        samples = startup.run_batch(BENIGN, 1, timeout=30, purge_cmd=purge_cmd)
+        samples = isolated_measurement(
+            "run_batch", BENIGN, n=1, timeout=30, purge_cmd=purge_cmd
+        )
         self.assertEqual(samples[0]["outcome"], "ok", samples[0])
         self.assertLess(samples[0]["max_rss"], hog["max_rss"] // 2)
 
