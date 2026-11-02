@@ -9319,17 +9319,23 @@ mod cov_main_topup {
         let (data_tx, mut data_rx) = mpsc::channel::<RunEvent>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<RunEvent>(1);
         drop(control_tx);
-        let mut interval = interval();
+        // Keep presentation ticks out of this channel-closure assertion.
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            TICK,
+        );
 
         let run = run_id("delayed-data-terminal");
+        let mut pending = Box::pin(next_loop_step(&mut interval, &mut data_rx, &mut control_rx));
+        let is_pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(pending.as_mut(), cx).is_pending())
+        })
+        .await;
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(5),
-                next_loop_step(&mut interval, &mut data_rx, &mut control_rx)
-            )
-            .await
-            .is_err()
+            is_pending,
+            "closed control alone must not complete the wait"
         );
+        drop(pending);
         data_tx
             .send(finished(&run, 0))
             .await

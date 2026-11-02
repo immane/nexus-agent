@@ -75,7 +75,7 @@ fn mock(replies: Vec<String>) -> Mock {
                 stream.write_all(chunk).unwrap();
                 stream.write_all(b"\r\n").unwrap();
             }
-            stream.write_all(b"0\r\n\r\n").unwrap();
+            finish_chunked_response(&mut stream).unwrap();
         }
     });
     Mock {
@@ -83,6 +83,49 @@ fn mock(replies: Vec<String>) -> Mock {
         requests,
         worker,
     }
+}
+
+fn finish_chunked_response(writer: &mut impl Write) -> std::io::Result<()> {
+    // All SSE payload bytes, including [DONE], have already been written.
+    // The adapter may finish there and close before the HTTP terminator arrives.
+    match writer.write_all(b"0\r\n\r\n") {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+#[test]
+fn chunked_terminator_allows_peer_close_but_preserves_other_write_errors() {
+    struct FailingWriter(std::io::ErrorKind);
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut bytes = Vec::new();
+    finish_chunked_response(&mut bytes).unwrap();
+    assert_eq!(bytes, b"0\r\n\r\n");
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionReset,
+    ] {
+        finish_chunked_response(&mut FailingWriter(kind)).unwrap();
+    }
+    let error = finish_chunked_response(&mut FailingWriter(std::io::ErrorKind::TimedOut))
+        .expect_err("unrelated write failures remain errors");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
 }
 
 fn chunk(delta: Value, finish: Option<&str>) -> String {
