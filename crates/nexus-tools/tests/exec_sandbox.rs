@@ -328,7 +328,11 @@ fn expired_command_cleans_up_and_executor_accepts_the_next_call() {
     assert_eq!(next.content(), "sandbox-ok");
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires an explicitly provisioned Linux sandbox"
+)]
 #[test]
 fn descendant_holding_output_pipe_does_not_extend_cleanup_unboundedly() {
     let root = TempRoot::new();

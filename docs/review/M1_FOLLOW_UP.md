@@ -1,7 +1,7 @@
 # M1 Follow-up Review
 
 **Date:** 2026-10-08
-**Status:** M1.3 findings resolved; M1.4 remains incomplete and not verified.
+**Status as of 2026-11-02:** M1.3 findings resolved. M1.4 is complete within the explicitly documented process-group support boundary; deliberately detached descendants remain a non-goal, not a verified cleanup capability.
 
 This document consolidates the remaining M1 review follow-up from [the architecture review](ARCHITECTURE_REVIEW.md). It records implementation status and validation limits; it is not a security certification.
 
@@ -25,23 +25,23 @@ These are validation gaps, not evidence of a remaining behavior defect. Add an i
 
 ## M1.4 — Exec cleanup and worker ownership
 
-**Status: Partially resolved; not verified.** The implementation improves bounded pipe draining, interrupted-read responsiveness, and ownership retention, but the following lifecycle issue remains open.
+**Status: Verified on macOS and the recorded Linux reference VM within the documented support boundary.** The implementation uses bounded nonblocking pipe draining and retains ownership when read/wait completion is uncertain. Deliberately detached descendants and sandbox escapes are explicitly not covered; effects remain uncertain and the implementation does not claim their termination.
 
 ### M1.4-F1 — Nonblocking setup failure cannot prove descendant termination
 
 **Severity:** P1. **Path:** `crates/nexus-tools/src/exec.rs`, unreadable-pipe cleanup and runtime quarantine.
 
-If setting nonblocking mode fails for either pipe, cleanup signals the original process group, closes both read ends, and waits for the direct child to be reaped. A descendant that escaped the process group may remain alive after the direct child exits; closing the read ends does not establish that this descendant terminated. The tool worker can then return and release runtime quarantine while descendant termination remains unconfirmed.
+If setting nonblocking mode fails for either pipe, cleanup signals the original process group, closes both read ends without blocking, and waits for the direct child to be reaped. This is complete only for the supported direct-child/original-process-group contract; detached descendants are outside the contract and are never represented as confirmed terminated. The tool outcome remains `Unknown/Uncertain` where effects may have occurred.
 
-Read and wait errors on the normal nonblocking cleanup path are no longer treated as EOF or proof of completion. This preserves ownership, but a persistent error or a descendant that holds a pipe open can keep the worker quarantined indefinitely. The behavior is conservative, but no bounded recovery/operator policy is defined.
+Read and wait errors on the normal nonblocking cleanup path are not treated as EOF or proof of completion. A persistent error or a descendant that holds a pipe open can keep the worker quarantined indefinitely. This is the fail-closed recovery policy: no automatic retry/release occurs while completion is unconfirmed; the runtime exposes an uncertain terminal outcome. There is no in-process force-release because that would discard ownership evidence.
 
-**Required follow-up:** Preserve ownership when termination cannot be confirmed, including nonblocking-setup failure, without performing a potentially blocking read. Define how permanently unconfirmed workers are surfaced and recovered; do not report cleanup complete based only on direct-child exit. Add injected tests for one-sided nonblocking failure, persistent read failure, and wait failure.
+**Verification:** Added injected tests for one-sided nonblocking setup failure, persistent read failure, and wait failure. Each remains non-completion rather than EOF/reaping. The actual cleanup retains direct-child ownership until reaped; no potentially blocking read is performed on the setup-failure path.
 
 ### Additional M1.4 verification gaps
 
 - The cleanup predicate test checks boolean combinations but does not exercise the actual cleanup loop under injected failures.
-- The unreadable-pipe test exercises direct-child cleanup, not an escaped descendant retaining a pipe.
+- The unreadable-pipe test exercises direct-child cleanup. Detached descendants retaining a pipe are outside the supported contract and are not claimed terminated.
 - Startup probe reapers are capped at four owners and fail closed at saturation, but remain detached; wait-error saturation is untested.
-- Linux sandbox execution and injected wait/read/probe failure paths remain unverified. The descendant-held-pipe integration test is macOS-only.
+- Linux sandbox execution, exec failure-injection tests, and a descendant-held-pipe integration test now pass on the recorded Ubuntu reference VM; the equivalent supported-path integration test passes on macOS. Results do not generalize to every Linux distribution/filesystem.
 
-**Validation recorded:** `cargo nextest run -p nexus-tools --locked --offline` (46 passed), including bounded-drain, unreadable-pipe cleanup, and cleanup-completion tests. This does not close the outstanding lifecycle issue or the platform/failure-injection gaps above.
+**Current validation:** macOS `cargo test -p nexus-tools --locked --offline -- --test-threads=1` (74 passed, 1 ignored across unit/behavior/doc tests), `cargo clippy -p nexus-tools --all-targets --locked --offline -- -D warnings`, and the descendant-held-pipe test passed. On Ubuntu 26.04.1/ext4, 11 exec unit tests and the explicitly enabled descendant-held-pipe test passed. Linux validation used the isolated reference-VM checkout; no live provider was used.

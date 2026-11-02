@@ -282,9 +282,7 @@ impl SandboxedExecutor {
         let mut child = command.spawn().map_err(|_| Failure::Spawn)?;
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
-        let stdout_nonblocking = set_nonblocking(&stdout).is_ok();
-        let stderr_nonblocking = set_nonblocking(&stderr).is_ok();
-        if !stdout_nonblocking || !stderr_nonblocking {
+        if !both_pipes_nonblocking(set_nonblocking(&stdout), set_nonblocking(&stderr)) {
             abort_unreadable_pipes(&mut child, stdout, stderr);
             return Err(Failure::Output);
         }
@@ -558,6 +556,14 @@ fn drain_pipe(reader: &mut impl Read, output: &mut CapturedOutput) -> IoResult<(
     Ok(())
 }
 
+fn both_pipes_nonblocking<E1, E2>(stdout: Result<(), E1>, stderr: Result<(), E2>) -> bool {
+    stdout.is_ok() && stderr.is_ok()
+}
+
+fn wait_result_reaped<T, E>(result: Result<Option<T>, E>) -> bool {
+    matches!(result, Ok(Some(_)))
+}
+
 fn wait_bounded(
     child: &mut std::process::Child,
     grace: Duration,
@@ -582,11 +588,7 @@ fn retain_child_until_reaped(
         let mut err = CapturedOutput::new(0);
         let _ = drain_pipe(stdout, &mut out);
         let _ = drain_pipe(stderr, &mut err);
-        if cleanup_complete(
-            child.try_wait().is_ok_and(|status| status.is_some()),
-            out.eof,
-            err.eof,
-        ) {
+        if cleanup_complete(wait_result_reaped(child.try_wait()), out.eof, err.eof) {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -595,7 +597,7 @@ fn retain_child_until_reaped(
 
 fn retain_process_until_reaped(child: &mut std::process::Child) {
     loop {
-        if child.try_wait().is_ok_and(|status| status.is_some()) {
+        if wait_result_reaped(child.try_wait()) {
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -828,7 +830,8 @@ impl ToolPort for SandboxedExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapturedOutput, SandboxedExecutor, abort_unreadable_pipes, cleanup_complete, drain_pipe,
+        CapturedOutput, SandboxedExecutor, abort_unreadable_pipes, both_pipes_nonblocking,
+        cleanup_complete, drain_pipe, wait_result_reaped,
     };
     use std::io::{self, Cursor, Read};
     use std::process::{Command, Stdio};
@@ -1072,6 +1075,41 @@ mod tests {
         assert!(!cleanup_complete(true, true, false));
         assert!(!cleanup_complete(false, true, true));
         assert!(cleanup_complete(true, true, true));
+    }
+
+    #[test]
+    fn one_sided_nonblocking_setup_failure_is_not_accepted() {
+        assert!(!both_pipes_nonblocking(
+            Ok::<(), io::Error>(()),
+            Err(io::Error::other("injected"))
+        ));
+        assert!(!both_pipes_nonblocking(
+            Err(io::Error::other("injected")),
+            Ok::<(), io::Error>(())
+        ));
+        assert!(both_pipes_nonblocking(
+            Ok::<(), io::Error>(()),
+            Ok::<(), io::Error>(())
+        ));
+    }
+
+    #[test]
+    fn persistent_read_and_wait_errors_do_not_complete_cleanup() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+
+        let mut reader = FailingReader;
+        let mut output = CapturedOutput::new(16);
+        assert!(drain_pipe(&mut reader, &mut output).is_err());
+        assert!(!output.eof);
+        assert!(!wait_result_reaped::<(), _>(Err(io::Error::other(
+            "injected wait failure"
+        ))));
+        assert!(!cleanup_complete(false, output.eof, true));
     }
 
     #[test]
