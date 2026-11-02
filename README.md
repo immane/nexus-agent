@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.4--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.5--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent with live model integrations, native terminal sessions,
 coding tools, and optional container execution. Designed around very fast startup
@@ -19,7 +19,7 @@ not an ever-growing engine. External plugins remain planned.
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.4-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **Scoped M0 acceptance is complete (2026-11-02); cross-platform production/security readiness is not.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.5-alpha**, with the scoped M0–M4 gates complete over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **The scoped M0–M4 gates are complete for their recorded scopes; Beta readiness and cross-platform production/security readiness are not claimed.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -444,7 +444,7 @@ and persistence/integrity failures still stop the run rather than bypassing
 safety checks. Stopping a run does not imply that an outstanding worker has
 stopped or that its effects were rolled back.
 
-Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Local-backend `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Container-backed execution uses the separate prototype boundary described above. Linux hardening remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
+Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Local-backend `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Container-backed execution uses the separate prototype boundary described above. Linux hardening beyond the recorded reference profile remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
 
 The server binds to loopback only. Configured providers or real tools require `--auth-token-env NAME` with a 64-hex-character bearer token. That server-wide token also authorizes approval/control routes; session IDs are not credentials. Loopback HTTP is not encrypted and does not isolate mutually untrusted same-user processes.
 
@@ -509,14 +509,17 @@ server from current source.
 
 ## Project Status
 
-**Current position: scoped M0 accepted; Linux and macOS M2 reference-platform
-tests pass; M4 consolidation slices are implemented, with selected M5
-capabilities already delivered. M1 is complete within its documented support
-scope; broader M4 acceptance remains open.**
+**Current position: the scoped M0–M4 gates are complete for their recorded
+acceptance scopes, with selected M5 capabilities already delivered. M1 is
+complete within its documented process-group support boundary; M2–M4 evidence is
+tied to the recorded macOS/Linux reference environments. This is Alpha status,
+not Beta readiness.**
 Development has been capability-driven rather than strictly milestone-ordered:
 the real model/tool/container loop and complex task repairs were exercised before
 all baseline measurements and acceptance reviews were finished. Implementation
-progress and verified readiness are tracked separately.
+progress and verified readiness are tracked separately. Beta would require
+closing the remaining lifecycle-test gaps and repeating release validation at the
+release commit.
 
 | Stage | Implementation and remaining acceptance work |
 | --- | --- |
@@ -528,9 +531,9 @@ progress and verified readiness are tracked separately.
 | **M5 — On-demand extensions** | Additional provider protocols implemented with offline fixtures; external-tool transport and HTTP/TLS replacement remain deferred. |
 
 M1–M5 refer to the [architecture migration stages](docs/tasks/08-architecture-migration.md),
-not sequential product releases. Officially resolved SWE-bench tasks demonstrate
-real end-to-end capability, not completion of every safety, performance, or
-cross-platform gate. Near-term work is incremental reliability improvement and
+not sequential product releases or Beta exit criteria. Officially resolved
+SWE-bench tasks demonstrate real end-to-end capability, not completion of every
+safety, performance, or cross-platform gate. Near-term work is incremental reliability improvement and
 acceptance closure, not a core rewrite or adding features merely to advance a
 milestone number.
 
@@ -606,7 +609,7 @@ M1–M5 migration gates above.
 - [ ] Recovery of active execution; restoring history does not resume processes or replay uncertain tool calls.
 - [ ] Semantic IR, graph/vector retrieval, and LoRA research components; these remain a vision, not shipped features.
 
-Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The alpha version is not a stable-release or production-readiness claim.
+Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The **0.2.5-alpha** version is not a stable-release or production-readiness claim.
 
 ## Documentation and Contributions
 
