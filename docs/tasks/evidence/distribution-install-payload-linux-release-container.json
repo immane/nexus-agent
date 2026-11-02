@@ -1,0 +1,53 @@
+{
+  "schema": "nexus.perf.install-payload/1",
+  "measurement": "sum of uncompressed installed file sizes; no archive/compression/container image",
+  "platform": {
+    "system": "Linux",
+    "release": "7.0.0-38-generic",
+    "machine": "x86_64"
+  },
+  "build": {
+    "profile": "release",
+    "toolchain": "rustc/cargo 1.99.0",
+    "locked": true,
+    "offline": true,
+    "features": [
+      "nexus-tui/container",
+      "nexus-server/container"
+    ]
+  },
+  "source_commit": null,
+  "source_dirty": null,
+  "files": [
+    {
+      "name": "nexus-tui",
+      "bytes": 6935288,
+      "sha256": "41184abc5f5945b5a988a9ac8f04026b5b8d8b7866be68c6d9f5a51fc2231238",
+      "mode": "0755"
+    },
+    {
+      "name": "nexus-server",
+      "bytes": 4805288,
+      "sha256": "a0108f6090eb5368faedf1be7c53d550698964e3ac49b985581cd71dd0fafff1",
+      "mode": "0755"
+    },
+    {
+      "name": "nexus-headless",
+      "bytes": 2809008,
+      "sha256": "ceebbaa26894d3749121868d27233bcc43b5540c89ebdf022597d2d027f43845",
+      "mode": "0755"
+    },
+    {
+      "name": "nexus-config",
+      "bytes": 26191,
+      "sha256": "b64cf56b6093029a1cb3fd79fd67019638ebf2ab305cbb4b471b20d22f6ed09a",
+      "mode": "0755"
+    }
+  ],
+  "total_uncompressed_installed_bytes": 14575775,
+  "source_provenance": {
+    "kind": "remote source snapshot without .git metadata",
+    "commit": "unavailable",
+    "dirty_state": "unavailable"
+  }
+}

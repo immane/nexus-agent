@@ -1,0 +1,40 @@
+{
+  "binary": "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui",
+  "binary_sha256": "adcec2e3fb2b8d24751185195f6ddaa2132b43561041c9c1640d1486ce3c2c91",
+  "platform": "macOS /bin/ps process sampling",
+  "workload": "loopback HTTP SSE; finite coding payload through final rendered marker",
+  "finite_chunks": 128,
+  "valid_samples": 1,
+  "invalid_samples": 0,
+  "samples": [
+    {
+      "run": 0,
+      "valid": true,
+      "outcome": "final-marker-rendered",
+      "window_s": 0.176101375,
+      "provider_chunks_sent": 128,
+      "provider_requests": 1,
+      "payload_profile": "coding",
+      "payload_bytes": 4470,
+      "sample_count": 4,
+      "sample_interval_s": 0.05,
+      "rss_min_kib": 5952,
+      "rss_median_kib": 6048,
+      "rss_max_sampled_kib": 6304,
+      "rss_peak_method": "maximum of sampled /bin/ps RSS values",
+      "first_chunk_to_final_marker_s": 0.176101375,
+      "visible_completion_chunks_per_s": 726.8540634620258,
+      "visible_progress_observations": 1,
+      "viewport_scrollback_visible": true,
+      "entry_output_truncation_visible": false,
+      "visible_progress_method": "insufficient distinct numbered content observations",
+      "sample_gap_min_ms": 2.315125,
+      "sample_gap_median_ms": 56.17025,
+      "sample_gap_max_ms": 56.584,
+      "ps_cpu_percent_min": 3.5,
+      "ps_cpu_percent_median": 4.3,
+      "ps_cpu_percent_max": 4.3,
+      "cpu_measurement_method": "OS-reported ps %cpu values; not a window CPU delta"
+    }
+  ]
+}

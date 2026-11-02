@@ -20,8 +20,9 @@ Measured, in this harness's own vocabulary:
 - idle CPU / RSS high-water: sampled only while the target stays alive
   after observed-frame-ready. RSS high-water comes from os.wait4 rusage on
   the directly waited child; live RSS sampling uses /proc on Linux and ps
-  on macOS. Wakeup accounting is explicitly unsupported: no privileged
-  tooling (no root, no powermetrics) is used.
+  on macOS. macOS wakeups use unprivileged per-process counters from
+  proc_pid_rusage; Linux scheduler wakeups remain unsupported here (the
+  separate tracefs experiment requires privilege).
 - cancellation observation: only if the target is still alive after
   observed-frame-ready. A marker time is reported only when explicit
   post-cancel evidence appears: by default the case-insensitive terminal
@@ -33,8 +34,8 @@ Measured, in this harness's own vocabulary:
   is "skipped"/"unconfirmed"/"timeout" and no latency is fabricated.
 
 Honesty rules:
-- warm cache only: this harness never runs sudo, docker, installs, or
-  cache resets, and never claims cold-cache numbers.
+- No cache reset is verified or cold-cache numbers claimed. An optional
+  caller-supplied preparation command runs only when explicitly requested.
 - machine JSON evidence records source commit, Cargo.lock SHA-256, binary
   SHA-256, build profile, platform, uname, compiler, command, and
   user-supplied labels.
@@ -60,6 +61,8 @@ unreaped target), 2 usage error.
 """
 
 import argparse
+import codecs
+import ctypes
 import errno
 import hashlib
 import json
@@ -67,6 +70,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -74,6 +78,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -87,9 +92,11 @@ except ImportError:  # pragma: no cover - non-POSIX import still works
 SCHEMA = "nexus.perf.readiness/1"
 DEFAULT_REQUIRED = ("composer (fixed)", "m0-test")
 DEFAULT_HEADER_MARKER = "nexus-tui"
+COMMAND_PROBE_MARKER = "Enter/Tab insert"
+COMMAND_ESCAPE_SETTLE = 0.35
 DEFAULT_CANCEL_EVIDENCE = ("run cancelled", "status: cancelled")
 ALT_SCREEN_SEQUENCE = "\x1b[?1049h"
-FAILURE_OUTCOMES = ("spawn-error", "ready-timeout", "run-timeout", "wait-error")
+FAILURE_OUTCOMES = ("preparation-error", "spawn-error", "ready-timeout", "run-timeout", "wait-error")
 POSIX_FORK = os.name == "posix" and hasattr(os, "fork") and hasattr(os, "wait4")
 PIPE_READ_SIZE = 65536
 MARKER_TAIL_BYTES = 65536
@@ -213,6 +220,91 @@ class AnsiFilter:
                 elif byte != 0x1B:
                     self.state = "osc"
         return bytes(out)
+
+
+class ProbeScreen:
+    """Bounded, partial terminal screen for the command-panel marker.
+
+    Handles the cursor and erase operations used by the TUI, not arbitrary
+    terminal protocols. Unicode wide cells occupy two columns.
+    """
+
+    def __init__(self, cols, rows):
+        self.cols, self.rows = cols, rows
+        self.cells = [[" "] * cols for _ in range(rows)]
+        self.x = self.y = 0
+        self.state = "text"
+        self.sequence = ""
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def feed(self, data):
+        for char in self.decoder.decode(data):
+            if self.state == "esc":
+                self.state = "csi" if char == "[" else "osc" if char == "]" else "text"
+                self.sequence = ""
+            elif self.state == "osc":
+                if char == "\a":
+                    self.state = "text"
+                elif char == "\x1b":
+                    self.state = "osc-esc"
+            elif self.state == "osc-esc":
+                self.state = "text" if char == "\\" else "osc"
+            elif self.state == "csi":
+                if "@" <= char <= "~":
+                    self._csi(char, self.sequence)
+                    self.state = "text"
+                elif len(self.sequence) < 128:
+                    self.sequence += char
+                else:
+                    self.state = "text"
+            elif char == "\x1b":
+                self.state = "esc"
+            elif char == "\r":
+                self.x = 0
+            elif char == "\n":
+                self.y = min(self.rows - 1, self.y + 1)
+            elif char == "\b":
+                self.x = max(0, self.x - 1)
+            elif char >= " " and char != "\x7f":
+                width = 0 if unicodedata.combining(char) else (
+                    2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+                )
+                if not width:
+                    continue
+                if self.x + width > self.cols:
+                    self.x = 0
+                    self.y = min(self.rows - 1, self.y + 1)
+                self.cells[self.y][self.x] = char
+                if width == 2:
+                    self.cells[self.y][self.x + 1] = " "
+                self.x += width
+
+    def _csi(self, op, params):
+        if params.startswith("?"):
+            return
+        try:
+            values = [int(part or "0") for part in params.split(";")]
+        except ValueError:
+            return
+        n = values[0] or 1
+        if op in "Hf":
+            self.y = min(self.rows - 1, n - 1)
+            self.x = min(self.cols - 1, (values[1] or 1) - 1 if len(values) > 1 else 0)
+        elif op == "A": self.y = max(0, self.y - n)
+        elif op == "B": self.y = min(self.rows - 1, self.y + n)
+        elif op == "C": self.x = min(self.cols - 1, self.x + n)
+        elif op == "D": self.x = max(0, self.x - n)
+        elif op == "G": self.x = min(self.cols - 1, n - 1)
+        elif op == "J" and values[0] in (2, 3):
+            self.cells = [[" "] * self.cols for _ in range(self.rows)]
+        elif op == "K":
+            x = min(self.x, self.cols - 1)
+            lo, hi = ((0, self.cols) if values[0] == 2 else
+                      (0, x + 1) if values[0] == 1 else (x, self.cols))
+            self.cells[self.y][lo:hi] = [" "] * (hi - lo)
+
+    def contains(self, marker):
+        return any(marker in "".join(row) for row in self.cells)
 
 
 class CaptureBuffer:
@@ -349,10 +441,16 @@ class PtyTarget:
 
     def write(self, data):
         try:
-            os.write(self.master, data)
-            return True
+            return os.write(self.master, data) == len(data)
         except OSError:
             return False
+
+    def echo_enabled(self):
+        """Sample the PTY line discipline; None means unavailable."""
+        try:
+            return bool(termios.tcgetattr(self.master)[3] & termios.ECHO)
+        except (OSError, termios.error, TypeError):
+            return None
 
     def read_chunk(self, timeout_s):
         """Returns (data, eof); eof means the PTY reported end-of-stream."""
@@ -715,6 +813,8 @@ class RunConfig:
     idle_window: float = 2.0
     idle_interval: float = 0.25
     probe_input: bool = False
+    probe_command: bool = False
+    probe_composer: bool = False
     probe_char: str = "z"
     probe_timeout: float = 2.0
     cancel_settle: float = 0.15
@@ -727,6 +827,47 @@ class RunConfig:
     header_marker: str = DEFAULT_HEADER_MARKER
     quit_keys: bytes = b"\x04"
     cancel_keys: bytes = b"\x03"
+    prepare_argv: tuple = ()
+    prepare_timeout: float = 30.0
+
+
+def prepare_sample(argv, timeout):
+    """Run caller-supplied argv without a shell; discard output and bound cleanup."""
+    started = time.monotonic_ns()
+    result = {"argv": list(argv), "status": "error", "elapsed_ms": None,
+              "exit_code": None, "error": None, "cleanup": "not-started"}
+    process = None
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            result["exit_code"] = process.wait(timeout=timeout)
+            result["status"] = "ok" if result["exit_code"] == 0 else "nonzero"
+            result["cleanup"] = "leader-reaped; descendants-unverified"
+        except subprocess.TimeoutExpired:
+            result["status"] = "timeout"
+            # The unreaped leader still reserves its PID, so the process group
+            # cannot have been recycled for an unrelated process.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                result["cleanup"] = "group-sigkill-requested"
+            except ProcessLookupError:
+                result["cleanup"] = "group-not-found"
+            except OSError as exc:
+                result["cleanup"] = f"group-signal-error: {exc}"
+                result["status"] = "error"
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                result["cleanup"] += "; direct-child-unreaped"
+                result["status"] = "error"
+    except (OSError, ValueError) as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        if process is not None:
+            result["cleanup"] = "unverified-after-wait-error"
+    finally:
+        result["elapsed_ms"] = (time.monotonic_ns() - started) / 1e6
+    return result
 
 
 def _context_switch_delta(first, second):
@@ -740,13 +881,56 @@ def _context_switch_delta(first, second):
     }
 
 
-def _idle_supported_note():
+def _idle_unsupported_note(reason):
     return {
         "status": "unsupported",
-        "reason": (
-            "unprivileged wakeup counting is not implemented; this harness never "
-            "uses root or privileged tooling"
-        ),
+        "reason": reason,
+    }
+
+
+def sample_darwin_wakeups(pid):
+    """Read Apple per-process package-idle and interrupt wakeup counters."""
+    if sys.platform != "darwin":
+        return _idle_unsupported_note("Apple proc_pid_rusage is macOS-only")
+    # rusage_info_v4 is 16 bytes of UUID followed by 36 uint64 fields (304 B).
+    # The two counters are fields 3 and 4, immediately after user/system time.
+    info_size = 16 + 36 * ctypes.sizeof(ctypes.c_uint64)
+    info = ctypes.create_string_buffer(info_size)
+    try:
+        proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        query = proc.proc_pid_rusage
+        query.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+        query.restype = ctypes.c_int
+        if query(pid, 4, ctypes.cast(info, ctypes.c_void_p)) != 0:
+            error = ctypes.get_errno()
+            detail = os.strerror(error) if error else "system error unavailable"
+            return _idle_unsupported_note(
+                f"proc_pid_rusage(RUSAGE_INFO_V4) failed: {detail}"
+            )
+    except (AttributeError, OSError) as exc:
+        return _idle_unsupported_note(f"proc_pid_rusage unavailable: {exc}")
+    values = (ctypes.c_uint64 * 2).from_buffer(info, 16 + 2 * 8)
+    return {
+        "status": "observed",
+        "method": "proc_pid_rusage RUSAGE_INFO_V4 (per-process cumulative counters)",
+        "pkg_idle_wkups": int(values[0]),
+        "interrupt_wkups": int(values[1]),
+    }
+
+
+def _idle_wakeup_delta(first, second):
+    if first.get("status") != "observed" or second.get("status") != "observed":
+        return second if second.get("status") != "observed" else first
+    package = second["pkg_idle_wkups"] - first["pkg_idle_wkups"]
+    interrupt = second["interrupt_wkups"] - first["interrupt_wkups"]
+    if package < 0 or interrupt < 0:
+        return _idle_unsupported_note("per-process counters decreased during sample")
+    return {
+        "status": "observed",
+        "method": second["method"],
+        "pkg_idle_wkups": package,
+        "interrupt_wkups": interrupt,
+        "scope": "per-process package-idle and interrupt wakeup counters; not scheduler events",
     }
 
 
@@ -765,6 +949,12 @@ def run_measurement(cfg, argv, run_index=0):
         "capture": None,
         "outcome": "ok",
     }
+    if cfg.prepare_argv:
+        result["preparation"] = prepare_sample(cfg.prepare_argv, cfg.prepare_timeout)
+        if result["preparation"]["status"] != "ok":
+            result["spawn"] = {"status": "not-attempted", "error": None}
+            result["outcome"] = "preparation-error"
+            return result
     try:
         target = spawn_pty(argv, cols=cfg.cols, rows=cfg.rows)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -780,15 +970,33 @@ def run_measurement(cfg, argv, run_index=0):
     alt_tracker = MarkerTracker((ALT_SCREEN_SEQUENCE,))
     echo_tracker = None
     cancel_evidence_tracker = None
+    command_tracker = MarkerTracker((COMMAND_PROBE_MARKER,)) if cfg.probe_command else None
+    command_screen = ProbeScreen(cfg.cols, cfg.rows) if cfg.probe_command or cfg.probe_composer else None
+    composer_marker = secrets.token_hex(8) if cfg.probe_composer else None
+    composer_tracker = MarkerTracker((composer_marker,)) if composer_marker else None
+    composer_seen = False
+    composer_ms = None
+    command_seen = False
+    command_ms = None
     ready_ms = None
     first_visible_ms = None
     echo_ms = None
     cancel_evidence_ms = None
 
     def feed(data):
-        nonlocal ready_ms, first_visible_ms, echo_ms, cancel_evidence_ms
+        nonlocal ready_ms, first_visible_ms, echo_ms, cancel_evidence_ms, command_ms, command_seen, composer_seen, composer_ms
         capture.feed(data)
         alt_tracker.feed(data)
+        if command_screen is not None:
+            command_screen.feed(data)
+            if command_screen.contains(COMMAND_PROBE_MARKER):
+                command_seen = True
+                if command_ms is None:
+                    command_ms = target.elapsed_ms()
+            if composer_marker and command_screen.contains(composer_marker):
+                composer_seen = True
+                if composer_ms is None:
+                    composer_ms = target.elapsed_ms()
         visible = ansi.feed(data)
         if not visible:
             return
@@ -797,6 +1005,10 @@ def run_measurement(cfg, argv, run_index=0):
             header_tracker.feed(visible)
         if echo_tracker is not None:
             echo_tracker.feed(visible)
+        if command_tracker is not None:
+            command_tracker.feed(visible)
+        if composer_tracker is not None:
+            composer_tracker.feed(visible)
         if cancel_evidence_tracker is not None:
             cancel_evidence_tracker.feed(visible)
         now_ms = target.elapsed_ms()
@@ -858,6 +1070,98 @@ def run_measurement(cfg, argv, run_index=0):
             "definition": "spawn to ANSI-filtered PTY output containing all required markers",
             "note": "observed frame output, not proof that input handling is live",
         }
+
+        if ready_ms is not None and cfg.probe_composer:
+            # Reject prior occurrences, including queued output, before writing.
+            while time.monotonic_ns() < run_deadline:
+                data, _ = target.read_chunk(0)
+                if not data:
+                    break
+                feed(data)
+            preexisting = composer_seen or composer_tracker.complete
+            exited = target.check_exit()
+            echo_before = target.echo_enabled() if not exited else None
+            start_ns = time.monotonic_ns()
+            deadline = min(run_deadline, start_ns + int(cfg.probe_timeout * 1e9))
+            wrote = False
+            if not preexisting and not exited and echo_before is False and start_ns < deadline:
+                wrote = target.write(composer_marker.encode("ascii"))
+            if wrote:
+                pump(deadline, done=lambda: composer_seen)
+            echo_after = target.echo_enabled() if wrote and not target.check_exit() else None
+            observed = wrote and composer_seen and echo_after is False
+            status = (
+                "marker-preexisting" if preexisting else
+                "exited-before-probe" if exited else
+                "echo-unavailable" if echo_before is None else
+                "echo-enabled" if echo_before else
+                "probe-timeout" if start_ns >= deadline else
+                "write-failed" if not wrote else
+                "echo-unconfirmed" if echo_after is not False else
+                "observed-composer-response" if observed else
+                "exited-before-marker" if target.reaped else "marker-not-observed"
+            )
+            result["input_probe"] = {
+                "status": status,
+                "ms": composer_ms - (start_ns - target.started_ns) / 1e6 if observed else None,
+                "spawn_to_response_ms": composer_ms if observed else None,
+                "bounded_ms": cfg.probe_timeout * 1000.0,
+                "marker": composer_marker,
+                "wrote_keys": wrote,
+                "echo_before": echo_before,
+                "echo_after": echo_after,
+                "interpretation": (
+                    "observational screen response to a random token; ECHO was sampled "
+                    "before writing and after observation, not continuously; delayed "
+                    "output, terminal mode races and screen emulation can confound causality"
+                ),
+            }
+
+        if ready_ms is not None and cfg.probe_command:
+            # Drain already queued output and reject a pre-existing marker.
+            while time.monotonic_ns() < run_deadline:
+                data, _ = target.read_chunk(0)
+                if not data:
+                    break
+                feed(data)
+            preexisting = command_seen or command_tracker.complete
+            exited = target.check_exit()
+            escape_written = False
+            wrote = False
+            start_ns = time.monotonic_ns()
+            probe_deadline = min(run_deadline, start_ns + int(cfg.probe_timeout * 1e9))
+            if not preexisting and not exited and start_ns < probe_deadline:
+                escape_written = target.write(b"\x1b")
+                if escape_written:
+                    pump(min(probe_deadline, start_ns + int(COMMAND_ESCAPE_SETTLE * 1e9)))
+                preexisting = command_seen or command_tracker.complete
+                exited = target.check_exit()
+            colon_start_ns = time.monotonic_ns()
+            command_ms = None
+            if escape_written and not preexisting and not exited and colon_start_ns < probe_deadline:
+                wrote = target.write(b":")
+            if wrote:
+                pump(probe_deadline, done=lambda: command_seen)
+            observed = wrote and command_seen and command_ms is not None
+            result["input_probe"] = {
+                "status": ("observed-command-panel" if observed else
+                           "marker-preexisting" if preexisting else
+                           "exited-before-probe" if exited else
+                           "probe-timeout" if not wrote and colon_start_ns >= probe_deadline else
+                           "write-failed" if not wrote else
+                           "exited-before-marker" if target.reaped else "marker-not-observed"),
+                "ms": command_ms - (colon_start_ns - target.started_ns) / 1e6 if observed else None,
+                "spawn_to_response_ms": command_ms if observed else None,
+                "bounded_ms": cfg.probe_timeout * 1000.0,
+                "keys_hex": "1b 3a",
+                "marker": COMMAND_PROBE_MARKER,
+                "wrote_keys": wrote,
+                "wrote_escape": escape_written,
+                "interpretation": (
+                    "observational: command-panel text cannot be terminal echo of ':'; "
+                    "unrelated or delayed output can still confound causality"
+                ),
+            }
 
         if ready_ms is not None and cfg.probe_input:
             probe_bounded_ms = cfg.probe_timeout * 1000.0
@@ -927,6 +1231,7 @@ def run_measurement(cfg, argv, run_index=0):
         if ready_ms is not None and cfg.mode == "idle":
             wall_start_ns = time.monotonic_ns()
             cpu_first = sample_cpu(target.pid)
+            wakeups_first = sample_darwin_wakeups(target.pid)
             rss_samples = []
             peak_sampled = None
             window_end_ns = min(
@@ -957,6 +1262,7 @@ def run_measurement(cfg, argv, run_index=0):
                     peak_sampled = max(peak_sampled or 0, rss["peak_rss_bytes"])
             wall_end_ns = time.monotonic_ns()
             cpu_second = sample_cpu(target.pid)
+            wakeups_second = sample_darwin_wakeups(target.pid)
             window_s = (wall_end_ns - wall_start_ns) / 1e9
             cpu_seconds = None
             if cpu_first.get("available") and cpu_second.get("available"):
@@ -964,6 +1270,7 @@ def run_measurement(cfg, argv, run_index=0):
             idle_percent = None
             if cpu_seconds is not None and window_s > 0:
                 idle_percent = (cpu_seconds / window_s) * 100.0
+            sorted_rss = sorted(rss_samples)
             short_window = exited_during_window or window_s < cfg.idle_window * 0.9
             result["idle"] = {
                 "status": "short" if short_window else "observed",
@@ -973,9 +1280,20 @@ def run_measurement(cfg, argv, run_index=0):
                 "cpu_method": cpu_second.get("method"),
                 "idle_cpu_percent": idle_percent,
                 "rss_samples": len(rss_samples),
+                "rss_min_sampled_bytes": sorted_rss[0] if sorted_rss else None,
+                "rss_median_sampled_bytes": (
+                    (
+                        sorted_rss[(len(sorted_rss) - 1) // 2]
+                        + sorted_rss[len(sorted_rss) // 2]
+                    )
+                    // 2
+                    if sorted_rss
+                    else None
+                ),
+                "rss_max_sampled_bytes": sorted_rss[-1] if sorted_rss else None,
                 "rss_peak_sampled_bytes": peak_sampled,
                 "context_switches": _context_switch_delta(cpu_first, cpu_second),
-                "wakeups": _idle_supported_note(),
+                "wakeups": _idle_wakeup_delta(wakeups_first, wakeups_second),
             }
 
         if ready_ms is not None and cfg.mode == "cancel":
@@ -1191,6 +1509,13 @@ def summarize_runs(cfg, runs):
             "cancellation observation only; not the full P7 evidence set"
         ),
     }
+    if cfg.probe_composer:
+        summary["composer_response_ms"] = summarize_ms([
+            run["input_probe"]["spawn_to_response_ms"]
+            for run in runs
+            if run["input_probe"] is not None
+            and run["input_probe"]["status"] == "observed-composer-response"
+        ])
     if cfg.mode == "idle":
         summary["idle"] = [
             {
@@ -1241,10 +1566,14 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description=(
             "Observe PTY frame readiness, idle CPU/RSS, and external cancellation "
-            "for an unmodified target (stdlib only; warm cache; no privileged actions)."
+            "for an unmodified target (stdlib only; optional caller-supplied preparation)."
         )
     )
     parser.add_argument("binary", help="Path to the target binary (or interpreter).")
+    parser.add_argument("--prepare-arg", action="append", metavar="ARG",
+                        help="Preparation argv element; repeat in order (no shell).")
+    parser.add_argument("--prepare-timeout", type=positive_seconds, default=30.0,
+                        help="Per-sample preparation timeout in seconds (default: 30).")
     parser.add_argument(
         "--mode",
         choices=["ready", "idle", "cancel"],
@@ -1303,6 +1632,14 @@ def build_parser():
         "--probe-input",
         action="store_true",
         help="After readiness, write one key and observe its echo (ready mode only).",
+    )
+    parser.add_argument(
+        "--probe-command", action="store_true",
+        help="After readiness, send ':' and observe the TUI command-completion panel (ready mode only).",
+    )
+    parser.add_argument(
+        "--probe-composer", action="store_true",
+        help="After readiness, observe a random composer token with PTY ECHO sampled off (ready mode only).",
     )
     parser.add_argument("--probe-char", default="z", help="Key to write for --probe-input.")
     parser.add_argument(
@@ -1411,8 +1748,14 @@ def main(argv=None):
         own, binary_args = raw, []
     parser = build_parser()
     args = parser.parse_args(own)
+    if args.prepare_arg and not args.prepare_arg[0]:
+        parser.error("the preparation executable must not be empty")
     if args.probe_input and args.mode != "ready":
         parser.error("--probe-input is only supported with --mode ready")
+    if args.probe_command and (args.mode != "ready" or args.probe_input):
+        parser.error("--probe-command requires --mode ready and cannot be combined with --probe-input")
+    if args.probe_composer and (args.mode != "ready" or args.probe_input or args.probe_command):
+        parser.error("--probe-composer requires --mode ready and cannot be combined with other probes")
     if not os.path.exists(args.binary) and shutil.which(args.binary) is None:
         parser.error(f"binary not found: {args.binary}")
     runs_requested = args.runs if args.runs is not None else (5 if args.mode == "ready" else 1)
@@ -1428,6 +1771,8 @@ def main(argv=None):
         idle_window=args.idle_window,
         idle_interval=args.idle_interval,
         probe_input=args.probe_input,
+        probe_command=args.probe_command,
+        probe_composer=args.probe_composer,
         probe_char=args.probe_char,
         probe_timeout=args.probe_timeout,
         cancel_settle=args.cancel_settle,
@@ -1444,6 +1789,8 @@ def main(argv=None):
         header_marker=args.header_marker,
         quit_keys=args.quit_hex,
         cancel_keys=args.cancel_hex,
+        prepare_argv=tuple(args.prepare_arg or ()),
+        prepare_timeout=args.prepare_timeout,
     )
     command = [args.binary] + binary_args
     evidence_binary = (
@@ -1456,6 +1803,14 @@ def main(argv=None):
         provenance = collect_provenance(args.lockfile)
         for key in ("lockfile", "lockfile_sha256"):
             methodology[key] = provenance[key]
+    methodology["cache_reset_verified"] = False
+    if cfg.prepare_argv:
+        methodology["cache_state"] = "unknown"
+        methodology["cache_note"] = "user-supplied preparation; cache reset never verified"
+        methodology["cold_measurements"] = "not verified"
+        methodology["preparation"] = {"argv": list(cfg.prepare_argv),
+                                      "timeout_s": cfg.prepare_timeout,
+                                      "method": "direct argv execution without shell, once per sample"}
     runs = [run_measurement(cfg, command, index) for index in range(runs_requested)]
     record = {
         "schema": SCHEMA,
@@ -1467,6 +1822,8 @@ def main(argv=None):
             "ready_timeout_s": cfg.ready_timeout,
             "idle_window_s": cfg.idle_window,
             "probe_input": cfg.probe_input,
+            "probe_command": cfg.probe_command,
+            "probe_composer": cfg.probe_composer,
             "cancel_timeout_s": cfg.cancel_timeout,
             "cancel_settle_s": cfg.cancel_settle,
             "cancel_evidence": list(cfg.cancel_evidence),
@@ -1493,8 +1850,8 @@ def main(argv=None):
         print(
             f"[{cfg.mode}] run {run['run_index'] + 1}/{runs_requested} "
             f"{ready_text} outcome={run['outcome']} "
-            f"capture={run['capture']['retained_bytes']}B "
-            f"dropped={run['capture']['dropped_bytes']}B",
+            f"capture={run['capture']['retained_bytes'] if run['capture'] else 0}B "
+            f"dropped={run['capture']['dropped_bytes'] if run['capture'] else 0}B",
             file=report_stream,
         )
         if run["idle"] is not None:

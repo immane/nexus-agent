@@ -5,3 +5,5 @@ mod fs_patch;
 mod fs_read_tools;
 mod fs_scope;
 mod fs_write;
+#[cfg(target_os = "linux")]
+mod linux_replacement_metadata;

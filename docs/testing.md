@@ -2,6 +2,13 @@
 
 ## Normal workflow
 
+Release packaging has offline stdlib-only regression tests:
+`python3 scripts/test-release.py`. These cover archive determinism, checksums,
+installation, tampering and symlink rejection without compiling Rust. An actual
+native artifact requires `python3 scripts/package-release.py --offline` and
+an extracted-install smoke test on each intended platform; unit tests alone
+do not establish binary compatibility.
+
 Run checks for the affected packages, **sequentially**. Concurrent Cargo builds,
 tests, and clippy commands share the target directory lock and do not accelerate
 validation. Avoid checking the same code immediately before clippy (which already
@@ -19,11 +26,34 @@ TUI, server, tools, and container integration tests share one `behavior` target
 per package instead of linking an executable for every source file. New
 integration modules in these packages must be added to `tests/behavior.rs`;
 automatic test target discovery is disabled in their manifests.
+The default Unix TUI suite also requires Python 3 for its pseudo-terminal
+credential-startup regression; it uses an isolated FIFO and loopback listener.
+The default `input_pressure` regression also uses Python 3, a real PTY and a
+loopback-only SSE provider. It verifies that an 80-character burst (larger than
+one input batch) appears intact while output continues, then checks draft
+clearing and cancellation. Its ten-second watchdog is a functional deadlock
+bound, not the 100 ms performance acceptance threshold. No live service or
+user credentials are used.
+On Linux the fixture also rejects native-readiness fallback and checks that the
+observer does not change stdin's `O_NONBLOCK` bit. Linux-only `input_ready` unit
+tests cover cancelled waits, stale readiness, later input, batch cooldown and
+hangup errors. Native readiness requires the Linux Tokio I/O driver; other
+platforms retain the periodic input path.
+
+The default `credential_env` regression (macOS and Linux) also needs `cc`,
+which Rust already requires as its linker. It compiles a temporary shim and
+preloads it into the TUI (`DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`) to record
+the names, never the values, passed to libc `getenv`. Startup must not look up
+the selected or an unselected provider's credential variable; a submission to
+a loopback listener must look up the selected one. On macOS the shim also
+records `open`, `connect` and process-creation calls: startup must open the
+configuration but no `credentials.json`, internet connection or process. Calls
+that bypass these libc entry points are not observed.
 
 The TUI has an opt-in real-terminal rendering regression (Unix and Python 3):
 
 ```sh
-cargo nextest run -j 1 -p nexus-tui session_commands_preserve_the_terminal_screen --run-ignored all --locked --offline
+cargo nextest run -j 1 -p nexus-tui --features demo session_commands_preserve_the_terminal_screen --run-ignored all --locked --offline
 ```
 
 It connects stdout and stderr to the same pseudo-terminal and checks incremental
@@ -34,6 +64,9 @@ diagnostics must not write directly to a terminal owned by the TUI. Interactive
 non-demo runs write bounded, metadata-only local logs automatically (see
 [Quickstart diagnostics](../QUICKSTART.md#tui-diagnostics)). Demo runs do not open
 the user's log directory; redirect stderr to retain their runtime diagnostics.
+The `demo` feature is disabled by default. Run `cargo nextest run -p nexus-tui
+--features demo --locked --offline` as well when changing demo behavior; the
+default suite separately checks that `--demo` is rejected without the feature.
 
 Development/test builds retain line-table debug information, debug assertions,
 overflow checks, and incremental compilation. Dependencies omit debug information.

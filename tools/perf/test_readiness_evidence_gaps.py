@@ -201,6 +201,9 @@ IDLE_KEYS = {
     "cpu_method",
     "idle_cpu_percent",
     "rss_samples",
+    "rss_min_sampled_bytes",
+    "rss_median_sampled_bytes",
+    "rss_max_sampled_bytes",
     "rss_peak_sampled_bytes",
     "context_switches",
     "wakeups",
@@ -655,8 +658,15 @@ time.sleep(30)
         idle = result["idle"]
         self.assertEqual(set(idle), IDLE_KEYS)
         self.assertIn(idle["status"], IDLE_STATUSES)
-        self.assertEqual(set(idle["wakeups"]), {"status", "reason"})
-        self.assertEqual(idle["wakeups"]["status"], "unsupported")
+        if sys.platform == "darwin":
+            self.assertEqual(idle["wakeups"]["status"], "observed")
+            self.assertEqual(
+                set(idle["wakeups"]),
+                {"status", "method", "pkg_idle_wkups", "interrupt_wkups", "scope"},
+            )
+        else:
+            self.assertEqual(set(idle["wakeups"]), {"status", "reason"})
+            self.assertEqual(idle["wakeups"]["status"], "unsupported")
         self.assertIn(idle["context_switches"], (None, {"voluntary", "nonvoluntary"}))
         self.assertIsNone(result["cancel"])
         self.assertNotIn("idle", readiness.summarize_runs(readiness.RunConfig(mode="ready"), [result]))

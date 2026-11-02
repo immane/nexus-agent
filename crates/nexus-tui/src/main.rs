@@ -8,7 +8,7 @@
 //!
 //! - The tick interval is persistent: continuously ready events cannot
 //!   starve keyboard polling or stalled-reorder handling.
-//! - Keyboard handling per tick is bounded, so an input flood cannot starve
+//! - Keyboard handling per input poll is bounded, so an input flood cannot starve
 //!   event application or redraws.
 //! - A `Submit` clears and records the draft and adopts the run identity
 //!   only on an `Accepted` reply; `Busy` keeps the draft untouched. A new
@@ -48,7 +48,8 @@ use nexus_core::{
     AgentError, ApprovalNotice, CommandReply, CommandResponse, ErrorCategory, EventPayload,
     GetSnapshotCommand, Limits, ListSessionsCommand, ModelInstructions, ModelRequest,
     ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
-    RestoreSessionCommand, RetryGuidance, RunEvent, RunId, SessionId, ToolRegistration,
+    RestoreSessionCommand, RetryGuidance, RunEvent, RunId, RunLifecycle, RunOutcome, SessionId,
+    ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_openai::OpenAiProvider;
@@ -65,20 +66,24 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 mod diagnostics;
+mod input_ready;
+
+use input_ready::InputReady;
 
 const DEMO_PROFILE: &str = "m0-test";
 const DEMO_INPUT: &str = "m0 test-only demo submission";
-/// Persistent tick: keyboard polling and stalled-reorder handling happen at
-/// this cadence even while events are continuously ready.
+/// Persistent maintenance cadence, even while events are continuously ready.
 const TICK: Duration = Duration::from_millis(50);
+/// Periodic parser draining and burst cadence; Linux also observes input readiness.
+const INPUT_POLL: Duration = Duration::from_millis(20);
 const HEADLESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounded window for cancellation reconciliation before terminal restore.
 const RECONCILE_TIMEOUT: Duration = Duration::from_millis(500);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Explicit Tokio teardown bound: native blocking provider/tool work is never
 /// awaited indefinitely.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-/// Keyboard events read per tick; a paste or autorepeat burst is drained
-/// across later ticks instead of starving events and redraws.
+/// Input events read per poll; bursts cannot starve events and redraws.
 const MAX_KEYS_PER_TICK: usize = 32;
 /// Finite cross-channel reorder buffer. Beyond this, missing sequences are
 /// skipped as explicitly counted presentation gaps, never reordered.
@@ -460,7 +465,8 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return StartupAction::Help,
-            "--demo" => demo = true,
+            "--demo" if cfg!(feature = "demo") => demo = true,
+            "--demo" => return StartupAction::Usage,
             "--strict-tools" => strict_tools = true,
             "--execution" | "--run" => {
                 if execution_set {
@@ -543,7 +549,7 @@ fn startup_usage(help: bool) -> ! {
             "Modes:\n",
             "  --execution <MODE>  Select local (default) or container execution\n",
             "  --run <MODE>        Alias for --execution\n",
-            "  --demo              Run the scripted demo (fake provider/tools; submits a canned task)\n\n",
+            "{}\n",
             "Workspace and tools:\n",
             "  --tools-root <PATH> Workspace jail; defaults to the current directory\n",
             "  --strict-tools      Use the strict jailed-tools policy\n\n",
@@ -558,7 +564,7 @@ fn startup_usage(help: bool) -> ! {
             "Other:\n",
             "  -h, --help          Print this help\n\n",
             "Behavior:\n",
-            "  Without --demo, live provider wiring is used when configured; otherwise\n",
+            "  Live provider wiring is used when configured; otherwise\n",
             "  task submission reports that no provider is configured. Local mode is default.\n",
             "  Container mode is experimental, needs a container-enabled build, both images\n",
             "  (flags or user config), and a workspace. It does not establish isolation.\n",
@@ -569,6 +575,11 @@ fn startup_usage(help: bool) -> ! {
             "  See QUICKSTART.md and docs/design/11-container-execution.md.\n\n",
             "{}\n",
         ),
+        if cfg!(feature = "demo") {
+            "  --demo              Run the scripted demo (may use live models and real tools)\n"
+        } else {
+            "  Demo support: disabled; rebuild with --features demo to use --demo.\n"
+        },
         if cfg!(feature = "container") {
             "Container support: enabled in this build."
         } else {
@@ -666,12 +677,16 @@ fn resolve_live_adapter(
     lookup: impl FnOnce(&str) -> Option<String>,
 ) -> LiveResolve {
     let Some(model_id) = selection.active_model.as_deref() else {
-        if selection.demo {
+        if cfg!(any(test, feature = "demo")) && selection.demo {
             return LiveResolve::Demo;
         }
         return LiveResolve::Failed(
             ErrorCategory::InvalidInput,
-            "no model configured: add a model or relaunch with --demo for the scripted demo",
+            if cfg!(feature = "demo") {
+                "no model configured: add a model or relaunch with --demo for the scripted demo"
+            } else {
+                "no model configured: add a model"
+            },
         );
     };
     let Some(entry) = selection.config.model(model_id) else {
@@ -954,7 +969,10 @@ impl PerRunProvider {
             discovered_context: Arc::new(Mutex::new(HashMap::new())),
             current: Mutex::new(PerRunState {
                 run: None,
-                provider: ActiveProvider::Fake(FakeProvider::demo_two_turn()),
+                provider: ActiveProvider::Unavailable(
+                    ErrorCategory::InvalidInput,
+                    "no run selected",
+                ),
             }),
         }
     }
@@ -1209,10 +1227,11 @@ fn build_live_runtime_with_store(
             }
         }
         ExecutionMode::Local => match &session_config.tools_root {
-            None => vec![
+            None if cfg!(test) || (cfg!(feature = "demo") && session_config.demo) => vec![
                 ToolRegistration::read(Arc::new(FakeTool::read_only())),
                 ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
             ],
+            None => return Err(io::Error::other("workspace root is unavailable")),
             Some(root) => {
                 let canonical = std::fs::canonicalize(root).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "tools root is unusable")
@@ -1273,18 +1292,16 @@ fn runtime_with_tools(
     Ok((runtime, streams, binding))
 }
 
-/// One-line wiring report for the transcript: which provider (if any) the
-/// next run resolves to, and whether file tools are real. Only counts and the
-/// operator's own identities appear; values never do.
+/// Reports the selection without resolving credentials or claiming it is usable.
 fn wiring_notice(
     selection: &LiveSelection,
     tools_root: Option<&std::path::Path>,
     execution: ExecutionMode,
 ) -> String {
-    let provider = match resolve_live_adapter(selection, env_credential) {
-        LiveResolve::Demo => "demo script".to_owned(),
-        LiveResolve::Live(adapter) => format!("live adapter ({})", adapter.model()),
-        LiveResolve::Failed(_, message) => format!("unavailable ({message})"),
+    let provider = match selection.active_model.as_deref() {
+        Some(model) => format!("selected model ({model}); provider validated on submission"),
+        None if selection.demo => "demo script".to_owned(),
+        None => "no model selected".to_owned(),
     };
     let tools = match (execution, tools_root) {
         (ExecutionMode::Container, Some(root)) => format!(
@@ -1306,7 +1323,7 @@ fn wiring_notice(
 fn main() {
     install_panic_hook();
     let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
@@ -1345,7 +1362,12 @@ async fn run() -> io::Result<()> {
            jailed file tools + sandboxed exec (writes/exec require approval). \
            --execution container is experimental and does not establish isolation. \
            Without a configured provider, runs fail as not-configured; \
-           relaunch with --demo for the scripted ephemeral demo."
+           {}",
+        if cfg!(feature = "demo") {
+            "Relaunch with --demo for the scripted ephemeral demo."
+        } else {
+            "Demo support is disabled in this build."
+        }
     );
     if session_config.execution == ExecutionMode::Container {
         eprintln!(
@@ -1366,6 +1388,9 @@ async fn run() -> io::Result<()> {
                 let restored = guard.restore();
                 match report {
                     Ok(report) => {
+                        for (_label, _warning) in report.close_warnings {
+                            eprintln!("nexus-tui: close warning emitted (details redacted)");
+                        }
                         if report.unresolved_blocking {
                             eprintln!(
                                 "nexus-tui: run cancellation did not reconcile; native \
@@ -1400,7 +1425,12 @@ async fn run() -> io::Result<()> {
                 }
                 if !session_config.demo {
                     return Err(io::Error::other(format!(
-                        "terminal setup failed ({error}); relaunch with --demo for the scripted transcript fallback"
+                        "terminal setup failed ({error}); {}",
+                        if cfg!(feature = "demo") {
+                            "relaunch with --demo for the scripted transcript fallback"
+                        } else {
+                            "an interactive terminal is required"
+                        }
                     )));
                 }
                 eprintln!("terminal setup failed ({error}); demo transcript fallback");
@@ -1415,9 +1445,11 @@ async fn run() -> io::Result<()> {
             ));
         }
         if !session_config.demo {
-            return Err(io::Error::other(
-                "no terminal attached; relaunch with --demo for the scripted transcript fallback",
-            ));
+            return Err(io::Error::other(if cfg!(feature = "demo") {
+                "no terminal attached; relaunch with --demo for the scripted transcript fallback"
+            } else {
+                "no terminal attached; an interactive terminal is required"
+            }));
         }
         let (runtime, streams) = build_demo_runtime(session_config.settings.limits())?;
         headless(runtime, streams, session_config).await
@@ -1504,6 +1536,45 @@ impl EventMerger {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotCompleteness {
+    Clean,
+    Truncated,
+    Unknown,
+}
+
+fn completeness_warning(completeness: SnapshotCompleteness) -> Option<&'static str> {
+    match completeness {
+        SnapshotCompleteness::Clean => None,
+        SnapshotCompleteness::Truncated => {
+            Some("runtime content was truncated; transcript may be incomplete")
+        }
+        SnapshotCompleteness::Unknown => {
+            Some("runtime content completeness is unknown; transcript may be incomplete")
+        }
+    }
+}
+
+fn closed_stream_outcome(front: &Frontend) -> (io::Result<()>, Option<&'static str>) {
+    let Some(run) = front.merger.active_run() else {
+        return (Ok(()), None);
+    };
+    if !front.merger.is_finalized() {
+        return (
+            Err(io::Error::other(
+                "event stream closed before the run reached a terminal outcome; runtime content completeness is unknown; transcript may be incomplete",
+            )),
+            None,
+        );
+    }
+    let completeness = if front.checked_run.as_ref() == Some(run) {
+        front.snapshot_completeness
+    } else {
+        SnapshotCompleteness::Unknown
+    };
+    (Ok(()), completeness_warning(completeness))
+}
+
 /// Frontend session state: presentation, focus, accepted-run merge, and the
 /// live runtime approval notice used to build decisions.
 struct Frontend {
@@ -1511,6 +1582,11 @@ struct Frontend {
     focus: Focus,
     session: SessionId,
     merger: EventMerger,
+    checked_run: Option<RunId>,
+    snapshot_completeness: SnapshotCompleteness,
+    terminal_outcome: Option<(RunId, RunOutcome)>,
+    incomplete_run_seen: bool,
+    close_warning: Option<&'static str>,
     request_counter: u64,
     /// Exact runtime notice for the live approval, captured in merged order.
     live_approval: Option<(RunId, ApprovalNotice)>,
@@ -1557,6 +1633,11 @@ impl Frontend {
             focus: Focus::Composer,
             session,
             merger: EventMerger::new(),
+            checked_run: None,
+            snapshot_completeness: SnapshotCompleteness::Unknown,
+            terminal_outcome: None,
+            incomplete_run_seen: false,
+            close_warning: None,
             request_counter: 0,
             live_approval: None,
             reported_gaps: 0,
@@ -1722,20 +1803,9 @@ impl Frontend {
         self.state.notice(&message);
     }
 
-    /// True when the next run resolves to a real adapter (selection known,
-    /// credential present, endpoint valid). The interactive canned demo
-    /// submission is gated on the negation: auto-firing a real network
-    /// call on every launch would bill the operator for a transcript
-    /// nobody asked for. No handle (unit tests) counts as demo.
-    fn is_live(&self) -> bool {
-        let Some(binding) = &self.live else {
-            return false;
-        };
-        let selection = binding.lock().expect("live selection lockable");
-        matches!(
-            resolve_live_adapter(&selection, env_credential),
-            LiveResolve::Live(_)
-        )
+    /// Only an unselected demo can safely submit the canned prompt at startup.
+    fn should_auto_submit_demo(&self) -> bool {
+        self.demo && self.active_model.is_none()
     }
 
     /// Advances the active model through the configured models in admission
@@ -2044,6 +2114,55 @@ impl Frontend {
         true
     }
 
+    async fn check_finalized(&mut self, runtime: &Runtime) -> bool {
+        if !self.merger.is_finalized() {
+            return false;
+        }
+        let Some(run) = self.merger.active_run().cloned() else {
+            return false;
+        };
+        if self.checked_run.as_ref() == Some(&run) {
+            return false;
+        }
+        let command = GetSnapshotCommand {
+            request: self.next_request(),
+            run: run.clone(),
+        };
+        let result = tokio::time::timeout(SNAPSHOT_TIMEOUT, runtime.get_snapshot(command)).await;
+        self.snapshot_completeness = match result {
+            Ok((reply, Some(snapshot)))
+                if reply.reply() == CommandReply::Accepted
+                    && reply.run() == Some(&run)
+                    && snapshot.run() == &run
+                    && snapshot.session() == &self.session
+                    && self
+                        .terminal_outcome
+                        .as_ref()
+                        .is_some_and(|(terminal_run, outcome)| {
+                            terminal_run == &run
+                                && snapshot.lifecycle() == RunLifecycle::Finalized(*outcome)
+                        }) =>
+            {
+                if snapshot.is_content_truncated() {
+                    self.state
+                        .notice("runtime content was truncated; transcript may be incomplete");
+                    SnapshotCompleteness::Truncated
+                } else {
+                    SnapshotCompleteness::Clean
+                }
+            }
+            _ => {
+                self.state.notice(
+                    "runtime content completeness is unknown; transcript may be incomplete",
+                );
+                SnapshotCompleteness::Unknown
+            }
+        };
+        self.incomplete_run_seen |= self.snapshot_completeness != SnapshotCompleteness::Clean;
+        self.checked_run = Some(run);
+        true
+    }
+
     /// Applies merged events in order. Returns true when the terminal
     /// outcome was applied; the run is never reopened afterwards. A
     /// terminal outcome returns keyboard focus to the composer so the
@@ -2058,6 +2177,8 @@ impl Frontend {
             self.note_approval(&event);
             if !self.state.apply_event(&event) {
                 self.state_rejected += 1;
+            } else if let EventPayload::RunFinished(finished) = event.payload() {
+                self.terminal_outcome = Some((event.run().clone(), finished.outcome()));
             }
             if terminal {
                 self.focus = Focus::Composer;
@@ -2111,6 +2232,7 @@ impl Frontend {
         if gaps > self.reported_gaps {
             let delta = gaps - self.reported_gaps;
             self.reported_gaps = gaps;
+            self.incomplete_run_seen = true;
             self.state.notice(&format!(
                 "presentation gap: {delta} event(s) missing from the data channel"
             ));
@@ -2124,6 +2246,7 @@ impl Frontend {
         }
         if self.state_rejected > 0 && !self.state_rejected_reported {
             self.state_rejected_reported = true;
+            self.incomplete_run_seen = true;
             self.state.notice(&format!(
                 "{} event(s) rejected by presentation state",
                 self.state_rejected
@@ -2149,29 +2272,62 @@ async fn next_loop_step(
     data: &mut mpsc::Receiver<RunEvent>,
     control: &mut mpsc::Receiver<RunEvent>,
 ) -> LoopStep {
-    tokio::select! {
-        event = data.recv() => match event {
-            Some(event) => LoopStep::Event(Box::new(event)),
-            None => LoopStep::Closed,
-        },
-        event = control.recv() => match event {
-            Some(event) => LoopStep::Event(Box::new(event)),
-            None => LoopStep::Closed,
-        },
-        _ = interval.tick() => LoopStep::Tick,
+    // Closure is learned only from recv(): a closed receiver can still have
+    // outstanding permits. These flags belong to this wait, so cancelling it
+    // for input or switching sessions cannot transfer state to another stream.
+    let mut data_done = false;
+    let mut control_done = false;
+    loop {
+        if data_done && control_done {
+            return LoopStep::Closed;
+        }
+        tokio::select! {
+            biased;
+            _ = interval.tick() => return LoopStep::Tick,
+            result = async {
+                tokio::select! {
+                    event = data.recv(), if !data_done => (true, event),
+                    event = control.recv(), if !control_done => (false, event),
+                }
+            } => match result {
+                (_, Some(event)) => return LoopStep::Event(Box::new(event)),
+                (true, None) => data_done = true,
+                (false, None) => control_done = true,
+            },
+        }
     }
 }
 
-/// Non-blocking next input event; resize traffic is drained and ignored so
-/// it cannot stall the loop, while mouse wheel notches surface as scroll
-/// input beside key presses.
+async fn next_interactive_step(
+    interval: &mut tokio::time::Interval,
+    input_interval: &mut tokio::time::Interval,
+    data: &mut mpsc::Receiver<RunEvent>,
+    control: &mut mpsc::Receiver<RunEvent>,
+    input_ready: &mut InputReady,
+) -> io::Result<Option<LoopStep>> {
+    tokio::select! {
+        step = next_loop_step(interval, data, control) => Ok(Some(step)),
+        _ = input_interval.tick() => {
+            input_ready.arm();
+            Ok(None)
+        },
+        ready = input_ready.ready() => {
+            ready?;
+            input_ready.defer(input_interval);
+            Ok(None)
+        },
+    }
+}
+
+/// Non-blocking next input event; ignored traffic consumes at most one event
+/// per poll, while mouse wheel notches surface beside key presses.
 fn read_input() -> io::Result<Option<Input>> {
-    while poll(Duration::ZERO)? {
-        match read()? {
-            Event::Key(key) => return Ok(Some(Input::Key(key))),
-            Event::Mouse(mouse) => return Ok(Some(Input::Mouse(mouse))),
-            _ => {}
-        }
+    if poll(Duration::ZERO)? {
+        return Ok(match read()? {
+            Event::Key(key) => Some(Input::Key(key)),
+            Event::Mouse(mouse) => Some(Input::Mouse(mouse)),
+            _ => None,
+        });
     }
     Ok(None)
 }
@@ -3480,6 +3636,14 @@ async fn handle_key_with_runtime(
             if front.state.composer().trim().is_empty() {
                 return false;
             }
+            if front.merger.active_run().is_some_and(|run| {
+                !front.merger.is_finalized() || front.checked_run.as_ref() != Some(run)
+            }) {
+                front.state.notice(
+                    "previous run is still being reconciled; draft preserved; submit again shortly",
+                );
+                return false;
+            }
             let request = front.next_request();
             let read_only = front.state.mode().read_only;
             match submit_command(
@@ -3721,6 +3885,7 @@ async fn handle_key_with_runtime(
 struct InteractiveReport {
     result: io::Result<()>,
     unresolved_blocking: bool,
+    close_warnings: Vec<(String, &'static str)>,
 }
 
 /// Interactive scripted demo: one canned submission, live approval card,
@@ -3762,6 +3927,7 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
             return Ok(InteractiveReport {
                 result: Ok(()),
                 unresolved_blocking: false,
+                close_warnings: Vec::new(),
             });
         };
         session_config = resolved_config;
@@ -3789,7 +3955,6 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
         session_config.tools_root.as_deref(),
         session_config.execution,
     );
-    let demo = session_config.demo;
     let mut sessions = SessionRegistry::new_with_store(
         SessionSlot {
             label: "s1".to_owned(),
@@ -3813,11 +3978,9 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Canned submission through the same command path as typed input. The
-    // draft is recorded and the run adopted only after `Accepted`. Doubly
-    // gated: explicit `--demo` (never silent fakes in the dev version), and
-    // not-live (a live adapter would fire a real billable network call on
-    // every launch for a transcript nobody asked for).
-    if demo && !sessions.active().front.is_live() {
+    // draft is recorded and the run adopted only after `Accepted`. A selected
+    // model must never be auto-submitted, even if its credentials are missing.
+    if sessions.active().front.should_auto_submit_demo() {
         let slot = sessions.active_mut();
         let submit = submit_command(
             slot.front.next_request(),
@@ -3842,17 +4005,66 @@ async fn interactive(mut session_config: SessionConfig) -> io::Result<Interactiv
     // window before the terminal is restored.
     sessions.poll_maintenance();
     let mut unresolved_blocking = sessions.maintenance.is_some();
+    let cancel_unknown = cancel_slots_before_reconcile(&mut sessions.slots).await;
     for slot in &mut sessions.slots {
-        if !slot.front.merger.is_finalized() {
-            unresolved_blocking |=
-                reconcile_after_stop(&slot.runtime, &mut slot.streams, &mut slot.front, "exit")
-                    .await;
+        unresolved_blocking |=
+            reconcile_events_after_stop(&slot.runtime, &mut slot.streams, &mut slot.front).await;
+    }
+    let mut close_warnings: Vec<_> = sessions
+        .slots
+        .iter()
+        .filter_map(|slot| exit_warning(&slot.front).map(|warning| (slot.label.clone(), warning)))
+        .collect();
+    for (slot, unknown) in sessions.slots.iter().zip(cancel_unknown) {
+        if unknown {
+            close_warnings.push((
+                slot.label.clone(),
+                "cancel outcome is unknown; do not blindly retry",
+            ));
+            unresolved_blocking = true;
         }
     }
     Ok(InteractiveReport {
         result,
         unresolved_blocking,
+        close_warnings,
     })
+}
+
+async fn cancel_slots_before_reconcile(slots: &mut [SessionSlot]) -> Vec<bool> {
+    let mut cancellations = tokio::task::JoinSet::new();
+    let deadline = tokio::time::Instant::now() + RECONCILE_TIMEOUT;
+    let mut attempted = vec![false; slots.len()];
+    for (index, slot) in slots.iter_mut().enumerate() {
+        if let Some(command) = stop_cancel_command(&mut slot.front) {
+            attempted[index] = true;
+            let runtime = slot.runtime.clone();
+            cancellations.spawn(async move {
+                let reply = tokio::time::timeout_at(deadline, runtime.handle(command)).await;
+                (index, reply.map(|(reply, _)| reply.reply()))
+            });
+        }
+    }
+    let mut cancel_unknown = vec![false; slots.len()];
+    while let Some(result) = cancellations.join_next().await {
+        match result {
+            Ok((index, reply)) => match reply {
+                Ok(reply) => slots[index]
+                    .front
+                    .state
+                    .notice(&format!("exit: cancel reply {reply:?}")),
+                Err(_) => cancel_unknown[index] = true,
+            },
+            Err(_) => {
+                // A failed task does not identify its slot here; conservatively
+                // report every attempted cancellation as unknown.
+                for (unknown, attempted) in cancel_unknown.iter_mut().zip(&attempted) {
+                    *unknown |= *attempted;
+                }
+            }
+        }
+    }
+    cancel_unknown
 }
 
 #[cfg(feature = "container")]
@@ -4064,6 +4276,20 @@ async fn interactive_loop(
     interval: &mut tokio::time::Interval,
 ) -> io::Result<()> {
     let mut event_since_tick = false;
+    let mut input_interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + INPUT_POLL, INPUT_POLL);
+    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input_ready = match InputReady::new() {
+        Ok(input_ready) => input_ready,
+        Err(_) => {
+            sessions
+                .active_mut()
+                .front
+                .state
+                .notice("native input readiness unavailable; using periodic terminal polling");
+            InputReady::default()
+        }
+    };
     loop {
         let mut dirty = false;
         if sessions
@@ -4081,15 +4307,23 @@ async fn interactive_loop(
         // buffering in their bounded channels until switched back to. The
         // borrow ends before the step is handled so a session switch inside
         // key handling can move the active index freely.
+        draw_pending(gate, Instant::now(), || {
+            draw(terminal, &mut sessions.active_mut().front)
+        })?;
         let step = {
             let slot = sessions.active_mut();
-            next_loop_step(interval, &mut slot.streams.data, &mut slot.streams.control).await
+            next_interactive_step(
+                interval,
+                &mut input_interval,
+                &mut slot.streams.data,
+                &mut slot.streams.control,
+                &mut input_ready,
+            )
+            .await?
         };
         match step {
-            // A closed channel ends input, but the other one may still hold
-            // queued events: apply everything already committed before exit
-            // so a close racing the terminal cannot drop the outcome.
-            LoopStep::Closed => {
+            // Both channels have reached their final closure.
+            Some(LoopStep::Closed) => {
                 let slot = sessions.active_mut();
                 let drained = drain_available(
                     &mut slot.streams.data,
@@ -4100,10 +4334,14 @@ async fn interactive_loop(
                 let flushed = slot.front.merger.flush();
                 slot.front.apply_events(flushed);
                 slot.front.report_merger();
+                slot.front.check_finalized(&slot.runtime).await;
+                let (result, warning) = closed_stream_outcome(&slot.front);
+                slot.front.close_warning = warning;
+                result?;
                 draw(terminal, &mut slot.front)?;
                 return Ok(());
             }
-            LoopStep::Event(event) => {
+            Some(LoopStep::Event(event)) => {
                 event_since_tick = true;
                 // A terminal outcome stays on screen and the loop keeps
                 // serving: the next `Accepted` submit adopts a new run.
@@ -4112,10 +4350,12 @@ async fn interactive_loop(
                 // iteration: drawing here as well would paint terminal
                 // outcomes twice in one pass under output load.
                 let slot = sessions.active_mut();
-                absorb(&mut slot.front, *event, &mut slot.streams);
+                if absorb(&mut slot.front, *event, &mut slot.streams) {
+                    gate.request_terminal();
+                }
                 dirty = true;
             }
-            LoopStep::Tick => {
+            None => {
                 dirty |= sessions.poll_maintenance();
                 let storage_busy = sessions.maintenance.is_some();
                 let batch = {
@@ -4132,20 +4372,24 @@ async fn interactive_loop(
                 if batch.quit {
                     return Ok(());
                 }
-                dirty |= batch.handled > 0;
-                // A just-expired copy toast needs one last frame to vanish;
-                // without input the loop would otherwise hold it forever.
-                dirty |= sessions.active_mut().front.state.poll_toast_expired();
-                dirty |= sessions.active_mut().front.state.tick_tool_animation();
-                dirty |= sessions.active_mut().front.state.tick_caret();
-                // Drain queued session intents against the registry in
-                // recording order: creation moves the active slot, so later
-                // intents resolve after earlier ones.
+                if batch.handled > 0 {
+                    dirty = true;
+                    gate.request_input();
+                    input_ready.defer(&mut input_interval);
+                }
                 let cmds = sessions.active_mut().front.take_session_cmds();
                 for cmd in &cmds {
                     execute_session_command(sessions, cmd).await;
                     dirty = true;
                 }
+            }
+            Some(LoopStep::Tick) => {
+                dirty |= sessions.poll_maintenance();
+                // A just-expired copy toast needs one last frame to vanish;
+                // without input the loop would otherwise hold it forever.
+                dirty |= sessions.active_mut().front.state.poll_toast_expired();
+                dirty |= sessions.active_mut().front.state.tick_tool_animation();
+                dirty |= sessions.active_mut().front.state.tick_caret();
                 let slot = sessions.active_mut();
                 if !event_since_tick && slot.front.merger.has_pending() {
                     let flushed = slot.front.merger.flush();
@@ -4154,21 +4398,240 @@ async fn interactive_loop(
                         // As above: leave the actual frame to the gate so a
                         // terminal outcome behind a reorder gap is painted
                         // once, not twice.
-                        slot.front.apply_events(flushed);
+                        let terminal = slot.front.apply_events(flushed);
+                        if terminal {
+                            gate.request_terminal();
+                        }
                         dirty = true;
                     }
                 }
                 event_since_tick = false;
             }
         }
+        let slot = sessions.active_mut();
+        dirty |= slot.front.check_finalized(&slot.runtime).await;
         if dirty {
             gate.request();
         }
+        draw_pending(gate, Instant::now(), || {
+            draw(terminal, &mut sessions.active_mut().front)
+        })?;
+    }
+}
+
+fn draw_pending(
+    gate: &mut RefreshGate,
+    now: Instant,
+    draw_frame: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if gate.ready(now) {
+        draw_frame()?;
+        gate.mark_drawn(now);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod refresh_loop_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn input_poll_is_independent_of_maintenance_tick() {
+        let (_data_tx, mut data) = mpsc::channel(1);
+        let (_control_tx, mut control) = mpsc::channel(1);
+        let mut maintenance = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
+        let mut input = tokio::time::interval(INPUT_POLL);
+        let mut input_ready = InputReady::default();
+        assert!(
+            next_interactive_step(
+                &mut maintenance,
+                &mut input,
+                &mut data,
+                &mut control,
+                &mut input_ready
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(INPUT_POLL < TICK);
+    }
+
+    #[tokio::test]
+    async fn maintenance_tick_does_not_wait_for_input_poll() {
+        let mut input_ready = InputReady::default();
+        let (_data_tx, mut data) = mpsc::channel(1);
+        let (_control_tx, mut control) = mpsc::channel(1);
+        let mut maintenance = tokio::time::interval(TICK);
+        let mut input = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            INPUT_POLL,
+        );
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                next_interactive_step(
+                    &mut maintenance,
+                    &mut input,
+                    &mut data,
+                    &mut control,
+                    &mut input_ready
+                )
+            )
+            .await,
+            Ok(Ok(Some(LoopStep::Tick)))
+        ));
+    }
+
+    #[test]
+    fn initial_frame_is_immediate_and_later_frames_are_coalesced() {
         let now = Instant::now();
-        if gate.ready(now) {
-            draw(terminal, &mut sessions.active_mut().front)?;
-            gate.mark_drawn(now);
+        let mut gate = RefreshGate::new(Duration::from_millis(33));
+        let mut frames = 0;
+        gate.request();
+        draw_pending(&mut gate, now, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 1);
+        gate.request();
+        draw_pending(&mut gate, now + Duration::from_millis(5), || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 1);
+        draw_pending(&mut gate, now + Duration::from_millis(33), || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 2);
+    }
+
+    #[test]
+    fn failed_frame_remains_pending() {
+        let now = Instant::now();
+        let mut gate = RefreshGate::new(TICK);
+        gate.request();
+        assert!(draw_pending(&mut gate, now, || Err(io::Error::other("draw failed"))).is_err());
+        assert!(gate.ready(now));
+    }
+
+    #[test]
+    fn input_frame_is_immediate_and_restarts_the_streaming_budget() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(33);
+        let mut gate = RefreshGate::new(interval);
+        let mut frames = 0;
+        gate.request();
+        draw_pending(&mut gate, now, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        let input_at = now + INPUT_POLL;
+        gate.request();
+        assert!(!gate.ready(input_at), "stream updates remain coalesced");
+        gate.request_input();
+        gate.request();
+        draw_pending(&mut gate, input_at, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 2);
+        assert!(
+            !gate.ready(input_at),
+            "input never leaves a duplicate frame"
+        );
+
+        gate.request();
+        assert!(!gate.ready(now + interval));
+        assert!(gate.ready(input_at + interval));
+    }
+
+    #[test]
+    fn terminal_feedback_does_not_wait_for_the_preceding_input_frame() {
+        let start = Instant::now();
+        let mut gate = RefreshGate::new(Duration::from_millis(33));
+        gate.request_input();
+        draw_pending(&mut gate, start, || Ok(())).unwrap();
+        let terminal_at = start + Duration::from_millis(1);
+        gate.request_terminal();
+        gate.request();
+        assert!(
+            draw_pending(&mut gate, terminal_at, || Err(io::Error::other(
+                "draw failed"
+            )))
+            .is_err()
+        );
+        assert!(
+            gate.ready(terminal_at),
+            "failed terminal frames remain urgent"
+        );
+        let mut frames = 0;
+        draw_pending(&mut gate, terminal_at, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        draw_pending(&mut gate, terminal_at, || {
+            frames += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(frames, 1, "terminal outcomes draw once");
+        gate.request();
+        assert!(!gate.ready(terminal_at + Duration::from_millis(32)));
+        assert!(gate.ready(terminal_at + Duration::from_millis(33)));
+    }
+
+    #[test]
+    fn sustained_input_and_output_do_not_duplicate_frames() {
+        let start = Instant::now();
+        let mut gate = RefreshGate::new(Duration::from_millis(33));
+        let mut frames = Vec::new();
+        // Model one stream update per millisecond and a processed input batch
+        // at each poll. This checks frame coalescing, not scheduler timing.
+        for ms in 0..=1000 {
+            gate.request();
+            if ms % INPUT_POLL.as_millis() as u64 == 0 {
+                gate.request_input();
+            }
+            let now = start + Duration::from_millis(ms);
+            draw_pending(&mut gate, now, || {
+                frames.push(ms);
+                Ok(())
+            })
+            .unwrap();
+            assert!(!gate.ready(now));
         }
+        assert_eq!(frames, (0..=1000).step_by(20).collect::<Vec<_>>());
+
+        // Once input stops, pending streaming updates resume the normal budget.
+        gate.request();
+        assert!(!gate.ready(start + Duration::from_millis(1032)));
+        assert!(gate.ready(start + Duration::from_millis(1033)));
+    }
+
+    #[test]
+    fn failed_input_frame_remains_immediate_until_drawn() {
+        let now = Instant::now();
+        let mut gate = RefreshGate::new(TICK);
+        gate.mark_drawn(now);
+        gate.request_input();
+        let input_at = now + INPUT_POLL;
+        assert!(
+            draw_pending(&mut gate, input_at, || Err(io::Error::other("draw failed"))).is_err()
+        );
+        assert!(gate.ready(input_at));
+        draw_pending(&mut gate, input_at, || Ok(())).unwrap();
+        assert!(!gate.ready(input_at));
+        gate.request();
+        assert!(!gate.ready(input_at + INPUT_POLL));
     }
 }
 
@@ -4219,40 +4682,75 @@ async fn reconcile_after_stop(
     front: &mut Frontend,
     reason: &str,
 ) -> bool {
+    let cancel_unknown = if let Some(command) = stop_cancel_command(front) {
+        match tokio::time::timeout(RECONCILE_TIMEOUT, runtime.handle(command)).await {
+            Ok((reply, _)) => {
+                front
+                    .state
+                    .notice(&format!("{reason}: cancel reply {:?}", reply.reply()));
+                false
+            }
+            Err(_) => {
+                front.state.notice(&format!(
+                    "{reason}: cancel outcome is unknown; do not blindly retry"
+                ));
+                true
+            }
+        }
+    } else {
+        false
+    };
+    cancel_unknown | reconcile_events_after_stop(runtime, streams, front).await
+}
+
+fn stop_cancel_command(front: &mut Frontend) -> Option<nexus_core::Command> {
     if front.merger.is_finalized() {
-        return false;
+        return None;
     }
     let run = front
         .merger
         .active_run()
         .cloned()
-        .or_else(|| front.state.active_run().cloned());
-    let Some(run) = run else {
+        .or_else(|| front.state.active_run().cloned())?;
+    Some(cancel_command(front.next_request(), &run))
+}
+
+async fn reconcile_events_after_stop(
+    runtime: &Runtime,
+    streams: &mut EventStreams,
+    front: &mut Frontend,
+) -> bool {
+    if front.merger.is_finalized() {
+        front.check_finalized(runtime).await;
         return false;
-    };
-    let reply = runtime
-        .handle(cancel_command(front.next_request(), &run))
-        .await
-        .0;
-    front
-        .state
-        .notice(&format!("{reason}: cancel reply {:?}", reply.reply()));
+    }
+    if front.merger.active_run().is_none() && front.state.active_run().is_none() {
+        return false;
+    }
     let deadline = Instant::now() + RECONCILE_TIMEOUT;
+    let mut data_done = false;
+    let mut control_done = false;
     while !front.merger.is_finalized() {
+        if data_done && control_done {
+            break;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
         tokio::select! {
-            event = streams.data.recv() => {
-                let Some(event) = event else { break };
-                let _ = absorb(front, event, streams);
-            }
-            event = streams.control.recv() => {
-                let Some(event) = event else { break };
-                let _ = absorb(front, event, streams);
-            }
+            biased;
             () = tokio::time::sleep(remaining) => break,
+            result = async {
+                tokio::select! {
+                    event = streams.data.recv(), if !data_done => (true, event),
+                    event = streams.control.recv(), if !control_done => (false, event),
+                }
+            } => match result {
+                (_, Some(event)) => { let _ = absorb(front, event, streams); }
+                (true, None) => data_done = true,
+                (false, None) => control_done = true,
+            }
         }
     }
     if !front.merger.is_finalized() {
@@ -4260,6 +4758,7 @@ async fn reconcile_after_stop(
         front.report_merger();
         let _ = front.apply_events(flushed);
     }
+    front.check_finalized(runtime).await;
     !front.merger.is_finalized()
 }
 
@@ -4272,6 +4771,24 @@ fn draw(
         .draw(|frame| render(&mut front.state, frame.size(), frame.buffer_mut(), focus))
         .map_err(io::Error::other)?;
     Ok(())
+}
+
+fn exit_warning(front: &Frontend) -> Option<&'static str> {
+    if let Some(warning) = front.close_warning {
+        return Some(warning);
+    }
+    let current = front.merger.active_run().and_then(|run| {
+        let completeness = if front.merger.is_finalized() && front.checked_run.as_ref() == Some(run)
+        {
+            front.snapshot_completeness
+        } else {
+            SnapshotCompleteness::Unknown
+        };
+        completeness_warning(completeness)
+    });
+    current.or(front
+        .incomplete_run_seen
+        .then_some("one or more run transcripts may be incomplete"))
 }
 
 /// Non-terminal fallback: drains the scripted run, denies any approval
@@ -4307,7 +4824,15 @@ async fn headless(
         let mut event_since_tick = false;
         loop {
             match next_loop_step(&mut interval, &mut streams.data, &mut streams.control).await {
-                LoopStep::Closed => break,
+                LoopStep::Closed => {
+                    let drained =
+                        drain_available(&mut streams.data, &mut streams.control, &mut front.merger);
+                    apply_headless(&runtime, &mut front, drained).await;
+                    let flushed = front.merger.flush();
+                    apply_headless(&runtime, &mut front, flushed).await;
+                    front.report_merger();
+                    break;
+                }
                 LoopStep::Event(event) => {
                     event_since_tick = true;
                     let pushed = front.merger.push(*event);
@@ -4353,6 +4878,7 @@ async fn headless(
         unresolved =
             reconcile_after_stop(&runtime, &mut streams, &mut front, "headless timeout").await;
     }
+    ensure_headless_completeness(&mut front);
     if unresolved {
         eprintln!(
             "nexus-tui headless: run did not reconcile after cancellation; native provider/tool \
@@ -4364,6 +4890,19 @@ async fn headless(
         println!("{line}");
     }
     Ok(())
+}
+
+fn ensure_headless_completeness(front: &mut Frontend) {
+    if !front.merger.is_finalized()
+        || front
+            .merger
+            .active_run()
+            .is_none_or(|run| front.checked_run.as_ref() != Some(run))
+    {
+        front
+            .state
+            .notice("runtime content completeness is unknown; transcript may be incomplete");
+    }
 }
 
 /// Applies merged headless events in order. Approvals are denied through the
@@ -4388,9 +4927,13 @@ async fn apply_headless(runtime: &Runtime, front: &mut Frontend, events: Vec<Run
         front.note_approval(&event);
         if !front.state.apply_event(&event) {
             front.state_rejected += 1;
+        } else if let EventPayload::RunFinished(finished) = event.payload() {
+            front.terminal_outcome = Some((event.run().clone(), finished.outcome()));
         }
         if terminal {
             front.record_model_use(event.run());
+            front.report_merger();
+            front.check_finalized(runtime).await;
             return true;
         }
     }
@@ -4454,6 +4997,377 @@ mod tests {
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + TICK, TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_each_slot_before_waiting_for_events() {
+        let mut slots = Vec::new();
+        for index in 0..2 {
+            let (runtime, streams) = build_runtime().unwrap();
+            let run = run_id(&format!("orphan-{index}"));
+            let mut front = Frontend::new(session());
+            front.merger.adopt(&run);
+            match stop_cancel_command(&mut front).unwrap() {
+                nexus_core::Command::Cancel(command) => assert_eq!(command.run, run),
+                _ => panic!("expected cancellation"),
+            }
+            slots.push(SessionSlot {
+                label: format!("s{index}"),
+                runtime,
+                streams,
+                front,
+            });
+        }
+        let unknown = tokio::time::timeout(
+            RECONCILE_TIMEOUT * 2,
+            cancel_slots_before_reconcile(&mut slots),
+        )
+        .await
+        .expect("cancellation phase does not wait for terminal events");
+        assert_eq!(unknown, vec![false, false]);
+        for slot in slots {
+            assert!(
+                slot.front
+                    .state
+                    .transcript()
+                    .iter()
+                    .any(|line| line.contains("exit: cancel reply"))
+            );
+            assert!(!slot.front.merger.is_finalized());
+        }
+    }
+
+    #[test]
+    fn closed_stream_reports_run_completeness() {
+        let mut front = Frontend::new(session());
+        let (result, warning) = closed_stream_outcome(&front);
+        assert!(result.is_ok());
+        assert!(warning.is_none());
+
+        let run = run_id("run-close-outcome");
+        front.merger.adopt(&run);
+        let (result, warning) = closed_stream_outcome(&front);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("completeness is unknown")
+        );
+        assert!(warning.is_none());
+
+        let events = front.merger.push(started(&run, 0));
+        front.apply_events(events);
+        let events = front.merger.push(finished(&run, 1));
+        front.apply_events(events);
+        let (result, warning) = closed_stream_outcome(&front);
+        assert!(result.is_ok());
+        assert!(warning.unwrap().contains("completeness is unknown"));
+
+        front.checked_run = Some(run);
+        front.snapshot_completeness = SnapshotCompleteness::Clean;
+        let (result, warning) = closed_stream_outcome(&front);
+        assert!(result.is_ok());
+        assert!(warning.is_none());
+        front.snapshot_completeness = SnapshotCompleteness::Truncated;
+        assert!(
+            closed_stream_outcome(&front)
+                .1
+                .unwrap()
+                .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn exit_and_headless_report_unpresented_or_unchecked_runs() {
+        let run = run_id("run-exit");
+        let mut front = Frontend::new(session());
+        assert!(exit_warning(&front).is_none());
+        front.merger.adopt(&run);
+        assert!(exit_warning(&front).unwrap().contains("unknown"));
+        let events = front.merger.push(started(&run, 0));
+        front.apply_events(events);
+        let events = front.merger.push(finished(&run, 1));
+        front.apply_events(events);
+        ensure_headless_completeness(&mut front);
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("completeness is unknown"))
+        );
+        front.checked_run = Some(run.clone());
+        front.snapshot_completeness = SnapshotCompleteness::Truncated;
+        assert!(exit_warning(&front).unwrap().contains("truncated"));
+        // A drawn frame does not prove the notice was visible in the viewport.
+        front.incomplete_run_seen = true;
+        front.snapshot_completeness = SnapshotCompleteness::Clean;
+        assert!(exit_warning(&front).unwrap().contains("run transcripts"));
+        front.close_warning = Some("closed warning");
+        assert_eq!(exit_warning(&front), Some("closed warning"));
+    }
+
+    #[test]
+    fn presentation_gap_remains_visible_at_exit_after_a_later_clean_run() {
+        let first = run_id("run-gap");
+        let second = run_id("run-clean");
+        let mut front = Frontend::new(session());
+        front.merger.adopt(&first);
+        let events = front.merger.push(started(&first, 0));
+        front.apply_events(events);
+        let events = front.merger.push(finished(&first, 2));
+        front.apply_events(events);
+        let events = front.merger.flush();
+        front.apply_events(events);
+        front.report_merger();
+        assert!(front.incomplete_run_seen);
+
+        front.merger.adopt(&second);
+        let events = front.merger.push(started(&second, 0));
+        front.apply_events(events);
+        let events = front.merger.push(finished(&second, 1));
+        front.apply_events(events);
+        front.checked_run = Some(second);
+        front.snapshot_completeness = SnapshotCompleteness::Clean;
+        assert!(exit_warning(&front).unwrap().contains("run transcripts"));
+    }
+
+    #[tokio::test]
+    async fn finalized_snapshot_reports_real_queue_saturation_once() {
+        use nexus_core::{FinishReason, TurnFinished, Usage, UsageFinality};
+        let mut limits = Limits::m0_test();
+        limits.event_data_capacity = 1;
+        let mut script = (0..20)
+            .map(|index| ProviderEvent::TextDelta {
+                item_key: format!("item-{index}"),
+                text: "x".into(),
+            })
+            .collect::<Vec<_>>();
+        script.push(ProviderEvent::TurnFinished(TurnFinished::new(
+            FinishReason::Stop,
+            Usage::new(None, None, UsageFinality::Final),
+            None,
+        )));
+        let config = RuntimeConfig {
+            limits,
+            policy: Policy::m0_test(),
+            has_approval_handler: true,
+        };
+        let (runtime, mut streams) =
+            Runtime::try_new(config, Arc::new(FakeProvider::new(vec![script])), vec![]).unwrap();
+        let mut front = Frontend::new(session());
+        let command = submit_command(
+            front.next_request(),
+            front.session.clone(),
+            "task",
+            DEMO_PROFILE,
+            false,
+        )
+        .unwrap();
+        let reply = runtime.handle(command).await.0;
+        assert!(front.adopt_accepted(&reply));
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if event.is_terminal() {
+                    break event;
+                }
+                absorb(&mut front, event, &mut streams);
+            }
+        })
+        .await
+        .unwrap();
+        absorb(&mut front, terminal, &mut streams);
+        assert!(front.merger.is_finalized());
+        assert!(front.check_finalized(&runtime).await);
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("runtime content was truncated"))
+        );
+        assert!(!front.check_finalized(&runtime).await);
+    }
+
+    #[tokio::test]
+    async fn real_control_outbox_exhaustion_shows_limit_and_truncation() {
+        use nexus_core::{CallCandidate, FinishReason, TurnFinished, Usage, UsageFinality};
+        let mut limits = Limits::m0_test();
+        limits.event_control_capacity = 4;
+        let mut script = (0..8)
+            .map(|index| {
+                ProviderEvent::ToolCallReady(
+                    CallCandidate::new(
+                        format!("item-{index}"),
+                        format!("prov-ref-{index}"),
+                        "host_read",
+                        r#"{"path":"src"}"#,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        script.push(ProviderEvent::TurnFinished(TurnFinished::new(
+            FinishReason::ToolCalls,
+            Usage::new(None, None, UsageFinality::Final),
+            None,
+        )));
+        let config = RuntimeConfig {
+            limits,
+            policy: Policy::m0_test(),
+            has_approval_handler: true,
+        };
+        let tools = vec![ToolRegistration::read(Arc::new(FakeTool::oversized(
+            "host_read",
+            4 * Limits::M0_TEST_TOOL_OUTPUT_BYTES,
+        )))];
+        let (runtime, mut streams) =
+            Runtime::try_new(config, Arc::new(FakeProvider::new(vec![script])), tools).unwrap();
+        let mut front = Frontend::new(session());
+        let command = submit_command(
+            front.next_request(),
+            front.session.clone(),
+            "task",
+            DEMO_PROFILE,
+            false,
+        )
+        .unwrap();
+        let reply = runtime.handle(command).await.0;
+        assert!(front.adopt_accepted(&reply));
+        let run = reply.run().unwrap().clone();
+        // The frontend is paused (e.g. a background slot) until the run ends.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, snapshot) = runtime
+                    .get_snapshot(GetSnapshotCommand {
+                        request: front.next_request(),
+                        run: run.clone(),
+                    })
+                    .await;
+                if snapshot.is_some_and(|s| s.lifecycle() != RunLifecycle::Active) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if absorb(&mut front, event, &mut streams) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(front.merger.is_finalized());
+        assert!(front.check_finalized(&runtime).await);
+        let transcript = front.state.transcript().join("\n");
+        assert!(transcript.contains("LimitReached"), "{transcript}");
+        assert!(transcript.contains("runtime content was truncated"));
+        assert!(exit_warning(&front).unwrap().contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn submit_preserves_draft_until_finalized_snapshot_checked() {
+        let (runtime, _) = build_runtime().unwrap();
+        let mut front = Frontend::new(session());
+        let run = run_id("run-unknown");
+        front.merger.adopt(&run);
+        for c in "next task".chars() {
+            front.state.composer_type(c);
+        }
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_key(&mut front, &runtime, enter).await;
+        assert_eq!(front.state.composer(), "next task");
+        let events = front.merger.push(started(&run, 0));
+        front.apply_events(events);
+        let events = front.merger.push(finished(&run, 1));
+        front.apply_events(events);
+        handle_key(&mut front, &runtime, enter).await;
+        assert_eq!(front.state.composer(), "next task");
+        assert!(front.check_finalized(&runtime).await);
+        assert!(
+            front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("completeness is unknown"))
+        );
+        assert!(!front.check_finalized(&runtime).await);
+        handle_key(&mut front, &runtime, enter).await;
+        assert_eq!(front.state.composer(), "");
+    }
+
+    #[tokio::test]
+    async fn clean_finalized_snapshot_has_no_completeness_warning() {
+        use nexus_core::{FinishReason, TurnFinished, Usage, UsageFinality};
+        let provider =
+            FakeProvider::new(vec![vec![ProviderEvent::TurnFinished(TurnFinished::new(
+                FinishReason::Stop,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            ))]]);
+        let config = RuntimeConfig {
+            limits: Limits::m0_test(),
+            policy: Policy::m0_test(),
+            has_approval_handler: true,
+        };
+        let (runtime, mut streams) = Runtime::try_new(config, Arc::new(provider), vec![]).unwrap();
+        let mut front = Frontend::new(session());
+        let command = submit_command(
+            front.next_request(),
+            front.session.clone(),
+            "task",
+            DEMO_PROFILE,
+            false,
+        )
+        .unwrap();
+        let reply = runtime.handle(command).await.0;
+        assert!(front.adopt_accepted(&reply));
+        let event = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if event.is_terminal() {
+                    break event;
+                }
+                absorb(&mut front, event, &mut streams);
+            }
+        })
+        .await
+        .unwrap();
+        absorb(&mut front, event, &mut streams);
+        let mut mismatch = Frontend::new(session());
+        let run = front.merger.active_run().unwrap().clone();
+        mismatch.merger.adopt(&run);
+        let events = mismatch.merger.push(started(&run, 0));
+        mismatch.apply_events(events);
+        let event = RunEvent::new(
+            session(),
+            run.clone(),
+            1,
+            EventPayload::RunFinished(
+                RunFinished::new(RunOutcome::Cancelled, PersistenceState::Ephemeral, None).unwrap(),
+            ),
+        );
+        let events = mismatch.merger.push(event);
+        mismatch.apply_events(events);
+        assert!(mismatch.check_finalized(&runtime).await);
+        assert_eq!(
+            mismatch.snapshot_completeness,
+            SnapshotCompleteness::Unknown
+        );
+        assert!(front.check_finalized(&runtime).await);
+        assert!(
+            !front
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("runtime content"))
+        );
     }
 
     #[test]
@@ -4688,11 +5602,73 @@ mod tests {
     #[tokio::test]
     async fn closed_channels_surface_as_closed_step() {
         let (data_tx, mut data_rx) = mpsc::channel::<RunEvent>(1);
-        let (_control_tx, mut control_rx) = mpsc::channel::<RunEvent>(1);
+        let (control_tx, mut control_rx) = mpsc::channel::<RunEvent>(1);
         drop(data_tx);
+        drop(control_tx);
         let mut interval = interval();
         let step = next_loop_step(&mut interval, &mut data_rx, &mut control_rx).await;
         assert!(matches!(step, LoopStep::Closed));
+    }
+
+    #[tokio::test]
+    async fn closed_data_waits_for_delayed_control_terminal_and_permit() {
+        let (data_tx, mut data) = mpsc::channel(1);
+        let (control_tx, mut control) = mpsc::channel(1);
+        let permit = control_tx.reserve().await.expect("capacity");
+        drop(data_tx);
+        control.close();
+        let mut interval = interval();
+        let mut pending = Box::pin(next_loop_step(&mut interval, &mut data, &mut control));
+        let is_pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(pending.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(is_pending, "outstanding permits must keep the channel open");
+        drop(pending);
+        let run = run_id("permit-terminal");
+        permit.send(finished(&run, 0));
+        assert!(matches!(
+            next_loop_step(&mut interval, &mut data, &mut control).await,
+            LoopStep::Event(_)
+        ));
+        assert!(matches!(
+            next_loop_step(&mut interval, &mut data, &mut control).await,
+            LoopStep::Closed
+        ));
+    }
+
+    #[tokio::test]
+    async fn both_channels_make_progress_with_competing_traffic() {
+        for terminal_on_data in [true, false] {
+            let (data_tx, mut data) = mpsc::channel(32);
+            let (control_tx, mut control) = mpsc::channel(32);
+            let run = run_id("fair-channels");
+            let (terminal_tx, busy_tx) = if terminal_on_data {
+                (&data_tx, &control_tx)
+            } else {
+                (&control_tx, &data_tx)
+            };
+            terminal_tx.try_send(finished(&run, 0)).expect("capacity");
+            for seq in 1..=16 {
+                busy_tx.try_send(text(&run, seq, "busy")).expect("capacity");
+            }
+            let mut interval = interval();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    match next_loop_step(&mut interval, &mut data, &mut control).await {
+                        LoopStep::Event(event)
+                            if matches!(event.payload(), EventPayload::RunFinished(_)) =>
+                        {
+                            break;
+                        }
+                        LoopStep::Closed => panic!("terminal lost"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("terminal is not starved");
+        }
     }
 
     #[test]
@@ -5532,23 +6508,30 @@ mod cov_main_private {
     async fn reconcile_is_skipped_for_a_finalized_or_absent_run() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
 
-        // A finalized run is already reconciled; the stop path is a no-op.
+        // A finalized run needs no cancellation, but its snapshot is checked.
         let done_run = run_id("run-done");
         let mut done = Frontend::new(session());
         done.merger.adopt(&done_run);
         assert_eq!(done.merger.push(started(&done_run, 0)).len(), 1);
         assert_eq!(done.merger.push(finished(&done_run, 1)).len(), 1);
         assert!(done.merger.is_finalized());
-        let before = done.state.transcript().len();
         let mut streams = closed_streams();
         assert!(
             !reconcile_after_stop(&runtime, &mut streams, &mut done, "quit").await,
             "an already finalized run needs no cancellation"
         );
-        assert_eq!(
-            done.state.transcript().len(),
-            before,
-            "no cancel reply is recorded for a finalized run"
+        assert!(
+            done.state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("completeness is unknown"))
+        );
+        assert!(
+            !done
+                .state
+                .transcript()
+                .iter()
+                .any(|line| line.contains("cancel reply"))
         );
         assert!(done.merger.is_finalized());
 
@@ -8332,18 +9315,29 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
-    async fn a_closed_control_channel_reports_closed_while_data_stays_open() {
+    async fn closed_control_waits_for_delayed_data_terminal() {
         let (data_tx, mut data_rx) = mpsc::channel::<RunEvent>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<RunEvent>(1);
         drop(control_tx);
         let mut interval = interval();
 
-        let step = next_loop_step(&mut interval, &mut data_rx, &mut control_rx).await;
-        drop(data_tx);
+        let run = run_id("delayed-data-terminal");
         assert!(
-            matches!(step, LoopStep::Closed),
-            "a closed control channel ends the wait even with data open"
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                next_loop_step(&mut interval, &mut data_rx, &mut control_rx)
+            )
+            .await
+            .is_err()
         );
+        data_tx
+            .send(finished(&run, 0))
+            .await
+            .expect("receiver open");
+        assert!(matches!(
+            next_loop_step(&mut interval, &mut data_rx, &mut control_rx).await,
+            LoopStep::Event(_)
+        ));
     }
 
     #[tokio::test]
@@ -8380,7 +9374,7 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
-    async fn reconcile_absorbs_a_queued_event_then_stops_on_the_closed_channel() {
+    async fn reconcile_absorbs_a_queued_event_then_times_out_on_open_channel() {
         let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
         let (run, mut front) = adopted_orphan();
         let (data_tx, data_rx) = mpsc::channel(4);
@@ -8406,6 +9400,41 @@ mod cov_main_topup {
     }
 
     #[tokio::test]
+    async fn reconcile_waits_for_terminal_after_either_channel_closes() {
+        let (runtime, _streams) = build_runtime().expect("demo wiring is valid");
+        for close_data in [true, false] {
+            let (run, mut front) = adopted_orphan();
+            let (data_tx, data_rx) = mpsc::channel(4);
+            let (control_tx, control_rx) = mpsc::channel(4);
+            let mut streams = EventStreams {
+                data: data_rx,
+                control: control_rx,
+            };
+            let sender = if close_data {
+                drop(data_tx);
+                control_tx
+            } else {
+                drop(control_tx);
+                data_tx
+            };
+            let send = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                sender.send(finished(&run, 0)).await.expect("receiver open");
+            });
+            assert!(
+                !tokio::time::timeout(
+                    Duration::from_secs(2),
+                    reconcile_after_stop(&runtime, &mut streams, &mut front, "quit")
+                )
+                .await
+                .expect("bounded wait")
+            );
+            send.await.expect("sender task");
+            assert!(front.merger.is_finalized());
+        }
+    }
+
+    #[tokio::test]
     async fn interactive_loop_ends_at_once_when_both_channels_close() {
         let (runtime, _) = build_runtime().expect("demo wiring is valid");
         let run = run_id("run-loop-closed");
@@ -8416,9 +9445,10 @@ mod cov_main_topup {
         let mut interval = interval();
         let mut terminal = fixed_terminal();
 
-        interactive_loop(&mut sessions, &mut gate, &mut terminal, &mut interval)
+        let error = interactive_loop(&mut sessions, &mut gate, &mut terminal, &mut interval)
             .await
-            .expect("a closed channel pair ends the loop cleanly");
+            .expect_err("a missing terminal outcome must not be reported as success");
+        assert!(error.to_string().contains("completeness is unknown"));
         let front = &sessions.active().front;
         assert_eq!(front.merger.active_run(), Some(&run));
         assert_eq!(front.state.last_seq(), None, "no event was applied");
@@ -8929,6 +9959,10 @@ mod cov_live_wiring {
     #[test]
     fn demo_mode_is_an_explicit_opt_in_flag() {
         assert!(!demo_flag(&[]), "the dev default serves no fakes");
+        if !cfg!(feature = "demo") {
+            usage(&["--demo"]);
+            return;
+        }
         assert!(demo_flag(&["--demo"]), "--demo opts in");
         assert!(demo_flag(&["--demo", "--tools-root", "/srv/root"]));
         assert!(demo_flag(&["--tools-root", "/srv/root", "--demo"]));
@@ -9072,7 +10106,8 @@ mod cov_live_wiring {
             "unconfigured dev runs fail instead of demoing"
         );
         if let LiveResolve::Failed(_, message) = resolved {
-            assert!(message.contains("--demo"), "the failure names the opt-in");
+            assert!(message.contains("no model configured"));
+            assert_eq!(message.contains("--demo"), cfg!(feature = "demo"));
         }
         // The same selection with the flag serves the scripted demo.
         selection.demo = true;
@@ -9114,13 +10149,13 @@ mod cov_live_wiring {
     }
 
     #[test]
-    fn wiring_notice_distinguishes_unavailable_provider_and_real_writes() {
+    fn wiring_notice_defers_provider_validation_and_reports_real_writes() {
         let notice = wiring_notice(
             &selection_with(Some("ghost")),
             Some(std::path::Path::new("/project")),
             ExecutionMode::Local,
         );
-        assert!(notice.contains("unavailable"));
+        assert!(notice.contains("selected model (ghost); provider validated on submission"));
         assert!(!notice.contains("demo script"));
         assert!(notice.contains("real file tools + sandboxed exec"));
         assert!(notice.contains("writes/exec require approval"));
@@ -9498,11 +10533,12 @@ mod cov_live_wiring {
             workload_image: None,
         };
         let (_runtime, _streams, live) = build_live_runtime(&session).expect("demo wiring builds");
-        assert!(
-            !Frontend::new(SessionId::new("sess-test-live").expect("test session id is valid"))
-                .is_live(),
-            "no handle means demo, even beside a live-capable runtime"
-        );
+        let mut front = Frontend::new(SessionId::new("sess-test-live").unwrap());
+        assert!(!front.should_auto_submit_demo());
+        front.demo = true;
+        assert!(front.should_auto_submit_demo());
+        front.active_model = Some("m0".to_owned());
+        assert!(!front.should_auto_submit_demo());
         drop(live);
     }
 

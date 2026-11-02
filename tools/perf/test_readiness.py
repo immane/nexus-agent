@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import readiness  # noqa: E402
@@ -511,7 +512,31 @@ class CancelTests(PtyTestCase):
 
 
 class IdleTests(PtyTestCase):
-    def test_idle_cpu_and_rss_sampling_with_unsupported_wakeups(self):
+    def test_darwin_wakeup_counter_layout_and_delta(self):
+        raw = bytearray(304)
+        raw[32:48] = (17).to_bytes(8, "little") + (23).to_bytes(8, "little")
+
+        def fill_buffer(pid, flavor, pointer):
+            ctypes_buffer = (readiness.ctypes.c_char * 304).from_address(pointer.value)
+            ctypes_buffer[:] = raw
+            return 0
+
+        library = mock.Mock()
+        library.proc_pid_rusage = fill_buffer
+        with mock.patch.object(readiness.sys, "platform", "darwin"), mock.patch.object(
+            readiness.ctypes, "CDLL", return_value=library
+        ):
+            first = readiness.sample_darwin_wakeups(123)
+        raw[32:48] = (20).to_bytes(8, "little") + (29).to_bytes(8, "little")
+        with mock.patch.object(readiness.sys, "platform", "darwin"), mock.patch.object(
+            readiness.ctypes, "CDLL", return_value=library
+        ):
+            second = readiness.sample_darwin_wakeups(123)
+        delta = readiness._idle_wakeup_delta(first, second)
+        self.assertEqual((delta["pkg_idle_wkups"], delta["interrupt_wkups"]), (3, 6))
+        self.assertIn("not scheduler events", delta["scope"])
+
+    def test_idle_cpu_rss_and_platform_wakeup_sampling(self):
         script = self.script("busy.py", BODY_FRAME_BUSY_THEN_QUIT)
         result = self.run_target(
             script, mode="idle", idle_window=0.6, idle_interval=0.1
@@ -522,7 +547,15 @@ class IdleTests(PtyTestCase):
         self.assertGreater(idle["cpu_seconds"], 0.05)
         self.assertIsNotNone(idle["idle_cpu_percent"])
         self.assertGreaterEqual(idle["idle_cpu_percent"], 0.0)
-        self.assertEqual(idle["wakeups"]["status"], "unsupported")
+        if sys.platform == "darwin":
+            self.assertEqual(idle["wakeups"]["status"], "observed")
+            self.assertGreaterEqual(idle["wakeups"]["pkg_idle_wkups"], 0)
+            self.assertGreaterEqual(idle["wakeups"]["interrupt_wkups"], 0)
+        else:
+            self.assertEqual(idle["wakeups"]["status"], "unsupported")
+        self.assertGreater(idle["rss_samples"], 0)
+        self.assertLessEqual(idle["rss_min_sampled_bytes"], idle["rss_median_sampled_bytes"])
+        self.assertLessEqual(idle["rss_median_sampled_bytes"], idle["rss_max_sampled_bytes"])
         self.assertGreater(result["resources"]["ru_maxrss"], 0)
 
     def test_rss_high_water_from_wait4(self):

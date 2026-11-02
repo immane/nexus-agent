@@ -106,7 +106,12 @@ pub struct Runtime {
     shared: Arc<Shared>,
 }
 
+#[cfg(test)]
+type DispatchSample = (RunId, CallId, StdInstant, StdInstant);
+
 struct Shared {
+    #[cfg(test)]
+    dispatch_probe: StdMutex<Option<std::sync::mpsc::Sender<DispatchSample>>>,
     local_reasoning: AtomicBool,
     diagnostic_writer: StdMutex<Option<Box<dyn std::io::Write + Send>>>,
     instructions: ModelInstructions,
@@ -695,6 +700,8 @@ impl Runtime {
         let (data_tx, data_rx) = mpsc::channel(config.limits.event_data_capacity);
         let (control_tx, control_rx) = mpsc::channel(config.limits.event_control_capacity);
         let shared = Arc::new(Shared {
+            #[cfg(test)]
+            dispatch_probe: StdMutex::new(None),
             local_reasoning: AtomicBool::new(false),
             diagnostic_writer: StdMutex::new(None),
             instructions,
@@ -3334,7 +3341,24 @@ impl Runtime {
                 current.dispatched = true;
             }
         }
-        let mut handle = tokio::task::spawn_blocking(move || tool.execute(&call, &context));
+        #[cfg(test)]
+        let probe = self
+            .shared
+            .dispatch_probe
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|sender| (sender, call.run().clone(), call.call().clone()));
+        #[cfg(test)]
+        let submitted = probe.as_ref().map(|_| StdInstant::now());
+        let mut handle = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some((sender, run, call_id)) = probe {
+                let entered = StdInstant::now();
+                let _ = sender.send((run, call_id, submitted.unwrap(), entered));
+            }
+            tool.execute(&call, &context)
+        });
         // The context retains the original deadline. A cooperative tool may
         // need bounded time to stop its work and report the actual effects.
         let cleanup_deadline = tool_deadline
@@ -5752,6 +5776,83 @@ mod tests {
         }
     }
 
+    // Run explicitly with --release --ignored --nocapture, without other load.
+    #[test]
+    #[ignore = "opt-in local dispatch measurement"]
+    fn measure_fake_tool_dispatch() {
+        struct MeasuredTool {
+            inner: FakeTool,
+            samples: std::sync::mpsc::Sender<(RunId, CallId, StdInstant, StdInstant)>,
+        }
+        impl ToolPort for MeasuredTool {
+            fn describe(&self) -> ToolSpec {
+                self.inner.describe()
+            }
+
+            fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+                let start = StdInstant::now();
+                let outcome = self.inner.execute(call, context);
+                let end = StdInstant::now();
+                self.samples
+                    .send((call.run().clone(), call.call().clone(), start, end))
+                    .unwrap();
+                outcome
+            }
+        }
+
+        const SAMPLES: usize = 16;
+        let candidates = (0..SAMPLES)
+            .map(|n| {
+                CallCandidate::new(
+                    format!("item-{n}"),
+                    format!("ref-{n}"),
+                    "host_read",
+                    r#"{"path":"src"}"#,
+                )
+                .unwrap()
+            })
+            .collect();
+        let provider = Arc::new(FakeProvider::new(vec![
+            FakeProvider::tool_turn(candidates),
+            FakeProvider::stop_turn("done"),
+        ]));
+        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::channel();
+        let (fake_tx, fake_rx) = std::sync::mpsc::channel();
+        let tool = Arc::new(MeasuredTool {
+            inner: FakeTool::succeeding("host_read", nexus_core::M0_REVISION),
+            samples: fake_tx,
+        });
+        let mut config = quick_config();
+        config.limits.max_tool_calls_per_run = SAMPLES as u32;
+        let (runtime, mut streams) =
+            Runtime::new(config, provider, vec![ToolRegistration::read(tool)]);
+        *runtime.shared.dispatch_probe.lock().unwrap() = Some(dispatch_tx);
+        test_rt().block_on(async {
+            assert_eq!(
+                runtime.submit(submit_cmd("dispatch-measure")).await.reply(),
+                CommandReply::Accepted
+            );
+            let (_, finished) =
+                collect_until_finished(&mut streams.data, &mut streams.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::Completed);
+        });
+        let dispatch: Vec<_> = dispatch_rx.try_iter().collect();
+        let fake: Vec<_> = fake_rx.try_iter().collect();
+        assert_eq!(dispatch.len(), SAMPLES);
+        assert_eq!(fake.len(), SAMPLES);
+        for (index, ((run, call, submitted, entered), (fake_run, fake_call, start, end))) in
+            dispatch.iter().zip(&fake).enumerate()
+        {
+            assert_eq!((run, call), (fake_run, fake_call));
+            assert!(*submitted <= *entered && *entered <= *start && *start <= *end);
+            println!(
+                "sample={index} run={run:?} call={call:?} submit_to_worker_ns={} fake_execute_ns={}",
+                entered.duration_since(*submitted).as_nanos(),
+                end.duration_since(*start).as_nanos()
+            );
+        }
+    }
+
     #[test]
     fn host_instructions_are_fixed_and_sent_on_every_model_turn() {
         struct InstructionProvider {
@@ -7099,6 +7200,7 @@ mod tests {
                     ControlOutcome::Sent
                 );
             }
+            let mut expected_bytes = 0;
             for seq in
                 CONTROL_CAPACITY as u64..(CONTROL_CAPACITY + CONTROL_OUTBOX_EVENT_LIMIT - 1) as u64
             {
@@ -7108,10 +7210,16 @@ mod tests {
                     seq,
                     EventPayload::UsageUpdated(usage),
                 );
+                expected_bytes += control_event_bytes(&event);
                 assert_eq!(
                     deliver_control(&runtime.shared, event),
                     ControlOutcome::Buffered
                 );
+                assert_eq!(
+                    runtime.shared.outbox_bytes.load(Ordering::SeqCst),
+                    expected_bytes
+                );
+                assert!(expected_bytes <= CONTROL_OUTBOX_BYTE_LIMIT);
             }
             let terminal_seq = (CONTROL_CAPACITY + CONTROL_OUTBOX_EVENT_LIMIT - 1) as u64;
             let excess = RunEvent::new(
@@ -7136,6 +7244,7 @@ mod tests {
                 terminal_seq,
                 EventPayload::RunFinished(terminal),
             );
+            expected_bytes += control_event_bytes(&event);
             assert_eq!(
                 deliver_control(&runtime.shared, event),
                 ControlOutcome::Buffered
@@ -7144,6 +7253,11 @@ mod tests {
                 runtime.shared.outbox_events.load(Ordering::SeqCst),
                 CONTROL_OUTBOX_EVENT_LIMIT
             );
+            assert_eq!(
+                runtime.shared.outbox_bytes.load(Ordering::SeqCst),
+                expected_bytes
+            );
+            assert!(expected_bytes <= CONTROL_OUTBOX_BYTE_LIMIT);
 
             let mut received = Vec::new();
             let total = CONTROL_CAPACITY + CONTROL_OUTBOX_EVENT_LIMIT;
@@ -7170,6 +7284,173 @@ mod tests {
                 collect_until_finished(&mut streams.data, &mut streams.control).await;
             assert_eq!(next_finished.outcome(), RunOutcome::Completed);
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn control_byte_exhaustion_is_visible_in_finalized_run_snapshot() {
+        let (provider, entered, release) = BlockingProvider::new();
+        let (runtime, mut streams) = Runtime::new(quick_config(), Arc::new(provider), Vec::new());
+        test_rt().block_on(async {
+            let reply = runtime.submit(submit_cmd("byte-pressure")).await;
+            assert_eq!(reply.reply(), CommandReply::Accepted);
+            let run = reply.run().cloned().expect("accepted run");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if entered.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("provider entered");
+
+            // Inject valid control payloads into the live run while its provider
+            // is paused. This is transport pressure, not real tool execution.
+            let outcome = ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                "x".repeat(Limits::M0_TEST_TOOL_OUTPUT_BYTES),
+                false,
+            )
+            .expect("bounded outcome");
+            let mut buffered = 0;
+            loop {
+                let mut state = runtime.shared.state.lock().await;
+                let active = state.active.as_mut().expect("run is active");
+                let result = emit_control(
+                    &runtime.shared,
+                    active,
+                    &run,
+                    EventPayload::ToolFinished(ToolFinishedInfo {
+                        call: CallId::new("synthetic-pressure").expect("valid"),
+                        outcome: outcome.clone(),
+                    }),
+                );
+                apply_control_outcome(active, result);
+                match result {
+                    ControlOutcome::Sent | ControlOutcome::Buffered => buffered += 1,
+                    ControlOutcome::Exhausted => break,
+                    ControlOutcome::Closed => panic!("control channel unexpectedly closed"),
+                }
+                assert!(buffered < CONTROL_OUTBOX_EVENT_LIMIT);
+            }
+            assert!(
+                runtime.shared.outbox_events.load(Ordering::SeqCst)
+                    < CONTROL_OUTBOX_EVENT_LIMIT - 1
+            );
+            release.send(()).expect("release provider");
+            let (_, finished) =
+                collect_until_finished(&mut streams.data, &mut streams.control).await;
+            assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+            let (reply, snapshot) = runtime
+                .get_snapshot(GetSnapshotCommand {
+                    request: RequestId::new("req-byte-snapshot").expect("valid"),
+                    run,
+                })
+                .await;
+            assert_eq!(reply.reply(), CommandReply::Accepted);
+            let snapshot = snapshot.expect("finalized snapshot");
+            assert_eq!(
+                snapshot.lifecycle(),
+                RunLifecycle::Finalized(RunOutcome::LimitReached)
+            );
+            assert!(snapshot.is_content_truncated());
+        });
+    }
+
+    #[test]
+    fn control_outbox_byte_exhaustion_preserves_terminal_reserve() {
+        let (runtime, mut streams) = Runtime::new(
+            quick_config(),
+            Arc::new(FakeProvider::new(vec![])),
+            Vec::new(),
+        );
+        test_rt().block_on(async {
+            let session = SessionId::new("sess-byte-limit").expect("valid");
+            let run = RunId::new("run-byte-limit").expect("valid");
+            let usage = Usage::new(Some(1), Some(1), UsageFinality::Provisional);
+            for seq in 0..CONTROL_CAPACITY as u64 {
+                let event = RunEvent::new(
+                    session.clone(),
+                    run.clone(),
+                    seq,
+                    EventPayload::UsageUpdated(usage),
+                );
+                assert_eq!(
+                    deliver_control(&runtime.shared, event),
+                    ControlOutcome::Sent
+                );
+            }
+            let outcome = ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                "x".repeat(Limits::M0_TEST_TOOL_OUTPUT_BYTES),
+                false,
+            )
+            .expect("bounded outcome");
+            let mut count = 0;
+            let mut bytes = 0;
+            loop {
+                let event = RunEvent::new(
+                    session.clone(),
+                    run.clone(),
+                    (CONTROL_CAPACITY + count) as u64,
+                    EventPayload::ToolFinished(ToolFinishedInfo {
+                        call: CallId::new("call-byte-limit").expect("valid"),
+                        outcome: outcome.clone(),
+                    }),
+                );
+                let size = control_event_bytes(&event);
+                match deliver_control(&runtime.shared, event) {
+                    ControlOutcome::Buffered => {
+                        count += 1;
+                        bytes += size;
+                        assert_eq!(runtime.shared.outbox_bytes.load(Ordering::SeqCst), bytes);
+                        assert!(
+                            bytes
+                                <= CONTROL_OUTBOX_BYTE_LIMIT
+                                    - CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES
+                        );
+                    }
+                    ControlOutcome::Exhausted => {
+                        assert!(
+                            bytes + size
+                                > CONTROL_OUTBOX_BYTE_LIMIT - CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES
+                        );
+                        break;
+                    }
+                    other => panic!("unexpected delivery outcome: {other:?}"),
+                }
+            }
+            assert!(count > 0 && count < CONTROL_OUTBOX_EVENT_LIMIT - 1);
+            let terminal =
+                RunFinished::new(RunOutcome::LimitReached, PersistenceState::Ephemeral, None)
+                    .expect("terminal builds");
+            let event = RunEvent::new(
+                session,
+                run,
+                (CONTROL_CAPACITY + count) as u64,
+                EventPayload::RunFinished(terminal),
+            );
+            bytes += control_event_bytes(&event);
+            assert_eq!(
+                deliver_control(&runtime.shared, event),
+                ControlOutcome::Buffered
+            );
+            assert_eq!(runtime.shared.outbox_bytes.load(Ordering::SeqCst), bytes);
+            assert!(bytes <= CONTROL_OUTBOX_BYTE_LIMIT);
+            for index in 0..CONTROL_CAPACITY + count + 1 {
+                let event = tokio::time::timeout(Duration::from_secs(5), streams.control.recv())
+                    .await
+                    .expect("event arrives")
+                    .expect("channel remains open");
+                assert_eq!(event.seq(), index as u64);
+                assert_eq!(event.is_terminal(), index == CONTROL_CAPACITY + count);
+            }
         });
     }
 
@@ -7592,6 +7873,39 @@ mod cov_runtime_private {
             false,
         ));
         assert!(!control_outbox_fits(CONTROL_OUTBOX_EVENT_LIMIT, 0, 1, true,));
+    }
+
+    /// The terminal reserve can always hold the largest representable
+    /// terminal, so outbox exhaustion by non-terminal events can never strand
+    /// a run without its `RunFinished` while the consumer remains attached.
+    #[test]
+    fn largest_terminal_fits_the_reserved_outbox_capacity() {
+        let message = "m".repeat(nexus_core::error::MAX_MESSAGE_LEN);
+        let error = |category| {
+            AgentError::new(category, message.clone(), RetryGuidance::DoNotRetry)
+                .expect("maximum safe message builds")
+        };
+        let terminal = RunFinished::new(
+            RunOutcome::LimitReached,
+            PersistenceState::SaveFailed,
+            Some(error(ErrorCategory::Internal)),
+        )
+        .expect("terminal builds")
+        .with_error(error(ErrorCategory::ResourceLimit));
+        let event = RunEvent::new(
+            SessionId::new("sess-max-terminal").expect("valid"),
+            RunId::new("run-max-terminal").expect("valid"),
+            u64::MAX,
+            EventPayload::RunFinished(terminal),
+        );
+        let bytes = control_event_bytes(&event);
+        assert!(bytes <= CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES, "{bytes}");
+        assert!(control_outbox_fits(
+            CONTROL_OUTBOX_EVENT_LIMIT - 1,
+            CONTROL_OUTBOX_BYTE_LIMIT - CONTROL_OUTBOX_TERMINAL_RESERVE_BYTES,
+            bytes,
+            true,
+        ));
     }
 
     #[test]

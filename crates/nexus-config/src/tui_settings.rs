@@ -124,6 +124,8 @@ impl Default for InputSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenderSettings {
+    /// Minimum interval for streamed/maintenance redraws. Processed terminal
+    /// input batches and newly applied terminal outcomes render immediately.
     pub redraw_interval_ms: u64,
     /// Blink half-period; the frontend measures this in 50ms UI ticks.
     pub caret_blink_interval_ms: u64,

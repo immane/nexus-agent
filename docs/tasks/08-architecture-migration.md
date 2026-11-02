@@ -1,6 +1,73 @@
 # Architecture Migration Plan
 
-Status: Proposed implementation plan based on the [architecture review](../review/ARCHITECTURE_REVIEW.md). No task is implemented or validated by this document. This is consolidation of the working agent, not a rewrite, a new M0 lock, or evidence of production security readiness.
+Status: Implementation and validation evidence is recorded below for the proposed plan based on the [architecture review](../review/ARCHITECTURE_REVIEW.md). This is consolidation of the working agent, not a rewrite, a new M0 lock, or evidence of production security readiness.
+
+## Linux validation update — 2026-10-31
+
+The references below to Linux being blocked for lack of an environment describe
+the earlier status. On an Ubuntu 26.04.1 LTS x86_64 VM (Linux 7.0.0-38,
+4 vCPUs, 7.3 GiB RAM), commit `938a9059ff6ce5f3fd7083c8e4843b42afd08420`
+plus the Linux sandbox regression tests was checked as an unprivileged user
+with Rust 1.99.0 and Bubblewrap 0.11.1:
+
+- `cargo +1.99.0 test --workspace --locked -- --test-threads=1`: 2,607
+  passed, 19 ignored, no failures (including doc tests).
+- `cargo +1.99.0 clippy --workspace --all-targets --locked -- -D warnings`
+  and `cargo +1.99.0 fmt --all --check`: passed.
+- `cargo +1.99.0 test -p nexus-tools --locked --offline --test behavior linux_ --
+  --ignored --test-threads=1`: four required-backend tests passed. They exercise
+  strict project writes, outside read/write denial, loopback TCP denial, and
+  development project `.env` masking and external write authorization, plus
+  timeout followed by another command. They require an actual working backend.
+  The last two tests were added after the workspace run; tools all-target Clippy
+  and formatting were rerun successfully afterward.
+
+An earlier root run from `/root` failed ten container workload tests because
+that location is explicitly protected as a container workspace; the
+unprivileged run from `/home/nexus-test/project` passed. These results provide
+partial Linux evidence only. Credential variants, adversarial file/metadata
+races, cancellation and descendant cleanup, injected
+exec failures, container networking, and M0 performance baselines still need
+their respective targeted evidence. The M1.4 escaped-descendant limitation
+remains unresolved; no full Linux security or M0–M4 acceptance is claimed.
+
+Later on 2026-10-31, a fresh Ubuntu 26.04.1 x86_64 VM with ext4 and Bubblewrap
+0.11.1 reran the current workspace and the four required-backend sandbox tests
+as an unprivileged user. Two additional Linux filesystem acceptance tests
+verified preservation of user xattrs, uid/gid, and mode through write/patch,
+and refusal without mutation for a non-UTF-8 xattr name. The filesystem tests
+were run explicitly after the workspace run; tools all-target Clippy passed.
+These checks do not establish ACL preservation, all inode flags, complete
+filesystem race guarantees, or descendant cleanup. M1.4 remains open.
+
+## Current Linux revalidation — 2026-11-02
+
+The exact PR source commit `473019982bb4d1d7ff438ccff313a88281ae10de` was
+exported to a new isolated directory on the Linux reference VM and tested as the
+unprivileged `nexus-test` account. The pre-existing `/home/nexus-test/project`
+snapshot was not modified. Environment: Ubuntu 26.04.1 x86_64, Linux
+`7.0.0-38-generic`, ext4, rustc 1.99.0, cargo 1.99.0, Bubblewrap 0.11.1.
+Machine-readable summary: [`evidence/migration-linux-validation-20261102.json`](evidence/migration-linux-validation-20261102.json). Logs for this final HEAD run are retained in the isolated directory recorded in that evidence file.
+
+- `cargo fmt --all --check`: passed.
+- `cargo test --workspace --locked --offline -- --test-threads=1`: 2,653
+  passed, 0 failed, 26 ignored (including doc tests).
+- `cargo test -p nexus-tools --locked --offline --test behavior linux_ --
+  --ignored --test-threads=1`: 6 passed, 0 failed. This explicitly enabled
+  four real-Bubblewrap tests (confinement/network denial, credential masking,
+  approved external writes, timeout cleanup) and two Linux xattr/metadata
+  acceptance tests.
+- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`:
+  passed.
+
+The default workspace run also exercised Linux exec pipe-drain/output-cap,
+probe timeout/failure, deadline/cancellation, and cleanup ownership tests. The
+six platform-acceptance tests above are the Linux-specific ignored tests; the
+opt-in first-command timing measurement, low-value census/signature tests, and
+live catalog test were not run. These results remove the Linux-environment
+blocker for the tested M2 file/sandbox behavior and covered M1.4 paths. They do
+not prove escaped descendants have terminated, cover every Linux filesystem or
+distribution, or close the M1.4 lifecycle limitation.
 
 ## Goal and scope
 
@@ -78,7 +145,7 @@ Task dependencies are listed below. Stage gates are the default integration orde
 
 ### M1.4 — Own exec cleanup on every exit path
 
-**Implementation status: In progress.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If a descendant keeps a pipe open beyond cleanup, the exec worker retains ownership rather than returning; runtime timeout/cancellation quarantines that worker. The original process group is signalled, but escaped descendants that close inherited pipes cannot be proven terminated by this mechanism (**cross-platform cleanup limitation; unresolved**). **Linux validation: BLOCKED** — Linux-specific sandbox execution and injected wait/read/probe failures are unverified without a Linux environment.
+**Implementation status: In progress.** Unix exec pipes are polled nonblocking with a per-pipe drain quantum of 64 KiB; retained output remains capped at 64 KiB per stream. Cleanup grace is 250 ms and the startup probe timeout is 2 s. If a descendant keeps a pipe open beyond cleanup, the exec worker retains ownership rather than returning; runtime timeout/cancellation quarantines that worker. The original process group is signalled, but escaped descendants that close inherited pipes cannot be proven terminated by this mechanism (**cross-platform cleanup limitation; unresolved**). Linux tests for sandbox execution, probe failure/timeout, pipe draining and deadline/cancellation passed on the recorded reference VM; see the 2026-11-02 evidence above. Linux validation does not resolve the escaped-descendant limitation.
 
 **Findings:** P1.4. **Paths:** `crates/nexus-tools/src/exec.rs`, tool exec tests. **Dependencies:** none; validate together with M1.3 when both are integrated.
 
@@ -172,12 +239,10 @@ passed.
 
 ### M1 gate
 
-**Implementation status: In progress — Linux validation blocked.** M1.7's
-trust decision is resolved, but M1.4 still has the documented escaped-descendant
-cleanup limitation and Linux exec/sandbox validation remains blocked. macOS
-results do not establish Linux behavior. The temporary macOS-only development
-scope recorded at M4 allows work to proceed without changing this gate's status
-or claiming Linux hardening.
+**Implementation status: In progress — escaped-descendant cleanup unresolved.**
+M1.7's trust decision is resolved, and Linux exec/sandbox tests for the covered
+paths are recorded above. M1.4 still cannot prove termination of escaped
+descendants that close inherited pipes, so the lifecycle gate remains open.
 
 ## M2 — Tighten permissions and concrete platform boundaries
 
@@ -235,21 +300,23 @@ test harness instead. No Linux filesystem or sandbox claim is made here.
 
 ### M2.3 — Bind file access and define update consistency
 
-**Implementation status: macOS verified; Linux blocked.** D3's main baseline and compatibility
+**Implementation status: tested on macOS and the recorded Linux reference filesystem.** D3's main baseline and compatibility
 defaults have been approved: descriptor-bound access, staged same-directory
 replacement, no-clobber new files, multi-hardlink mutation refusal,
 execution-time object binding, and best-effort external-writer detection. New
 files use the existing `0666 & umask` creation behavior. Replacements preserve
 ordinary mode bits and supported metadata; when metadata cannot be preserved,
-replacement fails closed. Same-directory rename guarantees atomic visibility
+replacement fails closed. Linux acceptance tests now verify user xattrs (including
+empty/binary values), uid/gid/mode preservation, and refusal without mutation
+for a non-UTF-8 xattr name. Same-directory rename guarantees atomic visibility
 only; crash durability is not promised. The initial Unix descriptor walk and
 writer/patch integration are implemented. Regressions cover parent-symlink
 swaps, concurrent source changes during staging, no-clobber creation,
 multi-hardlink refusal, in-root/out-of-root symlink behavior, and mode
-preservation. The serialized macOS tools behavior suite passes. **Linux runtime
-behavior and platform-metadata preservation remain BLOCKED** because no Linux
-test environment is available. No cross-platform guarantee is inferred from
-macOS results.
+preservation. The serialized macOS tools behavior suite and current Linux
+workspace/file acceptance suite pass on their documented reference environments.
+This does not establish ACL preservation, every inode flag, all filesystem race
+guarantees, or behavior on every Linux filesystem/distribution.
 
 **Findings:** P1.5. **Paths:** permissions, `crates/nexus-tools/src/fs.rs`, `development.rs`, filesystem tests; platform/security docs. **Dependencies:** M2.2 and accepted D3.
 
@@ -262,16 +329,15 @@ macOS results.
 
 ### M2.4 — Verify sandbox capability on both supported platforms
 
-**Implementation status: macOS verified; Linux blocked.** On macOS 26.3.1
+**Implementation status: macOS and Linux reference backends verified.** On macOS 26.3.1
 (Darwin 25.3.0, arm64), `/usr/bin/sandbox-exec` is present and the serialized
 tools behavior suite passed all 44 tests, including all six exec sandbox tests:
 `cargo test -p nexus-tools --locked --offline --test behavior --
 --test-threads=1`. An earlier parallel test run hit backend-availability
-assertions; use the serialized invocation for this evidence. Linux sandbox
-execution with the required backend remains unverified under M1.4; no Linux
-isolation evidence is claimed. **Linux validation remains BLOCKED** until a
-suitable Linux environment is available. The Linux lane must be run after M2.3
-before claiming Linux sandbox isolation.
+assertions; use the serialized invocation for this evidence. On the Linux
+reference VM, Bubblewrap 0.11.1 was available and the four explicitly enabled
+Linux tests passed after the M2.3 workspace validation. These results apply to
+the recorded Ubuntu profile only.
 
 **Findings:** P1 validation gap. **Paths:** `crates/nexus-tools/tests/exec_sandbox.rs`, `tests/behavior.rs`, CI workflow if authorized, platform documentation. **Dependencies:** M1.4; repeat relevant tests after M2.3.
 
@@ -283,12 +349,12 @@ before claiming Linux sandbox isolation.
 
 ### M2 gate
 
-**Implementation status: In progress — Linux validation blocked.**
-Strict/development/read-only and exact approval invariants hold on the tested
-macOS path. Linux file-race/metadata behavior (M2.3) and sandbox isolation
-(M2.4) remain explicitly blocked; no Linux or cross-platform hardening claim is
-made. The M4 temporary macOS-only development scope permits continued work but
-does not close this gate. No general permission framework has been introduced.
+**Implementation status: Verified on the recorded macOS and Linux reference
+profiles, with scoped limitations.** Strict/development/read-only and exact
+approval invariants, covered Linux file-race/metadata behavior (M2.3), and actual
+Linux Bubblewrap isolation (M2.4) passed. This is not a guarantee for every
+Linux filesystem/distribution, and does not resolve the separate M1.4 escaped-
+descendant cleanup limitation. No general permission framework was introduced.
 
 ## M3 — Reduce configuration and composition duplication
 
@@ -479,37 +545,38 @@ terminal variants. API retirement is explicitly out of scope for this migration.
 
 ### M4 gate
 
-**Implementation status: In progress — temporarily unblocked for macOS-only
-development.** M4.1–M4.3 are implemented and the default-feature workspace
-regression suite passes on macOS. By the user's explicit direction, Linux-only
-validation blockers are marked and do not prevent continued macOS development
-for now. This is a temporary scope waiver, **not** Linux verification and **not**
-a cross-platform hardening claim. M1.4 still has an unresolved escaped-descendant
-cleanup limitation; M2.3/M2.4 still lack Linux file race/metadata and
-sandbox-isolation evidence. Those capabilities remain blocked/unverified on
-Linux. The unused public `InvocationOutcome` contract is retained by the
+**Implementation status: In progress.** M4.1–M4.3 are implemented; the default-
+feature workspace regression suite passes on macOS and Linux reference hosts.
+Linux M2.3/M2.4 validation is now recorded above, but does not generalize to all
+Linux environments. M1.4 still has an unresolved escaped-descendant cleanup
+limitation, which keeps the dependent M1/M4 gate open. The unused public
+`InvocationOutcome` contract is retained by the
 explicit compatibility decision above, not silently retired. The migration
-gate must return to blocked before any claim of full cross-platform closure or
-Linux security readiness.
+gate remains open until the M1.4 cleanup limitation is resolved or explicitly
+scoped; this record is not production security readiness.
 
 **Current validation evidence:** `cargo nextest run --workspace --locked
---offline` (2,151 passed, 15 skipped) on macOS; affected-package all-target
-Clippy, formatting, and diff checks passed. This workspace run does not provide
-Linux evidence. The full optional/all-features ignored suite was not run.
+--offline` (2,151 passed, 15 skipped) on macOS; Linux commands and results are
+recorded in the 2026-11-02 section above. Affected-package all-target Clippy,
+formatting, and diff checks passed on macOS; Linux workspace Clippy and formatting
+also passed. The full optional/all-features ignored suite was not run.
 
-## M5 — Extension contracts only on concrete demand
+## M5 — Deferred extensions and validation
 
 M5.1 was implemented when concrete second protocols were requested. Its coverage
 is limited to the configured OpenAI Responses and Anthropic Messages dialects
 and offline fixtures; this is not live compatibility evidence for every service
 or model. M5.2 and M5.3 remain **deferred** and are not prerequisites for current
 migration completion.
+M5.4 is a separately owner-approved deferred validation item, not an extension
+trigger or evidence that macOS cold-start performance has passed.
 
 | Task | Status | Trigger and finding | Required work and gate |
 | --- | --- | --- | --- |
 | M5.1 — Second provider protocol | Implemented; offline fixtures only | A requested second concrete protocol; remaining P2.9 | Distinguish protocol family from direct/relay routing. Declare actual capabilities and continuation compatibility; add transcript/tool-call/error tests. Change config revisions only with a documented migration. No registry/framework by default. |
 | M5.2 — External tool transport | Deferred — not implemented | A requested concrete plugin/transport | Define host trust, credentials, resource/approval scope, bounded process/transport lifecycle, cancellation, and failure outcomes. All dispatch stays under runtime policy. A subprocess is not a sandbox; no compliance or untrusted-code containment claim without tests. |
 | M5.3 — HTTP/TLS replacement evaluation | Deferred — not implemented | A concrete maintenance/correctness need in current transport | Compare a mature implementation against hand-written HTTP/chunked/SSE/OpenSSL code using dependency size, build/startup cost, cancellation, verified TLS, bounded buffering, and protocol regressions. Keep this separate from permission refactoring; select a dependency only with justification. |
+| M5.4 — macOS cold-cache startup evidence | Deferred from M0 by owner, 2026-11-01; unverified | Suitable isolated macOS environment and accepted methodology | Measure default-build first-interactive startup with independently supported cold-cache methodology and report reference hardware, sample distribution, and limitations. Do not purge a user's system cache without authorization or treat warm results as cold. |
 
 ## Decisions required before behavior-changing implementation
 

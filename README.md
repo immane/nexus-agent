@@ -19,7 +19,7 @@ not an ever-growing engine. External plugins remain planned.
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.4-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: current consolidation is verified on macOS, with Linux filesystem/sandbox validation still blocked and descendant cleanup limitations unresolved. **Neither M0 acceptance nor cross-platform security readiness is complete.** The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.4-alpha**, with M4 consolidation slices implemented over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; escaped-descendant cleanup remains unresolved. **Scoped M0 acceptance is complete (2026-11-02); cross-platform production/security readiness is not.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -65,7 +65,7 @@ benchmark score. The separate SymPy replay triggered no reduction. See the
 
 | Priority | Direction |
 | --- | --- |
-| **Fast startup** | Target at most **100 ms** to become locally interactive in the first release, and keep reducing startup time. |
+| **Fast startup** | Aim for **100 ms** to become locally interactive; the scoped M0 ordinary warm/prepared ceiling is **150 ms per valid launch** on the accepted reference hosts. |
 | **Small footprint** | Keep reducing executable size, memory, idle CPU, and background work using measured baselines. |
 | **Clear boundaries** | Separate domain logic, execution, integrations, and presentation. |
 | **Broad model coverage** | Adapt mainstream protocols without requiring a different SDK for every vendor. |
@@ -73,33 +73,63 @@ benchmark score. The separate SymPy replay triggered no reduction. See the
 | **Concise code** | Keep normal paths direct, failure paths short, and validation at explicit boundaries. |
 | **Linux and macOS first** | Treat both as first-release acceptance platforms; defer Windows. |
 
-The startup target includes local configuration and interface initialization, but not model responses or optional plugin readiness. It is a goal for documented reference environments, **not a measured result or a guarantee on arbitrary hardware**. See the [performance design](docs/design/05-performance.md).
+The startup definition includes local configuration and interface initialization,
+not model responses or optional plugin readiness. Measurements below describe
+specific reference profiles, **not guarantees on arbitrary hardware**. See the
+[performance design](docs/design/05-performance.md).
 
-### Executable size measurements
+### Accepted M0 measurements
 
-Re-measured on **2026-10-25 UTC**, **macOS arm64** (`rustc 1.99.0`), from
-worktree based on revision `d5bd6e5` with local uncommitted changes. Sizes are
-Mach-O executable file lengths, not compressed downloads or installed-package
-sizes:
+Scoped M0 acceptance completed on **2026-11-02**. Startup uses default-feature
+release TUI builds, rustc **1.99.0**, a 120x40 PTY, isolated HOME/XDG/config,
+and an observed composer input response. Reference hosts are macOS arm64
+(Apple M4, 16 GiB) and Linux x86_64 (Ubuntu 26.04.1 VM, 4 vCPUs, 7.3 GiB).
 
-| Executable / profile | File size |
-| --- | ---: |
-| `nexus-headless`, default Cargo release | 2,108,976 bytes (2.01 MiB) |
-| `nexus-tui`, default Cargo release | 4,512,288 bytes (4.30 MiB) |
-| Headless + TUI total | 6,621,264 bytes (6.31 MiB) |
-| `nexus-server --features container`, default Cargo release | 3,803,264 bytes (3.63 MiB) |
-| Same server binary, copied and stripped with `strip -x` | 3,067,072 bytes (2.93 MiB) |
-| Server, `opt-level = "s"`, LTO, one codegen unit, symbols stripped | 1,797,680 bytes (1.71 MiB) |
-| Server, `opt-level = "z"`, LTO, one codegen unit, symbols stripped | 1,422,352 bytes (1.36 MiB) |
+| Startup profile | Valid samples | Spawn-to-input-response p50 / p95 / max |
+| --- | ---: | ---: |
+| macOS, ordinary warm after security scan | 30/30 | 32.326 / 37.895 / 38.804 ms |
+| Linux, ordinary warm | 30/30 | 12.394 / 13.933 / 15.510 ms |
+| Linux, executable-page prepared | 30/30 | 93.225 / 98.721 / 100.561 ms |
+| Linux, independent prepared repeat | 30/30 | 95.710 / 106.960 / 112.951 ms |
 
-The headless/TUI sizes use the default release profile without container
-features. The server comparison builds used Cargo command-line profile overrides;
-repository profiles were not changed. `opt-level = "z"` is the smallest measured
-binary, not a production default: runtime performance and tests were not
-measured for these size-oriented profiles. These measurements describe a local
-development worktree, not a published release. The 100 ms first-interactive
-startup target remains a goal; startup measurements are still pending. Binary
-sizes are historical measurements, not measurements of the current HEAD.
+The macOS **815.573 ms first execution** correlated with Gatekeeper/XProtect
+scanning is retained as a separate owner-approved profile, **not deleted or
+claimed to meet 150 ms**. No security checks were disabled. Linux prepared
+profiles do not establish cold shared libraries or filesystem metadata; the
+strict cold ELF profile has a separate 200 ms criterion and recorded owner
+exception. macOS cold-cache measurement remains deferred to M5.
+
+The composed synthetic read-only-tool workflow observed Linux TUI process RSS
+high-water of **6,960–7,060 KiB**, below its scoped **128 MiB** cap. This excludes
+tool-child memory and is not an allocator/full-session peak. macOS resident-size
+maxima are sampled, not kernel peaks; no macOS RSS cap is inferred. Full methods,
+binary hashes, idle CPU/wakeup, input/cancellation and queue/dispatch observations
+are in the [accepted M0 evidence](docs/tasks/04-m0-gates.md). Fixtures do not
+establish real-model throughput or a complete coding-session baseline.
+
+### Native release sizes
+
+Actual local `.tar.gz` artifacts were built with rustc **1.99.0**, locked
+dependencies and the standard release profile. These installer-aligned builds
+enable `nexus-tui/container` and `nexus-server/container`; they are **not the
+default-feature performance binaries above**. All values below are bytes:
+
+| Artifact / installed file | macOS arm64 | Linux x86_64 |
+| --- | ---: | ---: |
+| `nexus-tui` | 5,935,488 | 6,935,392 |
+| `nexus-server` | 4,253,344 | 4,805,376 |
+| `nexus-headless` | 2,456,624 | 2,808,864 |
+| `nexus-config` | 26,191 | 26,191 |
+| Four installed commands, uncompressed | 12,671,647 | 14,575,823 |
+| Complete `.tar.gz` archive | 4,700,780 | 5,173,727 |
+
+The archive also includes an offline installer, license and checksum/provenance
+manifest. Build records explicitly identify dirty source trees; these are
+measured local artifacts, **not published, signed, notarized or reproducible-build
+claims**. Extracted installation and command smoke checks passed on both
+reference hosts, not on every OS/glibc version. Per-file hashes and build metadata:
+[macOS](docs/tasks/evidence/distribution-release-macos-m0-close.json) ·
+[Linux](docs/tasks/evidence/distribution-release-linux-m0-close.json).
 
 ## Architecture
 
@@ -281,7 +311,21 @@ cargo run -p nexus-headless --locked --offline -- "hello"
 cargo run -p nexus-tui --locked --offline -- --tools-root /path/to/project
 ```
 
-Configure a model before submitting in the TUI; an unconfigured launch does not silently return fake replies. `--demo` permits demo fallback but does not disable real tools or override a selected live model. Cargo's `--offline` does not disable runtime API requests. See the [Quickstart](QUICKSTART.md).
+To build a native release archive for the current host (Python 3.11+ and Rust
+required; no automatic publication):
+
+```sh
+python3 scripts/package-release.py --offline
+```
+
+This writes `dist/nexus-agent-<version>-<rust-host-target>.tar.gz` and its
+`.sha256` sidecar. It includes container support but no container images; local
+execution remains the default. Verify the sidecar before extraction, then use
+the included `python3 install.py "$HOME/.local/bin"` for installation without
+Cargo. See [release build and installation](QUICKSTART.md#build-and-install-a-native-release-archive)
+for platform checks, runtime dependencies and unsigned-artifact limitations.
+
+Configure a model before submitting in the TUI; an unconfigured launch does not silently return fake replies. Provider credentials are resolved on submission, not at startup. The TUI's `demo` Cargo feature is off by default, including in release builds; enable it explicitly to use `--demo`. This permits demo fallback but does not disable real tools or override a selected live model. Its interactive canned prompt runs automatically only when no model is selected. Cargo's `--offline` does not disable runtime API requests. See the [Quickstart](QUICKSTART.md).
 
 ### Agent modes
 
@@ -465,8 +509,10 @@ server from current source.
 
 ## Project Status
 
-**Current position: M4 consolidation slices implemented, with selected M5
-capabilities already delivered; earlier acceptance gates remain open.**
+**Current position: scoped M0 accepted; Linux and macOS M2 reference-platform
+tests pass; M4 consolidation slices are implemented, with selected M5
+capabilities already delivered. M1.4 cleanup and dependent M1/M4 acceptance
+remain open.**
 Development has been capability-driven rather than strictly milestone-ordered:
 the real model/tool/container loop and complex task repairs were exercised before
 all baseline measurements and acceptance reviews were finished. Implementation
@@ -474,11 +520,11 @@ progress and verified readiness are tracked separately.
 
 | Stage | Implementation and remaining acceptance work |
 | --- | --- |
-| **M0 — Minimal execution baseline** | Functionality substantially exceeded; formal acceptance, current cross-platform evidence, and performance baselines remain incomplete. |
-| **M1 — Correctness and lifecycle** | Multiple slices implemented and verified; descendant cleanup limitations and Linux validation remain unresolved. |
-| **M2 — Permissions and platform boundaries** | Host-owned policy and scope handling implemented; filesystem and sandbox evidence covers macOS, with Linux validation blocked. |
+| **M0 — Minimal execution baseline** | Accepted for the owner-approved scope on 2026-11-02; cross-platform evidence, separate first-security-scan profile and M5 cold-cache deferral are recorded in the M0 gates. Not production/security certification. |
+| **M1 — Correctness and lifecycle** | Linux and macOS suites pass for covered paths; escaped-descendant cleanup remains unresolved, so M1 is open. |
+| **M2 — Permissions and platform boundaries** | Linux and macOS filesystem/sandbox reference tests pass; evidence is profile-specific, not a universal guarantee for all Linux filesystems/distributions. |
 | **M3 — Configuration and composition** | Consolidation slices recorded as verified. |
-| **M4 — Internal consolidation** | M4.1–M4.3 implemented, with passing macOS default-feature workspace evidence; the overall gate remains open. |
+| **M4 — Internal consolidation** | M4.1–M4.3 implemented, with passing macOS and Linux default-feature workspace evidence; the overall gate remains open. |
 | **M5 — On-demand extensions** | Additional provider protocols implemented with offline fixtures; external-tool transport and HTTP/TLS replacement remain deferred. |
 
 M1–M5 refer to the [architecture migration stages](docs/tasks/08-architecture-migration.md),
@@ -501,8 +547,8 @@ validation of every subsequent revision.
 - [x] Accepted minimal semantic contracts and finite test budgets ([M0 lock](docs/tasks/06-m0-lock.md)).
 - [x] Shared typed core/runtime, fake model/tool loop, scripted headless entry point, and terminal frontend.
 - [x] Runtime authorization, exact-call approvals, cancellation, explicit effect states, bounded events/output, and stale-run rejection.
-- [ ] Formal [M0 acceptance](docs/tasks/04-m0-gates.md), including reviewed current Linux/macOS evidence.
-- [ ] Reference performance baselines: PTY first-interactive startup, attributable RSS, idle CPU, streaming, buffer high-water marks, and dispatch overhead. Historical spawn-to-exit and size measurements do not close this gate.
+- [x] Formal scoped [M0 acceptance](docs/tasks/04-m0-gates.md), including reviewed Linux/macOS evidence, owner-approved first-security-scan separation, and the recorded limitations/deferral (2026-11-02).
+- [x] Scoped reference performance baselines: PTY first-interactive startup, platform-qualified RSS/idle CPU/wakeups, synthetic streaming, per-layer buffer high-water and fake dispatch, with native archive sizes. First-execution security scanning is separate; allocator/all-layer peaks and real-model/full-session claims are excluded. Historical spawn-to-exit measurements are not promoted to this baseline.
 
 #### M1 — Correctness and lifecycle
 
@@ -510,19 +556,19 @@ validation of every subsequent revision.
 - [x] **M1.2:** Treat closed control transport as terminal rather than repeatedly scheduling delivery.
 - [x] **M1.3:** Bound provisional streaming and control retention, validate usage updates, and preserve terminal-delivery accounting.
 - [x] **M1.4, implemented portion:** Nonblocking exec pipe draining, capped retained output, bounded cleanup checks, and ownership/quarantine for uncertain workers.
-- [ ] **M1.4, remaining:** Resolve escaped-descendant cleanup limitations and validate Linux exec/sandbox failure paths.
+- [ ] **M1.4, remaining:** Resolve escaped-descendant cleanup limitations. Linux exec/sandbox and injected probe/pipe-failure tests passed on the recorded reference VM; escaped-descendant termination is still not proven.
 - [x] **M1.5:** Attribute TUI usage to the accepted run's model despite later picker changes.
 - [x] **M1.6:** Bound server connections, sessions, SSE retention, and completion/usage bookkeeping.
 - [x] **M1.7:** Enforce the loopback real-tool server trust boundary with bearer authentication and Host/Origin checks.
-- [ ] **M1 gate:** Close remaining cleanup and Linux validation blockers.
+- [ ] **M1 gate:** Close the remaining escaped-descendant cleanup limitation; Linux validation for covered paths is recorded.
 
 #### M2 — Permissions and platform boundaries
 
 - [x] **M2.1:** Host-owned tool access classification, including conservative unknown/read-only handling.
 - [x] **M2.2:** Shared file/exec scope construction and exact authorization matching.
-- [x] **M2.3, macOS scope:** Descriptor-bound file access, staged replacement, no-clobber creation, hardlink refusal, and supported metadata preservation.
-- [x] **M2.4, macOS scope:** Actual sandbox tests recorded separately from backend-unavailable denial tests.
-- [ ] **M2 gate:** Linux file-race/metadata and sandbox-isolation validation; macOS evidence is not cross-platform acceptance.
+- [x] **M2.3:** Descriptor-bound file access, staged replacement, no-clobber creation, hardlink refusal, tested file-race cases, and supported metadata preservation on macOS and the recorded Linux filesystem.
+- [x] **M2.4:** Actual sandbox isolation tests passed on macOS and Linux; backend-unavailable denial tests remain distinct.
+- [x] **M2 gate:** Linux file-race/metadata and sandbox-isolation tests passed on the recorded Ubuntu reference VM; this does not claim every Linux distribution or filesystem.
 
 #### M3 — Configuration and composition
 
@@ -536,8 +582,8 @@ validation of every subsequent revision.
 - [x] **M4.1:** Shared bounded ordered-event consumption across TUI, headless, and server, retaining frontend-specific presentation/reconnect policies.
 - [x] **M4.2:** Direct reuse of concrete development file operations without per-call tool reconstruction or JSON redispatch.
 - [x] **M4.3:** Public-contract/consumer review, compatibility-preserving API retention, and correction of stale provider-event documentation.
-- [x] Default-feature workspace regression evidence recorded on macOS, with affected-package formatting and Clippy checks.
-- [ ] **M4 gate:** Full closure remains dependent on the M1/M2 cleanup and Linux blockers; continued macOS development is not a security waiver for release.
+- [x] Default-feature workspace regression evidence recorded on macOS and Linux, with formatting and all-target Clippy checks.
+- [ ] **M4 gate:** Full closure remains dependent on the unresolved M1.4 escaped-descendant cleanup limitation; Linux M2 blockers were validated on the recorded reference VM. This is not production security readiness.
 
 #### M5 — Extensions on concrete demand
 
@@ -545,6 +591,7 @@ validation of every subsequent revision.
 - [ ] Universal live compatibility is not established; individual services/models need their own evidence. Gemini native APIs are not implemented.
 - [ ] **M5.2, deferred:** External tool transport/plugins and their bounded lifecycle/trust contract.
 - [ ] **M5.3, deferred:** HTTP/TLS transport replacement evaluation; the current OpenSSL bridge remains in use.
+- [ ] **M5.4, deferred from M0:** macOS cold-cache interactive startup evidence, using an authorized isolated environment and accepted methodology. Warm-cache results do not establish cold performance.
 
 ### Additional delivered capabilities
 

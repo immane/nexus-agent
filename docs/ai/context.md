@@ -10,8 +10,10 @@
 - Stage: **M0 test-only, dev-versioned, with narrowed real boundaries**
   (plain-HTTP OpenAI-compatible adapter incl. Ollama reasoning fields,
   root-jailed file reader+writer defaulting to cwd, loopback HTTP server).
-  **M0 acceptance is NOT complete** (`docs/tasks/04-m0-gates.md`
-  still 8 unchecked / 0 checked).
+   **Scoped M0 acceptance completed on 2026-11-02**; see
+   `docs/tasks/04-m0-gates.md` for the authoritative baseline and owner-approved
+   first-security-scan separation/M5 deferral. This older session snapshot's
+   branch, stage and test counts below are historical, not current status.
 - M0 lock amended: tool calls **64/run, 16/turn**, retained context **256**
   (`docs/tasks/06-m0-lock.md` + tripwire test updated in step; dependent
   caps raised coherently: tool-definition aggregate 2MB, headless

@@ -1,0 +1,51 @@
+{
+  "binary": "/Volumes/Nayuki/Development/Rust/nexus-agent/target/release/nexus-tui",
+  "binary_sha256": "adcec2e3fb2b8d24751185195f6ddaa2132b43561041c9c1640d1486ce3c2c91",
+  "platform": "macOS /bin/ps process sampling",
+  "workload": "loopback HTTP SSE; finite stream through final rendered marker",
+  "finite_chunks": 128,
+  "valid_samples": 1,
+  "invalid_samples": 2,
+  "samples": [
+    {
+      "run": 0,
+      "valid": true,
+      "outcome": "final-marker-rendered",
+      "window_s": 0.167531667,
+      "provider_chunks_sent": 128,
+      "provider_chunks_per_s": 764.0346585938287,
+      "sample_count": 3,
+      "sample_interval_s": 0.05,
+      "rss_min_kib": 5888,
+      "rss_median_kib": 5952,
+      "rss_max_sampled_kib": 5984,
+      "rss_peak_method": "maximum of sampled /bin/ps RSS values",
+      "visible_progress_observations": 6,
+      "presentation_truncation_visible": false,
+      "visible_resource_index_first": 25,
+      "visible_resource_index_last": 127,
+      "visible_progress_window_s": 0.10945675,
+      "visible_marker_advance_per_s": 931.8749186322451,
+      "visible_progress_method": "observed monotonic advance of numbered content on the rendered PTY screen; rate covers only first-to-last observed advance",
+      "sample_gap_min_ms": 4.315542,
+      "sample_gap_median_ms": 58.12825,
+      "sample_gap_max_ms": 58.12825,
+      "ps_cpu_percent_min": 1.9,
+      "ps_cpu_percent_median": 3.0,
+      "ps_cpu_percent_max": 3.0,
+      "cpu_measurement_method": "OS-reported ps %cpu values; not a window CPU delta"
+    },
+    {
+      "run": 1,
+      "valid": false,
+      "outcome": "measurement-error",
+      "error": "PermissionError: [Errno 1] Operation not permitted"
+    },
+    {
+      "run": 2,
+      "valid": false,
+      "outcome": "measurement-error",
+      "error": "PermissionError: [Errno 1] Operation not permitted"
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-# Startup measurement harness
+# Performance measurement tools
 
 Generic, dependency-free (Python 3 stdlib only) harness that measures
 fresh-process startup for **any** binary path passed as an argument. It
@@ -27,6 +27,64 @@ Options: `binary [-- args...]`, `-n/--runs` (launches per mode),
 `--build-profile` (a label recorded in the methodology header; the script
 cannot detect it). These original flags keep their names and meanings.
 `--json PATH` is additive and writes the machine-readable record.
+
+## Loopback streaming TUI resources
+
+`measure_tui_stream_resources.py` runs a local Chat Completions-compatible SSE
+fixture and samples a TUI process while it streams, then verifies cancellation.
+It supports Linux and macOS and never contacts a live provider:
+
+```sh
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --window 3 --sample-interval 0.1 --output stream-resources.json
+
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --finite-chunks 128 --sample-interval 0.05 --output finite-stream.json
+
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --finite-chunks 128 --payload-profile coding \
+  --sample-interval 0.05 --output coding-stream.json
+
+python3 tools/perf/measure_tui_stream_resources.py target/release/nexus-tui \
+  --runs 10 --finite-chunks 128 --payload-profile coding-workflow \
+  --sample-interval 0.05 --output coding-workflow.json
+```
+
+RSS samples are platform-qualified: Linux reads `/proc` RSS and `VmHWM`; macOS
+uses `/bin/ps` for sustained profiles and `proc_pid_rusage
+RUSAGE_INFO_V4.ri_resident_size` for the short coding workflow. Both macOS
+values are sampled maxima, not a kernel high-water mark. Linux CPU is a `/proc`
+tick delta over the stream window. macOS retains
+OS-reported `ps %cpu` readings but does not interpret them as a window CPU
+delta. The fixture's chunks-per-second value is the local server emission rate,
+not a claim about application-consumed token or render throughput. The harness
+also observes increasing numbered content on the rendered PTY screen and reports
+the observed visible-marker advance rate separately. That rate covers only the
+first-to-last observed advance; if presentation reaches a configured retention
+bound, it is not sustained throughput. This is a rendered-output signal for the
+visible viewport, not proof that every generated chunk was consumed or rendered.
+The JSON distinguishes `viewport_scrollback_visible` (content above the current
+screen viewport) from `entry_output_truncation_visible` (the per-entry byte-cap
+marker); the former alone does not mean retained content was dropped.
+With `--finite-chunks N` (N >= 32), the fixture sends one finite response and
+the harness waits for its final numbered marker to appear in the PTY. It reports
+`visible_completion_chunks_per_s` from first fixture chunk to that rendered
+marker; this is a measured end-to-end rate for that finite test payload. Every
+run is retained; invalid runs are recorded and make the command exit nonzero.
+The `coding` profile emits a deterministic Rust patch-review response split
+across the requested chunks; it exercises multiline markdown/code rendering,
+not tool execution or a real model response.
+The `coding-workflow` profile adds a scripted Chat Completions tool-call turn:
+the TUI invokes read-only `host_read` on a Rust fixture inside its temporary
+workspace, the fixture verifies that the actual tool result is replayed to the
+second provider request, and a final patch-shaped response is streamed. It also
+types a sentinel while that response is streaming and records when it becomes
+visible. This is a composed local integration workload, not a real model, tool
+I/O, or complete coding session. It reports submission-to-final-marker latency,
+tool-result provenance, TUI RSS, and input-to-visible latency; the existing
+sustained-stream profile remains the cancellation-under-load observation.
+
+## Startup harness
 
 `--timeout` must be positive and finite; zero, negative, NaN, and infinite
 values are rejected. It bounds both each target launch and each purge run.
@@ -159,6 +217,114 @@ Linux notes: `ru_maxrss` is kilobytes; `/usr/bin/time -v` gives
 kernel, CPU, and build profile with every result. The purge command above
 is user-supplied; the harness enforces its exit status and timeout but
 does not require or embed `sudo`.
+
+## Readiness pre-launch preparation
+
+`readiness.py` hashes the executable and collects provenance before any sample.
+An external cache drop before starting the harness is therefore not a cold-start
+procedure. For an explicitly authorized, isolated environment, an optional
+trusted helper can run once per sample after all provenance reads and before
+target spawn:
+
+```sh
+python3 tools/perf/readiness.py /path/to/binary --runs 10 \
+  --prepare-arg=/path/to/trusted-helper --prepare-arg=argument --json results.json
+```
+
+Repeat `--prepare-arg=VALUE` for each argv element, including arguments starting
+with `-`. There is no shell interpretation; the helper is responsible for its
+own actions. Nothing is run by default and the harness does not automatically
+elevate privileges. Never include secrets in arguments: argv is recorded in JSON.
+Helper stdin, stdout and stderr are disconnected; failures retain status, exit
+code or launch error, and elapsed time, but not helper output. The positive
+finite `--prepare-timeout` defaults to 30 seconds, separately from target timing.
+An error, nonzero exit, or timeout skips that sample's target and produces
+`preparation-error`, a nonzero harness exit, and no readiness timing for it;
+subsequent samples are still attempted. Preparation time includes cleanup and
+is not included in spawn-to-ready timing.
+
+Helpers run in a new process group; on timeout the harness requests SIGKILL
+before reaping the direct child. After normal completion it does not signal the
+possibly recycled process group, and descendant termination is unverified. Escaped
+sessions, uninterruptible processes, and cleanup after abrupt harness termination
+are not guaranteed; use a trusted synchronous helper and independently clean up
+any escaped processes. Even exit zero **never verifies a cache reset**: JSON
+sets `cache_reset_verified` to false and cache state to unknown. Subsequent
+helper activity, filesystem access, other workloads, and the target itself can
+warm caches. Report these as user-prepared observations, not proven cold runs.
+
+## PTY input response probe
+
+For an initially focused composer, the no-fixed-delay probe is:
+
+```sh
+python3 tools/perf/readiness.py /path/to/nexus-tui --mode ready --runs 20 --require composer --probe-composer --json readiness.json -- --demo
+```
+
+After the required frame output, it samples PTY `ECHO`, sends a fresh random
+16-character token only if ECHO is off, and observes the complete token on one
+reconstructed screen row. A token already present in prior or queued output is
+rejected. ECHO must also be off when sampled after observation; unavailable or
+enabled ECHO produces no response timing. The probe modifies the composer draft
+but does not submit it. Check every `input_probe.status`: only
+`observed-composer-response` supplies `spawn_to_response_ms`, measured from
+spawn through observation; `ms` measures from token write to observation.
+Missing or unconfirmed probes do not make the harness exit nonzero.
+
+This is **not a strict real-time startup measurement** or proof of causal
+handling: ECHO is sampled, not monitored continuously, so a mode change between
+samples can confound the result. Delayed output, screen emulation limitations,
+scheduling, marker choice, readiness threshold, input focus, terminal size,
+and PTY buffering also matter. The token may not be visible if the composer
+is not focused or the screen is too small; a missing response is not proof of
+unresponsiveness. The harness inherits the target environment: isolate HOME and
+configuration yourself, and avoid sensitive or persistent target sessions.
+
+For the current TUI, `readiness.py` can additionally send Esc after the
+initial frame, wait 350 ms for the standalone key, then send `:` and observe
+the command-completion panel text:
+
+```sh
+python3 tools/perf/readiness.py /path/to/nexus-tui --mode ready --runs 10 --probe-command --json readiness.json
+```
+
+`input_probe.spawn_to_response_ms` measures spawn to observed panel text;
+`ms` measures from the `:` write to observation. The timeout includes the
+Esc wait. The marker `Enter/Tab insert` is not an echo of the keys, and a
+marker observed before `:` is rejected. A bounded partial terminal screen
+tracks cursor moves and erasures so incremental redraws can complete the
+marker; it is not a full terminal emulator.
+This remains external observational evidence: unrelated or delayed output
+can coincide with the probe, and output may still be queued at the write.
+The probe assumes Esc reaches the viewport, a large enough terminal for
+completions, and the current TUI's command panel; failure to observe is not proof of
+unresponsiveness. It does not change exit status on a missing probe marker;
+inspect each run's `input_probe.status`. The older `--probe-input` sentinel
+probe remains available and cannot establish input handling. These probes
+are mutually exclusive and available only in ready mode. The harness inherits
+the target environment; isolate HOME and configuration yourself if needed.
+
+## Linux scheduler wakeup experiment
+
+`tracefs_wakeup.py` is an explicit root-only experiment for a dedicated Linux
+test VM and trusted target, not a general sandbox. It runs the target as the
+specified non-root account with a temporary home and working directory, and
+uses its own tracefs instance without changing global tracing settings:
+
+```sh
+sudo python3 tools/perf/tracefs_wakeup.py --user nexus-test \
+  --binary /absolute/path/to/nexus-tui --runs 3
+```
+
+It reports `sched_wakeup` events for the target TIDs observed after the composer
+frame, thread-set changes, trace loss counters, and cleanup. These are not
+whole-machine wakeups, wakeups caused by the target, or a census of threads
+that start and stop between snapshots. Temporary HOME and cwd do not confine
+the target's filesystem or network access; use a dedicated user and VM.
+Interruptions such as SIGKILL or machine failure can prevent cleanup. Results
+are not comparable to the readiness harness's macOS-only
+`proc_pid_rusage` package-idle and interrupt counters. Linux readiness wakeups
+remain unsupported; the tracefs event count is a separate privileged measure.
 
 ## Tests
 

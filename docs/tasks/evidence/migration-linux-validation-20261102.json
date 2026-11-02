@@ -1,0 +1,64 @@
+{
+  "schema": "nexus.migration.linux-validation/1",
+  "date": "2026-11-02",
+  "source_commit": "473019982bb4d1d7ff438ccff313a88281ae10de",
+  "remote_work_directory": "/home/nexus-test/linux-m1-m2-20261102-4730199",
+  "target_directory": "/home/nexus-test/linux-m1-m2-20261102-b824b2e/target",
+  "logs_retained": [
+    "workspace-tests.log",
+    "linux-ignored-tests.log",
+    "workspace-clippy.log"
+  ],
+  "environment": {
+    "distribution": "Ubuntu 26.04.1 LTS",
+    "architecture": "x86_64",
+    "kernel": "Linux 7.0.0-38-generic",
+    "vcpus": 4,
+    "memory_gib": 7.3,
+    "filesystem": "ext4",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "bubblewrap": "0.11.1",
+    "execution_identity": "unprivileged user"
+  },
+  "commands": [
+    {
+      "command": "cargo fmt --all --check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --workspace --locked --offline -- --test-threads=1",
+      "passed": 2653,
+      "failed": 0,
+      "ignored": 26
+    },
+    {
+      "command": "cargo test -p nexus-tools --locked --offline --test behavior linux_ -- --ignored --test-threads=1",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "coverage": [
+        "Linux Bubblewrap filesystem and network confinement",
+        "development credential masking",
+        "approved external write scopes",
+        "sandbox timeout cleanup and next-call recovery",
+        "user xattr, uid, gid, mode, and content preservation",
+        "non-UTF-8 xattr refusal without mutation"
+      ]
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --locked --offline -- -D warnings",
+      "result": "passed"
+    }
+  ],
+  "remaining_unrun_ignored_tests": [
+    "opt-in first-command timing measurement",
+    "low-value key census and signature tests",
+    "live public catalog fetch"
+  ],
+  "limitations": [
+    "The run does not prove escaped descendants have terminated.",
+    "Filesystem results apply to the recorded ext4 Ubuntu profile, not every Linux filesystem or distribution.",
+    "This is targeted Linux platform evidence, not production security certification."
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "schema": "nexus.perf.profile-decision/1",
+  "decision_date": "2026-11-02",
+  "authority": "owner explicitly approved retaining the documented first security-scan execution separately from ordinary warm startup, then continuing conditional scoped M0 closure",
+  "ordinary_warm_per_sample_ceiling_ms": 150,
+  "first_execution": {
+    "source": "readiness-macos-final-warm-default-30.json",
+    "source_sha256": "a71a0cb3798f7dbfa4eafd4ad04263c08b4ed164629c8768842ba7b204db5b22",
+    "run_index": 0,
+    "valid": true,
+    "profile": "first-execution-security-scan",
+    "spawn_to_response_ms": 815.572917,
+    "meets_150_ms": false,
+    "included_in_ordinary_warm_baseline": false,
+    "reason": "exact output path and PID correlated with Gatekeeper/XProtect scan; explicit owner scope adjustment, not deletion merely for being an outlier",
+    "diagnostic": "readiness-macos-final-security-scan-diagnostic.json",
+    "diagnostic_sha256": "a12580a5f86ec0aaba2e2fd1cb55fe83fbf3c95e467cf3b081d0f205b8a6cede"
+  },
+  "ordinary_warm": {
+    "source": "readiness-macos-post-scan-warm-default-30.json",
+    "source_sha256": "2b22fe8f8348547d837b18f995ed320afcaead00f18876d079a91febade33d44",
+    "attempts": 30,
+    "valid_responses": 30,
+    "excluded_attempts": 0,
+    "over_limit_attempts": 0,
+    "cleanup_escalations": 0,
+    "p50_arithmetic_median_ms": 32.325542,
+    "p95_nearest_rank_ms": 37.895,
+    "maximum_ms": 38.804292
+  },
+  "binary_sha256": "688f39c4cfa7f3e96897b1ce669ba49e1aa6889511f5ebf3b2309e71a2020b99",
+  "build_provenance": "readiness-macos-final-build-provenance.json",
+  "build_provenance_sha256": "054cdfd57755a4831b36519b61e4771cfe508dc2fd0b65ddb5166a5cbaa6e2f6",
+  "security_controls_changed": false,
+  "raw_evidence_modified": false,
+  "limitations": [
+    "The original mixed-profile 30-attempt batch remains intact; it is not relabeled as 30 ordinary warm passes.",
+    "No scan time is subtracted from any sample.",
+    "Isolated slow ordinary launches are not automatically excluded.",
+    "Initial execution is not claimed to meet 150 ms; macOS cold-cache evidence remains deferred to M5.",
+    "Scoped M0 acceptance is not production/security, real-model/full-session, or subsequent milestone acceptance."
+  ]
+}

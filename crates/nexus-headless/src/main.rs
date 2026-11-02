@@ -22,9 +22,9 @@ use nexus_headless::{
 /// to be printable.
 const INVALID_ARGV: &str = "nexus-headless: error: arguments must be valid UTF-8";
 
-/// Static diagnostic when the finite report budget dropped event records.
+/// Static diagnostic for runtime or report-retention truncation.
 const TRUNCATED_REPORT: &str =
-    "nexus-headless: note: report truncated by the event retention budget";
+    "nexus-headless: note: report may be incomplete (runtime or retention truncated content)";
 
 /// Resolves a `--mode` id to its tool policy: the built-ins always
 /// resolve, customs resolve through user configuration. Unknown ids and
@@ -283,7 +283,7 @@ mod cov_main_private {
     fn truncated_report_note_is_a_note_and_not_an_error() {
         assert_eq!(
             TRUNCATED_REPORT,
-            "nexus-headless: note: report truncated by the event retention budget"
+            "nexus-headless: note: report may be incomplete (runtime or retention truncated content)"
         );
         assert!(TRUNCATED_REPORT.is_ascii(), "note stays ASCII");
         assert!(

@@ -65,7 +65,11 @@
 //!   event is emitted once as `data: {...}` with the per-run sequence in
 //!   `id:`, a `: ping` comment every idle window, and the connection closes
 //!   after that run's terminal event. Sync history first via `/snapshot`:
-//!   the stream only carries events from attach time.
+//!   the stream only carries events from attach time. Delivered sequences
+//!   stay contiguous even when the runtime dropped presentation events or
+//!   exhausted its control budget, so the stream cannot signal that loss
+//!   itself: after the terminal event, query `/snapshot` and treat
+//!   `content_truncated: true` as an incomplete event record.
 //!
 //! Enum names in JSON are the Rust `Debug` forms and are NOT a stable
 //! contract. Error bodies are static diagnostics; rejected input is never

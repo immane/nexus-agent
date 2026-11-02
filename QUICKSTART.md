@@ -14,7 +14,10 @@
   the project root and temp directories are automatic; other paths need
   approval, and `--strict-tools` restores project-jailed reads with per-call
   confirmation. No plugins, no durable history.
-  **M0 acceptance is NOT complete** (see `docs/tasks/04-m0-gates.md`).
+  **Scoped M0 acceptance is complete (2026-11-02)**; see
+  `docs/tasks/04-m0-gates.md` for first-execution separation, cold-cache deferral,
+  and measurement limitations. This does not certify real-provider security or
+  subsequent milestones.
 - The [migration record](docs/tasks/08-architecture-migration.md) documents
   implemented M4 consolidation slices and passing default-feature macOS
   workspace tests. Linux filesystem/metadata and sandbox-isolation validation
@@ -46,6 +49,54 @@ cargo run -p nexus-headless --locked --offline -- "hello"
 # Interactive terminal; configure a provider/model below before submitting:
 cargo run -p nexus-tui --locked --offline
 ```
+
+### Build and install a native release archive
+
+Packaging requires Python 3.11+ and the normal Rust build prerequisites. It
+builds the current host target on Linux or macOS (no cross compilation), with
+the same container features as `scripts/install.sh`, in a separate
+`target/release-package` directory:
+
+```sh
+python3 scripts/package-release.py --offline
+python3 scripts/test-release.py
+```
+
+Omit `--offline` only when dependency downloads are intended. The output is
+`dist/nexus-agent-<version>-<rust-host-target>.tar.gz` plus `.tar.gz.sha256`.
+Existing output files are never overwritten; use `--output-dir PATH` for a new
+build. Packaging rejects mismatched Python/Rust architectures (including mixed
+Rosetta/native tooling) before building; platform labels come from the Rust
+target. The archive contains three executables, `nexus-config`, `LICENSE`,
+`install.py`, and `manifest.json` with per-file checksums and build provenance.
+The manifest records commit, dirty state, tracked-diff hash, a content hash of
+existing tracked files plus the release scripts, lockfile hash, compiler and
+features. A dirty or untracked tree is explicitly marked and is
+not a claim of an exact reproducible source snapshot. No publication, signing,
+notarization, container images, or automatic downloads are performed.
+
+After obtaining an archive from a trusted source, change into the directory
+containing both the archive and its sidecar, then verify its checksum (macOS:
+`shasum -a 256 -c FILE.tar.gz.sha256`; Linux: `sha256sum -c FILE.tar.gz.sha256`),
+then extract and install without Cargo or root:
+
+```sh
+tar -xzf nexus-agent-<version>-<rust-host-target>.tar.gz
+cd nexus-agent-<version>-<rust-host-target>
+python3 install.py "$HOME/.local/bin"
+```
+
+The installer checks host OS/architecture and all four command checksums before
+copying; it refuses symlink command destinations. It replaces existing regular
+command files, but does not change configuration or history. Installation is
+not transactional: a filesystem error during copying can leave a partial
+installation. Python 3 is also needed by `nexus-config`. Native runtime
+dependencies (system OpenSSL and OS sandbox support, and compatible Linux
+glibc) still apply. Checksums detect corruption, not authenticity. These local
+artifacts are not signed or security-certified releases; container support
+remains experimental and local execution remains the default. Extracted-install
+smoke checks have been run on macOS arm64 and Linux x86_64 reference hosts;
+other architectures and older OS/glibc versions have not been validated.
 
 ### Experimental container mode
 
@@ -121,7 +172,7 @@ the full optional suite is documented in [Testing](docs/testing.md).
 | `crates/nexus-openai` | Streaming Chat Completions, Responses, and Messages adapters over HTTP/HTTPS |
 | `crates/nexus-runtime` | Single-active-run loop: policy, cancellation, quarantine, ordered events |
 | `crates/nexus-server` | Loopback HTTP frontend: sessions, SSE streams, config-gated selection |
-| `crates/nexus-tui` | TUI with configured live providers or scripted demo wiring |
+| `crates/nexus-tui` | TUI with configured live providers and opt-in scripted demo wiring |
 | `crates/nexus-headless` | One-shot machine-output runner over scripted fakes |
 | `crates/nexus-integration` | Cross-crate behavior and regression tests |
 | `tools/perf` | stdlib-only startup/readiness measurement harnesses + their tests |
@@ -131,19 +182,38 @@ the full optional suite is documented in [Testing](docs/testing.md).
 
 ```sh
 cargo run -p nexus-headless --locked --offline -- "hello"
-cargo run -p nexus-tui --locked --offline -- --demo
+cargo run -p nexus-tui --features demo --locked --offline -- --demo
 ```
 
 Headless uses scripted provider/tools, has no approval handler, and emits
 percent-encoded `key=value` records, not JSON. A leading `--mode plan` selects
-read-only mode; the default is `build`.
+read-only mode; the default is `build`. If runtime event delivery or report
+retention truncates presentation data, headless reports the limitation on
+stderr. If the finalized runtime snapshot cannot establish completeness, it
+returns an operation error instead of presenting a complete report.
+The TUI also warns when the finalized runtime snapshot reports potentially
+incomplete content, or when completeness cannot be confirmed. A new submission
+is deferred until the preceding run's terminal event and snapshot check have
+been handled; the draft is retained. If the event stream closes before a run
+reaches its terminal outcome, the TUI reports an error rather than claiming a
+complete transcript. An incomplete or unconfirmed run is also summarized on
+stderr after terminal restoration, even if its earlier notice was scrolled out
+of view.
+
+The TUI `demo` Cargo feature is disabled by default, including in release builds;
+without it `--demo` is rejected. For performance measurements it can also be
+enabled in a release build with `cargo build -p nexus-tui --release --features demo`.
 
 The TUI uses real development tools rooted at the working directory, even with
 `--demo`: project/temp operations apply for real. Demo fallback is available
 only when no configured model is selected; `--demo` does not override a live
 model or guarantee a side-effect-free run. Without `--demo`, an unconfigured
-submission fails explicitly instead of returning a fake reply. Neither
-frontend has durable conversation storage.
+submission fails explicitly instead of returning a fake reply. Interactive live
+TUI sessions use private local history storage; demo sessions are ephemeral.
+Startup does not resolve provider credentials; the selected provider is validated
+when a run is submitted. The interactive canned demo runs automatically only
+when no model is selected. A selected model is never submitted automatically,
+even if its credential is missing; manually submitting it can use the network.
 
 ## Use a configured model in the TUI
 
@@ -165,8 +235,8 @@ export NEXUS_CONFIG=/path/to/config.json
 From the repository root, build and install the TUI, server, headless binary,
 and interactive config helper to `~/.local/bin` (or pass another install
 directory). Installation requires Cargo, Python 3, and the locked dependencies;
-Cargo may use the network if they are not cached. The installed binaries use
-default features; experimental container support is not included.
+Cargo may use the network if they are not cached. The installed TUI and server
+include experimental container support; local execution remains the default.
 
 ```sh
 ./scripts/install.sh

@@ -4,10 +4,11 @@ Nexus Agent is a Rust coding agent designed around very fast startup, low resour
 
 ## Implementation Status
 
-Status: documentation repair in progress. The M0 test-only implementation
-exists, but **M0 acceptance is not complete**; the checks and measurements
-below are recorded historical context, not accepted readiness evidence,
-until the coordinator completes verification.
+Status: **scoped M0 accepted on 2026-11-02**; the authoritative current
+decision and baseline are in [M0 gates](tasks/04-m0-gates.md). The old sizes,
+checks and measurements below remain historical context and are not promoted
+to the accepted baseline. Subsequent milestones and production/security
+readiness are not accepted by this decision.
 
 The workspace contains a test-only M0 implementation driven by scripted
 fakes (`nexus-fakes`) through one `nexus-runtime` policy boundary.

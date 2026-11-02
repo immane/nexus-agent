@@ -1866,6 +1866,27 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_clean_directory_reads_index_without_loading_session_bodies() {
+        let directory = directory("lazy-session-body");
+        let checkpoint = checkpoint(1, "saved conversation");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        store.initialize_session(&checkpoint).unwrap();
+        let body = store.session_path(checkpoint.session());
+        drop(store);
+
+        fs::write(&body, b"invalid session body").unwrap();
+        let store = DirectorySessionStore::open(&directory)
+            .expect("opening a clean store does not decode saved bodies");
+        assert_eq!(
+            store.list_sessions(1).unwrap()[0].session,
+            *checkpoint.session()
+        );
+        assert!(store.load_session(checkpoint.session()).is_err());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn directory_transactions_recover_create_update_and_delete_without_loading_bodies() {
         for boundary in 0..3 {
             let directory = directory("transaction-recovery");
