@@ -9319,7 +9319,14 @@ mod cov_main_topup {
         let (data_tx, mut data_rx) = mpsc::channel::<RunEvent>(1);
         let (control_tx, mut control_rx) = mpsc::channel::<RunEvent>(1);
         drop(control_tx);
-        let mut interval = interval();
+        // The first tick must not satisfy this wait: a loaded test runner can
+        // delay the first poll past the normal tick interval, which would turn
+        // this into a flaky Tick result instead of proving that closed control
+        // alone does not complete the loop.
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(3600),
+            TICK,
+        );
 
         let run = run_id("delayed-data-terminal");
         assert!(
