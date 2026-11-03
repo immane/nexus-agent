@@ -3023,7 +3023,7 @@ mod tests {
             .await;
         assert_eq!(bytes.available_permits(), PROVISIONAL_STREAM_BYTE_CAPACITY);
         assert!(
-            prefix.exceeded,
+            prefix.exceeded.is_some(),
             "the queued second fragment exceeds the output bound during drain"
         );
         let terminal = runtime

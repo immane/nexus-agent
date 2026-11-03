@@ -264,14 +264,14 @@ struct StreamedPrefix {
     usage_updates: usize,
     usage_prefix: Vec<Usage>,
     usage_replayed: Vec<Usage>,
-    exceeded: bool,
+    exceeded: Option<&'static str>,
 }
 
 /// Provisional bridge has independent queue, payload, text-output, and event
 /// ceilings; none of these substitutes for the authoritative batch budget.
 const PROVISIONAL_STREAM_CAPACITY: usize = 64;
 const PROVISIONAL_STREAM_BYTE_CAPACITY: usize = 1_048_576;
-const PROVISIONAL_EVENT_LIMIT: usize = crate::protocol::MAX_BATCH_EVENTS;
+const PROVISIONAL_USAGE_LIMIT: usize = crate::protocol::MAX_BATCH_EVENTS;
 const PROVISIONAL_USAGE_UPDATE_LIMIT: usize = 16;
 const CONTROL_OUTBOX_EVENT_LIMIT: usize = 256;
 const CONTROL_OUTBOX_BYTE_LIMIT: usize = 1_048_576;
@@ -1703,7 +1703,7 @@ impl Runtime {
                         crate::protocol::validate_batch(&events, &effective_limits).is_ok();
                     self.publish_model_request_finished(run, &turn, response_validated)
                         .await;
-                    if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                    if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded.is_some() {
                         self.check_completed_stream_limits(
                             run,
                             &events,
@@ -1735,7 +1735,7 @@ impl Runtime {
                                     error: active.terminal_error.clone(),
                                 });
                             }
-                            if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                            if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded.is_some() {
                                 return Err(Terminal::limit(
                                     "summary provider stream exceeded its bound",
                                 ));
@@ -1875,13 +1875,13 @@ impl Runtime {
                     Err(Terminal::failed_internal(message))
                 }
                 None => {
-                    if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded {
+                    if stream_overflow.load(Ordering::SeqCst) || prefix.exceeded.is_some() {
                         self.quarantine_provider(run, handle).await;
-                        return Err(Terminal::limit(if prefix.exceeded {
-                            "provisional output budget exhausted"
-                        } else {
-                            "provisional provider event exceeded its byte bound"
-                        }));
+                        return Err(Terminal::limit(
+                            prefix
+                                .exceeded
+                                .unwrap_or("provisional provider event exceeded its byte bound"),
+                        ));
                     }
                     let forced = {
                         let state = self.shared.state.lock().await;
@@ -2019,8 +2019,8 @@ impl Runtime {
     ) -> Result<(), Terminal> {
         let message = if overflow {
             "provisional provider event exceeded its byte bound"
-        } else if prefix.exceeded {
-            "provisional output budget exhausted"
+        } else if let Some(reason) = prefix.exceeded {
+            reason
         } else {
             return Ok(());
         };
@@ -2060,12 +2060,7 @@ impl Runtime {
         if &active.run != run || active.cancelled || active.token.is_cancelled() {
             return;
         }
-        if prefix.event_count >= PROVISIONAL_EVENT_LIMIT {
-            prefix.exceeded = true;
-            active.token.cancel();
-            return;
-        }
-        prefix.event_count += 1;
+        prefix.event_count = prefix.event_count.saturating_add(1);
         if let ProviderEvent::TextDelta { item_key, .. }
         | ProviderEvent::ToolCallDelta { item_key, .. } = &event
             && let Err(error) = ItemKey::new(item_key.as_str())
@@ -2082,7 +2077,12 @@ impl Runtime {
             ProviderEvent::ReasoningDelta { text } => {
                 if !record_provisional(prefix, text.len(), self.shared.effective_output_budget) {
                     active.data_dropped = true;
-                    prefix.exceeded = true;
+                    mark_provisional_exceeded(
+                        &self.shared,
+                        run,
+                        prefix,
+                        "provisional text and reasoning exceed the output byte budget",
+                    );
                     active.token.cancel();
                     return;
                 }
@@ -2092,11 +2092,26 @@ impl Runtime {
                 }
             }
             ProviderEvent::TextDelta { item_key, text } => {
-                if !record_provisional(prefix, text.len(), self.shared.effective_output_budget)
-                    || !record_identity(prefix, item_key.len())
+                if !record_provisional(prefix, text.len(), self.shared.effective_output_budget) {
+                    active.data_dropped = true;
+                    mark_provisional_exceeded(
+                        &self.shared,
+                        run,
+                        prefix,
+                        "provisional text and reasoning exceed the output byte budget",
+                    );
+                    active.token.cancel();
+                    return;
+                }
+                if !prefix.text.contains_key(&item_key) && !record_identity(prefix, item_key.len())
                 {
                     active.data_dropped = true;
-                    prefix.exceeded = true;
+                    mark_provisional_exceeded(
+                        &self.shared,
+                        run,
+                        prefix,
+                        "provisional identity byte budget exhausted",
+                    );
                     active.token.cancel();
                     return;
                 }
@@ -2111,9 +2126,16 @@ impl Runtime {
                 }
             }
             ProviderEvent::ToolCallDelta { item_key, .. } => {
-                if !record_identity(prefix, item_key.len()) {
+                if !prefix.preview_keys.contains(&item_key)
+                    && !record_identity(prefix, item_key.len())
+                {
                     active.data_dropped = true;
-                    prefix.exceeded = true;
+                    mark_provisional_exceeded(
+                        &self.shared,
+                        run,
+                        prefix,
+                        "provisional identity byte budget exhausted",
+                    );
                     active.token.cancel();
                     return;
                 }
@@ -2129,6 +2151,16 @@ impl Runtime {
             }
             ProviderEvent::Usage(usage) => {
                 if usage.finality() == UsageFinality::Provisional {
+                    if prefix.usage_prefix.len() >= PROVISIONAL_USAGE_LIMIT {
+                        mark_provisional_exceeded(
+                            &self.shared,
+                            run,
+                            prefix,
+                            "provisional usage update count exceeded its bound",
+                        );
+                        active.token.cancel();
+                        return;
+                    }
                     prefix.usage_prefix.push(usage);
                 }
                 publish_usage(
@@ -4682,6 +4714,20 @@ fn failed_outcome(message: &'static str) -> ToolOutcome {
 
 fn run_event(active: &ActiveRun, seq: EventSequence, payload: EventPayload) -> RunEvent {
     RunEvent::new(active.session.clone(), active.run.clone(), seq, payload)
+}
+
+fn mark_provisional_exceeded(
+    shared: &Shared,
+    run: &RunId,
+    prefix: &mut StreamedPrefix,
+    reason: &'static str,
+) {
+    prefix.exceeded = Some(reason);
+    shared.diagnostic(format_args!(
+        "nexus-runtime: provisional limit run={} reason={} events={} text_bytes={} identity_bytes={} usage_updates={} output_byte_limit={}",
+        run.as_str(), reason, prefix.event_count, prefix.retained_bytes,
+        prefix.identity_bytes, prefix.usage_prefix.len(), shared.effective_output_budget,
+    ));
 }
 
 fn record_provisional(prefix: &mut StreamedPrefix, bytes: usize, byte_limit: usize) -> bool {
@@ -7837,14 +7883,7 @@ mod cov_runtime_private {
     use nexus_core::commands::MAX_TEXT_FRAGMENT_BYTES;
 
     #[test]
-    fn provisional_retention_enforces_event_and_byte_ceilings() {
-        let mut prefix = StreamedPrefix::default();
-        for _ in 0..PROVISIONAL_EVENT_LIMIT {
-            prefix.event_count += 1;
-        }
-        assert!(prefix.event_count >= PROVISIONAL_EVENT_LIMIT);
-        assert_eq!(prefix.event_count, PROVISIONAL_EVENT_LIMIT);
-
+    fn provisional_retention_enforces_byte_ceilings() {
         let mut bytes = StreamedPrefix::default();
         assert!(record_provisional(&mut bytes, 4, 4));
         assert!(!record_provisional(&mut bytes, 1, 4));

@@ -519,6 +519,8 @@ fall back to stderr only when it is redirected, never to the TUI-owned terminal.
 Records contain timestamps, host-generated run/turn identifiers, byte/count
 metrics, context budgets, output-limit recovery decisions, and terminal outcome,
 error category, source-persistence status, duration, and delivery metadata.
+Provisional-stream limit records identify the exhausted budget and counters;
+normal text or reasoning fragments are not limited by their individual count.
 They do **not** contain prompts, response/reasoning text, tool arguments/results,
 provider payloads, credentials, or error-message text. Logging does not change
 retry policy or budgets. Logs are not conversation archives or saved terminal
