@@ -414,9 +414,9 @@ See [model integration](docs/design/03-model-integration.md), [API relay](docs/d
 
 The runtime enforces permissions, resource scopes, deadlines, and output limits. Tool access categories come from host registration, not model-visible descriptions. Model output is data, not a permission grant.
 
-The TUI and ordinary server CLI allow up to 10 minutes per tool call within a
-one-hour run budget; each tool deadline is clamped to the remaining run budget.
-Benchmark-pilot mode allows one hour per tool within a 24-hour run budget.
+The TUI, ordinary server, and scripted headless runner default to one hour per
+tool call within a 24-hour run budget; each tool deadline is clamped to the
+remaining run budget. TUI and server settings may override these defaults.
 Timeouts do not bypass uncertain-effect handling or worker quarantine.
 Per-tool expiry is not, by itself, a run-budget failure. The runtime allows a
 bounded cleanup grace (up to two seconds, within the remaining run budget)

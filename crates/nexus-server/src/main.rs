@@ -30,11 +30,7 @@ const BENCHMARK_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 #[cfg(test)]
 fn server_runtime_limits() -> nexus_core::Limits {
-    use nexus_core::Limits;
-    let mut limits = Limits::m0_test();
-    limits.run_duration = std::time::Duration::from_secs(60 * 60);
-    limits.per_tool_timeout = std::time::Duration::from_secs(10 * 60);
-    limits
+    nexus_config::SettingsProfile::Server.default_limits()
 }
 #[cfg(test)]
 const BENCHMARK_RETAINED_CONTEXT_ITEMS: usize = 8_192;
@@ -57,9 +53,7 @@ fn usage() -> ! {
     eprintln!(
         "  --session-store opts into private original-source and tool-operation records in a dedicated directory; no session restore API."
     );
-    eprintln!(
-        "  --benchmark-pilot opts into finite 500-turn/24-hour limits; intended only for isolated benchmark runs."
-    );
+    eprintln!("  --benchmark-pilot enables isolated benchmark execution requirements.");
     eprintln!(
         "  --auth-token-env reads a 64-hex-character bearer token from the named environment variable."
     );
@@ -1026,10 +1020,13 @@ mod cov_main_args {
     }
 
     #[test]
-    fn ordinary_server_allows_ten_minute_tools_within_a_one_hour_run() {
+    fn ordinary_server_uses_benchmark_runtime_limits() {
         let limits = super::server_runtime_limits();
-        assert_eq!(limits.per_tool_timeout, std::time::Duration::from_secs(600));
-        assert_eq!(limits.run_duration, std::time::Duration::from_secs(3_600));
+        assert_eq!(
+            limits.per_tool_timeout,
+            std::time::Duration::from_secs(3_600)
+        );
+        assert_eq!(limits.run_duration, std::time::Duration::from_secs(86_400));
         assert!(limits.validate().is_ok());
     }
 

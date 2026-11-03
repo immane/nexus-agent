@@ -344,7 +344,11 @@ Only `tui` and `server` profiles belong in the shared `base.jsonc`.
 [`config/benchmark.jsonc`](config/benchmark.jsonc) is an ordinary settings file
 with the same schema, provided as an example for benchmark budgets. Use it with
 `--benchmark-pilot --base-config config/benchmark.jsonc`; the benchmark profile
-also supplies these runtime limits by default. This file does **not** select
+and ordinary TUI, server, and scripted headless runs also use these runtime
+limits by default. TUI and server base files and overlays can override them;
+headless remains fake-only. Snapshot summaries retain at most 512 tool
+outcomes even though the run budget allows 4096 calls, and report truncation
+when that bound is exceeded. This file does **not** select
 container execution, real tools, images, or credentials. A benchmark pilot
 requires a container-enabled build, explicit container/real-tool selection,
 immutable gateway and workload image references, and an auth-token environment

@@ -171,7 +171,7 @@ mod tests {
         let text = fs::read_to_string(directory.join("tui-runtime.log")).unwrap();
         assert!(text.contains("timestamp_unix_s="));
         assert!(
-            text.contains("nexus-runtime: context budget configured_items=512 effective_items=")
+            text.contains("nexus-runtime: context budget configured_items=8192 effective_items=")
         );
         drop((runtime, log));
         let reopened = DiagnosticLog::open(&directory, MAX_FILE_BYTES).unwrap();

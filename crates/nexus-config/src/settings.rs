@@ -117,6 +117,12 @@ pub enum SettingsProfile {
 }
 
 impl SettingsProfile {
+    /// Returns the built-in runtime budgets without loading configuration files.
+    #[must_use]
+    pub fn default_limits(self) -> Limits {
+        self.defaults().limits
+    }
+
     fn key(self) -> &'static str {
         match self {
             Self::Tui => "tui",
@@ -126,26 +132,7 @@ impl SettingsProfile {
     }
 
     fn defaults(self) -> EffectiveSettings {
-        let mut limits = Limits::m0_test();
-        match self {
-            Self::Tui | Self::Server => {
-                limits.max_model_turns_per_run = 256;
-                limits.max_tool_calls_per_run = 512;
-                limits.max_tool_calls_per_turn = 64;
-                limits.run_duration = Duration::from_secs(60 * 60);
-                limits.per_tool_timeout = Duration::from_secs(10 * 60);
-                limits.retained_context_items = 512;
-            }
-            Self::Benchmark => return benchmark_defaults(),
-        }
-        EffectiveSettings {
-            limits,
-            provider: ProviderSettings::default(),
-            server: ServerSettings::default(),
-            tools: ToolsSettings::default(),
-            launch: LaunchSettings::default(),
-            tui: TuiSettings::default(),
-        }
+        benchmark_defaults()
     }
 }
 
@@ -882,19 +869,21 @@ mod tests {
     #[test]
     fn profiles_preserve_existing_defaults() {
         let tui = SettingsProfile::Tui.defaults();
-        assert_eq!(tui.limits.max_model_turns_per_run, 256);
-        assert_eq!(tui.limits.max_tool_calls_per_run, 512);
+        assert_eq!(tui.limits.max_model_turns_per_run, 500);
+        assert_eq!(tui.limits.max_tool_calls_per_run, 4096);
         assert_eq!(tui.limits.max_tool_calls_per_turn, 64);
-        assert_eq!(tui.limits.run_duration, Duration::from_secs(3600));
-        assert_eq!(tui.limits.retained_context_items, 512);
+        assert_eq!(tui.limits.run_duration, Duration::from_secs(86400));
+        assert_eq!(tui.limits.per_tool_timeout, Duration::from_secs(3600));
+        assert_eq!(tui.limits.retained_context_items, 8192);
         let server = SettingsProfile::Server.defaults();
-        assert_eq!(server.limits.max_model_turns_per_run, 256);
-        assert_eq!(server.limits.max_tool_calls_per_run, 512);
+        assert_eq!(server.limits.max_model_turns_per_run, 500);
+        assert_eq!(server.limits.max_tool_calls_per_run, 4096);
         assert_eq!(server.limits.max_tool_calls_per_turn, 64);
         assert_eq!(server.limits, tui.limits);
         let benchmark = benchmark_defaults();
         assert_eq!(benchmark.limits.max_model_turns_per_run, 500);
         assert_eq!(benchmark.limits.max_tool_calls_per_run, 4096);
+        assert_eq!(benchmark.limits, tui.limits);
         for settings in [tui, server, benchmark] {
             assert_eq!(settings.provider(), &ProviderSettings::default());
             assert_eq!(settings.server(), &ServerSettings::default());
@@ -919,7 +908,7 @@ mod tests {
         let actual = load_settings(SettingsProfile::Tui, Some(&base), &[overlay]).unwrap();
         assert_eq!(actual.limits.max_model_turns_per_run, 200);
         assert_eq!(actual.limits.per_tool_timeout, Duration::from_secs(900));
-        assert_eq!(actual.limits.max_tool_calls_per_run, 512);
+        assert_eq!(actual.limits.max_tool_calls_per_run, 4096);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

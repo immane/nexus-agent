@@ -33,7 +33,7 @@ use nexus_headless::{
 /// CLI contract.
 const INVALID_ARGV_DIAGNOSTIC: &str = "nexus-headless: error: arguments must be valid UTF-8";
 const RUNTIME_CONTEXT_BUDGET: &str =
-    "nexus-runtime: context budget configured_items=256 effective_items=256 max_bytes=1048576";
+    "nexus-runtime: context budget configured_items=8192 effective_items=8192 max_bytes=1048576";
 
 /// Exit codes as the operating system reports them, taken from the public
 /// mapping so a changed constant cannot silently disagree with the assertions.

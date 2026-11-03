@@ -59,8 +59,8 @@ written; their existence is not evidence that they were committed or deployed.
 | `nexus-runtime/src/runtime.rs` | Admits calls, records intent, clamps deadlines, publishes lifecycle events, and quarantines uncertain blocking workers | No bounded progress bridge during execution; late worker activity needs a progress publication fence |
 | `nexus-server/src/json.rs` | Manually encodes outcomes and progress; SSE sends idle connection pings | No process metadata or actual executor output stream |
 | `nexus-session/src/lib.rs` | Separate operation outcome records and source-history tool results; file revision 3, revision 2 readable | Both persistence representations need explicit metadata compatibility handling |
-| TUI/server CLI | Ten-minute tools within one-hour runs; benchmark-pilot uses one-hour tools within 24-hour runs | Longer budgets alone cannot diagnose hangs or repair worker incompatibility |
-| Scripted headless | Uses M0 test limits and scripted execution | Do not advertise this as a live-provider execution frontend |
+| TUI/server CLI | One-hour tools within 24-hour runs by default; configuration can override these budgets | Longer budgets alone cannot diagnose hangs or repair worker incompatibility |
+| Scripted headless | Uses benchmark runtime limits and scripted execution | Do not advertise this as a live-provider execution frontend |
 
 Paths in this table are relative to `crates/`. Keep runtime dependencies directed
 toward domain types, not Docker or frontend implementations.
