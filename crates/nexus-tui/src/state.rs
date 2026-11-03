@@ -33,11 +33,11 @@ pub const MAX_RETAINED_ENTRIES: usize = Limits::M0_TEST_RETAINED_CONTEXT_ITEMS;
 /// default). The title, every retained line (including empty ones), and the
 /// per-line bookkeeping overhead count against it. Excess is dropped with
 /// the entry's truncation flag set.
-pub const MAX_ENTRY_BYTES: usize = 8_192;
+pub const MAX_ENTRY_BYTES: usize = 512 * 1024;
 /// Aggregate retained presentation bytes across all entries (M0-test choice,
 /// not a product default). Exceeding it drops the oldest entries first,
 /// counted as presentation drops.
-pub const MAX_RETAINED_BYTES: usize = 256 * 1024;
+pub const MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum retained title bytes (M0-test choice). Titles come from runtime
 /// identities and provider item keys, so they are sanitized, bounded, and
 /// flattened to one line on every insertion.
@@ -3449,6 +3449,7 @@ mod tests {
         entry.compact_prefix = Some(0);
         entry.folded = true;
         state.push_entry(entry);
+        state.mutate_tail(|entry| entry.append_text(&format!("{}\n", "x".repeat(MAX_ENTRY_BYTES))));
         for n in 0..500 {
             state
                 .mutate_tail(|entry| entry.append_text(&format!("line-{n}: {}\n", "x".repeat(80))));

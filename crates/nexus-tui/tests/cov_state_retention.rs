@@ -158,6 +158,26 @@ fn tool_output(seq: u64, call: &str, preview: &str, truncated: bool) -> RunEvent
 }
 
 #[test]
+fn streamed_assistant_output_above_old_limit_is_preserved() {
+    let mut state = AppState::new();
+    assert!(state.apply_event(&started(0)));
+    let fragment = "内容abcdef".repeat(256);
+    for seq in 1..=8 {
+        assert!(state.apply_event(&assistant_fragment(seq, &fragment)));
+    }
+    let entry = last_entry(&state);
+    assert!(fragment.len() * 8 > 8_192);
+    assert_eq!(entry.lines.concat(), fragment.repeat(8));
+    assert!(!entry.truncated);
+    assert!(
+        !state
+            .transcript()
+            .iter()
+            .any(|line| line.contains(TRUNCATION_MARK))
+    );
+}
+
+#[test]
 fn retained_entries_are_capped_with_visible_oldest_first_drops() {
     let mut state = AppState::new();
     let submitted = MAX_RETAINED_ENTRIES + 10;
@@ -427,7 +447,7 @@ fn fold_all_and_unfold_all_cover_retained_entries_without_touching_retention() {
     }
     assert_eq!(state.dropped_entries, 2);
     assert_eq!(state.retained_bytes(), bytes);
-    let unfolded = state.visible_lines(80, state.entry_count() * 3).lines;
+    let unfolded = state.visible_lines(80, state.total_height(80)).lines;
     assert!(
         unfolded
             .iter()
@@ -506,12 +526,8 @@ fn oversized_entry_sets_the_truncation_flag_and_keeps_a_safe_prefix() {
     );
 
     let view = state.visible_lines(200, 100);
-    assert_eq!(view.hidden_above, 0);
-    assert_eq!(
-        view.lines.len(),
-        state.total_height(200),
-        "the wrapped height matches the rendered window"
-    );
+    assert!(view.hidden_above > 0);
+    assert_eq!(view.lines.len(), 100);
     assert!(
         view.lines
             .iter()
@@ -581,12 +597,10 @@ fn tool_progress_truncation_sets_the_flag_without_adding_a_line() {
     assert!(!complete.truncated, "fitting output is not flagged");
 
     // An oversized preview is cut to the entry bound even without a flag.
-    assert!(state.apply_event(&tool_output(
-        4,
-        "call-d",
-        &"z".repeat(MAX_ENTRY_BYTES + 1),
-        false
-    )));
+    let chunk = "z".repeat(64 * 1024);
+    for seq in 4..=12 {
+        assert!(state.apply_event(&tool_output(seq, "call-d", &chunk, false)));
+    }
     let oversized = last_entry(&state);
     assert!(oversized.truncated);
     assert_eq!(entry_bytes(oversized), MAX_ENTRY_BYTES);
@@ -650,7 +664,12 @@ fn streamed_fragment_with_one_byte_left_drops_the_whole_character() {
     let filler = "a".repeat(MAX_ENTRY_BYTES - ASSISTANT_TITLE.len() - LINE_OVERHEAD - 1);
     let mut state = AppState::new();
     assert!(state.apply_event(&started(0)));
-    assert!(state.apply_event(&assistant_fragment(1, &filler)));
+    for (index, chunk) in filler.as_bytes().chunks(64 * 1024).enumerate() {
+        assert!(state.apply_event(&assistant_fragment(
+            index as u64 + 1,
+            std::str::from_utf8(chunk).unwrap()
+        )));
+    }
 
     let entry = last_entry(&state);
     assert_eq!(entry.title, ASSISTANT_TITLE);
@@ -658,7 +677,8 @@ fn streamed_fragment_with_one_byte_left_drops_the_whole_character() {
     assert!(!entry.truncated, "the first fragment fits the entry");
     assert_eq!(entry_bytes(entry), MAX_ENTRY_BYTES - 1);
 
-    assert!(state.apply_event(&assistant_fragment(2, "€abc")));
+    let next_seq = filler.len().div_ceil(64 * 1024) as u64 + 1;
+    assert!(state.apply_event(&assistant_fragment(next_seq, "€abc")));
     let cut = last_entry(&state);
     assert!(cut.truncated, "a fragment that cannot fit sets the flag");
     assert_eq!(

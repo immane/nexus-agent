@@ -461,6 +461,11 @@ including restored history. File contents and directory listings are not
 displayed; the model still receives tool results and source-history persistence
 is unchanged.
 
+TUI presentation retains up to 512 KiB per entry and 4 MiB across entries,
+including line bookkeeping. Longer entries show a truncation marker; older
+entries may be removed when the aggregate budget is reached. Provider and tool
+output budgets apply independently of these presentation limits.
+
 Changing the environment in another shell does not change a running TUI's
 credentials; restart it after changing credentials.
 

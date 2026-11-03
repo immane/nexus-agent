@@ -700,7 +700,7 @@ fn wrapped_heights_match_the_rendered_rows_across_frame_widths() {
         state.record_submitted("line one\nline two\nline three");
         // Beyond the per-entry byte bound, so the entry carries its truncation
         // marker and the window reports hidden rows above it.
-        state.record_submitted(&"z ".repeat(6000));
+        state.record_submitted(&"z ".repeat(nexus_tui::state::MAX_ENTRY_BYTES / 2 + 1));
         // `started` records the run-started system entry, so the oversized
         // submission is the last retained entry, not the fourth one.
         let oversized = state.entry_count() - 1;
