@@ -816,6 +816,9 @@ pub struct PointerGeometry {
     pub composer_y: u16,
     pub composer_inner_w: usize,
     pub composer_rows: usize,
+    /// First visible draft row and horizontal cell offset.
+    pub composer_scroll_y: usize,
+    pub composer_scroll_x: usize,
 }
 
 /// Copy-confirmation lifetime: long enough to be seen, then the next

@@ -2388,16 +2388,17 @@ fn composer_hit(state: &AppState, column: u16, row: u16) -> Option<usize> {
     if rel_row >= geo.composer_rows.max(1) {
         return None;
     }
-    let cell = (column as usize).saturating_sub((geo.composer_x + 1) as usize);
+    let cell =
+        (column as usize).saturating_sub((geo.composer_x + 1) as usize) + geo.composer_scroll_x;
     let mut offset = 0usize;
     for (index, line) in state.composer().lines().enumerate() {
-        if index == rel_row {
+        if index == rel_row + geo.composer_scroll_y {
             return Some(offset + cell_to_char_col(line, cell));
         }
         offset += line.chars().count() + 1;
     }
     // A trailing-newline draft has one more (empty) visual row.
-    (rel_row == state.composer().lines().count()).then_some(offset)
+    (rel_row + geo.composer_scroll_y == state.composer().lines().count()).then_some(offset)
 }
 
 /// Yank text is the exact visible selection: window rows as drawn for
@@ -8747,6 +8748,28 @@ mod cov_main_topup {
         ] {
             assert_eq!(base64_encode(raw.as_bytes()), encoded, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn composer_hit_accounts_for_scrolled_rows_and_columns() {
+        let mut state = AppState::new();
+        for ch in "first\n中文abcdef".chars() {
+            if ch == '\n' {
+                state.composer_newline();
+            } else {
+                state.composer_type(ch);
+            }
+        }
+        state.set_pointer_geometry(nexus_tui::state::PointerGeometry {
+            composer_x: 0,
+            composer_y: 0,
+            composer_rows: 1,
+            composer_scroll_y: 1,
+            composer_scroll_x: 4,
+            ..Default::default()
+        });
+        assert_eq!(composer_hit(&state, 1, 1), Some(8));
+        assert_eq!(composer_hit(&state, 3, 1), Some(10));
     }
 
     #[tokio::test]

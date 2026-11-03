@@ -20,6 +20,10 @@ Borrow layout and interaction concepts, not source code, branding, the full depe
 
 Start with a single primary conversation view rather than permanent side panels. Show accurate unknown/not-ready states instead of waiting for network discovery to populate the interface.
 
+The composer scrolls vertically and horizontally to keep the editing caret
+visible when the draft exceeds its available rows or columns. Mouse selection
+maps to the corresponding scrolled draft position.
+
 Keyboard operation must cover submission, multiline editing, focus, scrolling, folding, approval, and cancellation. Concrete bindings require terminal compatibility tests on Linux and macOS; do not blindly copy contradictory or version-dependent shortcuts from another product. Basic mouse support may complement keyboard operation without becoming a core dependency.
 
 The viewport currently uses Vim-inspired navigation: `j`/`k` scroll entries,

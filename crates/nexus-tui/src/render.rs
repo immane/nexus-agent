@@ -359,7 +359,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
     }
     let composer_body = state
         .composer()
-        .lines()
+        .split('\n')
         .count()
         .max(1)
         .min(state.settings().display.composer_max_rows as usize)
@@ -397,6 +397,7 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
     if let (Some(layout), Some(card_area)) = (approval.as_ref(), regions.approval) {
         render_approval_with_theme(layout, card_area, buf, &state.settings().theme, focus);
     }
+    let (composer_scroll_y, composer_scroll_x) = composer_scroll(state, regions.composer);
     render_composer(state, regions.composer, buf, focus);
     // Composer pointer geometry: origin plus the inner draft grid the
     // draft rows map onto (one row per draft line inside the border,
@@ -407,10 +408,12 @@ pub fn render(state: &mut AppState, area: Rect, buf: &mut Buffer, focus: Focus) 
         composer_inner_w: regions.composer.width.saturating_sub(2) as usize,
         composer_rows: state
             .composer()
-            .lines()
+            .split('\n')
             .count()
             .max(1)
             .min(composer_body as usize),
+        composer_scroll_y,
+        composer_scroll_x,
         ..state.pointer_geometry()
     });
     render_footer(state, regions.footer, buf, focus);
@@ -1311,6 +1314,22 @@ fn composer_selected_line(draft: &str, start: usize, len: usize, focused: bool) 
     Line::from(spans)
 }
 
+fn composer_scroll(state: &AppState, area: Rect) -> (usize, usize) {
+    let prefix: String = state
+        .composer()
+        .chars()
+        .take(state.composer_caret())
+        .collect();
+    let row = prefix.bytes().filter(|&byte| byte == b'\n').count();
+    let column = display_width(prefix.rsplit('\n').next().unwrap_or(""));
+    let height = usize::from(area.height.saturating_sub(2)).max(1);
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    (
+        row.saturating_sub(height - 1),
+        column.saturating_sub(width - 1),
+    )
+}
+
 fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus) {
     let theme = &state.settings().theme;
     // The composer border names the active agent mode: read-only modes
@@ -1402,6 +1421,13 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
         let mut rest = draft.chars().skip(caret);
         let mut spans = vec![Span::raw(before)];
         match rest.next() {
+            Some('\n') => {
+                spans.push(Span::styled(
+                    " ",
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(Span::raw(format!("\n{}", rest.collect::<String>())));
+            }
             Some(char) => {
                 spans.push(Span::styled(
                     char.to_string(),
@@ -1415,7 +1441,26 @@ fn render_composer(state: &AppState, area: Rect, buf: &mut Buffer, focus: Focus)
     } else {
         Line::from(draft)
     };
-    Paragraph::new(line).render(inner, buf);
+    let (scroll_y, scroll_x) = composer_scroll(state, area);
+    let mut lines = vec![Line::default()];
+    for span in line.spans {
+        for (index, part) in span.content.split('\n').enumerate() {
+            if index > 0 {
+                lines.push(Line::default());
+            }
+            lines
+                .last_mut()
+                .unwrap()
+                .spans
+                .push(Span::styled(part.to_owned(), span.style));
+        }
+    }
+    Paragraph::new(lines)
+        .scroll((
+            scroll_y.min(u16::MAX as usize) as u16,
+            scroll_x.min(u16::MAX as usize) as u16,
+        ))
+        .render(inner, buf);
 }
 
 fn render_footer(state: &AppState, area: Rect, buf: &mut Buffer, _focus: Focus) {
@@ -3150,6 +3195,41 @@ mod cov_render_private {
         assert!(text[1].contains("hello"), "{text:?}");
         assert!(!text[1].contains('▊'), "{text:?}");
         assert_ne!(blurred.get(0, 0).fg, Color::Green);
+    }
+
+    #[test]
+    fn composer_scrolls_to_keep_caret_visible() {
+        let mut state = AppState::new();
+        for ch in "first\nsecond\nthird\nfourth".chars() {
+            if ch == '\n' {
+                state.composer_newline();
+            } else {
+                state.composer_type(ch);
+            }
+        }
+        let area = Rect::new(0, 0, 14, 4);
+        let mut buf = Buffer::empty(area);
+        render_composer(&state, area, &mut buf, Focus::Composer);
+        let rows = text_rows(&buf);
+        assert!(rows[2].contains("fourth▊"), "{rows:?}");
+        for _ in 0.."third\nfourth".chars().count() {
+            state.caret_left();
+        }
+        let mut buf = Buffer::empty(area);
+        render_composer(&state, area, &mut buf, Focus::Composer);
+        assert!(text_rows(&buf)[1].contains("second"));
+
+        let mut long = AppState::new();
+        for ch in "abcdefghijklmnop中文".chars() {
+            long.composer_type(ch);
+        }
+        let mut buf = Buffer::empty(area);
+        render_composer(&long, area, &mut buf, Focus::Composer);
+        let rows = text_rows(&buf);
+        assert!(
+            rows[1].contains('中') && rows[1].contains('文') && rows[1].contains('▊'),
+            "{rows:?}"
+        );
     }
 
     #[test]
