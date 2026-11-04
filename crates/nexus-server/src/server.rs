@@ -473,7 +473,7 @@ impl Server {
             next_session: AtomicU64::new(1),
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
-            limits: Limits::m0_test(),
+            limits: nexus_config::SettingsProfile::Server.default_limits(),
             provider_settings: ProviderSettings::default(),
             server_settings: ServerSettings::default(),
             tools_settings: ToolsSettings::default(),

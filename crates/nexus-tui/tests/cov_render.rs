@@ -966,7 +966,8 @@ fn composer_input_stays_bounded_and_refuses_control_characters() {
     let rows = frame(&mut flooded, 80, 24, Focus::Composer);
     assert_bounded(&rows, 80, 24);
     let overflow = joined(&rows);
-    assert!(overflow.contains("deploy the thing"), "{overflow:?}");
+    assert!(overflow.contains('▊'), "{overflow:?}");
+    assert!(!overflow.contains("deploy the thing"), "{overflow:?}");
     assert!(!overflow.contains('\x1b'), "{overflow:?}");
 }
 

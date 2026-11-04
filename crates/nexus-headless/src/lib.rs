@@ -656,7 +656,7 @@ fn build_runtime(
 }
 
 async fn run_task_async(task: &str, mode: &HeadlessMode) -> Result<HeadlessReport, HeadlessError> {
-    let limits = Limits::m0_test();
+    let limits = nexus_config::SettingsProfile::Benchmark.default_limits();
     let provider: Arc<dyn nexus_core::ProviderPort + Send + Sync> =
         Arc::new(FakeProvider::new(script_for(task)));
     let (runtime, mut streams) = build_runtime(limits, provider, m0_tools())?;

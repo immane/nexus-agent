@@ -344,7 +344,11 @@ Only `tui` and `server` profiles belong in the shared `base.jsonc`.
 [`config/benchmark.jsonc`](config/benchmark.jsonc) is an ordinary settings file
 with the same schema, provided as an example for benchmark budgets. Use it with
 `--benchmark-pilot --base-config config/benchmark.jsonc`; the benchmark profile
-also supplies these runtime limits by default. This file does **not** select
+and ordinary TUI, server, and scripted headless runs also use these runtime
+limits by default. TUI and server base files and overlays can override them;
+headless remains fake-only. Snapshot summaries retain at most 512 tool
+outcomes even though the run budget allows 4096 calls, and report truncation
+when that bound is exceeded. This file does **not** select
 container execution, real tools, images, or credentials. A benchmark pilot
 requires a container-enabled build, explicit container/real-tool selection,
 immutable gateway and workload image references, and an auth-token environment
@@ -461,6 +465,11 @@ including restored history. File contents and directory listings are not
 displayed; the model still receives tool results and source-history persistence
 is unchanged.
 
+TUI presentation retains up to 512 KiB per entry and 4 MiB across entries,
+including line bookkeeping. Longer entries show a truncation marker; older
+entries may be removed when the aggregate budget is reached. Provider and tool
+output budgets apply independently of these presentation limits.
+
 Changing the environment in another shell does not change a running TUI's
 credentials; restart it after changing credentials.
 
@@ -510,6 +519,8 @@ fall back to stderr only when it is redirected, never to the TUI-owned terminal.
 Records contain timestamps, host-generated run/turn identifiers, byte/count
 metrics, context budgets, output-limit recovery decisions, and terminal outcome,
 error category, source-persistence status, duration, and delivery metadata.
+Provisional-stream limit records identify the exhausted budget and counters;
+normal text or reasoning fragments are not limited by their individual count.
 They do **not** contain prompts, response/reasoning text, tool arguments/results,
 provider payloads, credentials, or error-message text. Logging does not change
 retry policy or budgets. Logs are not conversation archives or saved terminal

@@ -219,6 +219,84 @@ async fn small_response_burst_waits_for_capacity_without_losing_or_replaying_tex
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn many_small_streamed_fragments_do_not_exhaust_a_fragment_count_budget() {
+    let key = "k".repeat(128);
+    let count = 10_000;
+    let provider = Arc::new(StreamingProvider::new(
+        (0..count).map(|_| text(&key, "x")).collect(),
+        vec![
+            text(&key, &"x".repeat(count)),
+            stop_turn(final_usage(None, None)),
+        ],
+    ));
+    let (runtime, mut streams) = Runtime::new(config(), provider, Vec::new());
+    assert_eq!(
+        runtime.submit(submit_cmd("many-fragments")).await.reply(),
+        CommandReply::Accepted
+    );
+    let (received, finished) = burst_terminal(&mut streams).await;
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert_eq!(received, "x".repeat(count));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn many_small_reasoning_fragments_finish_without_a_fragment_count_limit() {
+    let count = 10_000;
+    let provider = Arc::new(StreamingProvider::new(
+        (0..count)
+            .map(|_| ProviderEvent::ReasoningDelta { text: "x".into() })
+            .collect(),
+        vec![
+            ProviderEvent::ReasoningDelta {
+                text: "x".repeat(count),
+            },
+            stop_turn(final_usage(None, None)),
+        ],
+    ));
+    let (runtime, mut streams) = Runtime::new(config(), provider, Vec::new());
+    runtime.enable_local_reasoning();
+    assert_eq!(
+        runtime
+            .submit(submit_cmd("many-reasoning-fragments"))
+            .await
+            .reply(),
+        CommandReply::Accepted
+    );
+    let (reasoning, finished) = tokio::time::timeout(WAIT, async {
+        let mut reasoning = String::new();
+        loop {
+            tokio::select! {
+                event = streams.data.recv() => if let EventPayload::AssistantReasoningDelta(fragment) = event.unwrap().payload() { reasoning.push_str(&fragment.text); },
+                event = streams.control.recv() => if let EventPayload::RunFinished(done) = event.unwrap().payload() {
+                    while let Ok(event) = streams.data.try_recv() {
+                        if let EventPayload::AssistantReasoningDelta(fragment) = event.payload() { reasoning.push_str(&fragment.text); }
+                    }
+                    break (reasoning, done.clone());
+                },
+            }
+        }
+    }).await.unwrap();
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    assert_eq!(reasoning, "x".repeat(count));
+}
+
+#[tokio::test]
+async fn excessive_provisional_usage_updates_fail_with_a_specific_limit() {
+    let provider = Arc::new(StreamingProvider::new(
+        (0..4097)
+            .map(|index| ProviderEvent::Usage(provisional(Some(index), None)))
+            .collect(),
+        vec![stop_turn(final_usage(None, None))],
+    ));
+    let (_, _, finished) = run_turn(provider, "many-usage-updates", 0).await;
+    assert_eq!(finished.outcome(), RunOutcome::LimitReached);
+    assert_eq!(
+        finished.error().unwrap().message(),
+        "provisional usage update count exceeded its bound"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn cancellation_releases_a_provider_waiting_for_stream_capacity() {
     let (runtime, mut streams, run, finished_rx) =
         start_backpressured_response(config(), burst_provider(), Duration::from_millis(30)).await;
@@ -318,7 +396,7 @@ async fn output_exhaustion_releases_a_provider_waiting_for_stream_bytes() {
     assert_eq!(finished.outcome(), RunOutcome::LimitReached);
     assert_eq!(
         finished.error().unwrap().message(),
-        "provisional output budget exhausted"
+        "provisional text and reasoning exceed the output byte budget"
     );
     finished_rx.recv_timeout(WAIT).unwrap();
 }

@@ -89,13 +89,6 @@ const MAX_KEYS_PER_TICK: usize = 32;
 /// skipped as explicitly counted presentation gaps, never reordered.
 const MAX_REORDER_EVENTS: usize = ORDERED_EVENT_BUFFER_CAPACITY;
 const DEMO_SESSION: &str = "sess-tui-m0-test";
-/// The M0 fixture default is intentionally small, but interactive coding
-/// runs need room for inspect/edit/check/retry cycles.
-const TUI_MODEL_TURNS_PER_RUN: u32 = 256;
-const TUI_TOOL_CALLS_PER_RUN: u32 = 512;
-const TUI_TOOL_CALLS_PER_TURN: u32 = 64;
-const TUI_RUN_DURATION: Duration = Duration::from_secs(60 * 60);
-const TUI_RETAINED_CONTEXT_ITEMS: usize = 512;
 static SESSION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn new_tui_session_id() -> io::Result<SessionId> {
@@ -123,14 +116,7 @@ fn application_session_store() -> io::Result<SessionStoreHandle> {
 }
 
 fn tui_runtime_limits() -> Limits {
-    let mut limits = Limits::m0_test();
-    limits.max_model_turns_per_run = TUI_MODEL_TURNS_PER_RUN;
-    limits.max_tool_calls_per_run = TUI_TOOL_CALLS_PER_RUN;
-    limits.max_tool_calls_per_turn = TUI_TOOL_CALLS_PER_TURN;
-    limits.run_duration = TUI_RUN_DURATION;
-    limits.per_tool_timeout = Duration::from_secs(10 * 60);
-    limits.retained_context_items = TUI_RETAINED_CONTEXT_ITEMS;
-    limits
+    nexus_config::SettingsProfile::Tui.default_limits()
 }
 
 /// Fallible production composition: the runtime validates limits, provider
@@ -2388,16 +2374,17 @@ fn composer_hit(state: &AppState, column: u16, row: u16) -> Option<usize> {
     if rel_row >= geo.composer_rows.max(1) {
         return None;
     }
-    let cell = (column as usize).saturating_sub((geo.composer_x + 1) as usize);
+    let cell =
+        (column as usize).saturating_sub((geo.composer_x + 1) as usize) + geo.composer_scroll_x;
     let mut offset = 0usize;
     for (index, line) in state.composer().lines().enumerate() {
-        if index == rel_row {
+        if index == rel_row + geo.composer_scroll_y {
             return Some(offset + cell_to_char_col(line, cell));
         }
         offset += line.chars().count() + 1;
     }
     // A trailing-newline draft has one more (empty) visual row.
-    (rel_row == state.composer().lines().count()).then_some(offset)
+    (rel_row + geo.composer_scroll_y == state.composer().lines().count()).then_some(offset)
 }
 
 /// Yank text is the exact visible selection: window rows as drawn for
@@ -6935,12 +6922,12 @@ mod cov_main_topup {
     #[test]
     fn interactive_runtime_raises_model_turns_and_run_budget() {
         let limits = tui_runtime_limits();
-        assert_eq!(limits.max_model_turns_per_run, 256);
-        assert_eq!(limits.max_tool_calls_per_run, 512);
+        assert_eq!(limits.max_model_turns_per_run, 500);
+        assert_eq!(limits.max_tool_calls_per_run, 4096);
         assert_eq!(limits.max_tool_calls_per_turn, 64);
-        assert_eq!(limits.run_duration, Duration::from_secs(3_600));
-        assert_eq!(limits.per_tool_timeout, Duration::from_secs(600));
-        assert_eq!(limits.retained_context_items, 512);
+        assert_eq!(limits.run_duration, Duration::from_secs(86_400));
+        assert_eq!(limits.per_tool_timeout, Duration::from_secs(3_600));
+        assert_eq!(limits.retained_context_items, 8192);
         limits
             .validate()
             .expect("interactive limits remain finite and valid");
@@ -8747,6 +8734,28 @@ mod cov_main_topup {
         ] {
             assert_eq!(base64_encode(raw.as_bytes()), encoded, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn composer_hit_accounts_for_scrolled_rows_and_columns() {
+        let mut state = AppState::new();
+        for ch in "first\n中文abcdef".chars() {
+            if ch == '\n' {
+                state.composer_newline();
+            } else {
+                state.composer_type(ch);
+            }
+        }
+        state.set_pointer_geometry(nexus_tui::state::PointerGeometry {
+            composer_x: 0,
+            composer_y: 0,
+            composer_rows: 1,
+            composer_scroll_y: 1,
+            composer_scroll_x: 4,
+            ..Default::default()
+        });
+        assert_eq!(composer_hit(&state, 1, 1), Some(8));
+        assert_eq!(composer_hit(&state, 3, 1), Some(10));
     }
 
     #[tokio::test]

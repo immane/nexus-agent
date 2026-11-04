@@ -20,6 +20,10 @@ Borrow layout and interaction concepts, not source code, branding, the full depe
 
 Start with a single primary conversation view rather than permanent side panels. Show accurate unknown/not-ready states instead of waiting for network discovery to populate the interface.
 
+The composer scrolls vertically and horizontally to keep the editing caret
+visible when the draft exceeds its available rows or columns. Mouse selection
+maps to the corresponding scrolled draft position.
+
 Keyboard operation must cover submission, multiline editing, focus, scrolling, folding, approval, and cancellation. Concrete bindings require terminal compatibility tests on Linux and macOS; do not blindly copy contradictory or version-dependent shortcuts from another product. Basic mouse support may complement keyboard operation without becoming a core dependency.
 
 The viewport currently uses Vim-inspired navigation: `j`/`k` scroll entries,
@@ -31,12 +35,11 @@ Enter or Tab inserts the selected completion, and a subsequent Enter executes
 the command. Esc first closes the popup without moving focus. `@` path
 completion is display/insertion only and does not read or attach file content.
 
-Interactive TUI and ordinary server runtimes allow up to 256 model turns, 512
-tool calls per run, and 64 tool calls per turn, with a one-hour run deadline and
-512 retained context items, to accommodate coding workflows with
-inspect/edit/check and recovery cycles. These are frontend-profile overrides,
-not changes to shared runtime or headless M0-test defaults. Run snapshots can
-represent up to 512 tool outcomes so the increased call budget remains reportable.
+The TUI, ordinary server, and scripted headless runner default to 500 model
+turns, 4096 tool calls per run, and 64 tool calls per turn, with a 24-hour run
+deadline, one-hour per-tool timeout, and 8192 retained context items. TUI and
+server configuration can override these defaults. Run snapshots retain up to
+512 tool outcomes; larger runs report snapshot truncation.
 
 ## Approvals
 

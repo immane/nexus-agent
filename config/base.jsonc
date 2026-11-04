@@ -82,12 +82,12 @@
   "profiles": {
     "tui": {
       "runtime": {
-        "max_model_turns_per_run": 256,
-        "max_tool_calls_per_run": 512,
+        "max_model_turns_per_run": 500,
+        "max_tool_calls_per_run": 4096,
         "max_tool_calls_per_turn": 64,
-        "run_timeout_seconds": 3600,
-        "tool_timeout_seconds": 600,
-        "retained_context_items": 512,
+        "run_timeout_seconds": 86400,
+        "tool_timeout_seconds": 3600,
+        "retained_context_items": 8192,
         "max_arg_assembly_bytes": 65536,
         "max_tool_output_bytes": 262144,
         "event_data_capacity": 1024,
@@ -98,12 +98,12 @@
     },
     "server": {
       "runtime": {
-        "max_model_turns_per_run": 256,
-        "max_tool_calls_per_run": 512,
+        "max_model_turns_per_run": 500,
+        "max_tool_calls_per_run": 4096,
         "max_tool_calls_per_turn": 64,
-        "run_timeout_seconds": 3600,
-        "tool_timeout_seconds": 600,
-        "retained_context_items": 512,
+        "run_timeout_seconds": 86400,
+        "tool_timeout_seconds": 3600,
+        "retained_context_items": 8192,
         "max_arg_assembly_bytes": 65536,
         "max_tool_output_bytes": 262144,
         "event_data_capacity": 1024,
