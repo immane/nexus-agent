@@ -188,6 +188,18 @@ class WorkerPreflightTests(unittest.TestCase):
 
 
 class ModelPreflightTests(unittest.TestCase):
+    def test_opencode_go_uses_its_model_discovery_endpoint(self):
+        provider = {"endpoint": "https://opencode.ai/inference/go/openai/v1",
+                    "credential": {"env": "TEST_TOKEN"}}
+        with patch.object(swebench, "build_opener") as opener:
+            opener.return_value.open.return_value = io.StringIO('{"data":[{"id":"deepseek-v4.1-flash"}]}')
+            swebench.check_model(provider, {"name": "deepseek-v4.1-flash"}, {"TEST_TOKEN": "dummy"})
+        req = opener.return_value.open.call_args.args[0]
+        self.assertEqual(req.full_url, "https://opencode.ai/inference/go/v1/models")
+        self.assertEqual(req.get_method(), "GET")
+        self.assertEqual(req.get_header("User-agent"), "nexus-agent-benchmark/0.2")
+        self.assertEqual(req.get_header("Authorization"), "Bearer dummy")
+
     def test_ollama_preflight_does_not_require_or_send_a_token(self):
         provider = {"endpoint": "http://127.0.0.1:11434/v1", "credential": {"env": "OLLAMA_API_KEY"}}
         with patch.object(swebench, "build_opener") as opener:

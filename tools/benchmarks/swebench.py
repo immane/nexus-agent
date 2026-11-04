@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from urllib.parse import urlsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from run_nexus_swe_task import request, write_json
 
@@ -93,12 +93,20 @@ def inspect_image(image):
 
 def check_model(provider, model, env):
     """List model identities without generating tokens; bypass workstation proxies."""
-    url = provider["endpoint"].rstrip("/") + "/models"
+    endpoint = provider["endpoint"].rstrip("/")
+    url = ("https://opencode.ai/inference/go/v1/models"
+           if endpoint == "https://opencode.ai/inference/go/openai/v1"
+           else endpoint + "/models")
     value = env.get(provider["credential"]["env"])
-    headers = {"Authorization": "Bearer " + value} if value else {}
+    headers = {"User-Agent": "nexus-agent-benchmark/0.2"}
+    if value:
+        headers["Authorization"] = "Bearer " + value
     req = Request(url, headers=headers)
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
     try:
-        with build_opener(ProxyHandler({})).open(req, timeout=8) as response:
+        with build_opener(ProxyHandler({}), NoRedirect()).open(req, timeout=8) as response:
             models = json.load(response)
         if not any(entry.get("id") == model["name"] for entry in models.get("data", [])):
             raise RuntimeError("configured wire model is not listed by the model endpoint")
