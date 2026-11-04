@@ -483,11 +483,10 @@ comparisons should account for quantization, context budget, and agent harness.
 
 ### Hosted inference: DeepSeek V4.1 Flash
 
-These hosted runs used the configured model ID `deepseek-flash` after the local
-Ollama endpoint was unavailable. They are not included in the Qwen pilot table
-or its counts.
+These hosted runs used DeepSeek V4.1 Flash through either DeepSeek's API <sup>[1]</sup> or
+OpenCode Go <sup>[2]</sup>. They are not included in the Qwen pilot table or its counts.
 
-**Inference environment:** DeepSeek's hosted API at `https://api.deepseek.com`,
+**Inference environment <sup>[1]</sup>:** DeepSeek's hosted API at `https://api.deepseek.com`,
 selected as `deepseek/deepseek-flash`. Quantization and serving hardware were
 not recorded. These runs used prepared task images in the offline container
 workload. The first Sphinx, Pylint, and Flask runs had no configured
@@ -500,12 +499,34 @@ server from current source.
 
 | Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
 | --- | --- | ---: | --- | --- | --- |
-| `sphinx-doc__sphinx-8595` | 2026-10-26 | 1m 46s | Treat `__all__ = []` as explicitly empty rather than falling back to all members. | Resolved | Completed |
-| `sphinx-doc__sphinx-9461` | 2026-10-27 | 1h 49m 12s | Document class properties decorated with `@classmethod` and `@property`. | Resolved | Completed |
-| `pylint-dev__pylint-6506` | 2026-10-26 | 2m 21s | Report unrecognized CLI options through argparse usage errors instead of a traceback. | Resolved | Completed |
-| `pylint-dev__pylint-6506` (94,208-token context reference) | 2026-10-26 | 2m 31s | Same repair; context-controlled follow-up run. | Resolved | Completed |
-| `pylint-dev__pylint-6506` (32,768-token context reference) | 2026-10-26 | 3m 47s | Same repair; context-controlled follow-up run, no compaction observed. | Resolved | Completed |
-| `pallets__flask-4992` | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
+| `sphinx-doc__sphinx-8595` <sup>[1]</sup> | 2026-10-26 | 1m 46s | Treat `__all__ = []` as explicitly empty rather than falling back to all members. | Resolved | Completed |
+| `sphinx-doc__sphinx-9461` <sup>[1]</sup> | 2026-10-27 | 1h 49m 12s | Document class properties decorated with `@classmethod` and `@property`. | Resolved | Completed |
+| `pylint-dev__pylint-6506` <sup>[1]</sup> | 2026-10-26 | 2m 21s | Report unrecognized CLI options through argparse usage errors instead of a traceback. | Resolved | Completed |
+| `pylint-dev__pylint-6506` (94,208-token context reference) <sup>[1]</sup> | 2026-10-26 | 2m 31s | Same repair; context-controlled follow-up run. | Resolved | Completed |
+| `pylint-dev__pylint-6506` (32,768-token context reference) <sup>[1]</sup> | 2026-10-26 | 3m 47s | Same repair; context-controlled follow-up run, no compaction observed. | Resolved | Completed |
+| `pallets__flask-4992` <sup>[1]</sup> | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
+| `django__django-12700` <sup>[2]</sup> | 2026-11-04 | 120.136s | Recursively redact sensitive settings inside lists and tuples. | Resolved | Completed |
+| `astropy__astropy-14995` <sup>[2]</sup> | 2026-11-04 | 154.833s | Copy the existing mask when the other arithmetic operand has no mask. | Resolved | Completed |
+| `psf__requests-1963` <sup>[2]</sup><sup>[3]</sup> | 2026-11-04 | 172.363s | Carry method and body state forward across redirect chains. | **Unresolved** | Completed |
+| `pytest-dev__pytest-7373` <sup>[2]</sup> | 2026-11-04 | 469.196s | Evaluate skip and xfail conditions in each module’s context. | Resolved | Completed |
+| `pydata__xarray-4094` <sup>[2]</sup> | 2026-11-04 | 395.980s | Drop a conflicting stacked-dimension coordinate when unstacking a dataset. | Resolved | Completed |
+| `scikit-learn__scikit-learn-25570` <sup>[2]</sup> | 2026-11-04 | 1114.897s | Handle empty column selections in pandas-output ColumnTransformer. | Resolved | Completed |
+| `matplotlib__matplotlib-23299` <sup>[2]</sup><sup>[4]</sup> | 2026-11-04 | 651.621s | Avoid closing figures when switching to the same backend; does not satisfy the official test. | **Unresolved** | Completed |
+
+<small>[1] DeepSeek API runs used the inference environment described above.</small><br>
+<small>[2] OpenCode Go selection `opencode-go/deepseek-v4-1-flash` (wire model
+`deepseek-v4.1-flash`); five resolved and two unresolved under official
+SWE-bench 5.0.2. Blind status was not established. The task workload ran in a
+network-disconnected container while the host accessed the hosted model;
+evaluation used separate containers. Each run had a 24-hour and 4,096-tool-call
+limit. Agent tool calls in table order: 21, 25, 30, 43, 45, 65, 73.</small><br>
+<small>[3] All seven FAIL_TO_PASS tests passed, but two PASS_TO_PASS tests failed
+with HTTPS certificate verification errors. An environment effect is possible
+but has not been established by a same-environment baseline; the official
+unresolved result stands.</small><br>
+<small>[4] The official FAIL_TO_PASS test `test_no_backend_reset_rccontext`
+failed with an `agg` versus `module://aardvark` backend assertion. Both unresolved
+reports marked `infra_failure` false.</small>
 
 ## Project Status
 
