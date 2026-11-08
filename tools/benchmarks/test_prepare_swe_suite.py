@@ -50,6 +50,26 @@ class PreparationTests(unittest.TestCase):
             "swebench/sweb.eval.x86_64.pallets_1776_flask-4992:latest",
             "nexus-swebench-pallets__flask-4992:diagnostics-v1"))
 
+    def test_verified_hard_suite_is_pinned_and_ordered(self):
+        suite = prepare.load_suite(prepare.HERE / "swe_suite_verified_hard.json")
+        self.assertEqual(suite["name"], "verified-hard-v1")
+        self.assertEqual(suite["dataset"], {
+            "name": "SWE-bench/SWE-bench_Verified", "split": "test",
+            "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3"})
+        self.assertEqual([task["instance_id"] for task in suite["tasks"]], [
+            "pytest-dev__pytest-5787", "django__django-11885",
+            "pylint-dev__pylint-4551", "django__django-16263",
+            "django__django-16560"])
+        self.assertTrue(all(task["difficulty"] == "1-4 hours" for task in suite["tasks"]))
+
+    def test_verified_suite_rejects_a_lite_revision(self):
+        suite = json.loads((prepare.HERE / "swe_suite_verified_hard.json").read_text())
+        suite["dataset"]["revision"] = "b0dde1093fe417d83b7184254edf8199c1f0dff5"
+        path = self.root / "mismatched.json"
+        path.write_bytes(prepare.json_bytes(suite))
+        with self.assertRaisesRegex(ValueError, "pinned SWE-bench test dataset"):
+            prepare.load_suite(path)
+
     def test_metadata_only_full_rows_and_idempotent_rerun(self):
         with patch.object(prepare, "download_rows", side_effect=self.fake_download) as download, \
                 patch.object(prepare, "command", side_effect=AssertionError("unexpected command")), \

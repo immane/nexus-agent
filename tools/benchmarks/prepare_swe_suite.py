@@ -24,6 +24,10 @@ from swebench import HERE, REPO, agent_task, command, inspect_image
 PARQUET = "data/test-00000-of-00001.parquet"
 PYARROW_VERSION = "23.0.1"
 EXPOSURE = "selected diagnostic task; blind status not established"
+PINNED_DATASETS = {
+    "SWE-bench/SWE-bench_Lite": "b0dde1093fe417d83b7184254edf8199c1f0dff5",
+    "SWE-bench/SWE-bench_Verified": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+}
 
 
 def sha256(data):
@@ -41,9 +45,10 @@ def load_suite(path):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", suite["name"]):
         raise ValueError("suite name must be a safe directory component")
     dataset = suite["dataset"]
-    if (dataset["name"] != "SWE-bench/SWE-bench_Lite" or dataset["split"] != "test"
-            or not re.fullmatch(r"[a-f0-9]{40}", dataset["revision"])):
-        raise ValueError("expected SWE-bench_Lite test with an immutable dataset commit SHA")
+    if (not isinstance(dataset, dict) or dataset.get("name") not in PINNED_DATASETS
+            or dataset.get("split") != "test"
+            or dataset.get("revision") != PINNED_DATASETS.get(dataset.get("name"))):
+        raise ValueError("expected a pinned SWE-bench test dataset and immutable revision")
     if suite["platform"] != "linux/amd64" or suite["evaluator_version"] != "5.0.2":
         raise ValueError("expected linux/amd64 and evaluator_version 5.0.2")
     defaults = suite["defaults"]
