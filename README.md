@@ -549,6 +549,32 @@ local tests passed, but did not establish the required interface.</small><br>
 still contained an unnecessary subquery. All reported PASS_TO_PASS tests passed;
 the report marked `infra_failure` false.</small>
 
+### Concurrent simple-task attempt: OpenCode Go / DeepSeek V4.1 Flash
+
+On 2026-11-08, five SWE-bench Verified tasks annotated `<15 min fix` were
+selected to test concurrent model runs rather than task difficulty. The same
+OpenCode Go selection and temporary 120-second provider first-response timeout
+as [5] were used; official scoring remained sequential. All five gold-patch
+preflights resolved. These are diagnostic smoke runs, not a representative or
+blind sample, and the short wall times reflect the deliberately simple tasks.
+
+| Task | Agent wall time | Tool calls | Official evaluation |
+| --- | ---: | ---: | --- |
+| `pytest-dev__pytest-7521` | 10m 00s | 47 | Resolved |
+| `sphinx-doc__sphinx-8269` | 9m 31s | 34 | Resolved |
+| `pylint-dev__pylint-4970` | 33m 07s | 108 | Resolved |
+| `django__django-11179` | 40m 01s | 54 | Resolved |
+| `sympy__sympy-12096` | — | — | **Not run** (launcher preflight) |
+
+Four model runs executed concurrently and all four official evaluations
+resolved. Their cumulative agent time was about 92m 40s; the concurrent wall
+time was about 40 minutes, limited by the longest task. No provider retries were
+recorded during these runs. The fifth task, `sympy__sympy-12096`, stopped before
+inference because the benchmark launcher had no repository import-preflight
+mapping for SymPy; it produced no prediction and has no official model result.
+An earlier candidate, `psf__requests-1921`, was excluded before the run because
+its own gold patch failed three PASS_TO_PASS tests in this environment.
+
 ## Project Status
 
 **Current position: the scoped M0–M4 gates are complete for their recorded
