@@ -512,6 +512,11 @@ server from current source.
 | `pydata__xarray-4094` <sup>[2]</sup> | 2026-11-04 | 395.980s | Drop a conflicting stacked-dimension coordinate when unstacking a dataset. | Resolved | Completed |
 | `scikit-learn__scikit-learn-25570` <sup>[2]</sup> | 2026-11-04 | 1114.897s | Handle empty column selections in pandas-output ColumnTransformer. | Resolved | Completed |
 | `matplotlib__matplotlib-23299` <sup>[2]</sup><sup>[4]</sup> | 2026-11-04 | 651.621s | Avoid closing figures when switching to the same backend; does not satisfy the official test. | **Unresolved** | Completed |
+| `pytest-dev__pytest-5787` <sup>[5]</sup> | 2026-11-07 | 53m 23s | Preserve chained exceptions when serializing test reports. | Resolved | Completed |
+| `django__django-11885` <sup>[5]</sup> | 2026-11-07 | 2h 14m 49s | Combine fast-delete queries for related objects. | Resolved | Completed |
+| `pylint-dev__pylint-4551` <sup>[5]</sup><sup>[6]</sup> | 2026-11-07 | 1h 20m 10s | Use type annotations when inferring UML attribute types; missing an interface required by the official test. | **Unresolved / ambiguous** | Completed |
+| `django__django-16263` <sup>[5]</sup><sup>[7]</sup> | 2026-11-07 | 5h 57m 54s | Prune unused annotations during aggregation; some unnecessary subqueries remain. | **Unresolved** | Completed |
+| `django__django-16560` <sup>[5]</sup> | 2026-11-07 | 22m 25s | Support custom validation error codes in model constraints. | Resolved | Completed |
 
 <small>[1] DeepSeek API runs used the inference environment described above.</small><br>
 <small>[2] OpenCode Go selection `opencode-go/deepseek-v4-1-flash` (wire model
@@ -526,7 +531,23 @@ but has not been established by a same-environment baseline; the official
 unresolved result stands.</small><br>
 <small>[4] The official FAIL_TO_PASS test `test_no_backend_reset_rccontext`
 failed with an `agg` versus `module://aardvark` backend assertion. Both unresolved
-reports marked `infra_failure` false.</small>
+reports marked `infra_failure` false.</small><br>
+<small>[5] Five selected SWE-bench Verified tasks, pinned at revision
+`78f471bf655a3137b2e8a75af1501690ec009ec3`, used OpenCode Go with the model in
+[2] and official SWE-bench 5.0.2: three resolved and two unresolved. The dataset
+labels these tasks `1-4 hours`; selection favored larger reference patches and
+is neither representative nor established blind. All five gold-patch preflights
+resolved. Workloads were network-disconnected, with hosted inference on the host
+and separate scoring containers. Each run allowed 24 hours and 4,096 tool calls;
+a temporary 120-second provider first-response timeout was used. The pytest
+attempt was restarted after an earlier interrupted attempt. Tool calls in table
+order: 60, 76, 87, 171, 91.</small><br>
+<small>[6] The official report marked this unresolved and ambiguous
+(`no_tests_collected`): the test import of `get_annotation` failed. The agent's
+local tests passed, but did not establish the required interface.</small><br>
+<small>[7] One of three FAIL_TO_PASS tests passed; two failed because the SQL
+still contained an unnecessary subquery. All reported PASS_TO_PASS tests passed;
+the report marked `infra_failure` false.</small>
 
 ## Project Status
 

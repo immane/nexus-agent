@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "verified-hard-v1",
+  "dataset": {
+    "name": "SWE-bench/SWE-bench_Verified",
+    "split": "test",
+    "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3"
+  },
+  "evaluator_version": "5.0.2",
+  "platform": "linux/amd64",
+  "defaults": {
+    "max_run_seconds": 86400,
+    "max_tool_calls": 4096,
+    "tool_log_bytes": 8192
+  },
+  "tasks": [
+    {"instance_id": "pytest-dev__pytest-5787", "domain": "testing", "purpose": "Diagnose chained-exception serialization across a large test-runner patch.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "1-4 hours"},
+    {"instance_id": "django__django-11885", "domain": "web framework", "purpose": "Diagnose combined fast-delete query behavior in a multi-file framework patch.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "1-4 hours"},
+    {"instance_id": "pylint-dev__pylint-4551", "domain": "static analysis", "purpose": "Diagnose type-hint handling in UML generation across a multi-file analyzer patch.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "1-4 hours"},
+    {"instance_id": "django__django-16263", "domain": "web framework", "purpose": "Diagnose unused-annotation stripping from count queries in a multi-file framework patch.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "1-4 hours"},
+    {"instance_id": "django__django-16560", "domain": "web framework", "purpose": "Diagnose customizable validation-error codes in database constraints across a multi-file framework patch.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "1-4 hours"}
+  ]
+}

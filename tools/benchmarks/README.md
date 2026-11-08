@@ -278,6 +278,31 @@ selection for metadata/images before starting any model work. Cleanup
 uncertainty stops the batch. Failed tasks are preserved and are never retried
 automatically; repeating the command creates a new batch, not a resume.
 
+### Harder Verified diagnostic suite
+
+`swe_suite_verified_hard.json` is a separate, pinned five-task selection from
+`SWE-bench/SWE-bench_Verified` at revision
+`78f471bf655a3137b2e8a75af1501690ec009ec3`. It selects the largest gold patches
+in the dataset's `1-4 hours` estimated-fix-time band, not the `>4 hours` band,
+while excluding tasks already exposed by earlier pilot profiles. The estimate
+is the dataset's human annotation, not a calibrated pass rate. The selection is
+still diagnostic and not a blind or representative sample.
+
+```sh
+python3 tools/benchmarks/prepare_swe_suite.py --suite tools/benchmarks/swe_suite_verified_hard.json \
+  --work-root ../nexus-benchmark-work/verified-hard-v1 --images
+python3 tools/benchmarks/swe_suite.py prepare --suite tools/benchmarks/swe_suite_verified_hard.json \
+  --work-root ../nexus-benchmark-work/verified-hard-v1
+python3 tools/benchmarks/swe_suite.py evaluate --mode gold \
+  --suite tools/benchmarks/swe_suite_verified_hard.json \
+  --work-root ../nexus-benchmark-work/verified-hard-v1
+```
+
+Use the same explicit `--suite` and `--work-root` for live runs and prediction
+evaluation. The two pinned datasets are intentionally not interchangeable; the
+loader rejects a suite whose dataset revision does not match its pinned
+selection.
+
 The launcher import preflight verifies the mounted base commit, clean Git
 status, and module location under `/workspace` inside the disconnected workload.
 Suite adapters put `/workspace`, `/workspace/src`, and `/workspace/lib` on the
