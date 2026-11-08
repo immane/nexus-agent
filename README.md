@@ -454,100 +454,52 @@ See the [security design](docs/design/06-security.md) and [session recovery cont
 
 ## Benchmark Observations
 
-These selected diagnostic runs are **not a leaderboard score, a general success
-rate, or a controlled model comparison**. Agent completion is separate from
-an official resolution; agent wall time excludes evaluation time and dates are
-UTC. Reruns and previously exposed tasks are not blind samples. See the
-[benchmark run history](docs/research/agent-benchmarks.md#recent-benchmark-observations)
-for detailed methodology, limitations, and evidence.
+Selected SWE-bench diagnostics are summarized below. Difficulty uses Verified
+dataset labels where available: simple `<15 min fix`, medium `15 min - 1 hour`,
+complex `1-4 hours`. These describe estimated human effort, not agent runtime.
+DeepSeek V4.1 Flash ran through either DeepSeek API or OpenCode Go; local Qwen
+used Qwen3.8-27B IQ3_M with a 92K context window. These are not controlled model
+comparisons, leaderboard scores or representative success rates; blind status
+was not established. Agent completion is not official resolution.
 
-### Local inference: Qwen3.8-27B via Ollama
+| Execution / difficulty | Official results and scope |
+| --- | --- |
+| Single-task — simple | Local Qwen: Django 11099 resolved twice (including a regression rerun). DeepSeek: Sphinx 8595 (API), Astropy 14995 and xarray 4094 (OpenCode Go) resolved. |
+| Single-task — medium | Local Qwen: SymPy 20590 and Astropy 12907 resolved in the reported scored runs; earlier reruns/interruption history is separate. OpenCode Go / DeepSeek: Matplotlib 23299 unresolved. |
+| Single-task — complex | DeepSeek API: Sphinx 9461 resolved. OpenCode Go / DeepSeek: **3/5 resolved** (pytest 5787, Django 11885 and 16560); Pylint 4551 unresolved/ambiguous, Django 16263 unresolved. The five-task campaign had 5/5 gold preflights pass; pytest was restarted after an interrupted attempt. |
+| Single-task — difficulty not established | OpenCode Go / DeepSeek: Django 12700, pytest 7373 and scikit-learn 25570 resolved; Requests 1963 unresolved. DeepSeek API: Pylint 6506 resolved in three context-profile runs, Flask 4992 resolved. Local Qwen: Flask 4992 unresolved; two Pylint attempts interrupted and unscored. These are not additional Verified difficulty-band results. |
+| Parallel — simple smoke test | **4 resolved, 1 not run**: SymPy lacked a launcher import-preflight mapping. Four model runs executed concurrently; scoring was sequential. |
+| Parallel — simple, 30 tasks | **28 resolved, 1 unresolved, 1 empty patch**. Six sequential groups of five concurrent attempts; 30/30 gold preflights passed. |
+| Parallel — medium, 30 tasks | **20 resolved, 6 unresolved, 2 empty patches, 1 preflight failure, 1 ambiguous evaluation**. Five dynamically refilled workers, then sequential scoring; 30/30 gold preflights passed. |
 
-The `ollama-local/qwen3-27b` pilot has five scored task runs: **four resolved
-and one did not**. Interrupted attempts remain unscored.
+All parallel campaigns used OpenCode Go / DeepSeek. They and the five-task
+complex campaign used a temporary 120-second provider first-response timeout,
+not a changed product default. Repeated tasks above are attempts, not additional
+unique tasks; no aggregate score is inferred across these groups.
 
-**Inference environment:** Qwen3.8-27B, **IQ3_M quantization**, with a configured
-**92K context window (94,208 tokens, input plus output)**, served through Ollama
-as `qwen3.8-27b-iq3m-92k:latest`. The selection ID above is an alias, not a
-different model. These results are not BF16 or 128K-context measurements;
-comparisons should account for quantization, context budget, and agent harness.
+**Failure attribution matters:**
 
-| Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
-| --- | --- | ---: | --- | --- | --- |
-| `sympy__sympy-20590` (summary-fix v2, latest) | 2026-10-25 | 14m 11s | Restore slot-only instances by adding `Printable.__slots__`. | Resolved | Completed |
-| `astropy__astropy-12907` (correctness regression rerun) | 2026-10-26 | 14m 36s | Preserve separability matrices in nested compound models. | Resolved | Completed |
-| `django__django-11099` | 2026-10-24 | 34m 02s | Reject trailing newlines in username validators. | Resolved | Completed |
-| `django__django-11099` (post-rebuild regression rerun) | 2026-10-28 | 25m 17s | Reject trailing newlines in username validators. | Resolved (official SWE-bench 5.0.2, 1/1) | Completed |
-| `pallets__flask-4992` (harness validation) | 2026-10-26 | 1h 09m 00s | Pass `open()` keyword arguments through `Config.from_file`. | **Unresolved** | Completed |
-| `pylint-dev__pylint-6506` (background attempt 2) | 2026-10-26 | 2h 09m 33s | No patch produced. | Not scored (Ollama server crashed under load; confirmed) | Interrupted |
+- **Agent/runtime or harness:** the medium campaign exposed a 256-record session
+  operation-history limit despite a 4,096-call run budget (Astropy 13033), a
+  reported search deadline followed by an unavailable/poisoned worker (Astropy
+  7671), and a Docker preflight timeout before inference (Pylint 6386). Simple
+  smoke testing also exposed the missing SymPy preflight mapping. These are not
+  evidence that a model's proposed repair was correct or incorrect.
+- **Model/repair strategy and agent validation:** local Qwen's Flask patch used
+  the wrong interface; complex Pylint missed a required importable interface,
+  and complex Django retained unnecessary SQL subqueries. The medium campaign's
+  six unresolved patches failed target tests or introduced a regression; the
+  simple campaign missed Django's `LEVEL_TAGS` interface and produced one empty
+  scikit-learn patch. These show repair/verification limitations, but do not
+  isolate model capability from prompting, tools or harness behavior.
+- **Environment or uncertain cause:** local Pylint was interrupted, including
+  an Ollama crash; Requests had certificate-related test failures; medium
+  Pylint 4661 had an ambiguous evaluator failure. Concurrent resource contention
+  may contribute to timeouts, but has not been established by a controlled
+  comparison. Do not relabel these as resolved or infer an adjusted model score.
 
-### Hosted inference: DeepSeek V4.1 Flash
-
-These hosted runs used DeepSeek V4.1 Flash through either DeepSeek's API <sup>[1]</sup> or
-OpenCode Go <sup>[2]</sup>. They are not included in the Qwen pilot table or its counts.
-
-**Inference environment <sup>[1]</sup>:** DeepSeek's hosted API at `https://api.deepseek.com`,
-selected as `deepseek/deepseek-flash`. Quantization and serving hardware were
-not recorded. These runs used prepared task images in the offline container
-workload. The first Sphinx, Pylint, and Flask runs had no configured
-context-window reference; later Pylint follow-ups used harness context-window
-references of 94,208 tokens (matching the Qwen profile) and 32,768 tokens. These
-are harness references, not claims about DeepSeek's server-side limit. The Sphinx 8595 launch
-reused the existing release server (`--no-build`), so it does not validate the
-newly added `shell_command` interface; the first Pylint run built the release
-server from current source.
-
-| Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
-| --- | --- | ---: | --- | --- | --- |
-| `sphinx-doc__sphinx-8595` <sup>[1]</sup> | 2026-10-26 | 1m 46s | Treat `__all__ = []` as explicitly empty rather than falling back to all members. | Resolved | Completed |
-| `sphinx-doc__sphinx-9461` <sup>[1]</sup> | 2026-10-27 | 1h 49m 12s | Document class properties decorated with `@classmethod` and `@property`. | Resolved | Completed |
-| `pylint-dev__pylint-6506` <sup>[1]</sup> | 2026-10-26 | 2m 21s | Report unrecognized CLI options through argparse usage errors instead of a traceback. | Resolved | Completed |
-| `pylint-dev__pylint-6506` (94,208-token context reference) <sup>[1]</sup> | 2026-10-26 | 2m 31s | Same repair; context-controlled follow-up run. | Resolved | Completed |
-| `pylint-dev__pylint-6506` (32,768-token context reference) <sup>[1]</sup> | 2026-10-26 | 3m 47s | Same repair; context-controlled follow-up run, no compaction observed. | Resolved | Completed |
-| `pallets__flask-4992` <sup>[1]</sup> | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
-| `django__django-12700` <sup>[2]</sup> | 2026-11-04 | 120.136s | Recursively redact sensitive settings inside lists and tuples. | Resolved | Completed |
-| `astropy__astropy-14995` <sup>[2]</sup> | 2026-11-04 | 154.833s | Copy the existing mask when the other arithmetic operand has no mask. | Resolved | Completed |
-| `psf__requests-1963` <sup>[2]</sup><sup>[3]</sup> | 2026-11-04 | 172.363s | Carry method and body state forward across redirect chains. | **Unresolved** | Completed |
-| `pytest-dev__pytest-7373` <sup>[2]</sup> | 2026-11-04 | 469.196s | Evaluate skip and xfail conditions in each module’s context. | Resolved | Completed |
-| `pydata__xarray-4094` <sup>[2]</sup> | 2026-11-04 | 395.980s | Drop a conflicting stacked-dimension coordinate when unstacking a dataset. | Resolved | Completed |
-| `scikit-learn__scikit-learn-25570` <sup>[2]</sup> | 2026-11-04 | 1114.897s | Handle empty column selections in pandas-output ColumnTransformer. | Resolved | Completed |
-| `matplotlib__matplotlib-23299` <sup>[2]</sup><sup>[4]</sup> | 2026-11-04 | 651.621s | Avoid closing figures when switching to the same backend; does not satisfy the official test. | **Unresolved** | Completed |
-| `pytest-dev__pytest-5787` <sup>[5]</sup> | 2026-11-07 | 53m 23s | Preserve chained exceptions when serializing test reports. | Resolved | Completed |
-| `django__django-11885` <sup>[5]</sup> | 2026-11-07 | 2h 14m 49s | Combine fast-delete queries for related objects. | Resolved | Completed |
-| `pylint-dev__pylint-4551` <sup>[5]</sup><sup>[6]</sup> | 2026-11-07 | 1h 20m 10s | Use type annotations when inferring UML attribute types; missing an interface required by the official test. | **Unresolved / ambiguous** | Completed |
-| `django__django-16263` <sup>[5]</sup><sup>[7]</sup> | 2026-11-07 | 5h 57m 54s | Prune unused annotations during aggregation; some unnecessary subqueries remain. | **Unresolved** | Completed |
-| `django__django-16560` <sup>[5]</sup> | 2026-11-07 | 22m 25s | Support custom validation error codes in model constraints. | Resolved | Completed |
-
-<small>[1] DeepSeek API runs used the inference environment described above.</small><br>
-<small>[2] OpenCode Go selection `opencode-go/deepseek-v4-1-flash` (wire model
-`deepseek-v4.1-flash`); five resolved and two unresolved under official
-SWE-bench 5.0.2. Blind status was not established. The task workload ran in a
-network-disconnected container while the host accessed the hosted model;
-evaluation used separate containers. Each run had a 24-hour and 4,096-tool-call
-limit. Agent tool calls in table order: 21, 25, 30, 43, 45, 65, 73.</small><br>
-<small>[3] All seven FAIL_TO_PASS tests passed, but two PASS_TO_PASS tests failed
-with HTTPS certificate verification errors. An environment effect is possible
-but has not been established by a same-environment baseline; the official
-unresolved result stands.</small><br>
-<small>[4] The official FAIL_TO_PASS test `test_no_backend_reset_rccontext`
-failed with an `agg` versus `module://aardvark` backend assertion. Both unresolved
-reports marked `infra_failure` false.</small><br>
-<small>[5] Five selected SWE-bench Verified tasks, pinned at revision
-`78f471bf655a3137b2e8a75af1501690ec009ec3`, used OpenCode Go with the model in
-[2] and official SWE-bench 5.0.2: three resolved and two unresolved. The dataset
-labels these tasks `1-4 hours`; selection favored larger reference patches and
-is neither representative nor established blind. All five gold-patch preflights
-resolved. Workloads were network-disconnected, with hosted inference on the host
-and separate scoring containers. Each run allowed 24 hours and 4,096 tool calls;
-a temporary 120-second provider first-response timeout was used. The pytest
-attempt was restarted after an earlier interrupted attempt. Tool calls in table
-order: 60, 76, 87, 171, 91.</small><br>
-<small>[6] The official report marked this unresolved and ambiguous
-(`no_tests_collected`): the test import of `get_annotation` failed. The agent's
-local tests passed, but did not establish the required interface.</small><br>
-<small>[7] One of three FAIL_TO_PASS tests passed; two failed because the SQL
-still contained an unnecessary subquery. All reported PASS_TO_PASS tests passed;
-the report marked `infra_failure` false.</small>
+See the [benchmark history and evaluation](docs/research/agent-benchmarks.md#recent-benchmark-observations)
+for individual results, methods, limitations and operational findings.
 
 ## Project Status
 
@@ -579,55 +531,12 @@ safety, performance, or cross-platform gate. Near-term work is incremental relia
 acceptance closure, not a core rewrite or adding features merely to advance a
 milestone number.
 
-### M0–M5 implementation inventory
+### M5 implementation inventory
 
-Checked entries identify implemented work, **not blanket acceptance or production
-readiness**. Unchecked entries identify incomplete validation, partial work, or
-explicitly deferred extensions. The detailed [migration evidence](docs/tasks/08-architecture-migration.md)
-records the tested scope and historical commands; it is not a fresh full-suite
-validation of every subsequent revision.
-
-#### M0 — Shared execution baseline
-
-- [x] Accepted minimal semantic contracts and finite test budgets ([M0 lock](docs/tasks/06-m0-lock.md)).
-- [x] Shared typed core/runtime, fake model/tool loop, scripted headless entry point, and terminal frontend.
-- [x] Runtime authorization, exact-call approvals, cancellation, explicit effect states, bounded events/output, and stale-run rejection.
-- [x] Formal scoped [M0 acceptance](docs/tasks/04-m0-gates.md), including reviewed Linux/macOS evidence, owner-approved first-security-scan separation, and the recorded limitations/deferral (2026-11-02).
-- [x] Scoped reference performance baselines: PTY first-interactive startup, platform-qualified RSS/idle CPU/wakeups, synthetic streaming, per-layer buffer high-water and fake dispatch, with native archive sizes. First-execution security scanning is separate; allocator/all-layer peaks and real-model/full-session claims are excluded. Historical spawn-to-exit measurements are not promoted to this baseline.
-
-#### M1 — Correctness and lifecycle
-
-- [x] **M1.1:** Bind server submissions and usage to the session's actual provider/model selection.
-- [x] **M1.2:** Treat closed control transport as terminal rather than repeatedly scheduling delivery.
-- [x] **M1.3:** Bound provisional streaming and control retention, validate usage updates, and preserve terminal-delivery accounting.
-- [x] **M1.4:** Nonblocking exec pipe draining, capped retention, fail-closed ownership on uncertain read/wait paths, and Linux/macOS descendant-held-pipe regression tests. Deliberately detached descendants and sandbox escapes are explicitly outside the guarantee; no termination claim is made for them.
-- [x] **M1.5:** Attribute TUI usage to the accepted run's model despite later picker changes.
-- [x] **M1.6:** Bound server connections, sessions, SSE retention, and completion/usage bookkeeping.
-- [x] **M1.7:** Enforce the loopback real-tool server trust boundary with bearer authentication and Host/Origin checks.
-- [x] **M1 gate:** M1.1–M1.7 validated for the documented support scope; detached descendants remain a non-goal and effects remain uncertain.
-
-#### M2 — Permissions and platform boundaries
-
-- [x] **M2.1:** Host-owned tool access classification, including conservative unknown/read-only handling.
-- [x] **M2.2:** Shared file/exec scope construction and exact authorization matching.
-- [x] **M2.3:** Descriptor-bound file access, staged replacement, no-clobber creation, hardlink refusal, tested file-race cases, and supported metadata preservation on macOS and the recorded Linux filesystem.
-- [x] **M2.4:** Actual sandbox isolation tests passed on macOS and Linux; backend-unavailable denial tests remain distinct.
-- [x] **M2 gate:** Linux file-race/metadata and sandbox-isolation tests passed on the recorded Ubuntu reference VM; this does not claim every Linux distribution or filesystem.
-
-#### M3 — Configuration and composition
-
-- [x] **M3.1:** One mutable TUI configuration owner with serialized writeback across sessions.
-- [x] **M3.2:** Shared strict/development tool constructors without introducing a second application/runtime layer.
-- [x] **M3.3:** Explicit provider capability requirements and validation at live run binding.
-- [x] **M3 gate:** Targeted regression evidence recorded; frontend-specific configuration and failure behavior preserved.
-
-#### M4 — Internal consolidation
-
-- [x] **M4.1:** Shared bounded ordered-event consumption across TUI, headless, and server, retaining frontend-specific presentation/reconnect policies.
-- [x] **M4.2:** Direct reuse of concrete development file operations without per-call tool reconstruction or JSON redispatch.
-- [x] **M4.3:** Public-contract/consumer review, compatibility-preserving API retention, and correction of stale provider-event documentation.
-- [x] Default-feature workspace regression evidence recorded on macOS and Linux, with formatting and all-target Clippy checks.
-- [x] **M4 gate:** M4.1–M4.3 acceptance and default-feature regression checks are recorded; M1.4 and Linux M2 evidence remain limited to their documented support/reference scopes. This is not production security readiness.
+M0–M4 are complete within their recorded acceptance scopes; see the
+[migration evidence](docs/tasks/08-architecture-migration.md) for details.
+Checked entries below identify implemented work, not blanket acceptance or
+production readiness. Unchecked entries remain unvalidated or deferred.
 
 #### M5 — Extensions on concrete demand
 

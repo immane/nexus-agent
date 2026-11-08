@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "name": "verified-batch30-v1",
+  "dataset": {
+    "name": "SWE-bench/SWE-bench_Verified",
+    "split": "test",
+    "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3"
+  },
+  "evaluator_version": "5.0.2",
+  "platform": "linux/amd64",
+  "defaults": {
+    "max_run_seconds": 86400,
+    "max_tool_calls": 4096,
+    "tool_log_bytes": 8192
+  },
+  "tasks": [
+    {
+      "instance_id": "django__django-12209",
+      "domain": "web framework",
+      "purpose": "Diagnose: Change in behaviour when saving a model instance with an explcit pk value if the pk field has a default",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 1
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-9711",
+      "domain": "documentation",
+      "purpose": "Diagnose: needs_extensions checks versions using strings",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 1
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5809",
+      "domain": "testing",
+      "purpose": "Diagnose: Lexer \"python3\" in --pastebin feature causes HTTP errors",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 1
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-14141",
+      "domain": "machine learning",
+      "purpose": "Diagnose: Add joblib in show_versions",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 1
+    },
+    {
+      "instance_id": "pydata__xarray-4629",
+      "domain": "labeled arrays",
+      "purpose": "Diagnose: merge(combine_attrs='override') does not copy attrs but instead references attrs from the first object",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 1
+    },
+    {
+      "instance_id": "django__django-12419",
+      "domain": "web framework",
+      "purpose": "Diagnose: Add secure default SECURE_REFERRER_POLICY / Referrer-policy header",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 2
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8721",
+      "domain": "documentation",
+      "purpose": "Diagnose: viewcode creates pages for epub even if `viewcode_enable_epub=False` on `make html epub`",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 2
+    },
+    {
+      "instance_id": "pytest-dev__pytest-7205",
+      "domain": "testing",
+      "purpose": "Diagnose: BytesWarning when using --setup-show with bytes parameter",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 2
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-13328",
+      "domain": "machine learning",
+      "purpose": "Diagnose: TypeError when supplying a boolean X to HuberRegressor fit",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 2
+    },
+    {
+      "instance_id": "pydata__xarray-6461",
+      "domain": "labeled arrays",
+      "purpose": "Diagnose: xr.where with scalar as second argument fails with keep_attrs=True",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 2
+    },
+    {
+      "instance_id": "django__django-15127",
+      "domain": "web framework",
+      "purpose": "Diagnose: LEVEL_TAGS not updated when using @override_settings",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 3
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7889",
+      "domain": "documentation",
+      "purpose": "Diagnose: Autodoc extension's mock file throws TypeError for generic-typed classes.",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 3
+    },
+    {
+      "instance_id": "pytest-dev__pytest-10081",
+      "domain": "testing",
+      "purpose": "Diagnose: unittest.TestCase.tearDown executed for classes marked with `unittest.skip` when running --pdb",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 3
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-13779",
+      "domain": "machine learning",
+      "purpose": "Diagnose: Voting estimator will fail at fit if weights are passed and an estimator is None",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 3
+    },
+    {
+      "instance_id": "pylint-dev__pylint-6903",
+      "domain": "static analysis",
+      "purpose": "Diagnose: Running pylint in Kubernetes Pod with --jobs=0 fails",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 3
+    },
+    {
+      "instance_id": "django__django-11066",
+      "domain": "web framework",
+      "purpose": "Diagnose: RenameContentType._rename() doesn't save the content type on the correct database",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 4
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-9320",
+      "domain": "documentation",
+      "purpose": "Diagnose: `sphinx-quickstart` with existing conf.py doesn't exit easily",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 4
+    },
+    {
+      "instance_id": "pytest-dev__pytest-6202",
+      "domain": "testing",
+      "purpose": "Diagnose: '.[' replaced with '[' in the headline shown of the test report",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 4
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-13496",
+      "domain": "machine learning",
+      "purpose": "Diagnose: Expose warm_start in Isolation forest",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 4
+    },
+    {
+      "instance_id": "pylint-dev__pylint-7277",
+      "domain": "static analysis",
+      "purpose": "Diagnose: `pylint` removes first item from `sys.path` when running from `runpy`.",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 4
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7440",
+      "domain": "documentation",
+      "purpose": "Diagnose: glossary duplicate term with a different case",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 5
+    },
+    {
+      "instance_id": "pytest-dev__pytest-7432",
+      "domain": "testing",
+      "purpose": "Diagnose: skipping: --runxfail breaks pytest.mark.skip location reporting",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 5
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-12585",
+      "domain": "machine learning",
+      "purpose": "Diagnose: clone fails for parameters that are estimator types",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 5
+    },
+    {
+      "instance_id": "pallets__flask-5014",
+      "domain": "web framework",
+      "purpose": "Diagnose: Require a non-empty name for Blueprints",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 5
+    },
+    {
+      "instance_id": "astropy__astropy-7166",
+      "domain": "astronomy",
+      "purpose": "Diagnose: InheritDocstrings metaclass doesn't work for properties",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 5
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7910",
+      "domain": "documentation",
+      "purpose": "Diagnose: Decorated __init__ doesn't show up in docs",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 6
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8459",
+      "domain": "documentation",
+      "purpose": "Diagnose: autodoc_type_aliases doesn't work when autodoc_typehints is set to \"description\"",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 6
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8475",
+      "domain": "documentation",
+      "purpose": "Diagnose: Extend linkchecker GET fallback logic to handle Too Many Redirects",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 6
+    },
+    {
+      "instance_id": "pytest-dev__pytest-7982",
+      "domain": "testing",
+      "purpose": "Diagnose: Symlinked directories not collected since pytest 6.1.0",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 6
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-13135",
+      "domain": "machine learning",
+      "purpose": "Diagnose: KBinsDiscretizer: kmeans fails due to unsorted bin_edges",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "<15 min fix",
+      "group": 6
+    }
+  ]
+}

@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "name": "verified-medium30-v1",
+  "dataset": {
+    "name": "SWE-bench/SWE-bench_Verified",
+    "split": "test",
+    "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3"
+  },
+  "evaluator_version": "5.0.2",
+  "platform": "linux/amd64",
+  "defaults": {
+    "max_run_seconds": 86400,
+    "max_tool_calls": 4096,
+    "tool_log_bytes": 8192
+  },
+  "tasks": [
+    {
+      "instance_id": "astropy__astropy-7671",
+      "domain": "astronomy",
+      "purpose": "Diagnose: minversion failures",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "astropy__astropy-14365",
+      "domain": "astronomy",
+      "purpose": "Diagnose: ascii.qdp Table format assumes QDP commands are upper case",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "astropy__astropy-13453",
+      "domain": "astronomy",
+      "purpose": "Diagnose: ASCII table output to HTML does not support supplied \"formats\"",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "astropy__astropy-14182",
+      "domain": "astronomy",
+      "purpose": "Diagnose: Please support header rows in RestructuredText output",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "astropy__astropy-13033",
+      "domain": "astronomy",
+      "purpose": "Diagnose: TimeSeries: misleading exception when required column check fails.",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "django__django-10973",
+      "domain": "web framework",
+      "purpose": "Diagnose: Use subprocess.run and PGPASSWORD for client in postgres backend",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "django__django-16877",
+      "domain": "web framework",
+      "purpose": "Diagnose: New template filter `escapeseq`",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "django__django-11333",
+      "domain": "web framework",
+      "purpose": "Diagnose: Optimization: Multiple URLResolvers may be unintentionally be constructed by calls to `django.urls.resolvers.get_resolver`",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "django__django-16950",
+      "domain": "web framework",
+      "purpose": "Diagnose: Django Admin with Inlines not using UUIDField default value",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "django__django-11206",
+      "domain": "web framework",
+      "purpose": "Diagnose: utils.numberformat.format renders small decimals in exponential notation.",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "django__django-16502",
+      "domain": "web framework",
+      "purpose": "Diagnose: After #26052 runserver returns response body for HTTP HEAD requests",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pydata__xarray-3677",
+      "domain": "labeled arrays",
+      "purpose": "Diagnose: Merging dataArray into dataset using dataset method fails",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pydata__xarray-4966",
+      "domain": "labeled arrays",
+      "purpose": "Diagnose: Handling of signed bytes from OPeNDAP via pydap",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pydata__xarray-3151",
+      "domain": "labeled arrays",
+      "purpose": "Diagnose: xr.combine_by_coords raises ValueError if identical coordinates are non-monotonic",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pydata__xarray-7393",
+      "domain": "labeled arrays",
+      "purpose": "Diagnose: stack casts int32 dtype coordinate to int64",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pydata__xarray-7233",
+      "domain": "labeled arrays",
+      "purpose": "Diagnose: ds.Coarsen.construct demotes non-dimensional coordinates to variables",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-14053",
+      "domain": "machine learning",
+      "purpose": "Diagnose: IndexError: list index out of range in export_text when the tree only has one feature",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-25747",
+      "domain": "machine learning",
+      "purpose": "Diagnose: FeatureUnion not working when aggregating data and pandas transform output selected",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-10844",
+      "domain": "machine learning",
+      "purpose": "Diagnose: fowlkes_mallows_score returns RuntimeWarning when variables get too big",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-25931",
+      "domain": "machine learning",
+      "purpose": "Diagnose: X does not have valid feature names, but IsolationForest was fitted with feature names",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "scikit-learn__scikit-learn-14629",
+      "domain": "machine learning",
+      "purpose": "Diagnose: AttributeError with cross_val_predict(method='predict_proba') when using MultiOuputClassifier",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8593",
+      "domain": "documentation",
+      "purpose": "Diagnose: autodoc: `:meta public:` does not effect to variables",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-8035",
+      "domain": "documentation",
+      "purpose": "Diagnose: Support defining specific `:private-members:` for autodoc",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-7985",
+      "domain": "documentation",
+      "purpose": "Diagnose: linkcheck could also check local (internal) links",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-10614",
+      "domain": "documentation",
+      "purpose": "Diagnose: inheritance-diagram 404 links with SVG",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "sphinx-doc__sphinx-10673",
+      "domain": "documentation",
+      "purpose": "Diagnose: toctree contains reference to nonexisting document 'genindex', 'modindex', 'search'",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-7571",
+      "domain": "testing",
+      "purpose": "Diagnose: caplog fixture doesn't restore log level after test",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pytest-dev__pytest-5631",
+      "domain": "testing",
+      "purpose": "Diagnose: ValueError when collecting tests that patch an array",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pylint-dev__pylint-6386",
+      "domain": "static analysis",
+      "purpose": "Diagnose: Argument expected for short verbose option",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    },
+    {
+      "instance_id": "pylint-dev__pylint-4661",
+      "domain": "static analysis",
+      "purpose": "Diagnose: Make pylint XDG Base Directory Specification compliant",
+      "exposure": "selected diagnostic task; blind status not established",
+      "difficulty": "15 min - 1 hour"
+    }
+  ]
+}

@@ -70,6 +70,13 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pinned SWE-bench test dataset"):
             prepare.load_suite(path)
 
+    def test_verified_simple_suite_is_five_fast_tasks(self):
+        suite = prepare.load_suite(prepare.HERE / "swe_suite_verified_simple.json")
+        self.assertEqual(suite["name"], "verified-simple-v1")
+        self.assertEqual(len(suite["tasks"]), 5)
+        self.assertTrue(all(task["difficulty"] == "<15 min fix" for task in suite["tasks"]))
+        self.assertEqual(len({task["instance_id"].split("__")[0] for task in suite["tasks"]}), 5)
+
     def test_metadata_only_full_rows_and_idempotent_rerun(self):
         with patch.object(prepare, "download_rows", side_effect=self.fake_download) as download, \
                 patch.object(prepare, "command", side_effect=AssertionError("unexpected command")), \

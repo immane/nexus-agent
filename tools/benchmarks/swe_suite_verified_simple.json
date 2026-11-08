@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "name": "verified-simple-v1",
+  "dataset": {
+    "name": "SWE-bench/SWE-bench_Verified",
+    "split": "test",
+    "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3"
+  },
+  "evaluator_version": "5.0.2",
+  "platform": "linux/amd64",
+  "defaults": {
+    "max_run_seconds": 86400,
+    "max_tool_calls": 4096,
+    "tool_log_bytes": 8192
+  },
+  "tasks": [
+    {"instance_id": "pytest-dev__pytest-7521", "domain": "testing", "purpose": "Diagnose carriage-return preservation in captured output.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "<15 min fix"},
+    {"instance_id": "sphinx-doc__sphinx-8269", "domain": "documentation", "purpose": "Diagnose linkcheck HTTP error reporting.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "<15 min fix"},
+    {"instance_id": "sympy__sympy-12096", "domain": "symbolic math", "purpose": "Diagnose recursive numerical evaluation of implemented functions.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "<15 min fix"},
+    {"instance_id": "pylint-dev__pylint-4970", "domain": "static analysis", "purpose": "Diagnose disabling duplicate-code checks with a zero threshold.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "<15 min fix"},
+    {"instance_id": "django__django-11179", "domain": "web framework", "purpose": "Diagnose primary-key clearing after deleting a model without dependencies.", "exposure": "selected diagnostic task; blind status not established", "difficulty": "<15 min fix"}
+  ]
+}

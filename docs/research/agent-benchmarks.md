@@ -779,6 +779,15 @@ artifacts outside this repository; they are not available in a standalone clone.
 
 ### Local inference: Qwen3.8-27B via Ollama
 
+For the README's single-task difficulty summary, the pinned Verified revision
+`78f471bf655a3137b2e8a75af1501690ec009ec3` was checked using only the
+`instance_id` and `difficulty` columns. Django 11099, Sphinx 8595, Astropy 14995
+and xarray 4094 are `<15 min fix`; SymPy 20590, Astropy 12907 and Matplotlib
+23299 are `15 min - 1 hour`; Sphinx 9461 and the five-task hard suite are
+`1-4 hours`. Other historical single-task results listed in the README were
+not found in that Verified revision and are left unclassified, not assigned
+a difficulty from observed runtime. Repeated scored runs are not unique tasks.
+
 The `ollama-local/qwen3-27b` pilot has five scored task runs: **four resolved
 and one did not**. Interrupted attempts remain unscored.
 
@@ -917,6 +926,186 @@ Flask evidence: [run batch](../../../nexus-benchmark-work/lite-diagnostics-v1/su
 [launch record](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/lite-diagnostics-v1-20261026T223311Z-20eb9676/pallets__flask-4992/run-pallets__flask-4992-20261026T223312Z-adfc89ce/launch.json),
 and [official evaluator result](../../../nexus-benchmark-work/lite-diagnostics-v1/suites/evaluation-prediction-d10c7f09e7d2402c819bc9c6815fb01c/official/pallets__flask-4992-prediction-20261026T223451.689810Z-528bce98331c42308f5dd8e74fa79f51/evaluation.json).
 
+### Hosted task records and Verified diagnostic campaigns
+
+These hosted runs used DeepSeek V4.1 Flash through either DeepSeek's API <sup>[1]</sup> or
+OpenCode Go <sup>[2]</sup>. They are not included in the Qwen pilot table or its counts.
+
+**Inference environment <sup>[1]</sup>:** DeepSeek's hosted API at `https://api.deepseek.com`,
+selected as `deepseek/deepseek-flash`. Quantization and serving hardware were
+not recorded. These runs used prepared task images in the offline container
+workload. The first Sphinx, Pylint, and Flask runs had no configured
+context-window reference; later Pylint follow-ups used harness context-window
+references of 94,208 tokens (matching the Qwen profile) and 32,768 tokens. These
+are harness references, not claims about DeepSeek's server-side limit. The Sphinx 8595 launch
+reused the existing release server (`--no-build`), so it does not validate the
+newly added `shell_command` interface; the first Pylint run built the release
+server from current source.
+
+| Task | Test date (UTC) | Agent wall time | Repair | Official evaluation | Agent termination |
+| --- | --- | ---: | --- | --- | --- |
+| `sphinx-doc__sphinx-8595` <sup>[1]</sup> | 2026-10-26 | 1m 46s | Treat `__all__ = []` as explicitly empty rather than falling back to all members. | Resolved | Completed |
+| `sphinx-doc__sphinx-9461` <sup>[1]</sup> | 2026-10-27 | 1h 49m 12s | Document class properties decorated with `@classmethod` and `@property`. | Resolved | Completed |
+| `pylint-dev__pylint-6506` <sup>[1]</sup> | 2026-10-26 | 2m 21s | Report unrecognized CLI options through argparse usage errors instead of a traceback. | Resolved | Completed |
+| `pylint-dev__pylint-6506` (94,208-token context reference) <sup>[1]</sup> | 2026-10-26 | 2m 31s | Same repair; context-controlled follow-up run. | Resolved | Completed |
+| `pylint-dev__pylint-6506` (32,768-token context reference) <sup>[1]</sup> | 2026-10-26 | 3m 47s | Same repair; context-controlled follow-up run, no compaction observed. | Resolved | Completed |
+| `pallets__flask-4992` <sup>[1]</sup> | 2026-10-26 | 1m 19s | Add `text` mode to `Config.from_file` for binary loaders such as `tomllib.load`. | Resolved | Completed |
+| `django__django-12700` <sup>[2]</sup> | 2026-11-04 | 120.136s | Recursively redact sensitive settings inside lists and tuples. | Resolved | Completed |
+| `astropy__astropy-14995` <sup>[2]</sup> | 2026-11-04 | 154.833s | Copy the existing mask when the other arithmetic operand has no mask. | Resolved | Completed |
+| `psf__requests-1963` <sup>[2]</sup><sup>[3]</sup> | 2026-11-04 | 172.363s | Carry method and body state forward across redirect chains. | **Unresolved** | Completed |
+| `pytest-dev__pytest-7373` <sup>[2]</sup> | 2026-11-04 | 469.196s | Evaluate skip and xfail conditions in each module’s context. | Resolved | Completed |
+| `pydata__xarray-4094` <sup>[2]</sup> | 2026-11-04 | 395.980s | Drop a conflicting stacked-dimension coordinate when unstacking a dataset. | Resolved | Completed |
+| `scikit-learn__scikit-learn-25570` <sup>[2]</sup> | 2026-11-04 | 1114.897s | Handle empty column selections in pandas-output ColumnTransformer. | Resolved | Completed |
+| `matplotlib__matplotlib-23299` <sup>[2]</sup><sup>[4]</sup> | 2026-11-04 | 651.621s | Avoid closing figures when switching to the same backend; does not satisfy the official test. | **Unresolved** | Completed |
+| `pytest-dev__pytest-5787` <sup>[5]</sup> | 2026-11-07 | 53m 23s | Preserve chained exceptions when serializing test reports. | Resolved | Completed |
+| `django__django-11885` <sup>[5]</sup> | 2026-11-07 | 2h 14m 49s | Combine fast-delete queries for related objects. | Resolved | Completed |
+| `pylint-dev__pylint-4551` <sup>[5]</sup><sup>[6]</sup> | 2026-11-07 | 1h 20m 10s | Use type annotations when inferring UML attribute types; missing an interface required by the official test. | **Unresolved / ambiguous** | Completed |
+| `django__django-16263` <sup>[5]</sup><sup>[7]</sup> | 2026-11-07 | 5h 57m 54s | Prune unused annotations during aggregation; some unnecessary subqueries remain. | **Unresolved** | Completed |
+| `django__django-16560` <sup>[5]</sup> | 2026-11-07 | 22m 25s | Support custom validation error codes in model constraints. | Resolved | Completed |
+
+<small>[1] DeepSeek API runs used the inference environment described above.</small><br>
+<small>[2] OpenCode Go selection `opencode-go/deepseek-v4-1-flash` (wire model
+`deepseek-v4.1-flash`); five resolved and two unresolved under official
+SWE-bench 5.0.2. Blind status was not established. The task workload ran in a
+network-disconnected container while the host accessed the hosted model;
+evaluation used separate containers. Each run had a 24-hour and 4,096-tool-call
+limit. Agent tool calls in table order: 21, 25, 30, 43, 45, 65, 73.</small><br>
+<small>[3] All seven FAIL_TO_PASS tests passed, but two PASS_TO_PASS tests failed
+with HTTPS certificate verification errors. An environment effect is possible
+but has not been established by a same-environment baseline; the official
+unresolved result stands.</small><br>
+<small>[4] The official FAIL_TO_PASS test `test_no_backend_reset_rccontext`
+failed with an `agg` versus `module://aardvark` backend assertion. Both unresolved
+reports marked `infra_failure` false.</small><br>
+<small>[5] Five selected SWE-bench Verified tasks, pinned at revision
+`78f471bf655a3137b2e8a75af1501690ec009ec3`, used OpenCode Go with the model in
+[2] and official SWE-bench 5.0.2: three resolved and two unresolved. The dataset
+labels these tasks `1-4 hours`; selection favored larger reference patches and
+is neither representative nor established blind. All five gold-patch preflights
+resolved. Workloads were network-disconnected, with hosted inference on the host
+and separate scoring containers. Each run allowed 24 hours and 4,096 tool calls;
+a temporary 120-second provider first-response timeout was used. The pytest
+attempt was restarted after an earlier interrupted attempt. Tool calls in table
+order: 60, 76, 87, 171, 91.</small><br>
+<small>[6] The official report marked this unresolved and ambiguous
+(`no_tests_collected`): the test import of `get_annotation` failed. The agent's
+local tests passed, but did not establish the required interface.</small><br>
+<small>[7] One of three FAIL_TO_PASS tests passed; two failed because the SQL
+still contained an unnecessary subquery. All reported PASS_TO_PASS tests passed;
+the report marked `infra_failure` false.</small>
+
+### Concurrent simple-task attempt: OpenCode Go / DeepSeek V4.1 Flash
+
+On 2026-11-08, five SWE-bench Verified tasks annotated `<15 min fix` were
+selected to test concurrent model runs rather than task difficulty. The same
+OpenCode Go selection and temporary 120-second provider first-response timeout
+as [5] were used; official scoring remained sequential. All five gold-patch
+preflights resolved. These are diagnostic smoke runs, not a representative or
+blind sample, and the short wall times reflect the deliberately simple tasks.
+
+| Task | Agent wall time | Tool calls | Official evaluation |
+| --- | ---: | ---: | --- |
+| `pytest-dev__pytest-7521` | 10m 00s | 47 | Resolved |
+| `sphinx-doc__sphinx-8269` | 9m 31s | 34 | Resolved |
+| `pylint-dev__pylint-4970` | 33m 07s | 108 | Resolved |
+| `django__django-11179` | 40m 01s | 54 | Resolved |
+| `sympy__sympy-12096` | — | — | **Not run** (launcher preflight) |
+
+Four model runs executed concurrently and all four official evaluations
+resolved. Their cumulative agent time was about 92m 40s; the concurrent wall
+time was about 40 minutes, limited by the longest task. No provider retries were
+recorded during these runs. The fifth task, `sympy__sympy-12096`, stopped before
+inference because the benchmark launcher had no repository import-preflight
+mapping for SymPy; it produced no prediction and has no official model result.
+An earlier candidate, `psf__requests-1921`, was excluded before the run because
+its own gold patch failed three PASS_TO_PASS tests in this environment.
+
+### Thirty-task six-group concurrency campaign
+
+On 2026-11-08, 30 SWE-bench Verified tasks annotated
+`<15 min fix` were run in six sequential groups of five concurrent model
+attempts. Official scoring was sequential within each group. The same OpenCode
+Go selection and temporary 120-second provider first-response timeout as [5]
+were used. All 30 gold-patch preflights resolved. Each attempt allowed 24 hours
+and 4,096 tool calls; workloads were network-isolated and scoring used separate
+containers. This is a selected diagnostic sample, not a blind or representative
+benchmark, and the simple-task selection explains the high resolved count.
+
+Twenty-eight tasks were officially resolved. `django__django-15127` was
+unresolved because the hidden test expected `LEVEL_TAGS` on the messages storage
+base, and `scikit-learn__scikit-learn-12585` produced no patch after 1h 33m and
+198 tool calls. No provider retries were recorded. Cumulative agent time was
+about 6h 33m; the six-group campaign took about 4h 13m of wall time.
+
+| Group | Tasks (agent time, tool calls, official result) | Resolved |
+| --- | --- | ---: |
+| 1 | `django__django-12209` — 1h 05m 01s, 97 calls, resolved.<br>`sphinx-doc__sphinx-9711` — 8m 25s, 42 calls, resolved.<br>`pytest-dev__pytest-5809` — 1m 16s, 14 calls, resolved.<br>`scikit-learn__scikit-learn-14141` — 4m 05s, 19 calls, resolved.<br>`pydata__xarray-4629` — 3m 00s, 21 calls, resolved. | 5/5 |
+| 2 | `django__django-12419` — 11m 59s, 51 calls, resolved.<br>`sphinx-doc__sphinx-8721` — 9m 12s, 58 calls, resolved.<br>`pytest-dev__pytest-7205` — 6m 53s, 34 calls, resolved.<br>`scikit-learn__scikit-learn-13328` — 1m 20s, 13 calls, resolved.<br>`pydata__xarray-6461` — 9m 59s, 50 calls, resolved. | 5/5 |
+| 3 | `django__django-15127` — 2m 57s, 31 calls, **unresolved**.<br>`sphinx-doc__sphinx-7889` — 19m 31s, 49 calls, resolved.<br>`pytest-dev__pytest-10081` — 3m 33s, 25 calls, resolved.<br>`scikit-learn__scikit-learn-13779` — 4m 40s, 30 calls, resolved.<br>`pylint-dev__pylint-6903` — 6m 52s, 46 calls, resolved. | 4/5 |
+| 4 | `django__django-11066` — 57s, 10 calls, resolved.<br>`sphinx-doc__sphinx-9320` — 2m 07s, 26 calls, resolved.<br>`pytest-dev__pytest-6202` — 13m 02s, 51 calls, resolved.<br>`scikit-learn__scikit-learn-13496` — 6m 21s, 37 calls, resolved.<br>`pylint-dev__pylint-7277` — 11m 03s, 51 calls, resolved. | 5/5 |
+| 5 | `sphinx-doc__sphinx-7440` — 36m 48s, 93 calls, resolved.<br>`pytest-dev__pytest-7432` — 7m 57s, 37 calls, resolved.<br>`scikit-learn__scikit-learn-12585` — 1h 33m 48s, 198 calls, **empty-patch**.<br>`pallets__flask-5014` — 2m 13s, 28 calls, resolved.<br>`astropy__astropy-7166` — 7m 43s, 56 calls, resolved. | 4/5 |
+| 6 | `sphinx-doc__sphinx-7910` — 13m 49s, 46 calls, resolved.<br>`sphinx-doc__sphinx-8459` — 5m 08s, 46 calls, resolved.<br>`sphinx-doc__sphinx-8475` — 27m 01s, 38 calls, resolved.<br>`pytest-dev__pytest-7982` — 3m 07s, 29 calls, resolved.<br>`scikit-learn__scikit-learn-13135` — 3m 11s, 18 calls, resolved. | 5/5 |
+
+### Thirty medium-task dynamic concurrency campaign
+
+On 2026-11-08/09, 30 selected SWE-bench Verified `15 min - 1 hour` tasks
+across seven repositories used OpenCode Go `opencode-go/deepseek-v4-1-flash`,
+dataset revision `78f471bf655a3137b2e8a75af1501690ec009ec3` and evaluator
+5.0.2. All 30 gold-patch preflights resolved. Five model workers dynamically
+refilled; scoring was sequential after the attempts. The task workloads were
+network-isolated, inference was hosted, and scoring used separate containers.
+Each attempt allowed 24 hours and 4,096 tool calls; the 120-second provider
+first-response timeout was temporary, not a product default. No automatic
+model retries were planned. One task failed preflight before inference.
+
+Results: **20 resolved, six unresolved, two empty-patch, one preflight failure
+without a prediction, and one ambiguous evaluation failure**. The raw 20/30
+is a selected-sample result, not a general success rate; blind status was not
+established. Excluding three operationally affected attempts gives 20/27, but
+that retrospective subset is not an unbiased estimate of model capability or
+a replacement for the full denominator. Cumulative agent time was 32,491.76 s,
+with 1,649 tool calls, 47,387,997 input / 775,324 output tokens and zero
+provider retries recorded in the pool logs.
+
+Each row groups five selected tasks; times are agent durations, not evaluation
+or end-to-end wall times. A dash indicates the field was not recorded.
+
+| Group | Tasks (agent time, tool calls, agent outcome; official result) | Resolved |
+| --- | --- | ---: |
+| 1 | `astropy__astropy-7671` — 4350.0s, 86 calls, completed; **empty-patch**<br>`astropy__astropy-14365` — 180.7s, 29 calls, completed; **resolved**<br>`astropy__astropy-13453` — 369.1s, 54 calls, completed; **resolved**<br>`astropy__astropy-14182` — 688.8s, 68 calls, completed; **resolved**<br>`astropy__astropy-13033` — 4571.1s, 256 calls, failed; **empty-patch** | 3/5 |
+| 2 | `django__django-10973` — 241.4s, 24 calls, completed; **resolved**<br>`django__django-16877` — 195.5s, 30 calls, completed; **unresolved**<br>`django__django-11333` — 122.7s, 17 calls, completed; **resolved**<br>`django__django-16950` — 867.4s, 79 calls, completed; **unresolved**<br>`django__django-11206` — 102.7s, 19 calls, completed; **resolved** | 3/5 |
+| 3 | `django__django-16502` — 5339.2s, 92 calls, completed; **unresolved**<br>`pydata__xarray-3677` — 337.2s, 34 calls, completed; **resolved**<br>`pydata__xarray-4966` — 547.7s, 32 calls, completed; **resolved**<br>`pydata__xarray-3151` — 591.3s, 39 calls, completed; **resolved**<br>`pydata__xarray-7393` — 2455.9s, 50 calls, completed; **resolved** | 4/5 |
+| 4 | `pydata__xarray-7233` — 733.6s, 34 calls, completed; **resolved**<br>`scikit-learn__scikit-learn-14053` — 168.9s, 19 calls, completed; **resolved**<br>`scikit-learn__scikit-learn-25747` — 1031.3s, 51 calls, completed; **unresolved**<br>`scikit-learn__scikit-learn-10844` — 228.8s, 29 calls, completed; **resolved**<br>`scikit-learn__scikit-learn-25931` — 343.9s, 28 calls, completed; **resolved** | 4/5 |
+| 5 | `scikit-learn__scikit-learn-14629` — 849.9s, 66 calls, completed; **resolved**<br>`sphinx-doc__sphinx-8593` — 300.2s, 37 calls, completed; **resolved**<br>`sphinx-doc__sphinx-8035` — 457.0s, 55 calls, completed; **resolved**<br>`sphinx-doc__sphinx-7985` — 1838.3s, 78 calls, completed; **unresolved**<br>`sphinx-doc__sphinx-10614` — 1736.6s, 73 calls, completed; **unresolved** | 3/5 |
+| 6 | `sphinx-doc__sphinx-10673` — 1660.2s, 132 calls, completed; **resolved**<br>`pytest-dev__pytest-7571` — 1066.2s, 44 calls, completed; **resolved**<br>`pytest-dev__pytest-5631` — 300.9s, 30 calls, completed; **resolved**<br>`pylint-dev__pylint-6386` — —, — calls, not started; **no prediction (preflight failed)**<br>`pylint-dev__pylint-4661` — 815.3s, 64 calls, completed; **ambiguous-failure** | 3/5 |
+
+The six unresolved reports had `infra_failure=false`: Django 16877 failed four
+FAIL_TO_PASS tests; Django 16950 passed target tests but failed one PASS_TO_PASS
+test; Django 16502, scikit-learn 25747 and Sphinx 10614 each failed a target
+test; Sphinx 7985 failed two target tests. Pylint 4661's evaluator classified
+the outcome as `ambiguous-failure`; a reported test failed, but that is not a
+clean official unresolved classification and its cause remains uncertain.
+
+Astropy 13033 encountered `session operation history is full` at the store's
+256-record bound, despite the larger run budget. Astropy 7671 reported a broad
+search deadline followed by an unavailable/poisoned worker; no patch was
+applied. Pylint 6386 timed out in preflight on `docker exec ... git status`,
+so inference did not start. Concurrent resource contention is a plausible
+contributor to timeouts, not an established cause: no controlled concurrency
+comparison or resource measurements establish that five workers caused these
+failures. The storage limit is a separate capacity constraint. A lower-pressure
+comparison and resource sampling would be needed before recommending a safe
+concurrency or attributing a change in success rate to pressure.
+
+The findings warrant reconciling session record capacity with run limits,
+examining timeout and worker recovery semantics, and improving the distinction
+between preflight, agent, empty-patch and evaluator outcomes. No automatic
+retries, worker recovery or changes to limits are implied by these observations.
+See the [issue review](../review/MEDIUM_BENCHMARK_REVIEW_2026-11-09.md) for
+additional evidence and recommendations. The [campaign summary](../../../nexus-benchmark-work/verified-medium30-v1/pool-20261109/summary.json)
+and per-task logs are local artifacts outside the repository; logs may contain
+sensitive task interactions and should not be published without review.
+
 ### Shared evaluation workflow and suite progress
 
 A repeatable ten-task diagnostic suite, fixed to dataset revision
@@ -927,7 +1116,8 @@ model implicitly. Of the ten suite tasks, Flask has completed local-Qwen and
 hosted-DeepSeek scored runs; Sphinx and Pylint have separately recorded
 DeepSeek V4.1 Flash scored runs. Pylint also has two earlier local-Qwen
 interrupted, unscored attempts; the remaining seven tasks have prepared images
-and offline environment checks but no live model result.
+and offline environment checks but no live model result at that time; later
+Verified campaigns are recorded above.
 
 **Mandatory benchmark operation rule:** SWE-bench model runs must always be
 started and supervised as background jobs. Never run them as foreground,
