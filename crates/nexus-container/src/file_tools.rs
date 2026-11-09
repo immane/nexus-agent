@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_core::{
-    EffectState, Evidence, ExecutionStatus, M0_REVISION, ToolCall, ToolContext, ToolId,
-    ToolOutcome, ToolPort, ToolSpec,
+    BackendState, EffectState, Evidence, ExecutionStatus, M0_REVISION, ToolCall, ToolContext,
+    ToolId, ToolOutcome, ToolPort, ToolSpec,
 };
 use serde_json::Value;
 
@@ -119,6 +119,15 @@ impl<T> ContainerFileTools<T> {
 impl<T: WorkerTransport> ToolPort for ContainerFileTool<T> {
     fn describe(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    fn backend_state(&self) -> BackendState {
+        match self.session.inner.try_lock() {
+            Ok(session) if session.poisoned => BackendState::Unavailable,
+            Ok(_) => BackendState::Ready,
+            Err(std::sync::TryLockError::WouldBlock) => BackendState::Ready,
+            Err(std::sync::TryLockError::Poisoned(_)) => BackendState::Unavailable,
+        }
     }
 
     fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
@@ -553,8 +562,11 @@ mod tests {
             false,
             Instant::now() + Duration::from_secs(1),
         );
+        assert_eq!(tools.write.backend_state(), BackendState::Ready);
         let first = tools.write.execute(&call(HOST_WRITE_TOOL), &ctx);
+        assert_eq!(tools.write.backend_state(), BackendState::Unavailable);
         let second = tools.read.execute(&call(HOST_READ_TOOL), &ctx);
+        assert_eq!(tools.read.backend_state(), BackendState::Unavailable);
         assert_eq!(first.effect(), EffectState::Unknown);
         assert_eq!(first.evidence(), Evidence::Uncertain);
         assert_eq!(second.effect(), EffectState::NotStarted);

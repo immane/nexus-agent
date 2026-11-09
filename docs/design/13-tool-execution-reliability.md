@@ -58,7 +58,7 @@ written; their existence is not evidence that they were committed or deployed.
 | `nexus-container/src/exec.rs`, `worker_transport.rs` | Container transport observes Docker CLI status; nonzero status is represented in text, with a `-1` fallback for no numeric code | Observer identity and absence of a code are not structured; output is collected until completion |
 | `nexus-runtime/src/runtime.rs` | Admits calls, records intent, clamps deadlines, publishes lifecycle events, and quarantines uncertain blocking workers | No bounded progress bridge during execution; late worker activity needs a progress publication fence |
 | `nexus-server/src/json.rs` | Manually encodes outcomes and progress; SSE sends idle connection pings | No process metadata or actual executor output stream |
-| `nexus-session/src/lib.rs` | Separate operation outcome records and source-history tool results; file revision 3, revision 2 readable | Both persistence representations need explicit metadata compatibility handling |
+| `nexus-session/src/lib.rs` | Separate operation outcome records and source-history tool results; file revision 5 with an append-only operation/source-batch journal, revisions 2, 3 and 4 readable | Both persistence representations need explicit metadata compatibility handling |
 | TUI/server CLI | One-hour tools within 24-hour runs by default; configuration can override these budgets | Longer budgets alone cannot diagnose hangs or repair worker incompatibility |
 | Scripted headless | Uses benchmark runtime limits and scripted execution | Do not advertise this as a live-provider execution frontend |
 
@@ -285,7 +285,7 @@ as conversation/session persistence.
 | --- | --- |
 | Rust outcome/context types | Preserve existing construction paths where practical; private additive metadata with validated accessors; no dependency on Docker in core |
 | Server JSON | Document optional bounded process metadata and stream identity; old data means unknown; test consumers that reject unknown fields before selecting additive rollout or a wire revision |
-| Session persistence | Update operation outcome records and source-history tool results together. Existing strict revision-3 readers cannot silently accept changed records; propose a revision-4 writer only after migration review, with revision-2/3 read fixtures and explicit rejection by unsupported readers |
+| Session persistence | Update operation outcome records and source-history tool results together. Revision 4 adds the operation journal; revision-2/3 read fixtures cover migration, and unsupported revisions fail closed instead of silently omitting journal records |
 | Worker executable/protocol | Capability discovery is separate from file-protocol versioning; validate required argument features, response framing, and immutable image identity |
 | Ownership records | Version independently from session files; keep old records readable for safe inspection, never infer authority from an unrecognized record |
 | Model-visible content | Preserve bounded final content and honest status wording; optional metadata must survive serialization without granting execution authority |

@@ -8,8 +8,8 @@
 use std::{sync::Arc, time::Instant};
 
 use nexus_core::{
-    EffectState, Evidence, ExecutionStatus, M0_REVISION, ToolCall, ToolContext, ToolId,
-    ToolOutcome, ToolPort, ToolSpec,
+    BackendState, EffectState, Evidence, ExecutionStatus, M0_REVISION, ToolCall, ToolContext,
+    ToolId, ToolOutcome, ToolPort, ToolSpec,
 };
 
 use crate::session::ContainerSession;
@@ -217,6 +217,16 @@ impl<T: ExecTransport> ToolPort for ContainerExecTool<T> {
     fn describe(&self) -> ToolSpec {
         self.spec.clone()
     }
+
+    fn backend_state(&self) -> BackendState {
+        match self.session.inner.try_lock() {
+            Ok(session) if session.poisoned => BackendState::Unavailable,
+            Ok(_) => BackendState::Ready,
+            Err(std::sync::TryLockError::WouldBlock) => BackendState::Ready,
+            Err(std::sync::TryLockError::Poisoned(_)) => BackendState::Unavailable,
+        }
+    }
+
     fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
         let outcome = match self.invoke(call, context) {
             Ok((0, output, truncated)) => ToolOutcome::from_bounded_content(
@@ -547,6 +557,7 @@ mod tests {
             })),
         ));
         let tool = ContainerExecTool::from_session(Arc::clone(&session));
+        assert_eq!(tool.backend_state(), BackendState::Ready);
         let context = ctx("/workspace", Instant::now() + Duration::from_secs(1));
         let command = call(r#"{"argv":["sleep","10"]}"#);
         let timeout = tool.execute(&command, &context);
@@ -555,6 +566,7 @@ mod tests {
         assert_eq!(timeout.evidence(), Evidence::Uncertain);
         assert!(timeout.content().contains("do not retry"));
         assert!(session.inner.lock().unwrap().poisoned);
+        assert_eq!(tool.backend_state(), BackendState::Unavailable);
         let refused = tool.execute(&command, &context);
         assert_eq!(refused.effect(), EffectState::NotStarted);
         assert_eq!(calls.load(Ordering::SeqCst), 1);

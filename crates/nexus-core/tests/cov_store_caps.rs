@@ -71,8 +71,8 @@ fn store_test_caps_are_finite_positive_and_pinned() {
     // update, not silent drift.
     assert_eq!(MAX_STORED_MESSAGES, 256);
     assert_eq!(MAX_SESSIONS, 64);
-    assert_eq!(MAX_INTENT_RECORDS, 256);
-    assert_eq!(MAX_OUTCOME_RECORDS, 256);
+    assert_eq!(MAX_INTENT_RECORDS, 4_096);
+    assert_eq!(MAX_OUTCOME_RECORDS, 4_096);
     assert_eq!(MAX_PROFILE_LEN, 128);
 
     // Alignment with the retained-context budget and the provider

@@ -39,7 +39,7 @@ use nexus_context::{
 use nexus_core::commands::{EventSequence, MAX_TEXT_FRAGMENT_BYTES};
 use nexus_core::{
     AgentError, ApprovalBinding, ApprovalId, ApprovalNotice, ApproveCommand, AssistantText,
-    CallCandidate, CallId, CancelCommand, CancellationToken, Command, CommandReply,
+    BackendState, CallCandidate, CallId, CancelCommand, CancellationToken, Command, CommandReply,
     CommandResponse, ContinuationData, DenyCommand, EffectState, ErrorCategory, EventPayload,
     Evidence, ExecutionStatus, FinishReason, GetSnapshotCommand, ItemKey, Limits,
     ListSessionsCommand, ModelContextItem, ModelInstructions, ModelRequest, OutcomeSummary,
@@ -1604,6 +1604,9 @@ impl Runtime {
             }
         };
         loop {
+            if let Some(terminal) = self.active_terminal(run).await {
+                return Err(terminal);
+            }
             if token.is_cancelled() {
                 return Err(Terminal::cancelled());
             }
@@ -1667,6 +1670,9 @@ impl Runtime {
             let mut prefix = StreamedPrefix::default();
             let mut cancelled_first = false;
             let joined = loop {
+                if self.active_terminal(run).await.is_some() {
+                    break None;
+                }
                 if token.is_cancelled() {
                     cancelled_first = true;
                     break None;
@@ -1682,10 +1688,7 @@ impl Runtime {
                         }
                     }
                     () = wake.notified() => {
-                        if token.is_cancelled() {
-                            cancelled_first = true;
-                            break None;
-                        }
+                        continue;
                     }
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break None,
                 }
@@ -1697,6 +1700,9 @@ impl Runtime {
             stream_bytes.close();
             return match joined {
                 Some(Ok(events)) => {
+                    if let Some(terminal) = self.active_terminal(run).await {
+                        return Err(terminal);
+                    }
                     let mut effective_limits = self.shared.limits;
                     effective_limits.max_tool_output_bytes = self.shared.effective_output_budget;
                     let response_validated =
@@ -1938,6 +1944,12 @@ impl Runtime {
                 .as_mut()
                 .filter(|active| &active.run == run)
                 .ok_or_else(Terminal::cancelled)?;
+            if let Some(outcome) = active.terminal {
+                return Err(Terminal {
+                    outcome,
+                    error: active.terminal_error.clone(),
+                });
+            }
             if active.cancelled {
                 return Err(Terminal::cancelled());
             }
@@ -1972,6 +1984,9 @@ impl Runtime {
         ));
         let retry_at = tokio::time::Instant::now() + delay;
         loop {
+            if let Some(terminal) = self.active_terminal(run).await {
+                return Err(terminal);
+            }
             if token.is_cancelled() {
                 return Err(Terminal::cancelled());
             }
@@ -1984,7 +1999,24 @@ impl Runtime {
                 () = tokio::time::sleep_until(retry_at) => break,
             }
         }
+        if let Some(terminal) = self.active_terminal(run).await {
+            return Err(terminal);
+        }
         check()
+    }
+
+    async fn active_terminal(&self, run: &RunId) -> Option<Terminal> {
+        let state = self.shared.state.lock().await;
+        state
+            .active
+            .as_ref()
+            .filter(|active| &active.run == run)
+            .and_then(|active| {
+                active.terminal.map(|outcome| Terminal {
+                    outcome,
+                    error: active.terminal_error.clone(),
+                })
+            })
     }
 
     async fn publish_model_request_finished(
@@ -2205,6 +2237,14 @@ impl Runtime {
     ) -> Result<RunState, Terminal> {
         {
             let mut state = self.shared.state.lock().await;
+            if let Some(active) = state.active.as_ref().filter(|active| &active.run == run)
+                && let Some(outcome) = active.terminal
+            {
+                return Err(Terminal {
+                    outcome,
+                    error: active.terminal_error.clone(),
+                });
+            }
             if let Some(active) = state.active.as_mut().filter(|active| &active.run == run)
                 && active.pending_compaction.is_some()
             {
@@ -3150,6 +3190,18 @@ impl Runtime {
                 active.force_terminal = Some(RunOutcome::LimitReached);
                 return Ok(RunState::RecordingResult);
             }
+            if registered.port.backend_state() == BackendState::Unavailable {
+                active.outcome_slot = Some((
+                    call.call().clone(),
+                    unavailable_outcome("tool backend is unavailable; call was not dispatched"),
+                ));
+                active.force_terminal = Some(RunOutcome::Failed);
+                active.terminal_error = Some(runtime_error(
+                    ErrorCategory::ToolFailure,
+                    "tool backend is unavailable; run stopped before dispatch",
+                ));
+                return Ok(RunState::RecordingResult);
+            }
             let now_elapsed = active.started.elapsed();
             if let Some(binding) = current.binding.as_ref()
                 && binding
@@ -3389,7 +3441,9 @@ impl Runtime {
                 let entered = StdInstant::now();
                 let _ = sender.send((run, call_id, submitted.unwrap(), entered));
             }
-            tool.execute(&call, &context)
+            let outcome = tool.execute(&call, &context);
+            let backend = tool.backend_state();
+            (outcome, backend)
         });
         // The context retains the original deadline. A cooperative tool may
         // need bounded time to stop its work and report the actual effects.
@@ -3425,8 +3479,15 @@ impl Runtime {
             return Err(Terminal::cancelled());
         }
         match joined {
-            Some(Ok(outcome)) => {
+            Some(Ok((outcome, backend))) => {
                 active.outcome_slot = Some((call_id, bound_outcome(&self.shared, outcome)));
+                if backend == BackendState::Unavailable && active.terminal.is_none() {
+                    active.force_terminal = Some(RunOutcome::Failed);
+                    active.terminal_error = Some(runtime_error(
+                        ErrorCategory::ToolFailure,
+                        "tool backend is unavailable; run stopped before further dispatch",
+                    ));
+                }
                 Ok(RunState::RecordingResult)
             }
             Some(Err(join)) => {
@@ -3547,7 +3608,7 @@ impl Runtime {
         apply_required_control_outcome(active, delivery);
         let forced_terminal = active.force_terminal.take();
         if let Some(outcome) = forced_terminal {
-            active.terminal = Some(outcome);
+            active.terminal.get_or_insert(outcome);
         }
         drop(state);
         if let Err(error) = self.persist_pending_source(run).await {
@@ -4262,7 +4323,12 @@ impl Runtime {
         });
     }
 
-    async fn quarantine_tool(&self, run: &RunId, call: CallId, handle: JoinHandle<ToolOutcome>) {
+    async fn quarantine_tool(
+        &self,
+        run: &RunId,
+        call: CallId,
+        handle: JoinHandle<(ToolOutcome, BackendState)>,
+    ) {
         {
             let mut state = self.shared.state.lock().await;
             state.quarantine.push(QuarantineMeta {
@@ -4278,10 +4344,26 @@ impl Runtime {
             state
                 .quarantine
                 .retain(|meta| !(meta.run == run && meta.call.as_ref() == Some(&call)));
+            // A worker can return after the runtime stopped waiting. If its
+            // shared backend is now unusable, stop an active run before it
+            // dispatches again; a future run is also protected by the
+            // pre-dispatch backend check.
+            if let Ok((_, backend)) = &joined
+                && *backend == BackendState::Unavailable
+                && let Some(active) = state.active.as_mut().filter(|active| active.run == run)
+                && active.terminal.is_none()
+            {
+                active.terminal = Some(RunOutcome::Failed);
+                active.terminal_error = Some(runtime_error(
+                    ErrorCategory::ToolFailure,
+                    "tool backend became unavailable after delayed worker completion",
+                ));
+                active.wake.notify_one();
+            }
             // Late evidence is folded into the retained snapshot without a
             // duplicate ToolFinished event. Only an inconclusive effect is
             // refined; a recorded known effect is never rewritten.
-            if let Ok(outcome) = joined
+            if let Ok((outcome, _)) = joined
                 && let Some(last) = state.last.as_mut()
                 && last.run == run
                 && let Some(summary) = last
@@ -4710,6 +4792,17 @@ fn failed_outcome(message: &'static str) -> ToolOutcome {
         false,
     )
     .expect("static safe failure builds")
+}
+
+fn unavailable_outcome(message: &'static str) -> ToolOutcome {
+    ToolOutcome::new(
+        ExecutionStatus::Failed,
+        EffectState::NotStarted,
+        Evidence::HostObserved,
+        message,
+        false,
+    )
+    .expect("static safe backend-unavailable outcome builds")
 }
 
 fn run_event(active: &ActiveRun, seq: EventSequence, payload: EventPayload) -> RunEvent {
@@ -9623,6 +9716,58 @@ mod cov_runtime_topup_private {
         }
     }
 
+    struct UnavailableBackendTool {
+        spec: ToolSpec,
+        executed: AtomicUsize,
+        ready: AtomicBool,
+    }
+
+    impl UnavailableBackendTool {
+        fn new(name: &str) -> Self {
+            Self {
+                spec: ToolSpec::new(
+                    ToolId::new(name, M0_REVISION).expect("valid tool identity"),
+                    format!("unavailable backend double for {name}"),
+                    r#"{"type":"object"}"#,
+                )
+                .expect("valid tool spec"),
+                executed: AtomicUsize::new(0),
+                ready: AtomicBool::new(false),
+            }
+        }
+
+        fn execution_count(&self) -> usize {
+            self.executed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ToolPort for UnavailableBackendTool {
+        fn describe(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn execute(&self, _call: &ToolCall, _context: &ToolContext) -> ToolOutcome {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            self.ready.store(false, Ordering::SeqCst);
+            ToolOutcome::new(
+                ExecutionStatus::Succeeded,
+                EffectState::KnownApplied,
+                Evidence::HostObserved,
+                "test double executed against an unavailable backend",
+                false,
+            )
+            .expect("valid tool outcome")
+        }
+
+        fn backend_state(&self) -> BackendState {
+            if self.ready.load(Ordering::SeqCst) {
+                BackendState::Ready
+            } else {
+                BackendState::Unavailable
+            }
+        }
+    }
+
     /// Real runtime over hand-installed run state, plus its event receivers and
     /// inspectable doubles.
     struct Bed {
@@ -12063,12 +12208,198 @@ mod cov_runtime_topup_private {
         drop(runtime);
 
         let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
-        let snapshot = std::fs::read_to_string(directory.join("session-store.json")).unwrap();
-        assert!(snapshot.contains("run-persistent-tool"));
-        assert!(snapshot.contains("call-persistent-tool"));
-        assert!(snapshot.contains("succeeded"));
-        assert!(snapshot.contains("known_applied"));
+        let journal =
+            std::fs::read_to_string(directory.join("session-store.operations.jsonl")).unwrap();
+        assert!(journal.contains("run-persistent-tool"));
+        assert!(journal.contains("call-persistent-tool"));
+        assert!(journal.contains("succeeded"));
+        assert!(journal.contains("known_applied"));
         drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unavailable_backend_is_rejected_before_dispatch() {
+        let run = run_id("backend-unavailable-before-dispatch");
+        let tool = Arc::new(UnavailableBackendTool::new("host_read"));
+        let (runtime, _streams) = Runtime::try_new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            vec![ToolRegistration::read(tool.clone())],
+        )
+        .unwrap();
+        let call = read_call(&run, call_id("unavailable-before"));
+        let mut active = active_for(&run);
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(tool.execution_count(), 0, "no call is dispatched");
+            let state = runtime.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            let (_, outcome) = active.outcome_slot.as_ref().unwrap();
+            assert_eq!(outcome.status(), ExecutionStatus::Failed);
+            assert_eq!(outcome.effect(), EffectState::NotStarted);
+            assert!(outcome.content().contains("not dispatched"));
+            assert_eq!(active.force_terminal, Some(RunOutcome::Failed));
+            assert_eq!(
+                active.terminal_error.as_ref().map(AgentError::category),
+                Some(ErrorCategory::ToolFailure)
+            );
+        });
+    }
+
+    #[test]
+    fn delayed_quarantined_backend_marks_the_active_run_failed() {
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+        let run = run_id("delayed-backend");
+        let call = call_id("delayed");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            let outcome = ToolOutcome::new(
+                ExecutionStatus::TimedOut,
+                EffectState::Unknown,
+                Evidence::Uncertain,
+                "late worker completion",
+                false,
+            )
+            .unwrap();
+            let handle = tokio::spawn(async move { (outcome, BackendState::Unavailable) });
+            bed.runtime.quarantine_tool(&run, call, handle).await;
+            for _ in 0..100 {
+                let state = bed.shared.state.lock().await;
+                if let Some(active) = state.active.as_ref()
+                    && active.terminal.is_some()
+                {
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let state = bed.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert_eq!(active.terminal, Some(RunOutcome::Failed));
+            assert_eq!(
+                active.terminal_error.as_ref().map(AgentError::category),
+                Some(ErrorCategory::ToolFailure)
+            );
+            assert!(state.quarantine.is_empty());
+        });
+    }
+
+    #[test]
+    fn delayed_unavailable_backend_wakes_blocked_provider() {
+        let (gate, mut provider_gate) = gate();
+        let bed = make_bed(Limits::m0_test(), true, Vec::new(), Some(gate), None);
+        let run = run_id("delayed-backend-provider");
+        test_rt().block_on(async {
+            install(&bed, active_for(&run)).await;
+            let (result, ()) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(2), bed.runtime.on_calling_model(&run)),
+                async {
+                    provider_gate.entered.recv().await.unwrap();
+                    let outcome = timeout_outcome("late completion");
+                    let handle = tokio::spawn(async move { (outcome, BackendState::Unavailable) });
+                    bed.runtime
+                        .quarantine_tool(&run, call_id("delayed"), handle)
+                        .await;
+                }
+            );
+            let terminal = match result.expect("provider wait must wake promptly") {
+                Err(terminal) => terminal,
+                Ok(_) => panic!("unavailable backend must stop the provider wait"),
+            };
+            assert_eq!(terminal.outcome, RunOutcome::Failed);
+            assert_eq!(
+                terminal.error.as_ref().map(AgentError::category),
+                Some(ErrorCategory::ToolFailure)
+            );
+            assert!(
+                bed.shared
+                    .state
+                    .lock()
+                    .await
+                    .quarantine
+                    .iter()
+                    .any(|meta| meta.call.is_none())
+            );
+            provider_gate.release.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn unavailable_backend_stops_the_run_after_recording_the_outcome() {
+        let run = run_id("backend-unavailable");
+        let tool = Arc::new(UnavailableBackendTool::new("host_read"));
+        tool.ready.store(true, Ordering::SeqCst);
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-unavailable-store-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let mut active = active_for(&run);
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    active.session.clone(),
+                    STORE_FORMAT_REVISION,
+                    0,
+                    Vec::new(),
+                    active.profile.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        active.source_cursor = 1;
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            vec![ToolRegistration::read(tool.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        let call = read_call(&run, call_id("unavailable"));
+        active.current = Some(current_call(&call, None));
+        test_rt().block_on(async {
+            runtime.shared.state.lock().await.active = Some(active);
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(tool.execution_count(), 1);
+            assert_eq!(tool.backend_state(), BackendState::Unavailable);
+            assert!(matches!(
+                runtime.on_recording(&run).await,
+                Ok(RunState::Finished)
+            ));
+            let state = runtime.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert_eq!(active.terminal, Some(RunOutcome::Failed));
+            assert_eq!(
+                active.terminal_error.as_ref().map(AgentError::category),
+                Some(ErrorCategory::ToolFailure)
+            );
+            assert_eq!(active.outcomes.len(), 1);
+            assert_eq!(active.outcomes[0].effect, EffectState::KnownApplied);
+        });
+        drop(runtime);
+        let journal =
+            std::fs::read_to_string(directory.join("session-store.operations.jsonl")).unwrap();
+        assert!(journal.contains("call-unavailable"));
+        assert!(journal.contains("known_applied"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

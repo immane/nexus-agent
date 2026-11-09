@@ -52,6 +52,13 @@ failed; the model may correct its request within the existing run budgets.
 
 A successful command exit means the command met its execution convention; it does not prove the user's intended task. An interrupted plugin can have unknown effects even when no result arrived. The runtime MUST preserve the original outcome rather than replacing it with a fabricated success or rollback.
 
+A tool with shared mutable execution state reports
+`BackendState::Unavailable` only when that state is known to be unusable, not
+merely because an outcome has unknown effects. The runtime records the current
+outcome first, then stops the run before dispatching another call to the same
+backend. This is a fail-closed run termination, not a retry or recovery; the
+backend must be re-established separately.
+
 ## Output
 
 Text, structured content, and resource references MUST have defined bounds and supported representations. Invalid structured output must be identified rather than silently accepted as matching its schema.

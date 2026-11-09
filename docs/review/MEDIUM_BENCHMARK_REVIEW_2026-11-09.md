@@ -14,6 +14,50 @@ budgets.
 **Deliverable:** Findings and recommendations only. No product code, workflow,
 permission, or deployment changes were made while preparing this review.
 
+**Follow-up implementation (2026-11-09):** F1 and F3 have partial fixes under
+review, including a bounded operation/source-batch journal, larger record limits,
+merged-snapshot bytes/nodes reservations, a one-selected-session cache and explicit
+backend state propagation. Offline regressions cover near-byte/node capacity,
+pending outcomes across reopen, atomic source-batch tails, directory append-only
+source writes and revisions 2/3/4 upgrading to 5. These are not a production or
+cross-platform durability qualification. F2, F4,
+F5, F6, and F7 remain open as described below; the original evidence is retained.
+
+An offline debug-profile measurement using a fake provider and tool with the
+real directory store took 1.52, 5.80, 33.74 and 111.98 seconds for 16, 64,
+256 and 512 calls respectively on one local macOS run. These are single samples,
+not production benchmarks. After the source journal and selected-session cache,
+the same opt-in debug-profile measurement on this local macOS machine took
+**0.317, 1.180, 7.058 and 17.453 seconds** respectively (19.8, 18.4, 27.6 and
+34.1 ms/call). All four runs completed with saved source persistence. Compilation
+(5.12 seconds) and setup/cleanup are excluded from these samples. These are
+single warm-development samples, not a controlled production speedup claim;
+runtime diagnostics and filesystem syncs remain inside the measured interval.
+An intermediate source-journal-only sample still took 110.878 seconds at 512
+calls, motivating the bounded selected-session cache rather than claiming that
+append-only disk writes alone solved full-runtime scaling.
+
+Remaining limits: cold loads still decode/replay the bounded snapshot/journal;
+checkpoint publication still rewrites the full merged body; identity matching
+uses scans, and pending-outcome accounting and cold replay can be quadratic.
+The bytes/nodes budget reserves accepted records plus pending operation outcomes
+against the current checkpoint, not arbitrary future checkpoint growth or tool
+result/source content. Independent journal capacity may stop a run earlier.
+There is no guarantee that 4,096 calls with arbitrary valid content fit the
+bounded store. No Linux filesystem measurements or power-loss qualification were
+performed in this follow-up.
+The opt-in measurement is `directory_store_full_runtime_scaling` in
+`crates/nexus-runtime/tests/directory_store_measurement.rs`.
+
+Local follow-up validation (sequential Cargo invocations, locked/offline):
+`cargo test -p nexus-session -p nexus-runtime --locked --offline` passed 41
+session and 388 runtime tests; three existing/default ignored tests were skipped.
+The directory-store measurement was run separately with `--ignored --nocapture`.
+`cargo clippy -p nexus-session -p nexus-runtime --all-targets --locked --offline
+-- -D warnings`, `cargo fmt --all --check` and `git diff --check` also passed.
+Other packages and the complete optional/ignored suite were not rerun for this
+session-store follow-up.
+
 ## 1. Outcome summary
 
 The campaign processed all 30 tasks; one failed before model inference and one

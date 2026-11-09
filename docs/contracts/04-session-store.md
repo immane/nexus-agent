@@ -18,9 +18,11 @@ execution control or make restoration execute stored actions.
 The crate rename does not change the caller-supplied data directory. The TUI
 directory store uses `session-index.json` plus independent session files;
 the original `session-store.json` remains readable through explicit import.
-Snapshot revision 3 adds an explicit interrupted execution status;
-revision-2 snapshots remain readable and are rewritten as revision 3 on their
-next successful write. Runtime
+Snapshot revision 5 adds atomic source batches to revision 4's bounded
+operation-journal layout. Revisions 2, 3 and 4 remain readable; the snapshot is
+upgraded before the first new journal append or checkpoint publication, so older
+readers cannot silently omit journaled sources. Revision 3 added an explicit
+interrupted execution status. Runtime
 commands invoke bounded metadata listing and selected-session recovery only
 when a store was explicitly injected.
 
@@ -36,22 +38,40 @@ advances to dispatch/another model turn; write failure terminates the run.
 TUI storage uses the platform default user data directory outside the project.
 Its bounded metadata index is opened at startup; each session's history and
 operation journal live in an independent file and are decoded only when that
-session is selected or updated. An invalid old session body therefore does not
+session is selected or updated. At most one selected session body and its
+incremental merge budget are cached; switching sessions or publishing a
+checkpoint consumes that cache. An invalid old session body therefore does not
 prevent listing or creating another session. It is not application-encrypted.
 Restore only populates the runtime's
 bounded history cache; unfinished calls are represented as unknown effects and
-are never replayed. A completed run reports saved only after its source and
-operation records have passed the per-session file's sync-and-rename protocol. See the
+are never replayed. A completed run reports saved only after its source records
+and operation records have passed the applicable durable write protocol
+(snapshot sync-and-rename or journal append-and-sync). See the
 [context-management design](../design/12-context-management.md) for the current
 gap and the source-history/active-view boundary.
 
-Prefer a small file-backed implementation first. Versioned snapshots and a compact operation journal are candidates; a database or full event-sourcing system requires a concrete need. Do not persist every token merely because runtime events exist.
+Prefer a small file-backed implementation first. The current implementation uses versioned snapshots plus a bounded append-only operation journal; a database or full event-sourcing system requires a concrete need. Do not persist every token merely because runtime events exist.
 
-The initial `nexus-session` snapshot uses the standard library, existing
-`serde_json`, and existing strict JSON validation; it adds no third-party
-dependency. It caps the encoded file at 16 MiB and applies existing per-record
-and record-count limits. Its current format is revision 3 and rejects duplicate
-keys, unknown fields, and unsupported revisions. This format is an initial
+The `nexus-session` store uses `serde_json`, existing strict JSON validation,
+and `rustix` for descriptor-based Unix journal access. It caps the encoded file
+at 16 MiB and applies existing per-record
+and record-count limits. Its current format is revision 5 and rejects duplicate
+keys, unknown fields, and unsupported revisions. Tool intents and outcomes may
+also be appended to a private, revisioned JSONL journal beside the snapshot.
+Original source batches use one complete JSONL line per batch in the same
+journal. A partial trailing batch exposes no prefix of that batch. Sequence gaps
+and conflicting source duplicates are rejected; equal duplicates in overlapping
+snapshot/journal history are idempotent. Source appends in the directory store
+do not stage or rewrite the session snapshot or metadata index.
+Each append is synced before the operation is reported as recorded; a complete
+snapshot is written at checkpoint commits, and the journal is then
+removed only after directory publication. Older snapshots are upgraded before
+the first journal append. Journal reads, appends, and recovery truncation use
+validated descriptors without following a final-component symlink; this does not
+protect against concurrent modification of an already-open inode. Reopening merges
+snapshot and journal
+records idempotently, rejects conflicting duplicate identities, and may discard
+only a trailing incomplete journal record. This format is an initial
 implementation detail, not yet the complete session format promised by this
 contract.
 
@@ -89,7 +109,7 @@ sessions; retry skips identical sessions and never overwrites conflicting data.
 
 ### Indexed publication and recovery
 
-Each changed session is first staged as a complete private snapshot. A synced
+Each checkpoint change is first staged as a complete private snapshot. A synced
 `session-pending.json` metadata journal then names the target session and revision
 (or explicit deletion). Publication renames the staged body, syncs its directory,
 atomically updates the index, and removes and syncs the journal. Deletion records
@@ -124,6 +144,19 @@ conflicting records and inconsistent denied outcomes are rejected before writing
 
 Before publication, encoded snapshots are checked against the same complete
 validation and parser limits used on reopen, including the JSON node budget.
+Before accepting an intent (including an identical legacy intent), the store
+also checks the eventual merged snapshot's bytes and JSON nodes, reserving one
+bounded outcome for every pending intent. Source appends, unrelated outcomes and
+checkpoint changes cannot consume those reservations. The current checkpoint
+plus accepted records and pending outcomes must remain mergeable; this does not
+reserve arbitrary future checkpoint growth, tool-result source content, or future
+conversation turns. Byte accounting is conservative (one comma per new record,
+1,024 bytes per pending outcome); a session can therefore stop before the exact
+16 MiB limit. The journal has its own independent 16 MiB bound and is only cleared
+after checkpoint publication. Reads of older histories remain possible even when
+new writes cannot meet the reservations; no automatic truncation or tool replay
+is performed. A cold selected-session load still decodes/replays bounded history,
+and checkpoint publication still encodes and validates the complete snapshot.
 The runtime bounds store-worker waits by live cancellation and the run deadline.
 Interrupted workers remain owned until termination; further store-backed runs
 are refused until the host reopens and reconciles the store, even if the worker
