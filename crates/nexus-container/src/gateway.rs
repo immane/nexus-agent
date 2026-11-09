@@ -11,8 +11,14 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const PREPARE_TIMEOUT: Duration = Duration::from_secs(20);
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+// Docker Desktop can take well over 20 seconds to create, start, and report a
+// gateway healthy. The lifecycle still has a finite bound, but the preparation
+// budget must not expire while a successful mutation is still completing.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(120);
+// Inspect/remove can also exceed the old three-second wait on Docker Desktop;
+// keep cleanup bounded while allowing the daemon to complete an idempotent
+// exact-ID removal.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(200);
 const LABEL: &str = "io.nexus-agent.gateway-owner";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1035,6 +1041,13 @@ pub(crate) fn run_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_timeouts_cover_slow_docker_desktop_mutations_without_being_unbounded() {
+        assert_eq!(PREPARE_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(CLEANUP_TIMEOUT, Duration::from_secs(15));
+        assert!(CLEANUP_TIMEOUT < PREPARE_TIMEOUT);
+    }
     #[test]
     fn docker_desktop_detection_is_specific_and_case_insensitive() {
         assert!(is_docker_desktop("Docker Desktop"));

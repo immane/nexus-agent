@@ -346,8 +346,9 @@ container inspection rather than starting another evaluation blindly.
 Image preparation and scoring require external downloads and considerable disk,
 CPU, and possibly amd64 emulation. They do not invoke a model. Live batches
 reject public model endpoints by default. `--allow-hosted-inference` is an
-explicit operator opt-in for a `run` action; it enables the configured public
-endpoint but does not add a cumulative token or spend cap. Runtime token
+explicit operator opt-in for `prepare` or `run`; preparation remains
+`--prepare-only` and performs no inference, while a `run` enables the configured
+public endpoint but adds no cumulative token or spend cap. Runtime token
 accounting remains observational rather than a hard pre-generation spend cap.
 The sequential batch's default wall budget can still consume up to ten days for
 ten tasks, excluding preparation/evaluation. Use the opt-in only when hosted

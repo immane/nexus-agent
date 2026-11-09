@@ -277,12 +277,18 @@ def verify_task_environment(record, row):
     if module is None:
         raise RuntimeError("no import preflight registered for this repository")
     prefix = ["docker", "exec", "-w", "/workspace", record["workload_id"]]
+    # Large checkouts under amd64 emulation can take close to two minutes to
+    # enumerate status after native support files are restored. Keep the wait
+    # bounded, but do not misclassify a slow checkout as a preparation failure.
+    status_timeout = 300
     head = command(prefix + ["git", "rev-parse", "HEAD"], timeout=30)
-    if head != row["base_commit"] or command(prefix + ["git", "status", "--porcelain"], timeout=30):
+    if head != row["base_commit"] or command(
+        prefix + ["git", "status", "--porcelain"], timeout=status_timeout
+    ):
         raise RuntimeError("agent checkout is not clean at the task base")
     support = json.loads(command(prefix + ["python", "/usr/local/lib/nexus-swe-support.py", "restore",
                                           "/opt/nexus-task-support", "/workspace"], timeout=120))
-    if command(prefix + ["git", "status", "--porcelain"], timeout=30):
+    if command(prefix + ["git", "status", "--porcelain"], timeout=status_timeout):
         raise RuntimeError("native build support changed tracked/unignored task files")
     code = ("import importlib, importlib.util, json, pathlib, sys; "
             f"m = importlib.import_module({module!r}); "

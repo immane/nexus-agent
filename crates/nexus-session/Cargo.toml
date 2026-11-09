@@ -1,6 +1,6 @@
 [package]
 name = "nexus-session"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 edition = "2024"
 
 [dependencies]

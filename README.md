@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.5--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.6--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent with live model integrations, native terminal sessions,
 coding tools, and optional container execution. Designed around very fast startup
@@ -19,7 +19,7 @@ not an ever-growing engine. External plugins remain planned.
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.5-alpha**, with the scoped M0–M4 gates complete over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **The scoped M0–M4 gates are complete for their recorded scopes; Beta readiness and cross-platform production/security readiness are not claimed.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.6-alpha**, with the scoped M0–M4 gates complete over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **The scoped M0–M4 gates are complete for their recorded scopes; Beta readiness and cross-platform production/security readiness are not claimed.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -470,33 +470,47 @@ was not established. Agent completion is not official resolution.
 | Single-task — difficulty not established | OpenCode Go / DeepSeek: Django 12700, pytest 7373 and scikit-learn 25570 resolved; Requests 1963 unresolved. DeepSeek API: Pylint 6506 resolved in three context-profile runs, Flask 4992 resolved. Local Qwen: Flask 4992 unresolved; two Pylint attempts interrupted and unscored. These are not additional Verified difficulty-band results. |
 | Parallel — simple smoke test | **4 resolved, 1 not run**: SymPy lacked a launcher import-preflight mapping. Four model runs executed concurrently; scoring was sequential. |
 | Parallel — simple, 30 tasks | **28 resolved, 1 unresolved, 1 empty patch**. Six sequential groups of five concurrent attempts; 30/30 gold preflights passed. |
-| Parallel — medium, 30 tasks | **20 resolved, 6 unresolved, 2 empty patches, 1 preflight failure, 1 ambiguous evaluation**. Five dynamically refilled workers, then sequential scoring; 30/30 gold preflights passed. |
+| Parallel — medium, 30 tasks (first run) | **20 resolved, 6 unresolved, 2 empty patches, 1 preflight failure, 1 ambiguous evaluation**. Five dynamically refilled workers, then sequential scoring; 30/30 gold preflights passed. |
+| Parallel — medium, 30 tasks (rerun after runtime/session fixes) | **23 resolved, 5 unresolved, 2 ambiguous evaluations**, 0 empty patches and 0 missing predictions. Same fixed 30 tasks, model and five-worker shape; 30/30 gold preflights passed. One agent run stopped on delayed backend unavailability but its saved patch was officially resolved. |
 
 All parallel campaigns used OpenCode Go / DeepSeek. They and the five-task
 complex campaign used a temporary 120-second provider first-response timeout,
 not a changed product default. Repeated tasks above are attempts, not additional
-unique tasks; no aggregate score is inferred across these groups.
+unique tasks; no aggregate score is inferred across these groups. The two medium
+runs used the same fixed selection and model but were not a controlled A/B:
+runtime, harness, date and host conditions differed, so the higher rerun count is
+not evidence that a specific change caused an improvement.
 
 **Failure attribution matters:**
 
-- **Agent/runtime or harness:** the medium campaign exposed a 256-record session
-  operation-history limit despite a 4,096-call run budget (Astropy 13033), a
-  reported search deadline followed by an unavailable/poisoned worker (Astropy
-  7671), and a Docker preflight timeout before inference (Pylint 6386). Simple
-  smoke testing also exposed the missing SymPy preflight mapping. These are not
-  evidence that a model's proposed repair was correct or incorrect.
+- **Agent/runtime or harness:** the first medium campaign exposed a 256-record
+  session operation-history limit despite a 4,096-call run budget (Astropy
+  13033), a reported search deadline followed by an unavailable/poisoned worker
+  (Astropy 7671), and a Docker preflight timeout before inference (Pylint 6386).
+  The rerun produced no session-capacity failure, no preflight failure and no
+  empty patch after the bounded journal, gateway-lifecycle and preflight-wait
+  hardening. One rerun attempt stopped on delayed backend unavailability but
+  still produced an officially resolved patch; that is fail-closed runtime
+  behavior, not model success. Simple smoke testing also exposed the missing
+  SymPy preflight mapping. These are not evidence that a model's proposed repair
+  was correct or incorrect.
 - **Model/repair strategy and agent validation:** local Qwen's Flask patch used
   the wrong interface; complex Pylint missed a required importable interface,
-  and complex Django retained unnecessary SQL subqueries. The medium campaign's
-  six unresolved patches failed target tests or introduced a regression; the
-  simple campaign missed Django's `LEVEL_TAGS` interface and produced one empty
-  scikit-learn patch. These show repair/verification limitations, but do not
-  isolate model capability from prompting, tools or harness behavior.
+  and complex Django retained unnecessary SQL subqueries. The first medium
+  campaign's six unresolved patches failed target tests or introduced a
+  regression; the rerun had five unresolved patches and two ambiguous official
+  results. The simple campaign missed Django's `LEVEL_TAGS` interface and
+  produced one empty scikit-learn patch. These show repair/verification
+  limitations, but do not isolate model capability from prompting, tools or
+  harness behavior.
 - **Environment or uncertain cause:** local Pylint was interrupted, including
-  an Ollama crash; Requests had certificate-related test failures; medium
-  Pylint 4661 had an ambiguous evaluator failure. Concurrent resource contention
-  may contribute to timeouts, but has not been established by a controlled
-  comparison. Do not relabel these as resolved or infer an adjusted model score.
+  an Ollama crash; Requests had certificate-related test failures; the medium
+  rerun had two ambiguous official evaluations, Sphinx 10614 (`no_tests_collected`)
+  and Pylint 4661 (`missing_module`). Their root causes were not isolated, and
+  the first medium run's Pylint 4661 was also ambiguous. Concurrent resource
+  contention may contribute to timeouts, but has not been established by a
+  controlled comparison. Do not relabel these as resolved or infer an adjusted
+  model score.
 
 See the [benchmark history and evaluation](docs/research/agent-benchmarks.md#recent-benchmark-observations)
 for individual results, methods, limitations and operational findings.
@@ -560,7 +574,7 @@ M1–M5 migration gates above.
 - [ ] Recovery of active execution; restoring history does not resume processes or replay uncertain tool calls.
 - [ ] Semantic IR, graph/vector retrieval, and LoRA research components; these remain a vision, not shipped features.
 
-Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The **0.2.5-alpha** version is not a stable-release or production-readiness claim.
+Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The **0.2.6-alpha** version is not a stable-release or production-readiness claim.
 
 ## Documentation and Contributions
 

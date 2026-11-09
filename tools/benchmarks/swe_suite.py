@@ -298,8 +298,8 @@ def main():
     parser.add_argument("--mode", choices=("gold", "empty", "prediction"), default="gold",
                         help="explicit official evaluation mode; defaults to oracle preflight")
     args = parser.parse_args()
-    if args.allow_hosted_inference and args.action != "run":
-        parser.error("--allow-hosted-inference is only valid for run")
+    if args.allow_hosted_inference and args.action not in ("prepare", "run"):
+        parser.error("--allow-hosted-inference is only valid for prepare or run")
     if args.action == "summarize":
         if args.batch is None:
             parser.error("summarize requires --batch")
