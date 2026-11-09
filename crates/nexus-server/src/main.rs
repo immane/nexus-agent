@@ -609,6 +609,7 @@ fn main() {
             }
         );
     }
+    eprintln!("nexus-server: embedded web client at http://127.0.0.1:{port}/");
     let server = Arc::new(server);
     let cleanup_server = Arc::downgrade(&server);
     let cleanup_interval =

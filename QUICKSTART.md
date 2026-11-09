@@ -666,16 +666,22 @@ providers or real tools require the 64-hex-character bearer token. This token
 grants server-wide route access, including approvals; session IDs are not
 credentials. Only the fake-only server demo may run without authentication.
 
-Open `http://127.0.0.1:8471/` for the embedded web UI foundation (no separate
-frontend install or build). It provides a responsive workspace shell and
-System, Graphite, Paper, Forest, and Sand palettes. **Appearance & connection**
-checks `/health` and `/config` on demand; enter the server bearer token there
-if required. The token is cleared after submission and is not saved; only the
-palette preference is persisted in this browser. The static shell is public,
-but API authentication and Host/Origin checks remain enforced. Conversation,
-history, model selection, and execution controls are not connected yet and
-are shown as unavailable. Assets are embedded uncompressed; release compression
-and long-lived asset caching are not implemented in this foundation.
+Open `http://127.0.0.1:8471/` for the embedded web client (no separate
+frontend install or build). It connects to `/health` and `/config` on load,
+lets you choose a configured model, creates a session on the first message,
+and then uses the loopback HTTP and SSE APIs for the live transcript, tool
+activity, approvals, cancellation, usage, and terminal outcome. If no provider
+is configured, the model menu offers the test-only demo script.
+
+Open **Settings** to enter the 64-hex-character bearer token. It is held only
+in this page's memory, is never written to browser storage, and is gone after
+reload. Only the palette preference is persisted. The static shell is public,
+but API authentication and Host/Origin checks remain enforced. There is no
+session list, transcript restore, file browser, or Markdown renderer in this
+slice; reloading loses the view and the server session is not a saved
+conversation. An active run is not cancelled by closing the page. Assets are
+embedded uncompressed; release compression and long-lived asset caching are
+not implemented.
 
 In the server terminal, keep the generated token available through your
 secret manager or another secret-safe channel. In the client terminal, read

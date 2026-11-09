@@ -66,7 +66,8 @@ fn embedded_assets_keep_host_origin_and_api_authentication_checks() {
             match path {
                 "/" => {
                     assert!(head.contains("text/html; charset=utf-8"));
-                    assert!(body.contains("execution not connected"));
+                    assert!(body.contains("id=\"composer\""));
+                    assert!(body.contains("Live session client"));
                 }
                 "/assets/app.css" => assert!(head.contains("text/css; charset=utf-8")),
                 _ => assert!(head.contains("text/javascript; charset=utf-8")),

@@ -99,6 +99,7 @@ interfaces remain proposed; this link is not a claim of completed implementation
 | [11 - Optional container execution](design/11-container-execution.md) | Internal prototype status, target backend architecture, isolation gates, lifecycle, and acceptance | Partial feature-gated tools prototype; no runtime/frontend integration; isolation unvalidated |
 | [12 - Context management](design/12-context-management.md) | Source history, transactional compaction, evidence-system evolution, benchmark metrics, and shrinking-window validation | Owner-confirmed priority/direction; detailed design proposed; partial existing implementation |
 | [13 - Tool execution reliability](design/13-tool-execution-reliability.md) | Global worker admission, process exit observations, bounded progress, long-call presentation, cleanup reconciliation, and compatibility boundaries | Draft design proposal; benchmark-only mitigations distinguished from proposed global behavior |
+| [14 - Built-in web client](design/14-web-client.md) | Embedded HTML/CSS/JS session client, authentication, streaming, recovery, and known limits | Partial implementation; live sessions only |
 
 The context-management design also records the exposed Sphinx endurance-run
 findings and a staged follow-up proposal for bounded context and stagnation
