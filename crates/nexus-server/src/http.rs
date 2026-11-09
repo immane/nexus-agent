@@ -270,11 +270,21 @@ pub fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result
     } else {
         write!(
             stream,
-            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n{}connection: close\r\n\r\n",
             response.status,
             reason(response.status),
             response.content_type,
             response.body.len(),
+            if matches!(
+                response.content_type,
+                "text/html; charset=utf-8"
+                    | "text/css; charset=utf-8"
+                    | "text/javascript; charset=utf-8"
+            ) {
+                crate::web::HEADERS
+            } else {
+                ""
+            },
         )?;
     }
     stream.write_all(&response.body)?;

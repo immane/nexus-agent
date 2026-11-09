@@ -866,7 +866,10 @@ impl Server {
         let response = match http::read_request(&mut stream) {
             Ok(request) => {
                 let health = request.method == "GET" && request.route_path() == "/health";
-                let required = !health
+                let public = health
+                    || (request.method == "GET"
+                        && crate::web::asset(request.route_path()).is_some());
+                let required = !public
                     && (self.auth_token.is_some()
                         || !matches!(self.tools_mode, ToolsMode::Fakes)
                         || !self
@@ -875,7 +878,7 @@ impl Server {
                             .expect("config lockable")
                             .providers()
                             .is_empty());
-                let token = if health {
+                let token = if public {
                     None
                 } else {
                     self.auth_token.as_ref()
@@ -909,6 +912,11 @@ impl Server {
     /// Routes a parsed request. Returns `None` when the SSE loop took over
     /// the stream (headers already written); anything else is framed here.
     fn route(self: &Arc<Self>, request: &Request, stream: &mut TcpStream) -> Option<Response> {
+        if request.method == "GET"
+            && let Some(response) = crate::web::response(request.route_path())
+        {
+            return Some(response);
+        }
         let parsed: Value = if request.body.is_empty() {
             Value::Null
         } else {

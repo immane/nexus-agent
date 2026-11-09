@@ -10,3 +10,4 @@ mod session_store;
 mod support;
 mod tools_real;
 mod web_flow;
+mod web_shell;

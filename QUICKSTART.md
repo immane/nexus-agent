@@ -666,6 +666,17 @@ providers or real tools require the 64-hex-character bearer token. This token
 grants server-wide route access, including approvals; session IDs are not
 credentials. Only the fake-only server demo may run without authentication.
 
+Open `http://127.0.0.1:8471/` for the embedded web UI foundation (no separate
+frontend install or build). It provides a responsive workspace shell and
+System, Graphite, Paper, Forest, and Sand palettes. **Appearance & connection**
+checks `/health` and `/config` on demand; enter the server bearer token there
+if required. The token is cleared after submission and is not saved; only the
+palette preference is persisted in this browser. The static shell is public,
+but API authentication and Host/Origin checks remain enforced. Conversation,
+history, model selection, and execution controls are not connected yet and
+are shown as unavailable. Assets are embedded uncompressed; release compression
+and long-lived asset caching are not implemented in this foundation.
+
 In the server terminal, keep the generated token available through your
 secret manager or another secret-safe channel. In the client terminal, read
 it without echoing or putting it in shell history (then export it):

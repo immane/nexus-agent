@@ -6,7 +6,8 @@
 //! scripted [`nexus_fakes`] doubles (no provider credentials, no network
 //! egress beyond loopback, ephemeral sessions by default), and the server binds
 //! `127.0.0.1` only. Real tools and configured providers require a bearer
-//! credential; only the test-only fake demo may run unauthenticated. The
+//! credential; only the test-only fake demo may use APIs unauthenticated.
+//! The built-in static web shell and health endpoint are public. The
 //! credential holder can submit, approve, and cancel. Do not expose this
 //! server to a network.
 //! The binary caps concurrent connection threads at 64; sessions are capped
@@ -126,5 +127,6 @@ mod auth;
 pub mod http;
 pub mod json;
 pub mod server;
+mod web;
 
 pub use server::{Server, Session, ToolsMode};

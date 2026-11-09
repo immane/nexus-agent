@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Nexus · Workspace</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to workspace</a>
+  <aside class="sidebar" aria-label="Workspace navigation">
+    <a class="brand" href="/" aria-label="Nexus home"><span class="mark" aria-hidden="true">N</span> nexus<span class="badge">WEB</span></a>
+    <div class="workspace"><span class="eyebrow">WORKSPACE</span><strong>Local workspace</strong><span class="muted">Served by nexus-server</span></div>
+    <button class="new-session" disabled>＋ New session <span>soon</span></button>
+    <div class="section-label">SESSIONS <span>0</span></div>
+    <p class="sidebar-empty">Your sessions will appear here.<br>History is not connected yet.</p>
+    <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span> Local only <span class="badge">ALPHA</span></div>
+  </aside>
+  <div class="shell">
+    <header class="topbar"><div><span class="muted">Workspace</span><span class="separator">/</span><strong>Overview</strong></div><div class="toolbar"><span id="connection-status" class="status" role="status">Not checked</span><button id="open-settings" type="button">Appearance &amp; connection</button></div></header>
+    <main id="main" tabindex="-1">
+      <section class="welcome" aria-labelledby="welcome-title"><span class="eyebrow">A SMALL CORE. AN OPEN WORKSPACE.</span><h1 id="welcome-title">Space to build.</h1><p>A lightweight interface for your agent.<br>Everything runs through your local server.</p><span class="foundation">UI foundation · execution not connected</span></section>
+      <section class="cards" aria-label="Workspace capabilities">
+        <article><span class="card-number">01 / CONVERSATION</span><h2>Follow the thread</h2><p>Streaming responses and session context, in one focused space.</p><span class="muted">Coming next</span></article>
+        <article><span class="card-number">02 / TOOLS</span><h2>See the work</h2><p>Inspect tool activity and results without leaving the conversation.</p><span class="muted">Coming next</span></article>
+        <article><span class="card-number">03 / CONTROL</span><h2>Stay in charge</h2><p>Review approvals, cancel a run, and see its actual outcome.</p><span class="muted">Coming next</span></article>
+      </section>
+      <section class="composer" aria-label="Message composer"><label for="message">Message</label><textarea id="message" rows="3" disabled placeholder="Your next task starts here…"></textarea><div class="composer-footer"><span>No model selected</span><button disabled aria-label="Send message">Send ↑</button></div></section>
+      <p class="footnote">Native HTML, CSS &amp; JavaScript. No external assets. No background polling.</p>
+      <noscript><p>JavaScript is required for appearance settings and connection checks.</p></noscript>
+    </main>
+    <footer class="footer"><span>NEXUS AGENT</span><span>Built for focus, not overhead.</span></footer>
+  </div>
+  <dialog id="settings" aria-labelledby="settings-title">
+    <div class="dialog-heading"><h2 id="settings-title">Make it yours</h2><button id="close-settings" aria-label="Close settings">✕</button></div>
+    <p class="muted">Appearance stays in this browser. Credentials do not.</p>
+    <label for="theme">Color palette</label><select id="theme"><option value="system">System</option><option value="graphite">Graphite · dark</option><option value="paper">Paper · light</option><option value="forest">Forest · dark</option><option value="sand">Sand · light</option></select>
+    <div class="palette" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    <form id="connection-form"><h3>Server connection</h3><p class="muted">Same-origin only. Checks health and authenticated API access; does not start a session.</p><label for="token">Bearer token <span class="muted">(if required)</span></label><input id="token" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="64 hexadecimal characters"><p class="hint">Used only for this check, then cleared. Never saved.</p><button id="check-connection" type="submit">Check connection</button><p id="connection-detail" role="status">No request made yet.</p></form>
+  </dialog>
+</body>
+</html>
