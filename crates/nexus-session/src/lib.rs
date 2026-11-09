@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -26,15 +26,68 @@ use nexus_core::{
 };
 use serde_json::{Value, json};
 
-/// Current on-disk format revision. Revision 2 remains readable; all writes use
-/// this revision, and other mismatches fail closed without guessing.
-pub const FILE_FORMAT_REVISION: u64 = 3;
-const PREVIOUS_FILE_FORMAT_REVISION: u64 = 2;
+/// Current on-disk format revision. Revisions 2, 3 and 4 remain readable; all
+/// writes use this revision, and other mismatches fail closed without guessing.
+/// Revision 5 adds atomic source batches to the revision 4 operation journal.
+pub const FILE_FORMAT_REVISION: u64 = 5;
+const JOURNALED_FILE_FORMAT_REVISION: u64 = 4;
+const PREVIOUS_FILE_FORMAT_REVISION: u64 = 3;
+const LEGACY_FILE_FORMAT_REVISION: u64 = 2;
+const OPERATIONS_FORMAT_REVISION: u64 = 1;
 /// Maximum encoded store size.
 pub const MAX_STORE_BYTES: usize = nexus_validation::MAX_DOCUMENT_BYTES;
 /// Maximum number of accepted source records retained in one store.
 pub const MAX_SOURCE_RECORDS: usize = 16_384;
 const SOURCE_PAGE_SIZE: usize = 256;
+/// Conservative encoded size of one outcome line in the operation journal.
+/// The record carries identities and status fields, not tool output.
+const MAX_OUTCOME_JOURNAL_LINE_BYTES: usize = 1_024;
+// Matches the strict document parser's node limit. The boundary regression
+// checks this against the parser to detect validator-limit drift.
+const MAX_SNAPSHOT_NODES: usize = 200_000;
+const OUTCOME_NODES: usize = 7;
+
+#[derive(Clone, Copy)]
+struct SnapshotBudget {
+    bytes: usize,
+    nodes: usize,
+}
+
+fn value_nodes(value: &Value) -> usize {
+    1 + match value {
+        Value::Array(values) => values.iter().map(value_nodes).sum(),
+        Value::Object(values) => values.values().map(value_nodes).sum(),
+        _ => 0,
+    }
+}
+
+impl SnapshotBudget {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, AgentError> {
+        let value: Value =
+            serde_json::from_slice(bytes).map_err(|_| store_error("session store is invalid"))?;
+        Ok(Self {
+            bytes: bytes.len(),
+            nodes: value_nodes(&value),
+        })
+    }
+
+    fn check(self, pending: usize) -> Result<(), AgentError> {
+        if self
+            .bytes
+            .saturating_add(pending.saturating_mul(MAX_OUTCOME_JOURNAL_LINE_BYTES))
+            > MAX_STORE_BYTES
+            || self
+                .nodes
+                .saturating_add(pending.saturating_mul(OUTCOME_NODES))
+                > MAX_SNAPSHOT_NODES
+        {
+            return Err(capacity_error(
+                "session merged snapshot capacity is exhausted; restart in a new session",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Returns the user-local application data directory for automatic session
 /// storage, when a supported Unix home/state location is available.
@@ -75,6 +128,186 @@ type SnapshotRecords = (
     Vec<ToolOutcomeRecord>,
     Vec<SourceRecord>,
 );
+
+fn operations_path_for(snapshot: &Path) -> PathBuf {
+    snapshot.with_extension("operations.jsonl")
+}
+
+fn remove_operations_file(path: &Path) -> Result<(), AgentError> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| store_error("session operation journal path is invalid"))?;
+            sync_directory(parent)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(store_error(
+            "session operation journal could not be removed",
+        )),
+    }
+}
+
+fn load_operations_from(
+    path: &Path,
+    sessions: &[SessionCheckpoint],
+    intents: &mut Vec<ToolIntentRecord>,
+    outcomes: &mut Vec<ToolOutcomeRecord>,
+    sources: &mut Vec<SourceRecord>,
+    repair: bool,
+) -> Result<(), AgentError> {
+    let Some(mut file) = open_operations(path, repair, false)? else {
+        return Ok(());
+    };
+    let length = operations_length(&file)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_STORE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| store_error("session operation journal could not be read"))?;
+    if bytes.len() != length || operations_length(&file)? != length {
+        return Err(store_error("session operation journal changed during read"));
+    }
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let text = std::str::from_utf8(&bytes[..complete_len])
+        .map_err(|_| store_error("session operation journal is invalid"))?;
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let value = nexus_validation::parse_document_object(line, MAX_STORE_BYTES)
+            .map_err(|_| store_error("session operation journal is invalid"))?;
+        check_keys(&value, &["revision", "kind", "record"])?;
+        if number(field(&value, "revision")?)? != OPERATIONS_FORMAT_REVISION {
+            return Err(store_error(
+                "session operation journal revision is unsupported",
+            ));
+        }
+        let record = field(&value, "record")?;
+        match string(field(&value, "kind")?)?.as_str() {
+            "intent" => merge_intent_record(intents, parse_intent(record)?)?,
+            "outcome" => merge_outcome_record(outcomes, parse_outcome(record)?)?,
+            "source_batch" => {
+                let batch = bounded_array(record, MAX_SOURCE_RECORDS)?
+                    .iter()
+                    .map(parse_source_record)
+                    .collect::<Result<Vec<_>, _>>()?;
+                for source in batch {
+                    merge_source_record(sessions, sources, source)?;
+                }
+            }
+            _ => return Err(store_error("session operation journal is invalid")),
+        }
+    }
+    if complete_len != bytes.len() && repair {
+        if operations_length(&file)? != length {
+            return Err(store_error(
+                "session operation journal changed during recovery",
+            ));
+        }
+        file.set_len(complete_len as u64)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| store_error("session operation journal could not be recovered"))?;
+        sync_directory(
+            path.parent()
+                .ok_or_else(|| store_error("session operation journal path is invalid"))?,
+        )?;
+    }
+    Ok(())
+}
+
+fn merge_source_record(
+    sessions: &[SessionCheckpoint],
+    records: &mut Vec<SourceRecord>,
+    record: SourceRecord,
+) -> Result<(), AgentError> {
+    if !sessions
+        .iter()
+        .any(|checkpoint| checkpoint.session() == record.session())
+    {
+        return Err(store_error("source history session is not initialized"));
+    }
+    if let Some(existing) = records.iter().find(|existing| {
+        existing.session() == record.session() && existing.sequence() == record.sequence()
+    }) {
+        return if existing == &record {
+            Ok(())
+        } else {
+            Err(store_error(
+                "source record conflicts with existing sequence",
+            ))
+        };
+    }
+    let last = records
+        .iter()
+        .rev()
+        .find(|existing| existing.session() == record.session())
+        .map_or(0, SourceRecord::sequence);
+    if last.checked_add(1) != Some(record.sequence()) {
+        return Err(store_error("source record sequence is not contiguous"));
+    }
+    if records.len() >= MAX_SOURCE_RECORDS {
+        return Err(capacity_error(
+            "session source history is full; restart in a new session",
+        ));
+    }
+    records.push(record);
+    Ok(())
+}
+
+fn merge_intent_record(
+    intents: &mut Vec<ToolIntentRecord>,
+    intent: ToolIntentRecord,
+) -> Result<(), AgentError> {
+    if let Some(current) = intents
+        .iter()
+        .find(|current| current.run == intent.run && current.call == intent.call)
+    {
+        return if current == &intent {
+            Ok(())
+        } else {
+            Err(store_error(
+                "session store intent conflicts with existing record",
+            ))
+        };
+    }
+    if intents.len() >= nexus_core::store::MAX_INTENT_RECORDS {
+        return Err(capacity_error(
+            "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+        ));
+    }
+    intents.push(intent);
+    Ok(())
+}
+
+fn merge_outcome_record(
+    outcomes: &mut Vec<ToolOutcomeRecord>,
+    outcome: ToolOutcomeRecord,
+) -> Result<(), AgentError> {
+    check_outcome(outcome.status, outcome.effect)?;
+    if let Some(current) = outcomes
+        .iter()
+        .find(|current| current.run == outcome.run && current.call == outcome.call)
+    {
+        return if current == &outcome {
+            Ok(())
+        } else {
+            Err(store_error(
+                "session store outcome conflicts with existing record",
+            ))
+        };
+    }
+    if outcomes.len() >= nexus_core::store::MAX_OUTCOME_RECORDS {
+        return Err(capacity_error(
+            "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+        ));
+    }
+    outcomes.push(outcome);
+    Ok(())
+}
 
 /// Validated data loaded for an explicit session restore. This is history and
 /// metadata only; callers must apply current policy and start a fresh run.
@@ -152,6 +385,12 @@ pub fn recover_session(
 /// Persistent session store backed by `session-store.json` in a dedicated directory.
 pub struct FileSessionStore {
     path: PathBuf,
+    operations_path: PathBuf,
+    /// Directory publication stages the body before installing it. Its
+    /// operation journal must remain until the staged body is published.
+    defer_operations_clear: bool,
+    snapshot_current: bool,
+    snapshot_budget: Option<SnapshotBudget>,
     sessions: Vec<SessionCheckpoint>,
     intents: Vec<ToolIntentRecord>,
     outcomes: Vec<ToolOutcomeRecord>,
@@ -168,6 +407,9 @@ pub struct DirectorySessionStore {
     index_path: PathBuf,
     sessions: Vec<SessionMetadata>,
     write_uncertain: bool,
+    // At most one selected session body is retained. Checkpoint publication
+    // consumes this cache; journal-only writes keep its incremental budget.
+    loaded: Mutex<Option<FileSessionStore>>,
     _lock: File,
 }
 
@@ -187,6 +429,7 @@ impl DirectorySessionStore {
             index_path,
             sessions,
             write_uncertain: false,
+            loaded: Mutex::new(None),
             _lock: lock,
         };
         store.recover_transaction()?;
@@ -297,6 +540,7 @@ impl DirectorySessionStore {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(store_error("session data could not be removed")),
             }
+            self.clear_session_operations(&session)?;
             sync_directory(&self.sessions_directory)?;
         }
         fs::remove_file(self.journal_path())
@@ -332,24 +576,53 @@ impl DirectorySessionStore {
             staged?;
         }
         self.save_loaded(store)?;
+        self.clear_session_operations(session)?;
         Ok(value)
+    }
+
+    fn clear_session_operations(&mut self, session: &SessionId) -> Result<(), AgentError> {
+        if remove_operations_file(&operations_path_for(&self.session_path(session))).is_err() {
+            self.write_uncertain = true;
+            return Err(store_error(
+                "session operation journal could not be removed",
+            ));
+        }
+        Ok(())
     }
 
     fn load_file_store(&self, session: &SessionId) -> Result<FileSessionStore, AgentError> {
         self.ensure_available()?;
+        if let Some(store) = self
+            .loaded
+            .lock()
+            .map_err(|_| store_error("session store is unavailable"))?
+            .take()
+            && store
+                .sessions
+                .first()
+                .is_some_and(|checkpoint| checkpoint.session() == session)
+        {
+            store.ensure_available()?;
+            return Ok(store);
+        }
         if !self.sessions.iter().any(|entry| &entry.session == session) {
             return Err(store_error("session was not found"));
         }
         let path = self.session_path(session);
-        let (sessions, intents, outcomes, source_records) = match read_snapshot(&path)? {
-            Some(bytes) => decode(&bytes)?,
+        let bytes = read_snapshot(&path)?;
+        let (sessions, intents, outcomes, source_records) = match &bytes {
+            Some(bytes) => decode(bytes)?,
             None => return Err(store_error("session data is missing")),
         };
         if sessions.len() != 1 || sessions[0].session() != session {
             return Err(store_error("session data identity is invalid"));
         }
-        Ok(FileSessionStore {
+        let mut store = FileSessionStore {
+            operations_path: operations_path_for(&path),
             path,
+            defer_operations_clear: true,
+            snapshot_current: snapshot_is_current(bytes.as_deref())?,
+            snapshot_budget: None,
             sessions,
             intents,
             outcomes,
@@ -359,7 +632,38 @@ impl DirectorySessionStore {
                 ._lock
                 .try_clone()
                 .map_err(|_| store_error("session store is unavailable"))?,
-        })
+        };
+        store.load_operations()?;
+        Ok(store)
+    }
+
+    fn append_to_session<T>(
+        &mut self,
+        session: &SessionId,
+        change: impl FnOnce(&mut FileSessionStore) -> Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        let mut store = self.load_file_store(session)?;
+        let result = change(&mut store);
+        self.write_uncertain |= store.write_uncertain;
+        *self
+            .loaded
+            .lock()
+            .map_err(|_| store_error("session store is unavailable"))? = Some(store);
+        result
+    }
+
+    fn read_selected<T>(
+        &self,
+        session: &SessionId,
+        read: impl FnOnce(&FileSessionStore) -> Result<T, AgentError>,
+    ) -> Result<T, AgentError> {
+        let store = self.load_file_store(session)?;
+        let result = read(&store);
+        *self
+            .loaded
+            .lock()
+            .map_err(|_| store_error("session store is unavailable"))? = Some(store);
+        result
     }
 
     fn write_index(&mut self, entries: Vec<SessionMetadata>) -> Result<(), AgentError> {
@@ -544,7 +848,15 @@ impl SessionStore for DirectorySessionStore {
         let Some(bytes) = read_snapshot(&legacy)? else {
             return Err(store_error("legacy session store was not found"));
         };
-        let (checkpoints, intents, outcomes, records) = decode(&bytes)?;
+        let (checkpoints, mut intents, mut outcomes, mut records) = decode(&bytes)?;
+        load_operations_from(
+            &operations_path_for(&legacy),
+            &checkpoints,
+            &mut intents,
+            &mut outcomes,
+            &mut records,
+            false,
+        )?;
         // Tool records predate session ownership. Infer it only from original
         // source records, never by guessing which conversation owns a run.
         let mut owners = std::collections::HashMap::new();
@@ -657,11 +969,7 @@ impl SessionStore for DirectorySessionStore {
     }
 
     fn load_session(&self, id: &SessionId) -> Result<SessionCheckpoint, AgentError> {
-        self.load_file_store(id)?
-            .sessions
-            .into_iter()
-            .next()
-            .ok_or_else(|| store_error("session was not found"))
+        self.read_selected(id, |store| store.load_session(id))
     }
 
     fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError> {
@@ -702,7 +1010,11 @@ impl SessionStore for DirectorySessionStore {
             ));
         }
         let mut store = FileSessionStore {
+            operations_path: operations_path_for(&path),
             path: self.staging_path(),
+            defer_operations_clear: true,
+            snapshot_current: false,
+            snapshot_budget: None,
             sessions: Vec::new(),
             intents: Vec::new(),
             outcomes: Vec::new(),
@@ -717,6 +1029,7 @@ impl SessionStore for DirectorySessionStore {
         self.write_uncertain |= store.write_uncertain;
         result?;
         self.save_loaded(store)?;
+        self.clear_session_operations(checkpoint.session())?;
         Ok(true)
     }
 
@@ -731,7 +1044,7 @@ impl SessionStore for DirectorySessionStore {
         session: &SessionId,
         intent: &ToolIntentRecord,
     ) -> Result<(), AgentError> {
-        self.update(session, |store| store.record_intent(intent))
+        self.append_to_session(session, |store| store.record_intent(intent))
     }
 
     fn record_outcome(&mut self, _outcome: &ToolOutcomeRecord) -> Result<(), AgentError> {
@@ -745,7 +1058,7 @@ impl SessionStore for DirectorySessionStore {
         session: &SessionId,
         outcome: &ToolOutcomeRecord,
     ) -> Result<(), AgentError> {
-        self.update(session, |store| store.record_outcome(outcome))
+        self.append_to_session(session, |store| store.record_outcome(outcome))
     }
 
     fn delete_session(&mut self, session: &SessionId) -> Result<(), AgentError> {
@@ -753,11 +1066,15 @@ impl SessionStore for DirectorySessionStore {
         if !self.sessions.iter().any(|entry| &entry.session == session) {
             return Err(store_error("session was not found"));
         }
+        *self
+            .loaded
+            .lock()
+            .map_err(|_| store_error("session store is unavailable"))? = None;
         self.publish(session, None)
     }
 
     fn append_source_record(&mut self, record: &SourceRecord) -> Result<(), AgentError> {
-        self.update(record.session(), |store| store.append_source_record(record))
+        self.append_to_session(record.session(), |store| store.append_source_record(record))
     }
 
     fn load_source_records(
@@ -766,12 +1083,13 @@ impl SessionStore for DirectorySessionStore {
         after_sequence: u64,
         limit: usize,
     ) -> Result<Vec<SourceRecord>, AgentError> {
-        self.load_file_store(session)?
-            .load_source_records(session, after_sequence, limit)
+        self.read_selected(session, |store| {
+            store.load_source_records(session, after_sequence, limit)
+        })
     }
 
     fn last_source_sequence(&self, session: &SessionId) -> Result<u64, AgentError> {
-        self.load_file_store(session)?.last_source_sequence(session)
+        self.read_selected(session, |store| store.last_source_sequence(session))
     }
 
     fn append_source_items(
@@ -780,7 +1098,7 @@ impl SessionStore for DirectorySessionStore {
         run: &RunId,
         items: &[ModelContextItem],
     ) -> Result<u64, AgentError> {
-        self.update(session, |store| {
+        self.append_to_session(session, |store| {
             store.append_source_items(session, run, items)
         })
     }
@@ -795,19 +1113,154 @@ impl FileSessionStore {
         prepare_directory(&directory)?;
         let lock = acquire_lock(&directory)?;
         let path = directory.join("session-store.json");
-        let (sessions, intents, outcomes, source_records) = match read_snapshot(&path)? {
-            Some(bytes) => decode(&bytes)?,
+        let bytes = read_snapshot(&path)?;
+        let (sessions, intents, outcomes, source_records) = match &bytes {
+            Some(bytes) => decode(bytes)?,
             None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
-        Ok(Self {
+        let mut store = Self {
+            operations_path: operations_path_for(&path),
             path,
+            defer_operations_clear: false,
+            snapshot_current: snapshot_is_current(bytes.as_deref())?,
+            snapshot_budget: None,
             sessions,
             intents,
             outcomes,
             source_records,
             write_uncertain: false,
             _lock: lock,
-        })
+        };
+        store.load_operations()?;
+        Ok(store)
+    }
+
+    /// Loads the append-only operation journal that sits beside the last full
+    /// snapshot. A complete snapshot is written at checkpoint commits;
+    /// operation records then append here so every tool call does not rewrite
+    /// the whole session body. Duplicate records are accepted only when equal,
+    /// which makes crash recovery after a snapshot/journal overlap idempotent.
+    fn load_operations(&mut self) -> Result<(), AgentError> {
+        load_operations_from(
+            &self.operations_path,
+            &self.sessions,
+            &mut self.intents,
+            &mut self.outcomes,
+            &mut self.source_records,
+            true,
+        )
+    }
+
+    fn append_operation(
+        &mut self,
+        kind: &str,
+        record: Value,
+        pending_after: usize,
+    ) -> Result<(), AgentError> {
+        self.ensure_available()?;
+        let mut budget = match self.snapshot_budget {
+            Some(budget) => budget,
+            None => SnapshotBudget::from_bytes(&encode(
+                &self.sessions,
+                &self.intents,
+                &self.outcomes,
+                &self.source_records,
+            )?)?,
+        };
+        let additions = if kind == "source_batch" {
+            record
+                .as_array()
+                .ok_or_else(|| store_error("source batch is invalid"))?
+                .as_slice()
+        } else {
+            std::slice::from_ref(&record)
+        };
+        for addition in additions {
+            // One extra comma is conservative for an initially empty array.
+            budget.bytes += serde_json::to_vec(addition)
+                .map_err(|_| store_error("session record could not be encoded"))?
+                .len()
+                + 1;
+            budget.nodes += value_nodes(addition);
+        }
+        budget.check(pending_after)?;
+        let value = json!({
+            "revision": OPERATIONS_FORMAT_REVISION,
+            "kind": kind,
+            "record": record,
+        });
+        let mut line = serde_json::to_vec(&value)
+            .map_err(|_| store_error("session operation record could not be encoded"))?;
+        line.push(b'\n');
+        if line.len() > MAX_STORE_BYTES {
+            return Err(store_error("session operation record is too large"));
+        }
+        if kind == "outcome" && line.len() > MAX_OUTCOME_JOURNAL_LINE_BYTES {
+            return Err(store_error("session operation outcome is too large"));
+        }
+        let mut file = open_operations(&self.operations_path, true, true)?
+            .ok_or_else(|| store_error("session operation journal could not be opened"))?;
+        let existing = operations_length(&file)?;
+        if existing
+            .saturating_add(line.len())
+            .saturating_add(pending_after.saturating_mul(MAX_OUTCOME_JOURNAL_LINE_BYTES))
+            > MAX_STORE_BYTES
+        {
+            return Err(store_error(
+                "session operation journal size limit is exceeded",
+            ));
+        }
+        if !self.snapshot_current {
+            // Publish the format marker before exposing records in the journal.
+            // Keep any existing journal: it may overlap the upgraded snapshot.
+            let bytes = encode(
+                &self.sessions,
+                &self.intents,
+                &self.outcomes,
+                &self.source_records,
+            )?;
+            decode(&bytes)?;
+            atomic_write(
+                &self.path,
+                &bytes,
+                &mut self.write_uncertain,
+                sync_directory,
+            )?;
+            self.snapshot_current = true;
+        }
+        if operations_length(&file)? != existing {
+            return Err(store_error(
+                "session operation journal changed during append",
+            ));
+        }
+        if file.write_all(&line).is_err() || file.sync_all().is_err() {
+            self.write_uncertain = true;
+            return Err(store_error("session operation record could not be written"));
+        }
+        {
+            let parent = self
+                .operations_path
+                .parent()
+                .ok_or_else(|| store_error("session operation journal path is invalid"))?;
+            if sync_directory(parent).is_err() {
+                self.write_uncertain = true;
+                return Err(store_error(
+                    "session operation journal durability could not be confirmed",
+                ));
+            }
+        }
+        self.snapshot_budget = Some(budget);
+        Ok(())
+    }
+
+    fn clear_operations(&mut self) -> Result<(), AgentError> {
+        if remove_operations_file(&self.operations_path).is_err() {
+            self.write_uncertain = true;
+            return Err(store_error(
+                "session operation journal could not be removed",
+            ));
+        }
+        Ok(())
     }
 
     fn commit(
@@ -832,7 +1285,26 @@ impl FileSessionStore {
         let bytes = encode(&sessions, &intents, &outcomes, &source_records)?;
         // Every published snapshot must satisfy the same bounds as reopening it.
         decode(&bytes)?;
+        let budget = SnapshotBudget::from_bytes(&bytes)?;
+        let pending = intents
+            .iter()
+            .filter(|intent| {
+                !outcomes
+                    .iter()
+                    .any(|outcome| outcome.run == intent.run && outcome.call == intent.call)
+            })
+            .count();
+        budget.check(pending)?;
         atomic_write(&self.path, &bytes, &mut self.write_uncertain, sync)?;
+        self.snapshot_current = true;
+        self.snapshot_budget = Some(budget);
+        // The snapshot now contains every operation record. Removing the
+        // journal is a cleanup step: a crash before removal leaves duplicates
+        // that `load_operations` merges idempotently. Directory publication
+        // clears it only after the staged body is installed.
+        if !self.defer_operations_clear {
+            self.clear_operations()?;
+        }
         self.sessions = sessions;
         self.intents = intents;
         self.outcomes = outcomes;
@@ -848,6 +1320,50 @@ impl FileSessionStore {
         }
         Ok(())
     }
+
+    fn pending_outcomes(&self) -> usize {
+        self.intents
+            .iter()
+            .filter(|intent| {
+                !self
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.run == intent.run && outcome.call == intent.call)
+            })
+            .count()
+    }
+
+    fn check_pending_merge_budget(&mut self) -> Result<(), AgentError> {
+        let budget = match self.snapshot_budget {
+            Some(budget) => budget,
+            None => SnapshotBudget::from_bytes(&encode(
+                &self.sessions,
+                &self.intents,
+                &self.outcomes,
+                &self.source_records,
+            )?)?,
+        };
+        let pending = self.pending_outcomes();
+        budget.check(pending)?;
+        if let Some(file) = open_operations(&self.operations_path, false, false)?
+            && operations_length(&file)?
+                .saturating_add(pending.saturating_mul(MAX_OUTCOME_JOURNAL_LINE_BYTES))
+                > MAX_STORE_BYTES
+        {
+            return Err(capacity_error(
+                "session operation journal capacity is exhausted; restart in a new session",
+            ));
+        }
+        self.snapshot_budget = Some(budget);
+        Ok(())
+    }
+}
+
+fn snapshot_is_current(bytes: Option<&[u8]>) -> Result<bool, AgentError> {
+    let Some(bytes) = bytes else { return Ok(false) };
+    let root: Value =
+        serde_json::from_slice(bytes).map_err(|_| store_error("session store is invalid"))?;
+    Ok(number(field(&root, "revision")?)? == FILE_FORMAT_REVISION)
 }
 
 impl SessionStore for FileSessionStore {
@@ -896,8 +1412,8 @@ impl SessionStore for FileSessionStore {
             *current = checkpoint.clone();
         } else {
             if sessions.len() >= nexus_core::store::MAX_SESSIONS {
-                return Err(store_error(
-                    "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+                return Err(capacity_error(
+                    "session capacity reached; delete an old session with :session delete <id>",
                 ));
             }
             sessions.push(checkpoint.clone());
@@ -927,63 +1443,75 @@ impl SessionStore for FileSessionStore {
 
     fn record_intent(&mut self, intent: &ToolIntentRecord) -> Result<(), AgentError> {
         self.ensure_available()?;
-        if let Some(current) = self
+        if self
             .intents
             .iter()
-            .find(|current| current.run == intent.run && current.call == intent.call)
+            .any(|current| current.run == intent.run && current.call == intent.call)
         {
-            return if current == intent {
-                Ok(())
-            } else {
-                Err(store_error(
-                    "session store intent conflicts with existing record",
-                ))
-            };
+            merge_intent_record(&mut self.intents, intent.clone())?;
+            // A readable older journal may predate merged-budget reservations.
+            // Idempotence must not authorize dispatch from an unmergeable state.
+            return self.check_pending_merge_budget();
         }
         if self.intents.len() >= nexus_core::store::MAX_INTENT_RECORDS {
-            return Err(store_error(
+            return Err(capacity_error(
                 "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
             ));
         }
-        let mut intents = self.intents.clone();
-        intents.push(intent.clone());
-        self.commit(
-            self.sessions.clone(),
-            intents,
-            self.outcomes.clone(),
-            self.source_records.clone(),
-        )
+        let pending_outcomes = self.pending_outcomes();
+        let new_pending = usize::from(
+            !self
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.run == intent.run && outcome.call == intent.call),
+        );
+        if self
+            .outcomes
+            .len()
+            .saturating_add(pending_outcomes)
+            .saturating_add(new_pending)
+            > nexus_core::store::MAX_OUTCOME_RECORDS
+        {
+            return Err(capacity_error(
+                "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
+            ));
+        }
+        let reserved_after = pending_outcomes.saturating_add(new_pending);
+        self.append_operation("intent", intent_value(intent), reserved_after)?;
+        self.intents.push(intent.clone());
+        Ok(())
     }
 
     fn record_outcome(&mut self, outcome: &ToolOutcomeRecord) -> Result<(), AgentError> {
         self.ensure_available()?;
         check_outcome(outcome.status, outcome.effect)?;
-        if let Some(current) = self
+        if self
             .outcomes
             .iter()
-            .find(|current| current.run == outcome.run && current.call == outcome.call)
+            .any(|current| current.run == outcome.run && current.call == outcome.call)
         {
-            return if current == outcome {
-                Ok(())
-            } else {
-                Err(store_error(
-                    "session store outcome conflicts with existing record",
-                ))
-            };
+            return merge_outcome_record(&mut self.outcomes, outcome.clone());
         }
-        if self.outcomes.len() >= nexus_core::store::MAX_OUTCOME_RECORDS {
-            return Err(store_error(
+        let pending = self.pending_outcomes();
+        let matches_intent = self
+            .intents
+            .iter()
+            .any(|intent| intent.run == outcome.run && intent.call == outcome.call);
+        let pending_after = pending.saturating_sub(usize::from(matches_intent));
+        if self
+            .outcomes
+            .len()
+            .saturating_add(1)
+            .saturating_add(pending_after)
+            > nexus_core::store::MAX_OUTCOME_RECORDS
+        {
+            return Err(capacity_error(
                 "session operation history is full; restart in a new session, then delete an old saved session with :session delete <id>",
             ));
         }
-        let mut outcomes = self.outcomes.clone();
-        outcomes.push(outcome.clone());
-        self.commit(
-            self.sessions.clone(),
-            self.intents.clone(),
-            outcomes,
-            self.source_records.clone(),
-        )
+        self.append_operation("outcome", outcome_value(outcome), pending_after)?;
+        self.outcomes.push(outcome.clone());
+        Ok(())
     }
 
     fn append_source_record(&mut self, record: &SourceRecord) -> Result<(), AgentError> {
@@ -1021,14 +1549,13 @@ impl SessionStore for FileSessionStore {
                 "session source history is full; restart in a new session, then delete an old saved session with :session delete <id>",
             ));
         }
-        let mut records = self.source_records.clone();
-        records.push(record.clone());
-        self.commit(
-            self.sessions.clone(),
-            self.intents.clone(),
-            self.outcomes.clone(),
-            records,
-        )
+        self.append_operation(
+            "source_batch",
+            json!([source_record_value(record)]),
+            self.pending_outcomes(),
+        )?;
+        self.source_records.push(record.clone());
+        Ok(())
     }
 
     fn load_source_records(
@@ -1078,7 +1605,7 @@ impl SessionStore for FileSessionStore {
                 "session source history is full; restart in a new session, then delete an old saved session with :session delete <id>",
             ));
         }
-        let mut records = self.source_records.clone();
+        let mut records = Vec::with_capacity(items.len());
         for item in items {
             sequence = sequence
                 .checked_add(1)
@@ -1091,12 +1618,12 @@ impl SessionStore for FileSessionStore {
             )?);
         }
         if !items.is_empty() {
-            self.commit(
-                self.sessions.clone(),
-                self.intents.clone(),
-                self.outcomes.clone(),
-                records,
+            self.append_operation(
+                "source_batch",
+                Value::Array(records.iter().map(source_record_value).collect()),
+                self.pending_outcomes(),
             )?;
+            self.source_records.extend(records);
         }
         Ok(sequence)
     }
@@ -1141,7 +1668,11 @@ fn decode(bytes: &[u8]) -> Result<SnapshotRecords, AgentError> {
         ],
     )?;
     let revision = number(field(&root, "revision")?)?;
-    if revision != FILE_FORMAT_REVISION && revision != PREVIOUS_FILE_FORMAT_REVISION {
+    if revision != FILE_FORMAT_REVISION
+        && revision != JOURNALED_FILE_FORMAT_REVISION
+        && revision != PREVIOUS_FILE_FORMAT_REVISION
+        && revision != LEGACY_FILE_FORMAT_REVISION
+    {
         return Err(store_error("session store format revision is unsupported"));
     }
     let sessions = bounded_array(field(&root, "sessions")?, nexus_core::store::MAX_SESSIONS)?
@@ -1776,6 +2307,45 @@ fn create_private(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
+fn open_operations(path: &Path, write: bool, append: bool) -> Result<Option<File>, AgentError> {
+    use rustix::fs::{Mode, OFlags, open};
+    let mut flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    flags |= if write { OFlags::RDWR } else { OFlags::RDONLY };
+    if append {
+        flags |= OFlags::APPEND | OFlags::CREATE;
+    }
+    match open(path, flags, Mode::from_raw_mode(0o600)) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(rustix::io::Errno::NOENT) if !append => Ok(None),
+        Err(_) => Err(store_error("session operation journal could not be opened")),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_operations(_: &Path, _: bool, _: bool) -> Result<Option<File>, AgentError> {
+    Err(store_error(
+        "private session operation storage is unsupported on this platform",
+    ))
+}
+
+fn operations_length(file: &File) -> Result<usize, AgentError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| store_error("session operation journal could not be read"))?;
+    if !metadata.is_file() || metadata.len() > MAX_STORE_BYTES as u64 {
+        return Err(store_error("session operation journal is invalid"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            return Err(store_error("session operation journal is not private"));
+        }
+    }
+    usize::try_from(metadata.len()).map_err(|_| store_error("session operation journal is invalid"))
+}
+
+#[cfg(unix)]
 fn prepare_directory(path: &Path) -> Result<(), AgentError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let mut builder = fs::DirBuilder::new();
@@ -1820,6 +2390,15 @@ fn store_error(message: &'static str) -> AgentError {
         RetryGuidance::DoNotRetry,
     )
     .expect("static session-store message builds")
+}
+
+fn capacity_error(message: &'static str) -> AgentError {
+    AgentError::new(
+        ErrorCategory::ResourceLimit,
+        message,
+        RetryGuidance::DoNotRetry,
+    )
+    .expect("static session-store capacity message builds")
 }
 
 #[cfg(test)]
@@ -2209,16 +2788,25 @@ mod tests {
         store.initialize_session(&checkpoint_a).unwrap();
         store.initialize_session(&checkpoint_b).unwrap();
         let session = checkpoint_a.session();
-        for index in 0..nexus_core::store::MAX_INTENT_RECORDS {
-            let intent = ToolIntentRecord {
+        let intents = (0..nexus_core::store::MAX_INTENT_RECORDS)
+            .map(|index| ToolIntentRecord {
                 run: RunId::new(format!("run-{index}")).unwrap(),
                 call: CallId::new("call").unwrap(),
                 tool: ToolId::new("read", M0_REVISION).unwrap(),
                 args: NormalizedArgs::new("{}").unwrap(),
                 scope: ApprovedScope::new("read").unwrap(),
-            };
-            store.record_session_intent(session, &intent).unwrap();
-        }
+            })
+            .collect::<Vec<_>>();
+        store
+            .update(session, |file| {
+                file.commit(
+                    file.sessions.clone(),
+                    intents,
+                    file.outcomes.clone(),
+                    file.source_records.clone(),
+                )
+            })
+            .unwrap();
         let other_intent = ToolIntentRecord {
             run: RunId::new("run-other").unwrap(),
             call: CallId::new("call").unwrap(),
@@ -2226,6 +2814,10 @@ mod tests {
             args: NormalizedArgs::new("{}").unwrap(),
             scope: ApprovedScope::new("read").unwrap(),
         };
+        let error = store
+            .record_session_intent(session, &other_intent)
+            .expect_err("the exhausted session rejects further intent");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
         store
             .record_session_intent(checkpoint_b.session(), &other_intent)
             .unwrap();
@@ -2380,6 +2972,732 @@ mod tests {
         assert_eq!(reopened.load_session(&session).unwrap(), checkpoint);
         assert_eq!(reopened.source_records, original_records);
         drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn operation_journal_extends_capacity_beyond_the_previous_bound() {
+        let directory = directory("operation-journal-capacity");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let initial = checkpoint(1, "journal cap");
+        store.save_checkpoint(&initial).unwrap();
+        for index in 0..300 {
+            let intent = ToolIntentRecord {
+                run: RunId::new("run-long").unwrap(),
+                call: CallId::new(format!("call-{index}")).unwrap(),
+                tool: ToolId::new("host_write", M0_REVISION).unwrap(),
+                args: NormalizedArgs::new("{}").unwrap(),
+                scope: ApprovedScope::new("project-write").unwrap(),
+            };
+            store.record_intent(&intent).unwrap();
+            store
+                .record_outcome(&ToolOutcomeRecord {
+                    run: intent.run,
+                    call: intent.call,
+                    status: ExecutionStatus::Succeeded,
+                    effect: EffectState::Unknown,
+                    evidence: Evidence::Uncertain,
+                    truncated: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(store.intents.len(), 300);
+        assert_eq!(store.outcomes.len(), 300);
+        assert!(store.operations_path.exists());
+        let snapshot = decode(&fs::read(&store.path).unwrap()).unwrap();
+        assert!(
+            snapshot.1.is_empty(),
+            "append path does not rewrite the body"
+        );
+        drop(store);
+
+        let mut reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.intents.len(), 300);
+        assert_eq!(reopened.outcomes.len(), 300);
+        reopened
+            .save_checkpoint(&checkpoint(2, "compacted"))
+            .unwrap();
+        assert!(!reopened.operations_path.exists());
+        drop(reopened);
+
+        let reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.intents.len(), 300);
+        assert_eq!(reopened.outcomes.len(), 300);
+        assert_eq!(
+            reopened
+                .load_session(initial.session())
+                .unwrap()
+                .logical_revision(),
+            2
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn outcome_journal_reservation_covers_a_maximum_bound_outcome() {
+        let outcome = ToolOutcomeRecord {
+            run: RunId::new("r".repeat(64)).unwrap(),
+            call: CallId::new("c".repeat(64)).unwrap(),
+            status: ExecutionStatus::Succeeded,
+            effect: EffectState::KnownApplied,
+            evidence: Evidence::HostObserved,
+            truncated: true,
+        };
+        let line = serde_json::to_vec(&json!({
+            "revision": OPERATIONS_FORMAT_REVISION,
+            "kind": "outcome",
+            "record": outcome_value(&outcome),
+        }))
+        .unwrap();
+        assert!(line.len() < MAX_OUTCOME_JOURNAL_LINE_BYTES);
+        assert_eq!(value_nodes(&outcome_value(&outcome)), OUTCOME_NODES);
+    }
+
+    #[test]
+    fn merged_snapshot_reserves_bytes_and_nodes_before_dispatch_and_source_append() {
+        for node_bound in [false, true] {
+            for reject_intent in [false, true] {
+                let directory = directory("merged-budget");
+                let mut store = FileSessionStore::open(&directory).unwrap();
+                let initial = checkpoint(1, "seed");
+                let session = initial.session().clone();
+                let run = RunId::new("run").unwrap();
+                let intent = ToolIntentRecord {
+                    run: run.clone(),
+                    call: CallId::new("call").unwrap(),
+                    tool: ToolId::new("read", M0_REVISION).unwrap(),
+                    args: NormalizedArgs::new("{}").unwrap(),
+                    scope: ApprovedScope::new("read").unwrap(),
+                };
+                let small = ModelContextItem::user_text("x").unwrap();
+                let make_record = |sequence, item| {
+                    SourceRecord::new(session.clone(), sequence, run.clone(), item).unwrap()
+                };
+                let mut records;
+                if node_bound {
+                    let large = ModelContextItem::tool_result(
+                        CallId::new("call").unwrap(),
+                        "item",
+                        "ref",
+                        intent.tool.clone(),
+                        ToolOutcome::new(
+                            ExecutionStatus::Succeeded,
+                            EffectState::Unknown,
+                            Evidence::Uncertain,
+                            "ok",
+                            false,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let base = SnapshotBudget::from_bytes(
+                        &encode(std::slice::from_ref(&initial), &[], &[], &[]).unwrap(),
+                    )
+                    .unwrap();
+                    let target =
+                        MAX_SNAPSHOT_NODES - value_nodes(&intent_value(&intent)) - OUTCOME_NODES
+                            + usize::from(reject_intent);
+                    let large_nodes =
+                        value_nodes(&source_record_value(&make_record(1, large.clone())));
+                    let small_nodes =
+                        value_nodes(&source_record_value(&make_record(1, small.clone())));
+                    let count = (0..=(target - base.nodes) / large_nodes)
+                        .rev()
+                        .find(|n| {
+                            (target - base.nodes - n * large_nodes).is_multiple_of(small_nodes)
+                        })
+                        .unwrap();
+                    records = (0..count)
+                        .map(|n| make_record(n as u64 + 1, large.clone()))
+                        .collect::<Vec<_>>();
+                    let rest = (target - base.nodes - count * large_nodes) / small_nodes;
+                    for _ in 0..rest {
+                        records.push(make_record(records.len() as u64 + 1, small.clone()));
+                    }
+                } else {
+                    records = (1..=300)
+                        .map(|n| make_record(n, small.clone()))
+                        .collect::<Vec<_>>();
+                    let base = encode(std::slice::from_ref(&initial), &[], &[], &records)
+                        .unwrap()
+                        .len();
+                    let target = MAX_STORE_BYTES
+                        - serde_json::to_vec(&intent_value(&intent)).unwrap().len()
+                        - 1
+                        - MAX_OUTCOME_JOURNAL_LINE_BYTES
+                        + usize::from(reject_intent);
+                    let padding = target - base;
+                    for (index, record) in records.iter_mut().enumerate() {
+                        let length = 1 + padding / 300 + usize::from(index < padding % 300);
+                        *record = make_record(
+                            index as u64 + 1,
+                            ModelContextItem::user_text("x".repeat(length)).unwrap(),
+                        );
+                    }
+                }
+                store
+                    .commit(vec![initial], vec![], vec![], records)
+                    .unwrap();
+                drop(store);
+                let mut store = FileSessionStore::open(&directory).unwrap();
+                let snapshot = fs::read(&store.path).unwrap();
+                if reject_intent {
+                    assert_eq!(
+                        store.record_intent(&intent).unwrap_err().category(),
+                        ErrorCategory::ResourceLimit
+                    );
+                    assert!(!store.operations_path.exists());
+                    // Revision 4 could already contain an intent without a
+                    // merged-outcome reservation. Reading it remains allowed,
+                    // but re-recording it must not authorize dispatch.
+                    let mut legacy: Value = serde_json::from_slice(
+                        &encode(
+                            &store.sessions,
+                            std::slice::from_ref(&intent),
+                            &[],
+                            &store.source_records,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    legacy["revision"] = json!(4);
+                    if !node_bound {
+                        let text = legacy["source_records"][0]["item"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        legacy["source_records"][0]["item"]["text"] = json!(format!("{text}x"));
+                    }
+                    let path = store.path.clone();
+                    drop(store);
+                    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+                    let mut reopened = FileSessionStore::open(&directory).unwrap();
+                    assert_eq!(
+                        reopened.record_intent(&intent).unwrap_err().category(),
+                        ErrorCategory::ResourceLimit
+                    );
+                } else {
+                    store.record_intent(&intent).unwrap();
+                    let journal = fs::read(&store.operations_path).unwrap();
+                    assert!(
+                        store
+                            .append_source_items(
+                                &session,
+                                &run,
+                                &[ModelContextItem::user_text("extra").unwrap()]
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(fs::read(&store.operations_path).unwrap(), journal);
+                    assert!(
+                        store
+                            .record_intent(&ToolIntentRecord {
+                                call: CallId::new("next").unwrap(),
+                                ..intent.clone()
+                            })
+                            .is_err()
+                    );
+                    assert_eq!(fs::read(&store.path).unwrap(), snapshot);
+                    drop(store);
+                    let mut store = FileSessionStore::open(&directory).unwrap();
+                    store
+                        .record_outcome(&ToolOutcomeRecord {
+                            run: intent.run,
+                            call: intent.call,
+                            status: ExecutionStatus::Succeeded,
+                            effect: EffectState::KnownApplied,
+                            evidence: Evidence::HostObserved,
+                            truncated: false,
+                        })
+                        .unwrap();
+                    store.save_checkpoint(&checkpoint(2, "seed")).unwrap();
+                    drop(store);
+                    let reopened = FileSessionStore::open(&directory).unwrap();
+                    assert_eq!(reopened.intents.len(), 1);
+                    assert_eq!(reopened.outcomes.len(), 1);
+                    assert!(!reopened.operations_path.exists());
+                }
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_node_limit_matches_strict_document_parser() {
+        let mut value = String::from("{\"nodes\":[");
+        value.push_str(&vec!["0"; MAX_SNAPSHOT_NODES - 2].join(","));
+        value.push_str("]}");
+        assert!(nexus_validation::parse_document_object(&value, MAX_STORE_BYTES).is_ok());
+        value.insert_str(value.len() - 2, ",0");
+        assert!(nexus_validation::parse_document_object(&value, MAX_STORE_BYTES).is_err());
+    }
+
+    #[test]
+    fn directory_source_batches_append_without_rewriting_snapshot_and_recover_whole_lines() {
+        let directory = directory("directory-source-journal");
+        let initial = checkpoint(1, "seed");
+        let session = initial.session();
+        let run = RunId::new("run").unwrap();
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        store.initialize_session(&initial).unwrap();
+        let body = store.session_path(session);
+        let original = fs::read(&body).unwrap();
+        let index = fs::read(&store.index_path).unwrap();
+        let items = vec![
+            ModelContextItem::user_text("one").unwrap(),
+            ModelContextItem::user_text("two").unwrap(),
+        ];
+        store.append_source_items(session, &run, &items).unwrap();
+        let record = store.load_source_records(session, 0, 1).unwrap().remove(0);
+        store.append_source_record(&record).unwrap();
+        assert!(
+            store
+                .append_source_record(
+                    &SourceRecord::new(
+                        session.clone(),
+                        1,
+                        run.clone(),
+                        ModelContextItem::user_text("conflict").unwrap()
+                    )
+                    .unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&body).unwrap(), original);
+        assert_eq!(fs::read(&store.index_path).unwrap(), index);
+        let journal = operations_path_for(&body);
+        let complete = fs::read(&journal).unwrap();
+        assert_eq!(complete.iter().filter(|byte| **byte == b'\n').count(), 1);
+        drop(store);
+        // Representative incomplete suffixes of a multi-record batch expose
+        // neither its first record nor its second record on recovery.
+        let tail_records = [3, 4].map(|sequence| {
+            SourceRecord::new(session.clone(), sequence, run.clone(), items[0].clone()).unwrap()
+        });
+        let mut tail = serde_json::to_vec(&json!({"revision": 1, "kind": "source_batch", "record": tail_records.iter().map(source_record_value).collect::<Vec<_>>() })).unwrap();
+        tail.push(b'\n');
+        for cut in [1, tail.len() / 2, tail.len() - 1, tail.len()] {
+            let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+            file.write_all(&tail[..cut]).unwrap();
+            drop(file);
+            let mut store = DirectorySessionStore::open(&directory).unwrap();
+            let expected = if cut == tail.len() { 4 } else { 2 };
+            assert_eq!(store.last_source_sequence(session).unwrap(), expected);
+            assert_eq!(fs::read(&body).unwrap(), original);
+            if cut == tail.len() {
+                store.save_checkpoint(&checkpoint(2, "seed")).unwrap();
+            } else {
+                assert_eq!(fs::read(&journal).unwrap(), complete);
+            }
+        }
+        let store = DirectorySessionStore::open(&directory).unwrap();
+        assert_eq!(store.last_source_sequence(session).unwrap(), 4);
+        assert!(!journal.exists());
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selected_cache_is_bounded_and_invalidated_by_checkpoint_and_deletion() {
+        let directory = directory("selected-cache");
+        let mut store = DirectorySessionStore::open(&directory).unwrap();
+        let run = RunId::new("run").unwrap();
+        for id in ["first", "second"] {
+            let initial = checkpoint_for(id, 1, "seed");
+            store.initialize_session(&initial).unwrap();
+            store
+                .append_source_items(
+                    initial.session(),
+                    &run,
+                    &[ModelContextItem::user_text(id).unwrap()],
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .loaded
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .sessions
+                    .len(),
+                1
+            );
+        }
+        let first = SessionId::new("first").unwrap();
+        assert_eq!(store.last_source_sequence(&first).unwrap(), 1);
+        store
+            .save_checkpoint(&checkpoint_for("first", 2, "updated"))
+            .unwrap();
+        assert!(store.loaded.lock().unwrap().is_none());
+        assert_eq!(store.last_source_sequence(&first).unwrap(), 1);
+        store.delete_session(&first).unwrap();
+        assert!(store.loaded.lock().unwrap().is_none());
+        assert!(store.load_session(&first).is_err());
+        store
+            .initialize_session(&checkpoint_for("first", 1, "fresh"))
+            .unwrap();
+        assert_eq!(store.last_source_sequence(&first).unwrap(), 0);
+        drop(store);
+        let store = DirectorySessionStore::open(&directory).unwrap();
+        assert_eq!(store.last_source_sequence(&first).unwrap(), 0);
+        assert_eq!(
+            store
+                .last_source_sequence(&SessionId::new("second").unwrap())
+                .unwrap(),
+            1
+        );
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_journal_overlap_is_idempotent_but_complete_conflicts_and_gaps_fail_closed() {
+        let directory = directory("source-overlap");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let initial = checkpoint(1, "seed");
+        let session = initial.session().clone();
+        let run = RunId::new("run").unwrap();
+        store.initialize_session(&initial).unwrap();
+        store
+            .append_source_items(
+                &session,
+                &run,
+                &[ModelContextItem::user_text("retained").unwrap()],
+            )
+            .unwrap();
+        // Simulate a crash after snapshot publication but before journal cleanup.
+        store.defer_operations_clear = true;
+        store.save_checkpoint(&checkpoint(2, "seed")).unwrap();
+        let journal = store.operations_path.clone();
+        let complete = fs::read(&journal).unwrap();
+        drop(store);
+        let reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.source_records.len(), 1);
+        drop(reopened);
+        for sequences in [vec![1], vec![2, 4]] {
+            let records = sequences
+                .into_iter()
+                .map(|sequence| {
+                    SourceRecord::new(
+                        session.clone(),
+                        sequence,
+                        run.clone(),
+                        ModelContextItem::user_text("changed").unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut bytes = complete.clone();
+            bytes.extend(serde_json::to_vec(&json!({"revision": 1, "kind": "source_batch", "record": records.iter().map(source_record_value).collect::<Vec<_>>() })).unwrap());
+            bytes.extend_from_slice(b"\n{\"incomplete\"");
+            fs::write(&journal, &bytes).unwrap();
+            assert!(FileSessionStore::open(&directory).is_err());
+            assert_eq!(fs::read(&journal).unwrap(), bytes);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_snapshots_are_upgraded_before_the_first_operation_append() {
+        for revision in [2, 3, 4] {
+            for directory_store in [false, true] {
+                let directory = directory(&format!("upgrade-{revision}-{directory_store}"));
+                let initial = checkpoint(1, "upgrade");
+                let path = if directory_store {
+                    let mut store = DirectorySessionStore::open(&directory).unwrap();
+                    store.initialize_session(&initial).unwrap();
+                    store.session_path(initial.session())
+                } else {
+                    let mut store = FileSessionStore::open(&directory).unwrap();
+                    store.save_checkpoint(&initial).unwrap();
+                    store.path.clone()
+                };
+                let current = fs::read_to_string(&path).unwrap();
+                fs::write(
+                    &path,
+                    current.replacen("\"revision\":5", &format!("\"revision\":{revision}"), 1),
+                )
+                .unwrap();
+                let outcome = ToolOutcomeRecord {
+                    run: RunId::new("run-upgrade").unwrap(),
+                    call: CallId::new("call-upgrade").unwrap(),
+                    status: ExecutionStatus::Succeeded,
+                    effect: EffectState::KnownApplied,
+                    evidence: Evidence::HostObserved,
+                    truncated: false,
+                };
+                if directory_store {
+                    let mut store = DirectorySessionStore::open(&directory).unwrap();
+                    store
+                        .record_session_outcome(initial.session(), &outcome)
+                        .unwrap();
+                    assert_eq!(
+                        store.load_file_store(initial.session()).unwrap().outcomes,
+                        vec![outcome]
+                    );
+                } else {
+                    let mut store = FileSessionStore::open(&directory).unwrap();
+                    store.record_outcome(&outcome).unwrap();
+                    drop(store);
+                    assert_eq!(
+                        FileSessionStore::open(&directory).unwrap().outcomes,
+                        vec![outcome]
+                    );
+                }
+                assert!(
+                    fs::read_to_string(&path)
+                        .unwrap()
+                        .contains("\"revision\":5")
+                );
+                fs::remove_dir_all(directory).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_outcomes_cannot_consume_pending_outcome_reservations() {
+        let directory = directory("pending-outcome-reservations");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        store
+            .save_checkpoint(&checkpoint(1, "reservation"))
+            .unwrap();
+        let intent = ToolIntentRecord {
+            run: RunId::new("run-reservation").unwrap(),
+            call: CallId::new("pending").unwrap(),
+            tool: ToolId::new("read", M0_REVISION).unwrap(),
+            args: NormalizedArgs::new("{}").unwrap(),
+            scope: ApprovedScope::new("read").unwrap(),
+        };
+        store.record_intent(&intent).unwrap();
+        let outcome = ToolOutcomeRecord {
+            run: intent.run.clone(),
+            call: intent.call.clone(),
+            status: ExecutionStatus::Succeeded,
+            effect: EffectState::KnownApplied,
+            evidence: Evidence::HostObserved,
+            truncated: false,
+        };
+        let unrelated = ToolOutcomeRecord {
+            call: CallId::new("unrelated").unwrap(),
+            ..outcome.clone()
+        };
+        store.outcomes = (0..nexus_core::store::MAX_OUTCOME_RECORDS - 1)
+            .map(|index| ToolOutcomeRecord {
+                call: CallId::new(format!("old-{index}")).unwrap(),
+                ..outcome.clone()
+            })
+            .collect();
+        assert_eq!(
+            store.record_outcome(&unrelated).unwrap_err().category(),
+            ErrorCategory::ResourceLimit
+        );
+        store.outcomes.clear();
+
+        // Fill the journal with harmless empty lines up to the reserved margin.
+        let current = fs::metadata(&store.operations_path).unwrap().len() as usize;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&store.operations_path)
+            .unwrap();
+        file.write_all(&vec![
+            b'\n';
+            MAX_STORE_BYTES
+                - MAX_OUTCOME_JOURNAL_LINE_BYTES
+                - current
+        ])
+        .unwrap();
+        drop(file);
+        assert!(store.record_outcome(&unrelated).is_err());
+        store.record_outcome(&outcome).unwrap();
+        drop(store);
+        let reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.outcomes, vec![outcome]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn operation_journal_recovers_duplicate_and_partial_records() {
+        let directory = directory("operation-journal-recovery");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        store.save_checkpoint(&checkpoint(1, "recovery")).unwrap();
+        let intent = ToolIntentRecord {
+            run: RunId::new("run-recovery").unwrap(),
+            call: CallId::new("call-recovery").unwrap(),
+            tool: ToolId::new("host_write", M0_REVISION).unwrap(),
+            args: NormalizedArgs::new("{}").unwrap(),
+            scope: ApprovedScope::new("project-write").unwrap(),
+        };
+        store.record_intent(&intent).unwrap();
+        let line = fs::read_to_string(&store.operations_path).unwrap();
+        drop(store);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join("session-store.operations.jsonl"))
+            .unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+        file.write_all(br#"{"revision":1"#).unwrap();
+        drop(file);
+
+        let mut reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.intents, vec![intent.clone()]);
+        let repaired = fs::read(&reopened.operations_path).unwrap();
+        assert!(repaired.ends_with(b"\n"));
+        assert_eq!(repaired, format!("{line}{line}").into_bytes());
+        reopened
+            .record_intent(&ToolIntentRecord {
+                call: CallId::new("call-after-recovery").unwrap(),
+                ..intent
+            })
+            .unwrap();
+        drop(reopened);
+        let reopened = FileSessionStore::open(&directory).unwrap();
+        assert_eq!(reopened.intents.len(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_complete_journal_record_does_not_truncate_partial_tail() {
+        let directory = directory("invalid-journal-tail");
+        let store = FileSessionStore::open(&directory).unwrap();
+        let path = store.operations_path.clone();
+        let bytes = b"{\"revision\":99,\"kind\":\"intent\",\"record\":{}}\npartial";
+        let mut file = create_private(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        drop(file);
+        drop(store);
+        assert!(FileSessionStore::open(&directory).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_symlinks_are_rejected_for_recovery_and_append() {
+        use std::os::unix::fs::symlink;
+        let directory = directory("journal-symlink");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        store.save_checkpoint(&checkpoint(1, "symlink")).unwrap();
+        let target = directory.join("target");
+        let mut file = create_private(&target).unwrap();
+        file.write_all(b"untouched partial").unwrap();
+        drop(file);
+        symlink(&target, &store.operations_path).unwrap();
+        let outcome = ToolOutcomeRecord {
+            run: RunId::new("symlink-run").unwrap(),
+            call: CallId::new("symlink-call").unwrap(),
+            status: ExecutionStatus::Succeeded,
+            effect: EffectState::KnownApplied,
+            evidence: Evidence::HostObserved,
+            truncated: false,
+        };
+        assert!(store.record_outcome(&outcome).is_err());
+        drop(store);
+        assert!(FileSessionStore::open(&directory).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"untouched partial");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_hard_links_are_rejected_without_modifying_target() {
+        let directory = directory("journal-hard-link");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        store.save_checkpoint(&checkpoint(1, "hard link")).unwrap();
+        let target = directory.join("target");
+        let mut file = create_private(&target).unwrap();
+        file.write_all(b"untouched partial").unwrap();
+        drop(file);
+        fs::hard_link(&target, &store.operations_path).unwrap();
+        let outcome = ToolOutcomeRecord {
+            run: RunId::new("hard-link-run").unwrap(),
+            call: CallId::new("hard-link-call").unwrap(),
+            status: ExecutionStatus::Succeeded,
+            effect: EffectState::KnownApplied,
+            evidence: Evidence::HostObserved,
+            truncated: false,
+        };
+        assert!(store.record_outcome(&outcome).is_err());
+        drop(store);
+        assert!(FileSessionStore::open(&directory).is_err());
+        assert_eq!(fs::read(target).unwrap(), b"untouched partial");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_with_non_private_permissions_is_rejected_without_modification() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = directory("journal-permissions");
+        let store = FileSessionStore::open(&directory).unwrap();
+        let path = store.operations_path.clone();
+        let mut file = create_private(&path).unwrap();
+        file.write_all(b"partial").unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o644))
+            .unwrap();
+        drop(file);
+        drop(store);
+        assert!(FileSessionStore::open(&directory).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"partial");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_journal_descriptor_is_not_redirected_by_path_replacement() {
+        use std::os::unix::fs::symlink;
+        let directory = directory("journal-descriptor");
+        let store = FileSessionStore::open(&directory).unwrap();
+        let path = store.operations_path.clone();
+        let original = directory.join("original");
+        let target = directory.join("target");
+        let mut file = create_private(&path).unwrap();
+        file.write_all(b"valid\npartial").unwrap();
+        drop(file);
+        let descriptor = open_operations(&path, true, false).unwrap().unwrap();
+        fs::rename(&path, &original).unwrap();
+        fs::write(&target, b"do not truncate").unwrap();
+        symlink(&target, &path).unwrap();
+        descriptor.set_len(6).unwrap();
+        assert_eq!(fs::read(&original).unwrap(), b"valid\n");
+        assert_eq!(fs::read(&target).unwrap(), b"do not truncate");
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn intent_is_rejected_before_dispatch_when_outcome_capacity_is_exhausted() {
+        let directory = directory("outcome-capacity");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let initial = checkpoint(1, "outcome cap");
+        store.save_checkpoint(&initial).unwrap();
+        let outcomes = (0..nexus_core::store::MAX_OUTCOME_RECORDS)
+            .map(|index| ToolOutcomeRecord {
+                run: RunId::new("run-capacity").unwrap(),
+                call: CallId::new(format!("outcome-{index}")).unwrap(),
+                status: ExecutionStatus::Succeeded,
+                effect: EffectState::KnownApplied,
+                evidence: Evidence::HostObserved,
+                truncated: false,
+            })
+            .collect::<Vec<_>>();
+        store
+            .commit(vec![initial], Vec::new(), outcomes, Vec::new())
+            .unwrap();
+        let before = fs::read(&store.path).unwrap();
+        let error = store
+            .record_intent(&ToolIntentRecord {
+                run: RunId::new("run-capacity").unwrap(),
+                call: CallId::new("new-intent").unwrap(),
+                tool: ToolId::new("host_write", M0_REVISION).unwrap(),
+                args: NormalizedArgs::new("{}").unwrap(),
+                scope: ApprovedScope::new("project-write").unwrap(),
+            })
+            .expect_err("outcome capacity must be reserved before dispatch");
+        assert_eq!(error.category(), ErrorCategory::ResourceLimit);
+        assert_eq!(fs::read(&store.path).unwrap(), before);
+        assert!(!store.operations_path.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2620,8 +3938,8 @@ mod tests {
     }
 
     #[test]
-    fn revision_two_snapshots_remain_readable_and_new_status_round_trips() {
-        let directory = directory("revision-two");
+    fn older_snapshots_remain_readable_and_current_revision_round_trips() {
+        let directory = directory("older-revisions");
         let session = SessionId::new("session-a").expect("valid session");
         let run = RunId::new("run-a").expect("valid run");
         let mut store = FileSessionStore::open(&directory).expect("store opens");
@@ -2631,10 +3949,7 @@ mod tests {
         drop(store);
 
         let path = directory.join("session-store.json");
-        let v3 = fs::read_to_string(&path).expect("snapshot reads");
-        let v2 = v3.replacen("\"revision\":3", "\"revision\":2", 1);
-        fs::write(&path, v2).expect("legacy revision snapshot written");
-        let mut store = FileSessionStore::open(&directory).expect("revision 2 remains readable");
+        let current = fs::read_to_string(&path).expect("snapshot reads");
         let interrupted = ToolOutcome::new(
             ExecutionStatus::Interrupted,
             EffectState::Unknown,
@@ -2651,18 +3966,25 @@ mod tests {
             interrupted,
         )
         .expect("tool result builds");
-        store
-            .append_source_items(&session, &run, std::slice::from_ref(&item))
-            .expect("revision 3 write succeeds");
-        drop(store);
+        for revision in [2, 3, 4] {
+            remove_operations_file(&operations_path_for(&path)).unwrap();
+            let legacy = current.replacen("\"revision\":5", &format!("\"revision\":{revision}"), 1);
+            fs::write(&path, legacy).expect("legacy revision snapshot written");
+            let mut store = FileSessionStore::open(&directory)
+                .unwrap_or_else(|_| panic!("revision {revision} remains readable"));
+            store
+                .append_source_items(&session, &run, std::slice::from_ref(&item))
+                .expect("current revision write succeeds");
+            drop(store);
 
-        let reopened = FileSessionStore::open(&directory).expect("revision 3 reopens");
-        assert_eq!(
-            reopened.load_source_records(&session, 0, 1).unwrap()[0].item(),
-            &item
-        );
-        let saved = fs::read_to_string(&path).expect("new snapshot reads");
-        assert!(saved.contains("\"revision\":3"));
+            let reopened = FileSessionStore::open(&directory).expect("current revision reopens");
+            assert_eq!(
+                reopened.load_source_records(&session, 0, 1).unwrap()[0].item(),
+                &item
+            );
+            let saved = fs::read_to_string(&path).expect("new snapshot reads");
+            assert!(saved.contains("\"revision\":5"));
+        }
         fs::remove_dir_all(directory).expect("test directory cleanup");
     }
 

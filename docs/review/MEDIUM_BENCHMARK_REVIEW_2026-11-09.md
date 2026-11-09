@@ -14,6 +14,83 @@ budgets.
 **Deliverable:** Findings and recommendations only. No product code, workflow,
 permission, or deployment changes were made while preparing this review.
 
+**Follow-up implementation (2026-11-09):** F1 and F3 have partial fixes,
+exercised by the 30-task rerun below, including a bounded operation/source-batch journal, larger record limits,
+merged-snapshot bytes/nodes reservations, a one-selected-session cache and explicit
+backend state propagation. Offline regressions cover near-byte/node capacity,
+pending outcomes across reopen, atomic source-batch tails, directory append-only
+source writes and revisions 2/3/4 upgrading to 5. These are not a production or
+cross-platform durability qualification. F2, F4,
+F5, F6, and F7 remain open as described below; the original evidence is retained.
+
+**Follow-up 30-task campaign (2026-11-09/10):** The same fixed medium selection,
+model and five-worker shape were rerun on source baseline `39c6d24` plus the
+then-working-tree fixes. All **30/30 gold-patch
+preflights resolved**. Live attempts produced **29 completed, one failed, and 30
+nonempty patches**. Official prediction evaluation produced **23 resolved, five
+unresolved, and two ambiguous failures**; there were no empty patches or missing
+predictions. Cumulative agent time was **26,562.283 seconds**, with **1,491 tool
+calls** and **46,071,350 input / 759,602 output tokens** (the failed attempt's
+final usage was incomplete/null).
+
+The failed live attempt was `sphinx-doc__sphinx-10673`: a delayed worker returned
+`BackendState::Unavailable`, and the runtime stopped with `ToolFailure` after
+capturing a 7,817-byte patch. That patch was still officially resolved, so the
+agent terminal state and the official result must remain separate. The five
+unresolved tasks were Astropy 13033, Django 16877 and 16502, scikit-learn 25747
+and Sphinx 7985. The ambiguous results were Sphinx 10614 (`no_tests_collected`)
+and Pylint 4661 (`missing_module`); neither is counted as resolved.
+
+This rerun is not a controlled A/B. The first medium run produced 20 resolved,
+six unresolved, two empty patches, one preflight failure and one ambiguous
+result; the rerun had no empty patch or preflight failure. Runtime, harness,
+date and host conditions differed, so the higher count is not proof that a
+specific change caused the improvement. F4-F7 remain open, and 23/30 remains a
+selected diagnostic sample rather than a blind or representative score. See the
+[merged campaign summary](../../../nexus-benchmark-work/verified-medium30-v2/campaign-summary.json).
+
+Operational hardening exercised by the rerun: hosted-endpoint `prepare` now
+accepts the explicit hosted-inference opt-in while still requiring
+`--prepare-only`; preflight `git status` uses a 300-second bounded wait; and
+Docker gateway preparation/cleanup waits are 120/15 seconds. These avoid
+misclassifying slow Docker Desktop operations as task failures, but they do not
+establish a safe concurrency level or production durability.
+
+An offline debug-profile measurement using a fake provider and tool with the
+real directory store took 1.52, 5.80, 33.74 and 111.98 seconds for 16, 64,
+256 and 512 calls respectively on one local macOS run. These are single samples,
+not production benchmarks. After the source journal and selected-session cache,
+the same opt-in debug-profile measurement on this local macOS machine took
+**0.317, 1.180, 7.058 and 17.453 seconds** respectively (19.8, 18.4, 27.6 and
+34.1 ms/call). All four runs completed with saved source persistence. Compilation
+(5.12 seconds) and setup/cleanup are excluded from these samples. These are
+single warm-development samples, not a controlled production speedup claim;
+runtime diagnostics and filesystem syncs remain inside the measured interval.
+An intermediate source-journal-only sample still took 110.878 seconds at 512
+calls, motivating the bounded selected-session cache rather than claiming that
+append-only disk writes alone solved full-runtime scaling.
+
+Remaining limits: cold loads still decode/replay the bounded snapshot/journal;
+checkpoint publication still rewrites the full merged body; identity matching
+uses scans, and pending-outcome accounting and cold replay can be quadratic.
+The bytes/nodes budget reserves accepted records plus pending operation outcomes
+against the current checkpoint, not arbitrary future checkpoint growth or tool
+result/source content. Independent journal capacity may stop a run earlier.
+There is no guarantee that 4,096 calls with arbitrary valid content fit the
+bounded store. No Linux filesystem measurements or power-loss qualification were
+performed in this follow-up.
+The opt-in measurement is `directory_store_full_runtime_scaling` in
+`crates/nexus-runtime/tests/directory_store_measurement.rs`.
+
+Local follow-up validation (sequential Cargo invocations, locked/offline):
+`cargo test -p nexus-session -p nexus-runtime --locked --offline` passed 41
+session and 388 runtime tests; three existing/default ignored tests were skipped.
+The directory-store measurement was run separately with `--ignored --nocapture`.
+`cargo clippy -p nexus-session -p nexus-runtime --all-targets --locked --offline
+-- -D warnings`, `cargo fmt --all --check` and `git diff --check` also passed.
+Other packages and the complete optional/ignored suite were not rerun for this
+session-store follow-up.
+
 ## 1. Outcome summary
 
 The campaign processed all 30 tasks; one failed before model inference and one
@@ -43,15 +120,15 @@ be collapsed into a single model-quality number.
 
 ## 2. Findings at a glance
 
-| ID | Priority | Finding | Classification |
-| --- | --- | --- | --- |
-| F1 | P1 | A single persistent session cannot record more than 256 tool intents/outcomes, below the advertised 4,096-call budget | Deterministic runtime cap |
-| F2 | P2 | A five-worker preflight timed out on `docker exec ... git status` | Operational/concurrency |
-| F3 | P2 | The agent reported a search deadline followed by an unavailable/poisoned worker | Operational/tool behavior |
-| F4 | P2 | The safe worker count for medium tasks on this Docker VM is unverified | Operational/configuration |
-| F5 | P2 | Six official unresolved results and one ambiguous result show incomplete fixes or regressions | Agent/model correctness |
-| F6 | P3 | The pool summary reports `null`, `empty-patch`, and `ambiguous-failure` without a unified distinction between "not run" and "failed" | Reporting |
-| F7 | P3 | Bulk image preparation may require significant storage; measure before expansion | Operational/storage |
+| ID | Priority | Finding | Classification | Follow-up |
+| --- | --- | --- | --- | --- |
+| F1 | P1 | A single persistent session cannot record more than 256 tool intents/outcomes, below the advertised 4,096-call budget | Deterministic runtime cap | No capacity failure in the 30-task rerun; bounded journal and merged-snapshot reservations added. Arbitrary 4,096-call content is not guaranteed to fit. |
+| F2 | P2 | A five-worker preflight timed out on `docker exec ... git status` | Operational/concurrency | No preflight failure in the rerun after a 300-second bounded status wait; resource contention was not separately measured. |
+| F3 | P2 | The agent reported a search deadline followed by an unavailable/poisoned worker | Operational/tool behavior | The new fail-closed backend path triggered once; the run stopped with `ToolFailure` and its patch was officially resolved. The original search behavior is not proven eliminated. |
+| F4 | P2 | The safe worker count for medium tasks on this Docker VM is unverified | Operational/configuration | Still unverified; five workers were used again without a controlled concurrency ladder. |
+| F5 | P2 | Six official unresolved results and one ambiguous result show incomplete fixes or regressions | Agent/model correctness | Rerun: five unresolved and two ambiguous official results. |
+| F6 | P3 | The pool summary reports `null`, `empty-patch`, and `ambiguous-failure` without a unified distinction between "not run" and "failed" | Reporting | Still open; ambiguous evaluation stopped the first batch and required a second batch plus a merged summary. |
+| F7 | P3 | Bulk image preparation may require significant storage; measure before expansion | Operational/storage | Still open; 30 adapters were rebuilt twice during preparation. |
 
 ## 3. Detailed findings
 

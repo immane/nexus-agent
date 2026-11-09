@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-config"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-core",
  "nexus-validation",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-container"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-config",
  "nexus-core",
@@ -232,25 +232,25 @@ dependencies = [
 
 [[package]]
 name = "nexus-context"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-core",
 ]
 
 [[package]]
 name = "nexus-core"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 
 [[package]]
 name = "nexus-fakes"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-core",
 ]
 
 [[package]]
 name = "nexus-headless"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-config",
  "nexus-core",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-integration"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-config",
  "nexus-core",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-openai"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-config",
  "nexus-core",
@@ -288,11 +288,11 @@ dependencies = [
 
 [[package]]
 name = "nexus-permissions"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 
 [[package]]
 name = "nexus-runtime"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-context",
  "nexus-core",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-server"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-config",
  "nexus-container",
@@ -321,16 +321,17 @@ dependencies = [
 
 [[package]]
 name = "nexus-session"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-core",
  "nexus-validation",
+ "rustix",
  "serde_json",
 ]
 
 [[package]]
 name = "nexus-tools"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-config",
  "nexus-core",
@@ -341,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-tui"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "crossterm",
  "nexus-config",
@@ -362,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-validation"
-version = "0.2.5-alpha"
+version = "0.2.6-alpha"
 dependencies = [
  "nexus-core",
  "serde",

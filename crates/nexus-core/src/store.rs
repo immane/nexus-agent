@@ -28,13 +28,15 @@ pub const MAX_STORED_MESSAGES: usize = Limits::M0_TEST_RETAINED_CONTEXT_ITEMS;
 /// this limit fails explicitly; users can delete an old saved session.
 pub const MAX_SESSIONS: usize = 64;
 
-/// Maximum retained tool-intent records per session file. Recording beyond
-/// this bound fails explicitly; deleting that session frees its capacity.
-pub const MAX_INTENT_RECORDS: usize = 256;
+/// Maximum retained tool-intent records per session. Recording beyond this
+/// bound fails before dispatch; deleting that session frees its capacity.
+/// This count matches the default 4,096-call run budget, but byte and other
+/// storage limits may be reached earlier and existing records share the bound.
+pub const MAX_INTENT_RECORDS: usize = 4_096;
 
-/// Maximum retained tool-outcome records per session file. Recording beyond
-/// this bound fails explicitly; deleting that session frees its capacity.
-pub const MAX_OUTCOME_RECORDS: usize = 256;
+/// Maximum retained tool-outcome records per session. Recording beyond this
+/// bound fails explicitly; deleting that session frees its capacity.
+pub const MAX_OUTCOME_RECORDS: usize = 4_096;
 
 /// Maximum stored profile-metadata length in bytes (M0-TEST choice aligned
 /// with the provider profile-name bound).

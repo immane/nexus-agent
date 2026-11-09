@@ -1,4 +1,4 @@
-Output docs/images/demo.gif
+Output docs/images/demo.mp4
 
 # Terminal appearance
 Set Width 1440
@@ -8,7 +8,7 @@ Set TypingSpeed 80ms
 Set Theme "Dracula"
 
 # 1. Launch Nexus TUI
-Type "cargo run -p nexus-tui"
+Type "nexus-tui"
 Enter
 
 # Wait for the application to initialize
@@ -29,13 +29,18 @@ Sleep 3s
 Escape
 Sleep 50ms
 
-# 5. Return to the main interface
-Escape
+# 5. Select the hosted demo model
+Type ":model set deepseek-v4-1-flash"
+Enter
+Sleep 500ms
+
+# 6. Return to the main interface
+Type "i"
 Sleep 50ms
 
-# 6. Send a message
+# 7. Send a message
 Type "Please summarize @README.md for me."
 Enter
 
-# 7. Wait for the Agent response
-Sleep 15s
+# 8. Wait for the Agent response
+Sleep 40s

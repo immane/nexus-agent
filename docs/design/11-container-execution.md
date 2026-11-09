@@ -251,7 +251,7 @@ The shared session poisons itself on uncertain worker/exec transport outcomes an
 
 If the engine becomes unavailable, retain an explicit unknown/quarantined state and owned resource IDs for reconciliation. Do not report rollback, success, or verified termination. The runtime's existing worker quarantine must not be bypassed; additional dispatch is denied until reconciliation. Bound CLI startup, inspect, pull, preparation, execution, output-drain, and cleanup separately, using the remaining call deadline where applicable.
 
-Proposed preparation limits: 2 seconds for local CLI/daemon probes, 120 seconds for image preparation without pull, 10 minutes for explicit pulls, and 5 seconds for cleanup attempts. Timeout means unknown until inspected if a create/start might have reached the daemon. Runtime tool deadlines remain the current configured limits; preparation never extends an executing call silently.
+Preparation limits: 2 seconds for local CLI/daemon probes, 120 seconds for gateway preparation without pull, 10 minutes for explicit pulls, and 15 seconds for cleanup attempts. Docker Desktop can exceed shorter create/start/health and inspect/remove waits; these remain bounded and do not extend an executing tool call. Timeout means unknown until inspected if a create/start might have reached the daemon. Runtime tool deadlines remain the current configured limits; preparation never extends an executing call silently.
 
 ## Ownership, Lifecycle, and Resource Accounting
 

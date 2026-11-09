@@ -56,7 +56,7 @@ pub use store::{
     STORE_FORMAT_REVISION, SessionCheckpoint, SessionMetadata, SessionStore, SourceRecord,
     ToolIntentRecord, ToolOutcomeRecord,
 };
-pub use tool::{ToolAccess, ToolContext, ToolPort, ToolRegistration, ToolSpec};
+pub use tool::{BackendState, ToolAccess, ToolContext, ToolPort, ToolRegistration, ToolSpec};
 
 #[cfg(test)]
 mod cov_lib_private {

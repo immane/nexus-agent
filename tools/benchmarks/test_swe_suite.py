@@ -113,12 +113,13 @@ class SuiteTests(unittest.TestCase):
                                     action="prepare", config=root / "config.json", provider=None,
                                     model=None, model_output_tokens=None, max_run_seconds=None,
                                     max_tool_calls=None, tool_log_bytes=None,
-                                    allow_hosted_inference=False)
+                                    allow_hosted_inference=True)
             launcher_exit = 0
 
             def launch(argv, log):
                 if args.action == "prepare":
                     self.assertIn("--prepare-only", argv)
+                    self.assertIn("--allow-hosted-inference", argv)
                 else:
                     self.assertNotIn("--prepare-only", argv)
                     if args.allow_hosted_inference:
@@ -199,6 +200,17 @@ class EnvironmentTests(unittest.TestCase):
         argv = call.call_args.args[0]
         self.assertEqual(argv[:5], ["docker", "exec", "-w", "/workspace", "b" * 64])
         self.assertIn("'/workspace'", argv[-1])
+
+    def test_large_checkout_status_preflight_keeps_a_bounded_longer_wait(self):
+        row = {"repo": "pallets/flask", "base_commit": "a" * 40}
+        outputs = ["a" * 40, "", '{"restored_files": 0}', "",
+                   '{"source":"/workspace/src/flask/__init__.py"}']
+        with patch.object(swebench, "command", side_effect=outputs) as call:
+            evidence = swebench.verify_task_environment({"workload_id": "b" * 64}, row)
+        self.assertTrue(evidence["clean_checkout"])
+        timeouts = [item.kwargs["timeout"] for item in call.call_args_list]
+        self.assertEqual(timeouts[1], 300)
+        self.assertEqual(timeouts[3], 300)
 
     def test_wrong_revision_or_dirty_checkout_blocks_inference(self):
         row = {"repo": "pallets/flask", "base_commit": "a" * 40}

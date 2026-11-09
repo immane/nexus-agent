@@ -289,6 +289,18 @@ impl ToolContext {
     }
 }
 
+/// Whether a tool's execution backend can accept another call after an
+/// observed outcome. This is deliberately narrower than a health check: only a
+/// backend whose shared state is known to be unusable should report
+/// [`BackendState::Unavailable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendState {
+    /// The backend may accept another call.
+    Ready,
+    /// Shared backend state is unusable; further dispatch must stop.
+    Unavailable,
+}
+
 /// Tool port. Narrow by design: describe the current revision, then execute
 /// one admitted call.
 pub trait ToolPort {
@@ -298,6 +310,13 @@ pub trait ToolPort {
     /// Executes one admitted call and returns its actual outcome,
     /// optionally after emitting bounded progress through events.
     fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome;
+
+    /// Reports unrecoverable shared-backend state after execution. Tools with
+    /// no shared backend keep the default. Runtime must not infer this from an
+    /// outcome string or from [`crate::EffectState::Unknown`].
+    fn backend_state(&self) -> BackendState {
+        BackendState::Ready
+    }
 }
 
 fn tool_error(message: &'static str) -> AgentError {

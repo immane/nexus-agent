@@ -13,7 +13,8 @@ use std::{
 };
 
 use nexus_core::{
-    ToolAccess, ToolCall, ToolContext, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
+    BackendState, ToolAccess, ToolCall, ToolContext, ToolOutcome, ToolPort, ToolRegistration,
+    ToolSpec,
 };
 
 const OWNER_LABEL: &str = "io.nexus-agent.workload-owner";
@@ -747,6 +748,22 @@ impl ToolPort for OwnedContainerPort {
             OwnedPortKind::Write => owner.files.write.describe(),
             OwnedPortKind::Patch => owner.files.patch.describe(),
             OwnedPortKind::Exec => owner.exec.describe(),
+        }
+    }
+
+    fn backend_state(&self) -> BackendState {
+        let owner = match self.owner.try_lock() {
+            Ok(owner) => owner,
+            Err(std::sync::TryLockError::WouldBlock) => return BackendState::Ready,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        match self.kind {
+            OwnedPortKind::Read => owner.files.read.backend_state(),
+            OwnedPortKind::List => owner.files.list.backend_state(),
+            OwnedPortKind::Search => owner.files.search.backend_state(),
+            OwnedPortKind::Write => owner.files.write.backend_state(),
+            OwnedPortKind::Patch => owner.files.patch.backend_state(),
+            OwnedPortKind::Exec => owner.exec.backend_state(),
         }
     }
 

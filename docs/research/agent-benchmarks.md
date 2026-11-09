@@ -1106,6 +1106,70 @@ additional evidence and recommendations. The [campaign summary](../../../nexus-b
 and per-task logs are local artifacts outside the repository; logs may contain
 sensitive task interactions and should not be published without review.
 
+### Medium 30 rerun after session/runtime fixes
+
+On 2026-11-09/10, the same fixed 30-task `15 min - 1 hour` selection was rerun
+after the session-store journal, source-batch persistence, selected-session
+cache, backend-availability propagation and container gateway-lifecycle changes.
+The source baseline was `39c6d24`, plus the then-working-tree benchmark-tool and
+container changes. All 30 adapter images were rebuilt from that source; the
+model, dataset revision `78f471bf655a3137b2e8a75af1501690ec009ec3`, evaluator
+5.0.2, five-worker dynamic refill, temporary 120-second provider first-byte
+timeout and 24-hour / 4,096-tool-call budgets matched the first medium campaign.
+All **30/30 gold-patch preflights resolved** before inference.
+
+Live attempts: **29 agent completed, one agent failed, and all 30 produced
+nonempty patches**. The failed attempt was `sphinx-doc__sphinx-10673`: a delayed
+worker completed with `BackendState::Unavailable`, and the runtime stopped with
+`ToolFailure` rather than dispatching another call. Its 7,817-byte patch was
+still captured and was officially resolved.
+
+Official results: **23 resolved, five unresolved, and two ambiguous failures**.
+The raw selected-sample result is **23/30 (76.7%)**. There were no empty patches
+and no missing predictions. Cumulative agent time was **26,562.283 seconds
+(about 7h 22m 42s)**, with **1,491 tool calls** and **46,071,350 input /
+759,602 output tokens**. Token totals exclude the failed attempt because its
+final usage was incomplete/null. Official evaluation ran in two batches because
+the first batch stopped on an ambiguous result; the second batch covered the
+five remaining tasks. Both batches and the merged summary are local artifacts.
+
+| Group | Tasks (agent time, tool calls, agent outcome; official result) | Resolved |
+| --- | --- | ---: |
+| 1 | `astropy__astropy-7671` — 1061.7s, 69 calls, completed; **resolved**<br>`astropy__astropy-14365` — 205.7s, 30 calls, completed; **resolved**<br>`astropy__astropy-13453` — 315.2s, 44 calls, completed; **resolved**<br>`astropy__astropy-14182` — 1047.4s, 90 calls, completed; **resolved**<br>`astropy__astropy-13033` — 328.3s, 28 calls, completed; **unresolved** | 4/5 |
+| 2 | `django__django-10973` — 134.9s, 21 calls, completed; **resolved**<br>`django__django-16877` — 187.5s, 30 calls, completed; **unresolved**<br>`django__django-11333` — 350.6s, 46 calls, completed; **resolved**<br>`django__django-16950` — 1373.5s, 58 calls, completed; **resolved**<br>`django__django-11206` — 1483.9s, 26 calls, completed; **resolved** | 4/5 |
+| 3 | `django__django-16502` — 4266.0s, 78 calls, completed; **unresolved**<br>`pydata__xarray-3677` — 543.1s, 28 calls, completed; **resolved**<br>`pydata__xarray-4966` — 1522.7s, 68 calls, completed; **resolved**<br>`pydata__xarray-3151` — 432.1s, 32 calls, completed; **resolved**<br>`pydata__xarray-7393` — 606.6s, 57 calls, completed; **resolved** | 4/5 |
+| 4 | `pydata__xarray-7233` — 408.0s, 30 calls, completed; **resolved**<br>`scikit-learn__scikit-learn-14053` — 124.1s, 20 calls, completed; **resolved**<br>`scikit-learn__scikit-learn-25747` — 933.1s, 58 calls, completed; **unresolved**<br>`scikit-learn__scikit-learn-10844` — 148.0s, 17 calls, completed; **resolved**<br>`scikit-learn__scikit-learn-25931` — 412.9s, 29 calls, completed; **resolved** | 4/5 |
+| 5 | `scikit-learn__scikit-learn-14629` — 773.9s, 64 calls, completed; **resolved**<br>`sphinx-doc__sphinx-8593` — 425.3s, 69 calls, completed; **resolved**<br>`sphinx-doc__sphinx-8035` — 467.1s, 57 calls, completed; **resolved**<br>`sphinx-doc__sphinx-7985` — 934.1s, 66 calls, completed; **unresolved**<br>`sphinx-doc__sphinx-10614` — 2205.2s, 127 calls, completed; **ambiguous-failure** (`no_tests_collected`) | 3/5 |
+| 6 | `sphinx-doc__sphinx-10673` — 4490.5s, 92 calls, failed; **resolved**<br>`pytest-dev__pytest-7571` — 86.6s, 21 calls, completed; **resolved**<br>`pytest-dev__pytest-5631` — 176.5s, 23 calls, completed; **resolved**<br>`pylint-dev__pylint-6386` — 599.8s, 66 calls, completed; **resolved**<br>`pylint-dev__pylint-4661` — 517.9s, 47 calls, completed; **ambiguous-failure** (`missing_module`) | 4/5 |
+
+The five unresolved tasks were Astropy 13033, Django 16877 and 16502,
+scikit-learn 25747 and Sphinx 7985. The two ambiguous results were Sphinx 10614
+(`no_tests_collected`) and Pylint 4661 (`missing_module`); neither is counted as
+resolved, and their root causes were not isolated. Evaluation stopped on each
+ambiguous result and was continued in a separate batch rather than silently
+retrying it.
+
+This rerun is not a controlled comparison with the first medium campaign. The
+first run produced **20 resolved, six unresolved, two empty patches, one
+preflight failure and one ambiguous result**; the rerun produced no empty patch
+and no preflight failure. The same fixed tasks and model make the two runs
+useful follow-up evidence, but runtime, harness, date and host conditions
+differed. The higher count is not proof that a particular fix caused an
+improvement, and 23/30 remains a selected diagnostic sample rather than a blind
+or representative success rate.
+
+The rerun also exercised the container gateway lifecycle under Docker Desktop.
+Bounded gateway preparation and cleanup waits were raised to 120 and 15 seconds,
+and preflight `git status` checks to 300 seconds, after real prepares exceeded
+the earlier limits. Hosted-endpoint `prepare` now accepts the same explicit
+`--allow-hosted-inference` opt-in as live runs while still forcing
+`--prepare-only`. These are operational hardening changes, not model or benchmark
+scores.
+
+Merged evidence: [campaign summary](../../../nexus-benchmark-work/verified-medium30-v2/campaign-summary.json).
+Per-task logs and session archives remain local and may contain sensitive task
+interactions; do not publish them without review.
+
 ### Shared evaluation workflow and suite progress
 
 A repeatable ten-task diagnostic suite, fixed to dataset revision
