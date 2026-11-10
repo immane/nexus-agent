@@ -335,7 +335,7 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
     serde_json::json!({
         "revision": CONFIG_REVISION,
         "providers": config.providers().iter().map(|profile| {
-            serde_json::json!({
+            let mut provider = serde_json::json!({
                 "id": profile.id,
                 "display_name": profile.display_name,
                 "adapter": profile.adapter.name(),
@@ -344,7 +344,11 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "credential": profile.credential.to_json(),
                 "default_model": profile.default_model,
                 "context_window_tokens": profile.context_window_tokens,
-            })
+            });
+            if let Some(effort) = profile.task_reasoning_effort {
+                provider["task_reasoning_effort"] = effort.as_str().into();
+            }
+            provider
         }).collect::<Vec<_>>(),
         "models": config.models().iter().map(|entry| {
             serde_json::json!({

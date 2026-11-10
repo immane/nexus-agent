@@ -293,7 +293,12 @@ class ArchiveLaunchTests(unittest.TestCase):
             with self.subTest(size=size):
                 self.check_launch(read_page_bytes=size)
 
-    def check_launch(self, read_page_bytes=None, worker_failure=False):
+    def test_task_reasoning_setting_is_recorded_from_selected_provider(self):
+        for effort in ("none", "low"):
+            with self.subTest(effort=effort):
+                self.check_launch(task_reasoning_effort=effort)
+
+    def check_launch(self, read_page_bytes=None, worker_failure=False, task_reasoning_effort=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             server = root / "target/release/nexus-server"
@@ -305,6 +310,10 @@ class ArchiveLaunchTests(unittest.TestCase):
                                "credential": {"env": "OLLAMA_API_KEY"}}],
                 "models": [{"id": "local-model", "provider": "ollama-local"}],
             }))
+            if task_reasoning_effort is not None:
+                document = json.loads(config.read_text())
+                document["providers"][0]["task_reasoning_effort"] = task_reasoning_effort
+                config.write_text(json.dumps(document))
             profiles = {"provider": "ollama-local", "model": "local-model", "gateway_image": "gateway"}
             profile_path = root / "profiles.json"
             profile_path.write_text(json.dumps(profiles))
@@ -345,6 +354,7 @@ class ArchiveLaunchTests(unittest.TestCase):
             run = next(args.work_root.iterdir())
             evidence = json.loads((run / "launch.json").read_text())
             self.assertEqual(evidence["prompt_config"], {"read_page_bytes": read_page_bytes})
+            self.assertEqual(evidence["task_reasoning_effort"], task_reasoning_effort)
             self.assertEqual(evidence["evaluation"], "not-run")
             if worker_failure:
                 self.assertEqual(spawn.call_count, 1, "must start only the server, never the model runner")

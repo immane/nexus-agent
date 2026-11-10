@@ -8,7 +8,7 @@
 
 use nexus_core::{
     ContextCompactionStrategy, ContextManagementPolicy, ContextManagementSettings, ContextWindow,
-    ContextWindowSource,
+    ContextWindowSource, ReasoningEffort,
 };
 use serde_json::{Map, Value};
 
@@ -240,6 +240,9 @@ pub struct ProviderProfile {
     pub default_model: String,
     /// Configured context limit of the default model, not all provider models.
     pub context_window_tokens: Option<u32>,
+    /// Optional task-request fallback; currently supported only by Ollama Chat Completions.
+    /// Explicit request hints take precedence; this does not control reasoning visibility.
+    pub task_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ProviderProfile {
@@ -282,6 +285,7 @@ impl ProviderProfile {
             credential,
             default_model: default_model.into(),
             context_window_tokens: None,
+            task_reasoning_effort: None,
         };
         profile.validate()?;
         Ok(profile)
@@ -307,6 +311,14 @@ impl ProviderProfile {
             return Err(invalid("model name is invalid"));
         }
         configured_window(self.context_window_tokens)?;
+        if self.task_reasoning_effort.is_some()
+            && (self.adapter != AdapterKind::Direct
+                || self.protocol != ProtocolKind::ChatCompletions)
+        {
+            return Err(invalid(
+                "task reasoning effort requires direct chat completions",
+            ));
+        }
         Ok(())
     }
 }
@@ -1027,6 +1039,12 @@ fn provider_json(profile: &ProviderProfile) -> Value {
     if let Some(tokens) = profile.context_window_tokens {
         object.insert("context_window_tokens".to_owned(), Value::from(tokens));
     }
+    if let Some(effort) = profile.task_reasoning_effort {
+        object.insert(
+            "task_reasoning_effort".to_owned(),
+            Value::String(effort.as_str().to_owned()),
+        );
+    }
     Value::Object(object)
 }
 
@@ -1140,6 +1158,7 @@ fn parse_provider(
             "credential",
             "default_model",
             "context_window_tokens",
+            "task_reasoning_effort",
         ],
     )?;
     let credential = object
@@ -1179,6 +1198,12 @@ fn parse_provider(
         require_str(object, "default_model")?.to_owned(),
     )?;
     profile.context_window_tokens = parse_window_tokens(object)?;
+    profile.task_reasoning_effort = match object.get("task_reasoning_effort") {
+        None => None,
+        Some(Value::String(effort)) if effort == "none" => Some(ReasoningEffort::Disabled),
+        Some(Value::String(effort)) if effort == "low" => Some(ReasoningEffort::Low),
+        Some(_) => return Err(invalid("task reasoning effort is invalid")),
+    };
     profile.validate()?;
     Ok(profile)
 }

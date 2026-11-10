@@ -53,8 +53,9 @@ are under the sibling `nexus-benchmark-work/` directory, prefixed with
 | `20261110T171140Z-99e9173a` | 16,384 / 4,096 | summary candidate cannot fit | 354.485 | 18 | 0 B | 6,073 |
 | `20261110T172238Z-2af8558f` | 20,480 / 4,096 | protected floor cannot fit | 358.433 | 18 | 0 B | 8,378 |
 | `20261110T181510Z-90e347d4` | 16,384 / 4,096; `--read-page-bytes 4096` | protected floor cannot fit | 329.346 | 13 | 0 B | 6,777 |
+| `20261110T183604Z-3bf644e1` | 16,384 / 4,096; `--read-page-bytes 4096`; task effort `none` | completed; official evaluator resolved | 205.705 | 20 | 485 B | 7,685 |
 
-The last row is the first Phase B observation: diagnostic instrumentation and
+The second-to-last row is the first Phase B observation: diagnostic instrumentation and
 opt-in 4 KiB read-page guidance were active, with the prompt and global limits
 otherwise unchanged. It produced **14 requests: 9 task and 5 summary**. The final
 protected-floor breakdown was 18,693 reasoning bytes, 656 tool-result bytes,
@@ -63,6 +64,15 @@ tokens plus 4,096 reserve. Read-page guidance did not by itself remove the floor
 replayed reasoning dominated this trajectory. Maximum provider input remained
 6,777 tokens (41.4% of the window), so again no dispatched request approached
 16K; the runtime refused the next candidate.
+
+The last row confirms that the opt-in Ollama `task_reasoning_effort: "none"`
+request was accepted and the response contained no reasoning bytes. It produced
+**22 requests: 20 task and 2 summary**, maximum provider input 7,685 tokens
+(46.9%), maximum estimated input plus output 14,348, and no context-limit stop.
+The 485-byte patch added `__slots__ = ()` to `Printable`; the pinned official
+evaluator resolved the instance. This is one additional attempt on an exposed
+task, not independent task evidence or proof that one setting caused the
+difference. Other trajectory and sampling effects remain possible.
 
 All used the `ollama-local/qwen3-27b` binding, wire model
 `qwen3.8-27b-iq3m-92k:latest`, a 60% trigger and 10% target. This is a previously

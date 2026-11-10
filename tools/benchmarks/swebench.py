@@ -359,6 +359,7 @@ def launch(args, profiles, task):
                 "endpoint": provider["endpoint"], "config_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
                 "effective_config_sha256": hashlib.sha256(server_config.read_bytes()).hexdigest(),
                 "model_output_tokens": model.get("max_output_tokens"),
+                "task_reasoning_effort": provider.get("task_reasoning_effort"),
                 "prompt_config": {"read_page_bytes": args.read_page_bytes},
                 "limits": {"model_turns": 500, "tool_calls": args.max_tool_calls, "run_seconds": args.max_run_seconds,
                            "input_tokens": None, "output_tokens": None}, "evaluation": "not-run"}

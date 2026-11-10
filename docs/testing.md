@@ -25,6 +25,15 @@ on summary diagnostic lines; `request_max_output_tokens` is the separate cap on
 that particular request. The retained view may be larger than the final
 previewed request. Public event and persistence formats are unchanged.
 
+The opt-in provider `task_reasoning_effort` setting has offline coverage in
+`nexus-config`'s `task_reasoning_effort` test target, `nexus-openai`'s
+`reasoning_effort_tests`, and the existing server configuration integration
+module. These verify strict configuration roundtrips, preserved historical
+reasoning, explicit summary-hint precedence, unchanged generation caps, endpoint
+rejection before network I/O, and preservation/clearing through configuration
+updates. They verify request encoding, not a live model's compliance or repair
+quality. Benchmark launcher tests separately verify experiment metadata.
+
 ```sh
 cargo fmt --all --check
 cargo nextest run -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server --locked --offline

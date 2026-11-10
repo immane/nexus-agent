@@ -42,6 +42,9 @@ pub const MAX_TOOL_DEFINITION_BYTES: usize = 2_097_152;
 /// Provider-defined reasoning effort hint for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    /// Request no thinking output where the selected provider/model permits it.
+    /// This does not remove accepted historical reasoning or guarantee compliance.
+    Disabled,
     /// Prefer shorter reasoning where the selected provider/model supports it.
     Low,
 }
@@ -51,6 +54,7 @@ impl ReasoningEffort {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Disabled => "none",
             Self::Low => "low",
         }
     }

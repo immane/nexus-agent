@@ -931,3 +931,79 @@ fn providers_and_models_can_be_added_and_updated_over_http() {
     );
     let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
 }
+
+#[test]
+fn task_reasoning_effort_is_persisted_preserved_on_form_edits_and_explicitly_cleared() {
+    let path = temp_config("task-reasoning");
+    let port = spawn_server(configured(resolvable_probe()), Some(path.clone()));
+    for value in ["none", "low"] {
+        let body = format!(r#"{{"id":"acme","task_reasoning_effort":"{value}"}}"#);
+        let (status, summary) = post(port, "/config/providers", &body);
+        assert_eq!(status, 200, "setting admits: {summary}");
+        assert_eq!(summary["providers"][0]["task_reasoning_effort"], value);
+        let (status, summary) = post(
+            port,
+            "/config/providers",
+            r#"{"id":"acme","display_name":"Edited"}"#,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            summary["providers"][0]["task_reasoning_effort"], value,
+            "an editor without this field must preserve it"
+        );
+        assert_eq!(
+            read_back(&path)
+                .provider("acme")
+                .unwrap()
+                .task_reasoning_effort
+                .unwrap()
+                .as_str(),
+            value
+        );
+    }
+    for value in ["true", "123", r#""private-invalid-value""#] {
+        let body = format!(r#"{{"id":"acme","task_reasoning_effort":{value}}}"#);
+        let (status, reply) = post(port, "/config/providers", &body);
+        assert_eq!(status, 400);
+        assert!(!reply.to_string().contains("private"));
+        assert_eq!(
+            read_back(&path)
+                .provider("acme")
+                .unwrap()
+                .task_reasoning_effort,
+            Some(nexus_core::ReasoningEffort::Low)
+        );
+    }
+    let (status, _) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"acme","protocol":"anthropic_messages"}"#,
+    );
+    assert_eq!(
+        status, 400,
+        "cannot preserve a setting on an incompatible protocol"
+    );
+    // The configured example endpoint is not Ollama. Selection must reject the
+    // explicit option before discovery or inference can send it to that host.
+    let (status, _) = post(port, "/sessions", r#"{"provider":"acme"}"#);
+    assert_eq!(status, 400);
+    let (status, summary) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"acme","task_reasoning_effort":null}"#,
+    );
+    assert_eq!(status, 200);
+    assert!(
+        summary["providers"][0]
+            .get("task_reasoning_effort")
+            .is_none()
+    );
+    assert_eq!(
+        read_back(&path)
+            .provider("acme")
+            .unwrap()
+            .task_reasoning_effort,
+        None
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

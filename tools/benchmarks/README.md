@@ -70,6 +70,18 @@ omitted) is recorded as `prompt_config.read_page_bytes` in `launch.json`, runner
 `manifest.json`, and result JSON files. Compare against an otherwise identical
 run without the flag; no efficiency or repair-quality improvement is established.
 
+For a separate Ollama task-thinking experiment, set the optional provider field
+`"task_reasoning_effort": "none"` in a run-specific configuration passed with
+`--config`; do not rewrite the shared user configuration. Omission keeps current
+behavior, and `"low"` may still enable thinking rather than meaningfully shorten
+it on boolean-only models. The launcher records the configured value in
+`launch.json`. Keep the 16K window, 4,096 output cap, read-page guidance, and all
+other settings fixed when comparing against the prior read-paging run. Summary
+requests keep their explicit low-effort hint, and historical reasoning is not
+deleted. This is a provider request, not proof that a model obeys it or that
+repair quality is preserved; inspect actual reasoning output and evaluate the
+captured patch separately. See the [configuration contract](../../docs/contracts/05-configuration.md#provider-task-reasoning-effort).
+
 The cached list currently covers SymPy 20590, Astropy 12907/13398, Django 11099,
 Sphinx 9461 and pytest 10051. A task is available only when both its dataset row
 and adapter image are present. To add another installed task, register its

@@ -1577,6 +1577,19 @@ impl Server {
             Ok(None) => existing.as_ref().and_then(|p| p.context_window_tokens),
             Err(_) => return json_response(400, &json::error_body("context window is invalid")),
         };
+        let task_reasoning_effort = match body.get("task_reasoning_effort") {
+            None => existing
+                .as_ref()
+                .and_then(|profile| profile.task_reasoning_effort),
+            Some(Value::Null) => None,
+            Some(Value::String(value)) if value == "none" => {
+                Some(nexus_core::ReasoningEffort::Disabled)
+            }
+            Some(Value::String(value)) if value == "low" => Some(nexus_core::ReasoningEffort::Low),
+            Some(_) => {
+                return json_response(400, &json::error_body("task reasoning effort is invalid"));
+            }
+        };
         let profile = match ProviderProfile::new_with_protocol(
             id,
             display_name,
@@ -1591,6 +1604,7 @@ impl Server {
         };
         let mut profile = profile;
         profile.context_window_tokens = context_window;
+        profile.task_reasoning_effort = task_reasoning_effort;
         if let Err(error) = config.upsert_provider(profile) {
             return json_response(400, &json::error_body(error.message()));
         }

@@ -102,6 +102,37 @@ local tags are resolved to Docker image IDs at container startup. CLI image
 flags override their respective config fields. Startup only inspects local
 images; it never pulls or builds them.
 
+### Provider task reasoning effort
+
+In the revision-2 user-config document, a provider entry may optionally set
+`"task_reasoning_effort": "none"` or `"task_reasoning_effort": "low"`.
+Omission preserves provider defaults and is omitted on save; explicit `null`,
+non-string values, and other strings are rejected. An explicit setting requires
+`"adapter": "direct"` and `"protocol": "chat_completions"`.
+
+Only detected Ollama Chat Completions endpoints currently support this fallback;
+the adapter enforces endpoint support. It applies only when a request has no
+explicit reasoning hint. Summary requests retain their explicit hint regardless
+of this provider setting. `"none"` requests disabled thinking, whereas `"low"`
+requests lower effort and may still mean thinking is on for the selected model.
+Neither setting guarantees a strict reasoning-token or time bound, and no
+measured performance or task-quality improvement is claimed. The independent
+`show_reasoning` preference only controls local display of returned reasoning;
+it does not enable or disable model thinking.
+
+The redacted configuration summary includes this field only when configured.
+Provider updates through `POST /config/providers` preserve an omitted field;
+an explicit `null` clears it (unlike the stored document, which omits unset
+fields). Existing Web form edits therefore preserve the configured choice even
+though the form has no reasoning-effort control. Configuration changes apply to
+new sessions; existing adapter bindings are unchanged. Historical accepted
+reasoning remains archived and replayed by the existing adapter behavior.
+
+For Ollama 0.32.14, the OpenAI compatibility conversion maps `"none"` to
+`think=false`; model support and actual compliance must still be verified.
+References: [versioned conversion source](https://github.com/ollama/ollama/blob/v0.32.14/openai/openai.go)
+and [thinking controls](https://docs.ollama.com/capabilities/thinking).
+
 ## Compatibility and Privacy
 
 Version stored configuration independently from provider and external-plugin protocols. Explain migrations and reject unsupported required formats instead of inferring them.
