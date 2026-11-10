@@ -40,7 +40,7 @@
 //! the two can never disagree about what was used.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -395,7 +395,6 @@ pub struct Server {
     handle: tokio::runtime::Handle,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     pending_sessions: AtomicUsize,
-    next_session: AtomicU64,
     /// The live configuration document. Every read and write goes through
     /// this one lock so a run's usage record and the redacted summary can
     /// never observe a half-applied change.
@@ -482,7 +481,6 @@ impl Server {
             handle,
             sessions: Mutex::new(HashMap::new()),
             pending_sessions: AtomicUsize::new(0),
-            next_session: AtomicU64::new(1),
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             limits: nexus_config::SettingsProfile::Server.default_limits(),
@@ -700,9 +698,15 @@ impl Server {
             None => None,
             Some(id) => Some(self.select_provider(id, model)?),
         };
-        let n = self.next_session.fetch_add(1, Ordering::SeqCst);
-        let token = format!("sess-web-{n}");
-        let session = SessionId::new(&token).expect("counter session id is valid");
+        // Session identities outlive a server process when storage is enabled.
+        // Use OS entropy rather than a process-local counter or wall clock;
+        // failure must not silently fall back to a reusable identity.
+        let mut bytes = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut bytes))
+            .map_err(|_| SessionError::new(500, "session identity could not be generated"))?;
+        let token = format!("sess-web-{:032x}", u128::from_be_bytes(bytes));
+        let session = SessionId::new(&token).expect("random session id is valid");
         let (policy, tools) = self.session_tools(project_root.as_deref())?;
         let config = RuntimeConfig {
             limits: self.limits,
@@ -2446,6 +2450,27 @@ mod tests {
     }
 
     #[test]
+    fn session_identities_are_distinct_across_server_instances() {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut identities = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let server = Server::new(executor.handle().clone());
+            for _ in 0..32 {
+                let token = server.create_session().unwrap();
+                assert!(SessionId::new(&token).is_ok());
+                let suffix = token.strip_prefix("sess-web-").unwrap();
+                assert_eq!(suffix.len(), 32);
+                assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                assert!(identities.insert(token), "session identity was reused");
+            }
+        }
+    }
+
+    #[test]
     fn shared_session_store_retains_original_sources_from_every_server_runtime() {
         use nexus_core::{
             EventPayload, ModelContextItem, PersistenceState, RunOutcome, SessionStore,
@@ -2455,70 +2480,78 @@ mod tests {
             "nexus-server-original-sources-{}",
             std::process::id()
         ));
-        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
-        let executor = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_time()
-            .build()
-            .unwrap();
-        let mut server = Server::new(executor.handle().clone());
-        server.set_session_store(SessionStoreHandle::new(Box::new(store)));
         let mut expected = Vec::new();
-        for input in [
-            "first original input\n  keep whitespace",
-            "second original input",
+        for inputs in [
+            [
+                "first original input\n  keep whitespace",
+                "second original input",
+            ],
+            ["first input after restart", "second input after restart"],
         ] {
-            let token = server.create_session().unwrap();
-            let session = server.sessions.lock().unwrap()[&token].clone();
-            let runtime = session.runtime.lock().unwrap();
-            let mut control = session.control.lock().unwrap();
-            executor.block_on(async {
-                let response = runtime
-                    .submit(
-                        SubmitCommand::new(
-                            RequestId::new("request-original-sources").unwrap(),
-                            session.session.clone(),
-                            input,
-                            WEB_PROFILE,
+            // Reopen the same store in a fresh server/executor, as on restart.
+            let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+            let executor = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap();
+            let mut server = Server::new(executor.handle().clone());
+            server.set_session_store(SessionStoreHandle::new(Box::new(store)));
+            for input in inputs {
+                let token = server.create_session().unwrap();
+                let session = server.sessions.lock().unwrap()[&token].clone();
+                let runtime = session.runtime.lock().unwrap();
+                let mut control = session.control.lock().unwrap();
+                executor.block_on(async {
+                    let response = runtime
+                        .submit(
+                            SubmitCommand::new(
+                                RequestId::new("request-original-sources").unwrap(),
+                                session.session.clone(),
+                                input,
+                                WEB_PROFILE,
+                            )
+                            .unwrap(),
                         )
-                        .unwrap(),
-                    )
-                    .await;
-                assert_eq!(response.reply(), CommandReply::Accepted);
-                let run = response.run().unwrap().clone();
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        let event = control.recv().await.unwrap();
-                        match event.payload() {
-                            EventPayload::ApprovalRequired(notice) => {
-                                let response = runtime
-                                    .approve(ApproveCommand {
-                                        request: RequestId::new("request-approve-original")
-                                            .unwrap(),
-                                        approval: notice.approval.clone(),
-                                        run: run.clone(),
-                                        call: notice.call.clone(),
-                                    })
-                                    .await;
-                                assert_eq!(response.reply(), CommandReply::Accepted);
+                        .await;
+                    assert_eq!(response.reply(), CommandReply::Accepted);
+                    let run = response.run().unwrap().clone();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let event = control.recv().await.unwrap();
+                            match event.payload() {
+                                EventPayload::ApprovalRequired(notice) => {
+                                    let response = runtime
+                                        .approve(ApproveCommand {
+                                            request: RequestId::new("request-approve-original")
+                                                .unwrap(),
+                                            approval: notice.approval.clone(),
+                                            run: run.clone(),
+                                            call: notice.call.clone(),
+                                        })
+                                        .await;
+                                    assert_eq!(response.reply(), CommandReply::Accepted);
+                                }
+                                EventPayload::RunFinished(finished) => {
+                                    assert_eq!(finished.outcome(), RunOutcome::Completed);
+                                    assert_eq!(finished.persistence(), PersistenceState::Saved);
+                                    break;
+                                }
+                                _ => {}
                             }
-                            EventPayload::RunFinished(finished) => {
-                                assert_eq!(finished.outcome(), RunOutcome::Completed);
-                                assert_eq!(finished.persistence(), PersistenceState::Saved);
-                                break;
-                            }
-                            _ => {}
                         }
-                    }
-                })
-                .await
-                .expect("demo run finishes");
-            });
-            expected.push((session.session.clone(), input));
+                    })
+                    .await
+                    .expect("demo run finishes");
+                });
+                expected.push((session.session.clone(), input));
+            }
+            drop(server);
+            // Release all worker owners before opening the store again.
+            drop(executor);
         }
-        drop(server);
-        // Workers release their shared store owner before the executor stops.
-        drop(executor);
+        let identities: std::collections::HashSet<_> = expected.iter().map(|(id, _)| id).collect();
+        assert_eq!(identities.len(), expected.len());
         let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
         for (session, input) in expected {
             let records = reopened.load_source_records(&session, 0, 100).unwrap();

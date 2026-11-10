@@ -84,6 +84,13 @@ terminal errors remain visible.
 
 ## Sessions and authentication
 
+New server session IDs use a 128-bit OS-random suffix (`sess-web-<hex>`), not a
+counter reset at startup, so new sessions do not reuse earlier server identities
+when opening the same persistent store. ID generation fails explicitly if the
+system random source is unavailable. IDs remain opaque and are not credentials;
+legacy counter-based IDs remain valid inputs. This does not add a Web history or
+restore API.
+
 `POST /sessions` is called lazily on the first send. The provider/model choice
 is fixed at session creation, matching the server contract. The page keeps the
 session token in memory only; reloading loses the transcript and the session

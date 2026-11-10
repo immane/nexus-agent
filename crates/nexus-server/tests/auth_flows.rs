@@ -56,6 +56,12 @@ fn real_tool_http_requires_bearer_and_rejects_untrusted_host_or_origin() {
         .expect("runtime builds");
     let mut server = nexus_server::Server::new(runtime.handle().clone());
     server
+        .set_server_settings(&nexus_config::settings::ServerSettings {
+            max_sessions: 1,
+            ..Default::default()
+        })
+        .expect("one-session capacity validates");
+    server
         .set_tools_mode(nexus_server::ToolsMode::RealFiles { root: root.clone() })
         .expect("real tools configure");
     server.set_auth_token(TOKEN).expect("token validates");
@@ -124,11 +130,11 @@ fn real_tool_http_requires_bearer_and_rejects_untrusted_host_or_origin() {
     );
     assert_eq!(
         status, 201,
-        "valid same-origin authorized request succeeds: {body}"
+        "rejected requests did not consume the single session slot: {body}"
     );
-    assert!(
-        body.contains("sess-web-1"),
-        "rejected requests did not mint sessions"
-    );
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let session = response["session"].as_str().expect("session identity");
+    assert!(session.starts_with("sess-web-"));
+    assert!(nexus_core::SessionId::new(session).is_ok());
     let _ = std::fs::remove_dir_all(root);
 }
