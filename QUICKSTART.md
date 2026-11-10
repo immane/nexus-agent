@@ -697,8 +697,11 @@ names), never secret values. Changes apply to new sessions; live sessions keep
 their original provider, model, and tool root. There is no web deletion for
 providers or models; edit `config.json` to remove them.
 
-The token is held only in this page's memory, is never written to browser
-storage, and is gone after reload. Only the palette preference is persisted.
+After a successful connection, the bearer token is saved in same-origin browser
+storage and reused on launch. Disconnect removes it; invalid saved credentials
+are cleared on authentication failure. Same-origin scripts can read it, so use
+only a trusted local browser profile. If storage is unavailable, the connection
+works in memory only. Palette preferences are also persisted.
 The static shell is public, but API authentication and Host/Origin checks remain
 enforced. Assistant text renders a bounded Markdown subset (headings, emphasis,
 lists, quotes, fenced code, tables, and safe links); raw HTML, images, and syntax

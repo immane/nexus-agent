@@ -4,8 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#080808">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Nexus">
   <title>Nexus · Workspace</title>
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+  <link rel="apple-touch-icon" href="/assets/icon-192.png">
+  <link rel="manifest" href="/assets/manifest.webmanifest">
   <link rel="stylesheet" href="/assets/app.css">
   <script type="module" src="/assets/app.js"></script>
 </head>
@@ -64,6 +70,7 @@
         <textarea id="message" rows="2" disabled placeholder="Connect to start a task…"></textarea>
         <div class="composer-footer">
           <div class="composer-context">
+            <span class="composer-activity" id="composer-activity" aria-hidden="true" hidden><i></i><i></i><i></i></span>
             <span class="status" id="run-status" role="status" aria-live="polite">Not connected</span>
             <span class="usage" id="usage-status" hidden></span>
           </div>
@@ -102,7 +109,7 @@
     <div class="settings-content">
     <section class="settings-panel" id="appearance-panel" aria-labelledby="appearance-title">
     <h3 id="appearance-title">Appearance</h3>
-    <p class="muted">Appearance stays in this browser. The server token stays in this page's memory.</p>
+    <p class="muted">Appearance and your server connection are remembered in this browser.</p>
     <label for="theme">Color palette</label>
     <select id="theme">
       <option value="system">System</option>
@@ -118,7 +125,7 @@
       <p class="muted">Same-origin only. The check loads model identities; it does not start a session.</p>
       <label for="token">Bearer token <span class="muted">(if required)</span></label>
       <input id="token" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="64 hexadecimal characters">
-      <p class="hint">Kept only in this page's memory, never in browser storage, and cleared on reload.</p>
+      <p class="hint">Saved in this browser after a successful connection and reused on launch. Same-origin scripts can read it; use only a trusted local browser. Disconnect removes the saved token.</p>
       <div class="dialog-actions">
         <button class="primary" id="connect" type="submit">Connect</button>
         <button id="disconnect" type="button" disabled>Disconnect</button>
@@ -200,6 +207,11 @@
     <section class="settings-panel info-box" id="about-panel" aria-labelledby="about-title" hidden>
       <h3 id="about-title">About Nexus</h3>
       <p class="settings-version">Version <strong id="server-version">Not connected</strong></p>
+      <div class="install-block">
+        <strong>Install app</strong>
+        <p class="hint" id="install-note">Use your browser's Install or Add to Home Screen action. The local server must still be running; this browser remembers your connection.</p>
+        <button class="primary" id="install-app" type="button" hidden>Install Nexus</button>
+      </div>
       <strong>Current limits</strong>
       <p>Reloading or closing this page loses the transcript; the server session is not a saved conversation. History, file browsing, and session restore are not implemented.</p>
     </section>

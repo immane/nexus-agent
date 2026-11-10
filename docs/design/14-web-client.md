@@ -90,16 +90,37 @@ session token in memory only; reloading loses the transcript and the session
 view. Server idle cleanup can later remove the ephemeral runtime. Reloading or
 closing the page does not cancel an active run.
 
-The bearer token is entered manually in Settings. It stays only in the page's
-JavaScript memory and is sent in the `Authorization` header for API calls and
-SSE reads. It is never placed in a URL, cookie, `localStorage`, or
-`sessionStorage`. Disconnecting or receiving `401` clears it. The palette
-preference is the only persisted browser state.
+The bearer token is entered in Settings and saved in same-origin `localStorage`
+after a successful connection. The page reuses it on launch, sending it only in
+the `Authorization` header for API calls and SSE reads, never in a URL or cookie.
+Disconnect removes it, and a `401` clears the matching saved token. Network errors
+do not erase it. If browser storage is blocked, the connection remains usable in
+memory and the settings show that it could not be saved. The palette preference
+is also persisted. Same-origin scripts can read the saved token; use only a
+trusted browser profile. Different hostnames, ports, profiles, or isolated app
+storage may require connecting once again.
 
 The server permits one SSE subscriber per session. A second tab or client that
 attaches while another is streaming receives `409`; the UI shows that conflict
 and does not treat it as a run failure. Disconnecting an SSE read does not cancel
 the run.
+
+## Installed web app
+
+The composer shows animated activity bars and a breathing outer border during
+submission and active runs. Both stop on completion or disconnection; reduced
+motion preferences disable the animation while keeping the activity indicator.
+
+The page links a Web App Manifest with 192px and 512px icons and registers a
+root-scoped Service Worker. The worker handles navigations only, fetching them
+from the network; it never caches API responses or SSE frames. Installation is
+therefore a standalone-window and launcher affordance, not an offline mode.
+
+Chromium browsers may offer an install action and fire
+`beforeinstallprompt`; Settings → About exposes a matching button. Other
+browsers use their own Install or Add to Home Screen action. The local server
+must still be running after launch. The installed app reuses its saved bearer
+token where browser storage is shared, or requires connecting once if isolated.
 
 ## Projects and runtime mode
 

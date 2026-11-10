@@ -15,6 +15,8 @@ const dom = {
   settingsPanels: [...document.querySelectorAll('.settings-panel')],
   settingsContent: document.querySelector('.settings-content'),
   serverVersion: document.querySelector('#server-version'),
+  installApp: document.querySelector('#install-app'),
+  installNote: document.querySelector('#install-note'),
   connectionForm: document.querySelector('#connection-form'),
   token: document.querySelector('#token'),
   connect: document.querySelector('#connect'),
@@ -63,6 +65,7 @@ const dom = {
   modelBadge: document.querySelector('#model-badge'),
   message: document.querySelector('#message'),
   composer: document.querySelector('#composer'),
+  composerActivity: document.querySelector('#composer-activity'),
   send: document.querySelector('#send'),
   cancel: document.querySelector('#cancel-run'),
   jumpLatest: document.querySelector('#jump-latest'),
@@ -148,6 +151,72 @@ dom.theme.addEventListener('change', () => {
     // Appearance remains usable when browser storage is unavailable.
   }
 });
+
+/* Installation */
+
+let deferredInstallPrompt = null;
+
+function runningStandalone() {
+  return window.matchMedia?.('(display-mode: standalone)')?.matches === true
+    || window.navigator.standalone === true;
+}
+
+function updateInstallDisplay(message) {
+  if (!dom.installApp || !dom.installNote) return;
+  if (message) {
+    dom.installApp.hidden = true;
+    dom.installNote.textContent = message;
+    return;
+  }
+  if (runningStandalone()) {
+    dom.installApp.hidden = true;
+    dom.installNote.textContent = 'Nexus is running as an installed app. The local server must still be running; this browser remembers your connection.';
+  } else if (deferredInstallPrompt) {
+    dom.installApp.hidden = false;
+    dom.installNote.textContent = 'Install Nexus as a standalone window. The local server must still be running; this browser remembers your connection.';
+  } else {
+    dom.installApp.hidden = true;
+    dom.installNote.textContent = 'Use your browser\'s Install or Add to Home Screen action. The local server must still be running; this browser remembers your connection.';
+  }
+}
+
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  updateInstallDisplay();
+});
+
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  updateInstallDisplay('Nexus is installed. Open it from your app launcher or Dock. Connect once if the installed app uses separate browser storage.');
+});
+
+dom.installApp?.addEventListener('click', async () => {
+  const prompt = deferredInstallPrompt;
+  if (!prompt || dom.installApp.disabled) return;
+  deferredInstallPrompt = null;
+  dom.installApp.disabled = true;
+  try {
+    prompt.prompt();
+    const choice = await prompt.userChoice;
+    updateInstallDisplay(choice.outcome === 'accepted'
+      ? 'Installing Nexus…'
+      : 'Install prompt dismissed. Use the browser menu to install later.');
+  } catch {
+    updateInstallDisplay('The install prompt could not be opened. Use the browser menu instead.');
+  } finally {
+    dom.installApp.disabled = false;
+  }
+});
+
+window.matchMedia?.('(display-mode: standalone)').addEventListener?.('change', () => updateInstallDisplay());
+updateInstallDisplay();
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {
+    // The workspace remains usable when installation is unavailable.
+  });
+}
 
 /* Small helpers */
 
@@ -361,6 +430,7 @@ async function api(path, options = {}) {
 
 function markUnauthorized() {
   state.connected = false;
+  if (readSavedCredential() === state.credential) saveCredential('');
   state.credential = '';
   setConnectionStatus('Authentication required', 'error');
   dom.connectionDetail.textContent = 'Authentication failed. Enter the current server bearer token.';
@@ -789,6 +859,29 @@ function populateModels() {
   updateModelDisplay();
 }
 
+/* Saved connection */
+
+function readSavedCredential() {
+  try {
+    const value = localStorage.getItem('nexus.server-token') || '';
+    if (!value || TOKEN_PATTERN.test(value)) return value;
+    localStorage.removeItem('nexus.server-token');
+  } catch {
+    // A blocked storage backend must not prevent an in-memory connection.
+  }
+  return '';
+}
+
+function saveCredential(value) {
+  try {
+    if (value) localStorage.setItem('nexus.server-token', value);
+    else localStorage.removeItem('nexus.server-token');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /* Connection */
 
 async function connect(candidate) {
@@ -834,6 +927,9 @@ async function connect(candidate) {
     dom.token.value = '';
     setConnectionStatus('Connected', 'ok');
     updateConnectionDetail();
+    if (!saveCredential(candidate)) {
+      dom.connectionDetail.textContent += ' Browser storage is unavailable; this connection will not be remembered.';
+    }
 
     updateSessionDisplay();
     updateControls();
@@ -852,6 +948,7 @@ async function connect(candidate) {
       setConnectionStatus('Connected', 'ok');
       dom.connectionDetail.textContent = 'The new connection attempt failed; the previous connection is still active.';
     } else if (error instanceof ApiError && error.status === 401) {
+      if (readSavedCredential() === candidate) saveCredential('');
       setConnectionStatus('Authentication required', 'error');
       dom.connectionDetail.textContent = 'Authentication required. Enter the server bearer token.';
       setRunStatus('Authentication required', 'error');
@@ -884,9 +981,12 @@ function disconnect() {
   state.connectGeneration += 1;
   state.connected = false;
   state.credential = '';
+  const forgotten = saveCredential('');
   setConnectionStatus('Not connected', '');
   setRunStatus('Not connected', '');
-  dom.connectionDetail.textContent = 'Disconnected. The page no longer holds a server token.';
+  dom.connectionDetail.textContent = forgotten
+    ? 'Disconnected. The saved server token has been removed from this browser.'
+    : 'Disconnected. Browser storage could not be cleared; clear this site\'s data in your browser to forget the token.';
   updateControls();
 }
 
@@ -913,7 +1013,15 @@ function updateSessionDisplay() {
   dom.conversationTitle.textContent = state.sessionTitle || 'New conversation';
 }
 
+function updateComposerActivity() {
+  const running = state.connected && !state.inFlightUnknown
+    && (state.submitting || (state.active && !state.runTerminal));
+  dom.composer.dataset.activity = running ? 'running' : 'idle';
+  dom.composerActivity.hidden = !running;
+}
+
 function updateControls() {
+  updateComposerActivity();
   const connected = state.connected;
   const busy = state.active || state.submitting || state.connecting;
   const blocked = state.inFlightUnknown;
@@ -2858,4 +2966,4 @@ updateControls();
 updateJumpLatest();
 setConnectionStatus('Connecting…', 'busy');
 setRunStatus('Connecting…', 'busy');
-void connect('');
+void connect(readSavedCredential());

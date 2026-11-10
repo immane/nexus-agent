@@ -22,6 +22,14 @@ fn embedded_assets_keep_host_origin_and_api_authentication_checks() {
         ("GET", "/", host.as_str(), "", 200),
         ("GET", "/assets/app.css", host.as_str(), "", 200),
         ("GET", "/assets/app.js?v=1", host.as_str(), "", 200),
+        (
+            "GET",
+            "/assets/manifest.webmanifest",
+            host.as_str(),
+            "",
+            200,
+        ),
+        ("GET", "/sw.js", host.as_str(), "", 200),
         ("GET", "/config", host.as_str(), "", 401),
         ("POST", "/", host.as_str(), "", 401),
         ("GET", "/assets/../app.js", host.as_str(), "", 401),
@@ -67,10 +75,24 @@ fn embedded_assets_keep_host_origin_and_api_authentication_checks() {
                 "/" => {
                     assert!(head.contains("text/html; charset=utf-8"));
                     assert!(body.contains("id=\"composer\""));
+                    assert!(body.contains("rel=\"manifest\""));
+                    assert!(body.contains("id=\"install-app\""));
                     assert!(body.contains("Live session client"));
                 }
                 "/assets/app.css" => assert!(head.contains("text/css; charset=utf-8")),
-                _ => assert!(head.contains("text/javascript; charset=utf-8")),
+                "/assets/manifest.webmanifest" => {
+                    assert!(head.contains("application/manifest+json; charset=utf-8"));
+                }
+                "/assets/app.js?v=1" => {
+                    assert!(head.contains("text/javascript; charset=utf-8"));
+                    assert!(body.contains("beforeinstallprompt"));
+                    assert!(body.contains("/sw.js"));
+                }
+                "/sw.js" => {
+                    assert!(head.contains("text/javascript; charset=utf-8"));
+                    assert!(body.contains("addEventListener('fetch'"));
+                }
+                _ => unreachable!("unexpected success case"),
             }
         }
     }
