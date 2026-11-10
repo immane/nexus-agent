@@ -24,6 +24,10 @@ counts. `planning_output_reserve_tokens` is the task policy's headroom, includin
 on summary diagnostic lines; `request_max_output_tokens` is the separate cap on
 that particular request. The retained view may be larger than the final
 previewed request. Public event and persistence formats are unchanged.
+For unknown windows, detailed budget diagnostics require a host-owned diagnostic
+writer. The default scripted headless runner retains its existing stderr
+contract; `nexus-headless` CLI tests cover separate and merged streams and a
+closed stdout pipe without relaxing their output assertions.
 
 The opt-in provider `task_reasoning_effort` setting has offline coverage in
 `nexus-config`'s `task_reasoning_effort` test target, `nexus-openai`'s

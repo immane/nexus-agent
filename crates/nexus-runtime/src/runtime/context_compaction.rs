@@ -105,6 +105,16 @@ pub(super) fn diagnose_budget(
     stage: &'static str,
     purpose: nexus_core::ModelRequestPurpose,
 ) {
+    // Unknown-window scripted hosts retain their existing stderr contract.
+    // A host-owned sink can still collect detailed unknown-window diagnostics.
+    if active.context_management.window.is_none()
+        && !shared
+            .diagnostic_writer
+            .lock()
+            .is_ok_and(|writer| writer.is_some())
+    {
+        return;
+    }
     let estimator = if purpose == nexus_core::ModelRequestPurpose::Summary {
         &active.summary_token_estimator
     } else {
