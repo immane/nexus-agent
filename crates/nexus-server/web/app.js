@@ -1940,7 +1940,8 @@ function toolPresentation(tool, preview) {
     : tool === 'host_patch' ? 'patch' : 'generic';
   const result = {
     label: kind === 'exec' ? 'RUN' : kind === 'write' ? 'WRITE' : kind === 'patch' ? 'EDIT' : tool,
-    target: kind === 'exec' ? 'Command preview unavailable' : kind !== 'generic' ? 'File preview unavailable' : '',
+    target: kind === 'exec' ? 'Command preview unavailable' : kind !== 'generic' ? 'Preview unavailable' : '',
+    targetKnown: false,
     kind, sections: [],
   };
   if (!args || typeof args !== 'object' || Array.isArray(args)) return result;
@@ -1949,13 +1950,14 @@ function toolPresentation(tool, preview) {
     const command = args.argv.map((arg) => /^[\w./:=@%+,-]+$/.test(arg)
       ? arg : `'${arg.replaceAll("'", "'\\''")}'`).join(' ');
     return {
-      label: 'RUN', target: command, kind: 'exec',
+      label: 'RUN', target: command, kind: 'exec', targetKnown: true,
       sections: [{ label: 'Command', text: command }],
       directory: typeof args.write_dir === 'string' ? args.write_dir : '',
     };
   }
   if ((tool === 'host_write' || tool === 'host_patch') && typeof args.path === 'string') {
     result.target = args.path;
+    result.targetKnown = true;
     if (tool === 'host_write' && typeof args.content === 'string') {
       result.sections.push({ label: 'Proposed file content', text: args.content, style: 'content' });
     } else if (tool === 'host_patch') {
@@ -2040,9 +2042,13 @@ function startTool(detail) {
   root.dataset.kind = presentation.kind;
   const summary = node('summary');
   summary.append(node('span', 'tool-name', presentation.label));
+  let target = null;
   if (presentation.target) {
-    const target = node('span', 'tool-target', clip(presentation.target, 500));
-    target.title = clip(presentation.target, MAX_TOOL_CHARS);
+    target = node('span', 'tool-target', clip(presentation.target, 500));
+    target.title = presentation.targetKnown
+      ? clip(presentation.target, MAX_TOOL_CHARS)
+      : 'The server did not include this call\'s argument preview.';
+    if (!presentation.targetKnown) target.dataset.unavailable = 'true';
     summary.append(target);
   }
   const status = node('span', 'tool-status', 'Running');
@@ -2053,6 +2059,13 @@ function startTool(detail) {
   const body = node('div', 'tool-body');
   for (const section of presentation.sections) appendToolSection(body, section);
   if (presentation.directory) body.append(node('div', 'tool-meta', `Write directory: ${presentation.directory}`));
+  if (!presentation.targetKnown && presentation.kind !== 'generic') {
+    body.append(node(
+      'p',
+      'tool-note',
+      'The server did not provide an argument preview for this call. The tool still ran; its result is shown below.',
+    ));
+  }
   if (typeof detail.args_preview === 'string' && detail.args_preview) {
     const section = node('details', 'tool-arguments');
     section.append(node('summary', '', `Raw arguments · ${toolName}`));
@@ -2075,6 +2088,9 @@ function startTool(detail) {
   const record = {
     root,
     status,
+    target,
+    targetKnown: presentation.targetKnown,
+    kind: presentation.kind,
     outputSection,
     outputText,
     meta,
@@ -2134,6 +2150,15 @@ function finishTool(detail) {
       : status;
   setStatus(record.status, label, tone);
   record.root.dataset.state = tone;
+  if (!record.targetKnown && record.target && (record.kind === 'write' || record.kind === 'patch')) {
+    const result = typeof outcome.content === 'string' ? outcome.content.trim() : '';
+    if (result) {
+      record.target.textContent = clip(result, 240);
+      record.target.title = clip(result, MAX_TOOL_CHARS);
+      delete record.target.dataset.unavailable;
+      record.targetKnown = true;
+    }
+  }
   setRunStatus(`Tool finished: ${label}`, tone === 'error' ? 'error' : 'busy');
   if (!record.userToggled || tone !== 'ok') record.root.open = tone !== 'ok';
 

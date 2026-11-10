@@ -908,6 +908,19 @@ p {
   font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+.tool-target[data-unavailable="true"] {
+  color: var(--muted);
+  font-family: inherit;
+  font-style: italic;
+}
+
+.tool-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 .tool-card[data-state="running"] .tool-name {
   color: var(--warning);
   animation: blink 1.6s ease-in-out infinite;

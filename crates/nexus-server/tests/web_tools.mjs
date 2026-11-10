@@ -97,6 +97,28 @@ test('diff preserves context, handles insertion/deletion and bounds large previe
   assert.equal(run(`toolPresentation('host_patch', undefined).kind`), 'patch');
 });
 
+test('withheld write previews explain the limit and show the result instead', () => {
+  const { cards, run } = fixture();
+  run(`startTool({ call: 'large', tool: 'host_write' });`);
+  assert.equal(cards[0].children[0].children[0].textContent, 'WRITE');
+  const target = cards[0].children[0].children[1];
+  assert.equal(target.textContent, 'Preview unavailable');
+  assert.equal(target.dataset.unavailable, 'true');
+  assert.match(cards[0].textContent, /did not provide an argument preview/);
+  run(`finishTool({ call: 'large', outcome: { status: 'Succeeded', content: 'wrote 505 bytes' } });`);
+  assert.equal(target.textContent, 'wrote 505 bytes');
+  assert.equal(target.dataset.unavailable, undefined);
+  assert.equal(target.title, 'wrote 505 bytes');
+});
+
+test('withheld exec previews never show stdout as the command', () => {
+  const { cards, run } = fixture();
+  run(`startTool({ call: 'exec', tool: 'host_exec' });`);
+  run(`finishTool({ call: 'exec', outcome: { status: 'Succeeded', content: 'some stdout' } });`);
+  assert.equal(cards[0].children[0].children[1].textContent, 'Command preview unavailable');
+  assert.doesNotMatch(cards[0].children[0].textContent, /some stdout/);
+});
+
 test('unavailable exec arguments retain raw previews without guessing a command', () => {
   const { cards, run } = fixture();
   run(`startTool({ call: 'broken', tool: 'host_exec', args_preview: '{"argv":[' });`);
