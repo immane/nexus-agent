@@ -280,6 +280,8 @@ pub fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result
                 "text/html; charset=utf-8"
                     | "text/css; charset=utf-8"
                     | "text/javascript; charset=utf-8"
+                    | "application/manifest+json; charset=utf-8"
+                    | "image/png"
             ) {
                 crate::web::HEADERS
             } else {

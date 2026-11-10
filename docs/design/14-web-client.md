@@ -23,9 +23,10 @@ The client supports:
 - reconciling an uncertain stream failure with `GET /snapshot`;
 - five color palettes with the selected palette kept in `localStorage`.
 
-The client does not implement session listing, transcript restore, multi-session
-switching, file browsing, diffs, syntax highlighting, background polling,
-service workers, or a release asset-compression pipeline.
+The client supports saved-session listing and restore when the server enables
+persistence. It does not implement concurrent multi-session editing, file
+browsing, syntax highlighting, background polling, offline API access, or a
+release asset-compression pipeline. Its Service Worker is network-only.
 
 ## Boundaries
 
@@ -84,22 +85,60 @@ terminal errors remain visible.
 
 ## Sessions and authentication
 
-`POST /sessions` is called lazily on the first send. The provider/model choice
-is fixed at session creation, matching the server contract. The page keeps the
-session token in memory only; reloading loses the transcript and the session
-view. Server idle cleanup can later remove the ephemeral runtime. Reloading or
-closing the page does not cancel an active run.
+New server session IDs use a 128-bit OS-random suffix (`sess-web-<hex>`), not a
+counter reset at startup, so new sessions do not reuse earlier server identities
+when opening the same persistent store. ID generation fails explicitly if the
+system random source is unavailable. IDs remain opaque and are not credentials;
+legacy counter-based IDs remain valid inputs.
 
-The bearer token is entered manually in Settings. It stays only in the page's
-JavaScript memory and is sent in the `Authorization` header for API calls and
-SSE reads. It is never placed in a URL, cookie, `localStorage`, or
-`sessionStorage`. Disconnecting or receiving `401` clears it. The palette
-preference is the only persisted browser state.
+`POST /sessions` is called lazily on the first send. The provider/model choice
+is fixed at session creation, matching the server contract. The page remembers
+the current session id in browser storage and asks `POST /sessions/{id}/restore`
+to reopen it after a reload. Server idle cleanup can later remove the ephemeral
+runtime. Reloading or closing the page does not cancel an active run, and an
+active run is not reattached merely by restoring its saved history.
+
+When the server starts with `--session-store DIRECTORY`, the sidebar lists saved
+sessions from `GET /sessions`, reads bounded pages from
+`GET /sessions/{id}/history`, restores context without replaying tools, and can
+delete a non-live session with `DELETE /sessions/{id}`. Titles come from the
+first saved user item. History rendering is bounded; filesystem effects and old
+approval grants are never replayed. The provider/model/project binding is kept
+in browser storage because the session checkpoint format does not carry Web
+bindings; a different browser must select valid bindings before restoring.
+Without `--session-store`, the list reports persistence as disabled.
+
+The bearer token is entered in Settings and saved in same-origin `localStorage`
+after a successful connection. The page reuses it on launch, sending it only in
+the `Authorization` header for API calls and SSE reads, never in a URL or cookie.
+Disconnect removes it, and a `401` clears the matching saved token. Network errors
+do not erase it. If browser storage is blocked, the connection remains usable in
+memory and the settings show that it could not be saved. The palette preference
+is also persisted. Same-origin scripts can read the saved token; use only a
+trusted browser profile. Different hostnames, ports, profiles, or isolated app
+storage may require connecting once again.
 
 The server permits one SSE subscriber per session. A second tab or client that
 attaches while another is streaming receives `409`; the UI shows that conflict
 and does not treat it as a run failure. Disconnecting an SSE read does not cancel
 the run.
+
+## Installed web app
+
+The composer shows animated activity bars and a breathing outer border during
+submission and active runs. Both stop on completion or disconnection; reduced
+motion preferences disable the animation while keeping the activity indicator.
+
+The page links a Web App Manifest with 192px and 512px icons and registers a
+root-scoped Service Worker. The worker handles navigations only, fetching them
+from the network; it never caches API responses or SSE frames. Installation is
+therefore a standalone-window and launcher affordance, not an offline mode.
+
+Chromium browsers may offer an install action and fire
+`beforeinstallprompt`; Settings → About exposes a matching button. Other
+browsers use their own Install or Add to Home Screen action. The local server
+must still be running after launch. The installed app reuses its saved bearer
+token where browser storage is shared, or requires connecting once if isolated.
 
 ## Projects and runtime mode
 
@@ -115,7 +154,8 @@ turn the scripted demo into real tools. `GET /projects` reports the mode:
 
 Project selection is part of the left sidebar, with the active project
 highlighted. Selecting a different project while a session exists starts a new
-session after confirmation; the previous transcript is not saved. The Settings
+session after confirmation; the previous session remains available in saved
+history when persistence is enabled. The Settings
 dialog manages project admission/removal, and a sidebar `+` shortcut opens that
 section. On narrow screens the sidebar collapses and the composer exposes an
 equivalent project selector.
@@ -214,8 +254,11 @@ new session never claims to cancel work that may still be executing.
 
 ## Known limits
 
-- No source-history API is consumed, so a reload cannot reconstruct a
-  transcript. Snapshot recovery exposes final state, not lost content.
+- Saved history is available only when the server starts with
+  `--session-store`; an active run is not reattached after reload. Snapshot
+  recovery exposes final state, not lost event content.
+- Web bindings are stored in the browser, not the server checkpoint. A different
+  browser must select valid provider/model/project bindings before restoring.
 - One SSE subscriber per session means multi-tab use can conflict.
 - Retained event queues are bounded; saturated or evicted content is reported
   as incomplete, never reconstructed.

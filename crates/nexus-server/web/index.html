@@ -4,8 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#080808">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Nexus">
   <title>Nexus · Workspace</title>
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png">
+  <link rel="apple-touch-icon" href="/assets/icon-192.png">
+  <link rel="manifest" href="/assets/manifest.webmanifest">
   <link rel="stylesheet" href="/assets/app.css">
   <script type="module" src="/assets/app.js"></script>
 </head>
@@ -23,11 +29,15 @@
     <button class="new-session" id="new-session" type="button" disabled>＋ New session</button>
     <div class="section-label">SESSIONS <span id="session-count">0</span></div>
     <div class="session-list" id="session-list">
-      <p class="sidebar-empty" id="no-session-note">No active session.<br>Saved history is not available yet.</p>
+      <p class="sidebar-empty" id="no-session-note">No active session.<br>Choose a saved session or start a new one.</p>
       <div class="session-item" id="session-item" hidden>
         <span class="session-item-title" id="session-item-title">New conversation</span>
         <span class="session-item-meta" id="session-item-meta">Ready</span>
       </div>
+    </div>
+    <div class="section-label">SAVED <span id="saved-count">0</span></div>
+    <div class="saved-list" id="saved-sessions" aria-label="Saved sessions">
+      <p class="sidebar-empty" id="saved-note">Connect to load saved sessions.</p>
     </div>
     <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span> Local only <span class="badge">ALPHA</span></div>
   </aside>
@@ -47,7 +57,7 @@
         <span class="eyebrow">A SMALL CORE. AN OPEN WORKSPACE.</span>
         <h1 id="welcome-title">Space to build.</h1>
         <p>A lightweight interface for your agent.<br>Everything runs through your local server.</p>
-        <span class="foundation">Live session client · history not restored</span>
+        <span class="foundation">Live session client · saved history when enabled</span>
         <div class="cards" aria-label="Workspace capabilities">
           <article><span class="card-number">01 / CONVERSATION</span><h2>Follow the thread</h2><p>Stream responses and keep the current session in view.</p><span class="muted">Live</span></article>
           <article><span class="card-number">02 / TOOLS</span><h2>See the work</h2><p>Inspect tool activity, bounded output, and reported outcomes.</p><span class="muted">Live</span></article>
@@ -64,6 +74,7 @@
         <textarea id="message" rows="2" disabled placeholder="Connect to start a task…"></textarea>
         <div class="composer-footer">
           <div class="composer-context">
+            <span class="composer-activity" id="composer-activity" aria-hidden="true" hidden><i></i><i></i><i></i></span>
             <span class="status" id="run-status" role="status" aria-live="polite">Not connected</span>
             <span class="usage" id="usage-status" hidden></span>
           </div>
@@ -81,7 +92,7 @@
           </div>
         </div>
       </form>
-      <p class="footnote">Plain text view. No external assets. Transcripts are not restored after reload.</p>
+      <p class="footnote">Saved sessions restore their transcript; active runs are not resumed after reload.</p>
     </section>
     <footer class="footer"><span>NEXUS AGENT</span><span>Built for focus, not overhead.</span></footer>
   </div>
@@ -102,7 +113,7 @@
     <div class="settings-content">
     <section class="settings-panel" id="appearance-panel" aria-labelledby="appearance-title">
     <h3 id="appearance-title">Appearance</h3>
-    <p class="muted">Appearance stays in this browser. The server token stays in this page's memory.</p>
+    <p class="muted">Appearance and your server connection are remembered in this browser.</p>
     <label for="theme">Color palette</label>
     <select id="theme">
       <option value="system">System</option>
@@ -118,7 +129,7 @@
       <p class="muted">Same-origin only. The check loads model identities; it does not start a session.</p>
       <label for="token">Bearer token <span class="muted">(if required)</span></label>
       <input id="token" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="64 hexadecimal characters">
-      <p class="hint">Kept only in this page's memory, never in browser storage, and cleared on reload.</p>
+      <p class="hint">Saved in this browser after a successful connection and reused on launch. Same-origin scripts can read it; use only a trusted local browser. Disconnect removes the saved token.</p>
       <div class="dialog-actions">
         <button class="primary" id="connect" type="submit">Connect</button>
         <button id="disconnect" type="button" disabled>Disconnect</button>
@@ -200,8 +211,13 @@
     <section class="settings-panel info-box" id="about-panel" aria-labelledby="about-title" hidden>
       <h3 id="about-title">About Nexus</h3>
       <p class="settings-version">Version <strong id="server-version">Not connected</strong></p>
+      <div class="install-block">
+        <strong>Install app</strong>
+        <p class="hint" id="install-note">Use your browser's Install or Add to Home Screen action. The local server must still be running; this browser remembers your connection.</p>
+        <button class="primary" id="install-app" type="button" hidden>Install Nexus</button>
+      </div>
       <strong>Current limits</strong>
-      <p>Reloading or closing this page loses the transcript; the server session is not a saved conversation. History, file browsing, and session restore are not implemented.</p>
+      <p>Saved sessions restore their transcript when the server runs with <code>--session-store</code>. Active runs are not resumed after reload, and file browsing is not implemented.</p>
     </section>
     </div>
     </div>

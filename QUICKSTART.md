@@ -697,16 +697,21 @@ names), never secret values. Changes apply to new sessions; live sessions keep
 their original provider, model, and tool root. There is no web deletion for
 providers or models; edit `config.json` to remove them.
 
-The token is held only in this page's memory, is never written to browser
-storage, and is gone after reload. Only the palette preference is persisted.
+After a successful connection, the bearer token is saved in same-origin browser
+storage and reused on launch. Disconnect removes it; invalid saved credentials
+are cleared on authentication failure. Same-origin scripts can read it, so use
+only a trusted local browser profile. If storage is unavailable, the connection
+works in memory only. Palette preferences are also persisted.
 The static shell is public, but API authentication and Host/Origin checks remain
 enforced. Assistant text renders a bounded Markdown subset (headings, emphasis,
 lists, quotes, fenced code, tables, and safe links); raw HTML, images, and syntax
-highlighting are not rendered. There is no session list, transcript restore, or
-file browser in this slice; reloading loses the view and the server session is
-not a saved conversation. An active run is not cancelled by closing the page.
-Assets are embedded uncompressed; release compression and long-lived asset
-caching are not implemented.
+highlighting are not rendered. Start the server with `--session-store DIRECTORY`
+to enable the saved-session sidebar, transcript restore, and continuation across
+reloads or server restarts. The browser remembers the current session id and
+its provider/model/project binding; a different browser must select valid
+bindings. An active run is not resumed or cancelled by closing the page. There is
+no file browser. Assets are embedded uncompressed; release compression and
+long-lived asset caching are not implemented.
 
 In the server terminal, keep the generated token available through your
 secret manager or another secret-safe channel. In the client terminal, read

@@ -6,8 +6,8 @@
 //! fields the runtime already bounded and the policy already admitted.
 
 use nexus_core::{
-    AgentError, ApprovalNotice, CommandReply, EventPayload, OutcomeSummary, RunEvent, RunFinished,
-    RunLifecycle, Snapshot, ToolOutcome, Usage,
+    AgentError, ApprovalNotice, CommandReply, EventPayload, ModelContextItem, OutcomeSummary,
+    RunEvent, RunFinished, RunLifecycle, Snapshot, SourceRecord, ToolOutcome, Usage,
 };
 use serde_json::{Value, json};
 
@@ -219,6 +219,65 @@ pub fn event_json(event: &RunEvent) -> Value {
         "terminal": event.is_terminal(),
         "detail": detail,
     })
+}
+
+/// Encodes one durable source record for historical display. Reasoning text is
+/// never exposed; tool arguments and outcomes are the bounded values already
+/// accepted by the runtime.
+#[must_use]
+pub fn history_item_json(record: &SourceRecord) -> Value {
+    let base = |kind: &str| {
+        json!({
+            "kind": kind,
+            "sequence": record.sequence(),
+            "run": record.run().as_str(),
+        })
+    };
+    match record.item() {
+        ModelContextItem::UserText(text) => {
+            let mut value = base("user");
+            value["text"] = Value::String(text.as_str().to_owned());
+            value
+        }
+        ModelContextItem::AssistantText { text, .. } => {
+            let mut value = base("assistant");
+            value["text"] = Value::String(text.as_str().to_owned());
+            value
+        }
+        ModelContextItem::AssistantCall { call, .. } => {
+            let mut value = base("tool-call");
+            value["call"] = Value::String(call.call().as_str().to_owned());
+            value["tool"] = Value::String(call.tool().name().to_owned());
+            value["args"] = Value::String(call.args().as_str().to_owned());
+            value
+        }
+        ModelContextItem::AssistantDeniedCall {
+            call, candidate, ..
+        } => {
+            let mut value = base("tool-denied");
+            value["call"] = Value::String(call.as_str().to_owned());
+            value["tool"] = Value::String(candidate.tool_name().to_owned());
+            value["args"] = Value::String(candidate.arguments_json().to_owned());
+            value
+        }
+        ModelContextItem::AssistantReasoning { .. } => base("reasoning"),
+        ModelContextItem::ToolResult {
+            call,
+            tool,
+            outcome,
+            ..
+        } => {
+            let mut value = base("tool-result");
+            value["call"] = Value::String(call.as_str().to_owned());
+            value["tool"] = Value::String(tool.name().to_owned());
+            value["status"] = Value::String(format!("{:?}", outcome.status()));
+            value["effect"] = Value::String(format!("{:?}", outcome.effect()));
+            value["evidence"] = Value::String(format!("{:?}", outcome.evidence()));
+            value["content"] = Value::String(outcome.content().to_owned());
+            value["truncated"] = Value::Bool(outcome.is_truncated());
+            value
+        }
+    }
 }
 
 /// Encodes a bounded snapshot: lifecycle, last sequence, pending approval

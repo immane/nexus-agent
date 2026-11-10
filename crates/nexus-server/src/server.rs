@@ -40,7 +40,7 @@
 //! the two can never disagree about what was used.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -54,9 +54,10 @@ use nexus_config::{
     resolve_credential, save, summary,
 };
 use nexus_core::{
-    ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelInstructions,
-    ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
-    RunId, SessionId, SubmitCommand, ToolRegistration,
+    ApproveCommand, Command, CommandReply, DenyCommand, GetSnapshotCommand, Limits,
+    ModelInstructions, ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent,
+    ProviderPort, RequestId, RestoreSessionCommand, RunId, SessionId, SubmitCommand,
+    ToolRegistration,
 };
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::transport::{OrderedEventConsumer, is_control_payload};
@@ -395,7 +396,7 @@ pub struct Server {
     handle: tokio::runtime::Handle,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     pending_sessions: AtomicUsize,
-    next_session: AtomicU64,
+    next_restore: AtomicU64,
     /// The live configuration document. Every read and write goes through
     /// this one lock so a run's usage record and the redacted summary can
     /// never observe a half-applied change.
@@ -482,7 +483,7 @@ impl Server {
             handle,
             sessions: Mutex::new(HashMap::new()),
             pending_sessions: AtomicUsize::new(0),
-            next_session: AtomicU64::new(1),
+            next_restore: AtomicU64::new(1),
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             limits: nexus_config::SettingsProfile::Server.default_limits(),
@@ -654,6 +655,65 @@ impl Server {
         model: Option<&str>,
         project: Option<&str>,
     ) -> Result<String, SessionError> {
+        // Session identities outlive a server process when storage is enabled.
+        // Use OS entropy rather than a process-local counter or wall clock;
+        // failure must not silently fall back to a reusable identity.
+        let mut bytes = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut bytes))
+            .map_err(|_| SessionError::new(500, "session identity could not be generated"))?;
+        let token = format!("sess-web-{:032x}", u128::from_be_bytes(bytes));
+        let session = SessionId::new(&token).expect("random session id is valid");
+        self.build_session(session, provider, model, project, false)
+    }
+
+    /// Opens one saved session under its existing identity and loads its
+    /// bounded context. Bindings are supplied by the caller because the
+    /// checkpoint format does not carry Web provider/model/project choices.
+    fn restore_session(
+        &self,
+        id: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<String, SessionError> {
+        let Some(store) = self.session_store.clone() else {
+            return Err(SessionError::new(409, "session persistence is not enabled"));
+        };
+        let session = SessionId::new(id)
+            .map_err(|_| SessionError::new(400, "saved session identity is invalid"))?;
+        let existing = self
+            .sessions
+            .lock()
+            .expect("sessions lockable")
+            .get(id)
+            .cloned();
+        if let Some(existing) = existing {
+            if existing.provider.as_deref() != provider
+                || existing.model.as_deref() != model
+                || existing.project.as_deref() != project
+            {
+                return Err(SessionError::new(
+                    409,
+                    "session is open with different settings",
+                ));
+            }
+            return Ok(id.to_owned());
+        }
+        if store.load_session(&session).is_err() {
+            return Err(SessionError::new(404, "saved session was not found"));
+        }
+        self.build_session(session, provider, model, project, true)
+    }
+
+    fn build_session(
+        &self,
+        session: SessionId,
+        provider: Option<&str>,
+        model: Option<&str>,
+        project: Option<&str>,
+        restore: bool,
+    ) -> Result<String, SessionError> {
         // Reserve capacity under the map lock, then release it before any
         // provider/container construction so existing sessions remain
         // cancellable while Docker is slow.
@@ -700,9 +760,7 @@ impl Server {
             None => None,
             Some(id) => Some(self.select_provider(id, model)?),
         };
-        let n = self.next_session.fetch_add(1, Ordering::SeqCst);
-        let token = format!("sess-web-{n}");
-        let session = SessionId::new(&token).expect("counter session id is valid");
+        let token = session.as_str().to_owned();
         let (policy, tools) = self.session_tools(project_root.as_deref())?;
         let config = RuntimeConfig {
             limits: self.limits,
@@ -724,6 +782,23 @@ impl Server {
             None => Runtime::try_new(config, provider, tools),
         }
         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
+        if restore {
+            let n = self.next_restore.fetch_add(1, Ordering::SeqCst);
+            let request = RequestId::new(format!("req-web-restore-{n}"))
+                .expect("counter restore request id is valid");
+            let (reply, _) = self.handle.block_on(runtime.handle(Command::RestoreSession(
+                RestoreSessionCommand {
+                    request,
+                    session: session.clone(),
+                },
+            )));
+            if reply.reply() != CommandReply::Accepted {
+                return Err(SessionError::new(
+                    409,
+                    "saved session could not be restored",
+                ));
+            }
+        }
         let entry = Arc::new(Session {
             session,
             provider: bound_provider,
@@ -739,10 +814,12 @@ impl Server {
             last_activity: Mutex::new(Instant::now()),
             last_run: Mutex::new(None),
         });
-        self.sessions
-            .lock()
-            .expect("sessions lockable")
-            .insert(token.clone(), entry);
+        let mut sessions = self.sessions.lock().expect("sessions lockable");
+        if sessions.contains_key(&token) {
+            return Err(SessionError::new(409, "session is already open"));
+        }
+        sessions.insert(token.clone(), entry);
+        drop(sessions);
         drop(admission);
         Ok(token)
     }
@@ -1022,25 +1099,12 @@ impl Server {
         let body = &parsed;
         match route_path(&request.method, &request.path) {
             Route::Health => Some(json_response(200, &body_json(crate::json::health_json()))),
+            Route::ListSessions => Some(self.saved_sessions()),
             Route::CreateSession => {
-                let field = |key: &str| match body.get(key) {
-                    None | Some(Value::Null) => Ok(None),
-                    Some(Value::String(text)) => Ok(Some(text.as_str())),
-                    Some(_) => Err(json_response(
-                        400,
-                        &json::error_body("selected identity is invalid"),
-                    )),
+                let (provider, model, project) = match selected_identities(body) {
+                    Ok(selection) => selection,
+                    Err(response) => return Some(response),
                 };
-                let (provider, model, project) =
-                    match (field("provider"), field("model"), field("project")) {
-                        (Ok(provider), Ok(model), Ok(project)) => (provider, model, project),
-                        _ => {
-                            return Some(json_response(
-                                400,
-                                &json::error_body("selected identity is invalid"),
-                            ));
-                        }
-                    };
                 let created = match project {
                     Some(project) => self.create_session_in_project(provider, model, project),
                     None => self.create_session_with(provider, model),
@@ -1065,6 +1129,34 @@ impl Server {
                     )),
                 }
             }
+            Route::RestoreSaved { session } => {
+                let (provider, model, project) = match selected_identities(body) {
+                    Ok(selection) => selection,
+                    Err(response) => return Some(response),
+                };
+                match self.restore_session(session, provider, model, project) {
+                    Ok(token) => Some(json_response(
+                        200,
+                        &body_json(serde_json::json!({ "session": token, "restored": true })),
+                    )),
+                    Err(error) => Some(json_response(
+                        error.status(),
+                        &json::error_body(error.message()),
+                    )),
+                }
+            }
+            Route::SavedHistory { session } => {
+                let after = request
+                    .query("after")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let limit = request
+                    .query("limit")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .map_or(100, |value| value.clamp(1, 100));
+                Some(self.saved_history(session, after, limit))
+            }
+            Route::DeleteSaved { session } => Some(self.delete_saved_session(session)),
             Route::SubmitRun { session } => {
                 self.with_session(session, |entry| self.submit_run(&entry, body))
             }
@@ -1107,6 +1199,127 @@ impl Server {
         match self.session(token) {
             Some(entry) => handler(entry),
             None => Some(json_response(404, &json::error_body("unknown session"))),
+        }
+    }
+
+    /// Lists bounded saved sessions. Titles come from the first user source
+    /// record; no history or tool payload is loaded into the listing.
+    fn saved_sessions(&self) -> Response {
+        let Some(store) = self.session_store.clone() else {
+            return json_response(
+                200,
+                &body_json(serde_json::json!({ "enabled": false, "sessions": [] })),
+            );
+        };
+        let live: std::collections::HashSet<String> = self
+            .sessions
+            .lock()
+            .expect("sessions lockable")
+            .keys()
+            .cloned()
+            .collect();
+        let sessions = match store.list_sessions(nexus_core::store::MAX_SESSIONS) {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                return json_response(503, &json::error_body("session store is unavailable"));
+            }
+        };
+        let mut items = Vec::with_capacity(sessions.len());
+        for metadata in sessions {
+            let title = store
+                .load_source_records(&metadata.session, 0, 10)
+                .ok()
+                .and_then(|records| {
+                    records.into_iter().find_map(|record| match record.item() {
+                        nexus_core::ModelContextItem::UserText(text) => {
+                            Some(session_title(text.as_str()))
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(|| "Saved session".to_owned());
+            let messages = store.last_source_sequence(&metadata.session).unwrap_or(0);
+            items.push(serde_json::json!({
+                "session": metadata.session.as_str(),
+                "title": title,
+                "logical_revision": metadata.logical_revision,
+                "messages": messages,
+                "active": live.contains(metadata.session.as_str()),
+            }));
+        }
+        items.sort_by(|left, right| {
+            right["messages"]
+                .as_u64()
+                .cmp(&left["messages"].as_u64())
+                .then_with(|| left["session"].as_str().cmp(&right["session"].as_str()))
+        });
+        json_response(
+            200,
+            &body_json(serde_json::json!({ "enabled": true, "sessions": items })),
+        )
+    }
+
+    /// Reads one bounded page of durable source history for display. It never
+    /// dispatches tools or restores a runtime.
+    fn saved_history(&self, session: &str, after: u64, limit: usize) -> Response {
+        let Some(store) = self.session_store.clone() else {
+            return json_response(409, &json::error_body("session persistence is not enabled"));
+        };
+        let session = match SessionId::new(session) {
+            Ok(session) => session,
+            Err(_) => {
+                return json_response(400, &json::error_body("session identity is invalid"));
+            }
+        };
+        let checkpoint = match store.load_session(&session) {
+            Ok(checkpoint) => checkpoint,
+            Err(_) => {
+                return json_response(404, &json::error_body("saved session was not found"));
+            }
+        };
+        let records = match store.load_source_records(&session, after, limit) {
+            Ok(records) => records,
+            Err(_) => {
+                return json_response(503, &json::error_body("session history is unavailable"));
+            }
+        };
+        let last = store.last_source_sequence(&session).unwrap_or(0);
+        let next_after = records.last().map_or(after, |record| record.sequence());
+        let items: Vec<Value> = records.iter().map(json::history_item_json).collect();
+        json_response(
+            200,
+            &body_json(serde_json::json!({
+                "session": session.as_str(),
+                "logical_revision": checkpoint.logical_revision(),
+                "items": items,
+                "next_after": next_after,
+                "complete": next_after >= last,
+            })),
+        )
+    }
+
+    /// Deletes one saved session that is not currently open.
+    fn delete_saved_session(&self, session: &str) -> Response {
+        let Some(store) = self.session_store.clone() else {
+            return json_response(409, &json::error_body("session persistence is not enabled"));
+        };
+        let session = match SessionId::new(session) {
+            Ok(session) => session,
+            Err(_) => {
+                return json_response(400, &json::error_body("session identity is invalid"));
+            }
+        };
+        if self
+            .sessions
+            .lock()
+            .expect("sessions lockable")
+            .contains_key(session.as_str())
+        {
+            return json_response(409, &json::error_body("close the active session first"));
+        }
+        match store.delete_session(&session) {
+            Ok(()) => json_response(200, &body_json(serde_json::json!({ "reply": "deleted" }))),
+            Err(_) => json_response(404, &json::error_body("saved session was not found")),
         }
     }
 
@@ -2030,8 +2243,16 @@ pub enum Decision {
 enum Route<'a> {
     /// `GET /health`.
     Health,
+    /// `GET /sessions`: saved session metadata.
+    ListSessions,
     /// `POST /sessions`.
     CreateSession,
+    /// `POST /sessions/{sid}/restore`: open a saved session.
+    RestoreSaved { session: &'a str },
+    /// `GET /sessions/{sid}/history?after=<seq>&limit=<n>`.
+    SavedHistory { session: &'a str },
+    /// `DELETE /sessions/{sid}`.
+    DeleteSaved { session: &'a str },
     /// `POST /sessions/{sid}/runs`.
     SubmitRun { session: &'a str },
     /// `GET /sessions/{sid}/snapshot?run=<rid>`.
@@ -2073,7 +2294,13 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
     let segments: Vec<&str> = path.split('/').collect();
     match (method, segments.as_slice()) {
         ("GET", ["", "health"]) => Route::Health,
+        ("GET", ["", "sessions"]) => Route::ListSessions,
         ("POST", ["", "sessions"]) => Route::CreateSession,
+        ("POST", ["", "sessions", session, "restore"]) => Route::RestoreSaved { session },
+        ("GET", ["", "sessions", session, "history"]) => Route::SavedHistory { session },
+        ("DELETE", ["", "sessions", session]) if !session.is_empty() => {
+            Route::DeleteSaved { session }
+        }
         ("POST", ["", "sessions", session, "runs"]) => Route::SubmitRun { session },
         ("GET", ["", "sessions", session, "snapshot"]) => Route::Snapshot { session },
         ("POST", ["", "sessions", session, "runs", run, "cancel"]) => {
@@ -2112,6 +2339,34 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
 /// Extracts one string field from a JSON object body.
 fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
     body.get(key)?.as_str()
+}
+
+type SelectedIdentities<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
+/// Parses optional provider/model/project selection fields without echoing
+/// caller text in a diagnostic.
+fn selected_identities(body: &Value) -> Result<SelectedIdentities<'_>, Response> {
+    let field = |key: &str| match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str())),
+        Some(_) => Err(()),
+    };
+    match (field("provider"), field("model"), field("project")) {
+        (Ok(provider), Ok(model), Ok(project)) => Ok((provider, model, project)),
+        _ => Err(json_response(
+            400,
+            &json::error_body("selected identity is invalid"),
+        )),
+    }
+}
+
+fn session_title(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 80 {
+        compact
+    } else {
+        format!("{}…", compact.chars().take(80).collect::<String>())
+    }
 }
 
 /// Parses an optional positive `u32` update field.
@@ -2446,6 +2701,122 @@ mod tests {
     }
 
     #[test]
+    fn saved_sessions_are_listed_restored_and_continue() {
+        use nexus_core::{
+            ModelContextItem, STORE_FORMAT_REVISION, SessionCheckpoint, SessionStore,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-server-saved-sessions-{}-{nonce}",
+            std::process::id()
+        ));
+        let session = SessionId::new("sess-web-persisted-1").unwrap();
+        let run = RunId::new("run-persisted-1").unwrap();
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    STORE_FORMAT_REVISION,
+                    1,
+                    Vec::new(),
+                    WEB_PROFILE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_source_items(
+                &session,
+                &run,
+                &[
+                    ModelContextItem::user_text("persisted browser task").unwrap(),
+                    ModelContextItem::assistant_text("item-0", "persisted answer").unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(store);
+
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut server = Server::new(executor.handle().clone());
+        server.set_session_store(SessionStoreHandle::new(Box::new(
+            nexus_session::FileSessionStore::open(&directory).unwrap(),
+        )));
+        let listed: Value =
+            serde_json::from_slice(&server.saved_sessions().body).expect("listing JSON");
+        assert_eq!(listed["enabled"], true);
+        assert_eq!(listed["sessions"][0]["session"], session.as_str());
+        assert_eq!(listed["sessions"][0]["title"], "persisted browser task");
+
+        let history: Value =
+            serde_json::from_slice(&server.saved_history(session.as_str(), 0, 100).body)
+                .expect("history JSON");
+        assert_eq!(history["complete"], true);
+        assert_eq!(history["items"][0]["kind"], "user");
+        assert_eq!(history["items"][1]["text"], "persisted answer");
+
+        let restored = match server.restore_session(session.as_str(), None, None, None) {
+            Ok(restored) => restored,
+            Err(error) => panic!(
+                "saved session restores: HTTP {} {}",
+                error.status(),
+                error.message()
+            ),
+        };
+        assert_eq!(restored, session.as_str());
+        assert!(
+            server
+                .sessions
+                .lock()
+                .unwrap()
+                .contains_key(session.as_str())
+        );
+        let server = Arc::new(server);
+        let entry = server.sessions.lock().unwrap()[session.as_str()].clone();
+        let reply = server
+            .submit_run(&entry, &serde_json::json!({ "input": "continue" }))
+            .unwrap();
+        assert_eq!(reply.status, 201);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&reply.body).unwrap()["reply"].as_str(),
+            Some("accepted")
+        );
+        drop(entry);
+        drop(server);
+        drop(executor);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_identities_are_distinct_across_server_instances() {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut identities = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let server = Server::new(executor.handle().clone());
+            for _ in 0..32 {
+                let token = server.create_session().unwrap();
+                assert!(SessionId::new(&token).is_ok());
+                let suffix = token.strip_prefix("sess-web-").unwrap();
+                assert_eq!(suffix.len(), 32);
+                assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                assert!(identities.insert(token), "session identity was reused");
+            }
+        }
+    }
+
+    #[test]
     fn shared_session_store_retains_original_sources_from_every_server_runtime() {
         use nexus_core::{
             EventPayload, ModelContextItem, PersistenceState, RunOutcome, SessionStore,
@@ -2455,70 +2826,78 @@ mod tests {
             "nexus-server-original-sources-{}",
             std::process::id()
         ));
-        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
-        let executor = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_time()
-            .build()
-            .unwrap();
-        let mut server = Server::new(executor.handle().clone());
-        server.set_session_store(SessionStoreHandle::new(Box::new(store)));
         let mut expected = Vec::new();
-        for input in [
-            "first original input\n  keep whitespace",
-            "second original input",
+        for inputs in [
+            [
+                "first original input\n  keep whitespace",
+                "second original input",
+            ],
+            ["first input after restart", "second input after restart"],
         ] {
-            let token = server.create_session().unwrap();
-            let session = server.sessions.lock().unwrap()[&token].clone();
-            let runtime = session.runtime.lock().unwrap();
-            let mut control = session.control.lock().unwrap();
-            executor.block_on(async {
-                let response = runtime
-                    .submit(
-                        SubmitCommand::new(
-                            RequestId::new("request-original-sources").unwrap(),
-                            session.session.clone(),
-                            input,
-                            WEB_PROFILE,
+            // Reopen the same store in a fresh server/executor, as on restart.
+            let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+            let executor = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap();
+            let mut server = Server::new(executor.handle().clone());
+            server.set_session_store(SessionStoreHandle::new(Box::new(store)));
+            for input in inputs {
+                let token = server.create_session().unwrap();
+                let session = server.sessions.lock().unwrap()[&token].clone();
+                let runtime = session.runtime.lock().unwrap();
+                let mut control = session.control.lock().unwrap();
+                executor.block_on(async {
+                    let response = runtime
+                        .submit(
+                            SubmitCommand::new(
+                                RequestId::new("request-original-sources").unwrap(),
+                                session.session.clone(),
+                                input,
+                                WEB_PROFILE,
+                            )
+                            .unwrap(),
                         )
-                        .unwrap(),
-                    )
-                    .await;
-                assert_eq!(response.reply(), CommandReply::Accepted);
-                let run = response.run().unwrap().clone();
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        let event = control.recv().await.unwrap();
-                        match event.payload() {
-                            EventPayload::ApprovalRequired(notice) => {
-                                let response = runtime
-                                    .approve(ApproveCommand {
-                                        request: RequestId::new("request-approve-original")
-                                            .unwrap(),
-                                        approval: notice.approval.clone(),
-                                        run: run.clone(),
-                                        call: notice.call.clone(),
-                                    })
-                                    .await;
-                                assert_eq!(response.reply(), CommandReply::Accepted);
+                        .await;
+                    assert_eq!(response.reply(), CommandReply::Accepted);
+                    let run = response.run().unwrap().clone();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let event = control.recv().await.unwrap();
+                            match event.payload() {
+                                EventPayload::ApprovalRequired(notice) => {
+                                    let response = runtime
+                                        .approve(ApproveCommand {
+                                            request: RequestId::new("request-approve-original")
+                                                .unwrap(),
+                                            approval: notice.approval.clone(),
+                                            run: run.clone(),
+                                            call: notice.call.clone(),
+                                        })
+                                        .await;
+                                    assert_eq!(response.reply(), CommandReply::Accepted);
+                                }
+                                EventPayload::RunFinished(finished) => {
+                                    assert_eq!(finished.outcome(), RunOutcome::Completed);
+                                    assert_eq!(finished.persistence(), PersistenceState::Saved);
+                                    break;
+                                }
+                                _ => {}
                             }
-                            EventPayload::RunFinished(finished) => {
-                                assert_eq!(finished.outcome(), RunOutcome::Completed);
-                                assert_eq!(finished.persistence(), PersistenceState::Saved);
-                                break;
-                            }
-                            _ => {}
                         }
-                    }
-                })
-                .await
-                .expect("demo run finishes");
-            });
-            expected.push((session.session.clone(), input));
+                    })
+                    .await
+                    .expect("demo run finishes");
+                });
+                expected.push((session.session.clone(), input));
+            }
+            drop(server);
+            // Release all worker owners before opening the store again.
+            drop(executor);
         }
-        drop(server);
-        // Workers release their shared store owner before the executor stops.
-        drop(executor);
+        let identities: std::collections::HashSet<_> = expected.iter().map(|(id, _)| id).collect();
+        assert_eq!(identities.len(), expected.len());
         let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
         for (session, input) in expected {
             let records = reopened.load_source_records(&session, 0, 100).unwrap();
@@ -2913,7 +3292,26 @@ mod tests {
     #[test]
     fn route_table_matches_every_documented_path() {
         assert_eq!(route_path("GET", "/health"), Route::Health);
+        assert_eq!(route_path("GET", "/sessions"), Route::ListSessions);
         assert_eq!(route_path("POST", "/sessions"), Route::CreateSession);
+        assert_eq!(
+            route_path("POST", "/sessions/sess-web-1/restore"),
+            Route::RestoreSaved {
+                session: "sess-web-1"
+            }
+        );
+        assert_eq!(
+            route_path("GET", "/sessions/sess-web-1/history?after=1&limit=20"),
+            Route::SavedHistory {
+                session: "sess-web-1"
+            }
+        );
+        assert_eq!(
+            route_path("DELETE", "/sessions/sess-web-1"),
+            Route::DeleteSaved {
+                session: "sess-web-1"
+            }
+        );
         assert_eq!(
             route_path("POST", "/sessions/sess-web-1/runs"),
             Route::SubmitRun {
@@ -2962,7 +3360,9 @@ mod tests {
     fn unknown_methods_paths_and_shapes_miss() {
         for (method, path) in [
             ("DELETE", "/health"),
-            ("GET", "/sessions"),
+            ("POST", "/sessions/s/restore/extra"),
+            ("GET", "/sessions/s/history/extra"),
+            ("DELETE", "/sessions/"),
             ("POST", "/health"),
             ("GET", "/sessions/s/runs"),
             ("POST", "/sessions/s/snapshot"),
