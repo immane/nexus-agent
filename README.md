@@ -135,6 +135,71 @@ reference hosts, not on every OS/glibc version. Per-file hashes and build metada
 [macOS](docs/tasks/evidence/distribution-release-macos-m0-close.json) ·
 [Linux](docs/tasks/evidence/distribution-release-linux-m0-close.json).
 
+### Raspberry Pi 3 test profile
+
+This is a single-board compatibility and memory profile recorded on
+**2026-11-10**, not an accepted M0 reference host and not a controlled
+performance comparison. It uses a custom ARMv7 static build from the
+**0.2.7-alpha** source tree, not the published archives.
+
+| Item | Measurement |
+| --- | --- |
+| Device | Raspberry Pi 3 Model B+ Rev 1.3, 4× ARMv7, 1.4 GHz configured |
+| OS / kernel | Raspbian GNU/Linux 9 (stretch); Linux 4.14.34-v7+ |
+| Runtime | glibc 2.24, Python 3.5.3, gcc 6.3.0 |
+| Memory | 927 MiB total; 802 MiB available at measurement |
+| Build | `armv7-unknown-linux-musleabihf`, statically linked Rust commands, rustc 1.99.0, default features (no container); `nexus-config` is a shell script |
+
+Installed command sizes (bytes, uncompressed):
+
+| Command | Bytes |
+| --- | ---: |
+| `nexus-tui` | 6,083,936 |
+| `nexus-server` | 4,717,064 |
+| `nexus-headless` | 2,718,328 |
+| `nexus-config` | 26,191 |
+| Four commands total | 13,545,519 |
+
+Startup and memory observations:
+
+| Measurement | Samples | Result |
+| --- | ---: | --- |
+| Server spawn → `/health` | 3 | 44.0 ms first; 14.2 / 14.4 ms subsequent |
+| TUI `--check-config` | 3 | 6.8–7.1 ms |
+| TUI `--help` | 3 | 5.9–6.1 ms |
+| Headless scripted one-shot | 3 | 8.5–16.4 ms; peak RSS 4,512–4,524 KiB |
+| Server idle RSS / VmHWM | 1 | 3,668 / 4,192 KiB; 6 threads |
+| TUI idle RSS / VmHWM | 1 | 3,404 / 3,404 KiB; 1 thread |
+| Server idle CPU | 10 s | 0.0% (process-specific sampling) |
+
+Network and test-only processes:
+
+| Measurement | Samples | Result |
+| --- | ---: | --- |
+| Loopback `/health` | 20 | p50 5.13 ms; max 35.87 ms |
+| LAN `/health` through proxy | 20 | p50 34.00 ms; max 151.23 ms (Wi-Fi) |
+| LAN proxy RSS / VmHWM | 1 | 12,964 / 13,176 KiB; 1 thread |
+| Tetris Python test server RSS | 1 | 12,876 KiB; 2 threads |
+
+Observed model runs were provider-dominated and are **not** controlled
+benchmarks: 7.711 s for a 2-turn/1-call text reply, 16.230 s for a
+7-turn/10-call tool task, and 134.865 s for an 11-turn/13-call multi-file
+implementation attempt. A later run was cancelled after 63.167 s. The session
+store was 212 KiB and the test workspace 48 KiB at measurement time. The Pi ran
+at 600 MHz (idle scaling) and 56.4 °C; background kernel/fbcp activity made the
+system load average unsuitable as an agent CPU measurement.
+
+Limitations: this 32-bit Stretch image is end-of-life, so the result is a
+compatibility probe rather than a supported deployment baseline. The custom
+musl binaries differ from the release artifacts. `host_exec` required a locally
+built bubblewrap 0.3.3 plus a `/usr/bin/true` compatibility symlink (the image
+predates usrmerge); without those it fails closed. The LAN Web path used a
+header-rewriting proxy because the server accepts loopback Host/Origin only;
+the proxy's memory is listed separately and is not part of `nexus-server`.
+HTTP on the LAN has no TLS, and PWA installation is unavailable outside a secure
+context. No TUI interactive input latency, container mode, long-session memory
+growth, or cross-platform guarantee is established by this profile.
+
 ## Architecture
 
 The first diagram shows the host's in-process core, runtime, frontend, and
