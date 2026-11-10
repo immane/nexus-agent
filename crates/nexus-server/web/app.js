@@ -11,6 +11,10 @@ const dom = {
   settings: document.querySelector('#settings'),
   openSettings: document.querySelector('#open-settings'),
   closeSettings: document.querySelector('#close-settings'),
+  settingsButtons: [...document.querySelectorAll('[data-settings-section]')],
+  settingsPanels: [...document.querySelectorAll('.settings-panel')],
+  settingsContent: document.querySelector('.settings-content'),
+  serverVersion: document.querySelector('#server-version'),
   connectionForm: document.querySelector('#connection-form'),
   token: document.querySelector('#token'),
   connect: document.querySelector('#connect'),
@@ -23,7 +27,6 @@ const dom = {
   projectBadge: document.querySelector('#project-badge'),
   sidebarProjects: document.querySelector('#sidebar-projects'),
   addProjectSidebar: document.querySelector('#add-project-sidebar'),
-  projectsBlock: document.querySelector('#projects-block'),
   projectsNote: document.querySelector('#projects-note'),
   projectList: document.querySelector('#project-list'),
   projectForm: document.querySelector('#project-form'),
@@ -822,6 +825,7 @@ async function connect(candidate) {
     state.connected = true;
     state.credential = candidate;
     state.config = config;
+    dom.serverVersion.textContent = typeof config.version === 'string' ? config.version : 'Not reported';
     state.projects = projects;
     populateModels();
     populateProjects();
@@ -1932,9 +1936,13 @@ function toolPresentation(tool, preview) {
   } catch {
     // Previews may be truncated; keep the original text available below.
   }
-  const result = tool === 'host_exec'
-    ? { label: 'RUN', target: 'Command preview unavailable', kind: 'exec', sections: [] }
-    : { label: tool, target: '', kind: 'generic', sections: [] };
+  const kind = tool === 'host_exec' ? 'exec' : tool === 'host_write' ? 'write'
+    : tool === 'host_patch' ? 'patch' : 'generic';
+  const result = {
+    label: kind === 'exec' ? 'RUN' : kind === 'write' ? 'WRITE' : kind === 'patch' ? 'EDIT' : tool,
+    target: kind === 'exec' ? 'Command preview unavailable' : kind !== 'generic' ? 'File preview unavailable' : '',
+    kind, sections: [],
+  };
   if (!args || typeof args !== 'object' || Array.isArray(args)) return result;
   if (tool === 'host_exec' && Array.isArray(args.argv)
     && args.argv.length && args.argv.every((arg) => typeof arg === 'string')) {
@@ -1947,26 +1955,60 @@ function toolPresentation(tool, preview) {
     };
   }
   if ((tool === 'host_write' || tool === 'host_patch') && typeof args.path === 'string') {
-    result.label = tool === 'host_write' ? 'Write' : 'Edit';
     result.target = args.path;
-    result.kind = tool === 'host_write' ? 'write' : 'patch';
     if (tool === 'host_write' && typeof args.content === 'string') {
-      result.sections.push({ label: 'File content', text: args.content, style: 'added' });
+      result.sections.push({ label: 'Proposed file content', text: args.content, style: 'content' });
     } else if (tool === 'host_patch') {
-      if (typeof args.old_text === 'string') {
-        result.sections.push({ label: 'Replace', text: args.old_text, style: 'removed' });
-      }
-      if (typeof args.new_text === 'string') {
-        result.sections.push({ label: 'With', text: args.new_text, style: 'added' });
+      if (typeof args.old_text === 'string' && typeof args.new_text === 'string') {
+        result.sections.push(toolPatchDiff(args.old_text, args.new_text));
       }
     }
   }
   return result;
 }
 
+function toolPatchDiff(oldText, newText) {
+  const lines = (text) => text ? text.split('\n') : [];
+  const before = lines(clip(oldText, MAX_TOOL_CHARS));
+  const after = lines(clip(newText, MAX_TOOL_CHARS));
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) start += 1;
+  let end = 0;
+  while (end < before.length - start && end < after.length - start
+    && before[before.length - end - 1] === after[after.length - end - 1]) end += 1;
+  const rows = [];
+  // Keep comparison linear and bounded: one replacement region, not a minimal edit script.
+  for (let index = Math.max(0, start - 3); index < start; index += 1) {
+    rows.push({ style: 'context', text: `  ${before[index]}` });
+  }
+  for (let index = start; index < before.length - end; index += 1) {
+    rows.push({ style: 'removed', text: `- ${before[index]}` });
+  }
+  for (let index = start; index < after.length - end; index += 1) {
+    rows.push({ style: 'added', text: `+ ${after[index]}` });
+  }
+  for (let index = 0; index < Math.min(end, 3); index += 1) {
+    rows.push({ style: 'context', text: `  ${after[after.length - end + index]}` });
+  }
+  return {
+    label: 'Proposed diff · replacement excerpt', rows,
+    truncated: oldText.length > MAX_TOOL_CHARS || newText.length > MAX_TOOL_CHARS,
+    unchanged: oldText === newText,
+  };
+}
+
 function appendToolSection(body, section) {
   const root = node('div', 'tool-section');
   root.append(node('span', 'tool-label', section.label));
+  if (section.rows) {
+    const diff = node('pre', 'tool-diff');
+    for (const row of section.rows) diff.append(node('span', `tool-diff-line ${row.style}`, row.text));
+    if (section.unchanged) diff.textContent = 'No changes';
+    root.append(diff);
+    if (section.truncated) root.append(node('span', 'inline-warning', 'Diff preview truncated in this view'));
+    body.append(root);
+    return;
+  }
   const pre = node('pre', section.style ? `tool-code ${section.style}` : 'tool-command');
   const text = clip(section.text, MAX_TOOL_CHARS);
   if (section.style) {
@@ -1994,12 +2036,9 @@ function startTool(detail) {
   const root = node('details', 'tool-card');
   root.dataset.state = 'running';
   const presentation = toolPresentation(toolName, detail.args_preview);
-  root.open = presentation.kind !== 'exec';
+  root.open = false;
   root.dataset.kind = presentation.kind;
   const summary = node('summary');
-  const icon = node('span', 'tool-icon', presentation.kind === 'exec' ? '⌘' : presentation.kind === 'generic' ? '◇' : '✎');
-  icon.setAttribute('aria-hidden', 'true');
-  if (presentation.kind !== 'exec') summary.append(icon);
   summary.append(node('span', 'tool-name', presentation.label));
   if (presentation.target) {
     const target = node('span', 'tool-target', clip(presentation.target, 500));
@@ -2500,21 +2539,37 @@ async function reconcileAfterLoss(error) {
   );
 }
 
+/* Settings navigation */
+
+function selectSettingsSection(id) {
+  if (!dom.settingsPanels.some((panel) => panel.id === id)) return;
+  for (const panel of dom.settingsPanels) panel.hidden = panel.id !== id;
+  for (const button of dom.settingsButtons) {
+    if (button.dataset.settingsSection === id) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  dom.settingsContent.scrollTop = 0;
+}
+
 /* Wiring */
 
+for (const button of dom.settingsButtons) {
+  button.addEventListener('click', () => selectSettingsSection(button.dataset.settingsSection));
+}
+
 dom.openSettings.addEventListener('click', () => {
+  if (!state.connected) selectSettingsSection('connection-form');
   dom.settings.showModal();
   requestAnimationFrame(() => {
     if (!state.connected) dom.token.focus();
-    else dom.settings.querySelector('#theme')?.focus();
+    else dom.settings.querySelector('[aria-current="page"]')?.focus();
   });
 });
 dom.closeSettings.addEventListener('click', () => dom.settings.close());
 dom.addProjectSidebar.addEventListener('click', () => {
   if (!dom.settings.open) dom.settings.showModal();
-  dom.projectsBlock.open = true;
+  selectSettingsSection('projects-block');
   requestAnimationFrame(() => {
-    dom.settings.scrollTop = Math.max(0, dom.projectsBlock.offsetTop - 16);
     dom.projectName.focus();
   });
 });

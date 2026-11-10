@@ -1115,7 +1115,9 @@ impl Server {
     /// holds no secret values, so nothing here can disclose one.
     fn config_summary(&self) -> Response {
         let config = self.config.lock().expect("config lockable");
-        json_response(200, &body_json(summary(&config)))
+        let mut document = summary(&config);
+        document["version"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
+        json_response(200, &body_json(document))
     }
 
     /// Reports the local real-tool mode, the reserved startup workspace, and

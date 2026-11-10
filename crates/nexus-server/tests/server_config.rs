@@ -567,6 +567,7 @@ fn the_config_summary_is_redacted_and_complete() {
 
     let (status, body) = get(port, "/config");
     assert_eq!(status, 200);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["revision"], nexus_config::model::CONFIG_REVISION);
     assert_eq!(body["providers"][0]["id"], "acme");
     assert_eq!(body["providers"][0]["adapter"], "direct");

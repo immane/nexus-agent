@@ -137,6 +137,12 @@ session is created. The client sends the selected project id in
 
 ## Provider and model configuration
 
+Settings uses a wide dialog with category navigation for Appearance, Connection,
+Projects, Providers, Models, and About. On narrow screens the navigation becomes
+a horizontally scrollable row. Switching categories preserves unsaved form values.
+About displays the running server's package version from the additive `version`
+field in `GET /config`; it is not the configuration schema's `revision`.
+
 The Settings dialog can add or replace entries through
 `POST /config/providers` and `POST /config/models`. These writes require a
 configured server bearer token even when tools are scripted; an unauthenticated

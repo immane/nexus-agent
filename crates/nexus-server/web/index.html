@@ -90,6 +90,18 @@
       <h2 id="settings-title">Settings</h2>
       <button class="icon-button" id="close-settings" type="button" aria-label="Close settings">✕</button>
     </div>
+    <div class="settings-layout">
+    <nav class="settings-nav" aria-label="Settings categories">
+      <button type="button" data-settings-section="appearance-panel" aria-controls="appearance-panel" aria-current="page">Appearance</button>
+      <button type="button" data-settings-section="connection-form" aria-controls="connection-form">Connection</button>
+      <button type="button" data-settings-section="projects-block" aria-controls="projects-block">Projects</button>
+      <button type="button" data-settings-section="providers-block" aria-controls="providers-block">Providers</button>
+      <button type="button" data-settings-section="models-block" aria-controls="models-block">Models</button>
+      <button type="button" data-settings-section="about-panel" aria-controls="about-panel">About</button>
+    </nav>
+    <div class="settings-content">
+    <section class="settings-panel" id="appearance-panel" aria-labelledby="appearance-title">
+    <h3 id="appearance-title">Appearance</h3>
     <p class="muted">Appearance stays in this browser. The server token stays in this page's memory.</p>
     <label for="theme">Color palette</label>
     <select id="theme">
@@ -100,8 +112,9 @@
       <option value="sand">Sand · light</option>
     </select>
     <div class="palette" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
-    <form class="dialog-section" id="connection-form">
-      <h3>Server connection</h3>
+    </section>
+    <form class="settings-panel" id="connection-form" aria-labelledby="connection-title" hidden>
+      <h3 id="connection-title">Server connection</h3>
       <p class="muted">Same-origin only. The check loads model identities; it does not start a session.</p>
       <label for="token">Bearer token <span class="muted">(if required)</span></label>
       <input id="token" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="64 hexadecimal characters">
@@ -112,8 +125,8 @@
       </div>
       <p class="dialog-status status" id="connection-detail" role="status">No request made yet.</p>
     </form>
-    <details class="dialog-section config-block" id="projects-block">
-      <summary>Projects</summary>
+    <section class="settings-panel" id="projects-block" aria-labelledby="projects-title" hidden>
+      <h3 id="projects-title">Projects</h3>
       <div class="config-content">
         <p class="muted" id="projects-note">Projects bind a session to an allowed local directory. Real tools are not enabled on this server.</p>
         <div class="config-list" id="project-list"></div>
@@ -127,12 +140,11 @@
           <p class="dialog-status status" id="project-status" role="status"></p>
         </form>
       </div>
-    </details>
-    <details class="dialog-section config-block" id="providers-block">
-      <summary>Providers &amp; models</summary>
+    </section>
+    <section class="settings-panel" id="providers-block" aria-labelledby="providers-title" hidden>
+      <h3 id="providers-title">Providers</h3>
       <div class="config-content">
         <p class="muted">Credential fields accept a reference name only. Secret values are never entered here or stored in the configuration.</p>
-        <h3>Providers</h3>
         <div class="config-list" id="provider-list"></div>
         <form class="config-form" id="provider-form">
           <div class="form-grid">
@@ -160,7 +172,11 @@
           </div>
           <p class="dialog-status status" id="provider-status" role="status"></p>
         </form>
-        <h3>Models</h3>
+      </div>
+    </section>
+    <section class="settings-panel" id="models-block" aria-labelledby="models-title" hidden>
+        <h3 id="models-title">Models</h3>
+        <p class="muted">Choose a configured provider and the vendor's model name. Changes apply to new sessions.</p>
         <div class="config-list" id="model-list"></div>
         <form class="config-form" id="model-form">
           <div class="form-grid">
@@ -180,11 +196,14 @@
           <p class="dialog-status status" id="model-status" role="status"></p>
         </form>
         <p class="hint">Changes apply to new sessions. Existing sessions keep their original provider, model, and tools.</p>
-      </div>
-    </details>
-    <div class="dialog-section info-box">
+    </section>
+    <section class="settings-panel info-box" id="about-panel" aria-labelledby="about-title" hidden>
+      <h3 id="about-title">About Nexus</h3>
+      <p class="settings-version">Version <strong id="server-version">Not connected</strong></p>
       <strong>Current limits</strong>
       <p>Reloading or closing this page loses the transcript; the server session is not a saved conversation. History, file browsing, and session restore are not implemented.</p>
+    </section>
+    </div>
     </div>
   </dialog>
 </body>

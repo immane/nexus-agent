@@ -62,18 +62,39 @@ test('exec starts compact, shows safely quoted argv and keeps complete output', 
   assert.doesNotMatch(cards[0].textContent, /first chunk/);
 });
 
-test('write and patch render literal content with separate replacement excerpts', () => {
+test('write and patch start compact and render literal content and a proposed diff', () => {
   const { cards, run } = fixture();
   run(`startTool({ call: 'write', tool: 'host_write', args_preview: JSON.stringify({ path: 'src/main.rs', content: '<script>unsafe()</script>\\nsecond line' }) });`);
   assert.equal(cards[0].dataset.kind, 'write');
+  assert.equal(cards[0].open, false);
+  assert.equal(cards[0].children[0].children[0].textContent, 'WRITE');
   assert.match(cards[0].textContent, /src\/main.rs/);
   const content = cards[0].children[1].children[0].children[1];
   assert.equal(content.children.length, 2);
   assert.equal(content.children[0].textContent, '<script>unsafe()</script>');
   run(`startTool({ call: 'patch', tool: 'host_patch', args_preview: JSON.stringify({ path: 'test.txt', old_text: 'before', new_text: 'after' }) });`);
   const sections = cards[1].children[1].children;
-  assert.equal(sections[0].children[1].className, 'tool-code removed');
-  assert.equal(sections[1].children[1].className, 'tool-code added');
+  const diff = sections[0].children[1];
+  assert.equal(cards[1].open, false);
+  assert.equal(cards[1].children[0].children[0].textContent, 'EDIT');
+  assert.equal(diff.className, 'tool-diff');
+  assert.equal(diff.children[0].className, 'tool-diff-line removed');
+  assert.equal(diff.children[0].textContent, '- before');
+  assert.equal(diff.children[1].className, 'tool-diff-line added');
+  assert.equal(diff.children[1].textContent, '+ after');
+});
+
+test('diff preserves context, handles insertion/deletion and bounds large previews', () => {
+  const { run } = fixture();
+  assert.equal(run(`toolPatchDiff('same\\nbefore\\nend', 'same\\nafter\\nend').rows.map(row => row.text).join('\\n')`),
+    '  same\n- before\n+ after\n  end');
+  assert.equal(run(`toolPatchDiff('', 'new').rows[0].text`), '+ new');
+  assert.equal(run(`toolPatchDiff('old', '').rows[0].text`), '- old');
+  assert.equal(run(`toolPatchDiff('same', 'same').unchanged`), true);
+  assert.equal(run(`toolPatchDiff('x'.repeat(64001), 'new').truncated`), true);
+  assert.equal(run(`toolPatchDiff('old', '<script>unsafe()</script>').rows[1].text`), '+ <script>unsafe()</script>');
+  assert.equal(run(`toolPresentation('host_write', undefined).kind`), 'write');
+  assert.equal(run(`toolPresentation('host_patch', undefined).kind`), 'patch');
 });
 
 test('unavailable exec arguments retain raw previews without guessing a command', () => {
