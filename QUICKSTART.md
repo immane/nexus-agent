@@ -700,11 +700,13 @@ providers or models; edit `config.json` to remove them.
 The token is held only in this page's memory, is never written to browser
 storage, and is gone after reload. Only the palette preference is persisted.
 The static shell is public, but API authentication and Host/Origin checks remain
-enforced. There is no session list, transcript restore, file browser, or Markdown
-renderer in this slice; reloading loses the view and the server session is not a
-saved conversation. An active run is not cancelled by closing the page. Assets
-are embedded uncompressed; release compression and long-lived asset caching are
-not implemented.
+enforced. Assistant text renders a bounded Markdown subset (headings, emphasis,
+lists, quotes, fenced code, tables, and safe links); raw HTML, images, and syntax
+highlighting are not rendered. There is no session list, transcript restore, or
+file browser in this slice; reloading loses the view and the server session is
+not a saved conversation. An active run is not cancelled by closing the page.
+Assets are embedded uncompressed; release compression and long-lived asset
+caching are not implemented.
 
 In the server terminal, keep the generated token available through your
 secret manager or another secret-safe channel. In the client terminal, read

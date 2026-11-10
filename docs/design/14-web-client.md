@@ -24,8 +24,8 @@ The client supports:
 - five color palettes with the selected palette kept in `localStorage`.
 
 The client does not implement session listing, transcript restore, multi-session
-switching, file browsing, diffs, Markdown, syntax highlighting, background
-polling, service workers, or a release asset-compression pipeline.
+switching, file browsing, diffs, syntax highlighting, background polling,
+service workers, or a release asset-compression pipeline.
 
 ## Boundaries
 
@@ -60,16 +60,27 @@ The shell uses:
 - a same-origin CSP with no inline scripts or styles and `frame-ancestors
   'none'`;
 - text nodes for all model, tool, approval, and error content (never
-  `innerHTML`);
+  `innerHTML`); the Markdown renderer builds DOM nodes and never parses raw HTML;
 - `fetch` with `ReadableStream` instead of `EventSource`, because the bearer
   header cannot be attached to a native `EventSource`;
-- batched assistant-text appends on animation frames;
+- throttled assistant Markdown re-rendering while streaming, with a plain-text
+  fallback above 40,000 characters and a final Markdown pass at completion;
 - bounded display sizes (200,000 characters per assistant item and 64,000
   characters per tool item) with explicit truncation notices.
 
+The built-in Markdown renderer supports headings, paragraphs, emphasis, strong
+text, strikethrough, inline code, fenced code with a language label, ordered and
+unordered lists, task markers, blockquotes, horizontal rules, links, autolinks,
+and pipe tables. Link targets are limited to `http`, `https`, and `mailto`;
+unsafe or malformed targets remain plain text. Raw HTML is displayed as text.
+Images, footnotes, math, nested list structures, and syntax highlighting are not
+implemented.
+
 Successful tool cards collapse after completion; failed or interrupted results
-stay expanded. Markdown and code highlighting are intentionally absent from
-this slice.
+stay expanded. The path-only `host_read` and `host_list` calls are suppressed
+from the web transcript to avoid low-value read noise; their results still reach
+the model. Other tools, approvals, usage summaries, context reductions, and
+terminal errors remain visible.
 
 ## Sessions and authentication
 
@@ -212,6 +223,10 @@ new session never claims to cancel work that may still be executing.
   stricter web-addition path checks.
 - Provider/model removal is not exposed over HTTP. Existing sessions are not
   updated by configuration edits.
+- Markdown is a deliberately bounded subset. Images, footnotes, math, nested
+  list structures, raw HTML, and syntax highlighting are not rendered.
+- Very long assistant items switch to plain text while streaming and may take a
+  noticeable moment to format when the final Markdown pass runs.
 - The demo wiring is test-only; no provider behavior is simulated beyond what
   `nexus-server` serves.
 - Assets are served uncompressed. Release-size and transfer-size claims require
@@ -225,7 +240,9 @@ new session never claims to cancel work that may still be executing.
 assets, Host/Origin checks, API authentication, SSE flows, approvals, snapshot
 contracts, project admission/persistence/binding, and provider/model upserts.
 Browser checks during development covered model discovery, demo and
-authenticated sessions, streaming text, tool cards, approve/deny, cancellation,
+authenticated sessions, streaming text, Markdown headings/emphasis/lists/
+quotes/tables/code and safe links, manual scrolling to the end during and after
+streaming, hidden path-only read tools, tool cards, approve/deny, cancellation,
 stream-loss retry and snapshot recovery, theme switching, disconnect/reconnect,
 project add/select/remove, provider/model editing, and desktop/mobile layout.
 These are local functional checks, not a security certification or browser

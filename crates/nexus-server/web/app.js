@@ -62,6 +62,7 @@ const dom = {
   composer: document.querySelector('#composer'),
   send: document.querySelector('#send'),
   cancel: document.querySelector('#cancel-run'),
+  jumpLatest: document.querySelector('#jump-latest'),
   runStatus: document.querySelector('#run-status'),
   usage: document.querySelector('#usage-status'),
   main: document.querySelector('#main'),
@@ -111,6 +112,7 @@ const state = {
   noticeKeys: new Set(),
   notices: new Map(),
   lastOutcome: null,
+  lastUsage: null,
   pinned: true,
   connectGeneration: 0,
 };
@@ -226,11 +228,29 @@ function retryLabel(value) {
 /* Scrolling and incremental text */
 
 function nearBottom() {
-  return dom.main.scrollHeight - dom.main.scrollTop - dom.main.clientHeight < 120;
+  return dom.main.scrollHeight - dom.main.scrollTop - dom.main.clientHeight < 48;
 }
 
 function scrollToBottom() {
   dom.main.scrollTop = dom.main.scrollHeight;
+  updateJumpLatest();
+}
+
+function scrollToBottomSoon() {
+  if (!state.pinned) return;
+  scrollToBottom();
+  requestAnimationFrame(() => {
+    if (state.pinned) scrollToBottom();
+  });
+  setTimeout(() => {
+    if (state.pinned) scrollToBottom();
+  }, 120);
+}
+
+function updateJumpLatest() {
+  dom.jumpLatest.hidden = state.pinned
+    || dom.conversation.hidden
+    || dom.main.scrollHeight <= dom.main.clientHeight + 1;
 }
 
 function flushText() {
@@ -256,11 +276,11 @@ function queueText(textNode, text) {
 
 function appendNode(element) {
   flushText();
-  const pinned = state.pinned || nearBottom();
   dom.conversation.append(element);
   dom.welcome.hidden = true;
   dom.conversation.hidden = false;
-  if (pinned) scrollToBottom();
+  if (state.pinned) scrollToBottom();
+  updateJumpLatest();
 }
 
 /* Notices */
@@ -946,7 +966,11 @@ function resetRunState() {
   state.lastSeq = null;
   state.retries = 0;
   state.lastOutcome = null;
+  state.lastUsage = null;
   state.pendingApprovalSeen = false;
+  for (const record of state.assistantItems.values()) {
+    if (record.renderTimer) clearTimeout(record.renderTimer);
+  }
   state.assistantItems.clear();
   state.tools.clear();
   state.approvals.clear();
@@ -997,6 +1021,7 @@ function startNewSession({ force = false } = {}) {
   dom.welcome.hidden = false;
   dom.main.scrollTop = 0;
   state.pinned = true;
+  updateJumpLatest();
   dom.message.value = '';
   updateSessionDisplay();
   updateControls();
@@ -1268,6 +1293,7 @@ function handleEvent(event) {
       break;
     case 'model-request-finished':
       setRunStatus('Model response received', 'busy');
+      markStreamingDone();
       break;
     case 'model-response-discarded':
       addNotice('warning', 'A model response was discarded. The run may retry.', 'response-discarded');
@@ -1304,11 +1330,507 @@ function handleEvent(event) {
   }
 }
 
+/* Markdown */
+
+const LIVE_MARKDOWN_LIMIT = 40_000;
+const MARKDOWN_RENDER_DELAY_MS = 90;
+const HIDDEN_TOOL_NAMES = new Set(['host_read', 'host_list']);
+
+function isWordChar(character) {
+  return Boolean(character) && /[A-Za-z0-9_]/.test(character);
+}
+
+function safeMarkdownHref(raw) {
+  let text = raw.trim();
+  if (text.startsWith('<') && text.endsWith('>')) text = text.slice(1, -1);
+  try {
+    const parsed = new URL(text, location.href);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:' || parsed.protocol === 'mailto:') {
+      return parsed.href;
+    }
+  } catch {
+    // Invalid or unsafe targets stay as plain label text.
+  }
+  return null;
+}
+
+function appendMarkdownLink(parent, label, url, depth, inLink = false) {
+  const href = safeMarkdownHref(url);
+  if (!href) {
+    appendInlineMarkdown(parent, label || url, depth + 1, inLink);
+    return;
+  }
+  const link = node('a');
+  link.href = href;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  appendInlineMarkdown(link, label || url, depth + 1, true);
+  parent.append(link);
+}
+
+function appendInlineMarkdown(parent, text, depth = 0, inLink = false) {
+  if (!text) return;
+  if (depth > 12) {
+    parent.append(document.createTextNode(text));
+    return;
+  }
+  let index = 0;
+  let buffer = '';
+  const flush = () => {
+    if (buffer) {
+      parent.append(document.createTextNode(buffer));
+      buffer = '';
+    }
+  };
+
+  while (index < text.length) {
+    const character = text[index];
+
+    if (character === '\\' && index + 1 < text.length && /[\\`*{}\[\]()#+\-.!_>~|]/.test(text[index + 1])) {
+      buffer += text[index + 1];
+      index += 2;
+      continue;
+    }
+
+    if (character === '`') {
+      let run = 1;
+      while (text[index + run] === '`') run += 1;
+      const marker = '`'.repeat(run);
+      const end = text.indexOf(marker, index + run);
+      if (end > index + run) {
+        const content = text.slice(index + run, end).replace(/\n/g, ' ');
+        flush();
+        const code = node('code', '', content);
+        parent.append(code);
+        index = end + run;
+        continue;
+      }
+    }
+
+    if (character === '[' && !inLink) {
+      const close = text.indexOf('](', index + 1);
+      if (close > index) {
+        const end = text.indexOf(')', close + 2);
+        if (end > close) {
+          const label = text.slice(index + 1, close);
+          const target = text.slice(close + 2, end).trim().split(/\s+/)[0];
+          flush();
+          appendMarkdownLink(parent, label, target, depth);
+          index = end + 1;
+          continue;
+        }
+      }
+    }
+
+    if (text.startsWith('**', index) || text.startsWith('__', index)) {
+      const delimiter = text.slice(index, index + 2);
+      const end = text.indexOf(delimiter, index + 2);
+      if (end > index + 2) {
+        flush();
+        const strong = node('strong');
+        appendInlineMarkdown(strong, text.slice(index + 2, end), depth + 1, inLink);
+        parent.append(strong);
+        index = end + 2;
+        continue;
+      }
+    }
+
+    if (text.startsWith('~~', index)) {
+      const end = text.indexOf('~~', index + 2);
+      if (end > index + 2) {
+        flush();
+        const deleted = node('del');
+        appendInlineMarkdown(deleted, text.slice(index + 2, end), depth + 1, inLink);
+        parent.append(deleted);
+        index = end + 2;
+        continue;
+      }
+    }
+
+    if (character === '_') {
+      const previous = index > 0 ? text[index - 1] : '';
+      if (previous && isWordChar(previous)) {
+        buffer += character;
+        index += 1;
+        continue;
+      }
+      let end = -1;
+      for (let cursor = index + 1; cursor < text.length; cursor += 1) {
+        if (text[cursor] === '_'
+          && !/\s/.test(text[cursor - 1])
+          && (cursor + 1 >= text.length || !isWordChar(text[cursor + 1]))) {
+          end = cursor;
+          break;
+        }
+      }
+      if (end > index + 1 && !/\s/.test(text[index + 1])) {
+        flush();
+        const emphasis = node('em');
+        appendInlineMarkdown(emphasis, text.slice(index + 1, end), depth + 1, inLink);
+        parent.append(emphasis);
+        index = end + 1;
+        continue;
+      }
+    }
+
+    if (character === '*' && text[index + 1] !== '*') {
+      const end = text.indexOf('*', index + 1);
+      if (end > index + 1 && !/\s/.test(text[index + 1]) && !/\s/.test(text[end - 1])) {
+        flush();
+        const emphasis = node('em');
+        appendInlineMarkdown(emphasis, text.slice(index + 1, end), depth + 1, inLink);
+        parent.append(emphasis);
+        index = end + 1;
+        continue;
+      }
+    }
+
+    if (!inLink
+      && (text.startsWith('http://', index) || text.startsWith('https://', index))
+      && (index === 0 || !isWordChar(text[index - 1]))) {
+      const match = text.slice(index).match(/^https?:\/\/[^\s<>()]+/);
+      if (match) {
+        let url = match[0];
+        const trailing = url.match(/[.,;:!?]+$/);
+        if (trailing) url = url.slice(0, -trailing[0].length);
+        if (url.length > 8) {
+          flush();
+          appendMarkdownLink(parent, url, url, depth);
+          index += url.length;
+          continue;
+        }
+      }
+    }
+
+    buffer += character;
+    index += 1;
+  }
+  flush();
+}
+
+function leadingIndent(line) {
+  let width = 0;
+  for (const character of line) {
+    if (character === ' ') width += 1;
+    else if (character === '\t') width += 4;
+    else break;
+  }
+  return width;
+}
+
+function stripIndent(line, amount) {
+  let index = 0;
+  let removed = 0;
+  while (index < line.length && removed < amount) {
+    if (line[index] === ' ') {
+      removed += 1;
+      index += 1;
+    } else if (line[index] === '\t') {
+      removed += 4;
+      index += 1;
+    } else {
+      break;
+    }
+  }
+  return line.slice(index);
+}
+
+function matchFence(line) {
+  const match = line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+  if (!match) return null;
+  if (match[1][0] === '`' && match[2].includes('`')) return null;
+  return { marker: match[1], info: match[2].trim() };
+}
+
+function matchHeading(line) {
+  return line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+}
+
+function isHorizontalRule(line) {
+  return /^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/.test(line);
+}
+
+function matchBlockquote(line) {
+  return /^\s{0,3}>\s?/.test(line);
+}
+
+function matchListItem(line) {
+  const match = line.match(/^(\s*)([-+*]|\d+[.)])\s+(.*)$/);
+  if (!match) return null;
+  return {
+    indent: leadingIndent(line),
+    ordered: /\d/.test(match[2]),
+    start: Number.parseInt(match[2], 10) || 1,
+    text: match[3],
+  };
+}
+
+function splitTableRow(line) {
+  let text = line.trim();
+  if (text.startsWith('|')) text = text.slice(1);
+  if (text.endsWith('|')) text = text.slice(0, -1);
+  const cells = [];
+  let current = '';
+  let escaped = false;
+  for (const character of text) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+    } else if (character === '\\') {
+      escaped = true;
+    } else if (character === '|') {
+      cells.push(current);
+      current = '';
+    } else {
+      current += character;
+    }
+  }
+  cells.push(current);
+  return cells;
+}
+
+function tableSeparator(line) {
+  if (!line.includes('|')) return null;
+  const cells = splitTableRow(line).map((cell) => cell.trim());
+  if (!cells.length) return null;
+  const alignments = [];
+  for (const cell of cells) {
+    const match = cell.match(/^(:?)-{3,}(:?)$/);
+    if (!match) return null;
+    alignments.push(match[1] && match[2] ? 'center' : match[1] ? 'left' : match[2] ? 'right' : '');
+  }
+  return alignments;
+}
+
+function startsMarkdownBlock(lines, index) {
+  const line = lines[index];
+  if (!line || !line.trim()) return true;
+  if (matchFence(line) || matchHeading(line) || isHorizontalRule(line) || matchBlockquote(line) || matchListItem(line)) {
+    return true;
+  }
+  return line.includes('|') && index + 1 < lines.length && tableSeparator(lines[index + 1]) !== null;
+}
+
+function appendMarkdownBlocks(parent, lines) {
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = matchFence(line);
+    if (fence) {
+      const markerCharacter = fence.marker[0];
+      let end = index + 1;
+      let closed = false;
+      while (end < lines.length) {
+        const close = lines[end].match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+        if (close && close[1][0] === markerCharacter && close[1].length >= fence.marker.length) {
+          closed = true;
+          break;
+        }
+        end += 1;
+      }
+      const codeBlock = node('div', 'md-code-block');
+      const language = fence.info.split(/\s+/)[0];
+      if (language) codeBlock.append(node('div', 'md-code-lang', language));
+      const pre = node('pre');
+      const code = node('code', '', lines.slice(index + 1, end).join('\n'));
+      pre.append(code);
+      codeBlock.append(pre);
+      parent.append(codeBlock);
+      index = closed ? end + 1 : lines.length;
+      continue;
+    }
+
+    const heading = matchHeading(line);
+    if (heading) {
+      const level = Math.min(6, heading[1].length);
+      const title = heading[2].replace(/\s+#+\s*$/, '');
+      const element = node(`h${level}`);
+      appendInlineMarkdown(element, title);
+      parent.append(element);
+      index += 1;
+      continue;
+    }
+
+    if (isHorizontalRule(line)) {
+      parent.append(node('hr'));
+      index += 1;
+      continue;
+    }
+
+    if (matchBlockquote(line)) {
+      const inner = [];
+      while (index < lines.length && matchBlockquote(lines[index])) {
+        inner.push(lines[index].replace(/^\s{0,3}>\s?/, ''));
+        index += 1;
+      }
+      const quote = node('blockquote');
+      appendMarkdownBlocks(quote, inner);
+      parent.append(quote);
+      continue;
+    }
+
+    if (line.includes('|') && index + 1 < lines.length) {
+      const alignments = tableSeparator(lines[index + 1]);
+      const headerCells = splitTableRow(line);
+      if (alignments && alignments.length === headerCells.length) {
+        const wrap = node('div', 'md-table-wrap');
+        const table = node('table');
+        const head = node('thead');
+        const headRow = node('tr');
+        headerCells.forEach((cell, column) => {
+          const th = node('th', alignments[column] ? `md-align-${alignments[column]}` : '');
+          appendInlineMarkdown(th, cell.trim());
+          headRow.append(th);
+        });
+        head.append(headRow);
+        table.append(head);
+        index += 2;
+        const body = node('tbody');
+        while (index < lines.length && lines[index].trim() && lines[index].includes('|')) {
+          const cells = splitTableRow(lines[index]);
+          const row = node('tr');
+          for (let column = 0; column < headerCells.length; column += 1) {
+            const td = node('td', alignments[column] ? `md-align-${alignments[column]}` : '');
+            appendInlineMarkdown(td, (cells[column] || '').trim());
+            row.append(td);
+          }
+          body.append(row);
+          index += 1;
+        }
+        if (body.childElementCount) table.append(body);
+        wrap.append(table);
+        parent.append(wrap);
+        continue;
+      }
+    }
+
+    const item = matchListItem(line);
+    if (item) {
+      const baseIndent = item.indent;
+      const ordered = item.ordered;
+      const list = node(ordered ? 'ol' : 'ul');
+      if (ordered && item.start !== 1) list.start = item.start;
+      while (index < lines.length) {
+        const current = matchListItem(lines[index]);
+        if (!current || current.indent !== baseIndent || current.ordered !== ordered) break;
+        const content = [current.text];
+        index += 1;
+        while (index < lines.length) {
+          if (!lines[index].trim()) {
+            if (index + 1 < lines.length && leadingIndent(lines[index + 1]) > baseIndent) {
+              content.push('');
+              index += 1;
+              continue;
+            }
+            break;
+          }
+          const next = matchListItem(lines[index]);
+          if (next && leadingIndent(lines[index]) === baseIndent) break;
+          if (leadingIndent(lines[index]) > baseIndent) {
+            content.push(stripIndent(lines[index], baseIndent + 2));
+            index += 1;
+            continue;
+          }
+          break;
+        }
+        const listItem = node('li');
+        let itemText = content.join('\n');
+        const task = itemText.match(/^\[([ xX])\]\s+([\s\S]*)$/);
+        if (task) {
+          listItem.classList.add('md-task');
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.disabled = true;
+          checkbox.checked = task[1].toLowerCase() === 'x';
+          listItem.append(checkbox);
+          itemText = task[2];
+        }
+        itemText.split('\n').forEach((part, lineIndex) => {
+          if (lineIndex) listItem.append(document.createElement('br'));
+          appendInlineMarkdown(listItem, part);
+        });
+        list.append(listItem);
+      }
+      parent.append(list);
+      continue;
+    }
+
+    const paragraph = node('p');
+    const start = index;
+    index += 1;
+    while (index < lines.length && !startsMarkdownBlock(lines, index)) index += 1;
+    for (let lineIndex = start; lineIndex < index; lineIndex += 1) {
+      if (lineIndex > start) paragraph.append(document.createElement('br'));
+      appendInlineMarkdown(paragraph, lines[lineIndex].trim());
+    }
+    parent.append(paragraph);
+  }
+}
+
+function renderMarkdown(container, text) {
+  flushText();
+  container.replaceChildren();
+  appendMarkdownBlocks(container, text.replace(/\r\n?/g, '\n').split('\n'));
+}
+
+function assistantWarning(record) {
+  if (!record.truncated) return;
+  record.prose.append(node('span', 'inline-warning', 'Message truncated in this view.'));
+}
+
+function renderAssistant(record, final) {
+  if (!record) return;
+  if (record.renderTimer) {
+    clearTimeout(record.renderTimer);
+    record.renderTimer = 0;
+  }
+  const useMarkdown = final || record.text.length <= LIVE_MARKDOWN_LIMIT;
+  if (record.renderedLength === record.text.length
+    && record.finalized === final
+    && record.mdRendered === useMarkdown) {
+    return;
+  }
+  flushText();
+  record.textNode = null;
+  if (useMarkdown) {
+    record.mdRendered = true;
+    record.prose.classList.remove('plain-text');
+    renderMarkdown(record.prose, record.text);
+  } else {
+    record.mdRendered = false;
+    record.prose.classList.add('plain-text');
+    record.textNode = document.createTextNode(record.text);
+    record.prose.replaceChildren(record.textNode);
+  }
+  assistantWarning(record);
+  record.renderedLength = record.text.length;
+  record.finalized = final;
+  if (state.pinned) {
+    if (final) scrollToBottomSoon();
+    else scrollToBottom();
+  }
+  updateJumpLatest();
+}
+
+function scheduleAssistantRender(record) {
+  if (record.renderTimer) return;
+  record.renderTimer = setTimeout(() => {
+    record.renderTimer = 0;
+    renderAssistant(record, false);
+  }, MARKDOWN_RENDER_DELAY_MS);
+}
+
 /* Assistant text */
 
 function markStreamingDone() {
   for (const record of state.assistantItems.values()) {
     record.article.dataset.streaming = 'false';
+    renderAssistant(record, true);
   }
 }
 
@@ -1318,45 +1840,84 @@ function appendAssistantText(detail) {
   const key = `${detail.turn ?? ''}:${detail.item ?? ''}`;
   let record = state.assistantItems.get(key);
   if (!record) {
+    markStreamingDone();
     const article = node('article', 'message assistant');
     article.dataset.streaming = 'true';
     const head = node('div', 'message-head');
     head.append(node('span', '', 'NEXUS'));
     const body = node('div', 'message-body');
-    const prose = node('div', 'prose');
+    const prose = node('div', 'prose plain-text');
     const textNode = document.createTextNode('');
     prose.append(textNode);
     body.append(prose);
     article.append(head, body);
     appendNode(article);
-    record = { article, prose, textNode, chars: 0, truncated: false };
+    record = {
+      article,
+      prose,
+      textNode,
+      text: '',
+      chars: 0,
+      truncated: false,
+      mdRendered: false,
+      renderTimer: 0,
+      renderedLength: -1,
+      finalized: false,
+    };
     state.assistantItems.set(key, record);
   }
+  record.article.dataset.streaming = 'true';
+  record.finalized = false;
   if (record.chars >= MAX_ASSISTANT_CHARS) {
     if (!record.truncated) {
       flushText();
       record.truncated = true;
-      record.prose.append(node('span', 'inline-warning', 'Message truncated in this view.'));
+      assistantWarning(record);
     }
     return;
   }
   const remaining = MAX_ASSISTANT_CHARS - record.chars;
   const piece = text.length > remaining ? clip(text, remaining) : text;
-  queueText(record.textNode, piece);
+  record.text += piece;
   record.chars += piece.length;
-  if (piece.length < text.length && !record.truncated) {
+  if (piece.length < text.length) record.truncated = true;
+
+  if (!record.mdRendered) {
+    queueText(record.textNode, piece);
+    if (record.text.length <= LIVE_MARKDOWN_LIMIT) scheduleAssistantRender(record);
+  } else if (record.text.length <= LIVE_MARKDOWN_LIMIT) {
+    scheduleAssistantRender(record);
+  } else {
+    if (record.renderTimer) {
+      clearTimeout(record.renderTimer);
+      record.renderTimer = 0;
+    }
     flushText();
-    record.truncated = true;
-    record.prose.append(node('span', 'inline-warning', 'Message truncated in this view.'));
+    record.mdRendered = false;
+    record.prose.classList.add('plain-text');
+    record.textNode = document.createTextNode(record.text);
+    record.prose.replaceChildren(record.textNode);
+    assistantWarning(record);
+    if (state.pinned) scrollToBottom();
   }
 }
 
 function appendContextNotice(detail) {
   const removed = Number.isFinite(detail.removed_items) ? detail.removed_items : 'some';
   const method = typeof detail.method === 'string' ? detail.method : 'unknown method';
+  const retainedItems = Number.isFinite(detail.retained_items) ? detail.retained_items : null;
+  const itemLimit = Number.isFinite(detail.item_limit) ? detail.item_limit : null;
+  const retainedBytes = Number.isFinite(detail.retained_bytes) ? detail.retained_bytes : null;
+  const byteLimit = Number.isFinite(detail.byte_limit) ? detail.byte_limit : null;
+  const itemText = retainedItems !== null && itemLimit !== null
+    ? ` · ${retainedItems}/${itemLimit} items retained`
+    : '';
+  const byteText = retainedBytes !== null && byteLimit !== null
+    ? ` · ${retainedBytes}/${byteLimit} bytes retained`
+    : '';
   addNotice(
     'info',
-    `Context reduced: ${removed} item${removed === 1 ? '' : 's'} removed using ${method}.`,
+    `Context reduced: ${removed} item${removed === 1 ? '' : 's'} removed using ${method}${itemText}${byteText}.`,
     `context-${detail.removed_items ?? 'unknown'}`,
   );
 }
@@ -1368,12 +1929,17 @@ function startTool(detail) {
   if (!call || state.tools.has(call)) return;
   flushText();
   markStreamingDone();
-  setRunStatus(`Running tool: ${detail.tool || 'tool'}`, 'busy');
+  const toolName = typeof detail.tool === 'string' ? detail.tool : 'tool';
+  if (HIDDEN_TOOL_NAMES.has(toolName)) {
+    setRunStatus(toolName === 'host_list' ? 'Listing project files…' : 'Reading project file…', 'busy');
+    return;
+  }
+  setRunStatus(`Running tool: ${toolName}`, 'busy');
 
   const root = node('details', 'tool-card');
   root.open = true;
   const summary = node('summary');
-  summary.append(node('span', 'tool-name', typeof detail.tool === 'string' ? detail.tool : 'tool'));
+  summary.append(node('span', 'tool-name', toolName));
   const status = node('span', 'tool-status', 'Running');
   status.dataset.state = 'running';
   summary.append(status);
@@ -1601,9 +2167,14 @@ async function decide(record, approve) {
 /* Usage */
 
 function updateUsage(detail) {
+  state.lastUsage = {
+    input: Number.isFinite(detail.input) ? detail.input : null,
+    output: Number.isFinite(detail.output) ? detail.output : null,
+    finality: typeof detail.finality === 'string' ? detail.finality : '',
+  };
   const parts = [];
-  if (Number.isFinite(detail.input)) parts.push(`${detail.input} in`);
-  if (Number.isFinite(detail.output)) parts.push(`${detail.output} out`);
+  if (state.lastUsage.input !== null) parts.push(`${state.lastUsage.input} in`);
+  if (state.lastUsage.output !== null) parts.push(`${state.lastUsage.output} out`);
   dom.usage.textContent = parts.length ? `Usage: ${parts.join(' / ')}` : 'Usage: unknown';
   dom.usage.hidden = false;
 }
@@ -1641,6 +2212,8 @@ function finishRun(detail, { fromSnapshot = false } = {}) {
   appendRunSummary(detail, fromSnapshot);
   updateSessionDisplay();
   updateControls();
+  scrollToBottomSoon();
+  updateJumpLatest();
   void verifyTerminalSnapshot(session, run, lastSeq, fromSnapshot);
 }
 
@@ -1654,6 +2227,14 @@ function appendRunSummary(detail, fromSnapshot) {
   if (detail.persistence) {
     card.append(node('span', '', `Persistence: ${detail.persistence}`));
   }
+  const usageParts = [];
+  if (state.lastUsage?.input !== null && state.lastUsage?.input !== undefined) {
+    usageParts.push(`${state.lastUsage.input} in`);
+  }
+  if (state.lastUsage?.output !== null && state.lastUsage?.output !== undefined) {
+    usageParts.push(`${state.lastUsage.output} out`);
+  }
+  card.append(node('span', '', usageParts.length ? `Usage: ${usageParts.join(' / ')}` : 'Usage: not reported'));
   if (detail.error && typeof detail.error === 'object') {
     const errorBlock = node('div', 'run-detail');
     errorBlock.append(node('div', '', `${detail.error.category || 'Error'} · ${retryLabel(detail.error.retry)}`));
@@ -2047,6 +2628,14 @@ dom.newSessionMobile.addEventListener('click', () => startNewSession());
 
 dom.main.addEventListener('scroll', () => {
   state.pinned = nearBottom();
+  updateJumpLatest();
+});
+
+dom.jumpLatest.addEventListener('click', () => {
+  state.pinned = true;
+  scrollToBottomSoon();
+  updateJumpLatest();
+  dom.message.focus();
 });
 
 window.addEventListener('pagehide', () => {
@@ -2112,6 +2701,7 @@ async function cancelRun() {
 
 updateSessionDisplay();
 updateControls();
+updateJumpLatest();
 setConnectionStatus('Connecting…', 'busy');
 setRunStatus('Connecting…', 'busy');
 void connect('');
