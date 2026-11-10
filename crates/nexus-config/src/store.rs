@@ -49,7 +49,7 @@ impl ConfigError {
 
     /// Returns the static diagnostic.
     #[must_use]
-    pub fn message(&self) -> &str {
+    pub fn message(&self) -> &'static str {
         self.message
     }
 
@@ -343,6 +343,7 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "endpoint": profile.endpoint,
                 "credential": profile.credential.to_json(),
                 "default_model": profile.default_model,
+                "context_window_tokens": profile.context_window_tokens,
             })
         }).collect::<Vec<_>>(),
         "models": config.models().iter().map(|entry| {
@@ -350,6 +351,8 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "id": entry.id,
                 "provider": entry.provider,
                 "name": entry.name,
+                "context_window_tokens": entry.context_window_tokens,
+                "max_output_tokens": entry.max_output_tokens,
             })
         }).collect::<Vec<_>>(),
         "favourites": config.favourites(),

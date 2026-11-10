@@ -42,14 +42,17 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use nexus_config::ToolsSettings;
 use nexus_config::settings::{ProviderSettings, ServerSettings};
-use nexus_config::{ConfigError, UserConfig, resolve_credential, save, summary};
+use nexus_config::{
+    AdapterKind, ConfigError, CredentialRef, ModelEntry, ProtocolKind, ProviderProfile, UserConfig,
+    resolve_credential, save, summary,
+};
 use nexus_core::{
     ApproveCommand, CommandReply, DenyCommand, GetSnapshotCommand, Limits, ModelInstructions,
     ModelRequest, ProviderCapabilities, ProviderContext, ProviderEvent, ProviderPort, RequestId,
@@ -77,6 +80,7 @@ pub fn validate_auth_token(value: &str) -> Result<(), &'static str> {
 use crate::auth::{self, AuthToken};
 use crate::http::{self, Request, Response};
 use crate::json;
+use crate::projects::{DEFAULT_PROJECT_ID, ProjectCatalog, ProjectErrorKind};
 
 /// Idle SSE window: a `: ping` comment keeps the stream alive.
 const SSE_IDLE: Duration = Duration::from_secs(15);
@@ -191,6 +195,9 @@ pub struct Session {
     /// Configured model id bound at creation. `None` means the provider
     /// default (or the demo wiring).
     model: Option<String>,
+    /// Project id selected at creation, when the client supplied one. The
+    /// root is already captured by the session's tool registrations.
+    project: Option<String>,
     runtime: Mutex<Runtime>,
     data: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
     control: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
@@ -410,6 +417,11 @@ pub struct Server {
     /// Tool wiring for sessions created after the call. Startup-only: set
     /// before serving, alongside [`Server::set_config`].
     tools_mode: ToolsMode,
+    /// Web-selectable project roots. Empty by default; the startup tool root
+    /// is exposed separately as the reserved `default` project.
+    projects: Mutex<ProjectCatalog>,
+    /// Optional catalog file. `None` keeps project additions in memory.
+    projects_path: Option<PathBuf>,
     auth_token: Option<AuthToken>,
 }
 
@@ -481,8 +493,17 @@ impl Server {
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
+            projects: Mutex::new(ProjectCatalog::default()),
+            projects_path: None,
             auth_token: None,
         }
+    }
+
+    /// Installs the project catalog and its optional persistence file.
+    /// Startup-only; existing sessions keep their already-bound tool roots.
+    pub fn set_projects(&mut self, catalog: ProjectCatalog, path: Option<PathBuf>) {
+        self.projects = Mutex::new(catalog);
+        self.projects_path = path;
     }
 
     /// Installs one shared store for subsequently created session runtimes.
@@ -611,6 +632,28 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, SessionError> {
+        self.create_session_inner(provider, model, None)
+    }
+
+    /// Creates a session bound to a configured project root. The reserved
+    /// `default` id selects the startup tool root; other ids must resolve in
+    /// the operator-managed catalog. Project selection is refused unless real
+    /// local tools are enabled.
+    pub fn create_session_in_project(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+        project: &str,
+    ) -> Result<String, SessionError> {
+        self.create_session_inner(provider, model, Some(project))
+    }
+
+    fn create_session_inner(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<String, SessionError> {
         // Reserve capacity under the map lock, then release it before any
         // provider/container construction so existing sessions remain
         // cancellable while Docker is slow.
@@ -628,6 +671,27 @@ impl Server {
         if provider.is_none() && model.is_some() {
             return Err(SessionError::new(400, "selected model needs a provider"));
         }
+        let (project_root, bound_project) = match project {
+            None => (None, None),
+            Some(id) => {
+                if !matches!(
+                    self.tools_mode,
+                    ToolsMode::Development { .. } | ToolsMode::RealFiles { .. }
+                ) {
+                    return Err(SessionError::new(400, "projects are not enabled"));
+                }
+                let root = if id == DEFAULT_PROJECT_ID {
+                    None
+                } else {
+                    let catalog = self.projects.lock().expect("projects lockable");
+                    let project = catalog
+                        .find(id)
+                        .ok_or(SessionError::new(400, "project is unknown"))?;
+                    Some(project.path.clone())
+                };
+                (root, Some(id.to_owned()))
+            }
+        };
         // The validated identities are retained so a later submit can be
         // checked against what this session actually dispatches to.
         let bound_provider = provider.map(str::to_owned);
@@ -639,51 +703,15 @@ impl Server {
         let n = self.next_session.fetch_add(1, Ordering::SeqCst);
         let token = format!("sess-web-{n}");
         let session = SessionId::new(&token).expect("counter session id is valid");
+        let (policy, tools) = self.session_tools(project_root.as_deref())?;
         let config = RuntimeConfig {
             limits: self.limits,
-            policy: match &self.tools_mode {
-                ToolsMode::Development { root } => Policy::development(root)
-                    .map_err(|_| SessionError::new(500, "tool permissions are invalid"))?,
-                #[cfg(feature = "container")]
-                ToolsMode::Container { .. } => Policy::container(),
-                _ => Policy::m0_test(),
-            },
+            policy,
             has_approval_handler: true,
         };
         let provider: Arc<dyn nexus_core::ProviderPort + Send + Sync> = match provider {
             Some(adapter) => Arc::new(adapter),
             None => Arc::new(PerRunProvider::new()),
-        };
-        let tools = match &self.tools_mode {
-            ToolsMode::Fakes => vec![
-                ToolRegistration::read(Arc::new(FakeTool::read_only())),
-                ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
-            ],
-            ToolsMode::Development { root } => {
-                nexus_tools::development_tools_with_settings(root, &self.tools_settings)
-                    .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?
-            }
-            ToolsMode::RealFiles { root } => {
-                nexus_tools::strict_tools_with_settings(root, &self.tools_settings)
-                    .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?
-            }
-            #[cfg(feature = "container")]
-            ToolsMode::Container {
-                root,
-                gateway_image,
-                workload_image,
-            } => nexus_container::tool_registrations_with_settings(
-                root,
-                gateway_image,
-                workload_image,
-                &self.tools_settings,
-            )
-            .map_err(|error| {
-                // ContainerError contains fixed host-side diagnostics only,
-                // never Docker output, environment values, or credentials.
-                eprintln!("container environment preparation failed: {error}");
-                SessionError::new(503, "container environment is unavailable")
-            })?,
         };
         let (runtime, streams): (Runtime, EventStreams) = match &self.session_store {
             Some(store) => Runtime::try_new_with_session_store_handle(
@@ -700,6 +728,7 @@ impl Server {
             session,
             provider: bound_provider,
             model: bound_model,
+            project: bound_project,
             runtime: Mutex::new(runtime),
             data: Mutex::new(streams.data),
             control: Mutex::new(streams.control),
@@ -716,6 +745,66 @@ impl Server {
             .insert(token.clone(), entry);
         drop(admission);
         Ok(token)
+    }
+
+    /// Builds the policy and tool registrations for one session root. A
+    /// project override is accepted only for the two local real-tool modes.
+    fn session_tools(
+        &self,
+        project_root: Option<&Path>,
+    ) -> Result<(Policy, Vec<ToolRegistration>), SessionError> {
+        match &self.tools_mode {
+            ToolsMode::Fakes => {
+                if project_root.is_some() {
+                    return Err(SessionError::new(400, "projects are not enabled"));
+                }
+                Ok((
+                    Policy::m0_test(),
+                    vec![
+                        ToolRegistration::read(Arc::new(FakeTool::read_only())),
+                        ToolRegistration::mutation(Arc::new(FakeTool::mutation())),
+                    ],
+                ))
+            }
+            ToolsMode::Development { root } => {
+                let root = project_root.unwrap_or(root);
+                let policy = Policy::development(root)
+                    .map_err(|_| SessionError::new(500, "tool permissions are invalid"))?;
+                let tools =
+                    nexus_tools::development_tools_with_settings(root, &self.tools_settings)
+                        .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?;
+                Ok((policy, tools))
+            }
+            ToolsMode::RealFiles { root } => {
+                let root = project_root.unwrap_or(root);
+                let tools = nexus_tools::strict_tools_with_settings(root, &self.tools_settings)
+                    .map_err(|_| SessionError::new(500, "tool wiring is invalid"))?;
+                Ok((Policy::m0_test(), tools))
+            }
+            #[cfg(feature = "container")]
+            ToolsMode::Container {
+                root,
+                gateway_image,
+                workload_image,
+            } => {
+                if project_root.is_some() {
+                    return Err(SessionError::new(400, "projects are not enabled"));
+                }
+                let tools = nexus_container::tool_registrations_with_settings(
+                    root,
+                    gateway_image,
+                    workload_image,
+                    &self.tools_settings,
+                )
+                .map_err(|error| {
+                    // ContainerError contains fixed host-side diagnostics only,
+                    // never Docker output, environment values, or credentials.
+                    eprintln!("container environment preparation failed: {error}");
+                    SessionError::new(503, "container environment is unavailable")
+                })?;
+                Ok((Policy::container(), tools))
+            }
+        }
     }
 
     /// Resolves a configured provider plus an optional model override to
@@ -866,7 +955,10 @@ impl Server {
         let response = match http::read_request(&mut stream) {
             Ok(request) => {
                 let health = request.method == "GET" && request.route_path() == "/health";
-                let required = !health
+                let public = health
+                    || (request.method == "GET"
+                        && crate::web::asset(request.route_path()).is_some());
+                let required = !public
                     && (self.auth_token.is_some()
                         || !matches!(self.tools_mode, ToolsMode::Fakes)
                         || !self
@@ -875,7 +967,7 @@ impl Server {
                             .expect("config lockable")
                             .providers()
                             .is_empty());
-                let token = if health {
+                let token = if public {
                     None
                 } else {
                     self.auth_token.as_ref()
@@ -909,6 +1001,11 @@ impl Server {
     /// Routes a parsed request. Returns `None` when the SSE loop took over
     /// the stream (headers already written); anything else is framed here.
     fn route(self: &Arc<Self>, request: &Request, stream: &mut TcpStream) -> Option<Response> {
+        if request.method == "GET"
+            && let Some(response) = crate::web::response(request.route_path())
+        {
+            return Some(response);
+        }
         let parsed: Value = if request.body.is_empty() {
             Value::Null
         } else {
@@ -934,16 +1031,21 @@ impl Server {
                         &json::error_body("selected identity is invalid"),
                     )),
                 };
-                let (provider, model) = match (field("provider"), field("model")) {
-                    (Ok(provider), Ok(model)) => (provider, model),
-                    _ => {
-                        return Some(json_response(
-                            400,
-                            &json::error_body("selected identity is invalid"),
-                        ));
-                    }
+                let (provider, model, project) =
+                    match (field("provider"), field("model"), field("project")) {
+                        (Ok(provider), Ok(model), Ok(project)) => (provider, model, project),
+                        _ => {
+                            return Some(json_response(
+                                400,
+                                &json::error_body("selected identity is invalid"),
+                            ));
+                        }
+                    };
+                let created = match project {
+                    Some(project) => self.create_session_in_project(provider, model, project),
+                    None => self.create_session_with(provider, model),
                 };
-                match self.create_session_with(provider, model) {
+                match created {
                     Ok(token) => {
                         let mut reply = serde_json::json!({ "session": token });
                         if let Some(id) = provider {
@@ -951,6 +1053,9 @@ impl Server {
                         }
                         if let Some(name) = model {
                             reply["model"] = Value::String(name.to_owned());
+                        }
+                        if let Some(project) = project {
+                            reply["project"] = Value::String(project.to_owned());
                         }
                         Some(json_response(201, &body_json(reply)))
                     }
@@ -984,6 +1089,11 @@ impl Server {
             Route::Config => Some(self.config_summary()),
             Route::AddFavourite => Some(self.add_favourite(body)),
             Route::RemoveFavourite { model } => Some(self.remove_favourite(model)),
+            Route::UpsertProvider => Some(self.upsert_provider(body)),
+            Route::UpsertModel => Some(self.upsert_model(body)),
+            Route::Projects => Some(json_response(200, &self.projects_body())),
+            Route::AddProject => Some(self.add_project(body)),
+            Route::RemoveProject { project } => Some(self.remove_project(project)),
             Route::NotFound => Some(json_response(404, &json::error_body("unknown route"))),
         }
     }
@@ -1005,6 +1115,333 @@ impl Server {
     /// holds no secret values, so nothing here can disclose one.
     fn config_summary(&self) -> Response {
         let config = self.config.lock().expect("config lockable");
+        let mut document = summary(&config);
+        document["version"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
+        json_response(200, &body_json(document))
+    }
+
+    /// Reports the local real-tool mode, the reserved startup workspace, and
+    /// operator-added projects. In fake or container mode projects are
+    /// reported as unavailable and no paths are exposed.
+    fn projects_body(&self) -> Vec<u8> {
+        let (mode, enabled, default_root) = match &self.tools_mode {
+            ToolsMode::Development { root } => ("development", true, Some(root)),
+            ToolsMode::RealFiles { root } => ("strict", true, Some(root)),
+            ToolsMode::Fakes => ("fakes", false, None),
+            #[cfg(feature = "container")]
+            ToolsMode::Container { .. } => ("container", false, None),
+        };
+        let mut document = serde_json::json!({
+            "enabled": enabled,
+            "mode": mode,
+            "projects": [],
+        });
+        if enabled {
+            if let Some(root) = default_root {
+                let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                document["default"] = serde_json::json!({
+                    "id": DEFAULT_PROJECT_ID,
+                    "name": "Startup workspace",
+                    "path": root.to_string_lossy(),
+                });
+            }
+            let projects = self.projects.lock().expect("projects lockable");
+            document["projects"] = Value::Array(
+                projects
+                    .projects()
+                    .iter()
+                    .map(|project| {
+                        serde_json::json!({
+                            "id": project.id,
+                            "name": project.name,
+                            "path": project.path_text(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        body_json(document)
+    }
+
+    /// Adds one validated project root. Requires local real tools and a
+    /// writable catalog path for durable admission.
+    fn add_project(&self, body: &Value) -> Response {
+        if self.auth_token.is_none() {
+            return json_response(
+                503,
+                &json::error_body("server authentication is not configured"),
+            );
+        }
+        if !matches!(
+            self.tools_mode,
+            ToolsMode::Development { .. } | ToolsMode::RealFiles { .. }
+        ) {
+            return json_response(409, &json::error_body("projects are not enabled"));
+        }
+        let name = match body_str(body, "name") {
+            Some(name) => name,
+            None => return json_response(400, &json::error_body("project name is invalid")),
+        };
+        let path = match body_str(body, "path") {
+            Some(path) => path,
+            None => return json_response(400, &json::error_body("project path is invalid")),
+        };
+        let default_root = match &self.tools_mode {
+            ToolsMode::Development { root } | ToolsMode::RealFiles { root } => {
+                std::fs::canonicalize(root).ok()
+            }
+            _ => None,
+        };
+        if let (Some(default_root), Ok(candidate)) = (default_root, std::fs::canonicalize(path))
+            && default_root == candidate
+        {
+            return json_response(409, &json::error_body("project path is already registered"));
+        }
+        let project = {
+            let mut catalog = self.projects.lock().expect("projects lockable");
+            let project = match catalog.add(name, Path::new(path)) {
+                Ok(project) => project,
+                Err(error) => {
+                    let status = match error.kind() {
+                        ProjectErrorKind::Invalid => 400,
+                        ProjectErrorKind::Conflict => 409,
+                        ProjectErrorKind::Io => 500,
+                    };
+                    return json_response(status, &json::error_body(error.message()));
+                }
+            };
+            if let Some(path) = self.projects_path.as_deref()
+                && catalog.save(path).is_err()
+            {
+                return json_response(500, &json::error_body("project list could not be saved"));
+            }
+            project
+        };
+        let mut reply = serde_json::from_slice::<Value>(&self.projects_body())
+            .expect("projects body is valid JSON");
+        reply["project"] = serde_json::json!({
+            "id": project.id,
+            "name": project.name,
+            "path": project.path_text(),
+        });
+        json_response(201, &body_json(reply))
+    }
+
+    /// Removes one project. The reserved startup workspace cannot be removed
+    /// and a project referenced by any retained session is refused so an
+    /// already-granted tool root is not silently orphaned.
+    fn remove_project(&self, id: &str) -> Response {
+        if self.auth_token.is_none() {
+            return json_response(
+                503,
+                &json::error_body("server authentication is not configured"),
+            );
+        }
+        if !matches!(
+            self.tools_mode,
+            ToolsMode::Development { .. } | ToolsMode::RealFiles { .. }
+        ) {
+            return json_response(409, &json::error_body("projects are not enabled"));
+        }
+        if id == DEFAULT_PROJECT_ID {
+            return json_response(
+                400,
+                &json::error_body("the startup project cannot be removed"),
+            );
+        }
+        let in_use = self
+            .sessions
+            .lock()
+            .expect("sessions lockable")
+            .values()
+            .any(|session| session.project.as_deref() == Some(id));
+        if in_use {
+            return json_response(409, &json::error_body("project is still used by a session"));
+        }
+        {
+            let mut catalog = self.projects.lock().expect("projects lockable");
+            if let Err(error) = catalog.remove(id) {
+                let status = if error.kind() == ProjectErrorKind::Invalid {
+                    404
+                } else {
+                    400
+                };
+                return json_response(status, &json::error_body(error.message()));
+            }
+            if let Some(path) = self.projects_path.as_deref()
+                && catalog.save(path).is_err()
+            {
+                return json_response(500, &json::error_body("project list could not be saved"));
+            }
+        }
+        json_response(200, &self.projects_body())
+    }
+
+    /// Adds or replaces one provider profile. Credential values are never
+    /// accepted: the body may name an environment variable or stored entry.
+    fn upsert_provider(&self, body: &Value) -> Response {
+        if self.auth_token.is_none() {
+            return json_response(
+                503,
+                &json::error_body("server authentication is not configured"),
+            );
+        }
+        let id = match body_str(body, "id") {
+            Some(id) if !id.is_empty() => id.to_owned(),
+            _ => return json_response(400, &json::error_body("provider id is invalid")),
+        };
+        let mut config = self.config.lock().expect("config lockable");
+        let existing = config.provider(&id).cloned();
+        let display_name = match body_str(body, "display_name") {
+            Some(name) => name.to_owned(),
+            None => match &existing {
+                Some(profile) => profile.display_name.clone(),
+                None => {
+                    return json_response(400, &json::error_body("display name is invalid"));
+                }
+            },
+        };
+        let adapter = match body_str(body, "adapter") {
+            Some(value) => match AdapterKind::parse(value) {
+                Ok(adapter) => adapter,
+                Err(_) => return json_response(400, &json::error_body("adapter kind is invalid")),
+            },
+            None => match &existing {
+                Some(profile) => profile.adapter,
+                None => AdapterKind::Direct,
+            },
+        };
+        let protocol = match body_str(body, "protocol") {
+            Some(value) => match ProtocolKind::parse(value) {
+                Ok(protocol) => protocol,
+                Err(_) => {
+                    return json_response(400, &json::error_body("provider protocol is invalid"));
+                }
+            },
+            None => match &existing {
+                Some(profile) => profile.protocol,
+                None => ProtocolKind::ChatCompletions,
+            },
+        };
+        let endpoint = match body.get("endpoint") {
+            None => existing
+                .as_ref()
+                .and_then(|profile| profile.endpoint.clone()),
+            Some(Value::Null) => None,
+            Some(Value::String(text)) if text.trim().is_empty() => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return json_response(400, &json::error_body("endpoint is invalid")),
+        };
+        let credential = match body.get("credential") {
+            None => match &existing {
+                Some(profile) => profile.credential.clone(),
+                None => {
+                    return json_response(
+                        400,
+                        &json::error_body("credential reference is invalid"),
+                    );
+                }
+            },
+            Some(value) => match parse_credential(value) {
+                Some(credential) => credential,
+                None => {
+                    return json_response(
+                        400,
+                        &json::error_body("credential reference is invalid"),
+                    );
+                }
+            },
+        };
+        let default_model = match body_str(body, "default_model") {
+            Some(name) => name.to_owned(),
+            None => match &existing {
+                Some(profile) => profile.default_model.clone(),
+                None => return json_response(400, &json::error_body("model name is invalid")),
+            },
+        };
+        let context_window = match optional_positive_u32(body, "context_window_tokens") {
+            Ok(Some(value)) => value,
+            Ok(None) => existing.as_ref().and_then(|p| p.context_window_tokens),
+            Err(_) => return json_response(400, &json::error_body("context window is invalid")),
+        };
+        let profile = match ProviderProfile::new_with_protocol(
+            id,
+            display_name,
+            adapter,
+            protocol,
+            endpoint,
+            credential,
+            default_model,
+        ) {
+            Ok(profile) => profile,
+            Err(error) => return json_response(400, &json::error_body(error.message())),
+        };
+        let mut profile = profile;
+        profile.context_window_tokens = context_window;
+        if let Err(error) = config.upsert_provider(profile) {
+            return json_response(400, &json::error_body(error.message()));
+        }
+        if self.persist(&config).is_err() {
+            return json_response(500, &json::error_body("configuration could not be saved"));
+        }
+        json_response(200, &body_json(summary(&config)))
+    }
+
+    /// Adds or replaces one selectable model. Omitted optional fields keep
+    /// their previous values, so a form edit cannot silently discard limits.
+    fn upsert_model(&self, body: &Value) -> Response {
+        if self.auth_token.is_none() {
+            return json_response(
+                503,
+                &json::error_body("server authentication is not configured"),
+            );
+        }
+        let id = match body_str(body, "id") {
+            Some(id) if !id.is_empty() => id.to_owned(),
+            _ => return json_response(400, &json::error_body("model id is invalid")),
+        };
+        let mut config = self.config.lock().expect("config lockable");
+        let existing = config.model(&id).cloned();
+        let provider = match body_str(body, "provider") {
+            Some(provider) => provider.to_owned(),
+            None => match &existing {
+                Some(entry) => entry.provider.clone(),
+                None => {
+                    return json_response(400, &json::error_body("model provider is unknown"));
+                }
+            },
+        };
+        let name = match body_str(body, "name") {
+            Some(name) => name.to_owned(),
+            None => match &existing {
+                Some(entry) => entry.name.clone(),
+                None => return json_response(400, &json::error_body("model name is invalid")),
+            },
+        };
+        let context_window = match optional_positive_u32(body, "context_window_tokens") {
+            Ok(Some(value)) => value,
+            Ok(None) => existing.as_ref().and_then(|m| m.context_window_tokens),
+            Err(_) => return json_response(400, &json::error_body("context window is invalid")),
+        };
+        let max_output = match optional_positive_u32(body, "max_output_tokens") {
+            Ok(Some(value)) => value,
+            Ok(None) => existing.as_ref().and_then(|m| m.max_output_tokens),
+            Err(_) => return json_response(400, &json::error_body("max output tokens is invalid")),
+        };
+        let entry = match ModelEntry::new(id, provider, name) {
+            Ok(entry) => entry,
+            Err(error) => return json_response(400, &json::error_body(error.message())),
+        };
+        let mut entry = entry;
+        entry.context_window_tokens = context_window;
+        entry.max_output_tokens = max_output;
+        entry.context_management = existing.and_then(|entry| entry.context_management);
+        if let Err(error) = config.upsert_model(entry) {
+            return json_response(400, &json::error_body(error.message()));
+        }
+        if self.persist(&config).is_err() {
+            return json_response(500, &json::error_body("configuration could not be saved"));
+        }
         json_response(200, &body_json(summary(&config)))
     }
 
@@ -1615,6 +2052,16 @@ enum Route<'a> {
     AddFavourite,
     /// `DELETE /config/favourites/{mid}`.
     RemoveFavourite { model: &'a str },
+    /// `POST /config/providers`: add or replace one provider.
+    UpsertProvider,
+    /// `POST /config/models`: add or replace one model entry.
+    UpsertModel,
+    /// `GET /projects`: startup workspace plus operator projects.
+    Projects,
+    /// `POST /projects`: add one validated project root.
+    AddProject,
+    /// `DELETE /projects/{id}`.
+    RemoveProject { project: &'a str },
     /// Anything else.
     NotFound,
 }
@@ -1651,6 +2098,13 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
         ("DELETE", ["", "config", "favourites", model]) if !model.is_empty() => {
             Route::RemoveFavourite { model }
         }
+        ("POST", ["", "config", "providers"]) => Route::UpsertProvider,
+        ("POST", ["", "config", "models"]) => Route::UpsertModel,
+        ("GET", ["", "projects"]) => Route::Projects,
+        ("POST", ["", "projects"]) => Route::AddProject,
+        ("DELETE", ["", "projects", project]) if !project.is_empty() => {
+            Route::RemoveProject { project }
+        }
         _ => Route::NotFound,
     }
 }
@@ -1658,6 +2112,38 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
 /// Extracts one string field from a JSON object body.
 fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
     body.get(key)?.as_str()
+}
+
+/// Parses an optional positive `u32` update field.
+///
+/// `Ok(None)` means the field was omitted and the caller should preserve its
+/// previous value; `Ok(Some(None))` means explicit JSON null cleared it.
+fn optional_positive_u32(body: &Value, key: &str) -> Result<Option<Option<u32>>, ()> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .map(|value| Some(Some(value)))
+            .ok_or(()),
+    }
+}
+
+/// Parses a credential reference object without accepting any secret value.
+fn parse_credential(value: &Value) -> Option<CredentialRef> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    if let Some(var) = object.get("env").and_then(Value::as_str) {
+        return CredentialRef::env_var(var).ok();
+    }
+    if let Some(provider) = object.get("stored").and_then(Value::as_str) {
+        return CredentialRef::stored(provider).ok();
+    }
+    None
 }
 
 /// Reads an optional string selection field.
@@ -2501,6 +2987,19 @@ mod tests {
             route_path("DELETE", "/config/favourites/sonnet"),
             Route::RemoveFavourite { model: "sonnet" }
         );
+        assert_eq!(
+            route_path("POST", "/config/providers"),
+            Route::UpsertProvider
+        );
+        assert_eq!(route_path("POST", "/config/models"), Route::UpsertModel);
+        assert_eq!(route_path("GET", "/projects"), Route::Projects);
+        assert_eq!(route_path("POST", "/projects"), Route::AddProject);
+        assert_eq!(
+            route_path("DELETE", "/projects/project-1"),
+            Route::RemoveProject {
+                project: "project-1"
+            }
+        );
     }
 
     /// Each configuration route refuses the other methods, so a read cannot
@@ -2516,6 +3015,11 @@ mod tests {
             ("POST", "/config/favourites/sonnet/extra"),
             ("DELETE", "/config/favourites"),
             ("DELETE", "/config/favourites/"),
+            ("GET", "/config/providers"),
+            ("DELETE", "/config/models"),
+            ("POST", "/projects/default"),
+            ("DELETE", "/projects"),
+            ("DELETE", "/projects/"),
         ] {
             assert_eq!(route_path(method, path), Route::NotFound, "{method} {path}");
         }

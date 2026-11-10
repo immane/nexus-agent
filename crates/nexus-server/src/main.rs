@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use nexus_config::{UserConfig, load, resolve_path};
+use nexus_server::projects::{ProjectCatalog, path_near_config};
 use nexus_server::{Server, ToolsMode};
 
 /// Default loopback port.
@@ -446,6 +447,20 @@ fn main() {
     ) {
         usage();
     }
+    let projects_path = (tools_real && execution == ExecutionMode::Local)
+        .then(|| path.as_ref().map(|path| path_near_config(path)))
+        .flatten();
+    let project_catalog = match projects_path.as_deref() {
+        Some(path) => match ProjectCatalog::load(path) {
+            Ok(Some(catalog)) => catalog,
+            Ok(None) => ProjectCatalog::default(),
+            Err(error) => {
+                eprintln!("nexus-server: {error} ({})", path.display());
+                std::process::exit(1);
+            }
+        },
+        None => ProjectCatalog::default(),
+    };
     #[cfg(not(feature = "container"))]
     let _ = (&gateway_image, &workload_image);
     #[cfg(not(feature = "container"))]
@@ -525,6 +540,7 @@ fn main() {
     if let Some(store) = session_store {
         server.set_session_store(store);
     }
+    server.set_projects(project_catalog, projects_path);
     if benchmark_pilot {
         eprintln!(
             "nexus-server: finite benchmark pilot limits enabled ({} turns, {} tool calls, {} seconds, {} seconds per tool)",
@@ -609,6 +625,7 @@ fn main() {
             }
         );
     }
+    eprintln!("nexus-server: embedded web client at http://127.0.0.1:{port}/");
     let server = Arc::new(server);
     let cleanup_server = Arc::downgrade(&server);
     let cleanup_interval =

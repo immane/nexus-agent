@@ -3,7 +3,7 @@
 ## Status snapshot
 
 - See `git status` and `git log` for the current worktree and revision.
-- Implementation stage: **0.2.6-alpha**, built on the M0 runtime:
+- Implementation stage: **0.2.7-alpha**, built on the M0 runtime:
   Chat Completions, OpenAI Responses, and Anthropic Messages adapters
   (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
@@ -665,6 +665,48 @@ Ollama running locally. The server listens only on `127.0.0.1`; configured
 providers or real tools require the 64-hex-character bearer token. This token
 grants server-wide route access, including approvals; session IDs are not
 credentials. Only the fake-only server demo may run without authentication.
+
+Open `http://127.0.0.1:8471/` for the embedded web client (no separate
+frontend install or build). It connects to `/health`, `/config`, and `/projects`
+on load, lets you choose a configured model and project, creates a session on
+the first message, and then uses the loopback HTTP and SSE APIs for the live
+transcript, tool activity, approvals, cancellation, usage, and terminal outcome.
+If no provider is configured, the model menu offers the test-only demo script.
+
+Real local tools remain an explicit startup choice; the web page cannot switch
+the server out of fake mode. Use, for example:
+
+```sh
+nexus-server --tools real --tools-root /absolute/project \
+  --auth-token-env NEXUS_SERVER_TOKEN
+```
+
+Open **Settings** to enter the 64-hex-character bearer token. Projects are
+selected in the left sidebar; its **+** button opens the project section in
+Settings, where roots are added or removed. A project is an existing absolute
+directory used as the session's local tool root. The server refuses the
+filesystem root, the user's home or an ancestor, common system roots, and known
+credential directories. Projects are stored in `projects.json` next to the
+configured `config.json`, with owner-only permissions; removing a project is
+refused while a retained session still references it. Selecting a different
+project while a session exists starts a new session after confirmation.
+
+The same Settings dialog can add or update providers/models. Provider and model
+edits accept credential *references* (environment-variable or stored-entry
+names), never secret values. Changes apply to new sessions; live sessions keep
+their original provider, model, and tool root. There is no web deletion for
+providers or models; edit `config.json` to remove them.
+
+The token is held only in this page's memory, is never written to browser
+storage, and is gone after reload. Only the palette preference is persisted.
+The static shell is public, but API authentication and Host/Origin checks remain
+enforced. Assistant text renders a bounded Markdown subset (headings, emphasis,
+lists, quotes, fenced code, tables, and safe links); raw HTML, images, and syntax
+highlighting are not rendered. There is no session list, transcript restore, or
+file browser in this slice; reloading loses the view and the server session is
+not a saved conversation. An active run is not cancelled by closing the page.
+Assets are embedded uncompressed; release compression and long-lived asset
+caching are not implemented.
 
 In the server terminal, keep the generated token available through your
 secret manager or another secret-safe channel. In the client terminal, read

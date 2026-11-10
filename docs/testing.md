@@ -26,6 +26,10 @@ TUI, server, tools, and container integration tests share one `behavior` target
 per package instead of linking an executable for every source file. New
 integration modules in these packages must be added to `tests/behavior.rs`;
 automatic test target discovery is disabled in their manifests.
+The embedded Web client's tool-card regressions run separately with Node.js:
+`node --test crates/nexus-server/tests/web_*.mjs`. They exercise settings navigation, argument
+presentation, literal code content, bounded replacement diffs, streaming/final output, and disclosure states
+with a small DOM double; they do not replace browser layout checks.
 The default Unix TUI suite also requires Python 3 for its pseudo-terminal
 credential-startup regression; it uses an isolated FIFO and loopback listener.
 The default `input_pressure` regression also uses Python 3, a real PTY and a

@@ -669,6 +669,42 @@ impl UserConfig {
         Ok(())
     }
 
+    /// Adds or replaces one provider by identity. Replacement revalidates
+    /// every model that inherits the provider's default-model window, so a
+    /// changed default cannot leave previously valid limits inconsistent.
+    pub fn upsert_provider(&mut self, profile: ProviderProfile) -> Result<(), ConfigError> {
+        profile.validate()?;
+        if let Some(existing) = self
+            .providers
+            .iter()
+            .position(|existing| existing.id == profile.id)
+        {
+            for entry in self
+                .models
+                .iter()
+                .filter(|entry| entry.provider == profile.id)
+            {
+                let tokens = entry.context_window_tokens.or_else(|| {
+                    (entry.name == profile.default_model)
+                        .then_some(profile.context_window_tokens)
+                        .flatten()
+                });
+                context_settings(
+                    entry.context_management.unwrap_or(self.context_management),
+                    tokens,
+                    entry.max_output_tokens,
+                )?;
+            }
+            self.providers[existing] = profile;
+            return Ok(());
+        }
+        if self.providers.len() >= MAX_PROVIDERS {
+            return Err(invalid("provider list is full"));
+        }
+        self.providers.push(profile);
+        Ok(())
+    }
+
     /// Removes a provider. Fails while any model entry still names it
     /// instead of orphaning that entry silently.
     pub fn remove_provider(&mut self, id: &str) -> Result<(), ConfigError> {
@@ -701,6 +737,39 @@ impl UserConfig {
         )?;
         if self.models.iter().any(|existing| existing.id == entry.id) {
             return Err(invalid("model id is already registered"));
+        }
+        if self.models.len() >= MAX_MODELS {
+            return Err(invalid("model list is full"));
+        }
+        self.models.push(entry);
+        Ok(())
+    }
+
+    /// Adds or replaces one model entry by identity. The provider must
+    /// already resolve; replacing preserves favourites and recents for the
+    /// same model id, whose provider or vendor name may change.
+    pub fn upsert_model(&mut self, entry: ModelEntry) -> Result<(), ConfigError> {
+        entry.validate()?;
+        let profile = self
+            .provider(&entry.provider)
+            .ok_or(invalid("model provider is unknown"))?;
+        let tokens = entry.context_window_tokens.or_else(|| {
+            (entry.name == profile.default_model)
+                .then_some(profile.context_window_tokens)
+                .flatten()
+        });
+        context_settings(
+            entry.context_management.unwrap_or(self.context_management),
+            tokens,
+            entry.max_output_tokens,
+        )?;
+        if let Some(existing) = self
+            .models
+            .iter_mut()
+            .find(|existing| existing.id == entry.id)
+        {
+            *existing = entry;
+            return Ok(());
         }
         if self.models.len() >= MAX_MODELS {
             return Err(invalid("model list is full"));

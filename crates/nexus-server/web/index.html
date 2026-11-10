@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Nexus · Workspace</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to conversation</a>
+  <aside class="sidebar" aria-label="Workspace navigation">
+    <a class="brand" href="/" aria-label="Nexus home"><span class="mark" aria-hidden="true">N</span> nexus<span class="badge">WEB</span></a>
+    <div class="workspace">
+      <span class="eyebrow">WORKSPACE</span>
+      <strong>Local workspace</strong>
+      <span class="muted">Served by nexus-server</span>
+    </div>
+    <div class="section-label">PROJECTS <button class="section-add" id="add-project-sidebar" type="button" aria-label="Add project" disabled>＋</button></div>
+    <div class="project-list" id="sidebar-projects" aria-label="Projects"><p class="sidebar-empty">Connect to load projects.</p></div>
+    <button class="new-session" id="new-session" type="button" disabled>＋ New session</button>
+    <div class="section-label">SESSIONS <span id="session-count">0</span></div>
+    <div class="session-list" id="session-list">
+      <p class="sidebar-empty" id="no-session-note">No active session.<br>Saved history is not available yet.</p>
+      <div class="session-item" id="session-item" hidden>
+        <span class="session-item-title" id="session-item-title">New conversation</span>
+        <span class="session-item-meta" id="session-item-meta">Ready</span>
+      </div>
+    </div>
+    <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span> Local only <span class="badge">ALPHA</span></div>
+  </aside>
+  <div class="shell">
+    <header class="topbar">
+      <div class="crumb"><span class="muted">Workspace</span><span class="separator">/</span><strong id="conversation-title">New conversation</strong></div>
+      <div class="toolbar">
+        <span class="project-badge" id="project-badge" hidden></span>
+        <span class="model-badge" id="model-badge" hidden></span>
+        <span class="status" id="connection-status" role="status">Not connected</span>
+        <button class="icon-button" id="new-session-mobile" type="button" aria-label="New session" disabled>＋</button>
+        <button id="open-settings" type="button">Settings</button>
+      </div>
+    </header>
+    <main id="main" tabindex="-1">
+      <section class="welcome" id="welcome" aria-labelledby="welcome-title">
+        <span class="eyebrow">A SMALL CORE. AN OPEN WORKSPACE.</span>
+        <h1 id="welcome-title">Space to build.</h1>
+        <p>A lightweight interface for your agent.<br>Everything runs through your local server.</p>
+        <span class="foundation">Live session client · history not restored</span>
+        <div class="cards" aria-label="Workspace capabilities">
+          <article><span class="card-number">01 / CONVERSATION</span><h2>Follow the thread</h2><p>Stream responses and keep the current session in view.</p><span class="muted">Live</span></article>
+          <article><span class="card-number">02 / TOOLS</span><h2>See the work</h2><p>Inspect tool activity, bounded output, and reported outcomes.</p><span class="muted">Live</span></article>
+          <article><span class="card-number">03 / CONTROL</span><h2>Stay in charge</h2><p>Review approvals, cancel a run, and see its actual outcome.</p><span class="muted">Live</span></article>
+        </div>
+      </section>
+      <div class="conversation" id="conversation" hidden aria-label="Conversation"></div>
+      <noscript><p class="noscript">JavaScript is required to connect, send tasks, and view runs.</p></noscript>
+    </main>
+    <section class="composer-region" aria-label="Message composer">
+      <button class="jump-latest" id="jump-latest" type="button" hidden>Jump to latest ↓</button>
+      <form class="composer" id="composer">
+        <label class="sr-only" for="message">Message</label>
+        <textarea id="message" rows="2" disabled placeholder="Connect to start a task…"></textarea>
+        <div class="composer-footer">
+          <div class="composer-context">
+            <span class="status" id="run-status" role="status" aria-live="polite">Not connected</span>
+            <span class="usage" id="usage-status" hidden></span>
+          </div>
+          <div class="composer-actions">
+            <span class="composer-project">
+              <label class="sr-only" for="project">Project</label>
+              <select id="project" disabled aria-label="Project"></select>
+              <span class="model-label" id="project-label" hidden></span>
+            </span>
+            <label class="sr-only" for="model">Model</label>
+            <select id="model" disabled aria-label="Model"></select>
+            <span class="model-label" id="model-label" hidden></span>
+            <button class="danger" id="cancel-run" type="button" hidden disabled>Cancel</button>
+            <button class="primary" id="send" type="submit" disabled>Send ↑</button>
+          </div>
+        </div>
+      </form>
+      <p class="footnote">Plain text view. No external assets. Transcripts are not restored after reload.</p>
+    </section>
+    <footer class="footer"><span>NEXUS AGENT</span><span>Built for focus, not overhead.</span></footer>
+  </div>
+  <dialog id="settings" aria-labelledby="settings-title">
+    <div class="dialog-heading">
+      <h2 id="settings-title">Settings</h2>
+      <button class="icon-button" id="close-settings" type="button" aria-label="Close settings">✕</button>
+    </div>
+    <div class="settings-layout">
+    <nav class="settings-nav" aria-label="Settings categories">
+      <button type="button" data-settings-section="appearance-panel" aria-controls="appearance-panel" aria-current="page">Appearance</button>
+      <button type="button" data-settings-section="connection-form" aria-controls="connection-form">Connection</button>
+      <button type="button" data-settings-section="projects-block" aria-controls="projects-block">Projects</button>
+      <button type="button" data-settings-section="providers-block" aria-controls="providers-block">Providers</button>
+      <button type="button" data-settings-section="models-block" aria-controls="models-block">Models</button>
+      <button type="button" data-settings-section="about-panel" aria-controls="about-panel">About</button>
+    </nav>
+    <div class="settings-content">
+    <section class="settings-panel" id="appearance-panel" aria-labelledby="appearance-title">
+    <h3 id="appearance-title">Appearance</h3>
+    <p class="muted">Appearance stays in this browser. The server token stays in this page's memory.</p>
+    <label for="theme">Color palette</label>
+    <select id="theme">
+      <option value="system">System</option>
+      <option value="graphite">Graphite · dark</option>
+      <option value="paper">Paper · light</option>
+      <option value="forest">Forest · dark</option>
+      <option value="sand">Sand · light</option>
+    </select>
+    <div class="palette" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    </section>
+    <form class="settings-panel" id="connection-form" aria-labelledby="connection-title" hidden>
+      <h3 id="connection-title">Server connection</h3>
+      <p class="muted">Same-origin only. The check loads model identities; it does not start a session.</p>
+      <label for="token">Bearer token <span class="muted">(if required)</span></label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="64 hexadecimal characters">
+      <p class="hint">Kept only in this page's memory, never in browser storage, and cleared on reload.</p>
+      <div class="dialog-actions">
+        <button class="primary" id="connect" type="submit">Connect</button>
+        <button id="disconnect" type="button" disabled>Disconnect</button>
+      </div>
+      <p class="dialog-status status" id="connection-detail" role="status">No request made yet.</p>
+    </form>
+    <section class="settings-panel" id="projects-block" aria-labelledby="projects-title" hidden>
+      <h3 id="projects-title">Projects</h3>
+      <div class="config-content">
+        <p class="muted" id="projects-note">Projects bind a session to an allowed local directory. Real tools are not enabled on this server.</p>
+        <div class="config-list" id="project-list"></div>
+        <form class="config-form" id="project-form">
+          <div class="form-grid">
+            <div><label for="project-name">Project name</label><input id="project-name" maxlength="128" autocomplete="off" placeholder="My project"></div>
+            <div><label for="project-path">Absolute path</label><input id="project-path" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="/absolute/project"></div>
+          </div>
+          <p class="hint">Must be an existing directory. The filesystem root, home/ancestor directories, and known credential directories are refused.</p>
+          <div class="dialog-actions"><button class="primary" id="add-project" type="submit">Add project</button></div>
+          <p class="dialog-status status" id="project-status" role="status"></p>
+        </form>
+      </div>
+    </section>
+    <section class="settings-panel" id="providers-block" aria-labelledby="providers-title" hidden>
+      <h3 id="providers-title">Providers</h3>
+      <div class="config-content">
+        <p class="muted">Credential fields accept a reference name only. Secret values are never entered here or stored in the configuration.</p>
+        <div class="config-list" id="provider-list"></div>
+        <form class="config-form" id="provider-form">
+          <div class="form-grid">
+            <div><label for="provider-id">Provider ID</label><input id="provider-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="openai-main"></div>
+            <div><label for="provider-display">Display name</label><input id="provider-display" maxlength="128" autocomplete="off" placeholder="OpenAI"></div>
+          </div>
+          <div class="form-grid">
+            <div><label for="provider-adapter">Adapter</label><select id="provider-adapter"><option value="direct">Direct</option><option value="relay">Relay</option></select></div>
+            <div><label for="provider-protocol">Protocol</label><select id="provider-protocol"><option value="chat_completions">Chat Completions</option><option value="openai_responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></div>
+          </div>
+          <label for="provider-endpoint">Endpoint <span class="muted">(optional)</span></label>
+          <input id="provider-endpoint" maxlength="512" autocomplete="off" spellcheck="false" placeholder="https://api.example.com">
+          <div class="form-grid">
+            <div><label for="provider-credential-kind">Credential kind</label><select id="provider-credential-kind"><option value="env">Environment variable</option><option value="stored">Stored reference</option></select></div>
+            <div><label for="provider-credential-name">Credential name</label><input id="provider-credential-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY"></div>
+          </div>
+          <div class="form-grid">
+            <div><label for="provider-default-model">Default model</label><input id="provider-default-model" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5"></div>
+            <div><label for="provider-context-window">Context window <span class="muted">(optional)</span></label><input id="provider-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
+          </div>
+          <p class="hint">The provider window applies only to its default model; model entries can override it.</p>
+          <div class="dialog-actions">
+            <button class="primary" id="save-provider" type="submit">Save provider</button>
+            <button id="new-provider" type="button">New provider</button>
+          </div>
+          <p class="dialog-status status" id="provider-status" role="status"></p>
+        </form>
+      </div>
+    </section>
+    <section class="settings-panel" id="models-block" aria-labelledby="models-title" hidden>
+        <h3 id="models-title">Models</h3>
+        <p class="muted">Choose a configured provider and the vendor's model name. Changes apply to new sessions.</p>
+        <div class="config-list" id="model-list"></div>
+        <form class="config-form" id="model-form">
+          <div class="form-grid">
+            <div><label for="model-id">Model ID</label><input id="model-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="fast"></div>
+            <div><label for="model-provider">Provider</label><select id="model-provider"></select></div>
+          </div>
+          <label for="model-name">Vendor model name</label>
+          <input id="model-name" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5-mini">
+          <div class="form-grid">
+            <div><label for="model-context-window">Context window <span class="muted">(optional)</span></label><input id="model-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
+            <div><label for="model-max-output">Max output tokens <span class="muted">(optional)</span></label><input id="model-max-output" type="number" min="1" step="1" autocomplete="off" placeholder="8192"></div>
+          </div>
+          <div class="dialog-actions">
+            <button class="primary" id="save-model" type="submit">Save model</button>
+            <button id="new-model" type="button">New model</button>
+          </div>
+          <p class="dialog-status status" id="model-status" role="status"></p>
+        </form>
+        <p class="hint">Changes apply to new sessions. Existing sessions keep their original provider, model, and tools.</p>
+    </section>
+    <section class="settings-panel info-box" id="about-panel" aria-labelledby="about-title" hidden>
+      <h3 id="about-title">About Nexus</h3>
+      <p class="settings-version">Version <strong id="server-version">Not connected</strong></p>
+      <strong>Current limits</strong>
+      <p>Reloading or closing this page loses the transcript; the server session is not a saved conversation. History, file browsing, and session restore are not implemented.</p>
+    </section>
+    </div>
+    </div>
+  </dialog>
+</body>
+</html>
