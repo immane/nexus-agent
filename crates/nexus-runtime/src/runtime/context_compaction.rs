@@ -14,6 +14,127 @@ const MAX_SUMMARY_RECORD_BYTES: usize = 16 * 1024;
 const MAX_SUMMARY_OUTPUT_RETRIES: u8 = 2;
 const SUMMARY_REQUEST: &str = "Summarize the preceding historical data now. Do not continue the original task. Return only a concise, nonempty compact summary, not reasoning alone.";
 
+/// Disjoint payload-byte categories, not independently rounded token estimates.
+/// Framing and estimator calibration are reported separately.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BudgetPayloadBytes {
+    instructions: usize,
+    context_note: usize,
+    tool_definitions: usize,
+    user_text: usize,
+    assistant_text: usize,
+    reasoning: usize,
+    arguments: usize,
+    tool_results: usize,
+    derived_memory: usize,
+    retained_evidence: usize,
+    identities: usize,
+}
+
+impl BudgetPayloadBytes {
+    fn for_request(request: &ModelRequest) -> Self {
+        let mut bytes = Self {
+            instructions: request.instructions().payload_bytes(),
+            context_note: request.context_note_bytes(),
+            tool_definitions: request.tool_definitions().iter().fold(0usize, |sum, tool| {
+                sum.saturating_add(tool.id().name().len())
+                    .saturating_add(tool.description().len())
+                    .saturating_add(tool.input_schema_json().len())
+            }),
+            ..Self::default()
+        };
+        for item in request.conversation() {
+            let reasoning = item.reasoning().map_or(0, str::len);
+            bytes.reasoning = bytes.reasoning.saturating_add(reasoning);
+            let (category, content) = match item {
+                ModelContextItem::UserText(text) => (&mut bytes.user_text, text.as_str().len()),
+                ModelContextItem::AssistantText { item_key, text, .. } => {
+                    let category = if item_key.as_str() == nexus_context::MEMORY_KEY
+                        && text.as_str().starts_with(nexus_context::MEMORY_LABEL)
+                    {
+                        &mut bytes.derived_memory
+                    } else if nexus_context::is_retained_evidence(item) {
+                        &mut bytes.retained_evidence
+                    } else {
+                        &mut bytes.assistant_text
+                    };
+                    (category, text.as_str().len())
+                }
+                ModelContextItem::AssistantCall { call, .. } => {
+                    (&mut bytes.arguments, call.args().as_str().len())
+                }
+                ModelContextItem::AssistantDeniedCall { candidate, .. } => {
+                    (&mut bytes.arguments, candidate.arguments_json().len())
+                }
+                ModelContextItem::ToolResult { outcome, .. } => {
+                    (&mut bytes.tool_results, outcome.content().len())
+                }
+                ModelContextItem::AssistantReasoning { .. } => continue,
+            };
+            *category = category.saturating_add(content);
+            bytes.identities = bytes
+                .identities
+                .saturating_add(item.payload_bytes().saturating_sub(content + reasoning));
+        }
+        bytes
+    }
+
+    fn total(&self) -> usize {
+        [
+            self.instructions,
+            self.context_note,
+            self.tool_definitions,
+            self.user_text,
+            self.assistant_text,
+            self.reasoning,
+            self.arguments,
+            self.tool_results,
+            self.derived_memory,
+            self.retained_evidence,
+            self.identities,
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
+    }
+}
+
+pub(super) fn diagnose_budget(
+    shared: &Shared,
+    active: &ActiveRun,
+    request: &ModelRequest,
+    stage: &'static str,
+    purpose: nexus_core::ModelRequestPurpose,
+) {
+    // Unknown-window scripted hosts retain their existing stderr contract.
+    // A host-owned sink can still collect detailed unknown-window diagnostics.
+    if active.context_management.window.is_none()
+        && !shared
+            .diagnostic_writer
+            .lock()
+            .is_ok_and(|writer| writer.is_some())
+    {
+        return;
+    }
+    let estimator = if purpose == nexus_core::ModelRequestPurpose::Summary {
+        &active.summary_token_estimator
+    } else {
+        &active.token_estimator
+    };
+    let payload = BudgetPayloadBytes::for_request(request);
+    let raw = estimator.raw_estimate(request);
+    let window = active
+        .context_management
+        .window
+        .map(|window| u64::from(window.tokens()));
+    let reserve = window.map(|window| active.context_management.output_reserve_tokens(window));
+    shared.diagnostic(format_args!(
+        "nexus-runtime: context budget run={} turn={} stage={stage} purpose={purpose:?} window_tokens={window:?} configured_max_output_tokens={:?} planning_output_reserve_tokens={reserve:?} request_max_output_tokens={:?} raw_estimated_input_tokens={raw} estimated_input_tokens={} estimate_scale_millis={} framing_tokens={} payload_bytes={payload:?} measurement=heuristic_not_provider_usage",
+        request.run().as_str(), request.turn().as_str(), active.context_management.max_output_tokens,
+        request.max_output_tokens(), estimator.estimate(request), estimator.scale_millis(),
+        raw.saturating_sub(payload.total().div_ceil(3) as u64),
+    ));
+}
+
 pub(super) fn projection_overhead(active: &ActiveRun, note: &str) -> usize {
     memory_bytes(active.derived_memory.as_deref()).saturating_add(
         runtime_note_bytes(
@@ -407,6 +528,13 @@ pub(super) fn prepare_context_request(
         || input.saturating_add(output) > window)
         && active.continuation.is_none()
     {
+        diagnose_budget(
+            shared,
+            active,
+            &request,
+            "before_reduction",
+            nexus_core::ModelRequestPurpose::Task,
+        );
         let target = window.saturating_mul(u64::from(policy.target_percent())) / 100;
         let plan = if policy.strategy() == ContextCompactionStrategy::Summarize && archived {
             // Budget the largest accepted replacement memory, not just the old
@@ -435,6 +563,13 @@ pub(super) fn prepare_context_request(
                 minimum
             };
             let minimum_input = estimate(active, &minimum);
+            diagnose_budget(
+                shared,
+                active,
+                &minimum,
+                "protected_floor",
+                nexus_core::ModelRequestPurpose::Task,
+            );
             if minimum.conversation().len() > shared.context_items_bound
                 || minimum_input.saturating_add(output) > window
             {
@@ -502,6 +637,13 @@ pub(super) fn prepare_context_request(
         input = estimate(active, &request);
     }
     if input.saturating_add(output) > window {
+        diagnose_budget(
+            shared,
+            active,
+            &request,
+            "rejected_task",
+            nexus_core::ModelRequestPurpose::Task,
+        );
         shared.diagnostic(format_args!(
             "nexus-runtime: context cannot fit after reduction estimated_input_tokens={input} window_tokens={window} output_reserve_tokens={output} retained_items={}; protected context was not discarded",
             request.conversation().len(),
@@ -562,6 +704,13 @@ fn commit(
     )?;
     let before_estimated = estimate(active, &before);
     let estimated = estimate(active, &projected);
+    diagnose_budget(
+        shared,
+        active,
+        &projected,
+        "retained_view",
+        nexus_core::ModelRequestPurpose::Task,
+    );
     let window = active.context_management.window.map(|window| {
         let window = u64::from(window.tokens());
         (
@@ -823,6 +972,13 @@ pub(super) fn ingest_summary(
                     Some(request)
                 };
                 if let Some(request) = request {
+                    diagnose_budget(
+                        shared,
+                        active,
+                        &request,
+                        "summary_candidate",
+                        nexus_core::ModelRequestPurpose::Task,
+                    );
                     let input = estimate(active, &request);
                     let output = active.context_management.window.map_or(0, |window| {
                         active
@@ -1018,6 +1174,201 @@ mod tests {
     fn prepare(shared: &Arc<Shared>, active: &mut ActiveRun) -> ModelRequest {
         prepare_context_request(shared, active, &turn())
             .unwrap_or_else(|terminal| panic!("prepare failed: {:?}", terminal.error))
+    }
+
+    #[test]
+    fn budget_payload_categories_reconcile_without_double_counting_reasoning() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        active.conversation = vec![
+            ModelContextItem::user_text("private user 日本語").unwrap(),
+            ModelContextItem::assistant_text_with_reasoning(
+                "answer",
+                "private answer",
+                Some("private reasoning".into()),
+            )
+            .unwrap(),
+            ModelContextItem::assistant_reasoning("private thinking".into()).unwrap(),
+            ModelContextItem::assistant_text(
+                nexus_context::EVIDENCE_KEY,
+                format!("{}private evidence", nexus_context::EVIDENCE_LABEL),
+            )
+            .unwrap(),
+        ];
+        let mut exchange = context_exchange(&active.run, 0, 17);
+        if let ModelContextItem::AssistantCall { reasoning, .. } = &mut exchange[0] {
+            *reasoning = Some("call reasoning".into());
+        }
+        active.conversation.extend(exchange);
+        active.conversation.push(
+            ModelContextItem::assistant_denied_call(
+                CallId::new("denied").unwrap(),
+                CallCandidate::new("denied-item", "denied-ref", "unknown", "{bad").unwrap(),
+                Some("denied reasoning".into()),
+            )
+            .unwrap(),
+        );
+        active.derived_memory = Some("private memory".into());
+        let spec = ToolSpec::new(
+            ToolId::new("host_read", nexus_core::M0_REVISION).unwrap(),
+            "private description",
+            "{}",
+        )
+        .unwrap();
+        let request = normal_request(&shared, &active, &turn(), &active.conversation)
+            .unwrap_or_else(|terminal| panic!("request failed: {:?}", terminal.error))
+            .with_tool_definitions(vec![spec])
+            .unwrap();
+        let bytes = BudgetPayloadBytes::for_request(&request);
+        assert_eq!(bytes.user_text, "private user 日本語".len());
+        assert_eq!(bytes.assistant_text, "private answer".len());
+        assert_eq!(
+            bytes.reasoning,
+            [
+                "private reasoning",
+                "private thinking",
+                "call reasoning",
+                "denied reasoning"
+            ]
+            .iter()
+            .map(|s| s.len())
+            .sum::<usize>()
+        );
+        assert_eq!(bytes.arguments, "{}".len() + "{bad".len());
+        assert_eq!(bytes.tool_results, 17);
+        assert_eq!(
+            bytes.derived_memory,
+            nexus_context::MEMORY_LABEL.len() + "private memory".len()
+        );
+        assert_eq!(
+            bytes.retained_evidence,
+            nexus_context::EVIDENCE_LABEL.len() + "private evidence".len()
+        );
+        assert_eq!(
+            bytes.tool_definitions,
+            "host_read".len() + "private description".len() + "{}".len()
+        );
+        assert!(bytes.identities > 0);
+        let payload = request.instructions().payload_bytes()
+            + request.context_note_bytes()
+            + bytes.tool_definitions
+            + request
+                .conversation()
+                .iter()
+                .map(ModelContextItem::payload_bytes)
+                .sum::<usize>();
+        assert_eq!(bytes.total(), payload);
+        let framing =
+            (request.conversation().len() + 2) * 32 + request.tool_definitions().len() * 64;
+        assert_eq!(
+            estimated_input_tokens(&request),
+            payload.div_ceil(3) as u64 + framing as u64
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct BudgetCapture(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for BudgetCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn budget_diagnostics_distinguish_reserve_cap_purpose_and_unknown_window() {
+        let (shared, _data) = shared_with_data();
+        let capture = BudgetCapture::default();
+        *shared.diagnostic_writer.lock().unwrap() = Some(Box::new(capture.clone()));
+        let mut active = context_run();
+        active.context_management.window =
+            Some(ContextWindow::new(16_384, ContextWindowSource::Configured).unwrap());
+        active.context_management.max_output_tokens = Some(2048);
+        active.conversation = vec![ModelContextItem::user_text("PRIVATE_PAYLOAD").unwrap()];
+        let request = prepare(&shared, &mut active);
+        diagnose_budget(
+            &shared,
+            &active,
+            &request,
+            "dispatch",
+            nexus_core::ModelRequestPurpose::Task,
+        );
+        let summary = summary_request(&shared, &active, &turn(), "PRIVATE_SOURCE", None)
+            .unwrap_or_else(|terminal| panic!("summary failed: {:?}", terminal.error))
+            .unwrap();
+        diagnose_budget(
+            &shared,
+            &active,
+            &summary,
+            "dispatch",
+            nexus_core::ModelRequestPurpose::Summary,
+        );
+        active.context_management.window = None;
+        let unknown = prepare(&shared, &mut active);
+        diagnose_budget(
+            &shared,
+            &active,
+            &unknown,
+            "dispatch",
+            nexus_core::ModelRequestPurpose::Task,
+        );
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!log.contains("PRIVATE"));
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("stage=dispatch purpose=Task window_tokens=Some(16384)"));
+        assert!(lines[0].contains("configured_max_output_tokens=Some(2048) planning_output_reserve_tokens=Some(4096) request_max_output_tokens=Some(2048)"));
+        assert!(lines[1].contains("purpose=Summary"));
+        assert!(lines[1].contains("request_max_output_tokens=Some(4096)"));
+        assert!(lines[2].contains("window_tokens=None"));
+        assert!(lines[2].contains("planning_output_reserve_tokens=None"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.contains("measurement=heuristic_not_provider_usage"))
+        );
+    }
+
+    #[test]
+    fn budget_diagnostics_measure_previewed_results_without_rewriting_sources() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        known(&mut active, ContextCompactionStrategy::Summarize);
+        for n in 0..4 {
+            active
+                .conversation
+                .extend(context_exchange(&active.run, n, 4096));
+        }
+        let source = active.conversation.clone();
+        let retained = normal_request(&shared, &active, &turn(), &source)
+            .unwrap_or_else(|terminal| panic!("request failed: {:?}", terminal.error));
+        let projected = preview_request_for_headroom(&active, retained.clone(), 4096, 1024)
+            .unwrap_or_else(|terminal| panic!("preview failed: {:?}", terminal.error));
+        let before = BudgetPayloadBytes::for_request(&retained);
+        let after = BudgetPayloadBytes::for_request(&projected);
+        assert!(after.tool_results < before.tool_results);
+        assert_eq!(after.arguments, before.arguments);
+        assert_eq!(after.identities, before.identities);
+        assert_eq!(active.conversation, source);
+        assert_eq!(
+            after.tool_results,
+            projected
+                .conversation()
+                .iter()
+                .filter_map(|item| {
+                    if let ModelContextItem::ToolResult { outcome, .. } = item {
+                        Some(outcome.content().len())
+                    } else {
+                        None
+                    }
+                })
+                .sum::<usize>()
+        );
     }
 
     #[test]

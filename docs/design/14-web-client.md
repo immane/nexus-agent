@@ -178,7 +178,7 @@ session is created. The client sends the selected project id in
 ## Provider and model configuration
 
 Settings uses a wide dialog with category navigation for Appearance, Connection,
-Projects, Providers, Models, and About. On narrow screens the navigation becomes
+Thinking, Projects, Providers, Models, and About. On narrow screens the navigation becomes
 a horizontally scrollable row. Switching categories preserves unsaved form values.
 About displays the running server's package version from the additive `version`
 field in `GET /config`; it is not the configuration schema's `revision`.
@@ -196,6 +196,16 @@ unknown provider, dangling reference, invalid endpoint, or inconsistent context
 window is refused with a static error. A provider replacement revalidates models
 that inherit its default-model window. Successful writes use the normal atomic
 configuration save.
+
+Thinking exposes a global task-generation default through authenticated
+`POST /config/thinking`, with optional provider/model overrides in their existing
+forms. Choices are Default (inherit), On (low effort), and Off. Precedence is
+model, provider, then global; all inherited defaults preserve existing behavior.
+Only detected Ollama Direct / Chat Completions adapters currently support an
+effective explicit override. Other adapters reject it instead of silently
+ignoring it. Low effort may merely enable thinking on boolean-only models.
+This control does not show/hide reasoning, remove historical traces, or change
+summary thinking. See the [configuration contract](../contracts/05-configuration.md#provider-task-reasoning-effort).
 
 Changes apply to new sessions. A live session keeps the provider adapter and tool
 registrations created for it. This slice does not provide provider/model removal

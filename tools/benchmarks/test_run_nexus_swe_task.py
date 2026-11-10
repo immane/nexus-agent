@@ -1,10 +1,18 @@
 """Offline tests for benchmark result classification."""
 
 from argparse import Namespace
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import hashlib
+import io
+import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import run_nexus_swe_task as runner
 
 from run_nexus_swe_task import (
     build_task_prompt,
@@ -150,6 +158,29 @@ class ContainerGitCheckoutTests(unittest.TestCase):
 
 
 class TaskPromptTests(unittest.TestCase):
+    def test_default_prompt_is_byte_for_byte_unchanged(self):
+        prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
+        self.assertEqual(hashlib.sha256(prompt.encode()).hexdigest(),
+                         "23c3f83bb4237245cdb03f954a7872036e40f22b4c41bd0ea71980305fa03d52")
+        self.assertEqual(prompt, build_task_prompt("task-1", "abc123", "Fix the reported issue.", None))
+
+    def test_opt_in_only_appends_generic_ingestion_guidance(self):
+        baseline = build_task_prompt("task-1", "abc123", "Issue")
+        for size in (4, 4096, 16384):
+            with self.subTest(size=size):
+                prompt = build_task_prompt("task-1", "abc123", "Issue", size)
+                self.assertTrue(prompt.startswith(baseline))
+                guidance = prompt[len(baseline):]
+                self.assertIn(f"host_read with limit={size} bytes and offset=0", guidance)
+                self.assertIn("next_offset byte offset", guidance)
+                self.assertIn("Offsets are bytes, not lines", guidance)
+                self.assertIn("Narrow searches", guidance)
+                self.assertIn("command output bounded", guidance)
+                self.assertIn("preserving the exact command exit status", guidance)
+                self.assertNotIn("task-1", guidance)
+                self.assertNotIn("abc123", guidance)
+                self.assertNotIn("Issue", guidance)
+
     def test_prompt_identifies_authoritative_workspace_and_project_test_docs(self):
         prompt = build_task_prompt("task-1", "abc123", "Fix the reported issue.")
         self.assertIn("mounted at /workspace", prompt)
@@ -200,6 +231,49 @@ class TaskPromptTests(unittest.TestCase):
         self.assertIn("change expectations merely to obtain a pass", prompt)
         self.assertIn("Do not enable external network access", prompt)
         self.assertIn("or download dependencies/plugins", prompt)
+
+
+class ReadPagingRunnerTests(unittest.TestCase):
+    def test_invalid_cli_values_fail_before_any_requests(self):
+        required = ["runner", "--task-json", "unused", "--workspace", "unused",
+                    "--provider", "fixture", "--model", "fixture", "--output-dir", "unused"]
+        for value in ("3", "16385", "0", "-1", "4.5", "invalid"):
+            with self.subTest(value=value), patch.object(sys, "argv", required + ["--read-page-bytes", value]), \
+                    patch.object(runner, "request") as request, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    runner.main()
+                self.assertEqual(error.exception.code, 2)
+                request.assert_not_called()
+
+    def test_runner_submits_guidance_and_records_setting_only_when_opted_in(self):
+        @contextmanager
+        def events(_url, _headers, _status):
+            yield [b'data: {"seq":0,"kind":"run-finished","terminal":true,"detail":{"outcome":"completed"}}\n']
+
+        for size in (None, 4, 16384):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                task = root / "task.json"
+                task.write_text(json.dumps({"instance_id": "task-1", "base_commit": "abc123",
+                                            "problem_statement": "Issue"}))
+                argv = ["runner", "--task-json", str(task), "--workspace", str(root),
+                        "--provider", "fixture", "--model", "fixture", "--output-dir", str(root),
+                        "--session-id", "fixture", "--token-env", "FIXTURE_TOKEN"]
+                if size is not None:
+                    argv += ["--read-page-bytes", str(size)]
+                with patch.object(sys, "argv", argv), patch.dict(runner.os.environ, {"FIXTURE_TOKEN": "fixture"}), \
+                        patch.object(runner, "validate_container_git_checkout"), \
+                        patch.object(runner, "git", side_effect=[Namespace(stdout="abc123"), Namespace(stdout="")]), \
+                        patch.object(runner, "request", return_value={"run": "fixture"}) as request, \
+                        patch.object(runner, "event_stream_response", events), \
+                        patch.object(runner, "collect_patch", return_value="patch"), \
+                        redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(runner.main(), 0)
+                self.assertEqual(request.call_args.args[3]["input"],
+                                 build_task_prompt("task-1", "abc123", "Issue", size))
+                run = next((root / "runs").iterdir())
+                for path in (run / "manifest.json", run / "result.json", root / "task-1.result.json"):
+                    self.assertEqual(json.loads(path.read_text())["prompt_config"], {"read_page_bytes": size})
 
 
 if __name__ == "__main__":

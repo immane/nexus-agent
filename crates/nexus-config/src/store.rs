@@ -332,10 +332,10 @@ fn resolve_stored_at(provider: &str, path: &Path) -> Result<String, ConfigError>
 /// but no secret values (the document cannot hold any).
 #[must_use]
 pub fn summary(config: &UserConfig) -> serde_json::Value {
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "revision": CONFIG_REVISION,
         "providers": config.providers().iter().map(|profile| {
-            serde_json::json!({
+            let mut provider = serde_json::json!({
                 "id": profile.id,
                 "display_name": profile.display_name,
                 "adapter": profile.adapter.name(),
@@ -344,20 +344,32 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "credential": profile.credential.to_json(),
                 "default_model": profile.default_model,
                 "context_window_tokens": profile.context_window_tokens,
-            })
+            });
+            if let Some(effort) = profile.task_reasoning_effort {
+                provider["task_reasoning_effort"] = effort.as_str().into();
+            }
+            provider
         }).collect::<Vec<_>>(),
         "models": config.models().iter().map(|entry| {
-            serde_json::json!({
+            let mut model = serde_json::json!({
                 "id": entry.id,
                 "provider": entry.provider,
                 "name": entry.name,
                 "context_window_tokens": entry.context_window_tokens,
                 "max_output_tokens": entry.max_output_tokens,
-            })
+            });
+            if let Some(effort) = entry.task_reasoning_effort {
+                model["task_reasoning_effort"] = effort.as_str().into();
+            }
+            model
         }).collect::<Vec<_>>(),
         "favourites": config.favourites(),
         "recent": config.recent(),
-    })
+    });
+    if let Some(effort) = config.task_reasoning_effort() {
+        result["task_reasoning_effort"] = effort.as_str().into();
+    }
+    result
 }
 
 #[cfg(test)]

@@ -14,6 +14,35 @@ tests, and clippy commands share the target directory lock and do not accelerate
 validation. Avoid checking the same code immediately before clippy (which already
 checks it).
 
+Small-context runtime regressions include metadata-only budget diagnostics for
+pre-reduction, protected-floor, summary-candidate, retained-view, and final
+request stages. `cargo nextest run -p nexus-runtime budget_ --locked --offline`
+covers disjoint payload-byte accounting, previewed versus original results,
+task/summary generation caps, unknown windows, and exclusion of private payload
+text from diagnostics. These are heuristic estimates, not exact provider token
+counts. `planning_output_reserve_tokens` is the task policy's headroom, including
+on summary diagnostic lines; `request_max_output_tokens` is the separate cap on
+that particular request. The retained view may be larger than the final
+previewed request. Public event and persistence formats are unchanged.
+For unknown windows, detailed budget diagnostics require a host-owned diagnostic
+writer. The default scripted headless runner retains its existing stderr
+contract; `nexus-headless` CLI tests cover separate and merged streams and a
+closed stdout pipe without relaxing their output assertions.
+
+The opt-in provider `task_reasoning_effort` setting has offline coverage in
+`nexus-config`'s `task_reasoning_effort` test target, `nexus-openai`'s
+`reasoning_effort_tests`, and the existing server configuration integration
+module. These verify strict configuration roundtrips, preserved historical
+reasoning, explicit summary-hint precedence, unchanged generation caps, endpoint
+rejection before network I/O, and preservation/clearing through configuration
+updates. They verify request encoding, not a live model's compliance or repair
+quality. Benchmark launcher tests separately verify experiment metadata.
+Layered-thinking regressions additionally cover model/provider/global precedence,
+canonical inheritance, atomic rejection of incompatible model/provider changes,
+global HTTP updates, inherited unsupported-adapter rejection in both Server and
+TUI resolution, and per-run TUI snapshots. Web Node tests cover hydration without
+writes, explicit setting/clearing, authentication, busy state and save errors.
+
 ```sh
 cargo fmt --all --check
 cargo nextest run -p nexus-tools -p nexus-container -p nexus-tui -p nexus-server --locked --offline

@@ -273,7 +273,39 @@ class OutputTests(unittest.TestCase):
 
 
 class ArchiveLaunchTests(unittest.TestCase):
+    def test_invalid_read_page_bytes_fail_before_preparation(self):
+        for value in ("3", "16385", "0", "-1", "4.5", "invalid"):
+            with self.subTest(value=value), \
+                    patch.object(sys, "argv", ["swebench", "run", row()["instance_id"], "--read-page-bytes", value]), \
+                    patch.object(swebench, "available_tasks") as tasks, \
+                    patch.object(swebench, "launch") as launch, patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    swebench.main()
+                self.assertEqual(error.exception.code, 2)
+                tasks.assert_not_called()
+                launch.assert_not_called()
+
     def test_worker_preflight_failure_stops_before_runner_and_preserves_evidence(self):
+        self.check_launch(worker_failure=True)
+
+    def test_read_paging_passthrough_and_default_omission(self):
+        for size in (None, 4, 16384):
+            with self.subTest(size=size):
+                self.check_launch(read_page_bytes=size)
+
+    def test_task_reasoning_setting_is_recorded_from_selected_provider(self):
+        for effort in ("none", "low"):
+            with self.subTest(effort=effort):
+                self.check_launch(task_reasoning_effort=effort)
+
+    def test_inherited_task_reasoning_is_recorded_effectively(self):
+        self.check_launch(global_effort="none", expected_effort="none")
+        self.check_launch(global_effort="none", task_reasoning_effort="low", expected_effort="low")
+        self.check_launch(global_effort="low", task_reasoning_effort="low", model_effort="none", expected_effort="none")
+        self.check_launch(global_effort="none", task_reasoning_effort="inherit", model_effort="inherit", expected_effort="none")
+
+    def check_launch(self, read_page_bytes=None, worker_failure=False, task_reasoning_effort=None,
+                     global_effort=None, model_effort=None, expected_effort=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             server = root / "target/release/nexus-server"
@@ -285,19 +317,31 @@ class ArchiveLaunchTests(unittest.TestCase):
                                "credential": {"env": "OLLAMA_API_KEY"}}],
                 "models": [{"id": "local-model", "provider": "ollama-local"}],
             }))
+            if any(value is not None for value in (task_reasoning_effort, global_effort, model_effort)):
+                document = json.loads(config.read_text())
+                for layer, value in ((document, global_effort), (document["providers"][0], task_reasoning_effort),
+                                     (document["models"][0], model_effort)):
+                    if value is not None:
+                        layer["task_reasoning_effort"] = value
+                config.write_text(json.dumps(document))
             profiles = {"provider": "ollama-local", "model": "local-model", "gateway_image": "gateway"}
             profile_path = root / "profiles.json"
             profile_path.write_text(json.dumps(profiles))
             args = SimpleNamespace(config=config, profiles=profile_path, model=None, provider=None,
                                    model_output_tokens=None, gateway_image=None, container_image=None,
+                                   read_page_bytes=read_page_bytes, tool_log_bytes=8192, prepare_only=False,
                                    build=False, work_root=root / "runs", task=row()["instance_id"], port=0,
                                    max_tool_calls=4096, max_run_seconds=86400)
             task = {"row": row(), "image": "workload", "source": "fixture", "exposure": "exposed"}
             process, pump = Mock(), Mock()
             process.pid = 1234
             process.poll.return_value = None
+            process.wait.return_value = 0
             pump.is_alive.return_value = False
             errors = []
+            child = Mock()
+            child.wait.return_value = 0
+            child.poll.return_value = 0
             with patch.object(swebench, "REPO", root), \
                     patch.object(swebench, "check_model"), \
                     patch.object(swebench, "inspect_image", return_value={"Id": "fixture", "Architecture": "arm64"}), \
@@ -307,18 +351,35 @@ class ArchiveLaunchTests(unittest.TestCase):
                     patch.object(swebench, "request", return_value={"session": "fixture"}), \
                     patch.object(swebench, "owner_record", return_value=owner()), \
                     patch.object(swebench, "disconnect_network", return_value={"verified": True}), \
-                    patch.object(swebench, "verify_worker", side_effect=RuntimeError("rebuild task adapter")), \
-                    patch.object(swebench, "logged_process", return_value=(process, pump, errors)) as spawn, \
+                    patch.object(swebench, "verify_worker", return_value={"verified": True},
+                                 side_effect=RuntimeError("rebuild task adapter") if worker_failure else None), \
+                    patch.object(swebench, "logged_process", side_effect=[(process, pump, errors), (child, pump, [])]) as spawn, \
                     patch.object(swebench.sys, "stdout", io.StringIO()):
                 socket.return_value.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 12345)
-                with self.assertRaisesRegex(RuntimeError, "rebuild task adapter"):
-                    swebench.launch(args, profiles, task)
-            self.assertEqual(spawn.call_count, 1, "must start only the server, never the model runner")
+                if worker_failure:
+                    with self.assertRaisesRegex(RuntimeError, "rebuild task adapter"):
+                        swebench.launch(args, profiles, task)
+                else:
+                    self.assertEqual(swebench.launch(args, profiles, task), 0)
             run = next(args.work_root.iterdir())
             evidence = json.loads((run / "launch.json").read_text())
-            self.assertEqual(evidence["status"], "interrupted-or-failed")
+            self.assertEqual(evidence["prompt_config"], {"read_page_bytes": read_page_bytes})
+            self.assertEqual(evidence["task_reasoning_effort"], expected_effort if expected_effort is not None else task_reasoning_effort)
             self.assertEqual(evidence["evaluation"], "not-run")
-            self.assertNotIn("runner_argv", evidence)
+            if worker_failure:
+                self.assertEqual(spawn.call_count, 1, "must start only the server, never the model runner")
+                self.assertEqual(evidence["status"], "interrupted-or-failed")
+                self.assertNotIn("runner_argv", evidence)
+            else:
+                self.assertEqual(spawn.call_count, 2)
+                self.assertEqual(evidence["status"], "finished")
+                argv = spawn.call_args.args[0]
+                self.assertEqual(evidence["runner_argv"], argv)
+                if read_page_bytes is None:
+                    self.assertNotIn("--read-page-bytes", argv)
+                else:
+                    self.assertEqual(argv[argv.index("--read-page-bytes") + 1], str(read_page_bytes))
+                self.assertNotIn("--output-limit", argv)
             process.terminate.assert_called_once()
 
     def test_launcher_uses_a_run_local_archive_outside_the_workload_mount(self):
@@ -339,6 +400,7 @@ class ArchiveLaunchTests(unittest.TestCase):
             args = SimpleNamespace(
                 config=config, profiles=profile_path, model=None, provider=None,
                 model_output_tokens=32768,
+                read_page_bytes=None,
                 gateway_image=None, container_image=None, build=False,
                 work_root=root / "runs", task=row()["instance_id"], port=0,
                 max_tool_calls=4096, max_run_seconds=86400,

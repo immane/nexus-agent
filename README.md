@@ -61,7 +61,9 @@ text, not verified facts; see the implementation notes in the design document.
 The exposed one-task Astropy context-retention replay completed one context
 reduction and was resolved by the official evaluator. This single result does
 not establish reduced repeated investigation or causation, and is not an overall
-benchmark score. The separate SymPy replay triggered no reduction. See the
+benchmark score. An earlier SymPy replay triggered no reduction; the later
+[16K pressure test](#small-context-pressure-test) completed two summary reductions
+and was officially resolved with task thinking disabled. See the
 [reviewed evidence](docs/research/evidence/README.md) and
 [run history](docs/research/agent-benchmarks.md).
 
@@ -480,6 +482,36 @@ First-release authentication uses API profiles with external credential referenc
 
 See [model integration](docs/design/03-model-integration.md), [API relay](docs/design/08-api-relay.md), and the [provider contract](docs/contracts/01-provider.md).
 
+### Task thinking controls
+
+In current source builds, Web **Settings → Thinking** provides a global
+task-thinking default; the provider and model forms offer optional overrides.
+**All levels default to inheritance,
+so existing configurations and provider requests remain unchanged.** Precedence
+is **selected model → provider → global → adapter default**. Existing explicit
+provider settings retain priority over a new global default.
+
+| Web choice | `task_reasoning_effort` | Behavior |
+| --- | --- | --- |
+| Default (inherit) | omitted or `"inherit"` | Inherit the next setting; at the global level, preserve adapter defaults. |
+| On (low effort) | `"low"` | Request low-effort thinking; on boolean-only models this may simply enable thinking. |
+| Off | `"none"` | Request no thinking output, where the selected model permits it. |
+
+The optional field can be set at the configuration root, on a provider, or on
+an existing model entry. For a narrow experiment, set
+`"task_reasoning_effort": "none"` on only the selected model rather than changing
+the global default. Currently, explicit control is supported only on detected
+Ollama **Direct / Chat Completions** endpoints. Selecting another adapter with
+an effective override fails explicitly instead of silently ignoring it.
+
+These controls affect **new task generation**, not whether reasoning is shown.
+The existing `show_reasoning` display preference, historical reasoning replay,
+and summary requests' explicit low-effort hint are unchanged. No setting
+guarantees a reasoning-token limit or model compliance. Web changes apply to new
+sessions, not already-bound adapters; restart the TUI to load externally edited
+configuration. See the [configuration contract](docs/contracts/05-configuration.md#provider-task-reasoning-effort)
+for inheritance, API updates, and support limitations.
+
 ## Safety and Trust
 
 The runtime enforces permissions, resource scopes, deadlines, and output limits. Tool access categories come from host registration, not model-visible descriptions. Model output is data, not a permission grant.
@@ -516,7 +548,7 @@ stopped or that its effects were rolled back.
 
 Planned external plugins are explicitly enabled **trusted code**. They are not implemented, and no untrusted-plugin containment is claimed. Local-backend `host_exec` requires an OS sandbox and fails closed when unavailable; it is not a general sandbox for the TUI, all file tools, or future plugins. Container-backed execution uses the separate prototype boundary described above. Linux hardening beyond the recorded reference profile remains unverified, and process-group cleanup cannot prove that all escaped descendants terminated.
 
-The server binds to loopback only. Configured providers or real tools require `--auth-token-env NAME` with a 64-hex-character bearer token. That server-wide token also authorizes approval/control routes and web-side provider/model/project configuration; session IDs are not credentials. Local real tools remain an explicit startup flag (`--tools real`). Admitted projects bind a session to an existing allowed root and are stored next to the user configuration; web path admission refuses broad roots and known credential directories. The embedded web client at `/` uses the same token in page memory and keeps its transcript in the browser for the live session only; it does not add a history API. Loopback HTTP is not encrypted and does not isolate mutually untrusted same-user processes.
+The server binds to loopback only. Configured providers or real tools require `--auth-token-env NAME` with a 64-hex-character bearer token. That server-wide token also authorizes approval/control routes and web-side provider/model/project/thinking configuration; session IDs are not credentials. Local real tools remain an explicit startup flag (`--tools real`). Admitted projects bind a session to an existing allowed root and are stored next to the user configuration; web path admission refuses broad roots and known credential directories. The embedded web client at `/` uses the same token and can remember it in browser storage; forgetting it removes the saved browser copy. Treat that browser profile as credential-bearing. With `--session-store`, saved-session APIs support listing, history, explicit restoration, and deletion; active runs are not reattached after reload. Loopback HTTP is not encrypted and does not isolate mutually untrusted same-user processes.
 
 The default permission policy and session behavior are accepted; automatic access remains scoped to the project/temp boundary, external paths require exact-call confirmation (once, or a session-only directory grant that never persists), strict mode confirms every mutation and execution, and restored history never replays operations or old grants.
 
@@ -528,7 +560,8 @@ Selected SWE-bench diagnostics are summarized below. Difficulty uses Verified
 dataset labels where available: simple `<15 min fix`, medium `15 min - 1 hour`,
 complex `1-4 hours`. These describe estimated human effort, not agent runtime.
 DeepSeek V4.1 Flash ran through either DeepSeek API or OpenCode Go; local Qwen
-used Qwen3.8-27B IQ3_M with a 92K context window. These are not controlled model
+used Qwen3.8-27B IQ3_M with a 92K context window in the earlier campaigns;
+smaller-window pressure tests are reported separately below. These are not controlled model
 comparisons, leaderboard scores or representative success rates; blind status
 was not established. Agent completion is not official resolution.
 
@@ -585,6 +618,40 @@ not evidence that a specific change caused an improvement.
 See the [benchmark history and evaluation](docs/research/agent-benchmarks.md#recent-benchmark-observations)
 for individual results, methods, limitations and operational findings.
 
+### Small-context pressure test
+
+On **2026-11-11** (local time), the same exposed `sympy__sympy-20590` task was
+retried with local Ollama Qwen3.8-27B IQ3_M under smaller Nexus context budgets.
+These are individual regression attempts, not independent tasks or a controlled
+model comparison. All used a 60% compaction trigger and 10% target.
+
+| Nexus window / task output cap | Additional setting | Outcome | Agent time |
+| --- | --- | --- | ---: |
+| 32,768 / 4,096 | Model-default thinking | Completed; officially resolved | 820 s |
+| 16,384 / 2,048 | Model-default thinking | Model output limit; no patch | 283 s |
+| 16,384 / 4,096 | Model-default thinking | Summary candidate could not fit; no patch | 354 s |
+| 20,480 / 4,096 | Model-default thinking | Protected context could not fit; no patch | 358 s |
+| 16,384 / 4,096 | 4 KiB read-page guidance | Protected context could not fit; no patch | 329 s |
+| **16,384 / 4,096** | **4 KiB read-page guidance + task thinking off** | **Completed; officially resolved** | **206 s** |
+
+The final run made **20 tool calls and 22 model requests** (20 task, 2 summary),
+committed **two summary reductions**, and produced a 485-byte patch. Maximum
+reported provider input was **7,685 tokens**; maximum estimated request input
+plus output cap was **14,348 / 16,384**. Task-request contexts retained no
+reasoning bytes; this does not measure thinking generated by summary responses.
+The earlier read-page-only attempt still had 18,693 reasoning bytes in its final
+protected context. Paging guidance alone did not resolve that trajectory's
+pressure.
+
+This validates one successful 16K **Nexus budget** attempt, not a verified 16K
+Ollama backend allocation or an exact-token hard-bound guarantee. Sampling,
+trajectory, and environment differences prevent attributing the outcome solely
+to disabled thinking or claiming a general success-rate improvement. The
+read-page option is prompt guidance, not an enforced per-call limit. Detailed
+run identities and local artifact references are in the
+[small-context optimization record](docs/tasks/10-small-context-optimization.md#2-evidence-and-limits-of-the-existing-experiments);
+the artifacts are not bundled as portable published evidence.
+
 ## Project Status
 
 **Current position: the scoped M0–M4 gates are complete for their recorded
@@ -637,6 +704,7 @@ M1–M5 migration gates above.
 
 - [x] Live configured providers in the TUI/server, scoped file read/list/search/write/patch tools, and local sandboxed command execution.
 - [x] Bounded host instructions, context estimation/calibration, transactional compaction, and history projection protecting tool-call pairing and uncertain-effect evidence.
+- [x] Default-inherit task-thinking configuration with global/provider/model precedence, Web Settings controls, and opt-in Ollama support; display preferences and historical reasoning replay remain separate.
 - [x] Normal interactive TUI local persistence and explicit saved-history restoration; opt-in server persistence with Web saved-session listing, history, restore, and deletion.
 - [x] Opt-in container gateway/worker/workload composition, workspace tools, explicit shell commands, and lifecycle/quarantine handling.
 - [x] SWE-bench preparation, isolated model attempts, worker preflight, heartbeat diagnostics, and separate official scoring, with resolved task evidence above.

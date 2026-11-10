@@ -139,6 +139,7 @@ fn status_error_with_head(status: u16, head: &str) -> ProviderEvent {
 pub struct OpenAiProvider {
     operational_settings: ProviderSettings,
     context_management: nexus_core::ContextManagementSettings,
+    task_reasoning_effort: Option<nexus_core::ReasoningEffort>,
     host: String,
     port: u16,
     base_path: String,
@@ -278,6 +279,7 @@ impl OpenAiProvider {
         Ok(Self {
             operational_settings: ProviderSettings::default(),
             context_management: nexus_core::ContextManagementSettings::default(),
+            task_reasoning_effort: None,
             host,
             port,
             base_path: base_path.trim_end_matches('/').to_owned(),
@@ -299,12 +301,23 @@ impl OpenAiProvider {
         let endpoint = profile.endpoint.as_deref().ok_or_else(|| {
             provider_error_inner(ErrorCategory::InvalidInput, "provider endpoint is missing")
         })?;
-        Self::new_for_protocol(
+        let mut adapter = Self::new_for_protocol(
             endpoint,
             profile.credential.clone(),
             model,
             profile.protocol,
-        )
+        )?;
+        if profile.task_reasoning_effort.is_some()
+            && (profile.adapter != nexus_config::AdapterKind::Direct
+                || !adapter.is_ollama_endpoint())
+        {
+            return Err(provider_error_inner(
+                ErrorCategory::UnsupportedCapability,
+                "task reasoning effort requires an Ollama Chat Completions endpoint",
+            ));
+        }
+        adapter.task_reasoning_effort = profile.task_reasoning_effort;
+        Ok(adapter)
     }
 
     /// Binds timeout and retry settings without performing any network I/O.
@@ -527,7 +540,7 @@ impl OpenAiProvider {
             "max_tokens": output_token_limit(request),
         });
         if self.is_ollama_endpoint()
-            && let Some(effort) = request.reasoning_effort()
+            && let Some(effort) = request.reasoning_effort().or(self.task_reasoning_effort)
         {
             body["reasoning_effort"] = Value::String(effort.as_str().to_owned());
         }
@@ -3701,7 +3714,7 @@ mod opencode_go_tests {
 #[cfg(test)]
 mod reasoning_effort_tests {
     use super::OpenAiProvider;
-    use nexus_config::CredentialRef;
+    use nexus_config::{AdapterKind, CredentialRef, ProtocolKind, ProviderProfile};
     use nexus_core::{ModelContextItem, ModelRequest, ReasoningEffort, RunId, TurnId};
 
     fn request(with_effort: bool) -> ModelRequest {
@@ -3747,6 +3760,98 @@ mod reasoning_effort_tests {
         assert!(body.get("reasoning_effort").is_none());
         let body = ollama.request_body(&request(false)).unwrap();
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    fn profile(endpoint: &str, protocol: ProtocolKind) -> ProviderProfile {
+        ProviderProfile::new_with_protocol(
+            "local",
+            "Local",
+            AdapterKind::Direct,
+            protocol,
+            Some(endpoint.to_owned()),
+            CredentialRef::env_var("NEXUS_TEST_UNUSED_TOKEN").unwrap(),
+            "model",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn configured_task_effort_is_opt_in_and_explicit_request_hint_wins() {
+        let mut profile = profile("http://127.0.0.1:11434/v1", ProtocolKind::ChatCompletions);
+        let baseline = OpenAiProvider::from_profile(&profile, "model").unwrap();
+        let task = request(false)
+            .with_conversation(vec![
+                ModelContextItem::user_text("task").unwrap(),
+                ModelContextItem::assistant_text_with_reasoning(
+                    "answer",
+                    "accepted answer",
+                    Some("accepted reasoning must remain".into()),
+                )
+                .unwrap(),
+                ModelContextItem::user_text("continue").unwrap(),
+            ])
+            .unwrap()
+            .with_max_output_tokens(4096)
+            .unwrap();
+        let baseline_body = baseline.request_body(&task).unwrap();
+        assert!(baseline_body.get("reasoning_effort").is_none());
+        for (setting, expected) in [
+            (ReasoningEffort::Disabled, "none"),
+            (ReasoningEffort::Low, "low"),
+        ] {
+            profile.task_reasoning_effort = Some(setting);
+            let provider = OpenAiProvider::from_profile(&profile, "model").unwrap();
+            let body = provider.request_body(&task).unwrap();
+            assert_eq!(body["reasoning_effort"], expected);
+            assert_eq!(
+                body["messages"], baseline_body["messages"],
+                "generation controls must not delete historical reasoning"
+            );
+            assert_eq!(body["max_tokens"], 4096);
+            let summary = provider.request_body(&request(true)).unwrap();
+            assert_eq!(
+                summary["reasoning_effort"], "low",
+                "explicit summary hint is independent of task default"
+            );
+            let explicit = provider
+                .request_body(
+                    &task
+                        .clone()
+                        .with_reasoning_effort(ReasoningEffort::Disabled),
+                )
+                .unwrap();
+            assert_eq!(explicit["reasoning_effort"], "none");
+        }
+        assert_eq!(
+            task.reasoning_effort(),
+            None,
+            "encoding cannot mutate the request"
+        );
+    }
+
+    #[test]
+    fn task_effort_is_rejected_on_unsupported_endpoints_before_network_io() {
+        for (endpoint, protocol) in [
+            ("https://api.example.com/v1", ProtocolKind::ChatCompletions),
+            ("http://localhost:43210/v1", ProtocolKind::ChatCompletions),
+            ("http://localhost:11434/v1", ProtocolKind::OpenAiResponses),
+            ("http://localhost:11434/v1", ProtocolKind::AnthropicMessages),
+        ] {
+            let mut profile = profile(endpoint, protocol);
+            assert!(OpenAiProvider::from_profile(&profile, "model").is_ok());
+            profile.task_reasoning_effort = Some(ReasoningEffort::Disabled);
+            let error = OpenAiProvider::from_profile(&profile, "model")
+                .err()
+                .expect("unsupported endpoint");
+            assert_eq!(
+                error.category(),
+                nexus_core::ErrorCategory::UnsupportedCapability
+            );
+            assert_eq!(
+                error.message(),
+                "task reasoning effort requires an Ollama Chat Completions endpoint"
+            );
+        }
     }
 }
 

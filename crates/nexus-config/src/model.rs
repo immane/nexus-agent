@@ -8,7 +8,7 @@
 
 use nexus_core::{
     ContextCompactionStrategy, ContextManagementPolicy, ContextManagementSettings, ContextWindow,
-    ContextWindowSource,
+    ContextWindowSource, ReasoningEffort,
 };
 use serde_json::{Map, Value};
 
@@ -240,6 +240,9 @@ pub struct ProviderProfile {
     pub default_model: String,
     /// Configured context limit of the default model, not all provider models.
     pub context_window_tokens: Option<u32>,
+    /// Optional task-request fallback; currently supported only by Ollama Chat Completions.
+    /// Explicit request hints take precedence; this does not control reasoning visibility.
+    pub task_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ProviderProfile {
@@ -282,6 +285,7 @@ impl ProviderProfile {
             credential,
             default_model: default_model.into(),
             context_window_tokens: None,
+            task_reasoning_effort: None,
         };
         profile.validate()?;
         Ok(profile)
@@ -307,6 +311,7 @@ impl ProviderProfile {
             return Err(invalid("model name is invalid"));
         }
         configured_window(self.context_window_tokens)?;
+        validate_task_reasoning_effort(self, self.task_reasoning_effort)?;
         Ok(())
     }
 }
@@ -326,6 +331,8 @@ pub struct ModelEntry {
     pub max_output_tokens: Option<u32>,
     /// Optional policy override; omitted fields in JSON use core defaults.
     pub context_management: Option<ContextManagementPolicy>,
+    /// Optional task-request override; `None` inherits provider/global settings.
+    pub task_reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl ModelEntry {
@@ -343,6 +350,7 @@ impl ModelEntry {
             context_window_tokens: None,
             context_management: None,
             max_output_tokens: None,
+            task_reasoning_effort: None,
         };
         entry.validate()?;
         Ok(entry)
@@ -442,6 +450,7 @@ pub struct UserConfig {
     modes: Vec<AgentMode>,
     default_mode: Option<String>,
     context_management: ContextManagementPolicy,
+    task_reasoning_effort: Option<ReasoningEffort>,
     show_reasoning: bool,
     gateway_image: Option<String>,
     workload_image: Option<String>,
@@ -460,6 +469,7 @@ impl UserConfig {
             modes: Vec::new(),
             default_mode: None,
             context_management: ContextManagementPolicy::default(),
+            task_reasoning_effort: None,
             show_reasoning: false,
             gateway_image: None,
             workload_image: None,
@@ -488,6 +498,43 @@ impl UserConfig {
     /// Replaces the global policy with a validated core policy.
     pub fn set_context_management(&mut self, policy: ContextManagementPolicy) {
         self.context_management = policy;
+    }
+
+    /// Returns the global task-request fallback; `None` inherits adapter defaults.
+    #[must_use]
+    pub fn task_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.task_reasoning_effort
+    }
+
+    /// Sets the global task-request fallback, independently of reasoning visibility.
+    pub fn set_task_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.task_reasoning_effort = effort;
+    }
+
+    /// Resolves task-request effort: model override, provider override, then global.
+    /// Protocol support for an inherited global setting is checked at selection time.
+    pub fn task_reasoning_effort_for(
+        &self,
+        provider_id: &str,
+        model_id: Option<&str>,
+    ) -> Result<Option<ReasoningEffort>, ConfigError> {
+        check_id("provider id", provider_id)?;
+        let profile = self
+            .provider(provider_id)
+            .ok_or(invalid("provider is unknown"))?;
+        let model_effort = if let Some(id) = model_id {
+            check_id("model id", id)?;
+            let entry = self.model(id).ok_or(invalid("model is unknown"))?;
+            if entry.provider != provider_id {
+                return Err(invalid("model does not belong to provider"));
+            }
+            entry.task_reasoning_effort
+        } else {
+            None
+        };
+        Ok(model_effort
+            .or(profile.task_reasoning_effort)
+            .or(self.task_reasoning_effort))
     }
 
     /// Whether the local TUI reveals provider-returned reasoning by default.
@@ -684,6 +731,7 @@ impl UserConfig {
                 .iter()
                 .filter(|entry| entry.provider == profile.id)
             {
+                validate_task_reasoning_effort(&profile, entry.task_reasoning_effort)?;
                 let tokens = entry.context_window_tokens.or_else(|| {
                     (entry.name == profile.default_model)
                         .then_some(profile.context_window_tokens)
@@ -725,6 +773,7 @@ impl UserConfig {
         let profile = self
             .provider(&entry.provider)
             .ok_or(invalid("model provider is unknown"))?;
+        validate_task_reasoning_effort(profile, entry.task_reasoning_effort)?;
         let tokens = entry.context_window_tokens.or_else(|| {
             (entry.name == profile.default_model)
                 .then_some(profile.context_window_tokens)
@@ -753,6 +802,7 @@ impl UserConfig {
         let profile = self
             .provider(&entry.provider)
             .ok_or(invalid("model provider is unknown"))?;
+        validate_task_reasoning_effort(profile, entry.task_reasoning_effort)?;
         let tokens = entry.context_window_tokens.or_else(|| {
             (entry.name == profile.default_model)
                 .then_some(profile.context_window_tokens)
@@ -884,6 +934,12 @@ impl UserConfig {
                 policy_json(self.context_management),
             );
         }
+        if let Some(effort) = self.task_reasoning_effort {
+            document.insert(
+                "task_reasoning_effort".to_owned(),
+                Value::String(effort.as_str().to_owned()),
+            );
+        }
         if self.show_reasoning {
             document.insert("show_reasoning".to_owned(), Value::Bool(true));
         }
@@ -918,6 +974,7 @@ impl UserConfig {
                 "modes",
                 "default_mode",
                 "context_management",
+                "task_reasoning_effort",
                 "show_reasoning",
                 "container_images",
             ],
@@ -930,6 +987,7 @@ impl UserConfig {
             return Err(ConfigError::unsupported());
         }
         let mut config = Self::default_config();
+        config.set_task_reasoning_effort(parse_task_reasoning_effort(document)?);
         if let Some(policy) = document.get("context_management") {
             config.set_context_management(parse_policy(policy)?);
         }
@@ -1027,6 +1085,12 @@ fn provider_json(profile: &ProviderProfile) -> Value {
     if let Some(tokens) = profile.context_window_tokens {
         object.insert("context_window_tokens".to_owned(), Value::from(tokens));
     }
+    if let Some(effort) = profile.task_reasoning_effort {
+        object.insert(
+            "task_reasoning_effort".to_owned(),
+            Value::String(effort.as_str().to_owned()),
+        );
+    }
     Value::Object(object)
 }
 
@@ -1044,6 +1108,12 @@ fn model_json(entry: &ModelEntry) -> Value {
     }
     if let Some(tokens) = entry.max_output_tokens {
         object.insert("max_output_tokens".to_owned(), Value::from(tokens));
+    }
+    if let Some(effort) = entry.task_reasoning_effort {
+        object.insert(
+            "task_reasoning_effort".to_owned(),
+            Value::String(effort.as_str().to_owned()),
+        );
     }
     Value::Object(object)
 }
@@ -1140,6 +1210,7 @@ fn parse_provider(
             "credential",
             "default_model",
             "context_window_tokens",
+            "task_reasoning_effort",
         ],
     )?;
     let credential = object
@@ -1179,6 +1250,7 @@ fn parse_provider(
         require_str(object, "default_model")?.to_owned(),
     )?;
     profile.context_window_tokens = parse_window_tokens(object)?;
+    profile.task_reasoning_effort = parse_task_reasoning_effort(object)?;
     profile.validate()?;
     Ok(profile)
 }
@@ -1194,6 +1266,7 @@ fn parse_model(object: &Map<String, Value>) -> Result<ModelEntry, ConfigError> {
             "context_window_tokens",
             "context_management",
             "max_output_tokens",
+            "task_reasoning_effort",
         ],
     )?;
     let mut entry = ModelEntry::new(
@@ -1202,6 +1275,7 @@ fn parse_model(object: &Map<String, Value>) -> Result<ModelEntry, ConfigError> {
         require_str(object, "name")?.to_owned(),
     )?;
     entry.context_window_tokens = parse_window_tokens(object)?;
+    entry.task_reasoning_effort = parse_task_reasoning_effort(object)?;
     entry.max_output_tokens = object
         .get("max_output_tokens")
         .map(|value| {
@@ -1218,6 +1292,35 @@ fn parse_model(object: &Map<String, Value>) -> Result<ModelEntry, ConfigError> {
         .transpose()?;
     entry.validate()?;
     Ok(entry)
+}
+
+/// Explicit provider/model overrides require a supported routing/protocol pair.
+fn validate_task_reasoning_effort(
+    profile: &ProviderProfile,
+    effort: Option<ReasoningEffort>,
+) -> Result<(), ConfigError> {
+    if effort.is_some()
+        && (profile.adapter != AdapterKind::Direct
+            || profile.protocol != ProtocolKind::ChatCompletions)
+    {
+        return Err(invalid(
+            "task reasoning effort requires direct chat completions",
+        ));
+    }
+    Ok(())
+}
+
+/// Omission and explicit inheritance share the canonical omitted representation.
+fn parse_task_reasoning_effort(
+    object: &Map<String, Value>,
+) -> Result<Option<ReasoningEffort>, ConfigError> {
+    match object.get("task_reasoning_effort") {
+        None => Ok(None),
+        Some(Value::String(effort)) if effort == "inherit" => Ok(None),
+        Some(Value::String(effort)) if effort == "none" => Ok(Some(ReasoningEffort::Disabled)),
+        Some(Value::String(effort)) if effort == "low" => Ok(Some(ReasoningEffort::Low)),
+        Some(_) => Err(invalid("task reasoning effort is invalid")),
+    }
 }
 
 /// Validates resolved settings, including any inherited default-model window.
