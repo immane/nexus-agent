@@ -45,10 +45,10 @@ use nexus_core::{
     ListSessionsCommand, ModelContextItem, ModelInstructions, ModelRequest, OutcomeSummary,
     PersistenceState, ProviderContext, ProviderEvent, ProviderPort, RequestId,
     RestoreSessionCommand, RetryGuidance, RunEvent, RunFinished, RunId, RunLifecycle, RunOutcome,
-    STORE_FORMAT_REVISION, SessionCheckpoint, SessionId, SessionStore, Snapshot, SubmitCommand,
-    ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId, ToolIntentRecord, ToolOutcome,
-    ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec, ToolStartedInfo, TurnId, Usage,
-    UsageFinality,
+    STORE_FORMAT_REVISION, SessionCheckpoint, SessionId, SessionMetadata, SessionStore, Snapshot,
+    SourceRecord, SubmitCommand, ToolAccess, ToolCall, ToolContext, ToolFinishedInfo, ToolId,
+    ToolIntentRecord, ToolOutcome, ToolOutcomeRecord, ToolPort, ToolRegistration, ToolSpec,
+    ToolStartedInfo, TurnId, Usage, UsageFinality,
 };
 use nexus_session::recover_session;
 use nexus_validation::CompiledSchema;
@@ -153,6 +153,43 @@ impl SessionStoreHandle {
     #[must_use]
     pub fn new(store: Box<dyn SessionStore + Send>) -> Self {
         Self(Arc::new(StdMutex::new(store)))
+    }
+
+    /// Lists bounded saved-session metadata for a presentation layer.
+    pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMetadata>, AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .list_sessions(limit)
+    }
+
+    /// Loads one saved checkpoint without restoring it into a runtime.
+    pub fn load_session(&self, session: &SessionId) -> Result<SessionCheckpoint, AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .load_session(session)
+    }
+
+    /// Reads bounded original source records for historical display.
+    pub fn load_source_records(
+        &self,
+        session: &SessionId,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SourceRecord>, AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .load_source_records(session, after_sequence, limit)
+    }
+
+    /// Returns the newest stored source sequence for one session.
+    pub fn last_source_sequence(&self, session: &SessionId) -> Result<u64, AgentError> {
+        self.0
+            .lock()
+            .map_err(|_| runtime_error(ErrorCategory::Internal, "session store is unavailable"))?
+            .last_source_sequence(session)
     }
 
     /// Deletes one explicitly selected persisted conversation.

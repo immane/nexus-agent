@@ -30,7 +30,10 @@ The embedded Web client's regressions run separately with Node.js:
 `node --test crates/nexus-server/tests/web_*.mjs`. They exercise settings
 navigation, tool argument presentation, literal code content, bounded
 replacement diffs, streaming/final output, disclosure states, and the install
-prompt flow with a small DOM double; they do not replace browser layout checks.
+prompt flow, saved-session rendering, and busy-state wiring with a small DOM
+double; they do not replace browser layout checks. Server saved-session
+listing, history, restore, and continuation are covered by the server test
+suite with a reopened file store.
 The default Unix TUI suite also requires Python 3 for its pseudo-terminal
 credential-startup regression; it uses an isolated FIFO and loopback listener.
 The default `input_pressure` regression also uses Python 3, a real PTY and a

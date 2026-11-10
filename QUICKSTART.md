@@ -705,11 +705,13 @@ works in memory only. Palette preferences are also persisted.
 The static shell is public, but API authentication and Host/Origin checks remain
 enforced. Assistant text renders a bounded Markdown subset (headings, emphasis,
 lists, quotes, fenced code, tables, and safe links); raw HTML, images, and syntax
-highlighting are not rendered. There is no session list, transcript restore, or
-file browser in this slice; reloading loses the view and the server session is
-not a saved conversation. An active run is not cancelled by closing the page.
-Assets are embedded uncompressed; release compression and long-lived asset
-caching are not implemented.
+highlighting are not rendered. Start the server with `--session-store DIRECTORY`
+to enable the saved-session sidebar, transcript restore, and continuation across
+reloads or server restarts. The browser remembers the current session id and
+its provider/model/project binding; a different browser must select valid
+bindings. An active run is not resumed or cancelled by closing the page. There is
+no file browser. Assets are embedded uncompressed; release compression and
+long-lived asset caching are not implemented.
 
 In the server terminal, keep the generated token available through your
 secret manager or another secret-safe channel. In the client terminal, read

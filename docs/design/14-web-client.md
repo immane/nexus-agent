@@ -23,9 +23,10 @@ The client supports:
 - reconciling an uncertain stream failure with `GET /snapshot`;
 - five color palettes with the selected palette kept in `localStorage`.
 
-The client does not implement session listing, transcript restore, multi-session
-switching, file browsing, diffs, syntax highlighting, background polling,
-service workers, or a release asset-compression pipeline.
+The client supports saved-session listing and restore when the server enables
+persistence. It does not implement concurrent multi-session editing, file
+browsing, syntax highlighting, background polling, offline API access, or a
+release asset-compression pipeline. Its Service Worker is network-only.
 
 ## Boundaries
 
@@ -88,14 +89,24 @@ New server session IDs use a 128-bit OS-random suffix (`sess-web-<hex>`), not a
 counter reset at startup, so new sessions do not reuse earlier server identities
 when opening the same persistent store. ID generation fails explicitly if the
 system random source is unavailable. IDs remain opaque and are not credentials;
-legacy counter-based IDs remain valid inputs. This does not add a Web history or
-restore API.
+legacy counter-based IDs remain valid inputs.
 
 `POST /sessions` is called lazily on the first send. The provider/model choice
-is fixed at session creation, matching the server contract. The page keeps the
-session token in memory only; reloading loses the transcript and the session
-view. Server idle cleanup can later remove the ephemeral runtime. Reloading or
-closing the page does not cancel an active run.
+is fixed at session creation, matching the server contract. The page remembers
+the current session id in browser storage and asks `POST /sessions/{id}/restore`
+to reopen it after a reload. Server idle cleanup can later remove the ephemeral
+runtime. Reloading or closing the page does not cancel an active run, and an
+active run is not reattached merely by restoring its saved history.
+
+When the server starts with `--session-store DIRECTORY`, the sidebar lists saved
+sessions from `GET /sessions`, reads bounded pages from
+`GET /sessions/{id}/history`, restores context without replaying tools, and can
+delete a non-live session with `DELETE /sessions/{id}`. Titles come from the
+first saved user item. History rendering is bounded; filesystem effects and old
+approval grants are never replayed. The provider/model/project binding is kept
+in browser storage because the session checkpoint format does not carry Web
+bindings; a different browser must select valid bindings before restoring.
+Without `--session-store`, the list reports persistence as disabled.
 
 The bearer token is entered in Settings and saved in same-origin `localStorage`
 after a successful connection. The page reuses it on launch, sending it only in
@@ -143,7 +154,8 @@ turn the scripted demo into real tools. `GET /projects` reports the mode:
 
 Project selection is part of the left sidebar, with the active project
 highlighted. Selecting a different project while a session exists starts a new
-session after confirmation; the previous transcript is not saved. The Settings
+session after confirmation; the previous session remains available in saved
+history when persistence is enabled. The Settings
 dialog manages project admission/removal, and a sidebar `+` shortcut opens that
 section. On narrow screens the sidebar collapses and the composer exposes an
 equivalent project selector.
@@ -242,8 +254,11 @@ new session never claims to cancel work that may still be executing.
 
 ## Known limits
 
-- No source-history API is consumed, so a reload cannot reconstruct a
-  transcript. Snapshot recovery exposes final state, not lost content.
+- Saved history is available only when the server starts with
+  `--session-store`; an active run is not reattached after reload. Snapshot
+  recovery exposes final state, not lost event content.
+- Web bindings are stored in the browser, not the server checkpoint. A different
+  browser must select valid provider/model/project bindings before restoring.
 - One SSE subscriber per session means multi-tab use can conflict.
 - Retained event queues are bounded; saturated or evicted content is reported
   as incomplete, never reconstructed.

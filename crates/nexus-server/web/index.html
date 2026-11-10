@@ -29,11 +29,15 @@
     <button class="new-session" id="new-session" type="button" disabled>＋ New session</button>
     <div class="section-label">SESSIONS <span id="session-count">0</span></div>
     <div class="session-list" id="session-list">
-      <p class="sidebar-empty" id="no-session-note">No active session.<br>Saved history is not available yet.</p>
+      <p class="sidebar-empty" id="no-session-note">No active session.<br>Choose a saved session or start a new one.</p>
       <div class="session-item" id="session-item" hidden>
         <span class="session-item-title" id="session-item-title">New conversation</span>
         <span class="session-item-meta" id="session-item-meta">Ready</span>
       </div>
+    </div>
+    <div class="section-label">SAVED <span id="saved-count">0</span></div>
+    <div class="saved-list" id="saved-sessions" aria-label="Saved sessions">
+      <p class="sidebar-empty" id="saved-note">Connect to load saved sessions.</p>
     </div>
     <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span> Local only <span class="badge">ALPHA</span></div>
   </aside>
@@ -53,7 +57,7 @@
         <span class="eyebrow">A SMALL CORE. AN OPEN WORKSPACE.</span>
         <h1 id="welcome-title">Space to build.</h1>
         <p>A lightweight interface for your agent.<br>Everything runs through your local server.</p>
-        <span class="foundation">Live session client · history not restored</span>
+        <span class="foundation">Live session client · saved history when enabled</span>
         <div class="cards" aria-label="Workspace capabilities">
           <article><span class="card-number">01 / CONVERSATION</span><h2>Follow the thread</h2><p>Stream responses and keep the current session in view.</p><span class="muted">Live</span></article>
           <article><span class="card-number">02 / TOOLS</span><h2>See the work</h2><p>Inspect tool activity, bounded output, and reported outcomes.</p><span class="muted">Live</span></article>
@@ -88,7 +92,7 @@
           </div>
         </div>
       </form>
-      <p class="footnote">Plain text view. No external assets. Transcripts are not restored after reload.</p>
+      <p class="footnote">Saved sessions restore their transcript; active runs are not resumed after reload.</p>
     </section>
     <footer class="footer"><span>NEXUS AGENT</span><span>Built for focus, not overhead.</span></footer>
   </div>
@@ -213,7 +217,7 @@
         <button class="primary" id="install-app" type="button" hidden>Install Nexus</button>
       </div>
       <strong>Current limits</strong>
-      <p>Reloading or closing this page loses the transcript; the server session is not a saved conversation. History, file browsing, and session restore are not implemented.</p>
+      <p>Saved sessions restore their transcript when the server runs with <code>--session-store</code>. Active runs are not resumed after reload, and file browsing is not implemented.</p>
     </section>
     </div>
     </div>

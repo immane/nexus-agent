@@ -403,6 +403,68 @@ a {
   border-color: var(--accent);
 }
 
+.saved-list {
+  display: grid;
+  gap: 5px;
+  min-height: 0;
+}
+
+.saved-item {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+}
+
+.saved-item:hover,
+.saved-item[data-state="current"] {
+  border-color: var(--line);
+  background: var(--raised);
+}
+
+.saved-open {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+  padding: 7px 8px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.saved-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.saved-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.saved-delete {
+  flex: none;
+  width: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.saved-delete:hover:not(:disabled) {
+  color: var(--danger);
+}
+
 .sidebar-bottom {
   display: flex;
   align-items: center;

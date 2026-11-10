@@ -80,6 +80,8 @@ const dom = {
   sessionItemTitle: document.querySelector('#session-item-title'),
   sessionItemMeta: document.querySelector('#session-item-meta'),
   noSessionNote: document.querySelector('#no-session-note'),
+  savedSessions: document.querySelector('#saved-sessions'),
+  savedCount: document.querySelector('#saved-count'),
   newSession: document.querySelector('#new-session'),
   newSessionMobile: document.querySelector('#new-session-mobile'),
 };
@@ -94,6 +96,9 @@ const state = {
   projects: null,
   projectChoices: [],
   projectSelection: null,
+  savedSessions: [],
+  savedPersistence: false,
+  historyLoading: false,
   session: null,
   sessionProvider: null,
   sessionModel: null,
@@ -430,11 +435,14 @@ async function api(path, options = {}) {
 
 function markUnauthorized() {
   state.connected = false;
+  state.savedPersistence = false;
+  state.savedSessions = [];
   if (readSavedCredential() === state.credential) saveCredential('');
   state.credential = '';
   setConnectionStatus('Authentication required', 'error');
   dom.connectionDetail.textContent = 'Authentication failed. Enter the current server bearer token.';
   setRunStatus('Authentication required', 'error');
+  renderSavedSessions();
   updateControls();
 }
 
@@ -581,7 +589,7 @@ function selectProject(id) {
     return;
   }
   if (state.session) {
-    if (!window.confirm(`Switch to ${choice.label}? This starts a new session; the current transcript is not saved.`)) {
+    if (!window.confirm(`Switch to ${choice.label}? This starts a new session; the current session remains available in saved history.`)) {
       return;
     }
     state.projectSelection = choice;
@@ -882,6 +890,57 @@ function saveCredential(value) {
   }
 }
 
+/* Saved session references */
+
+const SESSION_INDEX_KEY = 'nexus.sessions';
+const CURRENT_SESSION_KEY = 'nexus.current-session';
+
+function readSessionIndex() {
+  try {
+    const value = JSON.parse(localStorage.getItem(SESSION_INDEX_KEY) || '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeSessionIndex(index) {
+  try {
+    localStorage.setItem(SESSION_INDEX_KEY, JSON.stringify(index));
+  } catch {
+    // The server remains authoritative when browser storage is unavailable.
+  }
+}
+
+function savedSessionMeta(id) {
+  const meta = readSessionIndex()[id];
+  return meta && typeof meta === 'object' ? meta : null;
+}
+
+function rememberSession(id, changes = {}) {
+  if (!id) return;
+  const index = readSessionIndex();
+  index[id] = { ...(index[id] || {}), ...changes };
+  writeSessionIndex(index);
+}
+
+function rememberCurrentSession(id) {
+  try {
+    if (id) localStorage.setItem(CURRENT_SESSION_KEY, id);
+    else localStorage.removeItem(CURRENT_SESSION_KEY);
+  } catch {
+    // Auto-open is optional; the saved session list remains usable.
+  }
+}
+
+function lastCurrentSession() {
+  try {
+    return localStorage.getItem(CURRENT_SESSION_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
 /* Connection */
 
 async function connect(candidate) {
@@ -933,7 +992,15 @@ async function connect(candidate) {
 
     updateSessionDisplay();
     updateControls();
+    await refreshSavedSessions();
     await resumeIfNeeded();
+    const last = lastCurrentSession();
+    if (!state.session && last && state.savedSessions.some((saved) => saved.session === last)) {
+      // Let connect() finish clearing `state.connecting` before restoring.
+      setTimeout(() => {
+        if (!state.session) void openSavedSession(last, { automatic: true });
+      }, 0);
+    }
     return true;
   } catch (error) {
     if (generation !== state.connectGeneration) return false;
@@ -981,12 +1048,15 @@ function disconnect() {
   state.connectGeneration += 1;
   state.connected = false;
   state.credential = '';
+  state.savedPersistence = false;
+  state.savedSessions = [];
   const forgotten = saveCredential('');
   setConnectionStatus('Not connected', '');
   setRunStatus('Not connected', '');
   dom.connectionDetail.textContent = forgotten
     ? 'Disconnected. The saved server token has been removed from this browser.'
     : 'Disconnected. Browser storage could not be cleared; clear this site\'s data in your browser to forget the token.';
+  renderSavedSessions();
   updateControls();
 }
 
@@ -1020,6 +1090,224 @@ function updateComposerActivity() {
   dom.composerActivity.hidden = !running;
 }
 
+async function refreshSavedSessions() {
+  if (!state.connected) {
+    state.savedPersistence = false;
+    state.savedSessions = [];
+    renderSavedSessions();
+    return;
+  }
+  try {
+    const reply = await api('/sessions');
+    state.savedPersistence = reply?.enabled === true;
+    state.savedSessions = Array.isArray(reply?.sessions) ? reply.sessions : [];
+  } catch (error) {
+    state.savedPersistence = false;
+    state.savedSessions = [];
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+  }
+  renderSavedSessions();
+}
+
+function renderSavedSessions() {
+  dom.savedCount.textContent = String(state.savedSessions.length);
+  dom.savedSessions.replaceChildren();
+  if (!state.connected) {
+    dom.savedSessions.append(node('p', 'sidebar-empty', 'Connect to load saved sessions.'));
+    return;
+  }
+  if (!state.savedPersistence) {
+    dom.savedSessions.append(node(
+      'p',
+      'sidebar-empty',
+      'Persistence is disabled. Start the server with --session-store DIRECTORY.',
+    ));
+    return;
+  }
+  if (!state.savedSessions.length) {
+    dom.savedSessions.append(node('p', 'sidebar-empty', 'No saved sessions yet.'));
+    return;
+  }
+  for (const saved of state.savedSessions) {
+    const id = typeof saved.session === 'string' ? saved.session : '';
+    if (!id) continue;
+    const item = node('div', 'saved-item');
+    item.dataset.state = state.session === id ? 'current' : saved.active ? 'open' : 'idle';
+    const open = node('button', 'saved-open');
+    open.type = 'button';
+    open.disabled = state.active || state.submitting || state.connecting || state.historyLoading;
+    open.append(node('span', 'saved-title', saved.title || 'Saved session'));
+    open.append(node('span', 'saved-meta', `${saved.messages || 0} items · ${saved.active ? 'open' : 'saved'}`));
+    open.addEventListener('click', () => void openSavedSession(id));
+    item.append(open);
+    const remove = node('button', 'saved-delete', '×');
+    remove.type = 'button';
+    remove.title = 'Delete saved session';
+    remove.setAttribute('aria-label', 'Delete saved session');
+    remove.disabled = state.active || state.submitting || state.connecting || state.historyLoading;
+    remove.addEventListener('click', () => void deleteSavedSession(id));
+    item.append(remove);
+    dom.savedSessions.append(item);
+  }
+}
+
+async function deleteSavedSession(id) {
+  if (!state.connected || state.active || state.submitting || state.connecting || state.historyLoading) return;
+  if (!window.confirm('Delete this saved session? This cannot be undone.')) return;
+  try {
+    await api(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const index = readSessionIndex();
+    delete index[id];
+    writeSessionIndex(index);
+    if (state.session === id) startNewSession({ force: true });
+    await refreshSavedSessions();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+    else addNotice('error', `Could not delete the saved session: ${error.message}`, 'delete-session-failed');
+  }
+}
+
+async function loadSessionHistory(id) {
+  let after = 0;
+  let complete = false;
+  let pages = 0;
+  const items = [];
+  while (!complete && pages < 5) {
+    const reply = await api(
+      `/sessions/${encodeURIComponent(id)}/history?after=${after}&limit=100`,
+    );
+    const page = Array.isArray(reply?.items) ? reply.items : [];
+    items.push(...page);
+    const next = Number(reply?.next_after);
+    complete = reply?.complete === true || !Number.isInteger(next) || next <= after;
+    if (!complete) after = next;
+    pages += 1;
+  }
+  renderHistory(items);
+  if (!complete) {
+    addNotice('warning', 'Only the first 500 saved history items were loaded.', 'history-truncated');
+  }
+}
+
+function renderHistoricalAssistant(text) {
+  const article = node('article', 'message assistant');
+  const head = node('div', 'message-head');
+  head.append(node('span', '', 'NEXUS'));
+  const body = node('div', 'message-body');
+  const prose = node('div', 'prose');
+  renderMarkdown(prose, text);
+  body.append(prose);
+  article.append(head, body);
+  appendNode(article);
+}
+
+function renderHistory(items) {
+  flushText();
+  dom.conversation.replaceChildren();
+  dom.conversation.hidden = true;
+  dom.welcome.hidden = false;
+  state.pinned = true;
+  for (const item of items) {
+    if (!item || typeof item.kind !== 'string') continue;
+    if (item.kind === 'user' && typeof item.text === 'string') {
+      appendUserMessage(item.text);
+    } else if (item.kind === 'assistant' && typeof item.text === 'string') {
+      renderHistoricalAssistant(item.text);
+    } else if (item.kind === 'tool-call' && typeof item.call === 'string') {
+      startTool({
+        call: item.call,
+        tool: typeof item.tool === 'string' ? item.tool : 'tool',
+        args_preview: `${item.tool} ${typeof item.args === 'string' ? item.args : ''}`,
+      });
+    } else if (item.kind === 'tool-result' && typeof item.call === 'string') {
+      if (!state.tools.has(item.call)) {
+        startTool({ call: item.call, tool: typeof item.tool === 'string' ? item.tool : 'tool' });
+      }
+      finishTool({
+        call: item.call,
+        outcome: {
+          status: item.status,
+          content: item.content,
+          effect: item.effect,
+          evidence: item.evidence,
+          truncated: item.truncated === true,
+        },
+      });
+    } else if (item.kind === 'tool-denied' && typeof item.call === 'string') {
+      startTool({ call: item.call, tool: typeof item.tool === 'string' ? item.tool : 'tool' });
+      finishTool({
+        call: item.call,
+        outcome: { status: 'Denied', content: 'Denied by policy', effect: 'NotStarted', evidence: 'HostObserved' },
+      });
+    }
+  }
+  markUnfinishedTools();
+  if (dom.conversation.childElementCount) {
+    dom.conversation.hidden = false;
+    dom.welcome.hidden = true;
+  }
+  scrollToBottomSoon();
+  updateJumpLatest();
+}
+
+async function openSavedSession(id, { automatic = false } = {}) {
+  if (!state.connected || !id || state.active || state.submitting || state.connecting || state.historyLoading) return;
+  if (state.session === id) return;
+  if (!automatic && dom.conversation.childElementCount > 0
+    && !window.confirm('Open this saved session? The current transcript stays available in saved history.')) {
+    return;
+  }
+  const meta = savedSessionMeta(id) || {};
+  let choice = state.selection;
+  if (meta.provider && meta.model) {
+    choice = state.choices.find((entry) => !entry.demo
+      && entry.provider === meta.provider && entry.model === meta.model) || choice;
+  }
+  const project = (meta.project && state.projectChoices.find((entry) => entry.id === meta.project))
+    || state.projectSelection;
+  const body = {};
+  if (choice && !choice.demo) {
+    body.provider = choice.provider;
+    body.model = choice.model;
+  }
+  if (state.projects?.enabled && project) body.project = project.id;
+  state.historyLoading = true;
+  setRunStatus('Restoring session…', 'busy');
+  updateControls();
+  try {
+    const reply = await api(`/sessions/${encodeURIComponent(id)}/restore`, { method: 'POST', body });
+    stopStream();
+    resetRunState();
+    state.session = reply?.session || id;
+    state.sessionProvider = body.provider || null;
+    state.sessionModel = body.model || null;
+    state.selection = choice || state.selection;
+    if (project) state.projectSelection = project;
+    const listed = state.savedSessions.find((saved) => saved.session === state.session);
+    state.sessionTitle = typeof meta.title === 'string' ? meta.title : (listed?.title || 'Saved session');
+    rememberSession(state.session, {
+      title: state.sessionTitle,
+      provider: state.sessionProvider,
+      model: state.sessionModel,
+      project: project?.id || null,
+    });
+    rememberCurrentSession(state.session);
+    updateSessionDisplay();
+    await loadSessionHistory(state.session);
+    setRunStatus('Ready', 'ok');
+    await refreshSavedSessions();
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+    else {
+      setRunStatus('Restore failed', 'error');
+      addNotice('error', `Could not restore the saved session: ${error.message}`, 'restore-session-failed');
+    }
+  } finally {
+    state.historyLoading = false;
+    updateControls();
+  }
+}
+
 function updateControls() {
   updateComposerActivity();
   const connected = state.connected;
@@ -1051,6 +1339,10 @@ function updateControls() {
       : state.active
         ? 'A run is active. You can draft the next task…'
         : 'Describe a task…';
+  const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
+  for (const button of dom.savedSessions.querySelectorAll('button')) {
+    button.disabled = savedBusy;
+  }
   for (const record of state.approvals.values()) {
     const available = connected && !record.attempted && !state.runTerminal;
     record.approve.disabled = !available;
@@ -1114,7 +1406,7 @@ function startNewSession({ force = false } = {}) {
     return;
   }
   if (!force && dom.conversation.childElementCount > 0) {
-    if (!window.confirm('Start a new session? This page cannot restore the current transcript.')) return;
+    if (!window.confirm('Start a new session? The current session remains available in saved history.')) return;
   }
   flushText();
   stopStream();
@@ -1123,6 +1415,7 @@ function startNewSession({ force = false } = {}) {
   state.sessionProvider = null;
   state.sessionModel = null;
   state.sessionTitle = '';
+  rememberCurrentSession('');
   if (state.connected) {
     populateModels();
     populateProjects();
@@ -1136,6 +1429,7 @@ function startNewSession({ force = false } = {}) {
   updateJumpLatest();
   dom.message.value = '';
   updateSessionDisplay();
+  renderSavedSessions();
   updateControls();
   setRunStatus('Ready', 'ok');
   dom.message.focus();
@@ -1147,6 +1441,7 @@ function setSessionTitleFromInput(text) {
   state.sessionTitle = compact.length > MAX_TITLE_CHARS
     ? `${compact.slice(0, MAX_TITLE_CHARS).trimEnd()}…`
     : compact;
+  if (state.session) rememberSession(state.session, { title: state.sessionTitle });
 }
 
 async function ensureSession() {
@@ -1167,7 +1462,15 @@ async function ensureSession() {
   state.session = reply.session;
   state.sessionProvider = state.selection.demo ? null : state.selection.provider;
   state.sessionModel = state.selection.demo ? null : state.selection.model;
+  rememberSession(state.session, {
+    title: state.sessionTitle || 'New conversation',
+    provider: state.sessionProvider,
+    model: state.sessionModel,
+    project: state.projects?.enabled && state.projectSelection ? state.projectSelection.id : null,
+  });
+  rememberCurrentSession(state.session);
   updateSessionDisplay();
+  void refreshSavedSessions();
 }
 
 /* Sending */
@@ -2460,6 +2763,7 @@ function finishRun(detail, { fromSnapshot = false } = {}) {
   updateControls();
   scrollToBottomSoon();
   updateJumpLatest();
+  void refreshSavedSessions();
   void verifyTerminalSnapshot(session, run, lastSeq, fromSnapshot);
 }
 
