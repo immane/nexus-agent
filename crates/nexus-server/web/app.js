@@ -17,6 +17,44 @@ const dom = {
   disconnect: document.querySelector('#disconnect'),
   connectionStatus: document.querySelector('#connection-status'),
   connectionDetail: document.querySelector('#connection-detail'),
+  project: document.querySelector('#project'),
+  composerProject: document.querySelector('.composer-project'),
+  projectLabel: document.querySelector('#project-label'),
+  projectBadge: document.querySelector('#project-badge'),
+  sidebarProjects: document.querySelector('#sidebar-projects'),
+  addProjectSidebar: document.querySelector('#add-project-sidebar'),
+  projectsBlock: document.querySelector('#projects-block'),
+  projectsNote: document.querySelector('#projects-note'),
+  projectList: document.querySelector('#project-list'),
+  projectForm: document.querySelector('#project-form'),
+  projectName: document.querySelector('#project-name'),
+  projectPath: document.querySelector('#project-path'),
+  addProject: document.querySelector('#add-project'),
+  projectStatus: document.querySelector('#project-status'),
+  providerList: document.querySelector('#provider-list'),
+  providerForm: document.querySelector('#provider-form'),
+  providerId: document.querySelector('#provider-id'),
+  providerDisplay: document.querySelector('#provider-display'),
+  providerAdapter: document.querySelector('#provider-adapter'),
+  providerProtocol: document.querySelector('#provider-protocol'),
+  providerEndpoint: document.querySelector('#provider-endpoint'),
+  providerCredentialKind: document.querySelector('#provider-credential-kind'),
+  providerCredentialName: document.querySelector('#provider-credential-name'),
+  providerDefaultModel: document.querySelector('#provider-default-model'),
+  providerContextWindow: document.querySelector('#provider-context-window'),
+  saveProvider: document.querySelector('#save-provider'),
+  newProvider: document.querySelector('#new-provider'),
+  providerStatus: document.querySelector('#provider-status'),
+  modelList: document.querySelector('#model-list'),
+  modelForm: document.querySelector('#model-form'),
+  modelId: document.querySelector('#model-id'),
+  modelProvider: document.querySelector('#model-provider'),
+  modelName: document.querySelector('#model-name'),
+  modelContextWindow: document.querySelector('#model-context-window'),
+  modelMaxOutput: document.querySelector('#model-max-output'),
+  saveModel: document.querySelector('#save-model'),
+  newModel: document.querySelector('#new-model'),
+  modelStatus: document.querySelector('#model-status'),
   model: document.querySelector('#model'),
   modelLabel: document.querySelector('#model-label'),
   modelBadge: document.querySelector('#model-badge'),
@@ -46,6 +84,9 @@ const state = {
   config: null,
   choices: [],
   selection: null,
+  projects: null,
+  projectChoices: [],
+  projectSelection: null,
   session: null,
   sessionProvider: null,
   sessionModel: null,
@@ -347,6 +388,347 @@ function choiceKey(choice) {
   return choice?.demo ? 'demo' : `${choice?.provider}\u0000${choice?.model}`;
 }
 
+function buildProjectChoices(projects) {
+  if (!projects?.enabled) return [];
+  const choices = [];
+  if (projects.default && typeof projects.default.id === 'string') {
+    choices.push({
+      demo: false,
+      id: projects.default.id,
+      label: projects.default.name || 'Startup workspace',
+      path: typeof projects.default.path === 'string' ? projects.default.path : '',
+    });
+  }
+  if (Array.isArray(projects.projects)) {
+    for (const project of projects.projects) {
+      if (!project || typeof project.id !== 'string') continue;
+      choices.push({
+        demo: false,
+        id: project.id,
+        label: typeof project.name === 'string' ? project.name : project.id,
+        path: typeof project.path === 'string' ? project.path : '',
+      });
+    }
+  }
+  return choices;
+}
+
+function populateProjects() {
+  const previous = state.projectSelection?.id || '';
+  state.projectChoices = buildProjectChoices(state.projects);
+  state.projectSelection = state.projectChoices.find((choice) => choice.id === previous)
+    || state.projectChoices[0]
+    || null;
+  dom.project.replaceChildren();
+  state.projectChoices.forEach((choice, index) => {
+    const option = node('option', '', choice.path ? `${choice.label} — ${choice.path}` : choice.label);
+    option.value = String(index);
+    dom.project.append(option);
+  });
+  if (state.projectSelection) {
+    dom.project.value = String(state.projectChoices.indexOf(state.projectSelection));
+  }
+  updateProjectDisplay();
+}
+
+function updateProjectDisplay() {
+  const enabled = Boolean(state.projects?.enabled);
+  const label = state.projectSelection
+    ? state.projectSelection.label
+    : enabled ? 'No project' : 'Projects disabled';
+  dom.projectLabel.textContent = label;
+  dom.projectBadge.textContent = enabled && state.projectSelection ? label : '';
+  dom.projectBadge.hidden = !state.connected || !enabled || !state.projectSelection;
+}
+
+function renderSidebarProjects() {
+  dom.sidebarProjects.replaceChildren();
+  if (!state.connected) {
+    dom.sidebarProjects.append(node('p', 'sidebar-empty', 'Connect to load projects.'));
+    return;
+  }
+  if (!state.projects?.enabled) {
+    dom.sidebarProjects.append(node('p', 'sidebar-empty', 'Real tools are disabled on this server.'));
+    return;
+  }
+  if (!state.projectChoices.length) {
+    dom.sidebarProjects.append(node('p', 'sidebar-empty', 'No projects available.'));
+    return;
+  }
+  for (const choice of state.projectChoices) {
+    const button = node('button', 'project-item');
+    button.type = 'button';
+    button.dataset.project = choice.id;
+    button.dataset.state = state.projectSelection?.id === choice.id ? 'active' : 'idle';
+    button.title = choice.path;
+    button.append(node('span', 'project-item-title', choice.label));
+    button.append(node('span', 'project-item-meta', choice.path));
+    button.addEventListener('click', () => selectProject(choice.id));
+    dom.sidebarProjects.append(button);
+  }
+  updateSidebarProjectControls();
+}
+
+function updateSidebarProjectControls() {
+  const busy = state.active || state.submitting || state.connecting;
+  for (const button of dom.sidebarProjects.querySelectorAll('.project-item')) {
+    button.disabled = !state.connected || busy;
+  }
+  dom.addProjectSidebar.disabled = !state.connected || !state.projects?.enabled;
+}
+
+function selectProject(id) {
+  if (!state.connected || !state.projects?.enabled || state.active || state.submitting || state.connecting) {
+    return;
+  }
+  const choice = state.projectChoices.find((entry) => entry.id === id);
+  if (!choice) return;
+  if (state.projectSelection?.id === id) {
+    dom.project.value = String(state.projectChoices.indexOf(choice));
+    return;
+  }
+  if (state.session) {
+    if (!window.confirm(`Switch to ${choice.label}? This starts a new session; the current transcript is not saved.`)) {
+      return;
+    }
+    state.projectSelection = choice;
+    startNewSession({ force: true });
+    return;
+  }
+  state.projectSelection = choice;
+  populateProjects();
+  renderSidebarProjects();
+  updateProjectDisplay();
+  updateSessionDisplay();
+  updateControls();
+}
+
+function setFormStatus(element, text, stateName) {
+  setStatus(element, text, stateName);
+}
+
+function optionalCount(input, label) {
+  const raw = input.value.trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${label} must be a positive integer.`);
+  return value;
+}
+
+function updateConnectionDetail() {
+  if (!state.connected) return;
+  const providers = Array.isArray(state.config?.providers) ? state.config.providers.length : 0;
+  const models = Array.isArray(state.config?.models) ? state.config.models.length : 0;
+  dom.connectionDetail.textContent = models
+    ? `Connected. ${providers} provider${providers === 1 ? '' : 's'} and ${models} model${models === 1 ? '' : 's'} available.`
+    : 'Connected. No selectable models are configured; the demo script remains available.';
+}
+
+function configModeLabel(mode) {
+  switch (mode) {
+    case 'development':
+      return 'Development tools';
+    case 'strict':
+      return 'Strict tools';
+    case 'container':
+      return 'Container tools';
+    case 'fakes':
+      return 'Scripted demo tools';
+    default:
+      return 'Unknown tool mode';
+  }
+}
+
+function renderProjectsList() {
+  dom.projectList.replaceChildren();
+  const enabled = Boolean(state.projects?.enabled);
+  dom.projectName.disabled = !enabled;
+  dom.projectPath.disabled = !enabled;
+  dom.addProject.disabled = !enabled;
+  if (!enabled) {
+    dom.projectsNote.textContent = state.projects?.mode === 'container'
+      ? 'Container tools are active. Per-project roots are not available in container mode.'
+      : 'Real tools are not enabled. Start nexus-server with --tools real --tools-root PATH to bind projects.';
+    dom.projectStatus.textContent = '';
+    return;
+  }
+  dom.projectsNote.textContent = `${configModeLabel(state.projects.mode)} · sessions use the selected root for project/temp tools.`;
+  const addItem = (project, removable) => {
+    const item = node('div', 'config-item');
+    const text = node('div', 'config-item-text');
+    text.append(node('span', 'config-item-title', project.name));
+    text.append(node('span', 'config-item-meta', `${project.id} · ${project.path}`));
+    item.append(text);
+    if (removable) {
+      const actions = node('div', 'config-item-actions');
+      const remove = node('button', '', 'Remove');
+      remove.type = 'button';
+      remove.addEventListener('click', async () => {
+        remove.disabled = true;
+        try {
+          const payload = await api(`/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' });
+          state.projects = payload;
+          populateProjects();
+          renderProjectsList();
+          renderSidebarProjects();
+          updateControls();
+          updateSessionDisplay();
+          setFormStatus(dom.projectStatus, `Removed ${project.name}.`, 'ok');
+        } catch (error) {
+          setFormStatus(dom.projectStatus, error.message, 'error');
+          if (error instanceof ApiError && error.status === 401) markUnauthorized();
+          remove.disabled = false;
+        }
+      });
+      actions.append(remove);
+      item.append(actions);
+    }
+    dom.projectList.append(item);
+  };
+  if (state.projects.default) {
+    addItem({
+      id: state.projects.default.id,
+      name: state.projects.default.name,
+      path: state.projects.default.path,
+    }, false);
+  }
+  for (const project of state.projects.projects || []) addItem(project, true);
+}
+
+function renderProviderList() {
+  dom.providerList.replaceChildren();
+  const providers = Array.isArray(state.config?.providers) ? state.config.providers : [];
+  if (!providers.length) {
+    dom.providerList.append(node('p', 'config-empty', 'No providers configured. The demo script is still available.'));
+  }
+  for (const provider of providers) {
+    const item = node('div', 'config-item');
+    const text = node('div', 'config-item-text');
+    text.append(node('span', 'config-item-title', provider.display_name || provider.id));
+    const credential = provider.credential && typeof provider.credential === 'object'
+      ? provider.credential.env || provider.credential.stored || 'unknown'
+      : 'unknown';
+    text.append(node(
+      'span',
+      'config-item-meta',
+      `${provider.id} · ${provider.adapter}/${provider.protocol} · ${provider.endpoint || 'no endpoint'} · ref: ${credential}`,
+    ));
+    item.append(text);
+    const actions = node('div', 'config-item-actions');
+    const edit = node('button', '', 'Edit');
+    edit.type = 'button';
+    edit.addEventListener('click', () => editProvider(provider.id));
+    actions.append(edit);
+    item.append(actions);
+    dom.providerList.append(item);
+  }
+}
+
+function renderModelList() {
+  dom.modelList.replaceChildren();
+  const models = Array.isArray(state.config?.models) ? state.config.models : [];
+  const providers = Array.isArray(state.config?.providers) ? state.config.providers : [];
+  if (!models.length) {
+    dom.modelList.append(node('p', 'config-empty', 'No selectable models configured.'));
+  }
+  for (const model of models) {
+    const item = node('div', 'config-item');
+    const text = node('div', 'config-item-text');
+    text.append(node('span', 'config-item-title', model.name || model.id));
+    text.append(node('span', 'config-item-meta', `${model.id} · provider ${model.provider}`));
+    item.append(text);
+    const actions = node('div', 'config-item-actions');
+    const edit = node('button', '', 'Edit');
+    edit.type = 'button';
+    edit.addEventListener('click', () => editModel(model.id));
+    actions.append(edit);
+    item.append(actions);
+    dom.modelList.append(item);
+  }
+  const previous = dom.modelProvider.value;
+  dom.modelProvider.replaceChildren();
+  for (const provider of providers) {
+    const option = node('option', '', provider.display_name || provider.id);
+    option.value = provider.id;
+    dom.modelProvider.append(option);
+  }
+  if (providers.some((provider) => provider.id === previous)) {
+    dom.modelProvider.value = previous;
+  } else if (providers.length) {
+    dom.modelProvider.value = providers[0].id;
+  }
+  dom.saveModel.disabled = !providers.length;
+}
+
+function resetProviderForm() {
+  dom.providerForm.dataset.original = '';
+  dom.providerId.readOnly = false;
+  dom.providerId.value = '';
+  dom.providerDisplay.value = '';
+  dom.providerAdapter.value = 'direct';
+  dom.providerProtocol.value = 'chat_completions';
+  dom.providerEndpoint.value = '';
+  dom.providerCredentialKind.value = 'env';
+  dom.providerCredentialName.value = '';
+  dom.providerDefaultModel.value = '';
+  dom.providerContextWindow.value = '';
+  setFormStatus(dom.providerStatus, '');
+}
+
+function editProvider(id) {
+  const provider = state.config?.providers?.find((entry) => entry.id === id);
+  if (!provider) return;
+  dom.providerForm.dataset.original = id;
+  dom.providerId.readOnly = true;
+  dom.providerId.value = provider.id;
+  dom.providerDisplay.value = provider.display_name || '';
+  dom.providerAdapter.value = provider.adapter || 'direct';
+  dom.providerProtocol.value = provider.protocol || 'chat_completions';
+  dom.providerEndpoint.value = provider.endpoint || '';
+  const credential = provider.credential && typeof provider.credential === 'object'
+    ? provider.credential
+    : {};
+  dom.providerCredentialKind.value = credential.stored ? 'stored' : 'env';
+  dom.providerCredentialName.value = credential.stored || credential.env || '';
+  dom.providerDefaultModel.value = provider.default_model || '';
+  dom.providerContextWindow.value = provider.context_window_tokens ?? '';
+  setFormStatus(dom.providerStatus, `Editing ${provider.display_name || provider.id}.`);
+}
+
+function resetModelForm() {
+  dom.modelForm.dataset.original = '';
+  dom.modelId.readOnly = false;
+  dom.modelId.value = '';
+  dom.modelName.value = '';
+  dom.modelContextWindow.value = '';
+  dom.modelMaxOutput.value = '';
+  if (dom.modelProvider.options.length) dom.modelProvider.selectedIndex = 0;
+  setFormStatus(dom.modelStatus, '');
+}
+
+function editModel(id) {
+  const model = state.config?.models?.find((entry) => entry.id === id);
+  if (!model) return;
+  dom.modelForm.dataset.original = id;
+  dom.modelId.readOnly = true;
+  dom.modelId.value = model.id;
+  if (state.config?.providers?.some((provider) => provider.id === model.provider)) {
+    dom.modelProvider.value = model.provider;
+  }
+  dom.modelName.value = model.name || '';
+  dom.modelContextWindow.value = model.context_window_tokens ?? '';
+  dom.modelMaxOutput.value = model.max_output_tokens ?? '';
+  setFormStatus(dom.modelStatus, `Editing ${model.name || model.id}.`);
+}
+
+function renderConfigEditors() {
+  renderProjectsList();
+  renderSidebarProjects();
+  renderProviderList();
+  renderModelList();
+  updateProjectDisplay();
+}
+
 function populateModels() {
   const previous = state.selection ? choiceKey(state.selection) : '';
   state.choices = buildChoices(state.config);
@@ -408,19 +790,26 @@ async function connect(candidate) {
     const health = await api('/health', { credential: '', signal: controller.signal });
     if (health?.status !== 'ok') throw new Error('Unexpected health response.');
     const config = await api('/config', { credential: candidate, signal: controller.signal });
+    let projects;
+    try {
+      projects = await api('/projects', { credential: candidate, signal: controller.signal });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) throw error;
+      projects = { enabled: false, mode: 'unavailable', projects: [] };
+    }
     if (generation !== state.connectGeneration) return false;
 
     state.connected = true;
     state.credential = candidate;
     state.config = config;
+    state.projects = projects;
     populateModels();
+    populateProjects();
+    renderSidebarProjects();
+    renderConfigEditors();
     dom.token.value = '';
     setConnectionStatus('Connected', 'ok');
-
-    const modelCount = Array.isArray(config?.models) ? config.models.length : 0;
-    dom.connectionDetail.textContent = modelCount
-      ? `Connected. ${modelCount} configured model${modelCount === 1 ? '' : 's'} available.`
-      : 'Connected. No provider is configured; sessions use the demo script.';
+    updateConnectionDetail();
 
     updateSessionDisplay();
     updateControls();
@@ -491,7 +880,10 @@ function updateSessionDisplay() {
   dom.sessionItem.hidden = !exists;
   if (exists) {
     dom.sessionItemTitle.textContent = state.sessionTitle || 'New conversation';
-    dom.sessionItemMeta.textContent = `${describeModelLabel()} · ${stateLabel}`;
+    const projectLabel = state.projects?.enabled && state.projectSelection
+      ? `${state.projectSelection.label} · `
+      : '';
+    dom.sessionItemMeta.textContent = `${projectLabel}${describeModelLabel()} · ${stateLabel}`;
     dom.sessionItem.dataset.state = state.active ? 'active' : 'idle';
   }
   dom.conversationTitle.textContent = state.sessionTitle || 'New conversation';
@@ -507,9 +899,14 @@ function updateControls() {
   dom.newSessionMobile.disabled = !canNewSession;
   dom.message.disabled = !connected || blocked;
   dom.send.disabled = !connected || busy || blocked || !state.selection || !dom.message.value.trim();
+  const projectEnabled = Boolean(state.projects?.enabled);
   dom.model.disabled = !connected || busy || Boolean(state.session);
   dom.model.hidden = Boolean(state.session);
   dom.modelLabel.hidden = !state.session;
+  dom.project.disabled = !connected || busy || Boolean(state.session) || !projectEnabled;
+  dom.project.hidden = Boolean(state.session) || !projectEnabled;
+  dom.projectLabel.hidden = !state.session || !projectEnabled;
+  dom.composerProject.hidden = !projectEnabled;
   dom.cancel.hidden = !state.active;
   dom.cancel.disabled = !connected || !state.active || state.cancelling || state.cancelRequested || !state.run;
   dom.cancel.textContent = state.cancelling || state.cancelRequested ? 'Cancelling…' : 'Cancel';
@@ -534,6 +931,8 @@ function updateControls() {
     }
   }
   updateModelDisplay();
+  updateProjectDisplay();
+  updateSidebarProjectControls();
 }
 
 function resetRunState() {
@@ -588,7 +987,11 @@ function startNewSession({ force = false } = {}) {
   state.sessionProvider = null;
   state.sessionModel = null;
   state.sessionTitle = '';
-  if (state.connected) populateModels();
+  if (state.connected) {
+    populateModels();
+    populateProjects();
+    renderSidebarProjects();
+  }
   dom.conversation.replaceChildren();
   dom.conversation.hidden = true;
   dom.welcome.hidden = false;
@@ -616,6 +1019,9 @@ async function ensureSession() {
   if (!state.selection.demo) {
     body.provider = state.selection.provider;
     body.model = state.selection.model;
+  }
+  if (state.projects?.enabled && state.projectSelection) {
+    body.project = state.projectSelection.id;
   }
   const reply = await api('/sessions', { method: 'POST', body });
   if (!reply || typeof reply.session !== 'string' || !reply.session) {
@@ -1449,6 +1855,14 @@ dom.openSettings.addEventListener('click', () => {
   });
 });
 dom.closeSettings.addEventListener('click', () => dom.settings.close());
+dom.addProjectSidebar.addEventListener('click', () => {
+  if (!dom.settings.open) dom.settings.showModal();
+  dom.projectsBlock.open = true;
+  requestAnimationFrame(() => {
+    dom.settings.scrollTop = Math.max(0, dom.projectsBlock.offsetTop - 16);
+    dom.projectName.focus();
+  });
+});
 dom.settings.addEventListener('close', () => {
   dom.token.value = '';
 });
@@ -1464,6 +1878,156 @@ dom.model.addEventListener('change', () => {
   state.selection = state.choices[index] || null;
   updateModelDisplay();
   updateControls();
+});
+
+dom.project.addEventListener('change', () => {
+  const index = Number(dom.project.value);
+  state.projectSelection = state.projectChoices[index] || null;
+  renderSidebarProjects();
+  updateProjectDisplay();
+  updateControls();
+});
+
+dom.projectForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!state.projects?.enabled) return;
+  const name = dom.projectName.value.trim();
+  const path = dom.projectPath.value.trim();
+  if (!name || !path) {
+    setFormStatus(dom.projectStatus, 'Project name and absolute path are required.', 'error');
+    return;
+  }
+  dom.addProject.disabled = true;
+  setFormStatus(dom.projectStatus, 'Adding project…', 'busy');
+  try {
+    const payload = await api('/projects', { method: 'POST', body: { name, path } });
+    state.projects = payload;
+    populateProjects();
+    const added = payload.project?.id;
+    if (added && !state.session) {
+      const choice = state.projectChoices.find((entry) => entry.id === added);
+      if (choice) {
+        state.projectSelection = choice;
+        dom.project.value = String(state.projectChoices.indexOf(choice));
+      }
+    }
+    renderProjectsList();
+    renderSidebarProjects();
+    dom.projectName.value = '';
+    dom.projectPath.value = '';
+    setFormStatus(dom.projectStatus, `Added ${payload.project?.name || name}.`, 'ok');
+    updateProjectDisplay();
+    updateSessionDisplay();
+    updateControls();
+  } catch (error) {
+    setFormStatus(dom.projectStatus, error.message, 'error');
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+  } finally {
+    dom.addProject.disabled = !state.projects?.enabled;
+  }
+});
+
+dom.newProvider.addEventListener('click', resetProviderForm);
+dom.newModel.addEventListener('click', resetModelForm);
+
+dom.providerForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const id = dom.providerId.value.trim();
+  const displayName = dom.providerDisplay.value.trim();
+  const defaultModel = dom.providerDefaultModel.value.trim();
+  const credentialName = dom.providerCredentialName.value.trim();
+  if (!id || !displayName || !defaultModel || !credentialName) {
+    setFormStatus(dom.providerStatus, 'Provider ID, display name, default model, and credential name are required.', 'error');
+    return;
+  }
+  let contextWindow;
+  try {
+    contextWindow = optionalCount(dom.providerContextWindow, 'Context window');
+  } catch (error) {
+    setFormStatus(dom.providerStatus, error.message, 'error');
+    return;
+  }
+  const endpoint = dom.providerEndpoint.value.trim() || null;
+  const credential = { [dom.providerCredentialKind.value]: credentialName };
+  dom.saveProvider.disabled = true;
+  setFormStatus(dom.providerStatus, 'Saving provider…', 'busy');
+  try {
+    const summary = await api('/config/providers', {
+      method: 'POST',
+      body: {
+        id,
+        display_name: displayName,
+        adapter: dom.providerAdapter.value,
+        protocol: dom.providerProtocol.value,
+        endpoint,
+        credential,
+        default_model: defaultModel,
+        context_window_tokens: contextWindow,
+      },
+    });
+    state.config = summary;
+    updateConnectionDetail();
+    populateModels();
+    renderConfigEditors();
+    dom.providerForm.dataset.original = id;
+    dom.providerId.readOnly = true;
+    setFormStatus(dom.providerStatus, `Saved ${displayName}. Changes apply to new sessions.`, 'ok');
+    updateSessionDisplay();
+    updateControls();
+  } catch (error) {
+    setFormStatus(dom.providerStatus, error.message, 'error');
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+  } finally {
+    dom.saveProvider.disabled = false;
+  }
+});
+
+dom.modelForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const id = dom.modelId.value.trim();
+  const provider = dom.modelProvider.value;
+  const name = dom.modelName.value.trim();
+  if (!id || !provider || !name) {
+    setFormStatus(dom.modelStatus, 'Model ID, provider, and vendor name are required.', 'error');
+    return;
+  }
+  let contextWindow;
+  let maxOutput;
+  try {
+    contextWindow = optionalCount(dom.modelContextWindow, 'Context window');
+    maxOutput = optionalCount(dom.modelMaxOutput, 'Max output tokens');
+  } catch (error) {
+    setFormStatus(dom.modelStatus, error.message, 'error');
+    return;
+  }
+  dom.saveModel.disabled = true;
+  setFormStatus(dom.modelStatus, 'Saving model…', 'busy');
+  try {
+    const summary = await api('/config/models', {
+      method: 'POST',
+      body: {
+        id,
+        provider,
+        name,
+        context_window_tokens: contextWindow,
+        max_output_tokens: maxOutput,
+      },
+    });
+    state.config = summary;
+    updateConnectionDetail();
+    populateModels();
+    renderConfigEditors();
+    dom.modelForm.dataset.original = id;
+    dom.modelId.readOnly = true;
+    setFormStatus(dom.modelStatus, `Saved ${name}. Changes apply to new sessions.`, 'ok');
+    updateSessionDisplay();
+    updateControls();
+  } catch (error) {
+    setFormStatus(dom.modelStatus, error.message, 'error');
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+  } finally {
+    dom.saveModel.disabled = !state.config?.providers?.length;
+  }
 });
 
 dom.message.addEventListener('input', updateControls);

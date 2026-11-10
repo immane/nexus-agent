@@ -12,6 +12,10 @@ The client supports:
   `GET /config`;
 - selecting a configured provider/model, or the test-only demo script when no
   provider is configured;
+- selecting an admitted local project root when real local tools are enabled;
+- adding and removing project roots through the authenticated API;
+- adding or updating provider and model entries, using credential references
+  only;
 - creating one runtime session on the first accepted message;
 - submitting runs, streaming events with SSE, and rendering assistant text,
   context notices, tool activity, usage, approvals, cancellation, and terminal
@@ -35,7 +39,10 @@ nexus-runtime: execution, approvals, policy, persistence
 
 The browser never receives provider credentials or tool authorization
 decisions it can grant locally. Approval cards carry only the exact identities
-published by the runtime; the server still validates the tuple.
+published by the runtime; the server still validates the tuple. Configuration
+forms submit credential references (an environment-variable name or stored-entry
+name), never secret values. Project paths are returned only to the authenticated
+page and only while local real tools are enabled.
 
 The static shell (`/`, `/assets/app.css`, `/assets/app.js`) is public by design.
 All API routes keep their existing bearer, Host, and Origin checks. The shell
@@ -82,6 +89,60 @@ The server permits one SSE subscriber per session. A second tab or client that
 attaches while another is streaming receives `409`; the UI shows that conflict
 and does not treat it as a run failure. Disconnecting an SSE read does not cancel
 the run.
+
+## Projects and runtime mode
+
+The operator must start the server with local real tools
+(`--tools real --tools-root PATH`, plus `--auth-token-env`). The web client cannot
+turn the scripted demo into real tools. `GET /projects` reports the mode:
+
+- `development`: project/temp file operations and sandboxed commands are
+  automatic; external file paths still require approval;
+- `strict`: project reads are jailed and mutations/commands require approval;
+- `fakes` and `container`: project selection is unavailable and no project paths
+  are reported.
+
+Project selection is part of the left sidebar, with the active project
+highlighted. Selecting a different project while a session exists starts a new
+session after confirmation; the previous transcript is not saved. The Settings
+dialog manages project admission/removal, and a sidebar `+` shortcut opens that
+section. On narrow screens the sidebar collapses and the composer exposes an
+equivalent project selector.
+
+The startup tool root is exposed as the reserved `default` project. Additional
+projects are existing absolute directories admitted by `POST /projects`. Before
+admission the server canonicalizes the path and refuses the filesystem root, the
+user's home or any ancestor of it, common system roots, and known credential
+directories. This is not secret detection; a project may still contain sensitive
+files.
+
+Project metadata is persisted in `projects.json` next to the user configuration,
+with owner-only permissions on Unix. A missing configuration path keeps project
+edits in memory only. `DELETE /projects/{id}` refuses the startup project and a
+root still referenced by a retained session; existing sessions otherwise keep
+their already-bound tool registrations. A session's project is fixed when the
+session is created. The client sends the selected project id in
+`POST /sessions`.
+
+## Provider and model configuration
+
+The Settings dialog can add or replace entries through
+`POST /config/providers` and `POST /config/models`. These writes require a
+configured server bearer token even when tools are scripted; an unauthenticated
+demo server refuses them. Provider credentials are references only: an
+environment-variable name or a stored-entry name. The configuration format has
+no field for a secret value and the browser never reads one.
+
+Updates retain optional context limits when the form leaves them untouched.
+Model defaults and provider ownership are validated by `nexus-config`; an
+unknown provider, dangling reference, invalid endpoint, or inconsistent context
+window is refused with a static error. A provider replacement revalidates models
+that inherit its default-model window. Successful writes use the normal atomic
+configuration save.
+
+Changes apply to new sessions. A live session keeps the provider adapter and tool
+registrations created for it. This slice does not provide provider/model removal
+through the web API; removal remains an explicit configuration-file edit.
 
 ## Event handling
 
@@ -141,6 +202,16 @@ new session never claims to cancel work that may still be executing.
 - One SSE subscriber per session means multi-tab use can conflict.
 - Retained event queues are bounded; saturated or evicted content is reported
   as incomplete, never reconstructed.
+- Projects require local real tools. Container-mode per-project roots are not
+  implemented, and the client does not browse a project's files.
+- A project cannot be removed while a retained session still references it;
+  sessions may remain for the idle-cleanup window after a run finishes.
+- Stored project roots are revalidated at startup; a missing directory prevents
+  startup until the catalog is corrected.
+- The startup `--tools-root` is an operator decision and is not subjected to the
+  stricter web-addition path checks.
+- Provider/model removal is not exposed over HTTP. Existing sessions are not
+  updated by configuration edits.
 - The demo wiring is test-only; no provider behavior is simulated beyond what
   `nexus-server` serves.
 - Assets are served uncompressed. Release-size and transfer-size claims require
@@ -151,9 +222,11 @@ new session never claims to cancel work that may still be executing.
 ## Validation
 
 `cargo nextest run -p nexus-server --locked --offline` covers the embedded
-assets, Host/Origin checks, API authentication, SSE flows, approvals, and
-snapshot contracts. Browser checks during development covered model discovery,
-demo and authenticated sessions, streaming text, tool cards, approve/deny,
-cancellation, stream-loss retry and snapshot recovery, theme switching,
-disconnect/reconnect, and desktop/mobile layout. These are local functional
-checks, not a security certification or browser compatibility claim.
+assets, Host/Origin checks, API authentication, SSE flows, approvals, snapshot
+contracts, project admission/persistence/binding, and provider/model upserts.
+Browser checks during development covered model discovery, demo and
+authenticated sessions, streaming text, tool cards, approve/deny, cancellation,
+stream-loss retry and snapshot recovery, theme switching, disconnect/reconnect,
+project add/select/remove, provider/model editing, and desktop/mobile layout.
+These are local functional checks, not a security certification or browser
+compatibility claim.

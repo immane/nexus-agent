@@ -4,6 +4,7 @@ mod api_flows;
 mod auth_flows;
 mod http_parser;
 mod json_encoding;
+mod project_flows;
 mod provider_sessions;
 mod server_config;
 mod session_store;

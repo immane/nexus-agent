@@ -45,9 +45,11 @@
 //!   session is never blocked by the first. An optional
 //!   `{"provider": "<id>", "model": "<id>"}` body binds the session to a
 //!   configured provider served by the real OpenAI-compatible adapter;
-//!   without it the session serves the demo script. Unknown identities
-//!   fail before any run is minted, and a missing credential fails
-//!   without network touch.
+//!   without it the session serves the demo script. An optional
+//!   `"project":"<id>"` binds the session's local tools to an admitted
+//!   project root; `"default"` selects the startup `--tools-root`. Unknown
+//!   identities fail before any run is minted, and a missing credential
+//!   fails without network touch.
 //! - `POST /sessions/{sid}/runs` with `{"input": "...", "profile?": "..."}`
 //!   -> `201 {"reply":"Accepted","run":"..."}` on acceptance,
 //!   `409` while the session's run slot is busy, `400` on invalid input.
@@ -102,6 +104,22 @@
 //! - `DELETE /config/favourites/{mid}` -> `200` with the resulting list;
 //!   `404` for an id that is not a favourite. The transport admits
 //!   `DELETE` alongside `GET` and `POST`, so this route is reachable.
+//! - `POST /config/providers` and `POST /config/models` add or replace one
+//!   validated entry by identity. Credential bodies carry an environment or
+//!   stored-reference name only, never a value. Optional context fields retain
+//!   their previous values when omitted. The reply is the redacted summary.
+//!   Changes affect newly created sessions; existing runtimes keep their
+//!   original adapters and tool roots.
+//! - `GET /projects` reports whether local real tools are enabled, the tool
+//!   mode, the reserved startup workspace, and admitted project roots. It
+//!   exposes no project paths in fake or container mode.
+//! - `POST /projects` with `{"name":"...","path":"/absolute/dir"}` admits one
+//!   existing canonical directory. The filesystem root, home/ancestor paths,
+//!   and known credential directories are refused. `DELETE /projects/{id}`
+//!   removes an unused project and refuses the startup workspace or a root
+//!   still referenced by a retained session. Projects are stored in
+//!   `projects.json` next to the user configuration with owner-only
+//!   permissions; no path is persisted when no configuration path exists.
 //!
 //! # Dependency justification
 //!
@@ -126,6 +144,7 @@
 mod auth;
 pub mod http;
 pub mod json;
+pub mod projects;
 pub mod server;
 mod web;
 

@@ -846,3 +846,87 @@ fn a_failed_save_reports_500_while_the_edit_stays_live() {
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+/// Provider and model upserts are authenticated, validated, persisted, and
+/// reported through the same redacted summary the web client already reads.
+#[test]
+fn providers_and_models_can_be_added_and_updated_over_http() {
+    let probe = resolvable_probe();
+    let path = temp_config("upsert");
+    let port = spawn_server(configured(probe), Some(path.clone()));
+
+    let provider_body = format!(
+        r#"{{"id":"acme","display_name":"Renamed Acme","adapter":"direct","protocol":"chat_completions","endpoint":"https://api.example.com","credential":{{"env":"{probe}"}},"default_model":"default-model","context_window_tokens":64000}}"#
+    );
+    let (status, summary) = post(port, "/config/providers", &provider_body);
+    assert_eq!(status, 200, "existing provider updates: {summary}");
+    assert_eq!(summary["providers"][0]["display_name"], "Renamed Acme");
+    assert_eq!(summary["providers"][0]["context_window_tokens"], 64_000);
+    assert_eq!(summary["providers"].as_array().unwrap().len(), 1);
+
+    let new_provider = r#"{"id":"beta","display_name":"Beta","adapter":"relay","protocol":"openai_responses","endpoint":"https://relay.example.com","credential":{"stored":"beta"},"default_model":"beta-default"}"#;
+    let (status, summary) = post(port, "/config/providers", new_provider);
+    assert_eq!(status, 200, "new provider admits: {summary}");
+    assert_eq!(summary["providers"].as_array().unwrap().len(), 2);
+
+    let model_body = r#"{"id":"beta-fast","provider":"beta","name":"beta-model","context_window_tokens":32000,"max_output_tokens":4000}"#;
+    let (status, summary) = post(port, "/config/models", model_body);
+    assert_eq!(status, 200, "new model admits: {summary}");
+    assert_eq!(summary["models"].as_array().unwrap().len(), 3);
+    let added = summary["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "beta-fast")
+        .expect("new model is reported");
+    assert_eq!(added["provider"], "beta");
+    assert_eq!(added["context_window_tokens"], 32_000);
+    assert_eq!(added["max_output_tokens"], 4_000);
+
+    let (status, summary) = post(
+        port,
+        "/config/models",
+        r#"{"id":"beta-fast","provider":"beta","name":"beta-model-v2"}"#,
+    );
+    assert_eq!(status, 200, "existing model updates: {summary}");
+    let updated = summary["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "beta-fast")
+        .expect("updated model is reported");
+    assert_eq!(updated["name"], "beta-model-v2");
+    assert_eq!(
+        updated["context_window_tokens"], 32_000,
+        "omitted optional fields are preserved"
+    );
+    assert_eq!(updated["max_output_tokens"], 4_000);
+
+    let (status, body) = post(
+        port,
+        "/config/models",
+        r#"{"id":"orphan","provider":"missing","name":"orphan"}"#,
+    );
+    assert_eq!(status, 400, "unknown provider is refused: {body}");
+    let (status, body) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"bad","display_name":"Bad","adapter":"direct","protocol":"chat_completions","endpoint":"https://example.com","credential":{"env":"KEY","stored":"secret"},"default_model":"m"}"#,
+    );
+    assert_eq!(status, 400, "ambiguous credential is refused: {body}");
+    assert!(!body.to_string().contains("secret"));
+
+    let persisted = read_back(&path);
+    assert_eq!(
+        persisted
+            .provider("beta")
+            .expect("beta persisted")
+            .display_name,
+        "Beta"
+    );
+    assert_eq!(
+        persisted.model("beta-fast").expect("model persisted").name,
+        "beta-model-v2"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
+}

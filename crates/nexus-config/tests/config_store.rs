@@ -499,3 +499,49 @@ fn mode_admission_is_closed_and_explicit() {
     )
     .is_err());
 }
+
+#[test]
+fn upserts_replace_in_place_and_revalidate_inherited_limits() {
+    let mut config = configured();
+    config.add_favourite("fast").expect("favourite admits");
+    config.record_use("fast").expect("use records");
+
+    let mut updated = provider("acme");
+    updated.display_name = "Updated Acme".to_owned();
+    config.upsert_provider(updated).expect("provider updates");
+    assert_eq!(config.providers().len(), 1, "replacement does not append");
+    assert_eq!(config.providers()[0].display_name, "Updated Acme");
+
+    let mut fast = model("fast", "acme");
+    fast.name = "vendor-fast-v2".to_owned();
+    config.upsert_model(fast).expect("model updates");
+    assert_eq!(config.models().len(), 2, "replacement does not append");
+    assert_eq!(
+        config.model("fast").expect("fast exists").name,
+        "vendor-fast-v2"
+    );
+    assert_eq!(config.favourites(), ["fast"]);
+    assert_eq!(config.recent(), ["fast"]);
+
+    let mut inherited = UserConfig::default_config();
+    inherited
+        .add_provider(provider("acme"))
+        .expect("provider admits");
+    let mut default_model = model("fast", "acme");
+    default_model.name = "default-model".to_owned();
+    default_model.max_output_tokens = Some(2_000);
+    inherited
+        .add_model(default_model)
+        .expect("window is unknown before replacement");
+
+    let mut narrowed = provider("acme");
+    narrowed.context_window_tokens = Some(1_000);
+    assert!(
+        inherited.upsert_provider(narrowed).is_err(),
+        "a new inherited window cannot invalidate an existing output cap"
+    );
+    assert!(
+        inherited.providers()[0].context_window_tokens.is_none(),
+        "a rejected replacement leaves the previous provider intact"
+    );
+}

@@ -18,6 +18,8 @@
       <strong>Local workspace</strong>
       <span class="muted">Served by nexus-server</span>
     </div>
+    <div class="section-label">PROJECTS <button class="section-add" id="add-project-sidebar" type="button" aria-label="Add project" disabled>＋</button></div>
+    <div class="project-list" id="sidebar-projects" aria-label="Projects"><p class="sidebar-empty">Connect to load projects.</p></div>
     <button class="new-session" id="new-session" type="button" disabled>＋ New session</button>
     <div class="section-label">SESSIONS <span id="session-count">0</span></div>
     <div class="session-list" id="session-list">
@@ -33,6 +35,7 @@
     <header class="topbar">
       <div class="crumb"><span class="muted">Workspace</span><span class="separator">/</span><strong id="conversation-title">New conversation</strong></div>
       <div class="toolbar">
+        <span class="project-badge" id="project-badge" hidden></span>
         <span class="model-badge" id="model-badge" hidden></span>
         <span class="status" id="connection-status" role="status">Not connected</span>
         <button class="icon-button" id="new-session-mobile" type="button" aria-label="New session" disabled>＋</button>
@@ -64,6 +67,11 @@
             <span class="usage" id="usage-status" hidden></span>
           </div>
           <div class="composer-actions">
+            <span class="composer-project">
+              <label class="sr-only" for="project">Project</label>
+              <select id="project" disabled aria-label="Project"></select>
+              <span class="model-label" id="project-label" hidden></span>
+            </span>
             <label class="sr-only" for="model">Model</label>
             <select id="model" disabled aria-label="Model"></select>
             <span class="model-label" id="model-label" hidden></span>
@@ -101,8 +109,78 @@
         <button class="primary" id="connect" type="submit">Connect</button>
         <button id="disconnect" type="button" disabled>Disconnect</button>
       </div>
-      <p class="dialog-status" id="connection-detail" role="status">No request made yet.</p>
+      <p class="dialog-status status" id="connection-detail" role="status">No request made yet.</p>
     </form>
+    <details class="dialog-section config-block" id="projects-block">
+      <summary>Projects</summary>
+      <div class="config-content">
+        <p class="muted" id="projects-note">Projects bind a session to an allowed local directory. Real tools are not enabled on this server.</p>
+        <div class="config-list" id="project-list"></div>
+        <form class="config-form" id="project-form">
+          <div class="form-grid">
+            <div><label for="project-name">Project name</label><input id="project-name" maxlength="128" autocomplete="off" placeholder="My project"></div>
+            <div><label for="project-path">Absolute path</label><input id="project-path" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="/absolute/project"></div>
+          </div>
+          <p class="hint">Must be an existing directory. The filesystem root, home/ancestor directories, and known credential directories are refused.</p>
+          <div class="dialog-actions"><button class="primary" id="add-project" type="submit">Add project</button></div>
+          <p class="dialog-status status" id="project-status" role="status"></p>
+        </form>
+      </div>
+    </details>
+    <details class="dialog-section config-block" id="providers-block">
+      <summary>Providers &amp; models</summary>
+      <div class="config-content">
+        <p class="muted">Credential fields accept a reference name only. Secret values are never entered here or stored in the configuration.</p>
+        <h3>Providers</h3>
+        <div class="config-list" id="provider-list"></div>
+        <form class="config-form" id="provider-form">
+          <div class="form-grid">
+            <div><label for="provider-id">Provider ID</label><input id="provider-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="openai-main"></div>
+            <div><label for="provider-display">Display name</label><input id="provider-display" maxlength="128" autocomplete="off" placeholder="OpenAI"></div>
+          </div>
+          <div class="form-grid">
+            <div><label for="provider-adapter">Adapter</label><select id="provider-adapter"><option value="direct">Direct</option><option value="relay">Relay</option></select></div>
+            <div><label for="provider-protocol">Protocol</label><select id="provider-protocol"><option value="chat_completions">Chat Completions</option><option value="openai_responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></div>
+          </div>
+          <label for="provider-endpoint">Endpoint <span class="muted">(optional)</span></label>
+          <input id="provider-endpoint" maxlength="512" autocomplete="off" spellcheck="false" placeholder="https://api.example.com">
+          <div class="form-grid">
+            <div><label for="provider-credential-kind">Credential kind</label><select id="provider-credential-kind"><option value="env">Environment variable</option><option value="stored">Stored reference</option></select></div>
+            <div><label for="provider-credential-name">Credential name</label><input id="provider-credential-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY"></div>
+          </div>
+          <div class="form-grid">
+            <div><label for="provider-default-model">Default model</label><input id="provider-default-model" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5"></div>
+            <div><label for="provider-context-window">Context window <span class="muted">(optional)</span></label><input id="provider-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
+          </div>
+          <p class="hint">The provider window applies only to its default model; model entries can override it.</p>
+          <div class="dialog-actions">
+            <button class="primary" id="save-provider" type="submit">Save provider</button>
+            <button id="new-provider" type="button">New provider</button>
+          </div>
+          <p class="dialog-status status" id="provider-status" role="status"></p>
+        </form>
+        <h3>Models</h3>
+        <div class="config-list" id="model-list"></div>
+        <form class="config-form" id="model-form">
+          <div class="form-grid">
+            <div><label for="model-id">Model ID</label><input id="model-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="fast"></div>
+            <div><label for="model-provider">Provider</label><select id="model-provider"></select></div>
+          </div>
+          <label for="model-name">Vendor model name</label>
+          <input id="model-name" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5-mini">
+          <div class="form-grid">
+            <div><label for="model-context-window">Context window <span class="muted">(optional)</span></label><input id="model-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
+            <div><label for="model-max-output">Max output tokens <span class="muted">(optional)</span></label><input id="model-max-output" type="number" min="1" step="1" autocomplete="off" placeholder="8192"></div>
+          </div>
+          <div class="dialog-actions">
+            <button class="primary" id="save-model" type="submit">Save model</button>
+            <button id="new-model" type="button">New model</button>
+          </div>
+          <p class="dialog-status status" id="model-status" role="status"></p>
+        </form>
+        <p class="hint">Changes apply to new sessions. Existing sessions keep their original provider, model, and tools.</p>
+      </div>
+    </details>
     <div class="dialog-section info-box">
       <strong>Current limits</strong>
       <p>Reloading or closing this page loses the transcript; the server session is not a saved conversation. History, file browsing, and session restore are not implemented.</p>

@@ -228,7 +228,8 @@ a {
 .eyebrow,
 .section-label,
 .card-number,
-.model-badge {
+.model-badge,
+.project-badge {
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.13em;
@@ -294,6 +295,66 @@ a {
 .section-label {
   display: flex;
   justify-content: space-between;
+}
+
+.section-add {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.section-add:hover:not(:disabled) {
+  color: var(--fg);
+  background: var(--raised);
+}
+
+.project-list {
+  display: grid;
+  gap: 5px;
+  min-height: 0;
+}
+
+.project-item {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  text-align: left;
+}
+
+.project-item:hover:not(:disabled) {
+  border-color: var(--line);
+  background: var(--raised);
+}
+
+.project-item[data-state="active"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.project-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.project-item-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 9px;
 }
 
 .new-session span {
@@ -404,8 +465,9 @@ a {
   gap: 12px;
 }
 
-.model-badge {
-  max-width: 25vw;
+.model-badge,
+.project-badge {
+  max-width: 18vw;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -414,6 +476,11 @@ a {
   border-radius: 5px;
   color: var(--muted);
   letter-spacing: 0.04em;
+}
+
+.project-badge {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line));
 }
 
 .icon-button {
@@ -955,8 +1022,12 @@ textarea::placeholder {
   flex: none;
 }
 
+.composer-project {
+  display: none;
+}
+
 .composer-actions select {
-  max-width: 250px;
+  max-width: 220px;
   font-size: 11px;
 }
 
@@ -1090,6 +1161,121 @@ dialog input {
   color: var(--muted);
 }
 
+.config-block summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  list-style: none;
+}
+
+.config-block summary::-webkit-details-marker {
+  display: none;
+}
+
+.config-block summary::after {
+  content: "›";
+  color: var(--muted);
+  transition: transform 120ms ease;
+}
+
+.config-block[open] summary::after {
+  transform: rotate(90deg);
+}
+
+.config-content {
+  margin-top: 14px;
+}
+
+.config-content h3 {
+  margin-top: 22px;
+}
+
+.config-block > .config-content > h3:first-child {
+  margin-top: 0;
+}
+
+.config-list {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 14px;
+}
+
+.config-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--raised);
+}
+
+.config-item-text {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.config-item-title {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.config-item-meta {
+  color: var(--muted);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+.config-item-actions {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+
+.config-item button {
+  padding: 3px 8px;
+  font-size: 10px;
+}
+
+.config-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.config-form {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.config-form label {
+  margin-top: 12px;
+}
+
+.config-form .form-grid > div > label {
+  margin-top: 0;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 10px;
+}
+
+.form-grid > div {
+  min-width: 0;
+}
+
 .info-box {
   color: var(--muted);
 }
@@ -1178,7 +1364,8 @@ dialog input {
     gap: 8px;
   }
 
-  .model-badge {
+  .model-badge,
+  .project-badge {
     display: none;
   }
 
@@ -1239,15 +1426,37 @@ dialog input {
     justify-content: flex-end;
   }
 
+  .composer-project {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    min-width: 0;
+  }
+
   .composer-actions select {
     flex: 1;
     max-width: none;
     min-width: 0;
   }
 
+  .composer-project select,
+  .composer-project .model-label {
+    flex: 1;
+    min-width: 0;
+    max-width: none;
+  }
+
   .model-label {
     flex: 1;
     max-width: none;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .config-item {
+    flex-wrap: wrap;
   }
 
   .footer {
