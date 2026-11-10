@@ -75,7 +75,10 @@ For a separate Ollama task-thinking experiment, set the optional provider field
 `--config`; do not rewrite the shared user configuration. Omission keeps current
 behavior, and `"low"` may still enable thinking rather than meaningfully shorten
 it on boolean-only models. The launcher records the configured value in
-`launch.json`. Keep the 16K window, 4,096 output cap, read-page guidance, and all
+`launch.json`, resolving model > provider > global and treating `"inherit"` as
+unset. The same optional field can now be placed on a selected model entry for a
+narrower experiment, or at the configuration root as a global fallback. Omitted
+fields preserve the original behavior. Keep the 16K window, 4,096 output cap, read-page guidance, and all
 other settings fixed when comparing against the prior read-paging run. Summary
 requests keep their explicit low-effort hint, and historical reasoning is not
 deleted. This is a provider request, not proof that a model obeys it or that

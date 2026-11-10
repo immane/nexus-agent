@@ -298,7 +298,14 @@ class ArchiveLaunchTests(unittest.TestCase):
             with self.subTest(effort=effort):
                 self.check_launch(task_reasoning_effort=effort)
 
-    def check_launch(self, read_page_bytes=None, worker_failure=False, task_reasoning_effort=None):
+    def test_inherited_task_reasoning_is_recorded_effectively(self):
+        self.check_launch(global_effort="none", expected_effort="none")
+        self.check_launch(global_effort="none", task_reasoning_effort="low", expected_effort="low")
+        self.check_launch(global_effort="low", task_reasoning_effort="low", model_effort="none", expected_effort="none")
+        self.check_launch(global_effort="none", task_reasoning_effort="inherit", model_effort="inherit", expected_effort="none")
+
+    def check_launch(self, read_page_bytes=None, worker_failure=False, task_reasoning_effort=None,
+                     global_effort=None, model_effort=None, expected_effort=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             server = root / "target/release/nexus-server"
@@ -310,9 +317,12 @@ class ArchiveLaunchTests(unittest.TestCase):
                                "credential": {"env": "OLLAMA_API_KEY"}}],
                 "models": [{"id": "local-model", "provider": "ollama-local"}],
             }))
-            if task_reasoning_effort is not None:
+            if any(value is not None for value in (task_reasoning_effort, global_effort, model_effort)):
                 document = json.loads(config.read_text())
-                document["providers"][0]["task_reasoning_effort"] = task_reasoning_effort
+                for layer, value in ((document, global_effort), (document["providers"][0], task_reasoning_effort),
+                                     (document["models"][0], model_effort)):
+                    if value is not None:
+                        layer["task_reasoning_effort"] = value
                 config.write_text(json.dumps(document))
             profiles = {"provider": "ollama-local", "model": "local-model", "gateway_image": "gateway"}
             profile_path = root / "profiles.json"
@@ -354,7 +364,7 @@ class ArchiveLaunchTests(unittest.TestCase):
             run = next(args.work_root.iterdir())
             evidence = json.loads((run / "launch.json").read_text())
             self.assertEqual(evidence["prompt_config"], {"read_page_bytes": read_page_bytes})
-            self.assertEqual(evidence["task_reasoning_effort"], task_reasoning_effort)
+            self.assertEqual(evidence["task_reasoning_effort"], expected_effort if expected_effort is not None else task_reasoning_effort)
             self.assertEqual(evidence["evaluation"], "not-run")
             if worker_failure:
                 self.assertEqual(spawn.call_count, 1, "must start only the server, never the model runner")

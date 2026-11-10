@@ -915,6 +915,11 @@ impl Server {
             let context_management = config.context_management_for(id, model).map_err(|_| {
                 SessionError::new(400, "selected model context configuration is invalid")
             })?;
+            let mut profile = profile;
+            profile.task_reasoning_effort =
+                config.task_reasoning_effort_for(id, model).map_err(|_| {
+                    SessionError::new(400, "selected model thinking configuration is invalid")
+                })?;
             (profile, vendor, context_management)
         };
         let (profile, vendor, context_management) = profile;
@@ -1179,6 +1184,7 @@ impl Server {
                 None => Some(json_response(404, &json::error_body("unknown session"))),
             },
             Route::Config => Some(self.config_summary()),
+            Route::UpdateThinking => Some(self.update_thinking(body)),
             Route::AddFavourite => Some(self.add_favourite(body)),
             Route::RemoveFavourite { model } => Some(self.remove_favourite(model)),
             Route::UpsertProvider => Some(self.upsert_provider(body)),
@@ -1331,6 +1337,31 @@ impl Server {
         let mut document = summary(&config);
         document["version"] = Value::String(env!("CARGO_PKG_VERSION").to_owned());
         json_response(200, &body_json(document))
+    }
+
+    /// Updates generation behavior only; display and historical replay are independent.
+    fn update_thinking(&self, body: &Value) -> Response {
+        if self.auth_token.is_none() {
+            return json_response(
+                503,
+                &json::error_body("server authentication is not configured"),
+            );
+        }
+        if !body.as_object().is_some_and(|fields| fields.len() == 1)
+            || body.get("task_reasoning_effort").is_none()
+        {
+            return json_response(400, &json::error_body("task reasoning effort is required"));
+        }
+        let effort = match optional_task_reasoning_effort(body) {
+            Ok(Some(effort)) => effort,
+            _ => return json_response(400, &json::error_body("task reasoning effort is invalid")),
+        };
+        let mut config = self.config.lock().expect("config lockable");
+        config.set_task_reasoning_effort(effort);
+        if self.persist(&config).is_err() {
+            return json_response(500, &json::error_body("configuration could not be saved"));
+        }
+        json_response(200, &body_json(summary(&config)))
     }
 
     /// Reports the local real-tool mode, the reserved startup workspace, and
@@ -1577,16 +1608,12 @@ impl Server {
             Ok(None) => existing.as_ref().and_then(|p| p.context_window_tokens),
             Err(_) => return json_response(400, &json::error_body("context window is invalid")),
         };
-        let task_reasoning_effort = match body.get("task_reasoning_effort") {
-            None => existing
+        let task_reasoning_effort = match optional_task_reasoning_effort(body) {
+            Ok(Some(effort)) => effort,
+            Ok(None) => existing
                 .as_ref()
                 .and_then(|profile| profile.task_reasoning_effort),
-            Some(Value::Null) => None,
-            Some(Value::String(value)) if value == "none" => {
-                Some(nexus_core::ReasoningEffort::Disabled)
-            }
-            Some(Value::String(value)) if value == "low" => Some(nexus_core::ReasoningEffort::Low),
-            Some(_) => {
+            Err(()) => {
                 return json_response(400, &json::error_body("task reasoning effort is invalid"));
             }
         };
@@ -1655,6 +1682,15 @@ impl Server {
             Ok(None) => existing.as_ref().and_then(|m| m.max_output_tokens),
             Err(_) => return json_response(400, &json::error_body("max output tokens is invalid")),
         };
+        let task_reasoning_effort = match optional_task_reasoning_effort(body) {
+            Ok(Some(effort)) => effort,
+            Ok(None) => existing
+                .as_ref()
+                .and_then(|entry| entry.task_reasoning_effort),
+            Err(()) => {
+                return json_response(400, &json::error_body("task reasoning effort is invalid"));
+            }
+        };
         let entry = match ModelEntry::new(id, provider, name) {
             Ok(entry) => entry,
             Err(error) => return json_response(400, &json::error_body(error.message())),
@@ -1662,6 +1698,7 @@ impl Server {
         let mut entry = entry;
         entry.context_window_tokens = context_window;
         entry.max_output_tokens = max_output;
+        entry.task_reasoning_effort = task_reasoning_effort;
         entry.context_management = existing.and_then(|entry| entry.context_management);
         if let Err(error) = config.upsert_model(entry) {
             return json_response(400, &json::error_body(error.message()));
@@ -2283,6 +2320,8 @@ enum Route<'a> {
     Events { session: &'a str, run: &'a str },
     /// `GET /config`: the redacted configuration summary.
     Config,
+    /// `POST /config/thinking`: update the inherited task-generation default.
+    UpdateThinking,
     /// `POST /config/favourites` with `{"id": "<model id>"}`.
     AddFavourite,
     /// `DELETE /config/favourites/{mid}`.
@@ -2332,6 +2371,7 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
         },
         ("GET", ["", "sessions", session, "runs", run, "events"]) => Route::Events { session, run },
         ("GET", ["", "config"]) => Route::Config,
+        ("POST", ["", "config", "thinking"]) => Route::UpdateThinking,
         ("POST", ["", "config", "favourites"]) => Route::AddFavourite,
         // An empty trailing segment is a malformed path, not a request to
         // remove the empty id: `/config/favourites/` must not reach the
@@ -2353,6 +2393,24 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
 /// Extracts one string field from a JSON object body.
 fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
     body.get(key)?.as_str()
+}
+
+/// Distinguishes an omitted update from explicitly clearing an override.
+fn optional_task_reasoning_effort(
+    body: &Value,
+) -> Result<Option<Option<nexus_core::ReasoningEffort>>, ()> {
+    match body.get("task_reasoning_effort") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) if value == "inherit" => Ok(Some(None)),
+        Some(Value::String(value)) if value == "none" => {
+            Ok(Some(Some(nexus_core::ReasoningEffort::Disabled)))
+        }
+        Some(Value::String(value)) if value == "low" => {
+            Ok(Some(Some(nexus_core::ReasoningEffort::Low)))
+        }
+        Some(_) => Err(()),
+    }
 }
 
 type SelectedIdentities<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>);

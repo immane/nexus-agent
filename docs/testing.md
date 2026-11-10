@@ -33,6 +33,11 @@ reasoning, explicit summary-hint precedence, unchanged generation caps, endpoint
 rejection before network I/O, and preservation/clearing through configuration
 updates. They verify request encoding, not a live model's compliance or repair
 quality. Benchmark launcher tests separately verify experiment metadata.
+Layered-thinking regressions additionally cover model/provider/global precedence,
+canonical inheritance, atomic rejection of incompatible model/provider changes,
+global HTTP updates, inherited unsupported-adapter rejection in both Server and
+TUI resolution, and per-run TUI snapshots. Web Node tests cover hydration without
+writes, explicit setting/clearing, authentication, busy state and save errors.
 
 ```sh
 cargo fmt --all --check

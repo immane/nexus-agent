@@ -105,6 +105,7 @@
     <nav class="settings-nav" aria-label="Settings categories">
       <button type="button" data-settings-section="appearance-panel" aria-controls="appearance-panel" aria-current="page">Appearance</button>
       <button type="button" data-settings-section="connection-form" aria-controls="connection-form">Connection</button>
+      <button type="button" data-settings-section="thinking-form" aria-controls="thinking-form">Thinking</button>
       <button type="button" data-settings-section="projects-block" aria-controls="projects-block">Projects</button>
       <button type="button" data-settings-section="providers-block" aria-controls="providers-block">Providers</button>
       <button type="button" data-settings-section="models-block" aria-controls="models-block">Models</button>
@@ -135,6 +136,18 @@
         <button id="disconnect" type="button" disabled>Disconnect</button>
       </div>
       <p class="dialog-status status" id="connection-detail" role="status">No request made yet.</p>
+    </form>
+    <form class="settings-panel" id="thinking-form" aria-labelledby="thinking-title" hidden>
+      <h3 id="thinking-title">Task thinking</h3>
+      <label for="task-thinking">Task thinking</label>
+      <select id="task-thinking" aria-describedby="thinking-hint">
+        <option value="inherit">Default (inherit)</option>
+        <option value="low">On (low effort)</option>
+        <option value="none">Off</option>
+      </select>
+      <p class="hint" id="thinking-hint">Default leaves existing behavior unchanged. Model overrides provider, which overrides this global setting. On requests low effort, but may merely enable thinking. Overrides currently support only detected Ollama endpoints using Direct / Chat Completions; other selected adapters reject an effective override. Changes apply to new Web sessions only. This does not show or hide reasoning, delete history, or change summary thinking.</p>
+      <div class="dialog-actions"><button class="primary" id="save-thinking" type="submit">Save thinking</button></div>
+      <p class="dialog-status status" id="thinking-status" role="status"></p>
     </form>
     <section class="settings-panel" id="projects-block" aria-labelledby="projects-title" hidden>
       <h3 id="projects-title">Projects</h3>
@@ -177,6 +190,13 @@
             <div><label for="provider-context-window">Context window <span class="muted">(optional)</span></label><input id="provider-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
           </div>
           <p class="hint">The provider window applies only to its default model; model entries can override it.</p>
+          <label for="provider-task-thinking">Task thinking <span class="muted">(optional override)</span></label>
+          <select id="provider-task-thinking" aria-describedby="provider-thinking-hint">
+            <option value="inherit">Default (inherit)</option>
+            <option value="low">On (low effort)</option>
+            <option value="none">Off</option>
+          </select>
+          <p class="hint" id="provider-thinking-hint">Inherit uses the global setting. Model overrides take priority. Only detected Ollama / Direct / Chat Completions supports overrides; low effort may merely enable thinking. Applies to new Web sessions.</p>
           <div class="dialog-actions">
             <button class="primary" id="save-provider" type="submit">Save provider</button>
             <button id="new-provider" type="button">New provider</button>
@@ -200,6 +220,13 @@
             <div><label for="model-context-window">Context window <span class="muted">(optional)</span></label><input id="model-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
             <div><label for="model-max-output">Max output tokens <span class="muted">(optional)</span></label><input id="model-max-output" type="number" min="1" step="1" autocomplete="off" placeholder="8192"></div>
           </div>
+          <label for="model-task-thinking">Task thinking <span class="muted">(optional override)</span></label>
+          <select id="model-task-thinking" aria-describedby="model-thinking-hint">
+            <option value="inherit">Default (inherit)</option>
+            <option value="low">On (low effort)</option>
+            <option value="none">Off</option>
+          </select>
+          <p class="hint" id="model-thinking-hint">Inherit uses the provider setting, then the global setting. Only detected Ollama / Direct / Chat Completions supports overrides; low effort may merely enable thinking. Applies to new Web sessions.</p>
           <div class="dialog-actions">
             <button class="primary" id="save-model" type="submit">Save model</button>
             <button id="new-model" type="button">New model</button>

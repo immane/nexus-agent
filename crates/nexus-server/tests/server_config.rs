@@ -1007,3 +1007,79 @@ fn task_reasoning_effort_is_persisted_preserved_on_form_edits_and_explicitly_cle
     );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+#[test]
+fn global_task_thinking_is_opt_in_persisted_and_rejected_on_unsupported_selection() {
+    let path = temp_config("global-thinking");
+    let port = spawn_server(configured(resolvable_probe()), Some(path.clone()));
+    let (_, before) = get(port, "/config");
+    assert!(before.get("task_reasoning_effort").is_none());
+    create_bound_session(port, r#"{"provider":"acme","model":"fast"}"#);
+    for value in ["low", "none"] {
+        let (status, summary) = post(
+            port,
+            "/config/thinking",
+            &format!(r#"{{"task_reasoning_effort":"{value}"}}"#),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(summary["task_reasoning_effort"], value);
+        assert_eq!(
+            read_back(&path).task_reasoning_effort().unwrap().as_str(),
+            value
+        );
+        let (status, _) = post(port, "/sessions", r#"{"provider":"acme","model":"fast"}"#);
+        assert_eq!(
+            status, 400,
+            "effective global choice cannot silently disappear on unsupported adapters"
+        );
+    }
+    for body in [
+        "{}",
+        r#"{"task_reasoning_effort":true}"#,
+        r#"{"task_reasoning_effort":"PRIVATE_INVALID"}"#,
+        r#"{"task_reasoning_effort":"low","unexpected":true}"#,
+    ] {
+        let (status, reply) = post(port, "/config/thinking", body);
+        assert_eq!(status, 400);
+        assert!(!reply.to_string().contains("PRIVATE"));
+        assert_eq!(
+            read_back(&path).task_reasoning_effort(),
+            Some(nexus_core::ReasoningEffort::Disabled)
+        );
+    }
+    let (status, summary) = post(
+        port,
+        "/config/models",
+        r#"{"id":"fast","task_reasoning_effort":"low"}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(summary["models"][0]["task_reasoning_effort"], "low");
+    let (status, summary) = post(port, "/config/models", r#"{"id":"fast","name":"renamed"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(summary["models"][0]["task_reasoning_effort"], "low");
+    let (status, summary) = post(
+        port,
+        "/config/models",
+        r#"{"id":"fast","task_reasoning_effort":"inherit"}"#,
+    );
+    assert_eq!(status, 200);
+    assert!(summary["models"][0].get("task_reasoning_effort").is_none());
+    assert_eq!(
+        read_back(&path)
+            .task_reasoning_effort_for("acme", Some("fast"))
+            .unwrap(),
+        Some(nexus_core::ReasoningEffort::Disabled)
+    );
+    let (status, summary) = post(
+        port,
+        "/config/thinking",
+        r#"{"task_reasoning_effort":"inherit"}"#,
+    );
+    assert_eq!(status, 200);
+    assert!(summary.get("task_reasoning_effort").is_none());
+    assert_eq!(read_back(&path).task_reasoning_effort(), None);
+    create_bound_session(port, r#"{"provider":"acme","model":"fast"}"#);
+    assert_eq!(get(port, "/config/thinking").0, 404);
+    assert_eq!(delete(port, "/config/thinking").0, 404);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

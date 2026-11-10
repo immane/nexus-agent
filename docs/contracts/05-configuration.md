@@ -104,29 +104,55 @@ images; it never pulls or builds them.
 
 ### Provider task reasoning effort
 
-In the revision-2 user-config document, a provider entry may optionally set
-`"task_reasoning_effort": "none"` or `"task_reasoning_effort": "low"`.
-Omission preserves provider defaults and is omitted on save; explicit `null`,
-non-string values, and other strings are rejected. An explicit setting requires
-`"adapter": "direct"` and `"protocol": "chat_completions"`.
+The optional `task_reasoning_effort` field is supported at the user-config root,
+on a provider, and on a model entry. It controls newly generated task thinking,
+not display or historical replay. The default is inheritance at every level:
+old documents retain their existing behavior and no new field is sent on the
+wire merely because this feature exists.
+
+| Value | Meaning |
+| --- | --- |
+| omitted or `"inherit"` | Inherit the next lower-priority setting; at the root, preserve adapter defaults |
+| `"low"` | Request thinking at low effort; boolean-only models may simply enable thinking |
+| `"none"` | Request no thinking output, where the model permits it |
+
+Resolution order is **selected model entry > provider > global > adapter
+default**. Existing provider overrides therefore retain priority over a new
+global choice. When no model entry id is selected, only provider/global values
+are used; vendor names are not guessed to match model entry ids. The canonical
+saved representation omits inherited fields. Explicit `null`, non-string values,
+and other strings are rejected in stored documents.
+
+For example, adding `"task_reasoning_effort": "none"` to a single model entry
+affects only that model's new bindings, without changing other providers. Putting
+the same field at the root supplies a global fallback to all inheriting models.
+Leave it omitted (or `"inherit"`) to keep the current installation unchanged.
 
 Only detected Ollama Chat Completions endpoints currently support this fallback;
-the adapter enforces endpoint support. It applies only when a request has no
+explicit provider/model overrides require `"adapter": "direct"` and
+`"protocol": "chat_completions"`. An effective global override on an unsupported
+selected adapter also fails explicitly, rather than being silently ignored.
+The adapter enforces endpoint support. The fallback applies only when a request has no
 explicit reasoning hint. Summary requests retain their explicit hint regardless
-of this provider setting. `"none"` requests disabled thinking, whereas `"low"`
-requests lower effort and may still mean thinking is on for the selected model.
+of these settings.
 Neither setting guarantees a strict reasoning-token or time bound, and no
 measured performance or task-quality improvement is claimed. The independent
 `show_reasoning` preference only controls local display of returned reasoning;
 it does not enable or disable model thinking.
 
-The redacted configuration summary includes this field only when configured.
-Provider updates through `POST /config/providers` preserve an omitted field;
-an explicit `null` clears it (unlike the stored document, which omits unset
-fields). Existing Web form edits therefore preserve the configured choice even
-though the form has no reasoning-effort control. Configuration changes apply to
-new sessions; existing adapter bindings are unchanged. Historical accepted
-reasoning remains archived and replayed by the existing adapter behavior.
+The redacted configuration summary includes each field only when configured.
+`POST /config/thinking` requires exactly one `task_reasoning_effort` field and
+sets the global choice. Provider/model updates through `POST /config/providers`
+and `POST /config/models` preserve an omitted field. Explicit `"inherit"` or
+`null` clears an API override (unlike stored documents, which omit unset fields).
+Authenticated Web Settings exposes the global choice and provider/model
+overrides. Configuration writes retain the existing save-failure behavior:
+an error reports failed durability even if the in-memory update is already live.
+
+Changes apply to new Web sessions; existing adapter bindings are unchanged.
+The TUI resolves the same precedence from its per-run selection snapshot;
+restart it to load external configuration-file edits. Historical accepted
+reasoning remains archived and encoded by the existing adapter behavior.
 
 For Ollama 0.32.14, the OpenAI compatibility conversion maps `"none"` to
 `think=false`; model support and actual compliance must still be verified.

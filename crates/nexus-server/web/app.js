@@ -23,6 +23,10 @@ const dom = {
   disconnect: document.querySelector('#disconnect'),
   connectionStatus: document.querySelector('#connection-status'),
   connectionDetail: document.querySelector('#connection-detail'),
+  thinkingForm: document.querySelector('#thinking-form'),
+  taskThinking: document.querySelector('#task-thinking'),
+  saveThinking: document.querySelector('#save-thinking'),
+  thinkingStatus: document.querySelector('#thinking-status'),
   project: document.querySelector('#project'),
   composerProject: document.querySelector('.composer-project'),
   projectLabel: document.querySelector('#project-label'),
@@ -47,6 +51,7 @@ const dom = {
   providerCredentialName: document.querySelector('#provider-credential-name'),
   providerDefaultModel: document.querySelector('#provider-default-model'),
   providerContextWindow: document.querySelector('#provider-context-window'),
+  providerTaskThinking: document.querySelector('#provider-task-thinking'),
   saveProvider: document.querySelector('#save-provider'),
   newProvider: document.querySelector('#new-provider'),
   providerStatus: document.querySelector('#provider-status'),
@@ -57,6 +62,7 @@ const dom = {
   modelName: document.querySelector('#model-name'),
   modelContextWindow: document.querySelector('#model-context-window'),
   modelMaxOutput: document.querySelector('#model-max-output'),
+  modelTaskThinking: document.querySelector('#model-task-thinking'),
   saveModel: document.querySelector('#save-model'),
   newModel: document.querySelector('#new-model'),
   modelStatus: document.querySelector('#model-status'),
@@ -91,6 +97,7 @@ const state = {
   connecting: false,
   credential: '',
   config: null,
+  thinkingSaving: false,
   choices: [],
   selection: null,
   projects: null,
@@ -773,6 +780,7 @@ function resetProviderForm() {
   dom.providerCredentialName.value = '';
   dom.providerDefaultModel.value = '';
   dom.providerContextWindow.value = '';
+  dom.providerTaskThinking.value = 'inherit';
   setFormStatus(dom.providerStatus, '');
 }
 
@@ -793,6 +801,7 @@ function editProvider(id) {
   dom.providerCredentialName.value = credential.stored || credential.env || '';
   dom.providerDefaultModel.value = provider.default_model || '';
   dom.providerContextWindow.value = provider.context_window_tokens ?? '';
+  dom.providerTaskThinking.value = provider.task_reasoning_effort ?? 'inherit';
   setFormStatus(dom.providerStatus, `Editing ${provider.display_name || provider.id}.`);
 }
 
@@ -803,6 +812,7 @@ function resetModelForm() {
   dom.modelName.value = '';
   dom.modelContextWindow.value = '';
   dom.modelMaxOutput.value = '';
+  dom.modelTaskThinking.value = 'inherit';
   if (dom.modelProvider.options.length) dom.modelProvider.selectedIndex = 0;
   setFormStatus(dom.modelStatus, '');
 }
@@ -819,10 +829,12 @@ function editModel(id) {
   dom.modelName.value = model.name || '';
   dom.modelContextWindow.value = model.context_window_tokens ?? '';
   dom.modelMaxOutput.value = model.max_output_tokens ?? '';
+  dom.modelTaskThinking.value = model.task_reasoning_effort ?? 'inherit';
   setFormStatus(dom.modelStatus, `Editing ${model.name || model.id}.`);
 }
 
-function renderConfigEditors() {
+function renderConfigEditors({ hydrateThinking = false } = {}) {
+  if (hydrateThinking) dom.taskThinking.value = state.config?.task_reasoning_effort ?? 'inherit';
   renderProjectsList();
   renderSidebarProjects();
   renderProviderList();
@@ -982,7 +994,7 @@ async function connect(candidate) {
     populateModels();
     populateProjects();
     renderSidebarProjects();
-    renderConfigEditors();
+    renderConfigEditors({ hydrateThinking: true });
     dom.token.value = '';
     setConnectionStatus('Connected', 'ok');
     updateConnectionDetail();
@@ -1332,6 +1344,8 @@ function updateControls() {
   dom.cancel.textContent = state.cancelling || state.cancelRequested ? 'Cancelling…' : 'Cancel';
   dom.connect.disabled = state.connecting;
   dom.disconnect.disabled = !connected || busy;
+  dom.taskThinking.disabled = !connected || state.thinkingSaving;
+  dom.saveThinking.disabled = !connected || state.thinkingSaving;
   dom.message.placeholder = !connected
     ? 'Connect to start a task…'
     : blocked
@@ -3077,6 +3091,33 @@ dom.projectForm.addEventListener('submit', async (event) => {
 dom.newProvider.addEventListener('click', resetProviderForm);
 dom.newModel.addEventListener('click', resetModelForm);
 
+dom.thinkingForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!state.connected || state.thinkingSaving) return;
+  const effort = dom.taskThinking.value;
+  state.thinkingSaving = true;
+  updateControls();
+  setFormStatus(dom.thinkingStatus, 'Saving thinking…', 'busy');
+  try {
+    const summary = await api('/config/thinking', {
+      method: 'POST',
+      body: { task_reasoning_effort: effort },
+    });
+    state.config = summary;
+    updateConnectionDetail();
+    populateModels();
+    renderConfigEditors({ hydrateThinking: true });
+    setFormStatus(dom.thinkingStatus, 'Saved task thinking. Changes apply to new Web sessions.', 'ok');
+    updateSessionDisplay();
+  } catch (error) {
+    setFormStatus(dom.thinkingStatus, error.message, 'error');
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+  } finally {
+    state.thinkingSaving = false;
+    updateControls();
+  }
+});
+
 dom.providerForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const id = dom.providerId.value.trim();
@@ -3110,6 +3151,7 @@ dom.providerForm.addEventListener('submit', async (event) => {
         credential,
         default_model: defaultModel,
         context_window_tokens: contextWindow,
+        task_reasoning_effort: dom.providerTaskThinking.value,
       },
     });
     state.config = summary;
@@ -3158,6 +3200,7 @@ dom.modelForm.addEventListener('submit', async (event) => {
         name,
         context_window_tokens: contextWindow,
         max_output_tokens: maxOutput,
+        task_reasoning_effort: dom.modelTaskThinking.value,
       },
     });
     state.config = summary;

@@ -698,7 +698,20 @@ fn resolve_live_adapter(
             "selected model context configuration is invalid",
         );
     };
-    match OpenAiProvider::from_profile(profile, &entry.name)
+    let mut profile = profile.clone();
+    profile.task_reasoning_effort = match selection
+        .config
+        .task_reasoning_effort_for(&entry.provider, Some(model_id))
+    {
+        Ok(effort) => effort,
+        Err(_) => {
+            return LiveResolve::Failed(
+                ErrorCategory::InvalidInput,
+                "selected model thinking configuration is invalid",
+            );
+        }
+    };
+    match OpenAiProvider::from_profile(&profile, &entry.name)
         .and_then(|adapter| adapter.with_operational_settings(&selection.provider_settings))
     {
         Ok(adapter) => {
@@ -999,6 +1012,14 @@ impl ProviderPort for PerRunProvider {
             let Some(profile) = selection.config.provider(&entry.provider) else {
                 return (settings, None);
             };
+            let mut profile = profile.clone();
+            profile.task_reasoning_effort = match selection
+                .config
+                .task_reasoning_effort_for(&entry.provider, Some(model_id))
+            {
+                Ok(effort) => effort,
+                Err(_) => return (settings, None),
+            };
             (
                 settings,
                 format!(
@@ -1011,7 +1032,7 @@ impl ProviderPort for PerRunProvider {
                         profile.protocol
                     )
                 ),
-                profile.clone(),
+                profile,
                 entry.name.clone(),
                 selection.provider_settings.clone(),
             )
@@ -10078,6 +10099,39 @@ mod cov_live_wiring {
             provider.context_management(),
             nexus_core::ContextManagementSettings::default()
         );
+    }
+
+    #[test]
+    fn inherited_task_thinking_reaches_live_resolution_without_changing_default_behavior() {
+        let mut selected = selection_with(Some("m0"));
+        assert!(matches!(
+            resolve_live_adapter(&selected, |_| Some("fixture".into())),
+            LiveResolve::Live(_)
+        ));
+        selected
+            .config
+            .set_task_reasoning_effort(Some(nexus_core::ReasoningEffort::Disabled));
+        // This endpoint is deliberately not Ollama. Reject before any connection
+        // instead of silently ignoring the inherited task-generation override.
+        assert!(matches!(
+            resolve_live_adapter(&selected, |_| Some("fixture".into())),
+            LiveResolve::Failed(ErrorCategory::InvalidInput, "selected provider is invalid")
+        ));
+        let mut latest = selected.clone();
+        latest.config.set_task_reasoning_effort(None);
+        latest.pending_run = Some(Box::new(selected));
+        let binding = Arc::new(Mutex::new(latest));
+        let run = RunId::new("thinking-snapshot").unwrap();
+        let snapshot = take_selection_for_run(&binding, &run);
+        assert_eq!(
+            snapshot.config.task_reasoning_effort(),
+            Some(nexus_core::ReasoningEffort::Disabled)
+        );
+        assert!(matches!(
+            resolve_live_adapter(&snapshot, |_| Some("fixture".into())),
+            LiveResolve::Failed(ErrorCategory::InvalidInput, "selected provider is invalid")
+        ));
+        assert_eq!(binding.lock().unwrap().config.task_reasoning_effort(), None);
     }
 
     #[test]
