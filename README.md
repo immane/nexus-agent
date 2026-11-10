@@ -3,7 +3,7 @@
 **Fast to start. Small by design. Open to extension.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.6--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
+[![Stage: Alpha](https://img.shields.io/badge/Stage-0.2.7--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent with live model integrations, native terminal sessions,
 coding tools, and optional container execution. Designed around very fast startup
@@ -19,7 +19,7 @@ not an ever-growing engine. External plugins remain planned.
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.2.6-alpha**, with the scoped M0–M4 gates complete over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **The scoped M0–M4 gates are complete for their recorded scopes; Beta readiness and cross-platform production/security readiness are not claimed.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.2.7-alpha**, with the scoped M0–M4 gates complete over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist source and tool-operation records, but has no HTTP restore API. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **The scoped M0–M4 gates are complete for their recorded scopes; Beta readiness and cross-platform production/security readiness are not claimed.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
 
 ## Vision
 
@@ -574,7 +574,7 @@ M1–M5 migration gates above.
 - [ ] Recovery of active execution; restoring history does not resume processes or replay uncertain tool calls.
 - [ ] Semantic IR, graph/vector retrieval, and LoRA research components; these remain a vision, not shipped features.
 
-Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The **0.2.6-alpha** version is not a stable-release or production-readiness claim.
+Windows and untrusted-plugin isolation are separate follow-up work. Build from source with `cargo build --workspace --release --locked --offline` (produces `nexus-headless`, `nexus-tui`, and `nexus-server` once dependencies are cached). The **0.2.7-alpha** version is not a stable-release or production-readiness claim.
 
 ## Documentation and Contributions
 
