@@ -856,47 +856,120 @@ p {
 .tool-card {
   min-width: 0;
   border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 55%, var(--bg));
+  overflow: hidden;
 }
 
-.tool-card summary {
+.tool-card + .tool-card {
+  margin-top: -14px;
+}
+
+.tool-card > summary {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 11px 14px;
+  gap: 9px;
+  padding: 10px 12px;
   cursor: pointer;
   list-style: none;
 }
 
-.tool-card summary::-webkit-details-marker {
+.tool-card > summary::-webkit-details-marker {
   display: none;
 }
 
-.tool-card summary::before {
+.tool-card > summary::after {
   content: "›";
   color: var(--muted);
   transition: transform 120ms ease;
 }
 
-.tool-card[open] summary::before {
+.tool-card[open] > summary::after {
   transform: rotate(90deg);
 }
 
-.tool-card[open] summary {
+.tool-card[open] > summary {
   border-bottom: 1px solid var(--line);
 }
 
 .tool-name {
+  flex: none;
+  max-width: 35%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tool-icon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: var(--raised);
+  color: var(--muted);
+}
+
+.tool-target {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
+  color: var(--muted);
+  font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.tool-card[data-state="running"] .tool-icon {
+  color: var(--warning);
+  animation: blink 1.6s ease-in-out infinite;
+}
+
+.tool-card[data-state="error"] {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+}
+
+.tool-card[data-kind="exec"] {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.tool-card[data-kind="exec"] > summary {
+  padding: 4px 0;
+  border: 0;
+}
+
+.tool-card[data-kind="exec"] .tool-name {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.tool-card[data-kind="exec"] .tool-target {
+  color: var(--fg);
+}
+
+.tool-card[data-kind="exec"][data-state="running"] .tool-name {
+  color: var(--warning);
+  animation: blink 1.6s ease-in-out infinite;
+}
+
+.tool-card[data-kind="exec"] .tool-body {
+  padding: 10px 0 8px 20px;
+}
+
+.tool-card[data-kind="exec"] pre {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .tool-status {
+  flex: none;
   margin-left: auto;
   color: var(--muted);
   font-size: 10px;
@@ -931,7 +1004,52 @@ p {
   color: var(--muted);
   font-size: 9px;
   font-weight: 600;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.tool-arguments > summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tool-arguments pre {
+  margin-top: 8px;
+}
+
+.tool-code {
+  padding: 6px 0;
+  counter-reset: tool-line;
+}
+
+.tool-code-line {
+  display: block;
+  position: relative;
+  min-height: 1.55em;
+  padding: 0 12px 0 52px;
+  counter-increment: tool-line;
+}
+
+.tool-code-line::before {
+  content: counter(tool-line);
+  position: absolute;
+  left: 8px;
+  width: 28px;
+  text-align: right;
+  color: var(--muted);
+  user-select: none;
+}
+
+.tool-code.added {
+  border-left: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 45%, var(--code-bg));
+}
+
+.tool-code.removed {
+  border-left: 2px solid var(--danger);
+  background: color-mix(in srgb, var(--danger-soft) 45%, var(--code-bg));
 }
 
 pre {

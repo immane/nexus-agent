@@ -1924,6 +1924,61 @@ function appendContextNotice(detail) {
 
 /* Tools */
 
+function toolPresentation(tool, preview) {
+  let args;
+  try {
+    const text = typeof preview === 'string' ? preview.trim() : '';
+    args = JSON.parse(text.startsWith(`${tool} `) ? text.slice(tool.length + 1) : text);
+  } catch {
+    // Previews may be truncated; keep the original text available below.
+  }
+  const result = tool === 'host_exec'
+    ? { label: 'RUN', target: 'Command preview unavailable', kind: 'exec', sections: [] }
+    : { label: tool, target: '', kind: 'generic', sections: [] };
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return result;
+  if (tool === 'host_exec' && Array.isArray(args.argv)
+    && args.argv.length && args.argv.every((arg) => typeof arg === 'string')) {
+    const command = args.argv.map((arg) => /^[\w./:=@%+,-]+$/.test(arg)
+      ? arg : `'${arg.replaceAll("'", "'\\''")}'`).join(' ');
+    return {
+      label: 'RUN', target: command, kind: 'exec',
+      sections: [{ label: 'Command', text: command }],
+      directory: typeof args.write_dir === 'string' ? args.write_dir : '',
+    };
+  }
+  if ((tool === 'host_write' || tool === 'host_patch') && typeof args.path === 'string') {
+    result.label = tool === 'host_write' ? 'Write' : 'Edit';
+    result.target = args.path;
+    result.kind = tool === 'host_write' ? 'write' : 'patch';
+    if (tool === 'host_write' && typeof args.content === 'string') {
+      result.sections.push({ label: 'File content', text: args.content, style: 'added' });
+    } else if (tool === 'host_patch') {
+      if (typeof args.old_text === 'string') {
+        result.sections.push({ label: 'Replace', text: args.old_text, style: 'removed' });
+      }
+      if (typeof args.new_text === 'string') {
+        result.sections.push({ label: 'With', text: args.new_text, style: 'added' });
+      }
+    }
+  }
+  return result;
+}
+
+function appendToolSection(body, section) {
+  const root = node('div', 'tool-section');
+  root.append(node('span', 'tool-label', section.label));
+  const pre = node('pre', section.style ? `tool-code ${section.style}` : 'tool-command');
+  const text = clip(section.text, MAX_TOOL_CHARS);
+  if (section.style) {
+    for (const line of text.split('\n')) pre.append(node('span', 'tool-code-line', line));
+  } else {
+    pre.textContent = text;
+  }
+  root.append(pre);
+  if (text.length < section.text.length) root.append(node('span', 'inline-warning', 'Preview truncated in this view'));
+  body.append(root);
+}
+
 function startTool(detail) {
   const call = String(detail.call ?? '');
   if (!call || state.tools.has(call)) return;
@@ -1937,18 +1992,31 @@ function startTool(detail) {
   setRunStatus(`Running tool: ${toolName}`, 'busy');
 
   const root = node('details', 'tool-card');
-  root.open = true;
+  root.dataset.state = 'running';
+  const presentation = toolPresentation(toolName, detail.args_preview);
+  root.open = presentation.kind !== 'exec';
+  root.dataset.kind = presentation.kind;
   const summary = node('summary');
-  summary.append(node('span', 'tool-name', toolName));
+  const icon = node('span', 'tool-icon', presentation.kind === 'exec' ? '⌘' : presentation.kind === 'generic' ? '◇' : '✎');
+  icon.setAttribute('aria-hidden', 'true');
+  if (presentation.kind !== 'exec') summary.append(icon);
+  summary.append(node('span', 'tool-name', presentation.label));
+  if (presentation.target) {
+    const target = node('span', 'tool-target', clip(presentation.target, 500));
+    target.title = clip(presentation.target, MAX_TOOL_CHARS);
+    summary.append(target);
+  }
   const status = node('span', 'tool-status', 'Running');
   status.dataset.state = 'running';
   summary.append(status);
   root.append(summary);
 
   const body = node('div', 'tool-body');
+  for (const section of presentation.sections) appendToolSection(body, section);
+  if (presentation.directory) body.append(node('div', 'tool-meta', `Write directory: ${presentation.directory}`));
   if (typeof detail.args_preview === 'string' && detail.args_preview) {
-    const section = node('div', 'tool-section');
-    section.append(node('span', 'tool-label', 'ARGUMENTS'));
+    const section = node('details', 'tool-arguments');
+    section.append(node('summary', '', `Raw arguments · ${toolName}`));
     section.append(node('pre', '', clip(detail.args_preview, MAX_TOOL_CHARS)));
     body.append(section);
   }
@@ -1965,7 +2033,7 @@ function startTool(detail) {
   root.append(body);
   appendNode(root);
 
-  state.tools.set(call, {
+  const record = {
     root,
     status,
     outputSection,
@@ -1974,7 +2042,10 @@ function startTool(detail) {
     chars: 0,
     truncated: false,
     finished: false,
-  });
+    userToggled: false,
+  };
+  summary.addEventListener('click', () => { record.userToggled = true; });
+  state.tools.set(call, record);
 }
 
 function updateToolOutput(detail) {
@@ -2023,8 +2094,9 @@ function finishTool(detail) {
     : status === 'TimedOut' ? 'Timed out'
       : status;
   setStatus(record.status, label, tone);
+  record.root.dataset.state = tone;
   setRunStatus(`Tool finished: ${label}`, tone === 'error' ? 'error' : 'busy');
-  record.root.open = tone !== 'ok';
+  if (!record.userToggled || tone !== 'ok') record.root.open = tone !== 'ok';
 
   record.meta.replaceChildren();
   if (typeof outcome.effect === 'string') record.meta.append(node('span', '', `Effect: ${outcome.effect}`));
@@ -2037,6 +2109,8 @@ function markUnfinishedTools() {
   for (const record of state.tools.values()) {
     if (!record.finished) {
       setStatus(record.status, 'No final result received', 'error');
+      record.root.dataset.state = 'error';
+      record.root.open = true;
       record.meta.append(node('span', '', 'The run finished before this call reported a result'));
     }
   }
