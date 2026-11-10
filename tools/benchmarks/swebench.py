@@ -21,7 +21,7 @@ import uuid
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from run_nexus_swe_task import request, write_json
+from run_nexus_swe_task import read_page_bytes, request, write_json
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -359,6 +359,7 @@ def launch(args, profiles, task):
                 "endpoint": provider["endpoint"], "config_sha256": hashlib.sha256(args.config.read_bytes()).hexdigest(),
                 "effective_config_sha256": hashlib.sha256(server_config.read_bytes()).hexdigest(),
                 "model_output_tokens": model.get("max_output_tokens"),
+                "prompt_config": {"read_page_bytes": args.read_page_bytes},
                 "limits": {"model_turns": 500, "tool_calls": args.max_tool_calls, "run_seconds": args.max_run_seconds,
                            "input_tokens": None, "output_tokens": None}, "evaluation": "not-run"}
     write_json(run / "launch.json", manifest)
@@ -432,6 +433,8 @@ def launch(args, profiles, task):
                   "--nexus-revision", revision + "+diff-" + manifest["working_diff_sha256"],
                   "--run-label", task["exposure"] + "; network-disabled", "--max-run-seconds", str(args.max_run_seconds),
                   "--max-tool-calls", str(args.max_tool_calls), "--tool-log-bytes", str(args.tool_log_bytes)]
+        if args.read_page_bytes is not None:
+            runner += ["--read-page-bytes", str(args.read_page_bytes)]
         if profiles.get("context_window_tokens") and model_id == profiles["model"] and provider_id == profiles["provider"]:
             runner += ["--context-window-tokens", str(profiles["context_window_tokens"])]
         manifest["runner_argv"] = runner
@@ -511,6 +514,8 @@ def main():
     parser.add_argument("--port", type=int, default=0, help="0 selects a free loopback port")
     parser.add_argument("--max-run-seconds", type=int, default=86400)
     parser.add_argument("--max-tool-calls", type=int, default=4096)
+    parser.add_argument("--read-page-bytes", type=read_page_bytes,
+                        help="opt-in bounded ingestion prompt guidance; page size in 4..16384 bytes")
     parser.add_argument("--tool-log-bytes", type=int, default=8192,
                         help="redacted tool content preview bytes per event; 0 disables content logging")
     parser.add_argument("--prepare-only", action="store_true", help="verify preparation/network and clean up; no inference")

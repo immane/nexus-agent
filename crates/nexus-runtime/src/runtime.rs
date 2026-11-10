@@ -1606,6 +1606,13 @@ impl Runtime {
             let raw_estimated_input_tokens = Some(estimator.raw_estimate(&request));
             let estimated_input_tokens = Some(estimator.estimate(&request));
             let estimate_scale_millis = estimator.scale_millis();
+            context_compaction::diagnose_budget(
+                &self.shared,
+                active,
+                &request,
+                "dispatch",
+                purpose,
+            );
             active.last_usage = None;
             active.published_usage = None;
             let started_payload = EventPayload::ModelRequestStarted {
