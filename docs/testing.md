@@ -29,6 +29,15 @@ writer. The default scripted headless runner retains its existing stderr
 contract; `nexus-headless` CLI tests cover separate and merged streams and a
 closed stdout pipe without relaxing their output assertions.
 
+Runtime eager-output-preview regressions cover a 128 KiB old warning log under
+large and unknown windows, an untouched latest complete exchange, preserved
+unknown effects/arguments/reasoning, unchanged source records, no extra summary
+calls, and opaque continuation bypass. A synthetic multi-turn replay compares
+cumulative estimates, not measured provider usage. Emergency-preview coverage
+also verifies that original truncation provenance survives the cheaper initial
+preview path. Existing reduction fixtures retain non-output pressure so their
+uncertainty-pinning and actual compaction assertions remain exercised.
+
 The opt-in provider `task_reasoning_effort` setting has offline coverage in
 `nexus-config`'s `task_reasoning_effort` test target, `nexus-openai`'s
 `reasoning_effort_tests`, and the existing server configuration integration

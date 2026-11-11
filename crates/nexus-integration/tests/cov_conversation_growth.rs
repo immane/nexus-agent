@@ -997,9 +997,8 @@ fn aggregate_byte_pressure_evicts_oldest_exchanges_and_completes() {
         }
         let last = requests.last().expect("at least one request");
         assert!(
-            payload_bytes(last) > MAX_CONVERSATION_BYTES / 2,
-            "the run really did accumulate a large conversation: {} bytes",
-            payload_bytes(last)
+            payload_bytes(last) < MAX_CONVERSATION_BYTES / 2,
+            "old result previews avoid replaying the full retained source history"
         );
         assert_eq!(
             kinds(last),
@@ -1060,16 +1059,30 @@ fn aggregate_byte_pressure_evicts_oldest_exchanges_and_completes() {
                 .collect::<Vec<_>>()
         );
         assert_eq!(result_calls(last), call_calls(last));
+        let newest_call = call_calls(last).last().unwrap().clone();
         for item in last.conversation() {
             if let ModelContextItem::ToolResult { call, outcome, .. } = item {
-                assert_eq!(
-                    outcome,
-                    &recorded
-                        .iter()
-                        .find(|(recorded_call, _)| recorded_call == call)
-                        .expect("recorded result")
-                        .1
-                );
+                let original = &recorded
+                    .iter()
+                    .find(|(recorded_call, _)| recorded_call == call)
+                    .expect("recorded result")
+                    .1;
+                if call == &newest_call {
+                    assert_eq!(outcome, original, "latest result stays complete");
+                } else {
+                    assert_eq!(outcome.status(), original.status());
+                    assert_eq!(outcome.effect(), original.effect());
+                    assert_eq!(outcome.evidence(), original.evidence());
+                    assert!(outcome.is_truncated());
+                    assert!(outcome.content().len() < 2560);
+                    assert!(outcome.content().contains("middle of tool output omitted"));
+                    assert!(outcome.content().starts_with(&original.content()[..1024]));
+                    assert!(
+                        outcome
+                            .content()
+                            .ends_with(&original.content()[original.content().len() - 1024..])
+                    );
+                }
             }
         }
     });

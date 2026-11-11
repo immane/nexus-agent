@@ -12853,7 +12853,8 @@ mod cov_runtime_topup_private {
             let reference = format!("stored-exec-reference-{n}");
             let group = vec![
                 ModelContextItem::assistant_reasoning(
-                    format!("original reasoning {n}; ").repeat(if old { 400 } else { 1 }),
+                    // Preserve summary pressure after old output bodies become previews.
+                    format!("original reasoning {n}; ").repeat(if old { 800 } else { 1 }),
                 )
                 .unwrap(),
                 ModelContextItem::assistant_call(&item, &reference, call.clone()).unwrap(),
@@ -12922,7 +12923,7 @@ mod cov_runtime_topup_private {
         // execution evidence must be host-derived, not dependent on this text.
         let summary = "Earlier operations were attempted.";
         let provider = Arc::new(ScriptedProvider::new(
-            (0..3)
+            (0..4)
                 .map(|_| stop_turn(summary))
                 .chain(std::iter::once(stop_turn("new answer")))
                 .collect(),

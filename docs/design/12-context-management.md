@@ -361,6 +361,34 @@ chunks remain staged until the complete candidate passes validation. Emergency
 tool-output previews preserve head/tail excerpts and outcome metadata without
 changing archived originals; they are not a semantic summarizer.
 
+Task request preparation now also applies deterministic old-output previews
+before testing the soft compaction threshold, including when the model window
+is unknown. Older completed tool-result bodies receive at most 2,048 bytes of
+UTF-8-safe head/tail excerpts plus an explicit omission/uncertainty notice. The
+latest complete tool group stays full unless the existing emergency headroom
+path needs to shorten it. Call arguments, required reasoning, identities,
+status/effect/evidence, and the original source conversation are unchanged.
+Opaque continuations and incompletely paired histories are not rewritten.
+
+This bounds repeated transmission of old large logs without spending summary
+calls or waiting for a large context window to become full. The previewed
+candidate is used for threshold checks, reduction selection, protected-floor
+checks, summary acceptance, and final dispatch estimates. Summary content still
+comes from original removed sources. Emergency previews also start from the
+original request rather than reinterpreting a prior preview's truncation flag.
+Request-only previews do not emit a committed `context-reduced` event; the
+existing request-start `projected_tool_outputs` counter identifies them. They
+do not remove the underlying records or replace the summary selector's
+three-recent-group retention policy.
+
+Omitted middle content is unavailable in that request. Retained source records
+remain available under existing persistence/history bounds, but this change
+adds no model-facing archive-retrieval tool. Rereading a file observes its
+current state, not necessarily its earlier contents; never re-execute an
+unknown-effect command merely to recover an omitted log. This is deterministic
+payload reduction, not proof of lower billed tokens, cache cost, or unchanged
+repair quality on arbitrary tasks. Those require matched live evaluation.
+
 #### Recommended order and acceptance boundaries
 
 | Priority | Focused change | Validation before adoption |

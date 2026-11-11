@@ -58,6 +58,11 @@ The current implementation includes adaptive request-estimate calibration and
 telemetry, plus summaries prompted to retain investigation state (`Established`,
 `Ruled out`, `Open`, `Next`). Those summaries remain untrusted model-generated
 text, not verified facts; see the implementation notes in the design document.
+Current source builds shorten older completed tool-result bodies into bounded
+head/tail previews before waiting for context pressure, reducing repeated large
+logs even with an unknown window. Original records, call metadata and required
+reasoning remain unchanged; the latest complete tool group is normally retained
+in full. This is not semantic compression or a measured token-cost guarantee.
 The exposed one-task Astropy context-retention replay completed one context
 reduction and was resolved by the official evaluator. This single result does
 not establish reduced repeated investigation or causation, and is not an overall

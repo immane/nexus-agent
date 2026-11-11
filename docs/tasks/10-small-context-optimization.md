@@ -35,6 +35,7 @@ Related documents:
 - [Benchmark observations](../research/agent-benchmarks.md).
 - [Benchmark runner](../../tools/benchmarks/README.md).
 - [Development tests](../testing.md).
+- [Tool-output and cumulative token-cost follow-up](11-tool-output-token-optimization.md).
 
 The context design document contains a dated baseline. Its statements about
 unwired persistence/restoration must not override the current implementation.
