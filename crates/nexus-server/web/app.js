@@ -2729,15 +2729,32 @@ async function decide(record, approve) {
 
 /* Usage */
 
+function usageParts() {
+  const parts = [];
+  if (state.lastUsage?.input !== null && state.lastUsage?.input !== undefined) {
+    parts.push(`${state.lastUsage.input} in`);
+  }
+  if (state.lastUsage?.output !== null && state.lastUsage?.output !== undefined) {
+    parts.push(`${state.lastUsage.output} out`);
+  }
+  if (state.lastUsage?.cacheRead !== null && state.lastUsage?.cacheRead !== undefined) {
+    parts.push(`${state.lastUsage.cacheRead} cache read`);
+  }
+  if (state.lastUsage?.cacheWrite !== null && state.lastUsage?.cacheWrite !== undefined) {
+    parts.push(`${state.lastUsage.cacheWrite} cache write`);
+  }
+  return parts;
+}
+
 function updateUsage(detail) {
   state.lastUsage = {
     input: Number.isFinite(detail.input) ? detail.input : null,
     output: Number.isFinite(detail.output) ? detail.output : null,
+    cacheRead: Number.isFinite(detail.cache_read) ? detail.cache_read : null,
+    cacheWrite: Number.isFinite(detail.cache_write) ? detail.cache_write : null,
     finality: typeof detail.finality === 'string' ? detail.finality : '',
   };
-  const parts = [];
-  if (state.lastUsage.input !== null) parts.push(`${state.lastUsage.input} in`);
-  if (state.lastUsage.output !== null) parts.push(`${state.lastUsage.output} out`);
+  const parts = usageParts();
   dom.usage.textContent = parts.length ? `Usage: ${parts.join(' / ')}` : 'Usage: unknown';
   dom.usage.hidden = false;
 }
@@ -2791,14 +2808,8 @@ function appendRunSummary(detail, fromSnapshot) {
   if (detail.persistence) {
     card.append(node('span', '', `Persistence: ${detail.persistence}`));
   }
-  const usageParts = [];
-  if (state.lastUsage?.input !== null && state.lastUsage?.input !== undefined) {
-    usageParts.push(`${state.lastUsage.input} in`);
-  }
-  if (state.lastUsage?.output !== null && state.lastUsage?.output !== undefined) {
-    usageParts.push(`${state.lastUsage.output} out`);
-  }
-  card.append(node('span', '', usageParts.length ? `Usage: ${usageParts.join(' / ')}` : 'Usage: not reported'));
+  const parts = usageParts();
+  card.append(node('span', '', parts.length ? `Usage: ${parts.join(' / ')}` : 'Usage: not reported'));
   if (detail.error && typeof detail.error === 'object') {
     const errorBlock = node('div', 'run-detail');
     errorBlock.append(node('div', '', `${detail.error.category || 'Error'} · ${retryLabel(detail.error.retry)}`));

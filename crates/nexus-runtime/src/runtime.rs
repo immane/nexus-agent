@@ -58,6 +58,7 @@ use tokio::task::JoinHandle;
 
 use crate::policy::Policy;
 use crate::transport::EventStreams;
+mod archive;
 mod context_compaction;
 #[cfg(test)]
 use crate::transport::{CONTROL_CAPACITY, DATA_CAPACITY};
@@ -634,7 +635,7 @@ impl Runtime {
     fn try_new_inner(
         config: RuntimeConfig,
         provider: Arc<dyn ProviderPort + Send + Sync>,
-        tools: Vec<ToolRegistration>,
+        mut tools: Vec<ToolRegistration>,
         instructions: ModelInstructions,
         session_store: Option<Arc<StdMutex<Box<dyn SessionStore + Send>>>>,
     ) -> Result<(Self, EventStreams), AgentError> {
@@ -648,6 +649,26 @@ impl Runtime {
                 ErrorCategory::UnsupportedCapability,
                 "provider cannot generate text",
             ));
+        }
+        if capabilities.tool_calls
+            && !config.policy.is_container()
+            && tools.len() < nexus_core::provider::MAX_TOOL_DEFINITIONS
+            && let Some(store) = session_store.clone()
+        {
+            let archive_id = ToolId::new(archive::HOST_ARCHIVE_TOOL, nexus_core::M0_REVISION)
+                .expect("static archive tool identity");
+            let already_registered = tools
+                .iter()
+                .any(|tool| tool.port().describe().id().name() == archive::HOST_ARCHIVE_TOOL);
+            if !already_registered
+                && !config
+                    .policy
+                    .requires_approval(ToolAccess::Read, &archive_id)
+            {
+                tools.push(ToolRegistration::read(Arc::new(archive::ArchivePort::new(
+                    store,
+                )?)));
+            }
         }
         if !tools.is_empty() && !capabilities.tool_calls {
             return Err(runtime_error(
@@ -3306,7 +3327,8 @@ impl Runtime {
                 scope.clone(),
             )
             .map_err(|_| Terminal::failed_internal("tool context is invalid"))?
-            .with_control(active.token.clone(), tool_deadline);
+            .with_control(active.token.clone(), tool_deadline)
+            .with_source_scope(active.session.clone(), active.run.clone());
             let intent = ToolIntentRecord {
                 run: call.run().clone(),
                 call: call.call().clone(),
@@ -4791,7 +4813,13 @@ fn merge_final_usage(last: Option<Usage>, terminal: Usage) -> Usage {
     let output = terminal
         .output_tokens()
         .or_else(|| last_final.and_then(|usage| usage.output_tokens()));
-    Usage::new(input, output, nexus_core::UsageFinality::Final)
+    let cache_read = terminal
+        .cache_read_input_tokens()
+        .or_else(|| last_final.and_then(|usage| usage.cache_read_input_tokens()));
+    let cache_write = terminal
+        .cache_write_input_tokens()
+        .or_else(|| last_final.and_then(|usage| usage.cache_write_input_tokens()));
+    Usage::new(input, output, nexus_core::UsageFinality::Final).with_cache(cache_read, cache_write)
 }
 
 fn denied_outcome(message: &'static str) -> ToolOutcome {
@@ -12444,6 +12472,217 @@ mod cov_runtime_topup_private {
             std::fs::read_to_string(directory.join("session-store.operations.jsonl")).unwrap();
         assert!(journal.contains("call-unavailable"));
         assert!(journal.contains("known_applied"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn archive_tool_turn(tool: &str, args: &str) -> Vec<ProviderEvent> {
+        let candidate =
+            CallCandidate::new("item-0", "prov-ref-0", tool, args).expect("valid candidate");
+        vec![
+            ProviderEvent::ToolCallReady(candidate),
+            ProviderEvent::TurnFinished(nexus_core::TurnFinished::new(
+                FinishReason::ToolCalls,
+                Usage::new(None, None, UsageFinality::Final),
+                None,
+            )),
+        ]
+    }
+
+    struct ArchiveFollowupProvider {
+        calls: AtomicUsize,
+    }
+
+    impl ProviderPort for ArchiveFollowupProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                text: true,
+                streaming: true,
+                tool_calls: true,
+                structured_output: false,
+                usage_reporting: false,
+                max_context_items: None,
+                max_output_bytes: None,
+            }
+        }
+
+        fn stream(&self, request: &ModelRequest, _context: &ProviderContext) -> Vec<ProviderEvent> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => archive_tool_turn("host_read", r#"{"path":"first"}"#),
+                1 => archive_tool_turn("host_read", r#"{"path":"second"}"#),
+                2 => {
+                    let output_ref = request
+                        .conversation()
+                        .iter()
+                        .find_map(|item| {
+                            let ModelContextItem::ToolResult { outcome, .. } = item else {
+                                return None;
+                            };
+                            let rest = outcome.content().split_once("output_ref=")?.1;
+                            Some(rest.split_whitespace().next()?.to_owned())
+                        })
+                        .expect("the old result carries a retrieval reference");
+                    let args =
+                        format!(r#"{{"output_ref":"{output_ref}","query":"middle-marker"}}"#);
+                    archive_tool_turn("host_archive", &args)
+                }
+                _ => stop_turn("archive inspected"),
+            }
+        }
+    }
+
+    #[test]
+    fn archive_retrieval_reads_original_source_records_for_the_active_session() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-archive-e2e-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let mut body = "a".repeat(4096);
+        body.push_str("middle-marker");
+        body.push_str(&"b".repeat(4096));
+        let body_len = body.len();
+        let mut tool = ScriptedTool::new("host_read", None);
+        tool.outcome = ToolOutcome::new(
+            ExecutionStatus::Succeeded,
+            EffectState::KnownNotApplied,
+            Evidence::HostObserved,
+            body,
+            false,
+        )
+        .unwrap();
+        let tool = Arc::new(tool);
+        let provider = Arc::new(ArchiveFollowupProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider.clone(),
+            vec![ToolRegistration::read(tool)],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            let submitted = runtime
+                .submit(
+                    SubmitCommand::new(
+                        RequestId::new("req-archive-e2e").expect("valid request"),
+                        SessionId::new("sess-1").expect("valid session"),
+                        "do work",
+                        "test-profile",
+                    )
+                    .expect("submit builds"),
+                )
+                .await;
+            assert_eq!(submitted.reply(), CommandReply::Accepted);
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    assert_eq!(finished.outcome(), RunOutcome::Completed);
+                    break;
+                }
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+        });
+        drop(runtime);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let session = SessionId::new("sess-1").unwrap();
+        let records = reopened.load_source_records(&session, 0, 32).unwrap();
+        assert!(records.iter().any(|record| matches!(
+            record.item(),
+            ModelContextItem::ToolResult { outcome, .. }
+                if outcome.content().contains("middle-marker")
+                    && outcome.content().len() == body_len
+        )));
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_full_tool_set_skips_the_implicit_archive_tool_instead_of_failing() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-full-tool-set-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let tools = (0..nexus_core::provider::MAX_TOOL_DEFINITIONS)
+            .map(|index| {
+                ToolRegistration::read(Arc::new(ScriptedTool::new(&format!("tool-{index}"), None)))
+            })
+            .collect();
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            tools,
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.shared.tool_order.len(),
+            nexus_core::provider::MAX_TOOL_DEFINITIONS
+        );
+        assert!(
+            !runtime
+                .shared
+                .tool_order
+                .iter()
+                .any(|name| name == "host_archive")
+        );
+        drop(runtime);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_store_registers_the_read_only_archive_retrieval_tool() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-archive-registration-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let (runtime, _streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Vec::new(),
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .shared
+                .tool_order
+                .iter()
+                .any(|name| name == "host_archive")
+        );
+        assert!(runtime.shared.tool_definitions.iter().any(|spec| {
+            spec.id().name() == "host_archive"
+                && spec.input_schema_json().contains("\"output_ref\"")
+        }));
+        assert_eq!(
+            runtime
+                .shared
+                .tools
+                .get("host_archive")
+                .map(|tool| tool.access),
+            Some(ToolAccess::Read)
+        );
+        drop(runtime);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

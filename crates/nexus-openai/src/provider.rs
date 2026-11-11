@@ -1891,6 +1891,8 @@ struct SseAccum {
     reason: String,
     input: Option<u64>,
     output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
 }
 
 /// What one `data:` JSON chunk contributed, for provisional sink delivery.
@@ -1898,7 +1900,6 @@ struct SseApplied {
     content: String,
     reasoning: String,
     usage_present: bool,
-    usage: (Option<u64>, Option<u64>),
 }
 
 /// Folds one `data:` payload into the accumulator. Chunks without a first
@@ -1915,20 +1916,25 @@ fn apply_sse_data(acc: &mut SseAccum, payload: &str) -> Result<SseApplied, Vec<P
         )]
     };
     let chunk: Value = serde_json::from_str(payload).map_err(|_| invalid())?;
-    let (input, output) = usage_of(&chunk);
+    let usage = usage_of(&chunk);
     if chunk.get("usage").is_some() {
-        if input.is_some() {
-            acc.input = input;
+        if usage.0.is_some() {
+            acc.input = usage.0;
         }
-        if output.is_some() {
-            acc.output = output;
+        if usage.1.is_some() {
+            acc.output = usage.1;
+        }
+        if usage.2.is_some() {
+            acc.cache_read = usage.2;
+        }
+        if usage.3.is_some() {
+            acc.cache_write = usage.3;
         }
     }
     let mut applied = SseApplied {
         content: String::new(),
         reasoning: String::new(),
         usage_present: chunk.get("usage").is_some(),
-        usage: (input, output),
     };
     let Some(choice) = chunk
         .get("choices")
@@ -2062,7 +2068,14 @@ fn finalize_sse(acc: &SseAccum) -> Vec<ProviderEvent> {
         }
     }
     events.extend(ready.iter().cloned());
-    match terminal_for(&acc.reason, !ready.is_empty(), acc.input, acc.output) {
+    match terminal_for(
+        &acc.reason,
+        !ready.is_empty(),
+        acc.input,
+        acc.output,
+        acc.cache_read,
+        acc.cache_write,
+    ) {
         Ok(terminal) => {
             events.push(terminal);
             events
@@ -2093,6 +2106,8 @@ struct ProtocolSseLive {
     response_text: String,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
     stop_reason: Option<String>,
 }
 
@@ -2110,6 +2125,8 @@ impl ProtocolSseLive {
             response_text: String::new(),
             input_tokens: None,
             output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
             stop_reason: None,
         }
     }
@@ -2258,6 +2275,12 @@ impl ProtocolSseLive {
                             self.input_tokens = event
                                 .pointer("/message/usage/input_tokens")
                                 .and_then(Value::as_u64);
+                            self.cache_read_input_tokens = event
+                                .pointer("/message/usage/cache_read_input_tokens")
+                                .and_then(Value::as_u64);
+                            self.cache_write_input_tokens = event
+                                .pointer("/message/usage/cache_creation_input_tokens")
+                                .and_then(Value::as_u64);
                         }
                         "content_block_start" => {
                             let (Some(index), Some(block)) = (
@@ -2383,6 +2406,18 @@ impl ProtocolSseLive {
                             self.output_tokens = event
                                 .pointer("/usage/output_tokens")
                                 .and_then(Value::as_u64);
+                            if let Some(read) = event
+                                .pointer("/usage/cache_read_input_tokens")
+                                .and_then(Value::as_u64)
+                            {
+                                self.cache_read_input_tokens = Some(read);
+                            }
+                            if let Some(write) = event
+                                .pointer("/usage/cache_creation_input_tokens")
+                                .and_then(Value::as_u64)
+                            {
+                                self.cache_write_input_tokens = Some(write);
+                            }
                         }
                         "message_stop" => {
                             if !self.open_blocks.is_empty() {
@@ -2444,7 +2479,12 @@ impl ProtocolSseLive {
             "type":"message",
             "content":content,
             "stop_reason":self.stop_reason,
-            "usage":{"input_tokens":self.input_tokens,"output_tokens":self.output_tokens},
+            "usage":{
+                "input_tokens":self.input_tokens,
+                "output_tokens":self.output_tokens,
+                "cache_read_input_tokens":self.cache_read_input_tokens,
+                "cache_creation_input_tokens":self.cache_write_input_tokens
+            },
         }))
     }
 }
@@ -2460,9 +2500,133 @@ struct SseLive {
     dechunker: Option<Dechunker>,
     buf: Vec<u8>,
     acc: SseAccum,
-    last_usage: (Option<u64>, Option<u64>),
+    last_usage: (Option<u64>, Option<u64>, Option<u64>, Option<u64>),
     raw_bytes: usize,
     records: usize,
+}
+
+#[cfg(test)]
+mod cache_usage_tests {
+    use super::*;
+
+    fn final_usage(events: &[ProviderEvent]) -> Usage {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ProviderEvent::TurnFinished(finished) => Some(finished.usage()),
+                _ => None,
+            })
+            .expect("terminal usage")
+    }
+
+    #[test]
+    fn chat_usage_keeps_cache_counters_independent() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "cache_creation_input_tokens": 12
+        });
+        assert_eq!(
+            usage_of(&serde_json::json!({ "usage": usage.clone() })),
+            (Some(100), Some(5), Some(80), Some(12))
+        );
+        let events = events_for_json(
+            serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": usage
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let usage = final_usage(&events);
+        assert_eq!(usage.input_tokens(), Some(100));
+        assert_eq!(usage.cache_read_input_tokens(), Some(80));
+        assert_eq!(usage.cache_write_input_tokens(), Some(12));
+    }
+
+    #[test]
+    fn responses_and_anthropic_parse_their_native_cache_fields() {
+        let responses = events_for_responses(&serde_json::json!({
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 40}
+            }
+        }));
+        let usage = final_usage(&responses);
+        assert_eq!(usage.cache_read_input_tokens(), Some(40));
+        assert_eq!(usage.cache_write_input_tokens(), None);
+
+        let anthropic = events_for_anthropic(&serde_json::json!({
+            "type": "message",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 60,
+                "output_tokens": 3,
+                "cache_read_input_tokens": 30,
+                "cache_creation_input_tokens": 20
+            }
+        }));
+        let usage = final_usage(&anthropic);
+        assert_eq!(usage.input_tokens(), Some(60));
+        assert_eq!(usage.cache_read_input_tokens(), Some(30));
+        assert_eq!(usage.cache_write_input_tokens(), Some(20));
+    }
+
+    #[test]
+    fn streaming_usage_keeps_earlier_cache_fields_across_later_chunks() {
+        let mut parser = SseLive::new(false);
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event| seen.lock().unwrap().push(event);
+        parser
+            .feed(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n",
+                &sink,
+            )
+            .unwrap();
+        parser
+            .feed(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n",
+                &sink,
+            )
+            .unwrap();
+        let seen = seen.into_inner().unwrap();
+        let usages: Vec<_> = seen
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usages.len(), 2);
+        assert_eq!(usages[1].cache_read_input_tokens(), Some(7));
+        assert_eq!(usages[1].output_tokens(), Some(2));
+    }
+
+    #[test]
+    fn streaming_provisional_usage_carries_cache_observation() {
+        let mut parser = SseLive::new(false);
+        let seen = std::sync::Mutex::new(Vec::new());
+        let sink = |event| seen.lock().unwrap().push(event);
+        parser
+            .feed(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"prompt_tokens_details\":{\"cached_tokens\":7}}}\n",
+                &sink,
+            )
+            .unwrap();
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Usage(usage)
+                if usage.finality() == UsageFinality::Provisional
+                    && usage.input_tokens() == Some(10)
+                    && usage.cache_read_input_tokens() == Some(7)
+        )));
+    }
 }
 
 #[cfg(test)]
@@ -2521,7 +2685,7 @@ impl SseLive {
             dechunker: chunked.then(Dechunker::new),
             buf: Vec::new(),
             acc: SseAccum::default(),
-            last_usage: (None, None),
+            last_usage: (None, None, None, None),
             raw_bytes: 0,
             records: 0,
         }
@@ -2616,13 +2780,18 @@ impl SseLive {
                     text: applied.reasoning,
                 });
             }
-            if applied.usage_present && applied.usage != self.last_usage {
-                self.last_usage = applied.usage;
-                sink(ProviderEvent::Usage(Usage::new(
-                    applied.usage.0,
-                    applied.usage.1,
-                    UsageFinality::Provisional,
-                )));
+            let usage = (
+                self.acc.input,
+                self.acc.output,
+                self.acc.cache_read,
+                self.acc.cache_write,
+            );
+            if applied.usage_present && usage != self.last_usage {
+                self.last_usage = usage;
+                sink(ProviderEvent::Usage(
+                    Usage::new(usage.0, usage.1, UsageFinality::Provisional)
+                        .with_cache(usage.2, usage.3),
+                ));
             }
             if self.acc.text.len()
                 + self.acc.reasoning.len()
@@ -3202,15 +3371,24 @@ fn events_for_responses(reply: &Value) -> Vec<ProviderEvent> {
             _ => {}
         }
     }
-    let (input, output) = reply
-        .get("usage")
-        .map(|usage| {
-            (
-                usage.get("input_tokens").and_then(Value::as_u64),
-                usage.get("output_tokens").and_then(Value::as_u64),
-            )
-        })
-        .unwrap_or((None, None));
+    let usage = reply.get("usage");
+    let input = usage
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let output = usage
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64);
+    let cache_read = usage
+        .and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.get("cache_read_input_tokens"))
+                .and_then(Value::as_u64)
+        });
+    let cache_write = usage
+        .and_then(|usage| usage.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
     let reason = if status == Some("incomplete") {
         if reply
             .pointer("/incomplete_details/reason")
@@ -3232,7 +3410,7 @@ fn events_for_responses(reply: &Value) -> Vec<ProviderEvent> {
     };
     events.push(ProviderEvent::TurnFinished(TurnFinished::new(
         reason,
-        Usage::new(input, output, UsageFinality::Final),
+        Usage::new(input, output, UsageFinality::Final).with_cache(cache_read, cache_write),
         None,
     )));
     events
@@ -3312,6 +3490,12 @@ fn events_for_anthropic(reply: &Value) -> Vec<ProviderEvent> {
     let output = usage
         .and_then(|usage| usage.get("output_tokens"))
         .and_then(Value::as_u64);
+    let cache_read = usage
+        .and_then(|usage| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64);
+    let cache_write = usage
+        .and_then(|usage| usage.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
     let reason = match reply.get("stop_reason").and_then(Value::as_str) {
         Some("end_turn") | Some("stop_sequence") => FinishReason::Stop,
         Some("tool_use") if call_count > 0 => FinishReason::ToolCalls,
@@ -3333,7 +3517,7 @@ fn events_for_anthropic(reply: &Value) -> Vec<ProviderEvent> {
     };
     events.push(ProviderEvent::TurnFinished(TurnFinished::new(
         reason,
-        Usage::new(input, output, UsageFinality::Final),
+        Usage::new(input, output, UsageFinality::Final).with_cache(cache_read, cache_write),
         None,
     )));
     events
@@ -3393,17 +3577,26 @@ struct SseCall {
     arguments: String,
 }
 
-/// Reads `usage.prompt_tokens` / `usage.completion_tokens` from one chunk.
-fn usage_of(chunk: &Value) -> (Option<u64>, Option<u64>) {
-    chunk
-        .get("usage")
-        .map(|usage| {
-            (
-                usage.get("prompt_tokens").and_then(Value::as_u64),
-                usage.get("completion_tokens").and_then(Value::as_u64),
-            )
-        })
-        .unwrap_or((None, None))
+/// Reads per-request counters and best-effort prompt-cache observations from
+/// one Chat Completions chunk. Cache fields are independent counters; cached
+/// input may already be included in the prompt count.
+fn usage_of(chunk: &Value) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    let Some(usage) = chunk.get("usage") else {
+        return (None, None, None, None);
+    };
+    let cache_read = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64));
+    let cache_write = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    (
+        usage.get("prompt_tokens").and_then(Value::as_u64),
+        usage.get("completion_tokens").and_then(Value::as_u64),
+        cache_read,
+        cache_write,
+    )
 }
 
 /// Builds the terminal event shared by the JSON and SSE shapes. Returns the
@@ -3414,6 +3607,8 @@ fn terminal_for(
     has_calls: bool,
     input: Option<u64>,
     output: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
 ) -> Result<ProviderEvent, Vec<ProviderEvent>> {
     let claimed_tool_calls = reason == "tool_calls";
     let finish = match reason {
@@ -3431,7 +3626,7 @@ fn terminal_for(
     }
     Ok(ProviderEvent::TurnFinished(TurnFinished::new(
         finish,
-        Usage::new(input, output, UsageFinality::Final),
+        Usage::new(input, output, UsageFinality::Final).with_cache(cache_read, cache_write),
         None,
     )))
 }
@@ -3540,16 +3735,15 @@ fn events_for_json(body: &[u8]) -> Vec<ProviderEvent> {
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let (input, output) = reply
-        .get("usage")
-        .map(|usage| {
-            (
-                usage.get("prompt_tokens").and_then(Value::as_u64),
-                usage.get("completion_tokens").and_then(Value::as_u64),
-            )
-        })
-        .unwrap_or((None, None));
-    match terminal_for(reason, !ready.is_empty(), input, output) {
+    let (input, output, cache_read, cache_write) = usage_of(&reply);
+    match terminal_for(
+        reason,
+        !ready.is_empty(),
+        input,
+        output,
+        cache_read,
+        cache_write,
+    ) {
         Ok(terminal) => {
             events.push(terminal);
             events

@@ -58,6 +58,11 @@
 //! use time). `serde_json` owns request encoding and response decoding.
 
 #![forbid(unsafe_code)]
+// `ProviderEvent` is the public, bounded adapter event union; protocol helpers
+// use it as the error payload because partial events must be returned without
+// a second error type. Boxing it would change the adapter contract rather than
+// reduce the event actually crossing the runtime boundary.
+#![allow(clippy::result_large_err)]
 
 pub mod provider;
 

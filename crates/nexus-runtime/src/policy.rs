@@ -1,6 +1,7 @@
 //! Approval policy for the M0 single-run loop.
 //!
-//! Strict mode permits only scoped reads/listings/searches automatically.
+//! Strict mode permits only scoped reads/listings/searches and the bounded
+//! session-local archive reader automatically.
 //! Development mode additionally permits project/temp mutations and sandboxed
 //! exec, with session directory grants owned by the runtime. Strict automatic
 //! execution is fail-closed: [`Policy::authorize`] accepts
@@ -52,7 +53,7 @@ use nexus_validation::serde_json::{self, Map, Value};
 /// registration access category: a [`ToolAccess::Read`] tool is still refused
 /// automatic execution unless it is one of these exact built-ins and its
 /// arguments resolve to a valid resource scope.
-const AUTO_READ_TOOLS: &[&str] = &["host_read", "host_list", "host_search"];
+const AUTO_READ_TOOLS: &[&str] = &["host_read", "host_list", "host_search", "host_archive"];
 
 /// Placeholder replacing a redacted JSON value.
 const REDACTED_VALUE: &str = "[redacted]";
@@ -106,8 +107,9 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// M0-test policy: `host_read`/`host_list`/`host_search` are automatic, everything
-    /// else requires confirmation. Revision is [`M0_REVISION`].
+    /// M0-test policy: `host_read`/`host_list`/`host_search`/`host_archive`
+    /// are automatic, everything else requires confirmation. Revision is
+    /// [`M0_REVISION`].
     #[must_use]
     pub fn m0_test() -> Self {
         Self::new(
@@ -202,6 +204,10 @@ impl Policy {
         let Some(policy) = &self.development else {
             return Ok(self.requires_approval(access, call.tool()));
         };
+        if call.tool().name() == "host_archive" && access == ToolAccess::Read {
+            self.authorize(call)?;
+            return Ok(false);
+        }
         let target = self.development_target(call)?;
         if let Some(path) = target {
             Ok(!policy.is_automatic(&path)
@@ -334,7 +340,7 @@ impl Policy {
     }
 
     /// Builds a validated policy, rejecting anything but the exact M0
-    /// revision and the automatic read/search set.
+    /// revision and the automatic read/search/archive set.
     pub fn try_new(auto_tools: Vec<String>, revision: u32) -> Result<Self, AgentError> {
         let policy = Self::new(auto_tools, revision);
         policy.validate()?;
@@ -342,7 +348,8 @@ impl Policy {
     }
 
     /// Validates the policy boundary: exact [`M0_REVISION`], and only
-    /// `host_read`/`host_list`/`host_search` may be automatic. An invalid policy fails
+    /// `host_read`/`host_list`/`host_search`/`host_archive` may be automatic.
+    /// An invalid policy fails
     /// closed in [`Self::authorize`] and [`Self::approval_scope`], so a
     /// custom set that names `host_write`/`host_exec` can never widen
     /// automatic execution. Diagnostics are static and never interpolate
@@ -396,18 +403,21 @@ impl Policy {
     /// approved resource scope.
     ///
     /// Fail-closed sequence:
-    /// 1. the policy itself must validate (exact M0 revision, only
-    ///    `host_read`/`host_search` automatic);
+    /// 1. the policy itself must validate (exact M0 revision, only the
+    ///    scoped reads/search and `host_archive` automatic);
     /// 2. the call's tool revision must equal the policy revision;
     /// 3. the tool must be automatic;
     /// 4. arguments must pass the strict JSON parse (duplicate keys and
-    ///    depth/node/byte budgets rejected) with a canonical logical
-    ///    project-relative path. Reads also allow bounded integer byte-page
-    ///    `offset` and `limit`; searches require a nonempty `query`.
+    ///    depth/node/byte budgets rejected). Path tools require a canonical
+    ///    logical project-relative path; reads also allow bounded integer
+    ///    byte-page `offset` and `limit`; searches require a nonempty `query`;
+    ///    archive retrieval requires a bounded call reference and optional
+    ///    query or byte range.
     ///
     /// A refusal returns a static diagnostic and never interpolates the
-    /// rejected arguments. The returned scope is `read:<path>` or
-    /// `search:<path>`. No filesystem or symlink claim is made.
+    /// rejected arguments. The returned scope is `read:<path>`,
+    /// `search:<path>`, or `archive:<call>`. No filesystem or symlink claim
+    /// is made.
     pub fn authorize(&self, call: &ToolCall) -> Result<ApprovedScope, AgentError> {
         if self.container {
             let access = match call.tool().name() {
@@ -434,6 +444,10 @@ impl Policy {
             ));
         }
         let args = parse_object_args(call)?;
+        if name == "host_archive" {
+            let output_ref = validate_archive_arguments(&args)?;
+            return bounded_scope(&format!("archive:{output_ref}"));
+        }
         let valid_args = if name == "host_read" {
             args.keys()
                 .all(|key| matches!(key.as_str(), "path" | "offset" | "limit"))
@@ -511,6 +525,9 @@ impl Policy {
             return bounded_scope("/workspace");
         }
         if self.is_development() {
+            if call.tool().name() == "host_archive" {
+                return self.authorize(call);
+            }
             return match self.development_target(call)? {
                 Some(path) => {
                     let scope = if call.tool().name() == "host_exec" {
@@ -781,9 +798,63 @@ fn bounded_scope(text: &str) -> Result<ApprovedScope, AgentError> {
     })
 }
 
-/// Returns true only for the two M0 automatic read/search tools.
+/// Returns true only for the M0 automatic read/search/archive tools.
 fn is_auto_read_tool(name: &str) -> bool {
     AUTO_READ_TOOLS.contains(&name)
+}
+
+fn validate_archive_arguments(args: &Map<String, Value>) -> Result<String, AgentError> {
+    if args
+        .keys()
+        .any(|key| !matches!(key.as_str(), "output_ref" | "query" | "offset" | "limit"))
+    {
+        return Err(policy_error(
+            ErrorCategory::PermissionDenied,
+            "automatic archive arguments are invalid",
+        ));
+    }
+    let Some(Value::String(output_ref)) = args.get("output_ref") else {
+        return Err(policy_error(
+            ErrorCategory::PermissionDenied,
+            "automatic archive arguments are invalid",
+        ));
+    };
+    if output_ref.is_empty()
+        || output_ref.len() > 64
+        || !output_ref
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(policy_error(
+            ErrorCategory::PermissionDenied,
+            "automatic archive arguments are invalid",
+        ));
+    }
+    if let Some(query) = args.get("query") {
+        if args.contains_key("offset")
+            || args.contains_key("limit")
+            || !matches!(query, Value::String(query) if !query.is_empty() && query.len() <= 512 && !query.contains('\0'))
+        {
+            return Err(policy_error(
+                ErrorCategory::PermissionDenied,
+                "automatic archive arguments are invalid",
+            ));
+        }
+    } else if args.get("offset").is_some_and(|value| {
+        !value
+            .as_u64()
+            .is_some_and(|offset| offset <= i64::MAX as u64)
+    }) || args.get("limit").is_some_and(|value| {
+        !value
+            .as_u64()
+            .is_some_and(|limit| (4..=16384).contains(&limit))
+    }) {
+        return Err(policy_error(
+            ErrorCategory::PermissionDenied,
+            "automatic archive arguments are invalid",
+        ));
+    }
+    Ok(output_ref.clone())
 }
 
 /// Builds a static, marker-safe policy diagnostic.
@@ -968,6 +1039,65 @@ mod tests {
                 .expect("scoped search authorizes")
                 .as_str(),
             "search:crates/nexus-core/src"
+        );
+    }
+
+    #[test]
+    fn archive_retrieval_requires_an_exact_bounded_reference() {
+        let policy = Policy::m0_test();
+        for args in [
+            r#"{"output_ref":"call-1"}"#,
+            r#"{"output_ref":"call-1","offset":0,"limit":8192}"#,
+            r#"{"output_ref":"call-1","query":"failure"}"#,
+        ] {
+            assert_eq!(
+                policy
+                    .authorize(&call("host_archive", M0_REVISION, args))
+                    .unwrap()
+                    .as_str(),
+                "archive:call-1"
+            );
+        }
+        for args in [
+            r#"{"output_ref":""}"#,
+            r#"{"output_ref":"../call-1"}"#,
+            r#"{"output_ref":"call-1","path":"src/lib.rs"}"#,
+            r#"{"output_ref":"call-1","query":"x","offset":4}"#,
+            r#"{"output_ref":"call-1","limit":3}"#,
+            r#"{"output_ref":"call-1","limit":16385}"#,
+        ] {
+            let error = policy
+                .authorize(&call("host_archive", M0_REVISION, args))
+                .expect_err("invalid archive arguments must be denied");
+            assert_eq!(error.category(), ErrorCategory::PermissionDenied);
+            assert_eq!(error.message(), "automatic archive arguments are invalid");
+        }
+    }
+
+    #[test]
+    fn development_archive_is_automatically_authorized_with_exact_scope() {
+        let policy = Policy::development(std::path::Path::new(".")).unwrap();
+        let archive = call("host_archive", M0_REVISION, r#"{"output_ref":"call-1"}"#);
+        assert!(
+            !policy
+                .call_requires_approval(&archive, &[], ToolAccess::Read)
+                .unwrap()
+        );
+        let scope = policy
+            .authorize_with_directories(&archive, &[], ToolAccess::Read)
+            .unwrap();
+        assert_eq!(scope.as_str(), "archive:call-1");
+        assert_eq!(policy.approval_scope(&archive).unwrap(), scope);
+        assert!(
+            policy
+                .call_requires_approval(&archive, &[], ToolAccess::Mutation)
+                .unwrap()
+        );
+        let invalid = call("host_archive", M0_REVISION, r#"{"output_ref":"../x"}"#);
+        assert!(
+            policy
+                .call_requires_approval(&invalid, &[], ToolAccess::Read)
+                .is_err()
         );
     }
 
@@ -1396,13 +1526,14 @@ mod cov_policy_private {
             vec![
                 "host_read".to_owned(),
                 "host_list".to_owned(),
-                "host_search".to_owned()
+                "host_search".to_owned(),
+                "host_archive".to_owned()
             ]
         );
         assert_eq!(policy.revision, M0_REVISION);
         assert_eq!(
             AUTO_READ_TOOLS,
-            ["host_read", "host_list", "host_search"].as_slice()
+            ["host_read", "host_list", "host_search", "host_archive"].as_slice()
         );
         assert_eq!(REDACTED_VALUE, "[redacted]");
         assert_eq!(REDACTED_KEY, "[redacted-key]");
@@ -1724,9 +1855,10 @@ mod cov_policy_private {
     }
 
     #[test]
-    fn is_auto_read_tool_accepts_exactly_the_two_m0_names() {
+    fn is_auto_read_tool_accepts_exactly_the_m0_names() {
         assert!(is_auto_read_tool("host_read"));
         assert!(is_auto_read_tool("host_search"));
+        assert!(is_auto_read_tool("host_archive"));
         for name in [
             "host_write",
             "host_exec",

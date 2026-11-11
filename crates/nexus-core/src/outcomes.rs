@@ -206,6 +206,8 @@ pub enum UsageFinality {
 pub struct Usage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
     finality: UsageFinality,
 }
 
@@ -220,8 +222,24 @@ impl Usage {
         Self {
             input_tokens,
             output_tokens,
+            cache_read_input_tokens: None,
+            cache_write_input_tokens: None,
             finality,
         }
+    }
+
+    /// Adds provider-reported prompt-cache counters. These are independent
+    /// observations: cached input may already be included in `input_tokens`
+    /// depending on the provider, so callers must not subtract blindly.
+    #[must_use]
+    pub fn with_cache(
+        mut self,
+        cache_read_input_tokens: Option<u64>,
+        cache_write_input_tokens: Option<u64>,
+    ) -> Self {
+        self.cache_read_input_tokens = cache_read_input_tokens;
+        self.cache_write_input_tokens = cache_write_input_tokens;
+        self
     }
 
     /// Returns known input tokens, or [`None`] when unknown.
@@ -234,6 +252,20 @@ impl Usage {
     #[must_use]
     pub fn output_tokens(&self) -> Option<u64> {
         self.output_tokens
+    }
+
+    /// Returns known cache-read input tokens, or [`None`] when the provider
+    /// did not report them.
+    #[must_use]
+    pub fn cache_read_input_tokens(&self) -> Option<u64> {
+        self.cache_read_input_tokens
+    }
+
+    /// Returns known cache-write input tokens, or [`None`] when the provider
+    /// did not report them.
+    #[must_use]
+    pub fn cache_write_input_tokens(&self) -> Option<u64> {
+        self.cache_write_input_tokens
     }
 
     /// Returns whether the counters are provisional or final.

@@ -361,14 +361,21 @@ chunks remain staged until the complete candidate passes validation. Emergency
 tool-output previews preserve head/tail excerpts and outcome metadata without
 changing archived originals; they are not a semantic summarizer.
 
-Task request preparation now also applies deterministic old-output previews
-before testing the soft compaction threshold, including when the model window
-is unknown. Older completed tool-result bodies receive at most 2,048 bytes of
-UTF-8-safe head/tail excerpts plus an explicit omission/uncertainty notice. The
-latest complete tool group stays full unless the existing emergency headroom
-path needs to shorten it. Call arguments, required reasoning, identities,
-status/effect/evidence, and the original source conversation are unchanged.
-Opaque continuations and incompletely paired histories are not rewritten.
+Task request preparation now also applies deterministic output previews before
+testing the soft compaction threshold, including when the model window is
+unknown. Older completed tool-result bodies receive at most 2,048 bytes of
+UTF-8-safe head/tail excerpts plus an explicit omission/uncertainty notice.
+When archive retrieval is available, command (`host_exec`) output uses a
+4,096-byte head/tail budget from its first request, so it does not change when a
+newer group arrives. The complete projection also carries a marker and up to
+1,024 bytes of deduplicated diagnostic lines with repetition and omitted-distinct
+counts, so 4,096 bytes is a head/tail budget rather than an exact total; outputs
+that would not shrink stay full. Without archive retrieval, command output stays
+full. Other tools keep the latest complete group full. Existing emergency
+headroom handling can shorten any group when a hard limit requires it. Call arguments, required reasoning,
+identities, status/effect/evidence, and the original source conversation are
+unchanged. Opaque continuations and incompletely paired histories are not
+rewritten.
 
 This bounds repeated transmission of old large logs without spending summary
 calls or waiting for a large context window to become full. The previewed
@@ -381,13 +388,29 @@ existing request-start `projected_tool_outputs` counter identifies them. They
 do not remove the underlying records or replace the summary selector's
 three-recent-group retention policy.
 
-Omitted middle content is unavailable in that request. Retained source records
-remain available under existing persistence/history bounds, but this change
-adds no model-facing archive-retrieval tool. Rereading a file observes its
-current state, not necessarily its earlier contents; never re-execute an
-unknown-effect command merely to recover an omitted log. This is deterministic
-payload reduction, not proof of lower billed tokens, cache cost, or unchanged
-repair quality on arbitrary tasks. Those require matched live evaluation.
+When a durable session store is available, the provider supports tools, and the
+non-container policy permits automatic reads, the runtime registers a read-only
+`host_archive` tool. Each projection
+includes an `output_ref` (the host call identity). The tool can read a bounded
+byte range or search captured lines in the active session's original source
+record. It is bound to the active session, cannot accept a host path, and never
+re-executes the original call. Missing records, cancellation, storage failure,
+and policy refusal are explicit outcomes. Source history retention bounds still
+apply, and captured logs that were already truncated are not presented as
+complete. Rereading a file observes its current state, not its earlier
+contents; never re-execute an unknown-effect command merely to recover an
+omitted log. Container policy does not register this local tool.
+
+Provider usage records now retain optional cache-read and cache-write counters
+when an adapter reports them; they are independent of input counters and are
+never subtracted blindly. Server usage JSON exposes both, preserving null for
+unknown values. Request-start events already carry run/turn/purpose, while usage
+events carry the latest provider counters; cumulative purpose totals and priced
+cost remain future work because the pinned default headless diagnostic stream
+must not gain unrelated lines. This is observation, not a billing calculation:
+prices, cache inclusion rules, and provider accounting still vary. Payload
+reduction is not proof of lower billed tokens, cache cost, or unchanged repair
+quality; matched live evaluation remains required.
 
 #### Recommended order and acceptance boundaries
 
@@ -419,7 +442,8 @@ the existing request path, not a new database, graph or planner. Ordinary
 investigation notes remain untrusted derived context, separate from exact
 execution uncertainty. Their successful parsing does not establish semantic
 truth. Existing source sequence/run/call identities are sufficient initially;
-model-facing archive retrieval and general provenance services remain deferred.
+bounded session-local archive retrieval is implemented, while general
+cross-session provenance services and priced-cost accounting remain deferred.
 
 Every new reduction path must retain atomic candidate acceptance, complete
 call/result pairing, protected task corrections, required provider reasoning,

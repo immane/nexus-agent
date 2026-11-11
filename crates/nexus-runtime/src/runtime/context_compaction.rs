@@ -4,7 +4,7 @@ use super::*;
 use nexus_context::{
     SUMMARY_PROMPT, TRUNCATE_NOTE, conversation_with_memory, estimated_input_tokens,
     needs_compaction, plan_reduction, plan_summary_reduction, project_old_tool_outputs,
-    project_tool_outputs, render_context_note, summary_text,
+    project_tool_outputs, project_tool_outputs_for_request, render_context_note, summary_text,
 };
 use nexus_core::{ContextCompactionStrategy, ReasoningEffort};
 
@@ -13,6 +13,7 @@ const MAX_SUMMARY_CHUNK_BYTES: usize = 24 * 1024;
 const MAX_SUMMARY_RECORD_BYTES: usize = 16 * 1024;
 const MAX_SUMMARY_OUTPUT_RETRIES: u8 = 2;
 const OLD_TOOL_OUTPUT_PREVIEW_BYTES: usize = 2048;
+const COMMAND_OUTPUT_PREVIEW_BYTES: usize = 4096;
 const SUMMARY_REQUEST: &str = "Summarize the preceding historical data now. Do not continue the original task. Return only a concise, nonempty compact summary, not reasoning alone.";
 
 /// Disjoint payload-byte categories, not independently rounded token estimates.
@@ -486,12 +487,18 @@ fn preview_request_for_headroom(
 fn preview_old_outputs(
     active: &ActiveRun,
     request: ModelRequest,
+    archive_available: bool,
 ) -> Result<ModelRequest, Terminal> {
     if active.continuation.is_some() {
         return Ok(request);
     }
-    let items = project_old_tool_outputs(request.conversation(), OLD_TOOL_OUTPUT_PREVIEW_BYTES)
-        .map_err(Terminal::failed)?;
+    let items = project_tool_outputs_for_request(
+        request.conversation(),
+        OLD_TOOL_OUTPUT_PREVIEW_BYTES,
+        COMMAND_OUTPUT_PREVIEW_BYTES,
+        archive_available,
+    )
+    .map_err(Terminal::failed)?;
     let request = request.with_conversation(items).map_err(Terminal::failed)?;
     let input = estimate(active, &request);
     request
@@ -522,10 +529,14 @@ pub(super) fn prepare_context_request(
         ));
     }
     let mut request = normal_request(shared, active, turn, &active.conversation)?;
+    let archive_available = shared.session_store.is_some()
+        && shared
+            .tools
+            .contains_key(crate::runtime::archive::HOST_ARCHIVE_TOOL);
     // Bound repeated old log bodies even before a large/unknown window reaches
     // its soft trigger. Keep the original request for emergency previews so
     // projection markers never replace original truncation provenance.
-    let mut projected = preview_old_outputs(active, request.clone())?;
+    let mut projected = preview_old_outputs(active, request.clone(), archive_available)?;
     let Some(window) = active.context_management.window else {
         active.input_estimate = estimated_input_tokens(&projected);
         return match active.context_management.max_output_tokens {
@@ -563,13 +574,13 @@ pub(super) fn prepare_context_request(
             let memory_allowance = "x".repeat(nexus_context::MAX_MEMORY_BYTES);
             plan_summary_reduction(&active.conversation, active.history_len, target, |items| {
                 normal_request_with_memory(shared, active, turn, items, Some(&memory_allowance))
-                    .and_then(|request| preview_old_outputs(active, request))
+                    .and_then(|request| preview_old_outputs(active, request, archive_available))
                     .map(|request| estimate(active, &request))
             })?
         } else {
             plan_reduction(&active.conversation, active.history_len, target, |items| {
                 normal_request(shared, active, turn, items)
-                    .and_then(|request| preview_old_outputs(active, request))
+                    .and_then(|request| preview_old_outputs(active, request, archive_available))
                     .map(|request| estimate(active, &request))
             })?
         };
@@ -581,7 +592,7 @@ pub(super) fn prepare_context_request(
         if policy.strategy() == ContextCompactionStrategy::Summarize && !plan.removed.is_empty() {
             let original_minimum =
                 normal_request_with_memory(shared, active, turn, &plan.items, None)?;
-            let minimum = preview_old_outputs(active, original_minimum.clone())?;
+            let minimum = preview_old_outputs(active, original_minimum.clone(), archive_available)?;
             let minimum = if estimate(active, &minimum).saturating_add(output) > window {
                 preview_request_for_headroom(active, original_minimum, window, output)?
             } else {
@@ -646,7 +657,7 @@ pub(super) fn prepare_context_request(
             }
             commit(shared, active, stage, None, "truncate")?;
             request = normal_request(shared, active, turn, &active.conversation)?;
-            projected = preview_old_outputs(active, request.clone())?;
+            projected = preview_old_outputs(active, request.clone(), archive_available)?;
         }
     }
     let mut input = estimate(active, &projected);
@@ -980,7 +991,12 @@ pub(super) fn ingest_summary(
         match normal_request_with_memory(shared, active, &turn, &stage.items, Some(&summary)) {
             Err(_) => rejection_reason = "projected_request_build_failed",
             Ok(original_request) => {
-                let request = preview_old_outputs(active, original_request.clone())?;
+                let archive_available = shared.session_store.is_some()
+                    && shared
+                        .tools
+                        .contains_key(crate::runtime::archive::HOST_ARCHIVE_TOOL);
+                let request =
+                    preview_old_outputs(active, original_request.clone(), archive_available)?;
                 let request = if let Some(window) = active.context_management.window {
                     let window = u64::from(window.tokens());
                     let output = active.context_management.output_reserve_tokens(window);

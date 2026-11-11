@@ -2,10 +2,12 @@
 
 Date: 2026-11-11.
 
-Status: follow-up proposal requested by the owner. Eager old-output previews are
-implemented in the current working tree; the additional changes below are not.
-This document does not authorize implementation, live inference, external costs,
-configuration changes, or another server restart.
+Status: implemented and locally validated; matched live evaluation remains
+pending. The implementation covers deterministic output previews,
+source-record retrieval, command diagnostics, and provider cache observations.
+Purpose-correlated cumulative usage and priced cost remain future work.
+Cost-aware threshold changes remain measurement-gated. This document does not authorize live inference, external
+costs, configuration changes, or another server restart.
 
 ## Scope and evidence
 
@@ -38,8 +40,15 @@ previews before pressure thresholds, including unknown context windows:
 
 - Older completed result bodies retain at most 2,048 bytes of UTF-8-safe
   head/tail excerpts plus an omission and uncertainty notice.
-- The latest complete tool group normally remains full. Existing emergency
-  headroom handling can shorten it when necessary.
+- When archive retrieval is available, command (`host_exec`) output uses a
+  4,096-byte head/tail budget from its first request, so the projection is
+  stable when a newer tool group arrives. The omitted middle contributes up to
+  1,024 bytes of deduplicated diagnostic lines, with repeated lines reported as
+  counts and omitted distinct diagnostics counted. The complete projection also
+  contains a marker and digest, so it is not an exact 4,096-byte total; a
+  near-threshold result stays full when projection would not shrink it. Without
+  archive retrieval, command output stays full. Other tools keep the latest
+  complete group in full.
 - Original records, exact call arguments, required reasoning, pairing,
   identities, and status/effect/evidence are preserved. Opaque continuations and
   incompletely paired histories are not rewritten.
@@ -47,14 +56,37 @@ previews before pressure thresholds, including unknown context windows:
   estimates use projected costs. Summary content still comes from original
   removed sources; emergency previews start from raw requests to preserve
   original truncation provenance.
-- Previews require no extra model request. They do not add a model-facing archive
-  retrieval tool or remove existing persistence/history bounds.
+- Projections include an `output_ref` and require no extra model request. The
+  model-facing read-only `host_archive` tool retrieves or searches the original
+  captured result by that reference.
 
-Validation of this working-tree change: 675 affected runtime/headless/integration
-tests passed, four were skipped under the default configuration; scoped Clippy
-with `-D warnings`, formatting, and diff checks passed. The debug server was
-rebuilt with container support and restarted using the same configuration and
-session store; its health check passed. No matched live cost evaluation was run.
+`host_archive` is registered automatically when a runtime has a durable session
+store, a tool-capable provider, and an automatic-read-compatible non-container
+policy. It is bound to the active
+session, not a host path, and never re-executes the original tool. Range reads
+are byte-based and capped at 16 KiB per call; search returns bounded matching
+lines. Missing or expired records fail explicitly, and a command with unknown
+effects must not be rerun to recover its log. Container policy does not register
+the local archive tool.
+
+Provider-reported usage now retains independent cache-read and cache-write
+counters where the adapter exposes them. They are not subtracted from input
+because provider accounting differs. Server usage JSON exposes optional
+`cache_read` and `cache_write`; unknown values stay null. Request-start events
+already carry run, turn, and purpose; usage events remain latest-request
+observations. Purpose-specific cumulative totals and priced cost were not added
+because the pinned default headless diagnostic stream must not gain unrelated
+lines. That accounting remains future work.
+
+Validation of this implementation: affected unit, integration, and server tests
+pass, including deterministic warning floods, missing records, invalid archive
+arguments, source retention, first-exposure command projection, and cache
+parsing. Full-suite and live cost evaluation remain separate gates. No live
+inference, cost, or repair-quality claim is made.
+
+Cost-aware compaction remains gated on matched measurement. This change does not
+lower global thresholds, disable thinking, add background summaries, or claim
+that fewer bytes reduce billed tokens when cache behavior changes.
 
 ## Reference-agent findings
 
@@ -81,7 +113,7 @@ their results are unused; neither is proposed as a default here.
 
 ## Proposed priorities
 
-### P0: Retrieve archived output without re-execution
+### P0: Retrieve archived output without re-execution (implemented)
 
 Reuse source-record identities and existing storage boundaries. Return an opaque
 output reference, original size, truncation/completeness information, and outcome
@@ -94,7 +126,7 @@ retention and byte limits; do not promise a complete process log when capture
 was already truncated. A current file reread is not historical evidence, and an
 unknown-effect command must never be rerun just to recover omitted output.
 
-### P0: Bound first exposure by tool type
+### P0: Bound first exposure by tool type (implemented for commands; existing read/search bounds reused)
 
 Old-output previews reduce replay, but do not prevent the first large result
 from entering a request. Separate capture/storage limits from model-visible
@@ -110,7 +142,7 @@ return budgets, reusing existing tool controls where possible:
 Do not prescribe one universal budget before evaluating information loss. Head,
 tail, and selected-diagnostic policies need tool-specific tests.
 
-### P1: Preserve reusable request prefixes
+### P1: Preserve reusable request prefixes (implemented for command previews; provider-cache audit remains)
 
 Audit the actual provider-encoded request, not just internal message sizes.
 Keep stable instructions and tool ordering stable; check whether changing budget
@@ -123,7 +155,7 @@ that cache tradeoff rather than assuming fewer bytes always means a cheaper
 request. Incremental transport reduces transmission, not necessarily billed
 context or occupancy. Provider cache support is adapter-specific.
 
-### P1: Observe actual usage and cost
+### P1: Observe actual usage and cost (implemented for provider counters; purpose totals and priced cost remain future work)
 
 Correlate requests by run/turn and purpose: task, summary, retry/recovery, and any
 future warming. Distinguish latest-request usage, cumulative usage, and active
@@ -134,7 +166,7 @@ Normalize provider accounting before computing uncached input or cost: cached
 tokens may already be included in input. Use applicable prices and retain missing
 price/accounting uncertainty. Diagnostics must not contain private payload text.
 
-### P2: Deterministic filtering and cost-aware compaction
+### P2: Deterministic filtering and cost-aware compaction (diagnostic digest implemented; threshold changes measurement-gated)
 
 Deduplicate repetitive warnings into bounded representative diagnostics with
 counts and original-output references. Preserve distinct failures and exit
@@ -169,6 +201,24 @@ Accept a candidate only when evidence remains recoverable within explicit
 retention bounds, unsafe repeats do not increase, and measured cost improves
 without unacceptable correctness or latency regressions. No universal percentage
 savings target is justified by the current single-session simulation.
+
+### Local validation results
+
+After the implementation, the affected packages were run sequentially with
+`--locked --offline`: `nexus-core`, `nexus-session`, `nexus-context`,
+`nexus-runtime`, and `nexus-openai` together ran 1,074 passed / 7 skipped;
+`nexus-headless` and `nexus-integration` 279 passed / 1 skipped;
+`nexus-server` 193 passed; `nexus-tui` 591 passed / 11 skipped. The embedded
+Web client's Node tests passed 27/27. `cargo fmt --all --check`, scoped Clippy
+with `-D warnings`, `nexus-container` all-target checks, and the
+`nexus-server --features container` all-target check passed.
+
+The first attempt to emit a new usage diagnostic on the default headless stderr
+stream failed three pinned headless output tests. That diagnostic was removed
+rather than weakening their assertions; provider counters remain available in
+the usage event and Server JSON. These are local deterministic checks only. No
+matched live task, cache-hit measurement, billing comparison, or repair-quality
+evaluation was run.
 
 ## Sources and version notes
 

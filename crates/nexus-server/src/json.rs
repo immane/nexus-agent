@@ -71,6 +71,8 @@ pub fn usage_json(usage: &Usage) -> Value {
     json!({
         "input": usage.input_tokens(),
         "output": usage.output_tokens(),
+        "cache_read": usage.cache_read_input_tokens(),
+        "cache_write": usage.cache_write_input_tokens(),
         "finality": format!("{:?}", usage.finality()),
     })
 }

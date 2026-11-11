@@ -60,9 +60,13 @@ telemetry, plus summaries prompted to retain investigation state (`Established`,
 text, not verified facts; see the implementation notes in the design document.
 Current source builds shorten older completed tool-result bodies into bounded
 head/tail previews before waiting for context pressure, reducing repeated large
-logs even with an unknown window. Original records, call metadata and required
-reasoning remain unchanged; the latest complete tool group is normally retained
-in full. This is not semantic compression or a measured token-cost guarantee.
+logs even with an unknown window. When durable archive retrieval is available,
+command output is bounded from its first request with a bounded diagnostic
+digest, and projections carry a reference for the read-only `host_archive`
+tool. Without that retrieval path, command output stays full. Original records, call metadata and required reasoning remain
+unchanged; non-command tool groups and required evidence are retained as
+documented. Provider usage may expose cache-read/write counters, but this is not
+semantic compression or a measured token-cost guarantee.
 The exposed one-task Astropy context-retention replay completed one context
 reduction and was resolved by the official evaluator. This single result does
 not establish reduced repeated investigation or causation, and is not an overall

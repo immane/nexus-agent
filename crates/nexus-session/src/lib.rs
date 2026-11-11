@@ -1574,6 +1574,26 @@ impl SessionStore for FileSessionStore {
             .collect())
     }
 
+    fn find_source_record(
+        &self,
+        session: &SessionId,
+        call: &CallId,
+    ) -> Result<Option<SourceRecord>, AgentError> {
+        self.ensure_available()?;
+        Ok(self
+            .source_records
+            .iter()
+            .find(|record| {
+                record.session() == session
+                    && matches!(
+                        record.item(),
+                        ModelContextItem::ToolResult { call: record_call, .. }
+                            if record_call == call
+                    )
+            })
+            .cloned())
+    }
+
     fn last_source_sequence(&self, session: &SessionId) -> Result<u64, AgentError> {
         self.ensure_available()?;
         Ok(self
