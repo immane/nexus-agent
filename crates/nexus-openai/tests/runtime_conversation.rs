@@ -381,6 +381,113 @@ fn test_rt() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+#[test]
+fn runtime_keeps_wire_prefix_stable_as_occupancy_and_calibration_change() {
+    // Final usage deliberately exceeds the initial estimate to force real
+    // runtime calibration before the next request is constructed.
+    let first = calls(&[("read-a", "host_read", r#"{"path":"a"}"#)])
+        .replace("\"prompt_tokens\":20", "\"prompt_tokens\":5000");
+    let mock = mock(vec![
+        first,
+        calls(&[("read-b", "host_read", r#"{"path":"b"}"#)]),
+        stop("done"),
+    ]);
+    test_rt().block_on(async {
+        let provider = OpenAiProvider::new(
+            &mock.endpoint,
+            CredentialRef::env_var("PATH").unwrap(),
+            "thinking-model",
+        )
+        .unwrap()
+        .with_context_management(ContextManagementSettings {
+            window: Some(ContextWindow::new(1_000_000, ContextWindowSource::Configured).unwrap()),
+            ..ContextManagementSettings::default()
+        });
+        let tool = Arc::new(LocalTool {
+            name: "host_read",
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let (runtime, mut streams) = Runtime::try_new_with_instructions(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(provider),
+            vec![ToolRegistration::read(tool)],
+            ModelInstructions::new("host rules", "workspace /repo").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.submit(submit("cache-prefix", "inspect")).await.reply(),
+            CommandReply::Accepted
+        );
+        let observations = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut observations = Vec::new();
+            loop {
+                tokio::select! {
+                    event = streams.control.recv() => {
+                        match event.unwrap().payload() {
+                            EventPayload::ModelRequestStarted {
+                                estimated_input_tokens,
+                                estimate_scale_millis,
+                                purpose,
+                                ..
+                            } => {
+                                assert_eq!(*purpose, ModelRequestPurpose::Task);
+                                observations.push((*estimated_input_tokens, *estimate_scale_millis));
+                            }
+                            EventPayload::ContextReduced { .. } => panic!("no reduction expected"),
+                            EventPayload::RunFinished(finished) => {
+                                assert_eq!(finished.outcome(), RunOutcome::Completed);
+                                break observations;
+                            }
+                            _ => {}
+                        }
+                    }
+                    event = streams.data.recv() => { assert!(event.is_some()); }
+                }
+            }
+        })
+        .await
+        .expect("local run terminates");
+        assert_eq!(observations.len(), 3);
+        assert_ne!(observations[0].0, observations[1].0, "occupancy must change");
+        assert!(observations[1].1 > observations[0].1, "calibration must change");
+    });
+    mock.worker.join().unwrap();
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let system = &requests[0]["messages"][0];
+    assert_eq!(system["role"], "system");
+    assert!(
+        system["content"]
+            .as_str()
+            .unwrap()
+            .contains("Context window: 1000000 tokens")
+    );
+    assert!(!system["content"].as_str().unwrap().contains("occupancy"));
+    for pair in requests.windows(2) {
+        let previous = pair[0]["messages"].as_array().unwrap();
+        let next = pair[1]["messages"].as_array().unwrap();
+        assert!(next.len() > previous.len());
+        assert_eq!(next[0], *system, "runtime-generated system content changed");
+        assert_eq!(
+            pair[0]["tools"], pair[1]["tools"],
+            "tool definitions changed"
+        );
+        assert_eq!(
+            &next[..previous.len()],
+            previous.as_slice(),
+            "wire prefix changed"
+        );
+    }
+    assert_eq!(
+        requests[2]["messages"][2]["reasoning_content"],
+        "先 think then act"
+    );
+}
+
 /// Independently enforce the vendor's correlation rule over actual wire JSON.
 fn assert_pairing(messages: &[Value]) {
     let mut pending = std::collections::HashSet::new();

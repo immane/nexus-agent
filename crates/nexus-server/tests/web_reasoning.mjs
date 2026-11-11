@@ -133,3 +133,21 @@ test('reasoning events deduplicate SSE replay and finish with the model response
   run(`handleEvent({seq: 2, kind: 'model-request-finished', detail: {}})`);
   assert.equal(cards[0].dataset.streaming, 'false');
 });
+
+test('thinking stylesheet retains the single-line preview and bounded expanded panel', () => {
+  const css = readFileSync(new URL('../web/app.css', import.meta.url), 'utf8');
+  const rules = new Map([...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .map(([, selector, declarations]) => [selector.trim(), declarations]));
+  const preview = rules.get('.reasoning-preview') ?? '';
+  assert.match(preview, /height:\s*1\.6em\s*;/);
+  assert.match(preview, /line-height:\s*1\.6\s*;/);
+  assert.match(preview, /overflow:\s*hidden\s*;/);
+  assert.match(preview, /white-space:\s*pre-wrap\s*;/);
+  assert.match(preview, /overflow-wrap:\s*anywhere\s*;/);
+  assert.match(rules.get('.reasoning-card[open] .reasoning-preview') ?? '', /display:\s*none\s*;/);
+  const body = rules.get('.reasoning-body') ?? '';
+  assert.match(body, /max-height:\s*320px\s*;/);
+  assert.match(body, /overflow-y:\s*auto\s*;/);
+  assert.match(body, /white-space:\s*pre-wrap\s*;/);
+  assert.match(body, /overflow-wrap:\s*anywhere\s*;/);
+});
