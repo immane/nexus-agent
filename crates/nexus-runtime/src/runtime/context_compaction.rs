@@ -140,7 +140,7 @@ pub(super) fn diagnose_budget(
 pub(super) fn projection_overhead(active: &ActiveRun, note: &str) -> usize {
     memory_bytes(active.derived_memory.as_deref()).saturating_add(
         runtime_note_bytes(
-            &render_context_note(active.context_management, note, 0),
+            &render_context_note(active.context_management, note),
             active.instruction_bytes > 0,
         )
         .saturating_sub(runtime_note_bytes(note, active.instruction_bytes > 0)),
@@ -231,10 +231,15 @@ fn summary_request(
         .map_err(Terminal::failed)?,
         ModelContextItem::user_text(SUMMARY_REQUEST).map_err(Terminal::failed)?,
     ];
-    let note = |tokens| render_context_note(active.context_management, "", tokens);
-    let request = request_for(shared, active, turn, &items, note(0), memory, true)?;
-    let estimated = active.summary_token_estimator.estimate(&request);
-    let request = request_for(shared, active, turn, &items, note(estimated), memory, true)?;
+    let request = request_for(
+        shared,
+        active,
+        turn,
+        &items,
+        render_context_note(active.context_management, ""),
+        memory,
+        true,
+    )?;
     let estimated = active.summary_token_estimator.estimate(&request);
     let Some(window) = active.context_management.window else {
         return request
@@ -433,15 +438,14 @@ fn normal_projection(
     memory: Option<&str>,
     context_note: &str,
 ) -> Result<ModelRequest, Terminal> {
-    // A fixed-width estimate makes rebuilding the note stable, rather than
-    // recursively increasing the occupancy by appending notes each turn.
-    let note = |tokens| task_context_note(active, context_note, tokens);
-    let request = request_for(shared, active, turn, items, note(0_u64), memory, false)?;
-    let tokens = estimate(active, &request);
-    request_for(shared, active, turn, items, note(tokens), memory, false)
+    // The note carries only stable policy and state-change text. Per-turn
+    // occupancy stays out of the request so the provider can reuse the cached
+    // prefix even when the transcript grows.
+    let note = task_context_note(active, context_note);
+    request_for(shared, active, turn, items, note, memory, false)
 }
 
-fn task_context_note(active: &ActiveRun, context_note: &str, tokens: u64) -> String {
+fn task_context_note(active: &ActiveRun, context_note: &str) -> String {
     let mut note = context_note.to_owned();
     if active.output_limit_recovery_used {
         note.push_str("\nAn earlier model response reached its output limit and was discarded as incomplete. Keep responses concise. Choose the next small actionable step from the accepted conversation; do not reconstruct or continue incomplete tool calls. This notice is not evidence that any action executed.");
@@ -450,7 +454,7 @@ fn task_context_note(active: &ActiveRun, context_note: &str, tokens: u64) -> Str
         note.push('\n');
         note.push_str(recovery);
     }
-    render_context_note(active.context_management, &note, tokens)
+    render_context_note(active.context_management, &note)
 }
 
 fn preview_request_for_headroom(
@@ -480,7 +484,7 @@ fn preview_request_for_headroom(
         preview_bytes /= 2;
     }
     request
-        .with_context_note(task_context_note(active, &active.context_note, input))
+        .with_context_note(task_context_note(active, &active.context_note))
         .map_err(Terminal::failed)
 }
 
@@ -499,10 +503,11 @@ fn preview_old_outputs(
         archive_available,
     )
     .map_err(Terminal::failed)?;
-    let request = request.with_conversation(items).map_err(Terminal::failed)?;
-    let input = estimate(active, &request);
     request
-        .with_context_note(task_context_note(active, &active.context_note, input))
+        .with_conversation(items)
+        .and_then(|request| {
+            request.with_context_note(task_context_note(active, &active.context_note))
+        })
         .map_err(Terminal::failed)
 }
 
@@ -1429,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn old_large_outputs_are_previewed_before_large_or_unknown_window_pressure() {
+    fn old_large_outputs_stay_full_for_normal_requests() {
         for window in [None, Some(1_048_576)] {
             let (shared, mut data) = shared_with_data();
             let mut active = context_run();
@@ -1452,29 +1457,14 @@ mod tests {
             }
             active.conversation.extend(old);
             let latest = context_exchange(&active.run, 1, 8192);
-            active.conversation.extend(latest.clone());
+            active.conversation.extend(latest);
             let original = active.conversation.clone();
             let cursor = active.source_cursor;
             let request = prepare(&shared, &mut active);
-            let ModelContextItem::ToolResult { outcome, .. } = &request.conversation()[2] else {
-                panic!("old result")
-            };
-            assert!(outcome.content().len() < OLD_TOOL_OUTPUT_PREVIEW_BYTES + 512);
-            assert!(outcome.content().contains("middle of tool output omitted"));
-            assert!(outcome.content().contains("original_output_truncated=true"));
-            assert!(outcome.content().contains("do not blindly retry"));
-            assert_eq!(outcome.status(), ExecutionStatus::Failed);
-            assert_eq!(outcome.effect(), EffectState::Unknown);
-            assert_eq!(outcome.evidence(), Evidence::HostObserved);
             assert_eq!(
-                request.conversation()[1],
-                original[1],
-                "call arguments and required reasoning are exact"
-            );
-            assert_eq!(
-                &request.conversation()[3..],
-                latest.as_slice(),
-                "newest full exchange is untouched"
+                request.conversation(),
+                original,
+                "a complete capture must not change when a newer group arrives"
             );
             assert_eq!(request.max_output_tokens(), Some(4096));
             assert_eq!(
@@ -1483,10 +1473,10 @@ mod tests {
             );
             assert_eq!(active.source_cursor, cursor);
             assert!(active.pending_compaction.is_none());
-            assert_eq!(active.turns_used, 0, "previews do not spend summary calls");
+            assert_eq!(active.turns_used, 0, "normal turns spend no summary calls");
             assert!(
                 data.try_recv().is_err(),
-                "a preview is not a committed history reduction"
+                "a normal request is not a committed history reduction"
             );
         }
     }
@@ -1552,35 +1542,30 @@ mod tests {
     }
 
     #[test]
-    fn eager_previews_reduce_cumulative_estimates_in_a_large_log_replay() {
+    fn normal_requests_do_not_rewrite_prior_tool_output() {
         let (shared, _data) = shared_with_data();
         let mut active = context_run();
         active
             .conversation
             .extend(context_exchange(&active.run, 0, 131_072));
-        let mut full_total = 0;
-        let mut projected_total = 0;
+        let mut previous = active.conversation.clone();
         for n in 1..=12 {
             active
                 .conversation
                 .extend(context_exchange(&active.run, n, 256));
-            let full = normal_request(&shared, &active, &turn(), &active.conversation)
-                .unwrap_or_else(|terminal| panic!("request failed: {:?}", terminal.error));
-            let source = active.conversation.clone();
-            let projected = prepare(&shared, &mut active);
-            full_total += estimated_input_tokens(&full);
-            projected_total += estimated_input_tokens(&projected);
-            assert_eq!(active.conversation, source);
+            let request = prepare(&shared, &mut active);
+            assert_eq!(
+                &request.conversation()[..previous.len()],
+                previous.as_slice(),
+                "each normal request must keep the accepted prefix intact"
+            );
+            previous = request.conversation().to_vec();
         }
-        assert!(
-            projected_total < full_total / 3,
-            "synthetic cumulative estimates, not measured provider tokens: full={full_total} previewed={projected_total}"
-        );
         assert_eq!(active.turns_used, 0);
     }
 
     #[test]
-    fn reduction_selection_budgets_projected_candidates_without_over_removing_history() {
+    fn reduction_selection_uses_original_sizes_and_keeps_pinned_groups() {
         let (shared, _data) = shared_with_data();
         let mut active = context_run();
         active.context_management.window =
@@ -1610,16 +1595,27 @@ mod tests {
             }
             active.conversation.extend(group);
         }
+        // Without age-based output projections the pinned 128 KiB result cannot
+        // be shortened for a candidate estimate, so every removable group is
+        // selected while the latest exchange stays.
         let mut expected = active.conversation.clone();
         expected.drain(1..3);
+        expected.drain(3..5);
         let request = prepare(&shared, &mut active);
         assert_eq!(
             active.conversation, expected,
-            "removing the first eligible group reaches the projected target; do not remove another group because of a pinned raw log"
+            "selection removes eligible groups and never splits the pinned unknown-effect group"
+        );
+        assert!(
+            !request.conversation().iter().any(|item| matches!(item,
+                ModelContextItem::AssistantCall { call, .. } if call.call().as_str() == "call-2")),
+            "the removed group is absent from the model view"
         );
         assert!(request.conversation().iter().any(|item| matches!(item,
-            ModelContextItem::AssistantCall { call, reasoning: Some(_), .. } if call.call().as_str() == "call-2")));
-        assert!(estimate(&active, &request) <= 65_536 * 20 / 100);
+            ModelContextItem::AssistantCall { call, .. } if call.call().as_str() == "call-1")));
+        assert!(request.conversation().iter().any(|item| matches!(item,
+            ModelContextItem::ToolResult { call, outcome, .. }
+                if call.as_str() == "call-1" && outcome.effect() == EffectState::Unknown)));
         assert!(active.pending_compaction.is_none());
         assert_eq!(active.turns_used, 0);
     }
@@ -1680,7 +1676,7 @@ mod tests {
                 .contains("Earlier task facts.")
         );
         assert!(!request.context_note().contains("Earlier task facts."));
-        assert!(request.context_note().contains("Estimated input occupancy"));
+        assert!(!request.context_note().contains("occupancy"));
         assert!(request.context_note().contains("trigger 65%"));
         assert!(active.pending_compaction.is_none());
         let events: Vec<_> = std::iter::from_fn(|| data.try_recv().ok()).collect();
@@ -2178,7 +2174,7 @@ mod tests {
                 .context_note()
                 .contains("Context window: 8192 tokens")
         );
-        assert!(request.context_note().contains("Estimated input occupancy"));
+        assert!(!request.context_note().contains("occupancy"));
         assert!(
             estimate(&active, &request)
                 + u64::from(request.max_output_tokens().expect("output cap"))
@@ -3894,7 +3890,12 @@ mod tests {
             provider.clone(),
             Vec::new(),
         );
-        let active = loaded_history(ContextCompactionStrategy::Summarize);
+        let mut active = loaded_history(ContextCompactionStrategy::Summarize);
+        // Large enough that the bounded summary request must split the source
+        // into two chunks under the stable (shorter) context note.
+        active.conversation[1] =
+            ModelContextItem::assistant_text("old-answer", "old source history ".repeat(410))
+                .expect("answer");
         let original = active.conversation.clone();
         let run = active.run.clone();
         runtime.shared.state.lock().await.active = Some(active);

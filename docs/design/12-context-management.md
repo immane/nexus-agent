@@ -361,18 +361,20 @@ chunks remain staged until the complete candidate passes validation. Emergency
 tool-output previews preserve head/tail excerpts and outcome metadata without
 changing archived originals; they are not a semantic summarizer.
 
-Task request preparation now also applies deterministic output previews before
+Task request preparation now applies deterministic output previews before
 testing the soft compaction threshold, including when the model window is
-unknown. Older completed tool-result bodies receive at most 2,048 bytes of
-UTF-8-safe head/tail excerpts plus an explicit omission/uncertainty notice.
-When archive retrieval is available, command (`host_exec`) output uses a
+unknown. When archive retrieval is available, command (`host_exec`) output uses a
 4,096-byte head/tail budget from its first request, so it does not change when a
 newer group arrives. The complete projection also carries a marker and up to
 1,024 bytes of deduplicated diagnostic lines with repetition and omitted-distinct
 counts, so 4,096 bytes is a head/tail budget rather than an exact total; outputs
 that would not shrink stay full. Without archive retrieval, command output stays
-full. Other tools keep the latest complete group full. Existing emergency
-headroom handling can shorten any group when a hard limit requires it. Call arguments, required reasoning,
+full. Other tools keep every complete result at the capture already accepted
+from the tool. They are deliberately not shortened merely because a newer group
+arrived: that rewrote an already-sent provider prefix and invalidated prompt
+caching, as recorded in the [prompt-cache stability
+design](15-prompt-cache.md). Existing emergency headroom handling can shorten
+any group when a hard limit requires it. Call arguments, required reasoning,
 identities, status/effect/evidence, and the original source conversation are
 unchanged. Opaque continuations and incompletely paired histories are not
 rewritten.

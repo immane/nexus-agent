@@ -12507,8 +12507,11 @@ mod cov_runtime_topup_private {
 
         fn stream(&self, request: &ModelRequest, _context: &ProviderContext) -> Vec<ProviderEvent> {
             match self.calls.fetch_add(1, Ordering::SeqCst) {
-                0 => archive_tool_turn("host_read", r#"{"path":"first"}"#),
-                1 => archive_tool_turn("host_read", r#"{"path":"second"}"#),
+                // Command output is the stable first-exposure projection that
+                // carries an archive reference; complete reads stay full so a
+                // growing transcript remains cacheable.
+                0 => archive_tool_turn("host_exec", r#"{"argv":["first"]}"#),
+                1 => archive_tool_turn("host_exec", r#"{"argv":["second"]}"#),
                 2 => {
                     let output_ref = request
                         .conversation()
@@ -12542,7 +12545,7 @@ mod cov_runtime_topup_private {
         body.push_str("middle-marker");
         body.push_str(&"b".repeat(4096));
         let body_len = body.len();
-        let mut tool = ScriptedTool::new("host_read", None);
+        let mut tool = ScriptedTool::new("host_exec", None);
         tool.outcome = ToolOutcome::new(
             ExecutionStatus::Succeeded,
             EffectState::KnownNotApplied,
@@ -12558,11 +12561,11 @@ mod cov_runtime_topup_private {
         let (runtime, mut streams) = Runtime::try_new_with_session_store(
             RuntimeConfig {
                 limits: Limits::m0_test(),
-                policy: Policy::m0_test(),
+                policy: Policy::development(&directory).unwrap(),
                 has_approval_handler: true,
             },
             provider.clone(),
-            vec![ToolRegistration::read(tool)],
+            vec![ToolRegistration::process(tool)],
             ModelInstructions::default(),
             Box::new(store),
         )

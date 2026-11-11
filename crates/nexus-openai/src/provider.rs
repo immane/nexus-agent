@@ -2578,6 +2578,28 @@ mod cache_usage_tests {
     }
 
     #[test]
+    fn deepseek_cache_hit_field_is_an_alternate_read_counter() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "prompt_cache_hit_tokens": 96,
+            "prompt_cache_miss_tokens": 24
+        });
+        assert_eq!(
+            usage_of(&serde_json::json!({ "usage": usage })),
+            (Some(120), Some(8), Some(96), None)
+        );
+        // A native detail field wins; alternate representations are never summed.
+        let both = serde_json::json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 100},
+            "prompt_cache_hit_tokens": 96
+        });
+        assert_eq!(usage_of(&serde_json::json!({ "usage": both })).2, Some(100));
+    }
+
+    #[test]
     fn streaming_usage_keeps_earlier_cache_fields_across_later_chunks() {
         let mut parser = SseLive::new(false);
         let seen = std::sync::Mutex::new(Vec::new());
@@ -3385,6 +3407,11 @@ fn events_for_responses(reply: &Value) -> Vec<ProviderEvent> {
             usage
                 .and_then(|usage| usage.get("cache_read_input_tokens"))
                 .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.get("prompt_cache_hit_tokens"))
+                .and_then(Value::as_u64)
         });
     let cache_write = usage
         .and_then(|usage| usage.get("cache_creation_input_tokens"))
@@ -3579,7 +3606,9 @@ struct SseCall {
 
 /// Reads per-request counters and best-effort prompt-cache observations from
 /// one Chat Completions chunk. Cache fields are independent counters; cached
-/// input may already be included in the prompt count.
+/// input may already be included in the prompt count. Providers name the same
+/// observation differently, so alternate fields are tried without summing
+/// them: double counting would overstate reuse.
 fn usage_of(chunk: &Value) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
     let Some(usage) = chunk.get("usage") else {
         return (None, None, None, None);
@@ -3587,7 +3616,8 @@ fn usage_of(chunk: &Value) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64
     let cache_read = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64));
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
     let cache_write = usage
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64);
@@ -4586,5 +4616,219 @@ mod retry_policy_tests {
         let error =
             write_request(&mut stream, b"request", b"body", &context, deadline).unwrap_err();
         assert!(has_retryable_terminal(&[error]));
+    }
+}
+
+/// Regression coverage for the append-only request shape that provider prompt
+/// caching depends on. These inspect the encoded body, because assistant-item
+/// merging and protocol conversion happen after the runtime builds its view.
+#[cfg(test)]
+mod prompt_cache_tests {
+    use super::*;
+    use nexus_core::{
+        CallId, EffectState, Evidence, ExecutionStatus, M0_REVISION, ModelContextItem,
+        ModelInstructions, ModelRequest, NormalizedArgs, RunId, SessionId, ToolCall, ToolId,
+        ToolOutcome, ToolSpec, TurnId,
+    };
+
+    fn provider(protocol: ProtocolKind) -> OpenAiProvider {
+        OpenAiProvider::new_for_protocol(
+            "https://opencode.ai/inference/go/openai/v1",
+            CredentialRef::env_var("TEST_OPENCODE_KEY").unwrap(),
+            "deepseek-v4.1-flash",
+            protocol,
+        )
+        .unwrap()
+    }
+
+    fn tools() -> Vec<ToolSpec> {
+        vec![
+            ToolSpec::new(
+                ToolId::new("host_read", M0_REVISION).unwrap(),
+                "Read a file",
+                r#"{"type":"object","properties":{"path":{"type":"string"}}}"#,
+            )
+            .unwrap(),
+            ToolSpec::new(
+                ToolId::new("host_exec", M0_REVISION).unwrap(),
+                "Run a command",
+                r#"{"type":"object","properties":{"argv":{"type":"array"}}}"#,
+            )
+            .unwrap(),
+        ]
+    }
+
+    fn base_request(conversation: Vec<ModelContextItem>) -> ModelRequest {
+        ModelRequest::new(
+            RunId::new("run").unwrap(),
+            TurnId::new("turn").unwrap(),
+            "profile",
+            Vec::new(),
+            None,
+            8192,
+        )
+        .unwrap()
+        .with_session(SessionId::new("session").unwrap())
+        .with_instructions(
+            ModelInstructions::new("host rules", "workspace /repo").unwrap(),
+        )
+        .unwrap()
+        .with_context_note(
+            "Context window: 1000000 tokens. Automatic compaction: trigger 65%, target 10%, method summarize.",
+        )
+        .unwrap()
+        .with_conversation(conversation)
+        .unwrap()
+        .with_tool_definitions(tools())
+        .unwrap()
+    }
+
+    fn exchange(
+        id: &str,
+        tool: &str,
+        content: &str,
+        reasoning: Option<&str>,
+    ) -> Vec<ModelContextItem> {
+        let call = ToolCall::new(
+            RunId::new("run").unwrap(),
+            TurnId::new("turn").unwrap(),
+            CallId::new(id).unwrap(),
+            ToolId::new(tool, M0_REVISION).unwrap(),
+            NormalizedArgs::new("{}").unwrap(),
+        );
+        vec![
+            ModelContextItem::assistant_call_with_reasoning(
+                id,
+                format!("provider-{id}"),
+                call.clone(),
+                reasoning.map(str::to_owned),
+            )
+            .unwrap(),
+            ModelContextItem::tool_result(
+                call.call().clone(),
+                id,
+                format!("provider-{id}"),
+                call.tool().clone(),
+                ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownNotApplied,
+                    Evidence::HostObserved,
+                    content,
+                    false,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ]
+    }
+
+    fn conversation_with_reasoning() -> Vec<ModelContextItem> {
+        let mut items = vec![
+            ModelContextItem::user_text("inspect the parser").unwrap(),
+            ModelContextItem::assistant_text("item-0", "Reading the implementation.").unwrap(),
+        ];
+        items.extend(exchange(
+            "call-1",
+            "host_read",
+            "complete file contents",
+            Some("tool-call reasoning must replay"),
+        ));
+        items.push(ModelContextItem::user_text("continue").unwrap());
+        items
+    }
+
+    /// Messages cannot replay reasoning, so its prefix fixture omits it.
+    fn conversation() -> Vec<ModelContextItem> {
+        let mut items = vec![
+            ModelContextItem::user_text("inspect the parser").unwrap(),
+            ModelContextItem::assistant_text("item-0", "Reading the implementation.").unwrap(),
+        ];
+        items.extend(exchange(
+            "call-1",
+            "host_read",
+            "complete file contents",
+            None,
+        ));
+        items.push(ModelContextItem::user_text("continue").unwrap());
+        items
+    }
+
+    /// Asserts `next` begins with all of `prefix`, element by element.
+    fn assert_prefix(prefix: &Value, next: &Value) {
+        let prefix = prefix.as_array().expect("encoded array");
+        let next = next.as_array().expect("encoded array");
+        assert!(
+            next.len() >= prefix.len(),
+            "a later turn cannot drop accepted input"
+        );
+        assert_eq!(
+            &next[..prefix.len()],
+            prefix.as_slice(),
+            "the already-sent input prefix changed"
+        );
+    }
+
+    #[test]
+    fn chat_prefix_stays_identical_when_the_transcript_grows() {
+        let provider = provider(ProtocolKind::ChatCompletions);
+        let first = base_request(conversation_with_reasoning());
+        let first_body = provider.request_body(&first).unwrap();
+
+        let mut later = conversation_with_reasoning();
+        later.push(ModelContextItem::assistant_text("item-2", "Parser is clear.").unwrap());
+        later.push(ModelContextItem::user_text("apply the fix").unwrap());
+        later.extend(exchange("call-2", "host_exec", "tests pass", None));
+        let second_body = provider.request_body(&base_request(later)).unwrap();
+
+        assert_eq!(
+            first_body["messages"][0], second_body["messages"][0],
+            "system content must not change between normal turns"
+        );
+        assert_eq!(
+            first_body["tools"], second_body["tools"],
+            "tool definitions and their order must not change"
+        );
+        assert_prefix(&first_body["messages"], &second_body["messages"]);
+        assert!(
+            second_body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message.get("reasoning_content").is_some()),
+            "required reasoning must remain in the replayed prefix"
+        );
+    }
+
+    #[test]
+    fn anthropic_prefix_stays_identical_when_the_transcript_grows() {
+        let provider = provider(ProtocolKind::AnthropicMessages);
+        let first_body = provider
+            .request_body(&base_request(conversation()))
+            .unwrap();
+
+        let mut later = conversation();
+        later.push(ModelContextItem::assistant_text("item-2", "Parser is clear.").unwrap());
+        later.push(ModelContextItem::user_text("apply the fix").unwrap());
+        let second_body = provider.request_body(&base_request(later)).unwrap();
+
+        assert_eq!(first_body["system"], second_body["system"]);
+        assert_eq!(first_body["tools"], second_body["tools"]);
+        assert_prefix(&first_body["messages"], &second_body["messages"]);
+    }
+
+    #[test]
+    fn a_stable_note_does_not_depend_on_estimate_size() {
+        let provider = provider(ProtocolKind::ChatCompletions);
+        let smaller = base_request(conversation());
+        let mut larger_conversation = conversation();
+        larger_conversation.push(ModelContextItem::user_text("x".repeat(4096)).unwrap());
+        let larger = base_request(larger_conversation);
+        let smaller_body = provider.request_body(&smaller).unwrap();
+        let larger_body = provider.request_body(&larger).unwrap();
+        assert_eq!(
+            smaller_body["messages"][0], larger_body["messages"][0],
+            "transcript growth must not rewrite the system message"
+        );
+        assert_prefix(&smaller_body["messages"], &larger_body["messages"]);
     }
 }
