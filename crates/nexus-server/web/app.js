@@ -124,6 +124,7 @@ const state = {
   retries: 0,
   lastSeq: null,
   assistantItems: new Map(),
+  reasoningItems: new Map(),
   tools: new Map(),
   approvals: new Map(),
   pendingApprovalSeen: false,
@@ -345,6 +346,7 @@ function flushText() {
   if (!pendingText.size) return;
   for (const [textNode, text] of pendingText) textNode.appendData(text);
   pendingText.clear();
+  for (const record of state.reasoningItems.values()) scrollReasoning(record);
   if (state.pinned) scrollToBottom();
 }
 
@@ -1390,6 +1392,7 @@ function resetRunState() {
     if (record.renderTimer) clearTimeout(record.renderTimer);
   }
   state.assistantItems.clear();
+  state.reasoningItems.clear();
   state.tools.clear();
   state.approvals.clear();
   state.noticeKeys.clear();
@@ -1713,6 +1716,10 @@ function handleEvent(event) {
       break;
     case 'assistant-text':
       appendAssistantText(detail);
+      break;
+    case 'assistant-reasoning':
+      appendReasoning(detail);
+      setRunStatus('Thinking…', 'busy');
       break;
     case 'reasoning-redacted':
       setRunStatus('Reasoning content is hidden', 'busy');
@@ -2257,6 +2264,10 @@ function scheduleAssistantRender(record) {
 /* Assistant text */
 
 function markStreamingDone() {
+  for (const record of state.reasoningItems.values()) {
+    record.card.dataset.streaming = 'false';
+    record.label.textContent = 'Thoughts';
+  }
   for (const record of state.assistantItems.values()) {
     record.article.dataset.streaming = 'false';
     renderAssistant(record, true);
@@ -2328,6 +2339,64 @@ function appendAssistantText(detail) {
     record.prose.replaceChildren(record.textNode);
     assistantWarning(record);
     if (state.pinned) scrollToBottom();
+  }
+}
+
+/* Live reasoning (historical reasoning remains hidden). */
+
+function scrollReasoning(record) {
+  record.preview.scrollTop = record.preview.scrollHeight;
+  if (record.card.open && record.follow) record.body.scrollTop = record.body.scrollHeight;
+}
+
+function appendReasoning(detail) {
+  const text = typeof detail.text === 'string' ? detail.text : '';
+  if (!text) return;
+  const key = `${detail.turn ?? ''}:${detail.item ?? ''}`;
+  let record = state.reasoningItems.get(key);
+  if (!record) {
+    markStreamingDone();
+    const card = node('details', 'tool-card reasoning-card');
+    card.open = false;
+    const summary = node('summary', 'reasoning-summary');
+    const label = node('span', 'tool-name reasoning-label', 'Thinking…');
+    const preview = node('span', 'reasoning-preview');
+    preview.setAttribute('aria-hidden', 'true');
+    const previewText = document.createTextNode('');
+    preview.append(previewText);
+    summary.append(label, preview);
+    const body = node('div', 'reasoning-body');
+    body.tabIndex = 0;
+    body.setAttribute('role', 'region');
+    body.setAttribute('aria-label', 'Live thinking');
+    const textNode = document.createTextNode('');
+    body.append(textNode);
+    const warning = node('p', 'reasoning-limit', 'Thinking display limit reached; further text is not shown.');
+    warning.hidden = true;
+    card.append(summary, body, warning);
+    record = { card, label, preview, previewText, body, textNode, warning, chars: 0, follow: true };
+    card.addEventListener('toggle', () => {
+      record.follow = true;
+      requestAnimationFrame(() => {
+        scrollReasoning(record);
+        if (state.pinned) scrollToBottom();
+      });
+    });
+    body.addEventListener('scroll', () => {
+      record.follow = body.scrollHeight - body.scrollTop - body.clientHeight < 48;
+    });
+    appendNode(card);
+    state.reasoningItems.set(key, record);
+  }
+  record.card.dataset.streaming = 'true';
+  record.label.textContent = 'Thinking…';
+  const remaining = MAX_ASSISTANT_CHARS - record.chars;
+  const piece = text.slice(0, remaining);
+  record.chars += piece.length;
+  if (piece.length < text.length) record.warning.hidden = false;
+  if (piece) {
+    queueText(record.previewText, piece);
+    queueText(record.textNode, piece);
   }
 }
 

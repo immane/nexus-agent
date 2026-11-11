@@ -75,7 +75,8 @@ The embedded Web client's regressions run separately with Node.js:
 `node --test crates/nexus-server/tests/web_*.mjs`. They exercise settings
 navigation, tool argument presentation, literal code content, bounded
 replacement diffs, streaming/final output, disclosure states, and the install
-prompt flow, saved-session rendering, and busy-state wiring with a small DOM
+prompt flow, saved-session rendering, live-thinking disclosure and bounded
+streaming previews, and busy-state wiring with a small DOM
 double; they do not replace browser layout checks. Server saved-session
 listing, history, restore, and continuation are covered by the server test
 suite with a reopened file store.

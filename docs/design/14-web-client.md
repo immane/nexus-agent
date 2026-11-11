@@ -220,7 +220,8 @@ contracts:
 | --- | --- |
 | `run-started` | Running status |
 | `assistant-text` | Incremental assistant text, keyed by turn and item |
-| `reasoning-redacted` | Running status; no hidden content |
+| `assistant-reasoning` | Live thinking, keyed by turn and item; collapsed last-line preview, expandable scrolling text |
+| `reasoning-redacted` | Compatibility status for older servers; no hidden content |
 | `model-request-started/finished` | Waiting/status transitions |
 | `model-response-discarded` | Warning notice |
 | `context-reduced` | Informational notice |
@@ -236,6 +237,15 @@ Sequence numbers are tracked per run. Duplicate sequence numbers are ignored;
 gaps produce an explicit incomplete-transcript notice. A terminal event always
 marks the run finished even if another UI update is in flight. Late cancellation
 or approval responses cannot overwrite a terminal status.
+
+Live thinking is sent as plain text through the same authenticated run event
+stream as assistant text. Each thinking item starts collapsed and follows its
+last wrapped line. Expanding reveals the received text in a bounded scrolling
+panel, which follows new output unless the reader scrolls up. Display is capped
+at 200,000 characters per item with an explicit truncation notice. The display
+does not enable model thinking or expose opaque provider state. Saved-history
+responses still omit reasoning text; restoring a session does not restore these
+live thinking panels.
 
 Approvals are sent only with the identities from the live event. The optional
 `session-directory` scope is offered only when the runtime published a directory.
