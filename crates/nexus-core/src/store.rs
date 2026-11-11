@@ -328,6 +328,35 @@ pub trait SessionStore {
         Err(store_error("source history is unsupported by this store"))
     }
 
+    /// Finds one archived tool result by its host call identity. The default
+    /// scans bounded pages; stores with an indexed view may override it.
+    fn find_source_record(
+        &self,
+        session: &SessionId,
+        call: &CallId,
+    ) -> Result<Option<SourceRecord>, AgentError> {
+        let mut after = 0;
+        loop {
+            let page = self.load_source_records(session, after, 256)?;
+            let Some(next) = page.last().map(SourceRecord::sequence) else {
+                return Ok(None);
+            };
+            if let Some(record) = page.into_iter().find(|record| {
+                matches!(
+                    record.item(),
+                    ModelContextItem::ToolResult { call: record_call, .. }
+                        if record_call == call
+                )
+            }) {
+                return Ok(Some(record));
+            }
+            if next <= after {
+                return Err(store_error("source history cursor is invalid"));
+            }
+            after = next;
+        }
+    }
+
     /// Returns the newest source sequence for one selected session.
     fn last_source_sequence(&self, _session: &SessionId) -> Result<u64, AgentError> {
         Err(store_error("source history is unsupported by this store"))

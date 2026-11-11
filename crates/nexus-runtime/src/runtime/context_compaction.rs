@@ -4,7 +4,7 @@ use super::*;
 use nexus_context::{
     SUMMARY_PROMPT, TRUNCATE_NOTE, conversation_with_memory, estimated_input_tokens,
     needs_compaction, plan_reduction, plan_summary_reduction, project_old_tool_outputs,
-    project_tool_outputs, render_context_note, summary_text,
+    project_tool_outputs, project_tool_outputs_for_request, render_context_note, summary_text,
 };
 use nexus_core::{ContextCompactionStrategy, ReasoningEffort};
 
@@ -12,6 +12,8 @@ const MAX_SUMMARY_OUTPUT_TOKENS: u64 = 4096;
 const MAX_SUMMARY_CHUNK_BYTES: usize = 24 * 1024;
 const MAX_SUMMARY_RECORD_BYTES: usize = 16 * 1024;
 const MAX_SUMMARY_OUTPUT_RETRIES: u8 = 2;
+const OLD_TOOL_OUTPUT_PREVIEW_BYTES: usize = 2048;
+const COMMAND_OUTPUT_PREVIEW_BYTES: usize = 4096;
 const SUMMARY_REQUEST: &str = "Summarize the preceding historical data now. Do not continue the original task. Return only a concise, nonempty compact summary, not reasoning alone.";
 
 /// Disjoint payload-byte categories, not independently rounded token estimates.
@@ -482,6 +484,28 @@ fn preview_request_for_headroom(
         .map_err(Terminal::failed)
 }
 
+fn preview_old_outputs(
+    active: &ActiveRun,
+    request: ModelRequest,
+    archive_available: bool,
+) -> Result<ModelRequest, Terminal> {
+    if active.continuation.is_some() {
+        return Ok(request);
+    }
+    let items = project_tool_outputs_for_request(
+        request.conversation(),
+        OLD_TOOL_OUTPUT_PREVIEW_BYTES,
+        COMMAND_OUTPUT_PREVIEW_BYTES,
+        archive_available,
+    )
+    .map_err(Terminal::failed)?;
+    let request = request.with_conversation(items).map_err(Terminal::failed)?;
+    let input = estimate(active, &request);
+    request
+        .with_context_note(task_context_note(active, &active.context_note, input))
+        .map_err(Terminal::failed)
+}
+
 pub(super) fn prepare_context_request(
     shared: &Arc<Shared>,
     active: &mut ActiveRun,
@@ -505,17 +529,25 @@ pub(super) fn prepare_context_request(
         ));
     }
     let mut request = normal_request(shared, active, turn, &active.conversation)?;
+    let archive_available = shared.session_store.is_some()
+        && shared
+            .tools
+            .contains_key(crate::runtime::archive::HOST_ARCHIVE_TOOL);
+    // Bound repeated old log bodies even before a large/unknown window reaches
+    // its soft trigger. Keep the original request for emergency previews so
+    // projection markers never replace original truncation provenance.
+    let mut projected = preview_old_outputs(active, request.clone(), archive_available)?;
     let Some(window) = active.context_management.window else {
-        active.input_estimate = estimated_input_tokens(&request);
+        active.input_estimate = estimated_input_tokens(&projected);
         return match active.context_management.max_output_tokens {
-            Some(output) => request
+            Some(output) => projected
                 .with_max_output_tokens(output)
                 .map_err(Terminal::failed),
-            None => Ok(request),
+            None => Ok(projected),
         };
     };
     let window = u64::from(window.tokens());
-    let input = estimate(active, &request);
+    let input = estimate(active, &projected);
     let policy = active.context_management.policy;
     let output = active.context_management.output_reserve_tokens(window);
     // Only archived sources may be replaced with compact execution facts.
@@ -531,7 +563,7 @@ pub(super) fn prepare_context_request(
         diagnose_budget(
             shared,
             active,
-            &request,
+            &projected,
             "before_reduction",
             nexus_core::ModelRequestPurpose::Task,
         );
@@ -542,11 +574,13 @@ pub(super) fn prepare_context_request(
             let memory_allowance = "x".repeat(nexus_context::MAX_MEMORY_BYTES);
             plan_summary_reduction(&active.conversation, active.history_len, target, |items| {
                 normal_request_with_memory(shared, active, turn, items, Some(&memory_allowance))
+                    .and_then(|request| preview_old_outputs(active, request, archive_available))
                     .map(|request| estimate(active, &request))
             })?
         } else {
             plan_reduction(&active.conversation, active.history_len, target, |items| {
                 normal_request(shared, active, turn, items)
+                    .and_then(|request| preview_old_outputs(active, request, archive_available))
                     .map(|request| estimate(active, &request))
             })?
         };
@@ -556,9 +590,11 @@ pub(super) fn prepare_context_request(
             plan.items.len(),
         ));
         if policy.strategy() == ContextCompactionStrategy::Summarize && !plan.removed.is_empty() {
-            let minimum = normal_request_with_memory(shared, active, turn, &plan.items, None)?;
+            let original_minimum =
+                normal_request_with_memory(shared, active, turn, &plan.items, None)?;
+            let minimum = preview_old_outputs(active, original_minimum.clone(), archive_available)?;
             let minimum = if estimate(active, &minimum).saturating_add(output) > window {
-                preview_request_for_headroom(active, minimum, window, output)?
+                preview_request_for_headroom(active, original_minimum, window, output)?
             } else {
                 minimum
             };
@@ -621,9 +657,10 @@ pub(super) fn prepare_context_request(
             }
             commit(shared, active, stage, None, "truncate")?;
             request = normal_request(shared, active, turn, &active.conversation)?;
+            projected = preview_old_outputs(active, request.clone(), archive_available)?;
         }
     }
-    let mut input = estimate(active, &request);
+    let mut input = estimate(active, &projected);
     if active.continuation.is_none()
         && (needs_compaction(input, window, policy.trigger_percent())
             || input.saturating_add(output) > window)
@@ -633,27 +670,27 @@ pub(super) fn prepare_context_request(
         && (!(archived && policy.strategy() == ContextCompactionStrategy::Summarize)
             || input.saturating_add(output) > window)
     {
-        request = preview_request_for_headroom(active, request, window, output)?;
-        input = estimate(active, &request);
+        projected = preview_request_for_headroom(active, request, window, output)?;
+        input = estimate(active, &projected);
     }
     if input.saturating_add(output) > window {
         diagnose_budget(
             shared,
             active,
-            &request,
+            &projected,
             "rejected_task",
             nexus_core::ModelRequestPurpose::Task,
         );
         shared.diagnostic(format_args!(
             "nexus-runtime: context cannot fit after reduction estimated_input_tokens={input} window_tokens={window} output_reserve_tokens={output} retained_items={}; protected context was not discarded",
-            request.conversation().len(),
+            projected.conversation().len(),
         ));
         return Err(Terminal::limit(
             "estimated context occupancy cannot preserve the configured output reserve",
         ));
     }
-    active.input_estimate = estimated_input_tokens(&request);
-    request
+    active.input_estimate = estimated_input_tokens(&projected);
+    projected
         .with_max_output_tokens(
             active
                 .context_management
@@ -953,12 +990,19 @@ pub(super) fn ingest_summary(
             .map_err(|_| Terminal::failed_internal("projection turn identity is invalid"))?;
         match normal_request_with_memory(shared, active, &turn, &stage.items, Some(&summary)) {
             Err(_) => rejection_reason = "projected_request_build_failed",
-            Ok(request) => {
+            Ok(original_request) => {
+                let archive_available = shared.session_store.is_some()
+                    && shared
+                        .tools
+                        .contains_key(crate::runtime::archive::HOST_ARCHIVE_TOOL);
+                let request =
+                    preview_old_outputs(active, original_request.clone(), archive_available)?;
                 let request = if let Some(window) = active.context_management.window {
                     let window = u64::from(window.tokens());
                     let output = active.context_management.output_reserve_tokens(window);
                     if estimate(active, &request).saturating_add(output) > window {
-                        match preview_request_for_headroom(active, request, window, output) {
+                        match preview_request_for_headroom(active, original_request, window, output)
+                        {
                             Ok(previewed) => Some(previewed),
                             Err(_) => {
                                 rejection_reason = "headroom_projection_failed";
@@ -1380,6 +1424,202 @@ mod tests {
         let request = prepare(&shared, &mut active);
         assert_eq!(request.conversation(), original);
         assert_eq!(request.max_output_tokens(), None);
+        assert!(active.pending_compaction.is_none());
+        assert_eq!(active.turns_used, 0);
+    }
+
+    #[test]
+    fn old_large_outputs_are_previewed_before_large_or_unknown_window_pressure() {
+        for window in [None, Some(1_048_576)] {
+            let (shared, mut data) = shared_with_data();
+            let mut active = context_run();
+            active.context_management.window = window
+                .map(|tokens| ContextWindow::new(tokens, ContextWindowSource::Configured).unwrap());
+            active.context_management.max_output_tokens = Some(4096);
+            let mut old = context_exchange(&active.run, 0, 131_072);
+            if let ModelContextItem::AssistantCall { reasoning, .. } = &mut old[0] {
+                *reasoning = Some("required provider reasoning".into());
+            }
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut old[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Failed,
+                    EffectState::Unknown,
+                    Evidence::HostObserved,
+                    "Deprecated warning\n".repeat(7000),
+                    true,
+                )
+                .unwrap();
+            }
+            active.conversation.extend(old);
+            let latest = context_exchange(&active.run, 1, 8192);
+            active.conversation.extend(latest.clone());
+            let original = active.conversation.clone();
+            let cursor = active.source_cursor;
+            let request = prepare(&shared, &mut active);
+            let ModelContextItem::ToolResult { outcome, .. } = &request.conversation()[2] else {
+                panic!("old result")
+            };
+            assert!(outcome.content().len() < OLD_TOOL_OUTPUT_PREVIEW_BYTES + 512);
+            assert!(outcome.content().contains("middle of tool output omitted"));
+            assert!(outcome.content().contains("original_output_truncated=true"));
+            assert!(outcome.content().contains("do not blindly retry"));
+            assert_eq!(outcome.status(), ExecutionStatus::Failed);
+            assert_eq!(outcome.effect(), EffectState::Unknown);
+            assert_eq!(outcome.evidence(), Evidence::HostObserved);
+            assert_eq!(
+                request.conversation()[1],
+                original[1],
+                "call arguments and required reasoning are exact"
+            );
+            assert_eq!(
+                &request.conversation()[3..],
+                latest.as_slice(),
+                "newest full exchange is untouched"
+            );
+            assert_eq!(request.max_output_tokens(), Some(4096));
+            assert_eq!(
+                active.conversation, original,
+                "source records are not shortened"
+            );
+            assert_eq!(active.source_cursor, cursor);
+            assert!(active.pending_compaction.is_none());
+            assert_eq!(active.turns_used, 0, "previews do not spend summary calls");
+            assert!(
+                data.try_recv().is_err(),
+                "a preview is not a committed history reduction"
+            );
+        }
+    }
+
+    #[test]
+    fn eager_output_previews_do_not_rewrite_opaque_continuation_requests() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        active
+            .conversation
+            .extend(context_exchange(&active.run, 0, 131_072));
+        active
+            .conversation
+            .extend(context_exchange(&active.run, 1, 32));
+        active.continuation =
+            Some(ContinuationData::new("test-adapter", "profile", b"opaque".to_vec()).unwrap());
+        let original = active.conversation.clone();
+        let request = prepare(&shared, &mut active);
+        assert_eq!(request.conversation(), original);
+        assert_eq!(request.continuation(), active.continuation.as_ref());
+        assert_eq!(active.conversation, original);
+    }
+
+    #[test]
+    fn emergency_previews_still_use_original_output_truncation_provenance() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        active.context_management.window =
+            Some(ContextWindow::new(8192, ContextWindowSource::Configured).unwrap());
+        for n in 0..2 {
+            let mut exchange = context_exchange(&active.run, n, 16_384);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut exchange[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Failed,
+                    EffectState::Unknown,
+                    Evidence::HostObserved,
+                    "x".repeat(16_384),
+                    false,
+                )
+                .unwrap();
+            }
+            active.conversation.extend(exchange);
+        }
+        let original = active.conversation.clone();
+        let request = prepare(&shared, &mut active);
+        let mut projected_results = 0;
+        for item in request.conversation() {
+            if let ModelContextItem::ToolResult { outcome, .. } = item {
+                assert!(outcome.is_truncated());
+                assert!(
+                    outcome
+                        .content()
+                        .contains("original_output_truncated=false")
+                );
+                assert!(!outcome.content().contains("original_output_truncated=true"));
+                projected_results += 1;
+            }
+        }
+        assert_eq!(projected_results, 2);
+        assert!(estimate(&active, &request) + reserve(8192) <= 8192);
+        assert_eq!(active.conversation, original);
+        assert!(active.pending_compaction.is_none());
+    }
+
+    #[test]
+    fn eager_previews_reduce_cumulative_estimates_in_a_large_log_replay() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        active
+            .conversation
+            .extend(context_exchange(&active.run, 0, 131_072));
+        let mut full_total = 0;
+        let mut projected_total = 0;
+        for n in 1..=12 {
+            active
+                .conversation
+                .extend(context_exchange(&active.run, n, 256));
+            let full = normal_request(&shared, &active, &turn(), &active.conversation)
+                .unwrap_or_else(|terminal| panic!("request failed: {:?}", terminal.error));
+            let source = active.conversation.clone();
+            let projected = prepare(&shared, &mut active);
+            full_total += estimated_input_tokens(&full);
+            projected_total += estimated_input_tokens(&projected);
+            assert_eq!(active.conversation, source);
+        }
+        assert!(
+            projected_total < full_total / 3,
+            "synthetic cumulative estimates, not measured provider tokens: full={full_total} previewed={projected_total}"
+        );
+        assert_eq!(active.turns_used, 0);
+    }
+
+    #[test]
+    fn reduction_selection_budgets_projected_candidates_without_over_removing_history() {
+        let (shared, _data) = shared_with_data();
+        let mut active = context_run();
+        active.context_management.window =
+            Some(ContextWindow::new(65_536, ContextWindowSource::Configured).unwrap());
+        active.context_management.policy =
+            ContextManagementPolicy::new(40, 20, ContextCompactionStrategy::Truncate).unwrap();
+        for n in 0..4 {
+            let mut group = context_exchange(&active.run, n, if n == 1 { 131_072 } else { 32 });
+            if let ModelContextItem::AssistantCall { reasoning, .. } = &mut group[0] {
+                *reasoning = match n {
+                    0 => Some("r".repeat(64_000)),
+                    2 => Some("still useful context ".repeat(600)),
+                    _ => None,
+                };
+            }
+            if n == 1
+                && let ModelContextItem::ToolResult { outcome, .. } = &mut group[1]
+            {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Failed,
+                    EffectState::Unknown,
+                    Evidence::HostObserved,
+                    "x".repeat(131_072),
+                    true,
+                )
+                .unwrap();
+            }
+            active.conversation.extend(group);
+        }
+        let mut expected = active.conversation.clone();
+        expected.drain(1..3);
+        let request = prepare(&shared, &mut active);
+        assert_eq!(
+            active.conversation, expected,
+            "removing the first eligible group reaches the projected target; do not remove another group because of a pinned raw log"
+        );
+        assert!(request.conversation().iter().any(|item| matches!(item,
+            ModelContextItem::AssistantCall { call, reasoning: Some(_), .. } if call.call().as_str() == "call-2")));
+        assert!(estimate(&active, &request) <= 65_536 * 20 / 100);
         assert!(active.pending_compaction.is_none());
         assert_eq!(active.turns_used, 0);
     }
@@ -2842,7 +3082,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_safe_output_is_compacted_after_an_uncertain_exec() {
+    fn oversized_safe_exchange_is_compacted_after_an_uncertain_exec() {
         for strategy in [
             ContextCompactionStrategy::Truncate,
             ContextCompactionStrategy::Summarize,
@@ -2866,6 +3106,11 @@ mod tests {
             active
                 .conversation
                 .extend(context_exchange(&active.run, 1, 16_000));
+            // Keep pressure after eager output previews so this still exercises
+            // exchange reduction, not the cheaper request-only preview path.
+            if let ModelContextItem::AssistantCall { reasoning, .. } = &mut active.conversation[3] {
+                *reasoning = Some("r".repeat(6000));
+            }
             active
                 .conversation
                 .extend(context_exchange(&active.run, 2, 32));

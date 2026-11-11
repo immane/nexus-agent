@@ -29,6 +29,22 @@ writer. The default scripted headless runner retains its existing stderr
 contract; `nexus-headless` CLI tests cover separate and merged streams and a
 closed stdout pipe without relaxing their output assertions.
 
+Runtime output-projection regressions cover a 128 KiB old warning log under large
+and unknown windows, an untouched latest complete non-command exchange,
+preserved unknown effects/arguments/reasoning, unchanged source records, no
+extra summary calls, opaque continuation bypass, stable first-exposure command
+bounds, deduplicated diagnostic lines, and emergency truncation provenance.
+`host_archive` coverage verifies exact bounded references, invalid or path-like
+arguments, missing records, range and search reads, long-line truncation,
+active-session binding, cross-session refusal, store reopen, original-source
+retention, and end-to-end retrieval without re-execution.
+Server JSON tests keep cache counters independent from input and preserve null
+for unknown values. Runtime usage tests verify terminal cache merging. A
+synthetic multi-turn replay compares
+cumulative estimates, not measured provider usage. Existing reduction fixtures
+retain non-output pressure so their uncertainty-pinning and actual compaction
+assertions remain exercised.
+
 The opt-in provider `task_reasoning_effort` setting has offline coverage in
 `nexus-config`'s `task_reasoning_effort` test target, `nexus-openai`'s
 `reasoning_effort_tests`, and the existing server configuration integration

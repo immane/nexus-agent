@@ -350,7 +350,13 @@ fn usage_json_keeps_unknown_counters_null_never_zero() {
             let encoded = usage_json(&Usage::new(input, output, finality));
             assert_eq!(
                 encoded,
-                json!({ "input": input, "output": output, "finality": finality_name }),
+                json!({
+                    "input": input,
+                    "output": output,
+                    "cache_read": null,
+                    "cache_write": null,
+                    "finality": finality_name
+                }),
                 "input {input:?} output {output:?} finality {finality_name}"
             );
             if input.is_none() {
@@ -369,7 +375,11 @@ fn usage_json_keeps_unknown_counters_null_never_zero() {
             } else {
                 assert_eq!(encoded["output"].as_u64(), output, "known output is exact");
             }
-            assert_eq!(field_count(&encoded), 3, "exactly input, output, finality");
+            assert_eq!(
+                field_count(&encoded),
+                5,
+                "exactly input, output, cache_read, cache_write, finality"
+            );
             encoded_count += 1;
         }
     }
@@ -714,6 +724,20 @@ fn event_json_tool_finished_carries_the_typed_outcome() {
 }
 
 #[test]
+fn usage_json_keeps_cache_counters_independent_and_optional() {
+    let encoded = usage_json(
+        &Usage::new(Some(100), Some(5), UsageFinality::Final).with_cache(Some(80), Some(12)),
+    );
+    assert_eq!(encoded["cache_read"], 80);
+    assert_eq!(encoded["cache_write"], 12);
+    assert_eq!(encoded["input"], 100, "cache counters are not subtracted");
+    let read_only =
+        usage_json(&Usage::new(None, None, UsageFinality::Provisional).with_cache(Some(0), None));
+    assert_eq!(read_only["cache_read"], 0, "a reported zero remains zero");
+    assert!(read_only["cache_write"].is_null());
+}
+
+#[test]
 fn event_json_usage_keeps_unknown_counters_null_never_zero() {
     let unknown = event_json(&event(
         8,
@@ -723,7 +747,13 @@ fn event_json_usage_keeps_unknown_counters_null_never_zero() {
     assert_eq!(unknown["terminal"], false);
     assert_eq!(
         unknown["detail"],
-        json!({ "input": null, "output": null, "finality": "Final" })
+        json!({
+            "input": null,
+            "output": null,
+            "cache_read": null,
+            "cache_write": null,
+            "finality": "Final"
+        })
     );
     assert!(unknown["detail"]["input"].is_null());
     assert!(unknown["detail"]["output"].is_null());
@@ -734,7 +764,13 @@ fn event_json_usage_keeps_unknown_counters_null_never_zero() {
     ));
     assert_eq!(
         provisional["detail"],
-        json!({ "input": 11, "output": null, "finality": "Provisional" })
+        json!({
+            "input": 11,
+            "output": null,
+            "cache_read": null,
+            "cache_write": null,
+            "finality": "Provisional"
+        })
     );
     assert_eq!(
         usage_json(&Usage::new(Some(11), None, UsageFinality::Provisional)),

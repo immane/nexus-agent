@@ -182,6 +182,8 @@ pub struct ToolContext {
     scope: ApprovedScope,
     token: Option<CancellationToken>,
     deadline_at: Option<Instant>,
+    session: Option<crate::SessionId>,
+    run: Option<crate::RunId>,
 }
 
 impl ToolContext {
@@ -204,6 +206,8 @@ impl ToolContext {
             scope,
             token: None,
             deadline_at: None,
+            session: None,
+            run: None,
         })
     }
 
@@ -215,6 +219,30 @@ impl ToolContext {
         self.token = Some(token);
         self.deadline_at = Some(deadline);
         self
+    }
+
+    /// Binds a host-owned source scope for tools that may read accepted
+    /// historical records. This never widens filesystem or approval scope.
+    /// The archive reader authorizes by the active session; the run identity
+    /// proves that retrieval occurs inside a live run and is informational for
+    /// restored histories from earlier runs in the same session.
+    #[must_use]
+    pub fn with_source_scope(mut self, session: crate::SessionId, run: crate::RunId) -> Self {
+        self.session = Some(session);
+        self.run = Some(run);
+        self
+    }
+
+    /// Returns the active session bound for source retrieval, when present.
+    #[must_use]
+    pub fn session(&self) -> Option<&crate::SessionId> {
+        self.session.as_ref()
+    }
+
+    /// Returns the active run bound for source retrieval, when present.
+    #[must_use]
+    pub fn run(&self) -> Option<&crate::RunId> {
+        self.run.as_ref()
     }
 
     /// Returns the finite output budget in bytes.

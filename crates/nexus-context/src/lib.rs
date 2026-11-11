@@ -402,6 +402,40 @@ pub fn project_tool_outputs(
     output_bytes: usize,
     preserve_latest: bool,
 ) -> Result<Vec<ModelContextItem>, AgentError> {
+    project_tool_outputs_with(items, output_bytes, |_, latest| {
+        (!preserve_latest || !latest).then_some(output_bytes)
+    })
+}
+
+/// Stable first-exposure projection for normal task requests. When the
+/// read-only archive tool is available, command output is bounded from the
+/// first request onward so it does not change once a newer tool group arrives;
+/// without archive retrieval, the latest command group stays full. Other tools
+/// keep the latest complete group verbatim in either case. The selected bound
+/// is deterministic and the original capture remains in source history for
+/// `host_archive`.
+pub fn project_tool_outputs_for_request(
+    items: &[ModelContextItem],
+    old_output_bytes: usize,
+    command_output_bytes: usize,
+    archive_available: bool,
+) -> Result<Vec<ModelContextItem>, AgentError> {
+    project_tool_outputs_with(items, old_output_bytes, |tool, latest| {
+        if tool.name() == "host_exec" {
+            archive_available.then_some(command_output_bytes.max(old_output_bytes))
+        } else if latest {
+            None
+        } else {
+            Some(old_output_bytes)
+        }
+    })
+}
+
+fn project_tool_outputs_with(
+    items: &[ModelContextItem],
+    output_bytes: usize,
+    mut budget: impl FnMut(&nexus_core::ToolId, bool) -> Option<usize>,
+) -> Result<Vec<ModelContextItem>, AgentError> {
     let mut projected = items.to_vec();
     if output_bytes == 0 || !context_calls_are_paired(items) {
         return Ok(projected);
@@ -432,45 +466,146 @@ pub fn project_tool_outputs(
             _ => {}
         }
     }
-    let end = if preserve_latest {
-        latest_start
-    } else {
-        projected.len()
-    };
-    for item in &mut projected[..end] {
-        if let ModelContextItem::ToolResult { outcome, .. } = item
-            && outcome.content().len() > output_bytes
-        {
-            let mut prefix_end = output_bytes / 2;
-            while !outcome.content().is_char_boundary(prefix_end) {
-                prefix_end -= 1;
-            }
-            let mut suffix_start = outcome.content().len() - output_bytes / 2;
-            while !outcome.content().is_char_boundary(suffix_start) {
-                suffix_start += 1;
-            }
-            let content = format!(
-                "{}\n[Nexus model-context projection: middle of tool output omitted; not a complete result. status={:?} effect={:?} evidence={:?} original_output_truncated={}. Unknown effects remain unresolved; do not blindly retry.]\n{}",
-                &outcome.content()[..prefix_end],
-                outcome.status(),
-                outcome.effect(),
-                outcome.evidence(),
-                outcome.is_truncated(),
-                &outcome.content()[suffix_start..]
-            );
-            if content.len() >= outcome.content().len() {
-                continue;
-            }
-            *outcome = nexus_core::ToolOutcome::from_bounded_content(
-                outcome.status(),
-                outcome.effect(),
-                outcome.evidence(),
-                content,
-                true,
-            )?;
+    for (index, item) in projected.iter_mut().enumerate() {
+        let ModelContextItem::ToolResult {
+            call,
+            tool,
+            outcome,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let latest = index >= latest_start;
+        let Some(limit) = budget(tool, latest) else {
+            continue;
+        };
+        if limit == 0 || outcome.content().len() <= limit {
+            continue;
         }
+        let mut prefix_end = limit / 2;
+        while !outcome.content().is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
+        let mut suffix_start = outcome.content().len() - limit / 2;
+        while !outcome.content().is_char_boundary(suffix_start) {
+            suffix_start += 1;
+        }
+        let diagnostics = if tool.name() == "host_exec" {
+            diagnostic_digest(&outcome.content()[prefix_end..suffix_start])
+        } else {
+            String::new()
+        };
+        let content = format!(
+            "{}\n[Nexus model-context projection: middle of tool output omitted; not a complete result. output_ref={} status={:?} effect={:?} evidence={:?} original_output_truncated={}. Use host_archive with this output_ref when available to read or search the original captured output. Unknown effects remain unresolved; do not blindly retry.]\n{diagnostics}{}",
+            &outcome.content()[..prefix_end],
+            call.as_str(),
+            outcome.status(),
+            outcome.effect(),
+            outcome.evidence(),
+            outcome.is_truncated(),
+            &outcome.content()[suffix_start..]
+        );
+        if content.len() >= outcome.content().len() {
+            continue;
+        }
+        *outcome = nexus_core::ToolOutcome::from_bounded_content(
+            outcome.status(),
+            outcome.effect(),
+            outcome.evidence(),
+            content,
+            true,
+        )?;
     }
     Ok(projected)
+}
+
+const DIAGNOSTIC_DIGEST_BYTES: usize = 1024;
+const DIAGNOSTIC_DIGEST_MATCHES: usize = 8;
+const DIAGNOSTIC_LINE_BYTES: usize = 240;
+const DIAGNOSTIC_TOKENS: &[&str] = &[
+    "error",
+    "failed",
+    "failure",
+    "fatal",
+    "panic",
+    "exception",
+    "warning",
+    "deprecated",
+    "deprecation",
+    "timed out",
+    "timeout",
+    "traceback",
+    "assert",
+    "not found",
+    "denied",
+    "cannot",
+    "refused",
+];
+
+/// Selects bounded, deduplicated diagnostic lines from omitted command output.
+/// Repetition is reported as a count rather than silently collapsed; the
+/// complete capture remains retrievable. Selection is host-side and needs no
+/// model call.
+fn diagnostic_digest(omitted: &str) -> String {
+    let mut selected: Vec<(&str, usize)> = Vec::new();
+    let mut omitted_distinct = 0usize;
+    for line in omitted.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !DIAGNOSTIC_TOKENS.iter().any(|token| lower.contains(token)) {
+            continue;
+        }
+        if let Some((_, count)) = selected
+            .iter_mut()
+            .find(|(existing, _)| *existing == trimmed)
+        {
+            *count = count.saturating_add(1);
+            continue;
+        }
+        if selected.len() >= DIAGNOSTIC_DIGEST_MATCHES {
+            omitted_distinct = omitted_distinct.saturating_add(1);
+            continue;
+        }
+        selected.push((trimmed, 1));
+    }
+    if selected.is_empty() {
+        return String::new();
+    }
+    let mut digest = String::from("[selected diagnostic lines from omitted middle]\n");
+    for (index, (line, count)) in selected.iter().enumerate() {
+        let line = diagnostic_line(line);
+        let numbered = if *count > 1 {
+            format!("{line} [repeated {count} times]\n")
+        } else {
+            format!("{line}\n")
+        };
+        if digest.len().saturating_add(numbered.len()) > DIAGNOSTIC_DIGEST_BYTES {
+            omitted_distinct = omitted_distinct.saturating_add(selected.len() - index);
+            break;
+        }
+        digest.push_str(&numbered);
+    }
+    if omitted_distinct > 0 {
+        digest.push_str(&format!(
+            "[{omitted_distinct} additional distinct diagnostic lines not shown; use host_archive to search]\n"
+        ));
+    }
+    digest
+}
+
+fn diagnostic_line(text: &str) -> String {
+    if text.len() <= DIAGNOSTIC_LINE_BYTES {
+        return text.to_owned();
+    }
+    let mut end = DIAGNOSTIC_LINE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[line truncated]", &text[..end])
 }
 
 /// Oldest completed tool exchange in the current task. Keeps the user task and
@@ -1593,6 +1728,73 @@ mod tests {
         let mut pending = items.clone();
         pending.push(exchange("pending", EffectState::KnownNotApplied).remove(0));
         assert_eq!(project_old_tool_outputs(&pending, 2048).unwrap(), pending);
+    }
+
+    #[test]
+    fn request_projection_bounds_command_output_from_its_first_exposure() {
+        let mut items = vec![ModelContextItem::user_text("task").unwrap()];
+        let mut command = exchange_with(
+            "host_exec",
+            r#"{"argv":["test"]}"#,
+            "command",
+            EffectState::KnownNotApplied,
+        );
+        let mut content = String::from("starting test\n");
+        for _ in 0..500 {
+            content.push_str("warning: deprecated API\n");
+        }
+        content.push_str("failure: assertion failed\ntest result: FAILED\n");
+        content.push_str(&"x".repeat(8192));
+        if let ModelContextItem::ToolResult { outcome, .. } = &mut command[1] {
+            *outcome = ToolOutcome::new(
+                ExecutionStatus::Failed,
+                EffectState::KnownNotApplied,
+                Evidence::HostObserved,
+                content,
+                false,
+            )
+            .unwrap();
+        }
+        items.extend(command.clone());
+        items.extend(exchange("latest-read", EffectState::KnownNotApplied));
+        let original = items.clone();
+        let projected =
+            project_tool_outputs_for_request(&items, 2048, 4096, true).expect("projection builds");
+        assert_eq!(items, original);
+        let ModelContextItem::ToolResult { outcome, .. } = &projected[2] else {
+            panic!("command result");
+        };
+        assert!(outcome.is_truncated());
+        assert!(outcome.content().contains("output_ref=command"));
+        assert!(outcome.content().contains("failure: assertion failed"));
+        assert!(outcome.content().contains("[repeated "));
+        assert!(outcome.content().contains(" times]"));
+        assert!(outcome.content().len() < 6500);
+        assert_eq!(&projected[3..], &items[3..]);
+
+        let mut later = original.clone();
+        later.extend(exchange("later", EffectState::KnownNotApplied));
+        let later_projected =
+            project_tool_outputs_for_request(&later, 2048, 4096, true).expect("projection builds");
+        assert_eq!(
+            later_projected[2], projected[2],
+            "command projection is stable across later turns"
+        );
+
+        let mut without_archive = vec![ModelContextItem::user_text("task").unwrap()];
+        without_archive.extend(command);
+        assert_eq!(
+            project_tool_outputs_for_request(&without_archive, 2048, 4096, false)
+                .expect("projection builds"),
+            without_archive,
+            "command output stays full when archive retrieval is unavailable"
+        );
+        let latest_command = project_tool_outputs_for_request(&without_archive, 2048, 4096, true)
+            .expect("projection builds");
+        assert!(matches!(
+            &latest_command[2],
+            ModelContextItem::ToolResult { outcome, .. } if outcome.is_truncated()
+        ));
     }
 
     #[test]

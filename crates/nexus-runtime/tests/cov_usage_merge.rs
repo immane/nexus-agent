@@ -304,6 +304,27 @@ async fn terminal_merge_completes_each_counter_from_its_own_final_source() {
 }
 
 #[tokio::test]
+async fn terminal_merge_keeps_cache_read_and_write_counters_independent() {
+    let observed = final_usage(Some(10), Some(8)).with_cache(Some(9), Some(4));
+    let terminal = final_usage(Some(10), Some(8)).with_cache(None, Some(6));
+    let (control, finished) = run_script(
+        "merge-cache-counters",
+        vec![vec![ProviderEvent::Usage(observed), stop_turn(terminal)]],
+    )
+    .await;
+    assert_eq!(finished.outcome(), RunOutcome::Completed);
+    let updates = usage_updates(&control);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[1].cache_read_input_tokens(), Some(9));
+    assert_eq!(
+        updates[1].cache_write_input_tokens(),
+        Some(6),
+        "the terminal cache write wins while the omitted cache read is retained"
+    );
+    assert_eq!(updates[1].input_tokens(), Some(10));
+}
+
+#[tokio::test]
 async fn unknown_counters_stay_unknown_and_never_become_zero() {
     let bare = final_usage(None, None);
     let (control, finished) = run_script("unknown-bare", vec![vec![stop_turn(bare)]]).await;

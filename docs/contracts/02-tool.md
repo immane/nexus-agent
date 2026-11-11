@@ -27,7 +27,7 @@ A narrow context does not remove the ambient OS privileges of trusted native cod
 
 Check authorization against the actual tool identity, revision, normalized arguments, current resource scope, and effective policy immediately before dispatch. An approval binds these values plus its run, call, expiry, and relevant policy revision.
 
-The default policy automatically permits only host-authorized project reads/searches. Model-directed file mutations and all command execution require confirmation, even for commands described as read-only. Unknown or externally declared effect classifications do not independently earn automatic permission.
+The default policy automatically permits host-authorized project reads/searches and the bounded, session-local `host_archive` reader. `host_archive` accepts only an opaque call reference plus byte range or search query; it cannot accept a host path, read another session, or re-execute the referenced tool. Model-directed file mutations and all command execution require confirmation, even for commands described as read-only. Unknown or externally declared effect classifications do not independently earn automatic permission.
 
 Without an explicitly configured approval handler, a headless confirmation-required call MUST be denied with not-started effects. It cannot wait for nonexistent terminal input, silently enable automatic approval, or execute via another adapter.
 
