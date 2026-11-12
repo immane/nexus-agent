@@ -246,10 +246,12 @@ pub fn needs_compaction(input: u64, window: u64, trigger_percent: u8) -> bool {
         || input.saturating_add(output_reserve_tokens(window)) > window
 }
 
-/// Renders model-visible host metadata, not source-derived memory. Fixed-width
-/// occupancy keeps repeated estimation stable without growing the note.
+/// Renders stable model-visible host metadata, not source-derived memory. The
+/// note must not embed per-turn occupancy: it precedes the transcript in the
+/// system message, so changing it invalidates the provider prompt-cache prefix.
+/// Estimates remain available through runtime diagnostics and budgeting.
 #[must_use]
-pub fn render_context_note(settings: ContextManagementSettings, note: &str, tokens: u64) -> String {
+pub fn render_context_note(settings: ContextManagementSettings, note: &str) -> String {
     let Some(window) = settings.window else {
         return note.to_owned();
     };
@@ -259,7 +261,7 @@ pub fn render_context_note(settings: ContextManagementSettings, note: &str, toke
         ContextCompactionStrategy::Truncate => "truncate",
     };
     format!(
-        "{note}\nContext window: {} tokens. Estimated input occupancy (heuristic, not exact): {tokens:020} tokens. Automatic compaction: trigger {}%, target {}%, method {method}. Estimates include instructions, runtime notes, transcript, tool definitions and framing; provider tokenization may differ.",
+        "{note}\nContext window: {} tokens. Automatic compaction: trigger {}%, target {}%, method {method}. Token estimates are heuristic; provider tokenization may differ.",
         window.tokens(),
         policy.trigger_percent(),
         policy.target_percent()
@@ -410,24 +412,20 @@ pub fn project_tool_outputs(
 /// Stable first-exposure projection for normal task requests. When the
 /// read-only archive tool is available, command output is bounded from the
 /// first request onward so it does not change once a newer tool group arrives;
-/// without archive retrieval, the latest command group stays full. Other tools
-/// keep the latest complete group verbatim in either case. The selected bound
-/// is deterministic and the original capture remains in source history for
-/// `host_archive`.
+/// without archive retrieval, command output stays full. Other tools keep their
+/// accepted bounded capture verbatim: shortening them only because a newer
+/// group arrived would rewrite an already-sent prefix and defeat provider
+/// prompt caching. The selected bound is deterministic and the original capture
+/// remains in source history for `host_archive`.
 pub fn project_tool_outputs_for_request(
     items: &[ModelContextItem],
     old_output_bytes: usize,
     command_output_bytes: usize,
     archive_available: bool,
 ) -> Result<Vec<ModelContextItem>, AgentError> {
-    project_tool_outputs_with(items, old_output_bytes, |tool, latest| {
-        if tool.name() == "host_exec" {
-            archive_available.then_some(command_output_bytes.max(old_output_bytes))
-        } else if latest {
-            None
-        } else {
-            Some(old_output_bytes)
-        }
+    project_tool_outputs_with(items, old_output_bytes, |tool, _| {
+        (tool.name() == "host_exec" && archive_available)
+            .then_some(command_output_bytes.max(old_output_bytes))
     })
 }
 
@@ -1798,6 +1796,33 @@ mod tests {
     }
 
     #[test]
+    fn request_projection_leaves_complete_non_command_output_stable() {
+        let mut items = vec![ModelContextItem::user_text("task").unwrap()];
+        for (tool, id) in [("host_read", "old-read"), ("host_search", "old-search")] {
+            let mut group = exchange_with(tool, "{}", id, EffectState::KnownNotApplied);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut group[1] {
+                *outcome = ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::KnownNotApplied,
+                    Evidence::HostObserved,
+                    "result line\n".repeat(1024),
+                    false,
+                )
+                .unwrap();
+            }
+            items.extend(group);
+        }
+        items.extend(exchange("latest", EffectState::KnownNotApplied));
+        let original = items.clone();
+        assert_eq!(
+            project_tool_outputs_for_request(&items, 2048, 4096, true).expect("projection builds"),
+            original,
+            "non-command captures must not change when a newer group arrives"
+        );
+        assert_eq!(items, original);
+    }
+
+    #[test]
     fn output_projection_keeps_latest_multi_call_group_and_provider_reasoning() {
         let mut items = vec![ModelContextItem::user_text("task").unwrap()];
         let mut old = exchange("old", EffectState::Unknown);
@@ -2020,16 +2045,17 @@ mod tests {
         assert!(needs_compaction(9_500, 10_000, 99));
         let mut settings = ContextManagementSettings::default();
         assert_eq!(
-            render_context_note(settings, "existing note", 100),
+            render_context_note(settings, "existing note"),
             "existing note"
         );
         settings.window =
             Some(ContextWindow::new(94_208, ContextWindowSource::Configured).unwrap());
-        let first = render_context_note(settings, "", 1);
-        let second = render_context_note(settings, "", 50_000);
-        assert_eq!(first.len(), second.len());
+        let first = render_context_note(settings, "");
+        let second = render_context_note(settings, "");
+        assert_eq!(first, second, "the note must not change between turns");
+        assert!(!first.contains("occupancy"));
         assert!(first.contains("94208 tokens"));
         assert!(first.contains("trigger 65%, target 10%"));
-        assert!(first.contains("heuristic, not exact"));
+        assert!(first.contains("heuristic"));
     }
 }

@@ -626,6 +626,26 @@ fn event_json_assistant_text_delta_carries_turn_item_and_text() {
 }
 
 #[test]
+fn event_json_live_reasoning_carries_text_but_history_still_omits_it() {
+    let fragment = AssistantText::new(turn(), "thought-0", "live thinking").unwrap();
+    let encoded = event_json(&event(1, EventPayload::AssistantReasoningDelta(fragment)));
+    assert_eq!(encoded["kind"], "assistant-reasoning");
+    assert_eq!(encoded["terminal"], false);
+    assert_eq!(
+        encoded["detail"],
+        json!({ "turn": "turn-1", "item": "thought-0", "text": "live thinking" })
+    );
+
+    let item =
+        nexus_core::ModelContextItem::assistant_reasoning("historical thinking".into()).unwrap();
+    let record = nexus_core::SourceRecord::new(session(), 1, run(), item).unwrap();
+    assert_eq!(
+        nexus_server::json::history_item_json(&record),
+        json!({ "kind": "reasoning", "sequence": 1, "run": "run-1" })
+    );
+}
+
+#[test]
 fn event_json_tool_call_preview_carries_only_the_item_key() {
     let encoded = event_json(&event(
         2,

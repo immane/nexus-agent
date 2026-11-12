@@ -3,11 +3,14 @@
 Date: 2026-11-11.
 
 Status: implemented and locally validated; matched live evaluation remains
-pending. The implementation covers deterministic output previews,
-source-record retrieval, command diagnostics, and provider cache observations.
-Purpose-correlated cumulative usage and priced cost remain future work.
-Cost-aware threshold changes remain measurement-gated. This document does not authorize live inference, external
-costs, configuration changes, or another server restart.
+pending. The implementation covers deterministic command-output previews,
+source-record retrieval, command diagnostics, provider cache observations, and a
+stable request prefix for prompt caching. Remaining non-command results are no
+longer shortened by age; see
+[Prompt cache stability](../design/15-prompt-cache.md). Purpose-correlated
+cumulative usage and priced cost remain future work. Cost-aware threshold changes
+remain measurement-gated. This document does not authorize live inference,
+external costs, configuration changes, or another server restart.
 
 ## Scope and evidence
 
@@ -38,8 +41,6 @@ Related documents:
 `crates/nexus-runtime/src/runtime/context_compaction.rs` applies deterministic
 previews before pressure thresholds, including unknown context windows:
 
-- Older completed result bodies retain at most 2,048 bytes of UTF-8-safe
-  head/tail excerpts plus an omission and uncertainty notice.
 - When archive retrieval is available, command (`host_exec`) output uses a
   4,096-byte head/tail budget from its first request, so the projection is
   stable when a newer tool group arrives. The omitted middle contributes up to
@@ -47,15 +48,19 @@ previews before pressure thresholds, including unknown context windows:
   counts and omitted distinct diagnostics counted. The complete projection also
   contains a marker and digest, so it is not an exact 4,096-byte total; a
   near-threshold result stays full when projection would not shrink it. Without
-  archive retrieval, command output stays full. Other tools keep the latest
-  complete group in full.
+  archive retrieval, command output stays full.
+- Complete non-command results keep the capture already accepted from the tool.
+  The runtime no longer shortens them only because a newer group arrived: doing
+  so changed an already-sent provider prefix and invalidated prompt caching.
+  Explicit compaction and emergency headroom paths may still project, and an
+  archived command projection remains retrievable through `host_archive`.
 - Original records, exact call arguments, required reasoning, pairing,
   identities, and status/effect/evidence are preserved. Opaque continuations and
   incompletely paired histories are not rewritten.
 - Candidate selection, protected-floor checks, summary acceptance, and dispatch
-  estimates use projected costs. Summary content still comes from original
-  removed sources; emergency previews start from raw requests to preserve
-  original truncation provenance.
+  estimates use projected costs for command output. Summary content still comes
+  from original removed sources; emergency previews start from raw requests to
+  preserve original truncation provenance.
 - Projections include an `output_ref` and require no extra model request. The
   model-facing read-only `host_archive` tool retrieves or searches the original
   captured result by that reference.

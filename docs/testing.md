@@ -41,7 +41,14 @@ retention, and end-to-end retrieval without re-execution.
 Server JSON tests keep cache counters independent from input and preserve null
 for unknown values. Runtime usage tests verify terminal cache merging. A
 synthetic multi-turn replay compares
-cumulative estimates, not measured provider usage. Existing reduction fixtures
+cumulative estimates, not measured provider usage. Prompt-cache regressions in
+`nexus-openai::provider::prompt_cache_tests` compare the encoded system message,
+tool definitions, and message prefix across growing transcripts for Chat
+Completions and Anthropic Messages, and `nexus-context`/`nexus-runtime` tests
+assert that per-turn estimates do not enter the note and that normal requests do
+not rewrite already-sent tool output. DeepSeek's alternate
+`prompt_cache_hit_tokens` counter is covered beside native cache fields; none of
+these tests measures a live provider's cache hit rate. Existing reduction fixtures
 retain non-output pressure so their uncertainty-pinning and actual compaction
 assertions remain exercised.
 
@@ -75,8 +82,15 @@ The embedded Web client's regressions run separately with Node.js:
 `node --test crates/nexus-server/tests/web_*.mjs`. They exercise settings
 navigation, tool argument presentation, literal code content, bounded
 replacement diffs, streaming/final output, disclosure states, and the install
-prompt flow, saved-session rendering, and busy-state wiring with a small DOM
-double; they do not replace browser layout checks. Server saved-session
+prompt flow, saved-session rendering, live-thinking disclosure and bounded
+streaming previews, and busy-state wiring with a small DOM
+double. Thinking also has a stylesheet contract check for the clipped preview
+and bounded expanded panel; these do not replace browser layout checks.
+`nexus-openai`'s `runtime_keeps_wire_prefix_stable_as_occupancy_and_calibration_change`
+regression captures loopback HTTP requests from the real runtime and adapter,
+with a known window and usage-driven estimator calibration, rather than using
+a hard-coded runtime note. It checks the generated system, tools, and message
+prefix. Server saved-session
 listing, history, restore, and continuation are covered by the server test
 suite with a reopened file store.
 The default Unix TUI suite also requires Python 3 for its pseudo-terminal
