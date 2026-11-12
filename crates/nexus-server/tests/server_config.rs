@@ -932,6 +932,146 @@ fn providers_and_models_can_be_added_and_updated_over_http() {
     let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
 }
 
+/// The Web API may write a provider token into the local credential store.
+/// The configuration keeps only the reference, no response echoes the value,
+/// and provider deletion removes an owned credential but refuses while a
+/// model still references the provider.
+#[test]
+fn provider_tokens_are_stored_updated_and_removed_with_the_provider() {
+    let path = temp_config("provider-token");
+    let credentials = path.with_file_name("credentials.json");
+    let port = spawn_server(UserConfig::default_config(), Some(path.clone()));
+
+    let stored = |id: &str, token: Option<&str>| {
+        let mut body = serde_json::json!({
+            "id": id,
+            "display_name": id,
+            "adapter": "direct",
+            "protocol": "chat_completions",
+            "endpoint": "https://api.example.com",
+            "credential": {"stored": id},
+            "default_model": "default-model",
+        });
+        if let Some(token) = token {
+            body["api_token"] = Value::String(token.to_owned());
+        }
+        body.to_string()
+    };
+
+    let (status, summary) = post(
+        port,
+        "/config/providers",
+        &stored("beta", Some("secret-one")),
+    );
+    assert_eq!(status, 200, "token-backed provider admits: {summary}");
+    assert_eq!(
+        summary["providers"][0]["credential"],
+        serde_json::json!({"stored":"beta"})
+    );
+    assert!(!summary.to_string().contains("secret-one"));
+    let on_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&credentials).unwrap()).unwrap();
+    assert_eq!(on_disk["beta"], "secret-one");
+
+    let (status, summary) = post(
+        port,
+        "/config/providers",
+        &stored("beta", Some("secret-two")),
+    );
+    assert_eq!(status, 200, "token updates: {summary}");
+    assert_eq!(
+        read_back(&path).provider("beta").unwrap().default_model,
+        "default-model",
+        "a token-only update preserves other provider fields"
+    );
+    let on_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&credentials).unwrap()).unwrap();
+    assert_eq!(on_disk["beta"], "secret-two");
+    let (status, summary) = get(port, "/config");
+    assert_eq!(status, 200);
+    assert!(!summary.to_string().contains("secret-two"));
+
+    let (status, summary) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"beta","enabled":false}"#,
+    );
+    assert_eq!(status, 200, "provider disables: {summary}");
+    assert_eq!(summary["providers"][0]["enabled"], false);
+    let (status, body) = post(port, "/sessions", r#"{"provider":"beta"}"#);
+    assert_eq!(
+        status, 400,
+        "a disabled provider cannot be selected: {body}"
+    );
+    let (status, summary) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"beta","display_name":"Renamed"}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        summary["providers"][0]["enabled"], false,
+        "an edit without the flag preserves the disabled state"
+    );
+    let (status, _) = post(port, "/config/providers", r#"{"id":"beta","enabled":true}"#);
+    assert_eq!(status, 200);
+    let (status, session) = post(port, "/sessions", r#"{"provider":"beta"}"#);
+    assert_eq!(
+        status, 201,
+        "stored token resolves beside the configured document: {session}"
+    );
+
+    let (status, body) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"env-key","display_name":"Env","adapter":"direct","protocol":"chat_completions","endpoint":"https://api.example.com","credential":{"env":"PATH"},"default_model":"m","api_token":"secret-three"}"#,
+    );
+    assert_eq!(
+        status, 400,
+        "an env credential cannot carry a token: {body}"
+    );
+    assert!(!body.to_string().contains("secret-three"));
+
+    let (status, _) = post(
+        port,
+        "/config/models",
+        r#"{"id":"beta-fast","provider":"beta","name":"beta-model"}"#,
+    );
+    assert_eq!(status, 200);
+    let (status, body) = delete(port, "/config/providers/beta");
+    assert_eq!(
+        status, 409,
+        "a referenced provider cannot be deleted: {body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&credentials).unwrap()).unwrap()["beta"],
+        "secret-two"
+    );
+
+    let (status, _) = post(
+        port,
+        "/config/providers",
+        &stored("gamma", Some("secret-four")),
+    );
+    assert_eq!(status, 200);
+    let (status, summary) = delete(port, "/config/providers/gamma");
+    assert_eq!(status, 200, "an unreferenced provider deletes: {summary}");
+    assert!(
+        summary["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["id"] != "gamma")
+    );
+    let on_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&credentials).unwrap()).unwrap();
+    assert!(on_disk.get("gamma").is_none());
+    assert_eq!(on_disk["beta"], "secret-two");
+    let (status, _) = delete(port, "/config/providers/gamma");
+    assert_eq!(status, 404, "repeat deletion is unknown");
+    let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
+}
+
 #[test]
 fn task_reasoning_effort_is_persisted_preserved_on_form_edits_and_explicitly_cleared() {
     let path = temp_config("task-reasoning");

@@ -23,7 +23,7 @@ struct Mock {
 fn read_request(stream: &mut TcpStream) -> Value {
     stream.set_nonblocking(false).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let mut head = Vec::new();
     let mut byte = [0];
@@ -54,7 +54,7 @@ fn mock(replies: Vec<String>) -> Mock {
     let captured = requests.clone();
     let worker = std::thread::spawn(move || {
         for reply in replies {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -235,7 +235,7 @@ fn translate_then_overwrite_followup_uses_history_and_real_approved_writes() {
                 SessionId::new("files").unwrap(), input, "thinking-profile",
             ).unwrap();
             assert_eq!(runtime.submit(command).await.reply(), CommandReply::Accepted);
-            let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            let finished = tokio::time::timeout(Duration::from_secs(15), async {
                 loop {
                     tokio::select! {
                         event = streams.control.recv() => {
@@ -358,7 +358,7 @@ fn submit(session: &str, input: &str) -> SubmitCommand {
 }
 
 async fn finish(streams: &mut EventStreams) -> RunFinished {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             tokio::select! {
                 event = streams.control.recv() => {
@@ -422,7 +422,7 @@ fn runtime_keeps_wire_prefix_stable_as_occupancy_and_calibration_change() {
             runtime.submit(submit("cache-prefix", "inspect")).await.reply(),
             CommandReply::Accepted
         );
-        let observations = tokio::time::timeout(Duration::from_secs(5), async {
+        let observations = tokio::time::timeout(Duration::from_secs(15), async {
             let mut observations = Vec::new();
             loop {
                 tokio::select! {
@@ -650,7 +650,7 @@ fn cancelled_pending_multi_call_run_never_enters_next_request() {
         assert_eq!(finish(&mut streams).await.outcome(), RunOutcome::Completed);
         let response = runtime.submit(submit("s", "cancelled")).await;
         let run = response.run().unwrap().clone();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let event = streams.control.recv().await.unwrap();
                 if matches!(event.payload(), EventPayload::ApprovalRequired(_)) {

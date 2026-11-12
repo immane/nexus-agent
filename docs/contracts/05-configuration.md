@@ -73,6 +73,16 @@ Bound configuration size and processing. Do not perform network discovery, packa
 
 Use secret references such as named environment variables or approved secret-store entries. Resolve credentials only for the selected integration when needed. Never serialize secret values into session history, debug dumps, or public errors.
 
+The authenticated Web provider API may add or replace a stored credential for an
+existing or new provider id. The value is written to `credentials.json` beside
+the server's configured document, never into the configuration document or its
+redacted summary. The file is strictly parsed before replacement, written
+atomically with owner-only permissions on Unix, and limited to 16 KiB per value.
+Values containing control characters are refused so they cannot alter HTTP
+headers. Provider deletion removes an owned stored entry when it is no longer
+referenced; a provider still named by a model is refused. Credential cleanup
+failure after configuration deletion is reported explicitly rather than hidden.
+
 External plugins receive only explicitly allowed environment and credentials. A host provider secret is not implicitly available to every tool. A missing credential should produce a safe actionable failure, not silent fallback to another service.
 
 A relay receives only the credential reference assigned to its profile. Do not embed secret values in stored endpoints or forward another provider's key automatically. Endpoint/routing changes require destination, compatibility, and credential-scope validation. No network authentication, relay probing, or local-relay launch belongs in ordinary startup configuration loading.
@@ -153,6 +163,16 @@ Changes apply to new Web sessions; existing adapter bindings are unchanged.
 The TUI resolves the same precedence from its per-run selection snapshot;
 restart it to load external configuration-file edits. Historical accepted
 reasoning remains archived and encoded by the existing adapter behavior.
+
+### Provider availability
+
+The optional provider-level `enabled` boolean defaults to `true`; the saved
+document omits the field when enabled so existing documents keep their shape.
+Setting it to `false` keeps the provider, its models, endpoint, and credential
+configured, but new session selection is refused with a static diagnostic. The
+redacted summary always reports the effective flag. Web and TUI resolution both
+enforce it. Disabling a provider does not alter sessions that are already bound
+to it, and an update that omits the flag preserves the previous value.
 
 For Ollama 0.32.14, the OpenAI compatibility conversion maps `"none"` to
 `think=false`; model support and actual compliance must still be verified.

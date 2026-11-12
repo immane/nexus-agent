@@ -7,13 +7,15 @@
 //! permissions on Unix.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::model::{CONFIG_REVISION, UserConfig};
 
 /// Maximum configuration document size in bytes (parse budget).
 pub const MAX_DOCUMENT_BYTES: usize = 65_536;
+/// Maximum one stored credential value accepted from an authenticated caller.
+pub const MAX_CREDENTIAL_BYTES: usize = 16_384;
 /// Environment variable overriding the configuration file path.
 pub const CONFIG_ENV_VAR: &str = "NEXUS_CONFIG";
 /// Configuration file name under the platform config directory.
@@ -171,9 +173,20 @@ static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
 /// over the target. Readers never observe a partial document, concurrent
 /// saves never share a temporary, and no world-readable window exists.
 pub fn save(config: &UserConfig, path: &Path) -> Result<(), ConfigError> {
+    write_atomic(
+        path,
+        config.to_json().as_bytes(),
+        "configuration could not be written",
+    )
+}
+
+/// Atomic owner-only replacement shared by the configuration and stored
+/// credentials. A uniquely named sibling is written, flushed, restricted, and
+/// renamed so readers never observe a partial document.
+fn write_atomic(path: &Path, contents: &[u8], message: &'static str) -> Result<(), ConfigError> {
     let io_error = || ConfigError {
         kind: ConfigErrorKind::Io,
-        message: "configuration could not be written",
+        message,
     };
     let parent = path.parent().ok_or_else(io_error)?;
     let pid = std::process::id();
@@ -193,7 +206,7 @@ pub fn save(config: &UserConfig, path: &Path) -> Result<(), ConfigError> {
             Err(_) => return Err(io_error()),
             Ok(file) => file,
         };
-        if file.write_all(config.to_json().as_bytes()).is_err()
+        if file.write_all(contents).is_err()
             || restrict_owner_only(&temporary).is_err()
             || file.sync_all().is_err()
         {
@@ -248,13 +261,38 @@ fn restrict_owner_only(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Returns the stored-credential file beside the default configuration file.
+#[must_use]
+pub fn credentials_path() -> Option<PathBuf> {
+    default_path().map(|path| path.with_file_name("credentials.json"))
+}
+
 /// Resolves a credential reference for the selected integration, reading
 /// the value only at use time. Missing or empty credentials are safe
 /// actionable failures; the value never enters an error or a log.
 pub fn resolve_credential(credential: &crate::model::CredentialRef) -> Result<String, ConfigError> {
-    resolve_with(credential, |var| {
-        std::env::var(var).ok().filter(|value| !value.is_empty())
-    })
+    resolve_credential_at(credential, None)
+}
+
+/// Resolves a credential with an explicit stored-credential file. Env-var
+/// references still use the process environment. `None` uses the default
+/// credentials path, preserving the existing API.
+pub fn resolve_credential_at(
+    credential: &crate::model::CredentialRef,
+    stored_path: Option<&Path>,
+) -> Result<String, ConfigError> {
+    match credential {
+        crate::model::CredentialRef::EnvVar { .. } => resolve_with(credential, |var| {
+            std::env::var(var).ok().filter(|value| !value.is_empty())
+        }),
+        crate::model::CredentialRef::Stored { provider } => {
+            let path = stored_path
+                .map(Path::to_path_buf)
+                .or_else(credentials_path)
+                .ok_or_else(missing_credential)?;
+            resolve_stored_at(provider, &path)
+        }
+    }
 }
 
 /// Resolves a credential through an injected lookup, so the missing/empty
@@ -287,11 +325,13 @@ fn missing_credential() -> ConfigError {
     }
 }
 
-fn resolve_stored_at(provider: &str, path: &Path) -> Result<String, ConfigError> {
+fn read_credentials_at(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, ConfigError> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(missing_credential());
+            return Ok(serde_json::Map::new());
         }
         Err(_) => {
             return Err(ConfigError {
@@ -315,17 +355,89 @@ fn resolve_stored_at(provider: &str, path: &Path) -> Result<String, ConfigError>
         .map_err(|_| invalid("credentials are invalid"))?;
     let object = document
         .as_object()
-        .ok_or(invalid("credentials are invalid"))?;
+        .ok_or(invalid("credentials are invalid"))?
+        .clone();
     if !object.iter().all(|(id, value)| {
         crate::model::is_id_text(id) && value.as_str().is_some_and(|key| !key.is_empty())
     }) {
         return Err(invalid("credentials are invalid"));
     }
-    object
+    Ok(object)
+}
+
+fn resolve_stored_at(provider: &str, path: &Path) -> Result<String, ConfigError> {
+    read_credentials_at(path)?
         .get(provider)
         .and_then(|value| value.as_str())
         .map(str::to_owned)
         .ok_or_else(missing_credential)
+}
+
+/// Adds or replaces one stored credential in the default credentials file.
+pub fn store_stored_credential(provider: &str, value: &str) -> Result<(), ConfigError> {
+    let path = credentials_path().ok_or(ConfigError {
+        kind: ConfigErrorKind::Io,
+        message: "credentials could not be written",
+    })?;
+    store_stored_credential_at(&path, provider, value)
+}
+
+/// Adds or replaces one stored credential at an explicit path. The file is
+/// parsed strictly first so malformed caller-owned data is never overwritten,
+/// then replaced atomically with owner-only permissions. The value never
+/// enters an error or a log.
+pub fn store_stored_credential_at(
+    path: &Path,
+    provider: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    if !crate::model::is_id_text(provider)
+        || value.is_empty()
+        || value.len() > MAX_CREDENTIAL_BYTES
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(invalid("credential value is invalid"));
+    }
+    let mut object = read_credentials_at(path)?;
+    object.insert(
+        provider.to_owned(),
+        serde_json::Value::String(value.to_owned()),
+    );
+    let text = serde_json::to_vec(&object).map_err(|_| invalid("credentials are invalid"))?;
+    if text.len() > MAX_DOCUMENT_BYTES {
+        return Err(invalid("credentials are too large"));
+    }
+    write_atomic(path, &text, "credentials could not be written")
+}
+
+/// Removes one stored credential from the default credentials file.
+pub fn remove_stored_credential(provider: &str) -> Result<(), ConfigError> {
+    let Some(path) = credentials_path() else {
+        return Ok(());
+    };
+    remove_stored_credential_at(&path, provider)
+}
+
+/// Removes one stored credential at an explicit path. Missing files and
+/// entries are already in the requested state. An empty document removes the
+/// file instead of leaving an empty secret store behind.
+pub fn remove_stored_credential_at(path: &Path, provider: &str) -> Result<(), ConfigError> {
+    let mut object = read_credentials_at(path)?;
+    if object.remove(provider).is_none() {
+        return Ok(());
+    }
+    if object.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(ConfigError {
+                kind: ConfigErrorKind::Io,
+                message: "credentials could not be written",
+            }),
+        };
+    }
+    let text = serde_json::to_vec(&object).map_err(|_| invalid("credentials are invalid"))?;
+    write_atomic(path, &text, "credentials could not be written")
 }
 
 /// Renders a redacted summary: identities, labels, references, and order,
@@ -344,6 +456,7 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "credential": profile.credential.to_json(),
                 "default_model": profile.default_model,
                 "context_window_tokens": profile.context_window_tokens,
+                "enabled": profile.enabled,
             });
             if let Some(effort) = profile.task_reasoning_effort {
                 provider["task_reasoning_effort"] = effort.as_str().into();
@@ -414,5 +527,53 @@ mod credential_tests {
             ConfigErrorKind::Invalid
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stored_credentials_are_updated_removed_and_never_overwrite_malformed_data() {
+        let path = std::env::temp_dir().join(format!(
+            "nexus-credentials-write-test-{}-{}",
+            std::process::id(),
+            SAVE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        store_stored_credential_at(&path, "acme", "secret-one").unwrap();
+        assert_eq!(resolve_stored_at("acme", &path).unwrap(), "secret-one");
+        store_stored_credential_at(&path, "acme", "secret-two").unwrap();
+        store_stored_credential_at(&path, "other", "secret-three").unwrap();
+        assert_eq!(resolve_stored_at("acme", &path).unwrap(), "secret-two");
+        assert_eq!(resolve_stored_at("other", &path).unwrap(), "secret-three");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        for invalid in ["", "line\nbreak", "nul\0byte"] {
+            assert_eq!(
+                store_stored_credential_at(&path, "acme", invalid)
+                    .unwrap_err()
+                    .kind(),
+                ConfigErrorKind::Invalid
+            );
+        }
+        assert_eq!(resolve_stored_at("acme", &path).unwrap(), "secret-two");
+
+        std::fs::write(&path, "not-json").unwrap();
+        assert_eq!(
+            store_stored_credential_at(&path, "acme", "replacement")
+                .unwrap_err()
+                .kind(),
+            ConfigErrorKind::Invalid
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not-json");
+
+        std::fs::write(&path, r#"{"acme":"one","other":"two"}"#).unwrap();
+        remove_stored_credential_at(&path, "acme").unwrap();
+        assert_eq!(resolve_stored_at("other", &path).unwrap(), "two");
+        remove_stored_credential_at(&path, "other").unwrap();
+        assert!(!path.exists(), "an empty credential store is removed");
+        remove_stored_credential_at(&path, "other").unwrap();
     }
 }

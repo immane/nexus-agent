@@ -84,8 +84,11 @@ navigation, tool argument presentation, literal code content, bounded
 replacement diffs, streaming/final output, disclosure states, and the install
 prompt flow, saved-session rendering, live-thinking disclosure and bounded
 streaming previews, and busy-state wiring with a small DOM
-double. Thinking also has a stylesheet contract check for the clipped preview
-and bounded expanded panel; these do not replace browser layout checks.
+double. Provider settings coverage includes stored-token create/update, no
+secret echo, deletion through the authenticated route, a conflict when a model
+still references the provider, and enabled/disabled selection enforcement. Thinking also has a stylesheet contract
+check for the clipped preview and bounded expanded panel; these do not replace
+browser layout checks.
 `nexus-openai`'s `runtime_keeps_wire_prefix_stable_as_occupancy_and_calibration_change`
 regression captures loopback HTTP requests from the real runtime and adapter,
 with a known window and usage-driven estimator calibration, rather than using

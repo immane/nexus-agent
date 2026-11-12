@@ -144,6 +144,7 @@ pub struct OpenAiProvider {
     port: u16,
     base_path: String,
     credential: CredentialRef,
+    credential_value: Option<String>,
     model: String,
     use_tls: bool,
     protocol: ProtocolKind,
@@ -284,6 +285,7 @@ impl OpenAiProvider {
             port,
             base_path: base_path.trim_end_matches('/').to_owned(),
             credential,
+            credential_value: None,
             model,
             use_tls,
             protocol,
@@ -356,6 +358,21 @@ impl OpenAiProvider {
             ));
         }
         Ok(())
+    }
+
+    /// Supplies an already-resolved credential value. The server resolves the
+    /// stored-credential file at the configured location before the adapter is
+    /// created, avoiding a second lookup at the default path.
+    #[must_use]
+    pub fn with_resolved_credential(mut self, value: impl Into<String>) -> Self {
+        self.credential_value = Some(value.into());
+        self
+    }
+
+    fn resolved_credential(&self) -> Option<String> {
+        self.credential_value
+            .clone()
+            .or_else(|| nexus_config::resolve_credential(&self.credential).ok())
     }
 
     /// Binds validated host settings. This does not perform discovery or enable
@@ -460,7 +477,7 @@ impl OpenAiProvider {
     }
 
     fn discover_ollama_context_window(&self) -> Option<u32> {
-        let token = nexus_config::resolve_credential(&self.credential).ok()?;
+        let token = self.resolved_credential()?;
         if token.bytes().any(|byte| byte.is_ascii_control()) {
             return None;
         }
@@ -588,9 +605,9 @@ impl OpenAiProvider {
             Ok(headers) => headers,
             Err(failure) => return vec![failure],
         };
-        let token = match nexus_config::resolve_credential(&self.credential) {
-            Ok(token) => token,
-            Err(_) => {
+        let token = match self.resolved_credential() {
+            Some(token) => token,
+            None => {
                 return vec![provider_error(
                     ErrorCategory::Authentication,
                     "provider credential is unavailable",
@@ -3904,6 +3921,20 @@ mod opencode_go_tests {
             provider
                 .opencode_go_headers(&request(None, "run-d"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_host_resolved_credential_value_bypasses_a_later_reference_lookup() {
+        let provider = provider(
+            "https://opencode.ai/inference/go/openai/v1",
+            ProtocolKind::ChatCompletions,
+        );
+        assert!(provider.resolved_credential().is_none());
+        let provider = provider.with_resolved_credential("resolved-secret");
+        assert_eq!(
+            provider.resolved_credential().as_deref(),
+            Some("resolved-secret")
         );
     }
 

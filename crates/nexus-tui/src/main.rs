@@ -683,6 +683,9 @@ fn resolve_live_adapter(
     let Some(profile) = selection.config.provider(&entry.provider) else {
         return LiveResolve::Failed(ErrorCategory::InvalidInput, "selected provider is unknown");
     };
+    if !profile.enabled {
+        return LiveResolve::Failed(ErrorCategory::InvalidInput, "selected provider is disabled");
+    }
     if resolve_with(&profile.credential, lookup).is_err() {
         return LiveResolve::Failed(
             ErrorCategory::Authentication,
@@ -1012,6 +1015,9 @@ impl ProviderPort for PerRunProvider {
             let Some(profile) = selection.config.provider(&entry.provider) else {
                 return (settings, None);
             };
+            if !profile.enabled {
+                return (settings, None);
+            }
             let mut profile = profile.clone();
             profile.task_reasoning_effort = match selection
                 .config
