@@ -14,8 +14,9 @@ The client supports:
   provider is configured;
 - selecting an admitted local project root when real local tools are enabled;
 - adding and removing project roots through the authenticated API;
-- adding or updating provider and model entries, using credential references
-  only;
+- adding, updating, or deleting provider entries; updating a stored provider
+  token through the local credentials file; and adding or updating model
+  entries using credential references only;
 - creating one runtime session on the first accepted message;
 - submitting runs, streaming events with SSE, and rendering assistant text,
   context notices, tool activity, usage, approvals, cancellation, and terminal
@@ -186,9 +187,22 @@ field in `GET /config`; it is not the configuration schema's `revision`.
 The Settings dialog can add or replace entries through
 `POST /config/providers` and `POST /config/models`. These writes require a
 configured server bearer token even when tools are scripted; an unauthenticated
-demo server refuses them. Provider credentials are references only: an
-environment-variable name or a stored-entry name. The configuration format has
-no field for a secret value and the browser never reads one.
+demo server refuses them. Provider credentials are references: an
+environment-variable name or a stored-entry name. The configuration document
+itself has no field for a secret value.
+
+For a stored reference, the optional `api_token` field on
+`POST /config/providers` writes the value to `credentials.json` beside the
+server's configured document. The file is parsed strictly before replacement,
+written atomically with owner-only permissions on Unix, and never returned by
+the API. An empty or control-character value is refused. Tokens require a stored
+reference matching the provider id. The browser uses a password field that is
+cleared after a successful save and never populated from server state.
+
+`DELETE /config/providers/{id}` removes an unreferenced provider and, when it
+owned the matching stored credential, removes that entry. A provider still named
+by a model is a conflict. Model removal is not provided through the web API;
+removal remains an explicit configuration-file edit.
 
 Updates retain optional context limits when the form leaves them untouched.
 Model defaults and provider ownership are validated by `nexus-config`; an
@@ -208,8 +222,8 @@ This control does not show/hide reasoning, remove historical traces, or change
 summary thinking. See the [configuration contract](../contracts/05-configuration.md#provider-task-reasoning-effort).
 
 Changes apply to new sessions. A live session keeps the provider adapter and tool
-registrations created for it. This slice does not provide provider/model removal
-through the web API; removal remains an explicit configuration-file edit.
+registrations created for it. Provider deletion does not affect sessions that
+are already bound.
 
 ## Event handling
 

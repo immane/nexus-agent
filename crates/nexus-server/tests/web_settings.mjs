@@ -69,18 +69,23 @@ function thinkingFixture(config = {}) {
   let wait = null;
   const context = vm.createContext({
     dom, state,
+    confirm: () => true,
     fetch: async (path, options) => {
-      const body = JSON.parse(options.body);
+      const body = options.body === undefined ? undefined : JSON.parse(options.body);
       requests.push({ path, ...options, body });
       if (wait) await wait;
       if (failure) return { ok: false, status: failure.status, json: async () => ({ error: failure.message }) };
       const summary = JSON.parse(JSON.stringify(state.config));
-      if (path === '/config/thinking') {
+      if (options.method === 'DELETE') {
+        const id = decodeURIComponent(path.split('/').at(-1));
+        summary.providers = summary.providers.filter((provider) => provider.id !== id);
+      } else if (path === '/config/thinking') {
         if (body.task_reasoning_effort === 'inherit') delete summary.task_reasoning_effort;
         else summary.task_reasoning_effort = body.task_reasoning_effort;
       } else {
         const entries = path === '/config/providers' ? summary.providers : summary.models;
         const entry = { ...body };
+        delete entry.api_token;
         if (entry.task_reasoning_effort === 'inherit') delete entry.task_reasoning_effort;
         const index = entries.findIndex((item) => item.id === entry.id);
         if (index < 0) entries.push(entry);
@@ -97,7 +102,7 @@ function thinkingFixture(config = {}) {
   });
   const run = (code) => vm.runInContext(code, context);
   run(source.slice(source.indexOf('class ApiError '), source.indexOf('function markUnauthorized(')));
-  run(source.slice(source.indexOf('function resetProviderForm('), source.indexOf('function populateModels(')));
+  run(source.slice(source.indexOf('function updateProviderCredentialFields('), source.indexOf('function populateModels(')));
   run(source.slice(source.indexOf('function updateControls('), source.indexOf('function resetRunState(')));
   run(source.slice(source.indexOf('function selectSettingsSection('), source.indexOf('/* Wiring */')));
   run(source.slice(source.indexOf("dom.newProvider.addEventListener('click'"), source.indexOf("dom.message.addEventListener('input'")));
@@ -228,6 +233,46 @@ test('thinking save disables controls, prevents duplicate saves and does not wri
   assert.equal(dom.saveThinking.disabled, false);
   assert.equal(dom.taskThinking.disabled, false);
   assert.equal(state.config.task_reasoning_effort, 'none');
+});
+
+test('provider API tokens save only with a stored reference and clear after success', async () => {
+  const { dom, state, requests, submit, run } = thinkingFixture();
+  run("editProvider('local')");
+  dom.providerCredentialKind.value = 'stored';
+  dom.providerCredentialKind.listeners.change();
+  dom.providerCredentialName.value = 'local';
+  dom.providerApiToken.value = 'secret-token';
+  await submit('providerForm');
+  const request = requests.at(-1);
+  assert.equal(request.path, '/config/providers');
+  assert.equal(request.body.credential.stored, 'local');
+  assert.equal(request.body.api_token, 'secret-token');
+  assert.equal(dom.providerApiToken.value, '');
+  assert.equal(dom.deleteProvider.hidden, false);
+  assert.equal(Object.hasOwn(state.config.providers[0], 'api_token'), false);
+  assert.equal(dom.providerStatus.dataset.state, 'ok');
+
+  run("editProvider('local')");
+  dom.providerCredentialKind.value = 'env';
+  dom.providerCredentialKind.listeners.change();
+  dom.providerCredentialName.value = 'LOCAL_KEY';
+  await submit('providerForm');
+  assert.equal(Object.hasOwn(requests.at(-1).body, 'api_token'), false);
+  assert.equal(dom.providerTokenField.hidden, true);
+});
+
+test('provider deletion uses the authenticated DELETE route and updates the list', async () => {
+  const { dom, state, requests, run } = thinkingFixture();
+  run("editProvider('local')");
+  assert.equal(dom.deleteProvider.hidden, false);
+  await dom.deleteProvider.listeners.click();
+  const request = requests.at(-1);
+  assert.equal(request.path, '/config/providers/local');
+  assert.equal(request.method, 'DELETE');
+  assert.equal(request.headers.Authorization, 'Bearer test-token');
+  assert.deepEqual(state.config.providers, []);
+  assert.equal(dom.providerStatus.dataset.state, 'ok');
+  assert.equal(dom.deleteProvider.hidden, true);
 });
 
 test('failed thinking saves leave config unchanged and preserve drafts; auth errors disconnect', async () => {

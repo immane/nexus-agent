@@ -73,6 +73,16 @@ Bound configuration size and processing. Do not perform network discovery, packa
 
 Use secret references such as named environment variables or approved secret-store entries. Resolve credentials only for the selected integration when needed. Never serialize secret values into session history, debug dumps, or public errors.
 
+The authenticated Web provider API may add or replace a stored credential for an
+existing or new provider id. The value is written to `credentials.json` beside
+the server's configured document, never into the configuration document or its
+redacted summary. The file is strictly parsed before replacement, written
+atomically with owner-only permissions on Unix, and limited to 16 KiB per value.
+Values containing control characters are refused so they cannot alter HTTP
+headers. Provider deletion removes an owned stored entry when it is no longer
+referenced; a provider still named by a model is refused. Credential cleanup
+failure after configuration deletion is reported explicitly rather than hidden.
+
 External plugins receive only explicitly allowed environment and credentials. A host provider secret is not implicitly available to every tool. A missing credential should produce a safe actionable failure, not silent fallback to another service.
 
 A relay receives only the credential reference assigned to its profile. Do not embed secret values in stored endpoints or forward another provider's key automatically. Endpoint/routing changes require destination, compatibility, and credential-scope validation. No network authentication, relay probing, or local-relay launch belongs in ordinary startup configuration loading.

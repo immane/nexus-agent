@@ -169,7 +169,7 @@
     <section class="settings-panel" id="providers-block" aria-labelledby="providers-title" hidden>
       <h3 id="providers-title">Providers</h3>
       <div class="config-content">
-        <p class="muted">Credential fields accept a reference name only. Secret values are never entered here or stored in the configuration.</p>
+        <p class="muted">The configuration stores credential references only. A stored provider token is written to the local credentials file and is never shown again in this interface.</p>
         <div class="config-list" id="provider-list"></div>
         <form class="config-form" id="provider-form">
           <div class="form-grid">
@@ -186,6 +186,11 @@
             <div><label for="provider-credential-kind">Credential kind</label><select id="provider-credential-kind"><option value="env">Environment variable</option><option value="stored">Stored reference</option></select></div>
             <div><label for="provider-credential-name">Credential name</label><input id="provider-credential-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY"></div>
           </div>
+          <div id="provider-token-field" hidden>
+            <label for="provider-api-token">API token <span class="muted">(stored locally; leave blank to keep the current token)</span></label>
+            <input id="provider-api-token" type="password" maxlength="16384" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="Paste a token to add or replace it">
+            <p class="hint">Saved beside the configuration with owner-only permissions. The token stays out of the configuration document and is never returned by the API.</p>
+          </div>
           <div class="form-grid">
             <div><label for="provider-default-model">Default model</label><input id="provider-default-model" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5"></div>
             <div><label for="provider-context-window">Context window <span class="muted">(optional)</span></label><input id="provider-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
@@ -201,6 +206,7 @@
           <div class="dialog-actions">
             <button class="primary" id="save-provider" type="submit">Save provider</button>
             <button id="new-provider" type="button">New provider</button>
+            <button class="danger" id="delete-provider" type="button" hidden>Delete provider</button>
           </div>
           <p class="dialog-status status" id="provider-status" role="status"></p>
         </form>

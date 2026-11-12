@@ -51,7 +51,7 @@ use nexus_config::ToolsSettings;
 use nexus_config::settings::{ProviderSettings, ServerSettings};
 use nexus_config::{
     AdapterKind, ConfigError, CredentialRef, ModelEntry, ProtocolKind, ProviderProfile, UserConfig,
-    resolve_credential, save, summary,
+    remove_stored_credential_at, resolve_credential_at, save, store_stored_credential_at, summary,
 };
 use nexus_core::{
     ApproveCommand, Command, CommandReply, DenyCommand, GetSnapshotCommand, Limits,
@@ -924,12 +924,15 @@ impl Server {
         };
         let (profile, vendor, context_management) = profile;
         let vendor = vendor.unwrap_or(profile.default_model.clone());
-        resolve_credential(&profile.credential)
-            .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
+        let credential_value =
+            resolve_credential_at(&profile.credential, self.credentials_path().as_deref())
+                .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
         nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
             .and_then(|adapter| adapter.with_operational_settings(&self.provider_settings))
             .map(|adapter| {
-                let adapter = adapter.with_context_management(context_management);
+                let adapter = adapter
+                    .with_resolved_credential(credential_value)
+                    .with_context_management(context_management);
                 if adapter.supports_context_discovery() {
                     adapter.discover_context_management()
                 } else {
@@ -1188,6 +1191,7 @@ impl Server {
             Route::AddFavourite => Some(self.add_favourite(body)),
             Route::RemoveFavourite { model } => Some(self.remove_favourite(model)),
             Route::UpsertProvider => Some(self.upsert_provider(body)),
+            Route::RemoveProvider { provider } => Some(self.remove_provider(provider)),
             Route::UpsertModel => Some(self.upsert_model(body)),
             Route::Projects => Some(json_response(200, &self.projects_body())),
             Route::AddProject => Some(self.add_project(body)),
@@ -1617,6 +1621,27 @@ impl Server {
                 return json_response(400, &json::error_body("task reasoning effort is invalid"));
             }
         };
+        let api_token = match body.get("api_token") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value))
+                if !value.is_empty()
+                    && value.len() <= nexus_config::MAX_CREDENTIAL_BYTES
+                    && !value.bytes().any(|byte| byte.is_ascii_control()) =>
+            {
+                Some(value.clone())
+            }
+            Some(_) => return json_response(400, &json::error_body("API token is invalid")),
+        };
+        if api_token.is_some()
+            && !matches!(&credential, CredentialRef::Stored { provider } if provider == &id)
+        {
+            return json_response(
+                400,
+                &json::error_body(
+                    "API token requires a stored credential reference for this provider",
+                ),
+            );
+        }
         let profile = match ProviderProfile::new_with_protocol(
             id,
             display_name,
@@ -1632,11 +1657,62 @@ impl Server {
         let mut profile = profile;
         profile.context_window_tokens = context_window;
         profile.task_reasoning_effort = task_reasoning_effort;
-        if let Err(error) = config.upsert_provider(profile) {
+        let provider_id = profile.id.clone();
+        let mut next = config.clone();
+        if let Err(error) = next.upsert_provider(profile) {
             return json_response(400, &json::error_body(error.message()));
         }
+        if let Some(token) = api_token {
+            let Some(path) = self.credentials_path() else {
+                return json_response(500, &json::error_body("credential storage is unavailable"));
+            };
+            if store_stored_credential_at(&path, &provider_id, &token).is_err() {
+                return json_response(500, &json::error_body("API token could not be saved"));
+            }
+        }
+        *config = next;
         if self.persist(&config).is_err() {
             return json_response(500, &json::error_body("configuration could not be saved"));
+        }
+        json_response(200, &body_json(summary(&config)))
+    }
+
+    /// Removes a provider and, when it owned a stored credential, the
+    /// corresponding secret. Models still referencing it are a conflict.
+    fn remove_provider(&self, id: &str) -> Response {
+        if self.auth_token.is_none() {
+            return json_response(
+                503,
+                &json::error_body("server authentication is not configured"),
+            );
+        }
+        let mut config = self.config.lock().expect("config lockable");
+        let Some(existing) = config.provider(id).cloned() else {
+            return json_response(404, &json::error_body("provider is unknown"));
+        };
+        let mut next = config.clone();
+        if let Err(error) = next.remove_provider(id) {
+            let status = if error.message() == "provider is still referenced by a model" {
+                409
+            } else {
+                400
+            };
+            return json_response(status, &json::error_body(error.message()));
+        }
+        *config = next;
+        if self.persist(&config).is_err() {
+            return json_response(500, &json::error_body("configuration could not be saved"));
+        }
+        if matches!(&existing.credential, CredentialRef::Stored { provider } if provider == id)
+            && let Some(path) = self.credentials_path()
+            && remove_stored_credential_at(&path, id).is_err()
+        {
+            return json_response(
+                500,
+                &json::error_body(
+                    "provider was removed but its stored credential could not be removed",
+                ),
+            );
         }
         json_response(200, &body_json(summary(&config)))
     }
@@ -1763,6 +1839,15 @@ impl Server {
             None => Ok(()),
             Some(path) => save(config, path),
         }
+    }
+
+    /// Stored credentials live beside the configured document. Without a
+    /// configured path, the platform default is used, matching selection.
+    fn credentials_path(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_ref()
+            .map(|path| path.with_file_name("credentials.json"))
+            .or_else(nexus_config::credentials_path)
     }
 
     /// Accepts a task for the session. Only `Accepted` mints a run; every
@@ -2328,6 +2413,8 @@ enum Route<'a> {
     RemoveFavourite { model: &'a str },
     /// `POST /config/providers`: add or replace one provider.
     UpsertProvider,
+    /// `DELETE /config/providers/{provider}`.
+    RemoveProvider { provider: &'a str },
     /// `POST /config/models`: add or replace one model entry.
     UpsertModel,
     /// `GET /projects`: startup workspace plus operator projects.
@@ -2380,6 +2467,9 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
             Route::RemoveFavourite { model }
         }
         ("POST", ["", "config", "providers"]) => Route::UpsertProvider,
+        ("DELETE", ["", "config", "providers", provider]) if !provider.is_empty() => {
+            Route::RemoveProvider { provider }
+        }
         ("POST", ["", "config", "models"]) => Route::UpsertModel,
         ("GET", ["", "projects"]) => Route::Projects,
         ("POST", ["", "projects"]) => Route::AddProject,
@@ -3463,6 +3553,11 @@ mod tests {
             route_path("POST", "/config/providers"),
             Route::UpsertProvider
         );
+        assert_eq!(
+            route_path("DELETE", "/config/providers/acme"),
+            Route::RemoveProvider { provider: "acme" }
+        );
+        assert_eq!(route_path("DELETE", "/config/providers/"), Route::NotFound);
         assert_eq!(route_path("POST", "/config/models"), Route::UpsertModel);
         assert_eq!(route_path("GET", "/projects"), Route::Projects);
         assert_eq!(route_path("POST", "/projects"), Route::AddProject);
@@ -3488,6 +3583,8 @@ mod tests {
             ("DELETE", "/config/favourites"),
             ("DELETE", "/config/favourites/"),
             ("GET", "/config/providers"),
+            ("GET", "/config/providers/acme"),
+            ("POST", "/config/providers/acme"),
             ("DELETE", "/config/models"),
             ("POST", "/projects/default"),
             ("DELETE", "/projects"),

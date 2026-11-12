@@ -49,11 +49,14 @@ const dom = {
   providerEndpoint: document.querySelector('#provider-endpoint'),
   providerCredentialKind: document.querySelector('#provider-credential-kind'),
   providerCredentialName: document.querySelector('#provider-credential-name'),
+  providerTokenField: document.querySelector('#provider-token-field'),
+  providerApiToken: document.querySelector('#provider-api-token'),
   providerDefaultModel: document.querySelector('#provider-default-model'),
   providerContextWindow: document.querySelector('#provider-context-window'),
   providerTaskThinking: document.querySelector('#provider-task-thinking'),
   saveProvider: document.querySelector('#save-provider'),
   newProvider: document.querySelector('#new-provider'),
+  deleteProvider: document.querySelector('#delete-provider'),
   providerStatus: document.querySelector('#provider-status'),
   modelList: document.querySelector('#model-list'),
   modelForm: document.querySelector('#model-form'),
@@ -728,7 +731,10 @@ function renderProviderList() {
     const edit = node('button', '', 'Edit');
     edit.type = 'button';
     edit.addEventListener('click', () => editProvider(provider.id));
-    actions.append(edit);
+    const remove = node('button', 'danger', 'Delete');
+    remove.type = 'button';
+    remove.addEventListener('click', () => deleteProvider(provider.id));
+    actions.append(edit, remove);
     item.append(actions);
     dom.providerList.append(item);
   }
@@ -770,6 +776,16 @@ function renderModelList() {
   dom.saveModel.disabled = !providers.length;
 }
 
+function updateProviderCredentialFields() {
+  const stored = dom.providerCredentialKind.value === 'stored';
+  dom.providerTokenField.hidden = !stored;
+  dom.providerCredentialName.placeholder = stored ? 'stored-name' : 'OPENAI_API_KEY';
+  if (stored && !dom.providerCredentialName.value) {
+    dom.providerCredentialName.value = dom.providerId.value.trim();
+  }
+  if (!stored) dom.providerApiToken.value = '';
+}
+
 function resetProviderForm() {
   dom.providerForm.dataset.original = '';
   dom.providerId.readOnly = false;
@@ -780,6 +796,9 @@ function resetProviderForm() {
   dom.providerEndpoint.value = '';
   dom.providerCredentialKind.value = 'env';
   dom.providerCredentialName.value = '';
+  dom.providerApiToken.value = '';
+  dom.deleteProvider.hidden = true;
+  updateProviderCredentialFields();
   dom.providerDefaultModel.value = '';
   dom.providerContextWindow.value = '';
   dom.providerTaskThinking.value = 'inherit';
@@ -801,10 +820,36 @@ function editProvider(id) {
     : {};
   dom.providerCredentialKind.value = credential.stored ? 'stored' : 'env';
   dom.providerCredentialName.value = credential.stored || credential.env || '';
+  dom.providerApiToken.value = '';
+  dom.deleteProvider.hidden = false;
+  updateProviderCredentialFields();
   dom.providerDefaultModel.value = provider.default_model || '';
   dom.providerContextWindow.value = provider.context_window_tokens ?? '';
   dom.providerTaskThinking.value = provider.task_reasoning_effort ?? 'inherit';
   setFormStatus(dom.providerStatus, `Editing ${provider.display_name || provider.id}.`);
+}
+
+async function deleteProvider(id) {
+  if (!id || !state.connected) return;
+  if (!globalThis.confirm(`Delete provider ${id}? Models that still reference it must be removed first.`)) return;
+  dom.deleteProvider.disabled = true;
+  setFormStatus(dom.providerStatus, `Deleting ${id}…`, 'busy');
+  try {
+    const summary = await api(`/config/providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    state.config = summary;
+    updateConnectionDetail();
+    populateModels();
+    renderConfigEditors();
+    resetProviderForm();
+    setFormStatus(dom.providerStatus, `Deleted ${id}.`, 'ok');
+    updateSessionDisplay();
+    updateControls();
+  } catch (error) {
+    setFormStatus(dom.providerStatus, error.message, 'error');
+    if (error instanceof ApiError && error.status === 401) markUnauthorized();
+  } finally {
+    dom.deleteProvider.disabled = false;
+  }
 }
 
 function resetModelForm() {
@@ -3170,6 +3215,8 @@ dom.projectForm.addEventListener('submit', async (event) => {
 
 dom.newProvider.addEventListener('click', resetProviderForm);
 dom.newModel.addEventListener('click', resetModelForm);
+dom.providerCredentialKind.addEventListener('change', updateProviderCredentialFields);
+dom.deleteProvider.addEventListener('click', () => deleteProvider(dom.providerForm.dataset.original));
 
 dom.thinkingForm.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -3216,30 +3263,34 @@ dom.providerForm.addEventListener('submit', async (event) => {
     return;
   }
   const endpoint = dom.providerEndpoint.value.trim() || null;
-  const credential = { [dom.providerCredentialKind.value]: credentialName };
+  const credentialKind = dom.providerCredentialKind.value;
+  const credential = { [credentialKind]: credentialName };
+  const body = {
+    id,
+    display_name: displayName,
+    adapter: dom.providerAdapter.value,
+    protocol: dom.providerProtocol.value,
+    endpoint,
+    credential,
+    default_model: defaultModel,
+    context_window_tokens: contextWindow,
+    task_reasoning_effort: dom.providerTaskThinking.value,
+  };
+  if (credentialKind === 'stored' && dom.providerApiToken.value) {
+    body.api_token = dom.providerApiToken.value;
+  }
   dom.saveProvider.disabled = true;
   setFormStatus(dom.providerStatus, 'Saving provider…', 'busy');
   try {
-    const summary = await api('/config/providers', {
-      method: 'POST',
-      body: {
-        id,
-        display_name: displayName,
-        adapter: dom.providerAdapter.value,
-        protocol: dom.providerProtocol.value,
-        endpoint,
-        credential,
-        default_model: defaultModel,
-        context_window_tokens: contextWindow,
-        task_reasoning_effort: dom.providerTaskThinking.value,
-      },
-    });
+    const summary = await api('/config/providers', { method: 'POST', body });
     state.config = summary;
     updateConnectionDetail();
     populateModels();
     renderConfigEditors();
     dom.providerForm.dataset.original = id;
     dom.providerId.readOnly = true;
+    dom.providerApiToken.value = '';
+    dom.deleteProvider.hidden = false;
     setFormStatus(dom.providerStatus, `Saved ${displayName}. Changes apply to new sessions.`, 'ok');
     updateSessionDisplay();
     updateControls();

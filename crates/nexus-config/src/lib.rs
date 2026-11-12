@@ -87,8 +87,10 @@ pub use settings::{
     settings_json,
 };
 pub use store::{
-    CONFIG_ENV_VAR, CONFIG_FILE_NAME, ConfigError, ConfigErrorKind, default_path,
-    default_path_with, load, resolve_credential, resolve_path, resolve_path_with, resolve_with,
-    save, summary,
+    CONFIG_ENV_VAR, CONFIG_FILE_NAME, ConfigError, ConfigErrorKind, MAX_CREDENTIAL_BYTES,
+    credentials_path, default_path, default_path_with, load, remove_stored_credential,
+    remove_stored_credential_at, resolve_credential, resolve_credential_at, resolve_path,
+    resolve_path_with, resolve_with, save, store_stored_credential, store_stored_credential_at,
+    summary,
 };
 pub use tui_settings::{ThemeSettings, TuiSettings};
