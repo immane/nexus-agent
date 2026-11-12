@@ -285,6 +285,38 @@ fn documents_round_trip_and_reject_bad_shapes() {
 }
 
 #[test]
+fn provider_enabled_defaults_true_round_trips_false_and_rejects_wrong_types() {
+    let mut config = configured();
+    assert!(config.provider("acme").unwrap().enabled);
+    let saved = config.to_json();
+    assert!(
+        !saved.contains("\"enabled\""),
+        "enabled providers retain the legacy document shape"
+    );
+
+    let mut disabled = provider("acme");
+    disabled.enabled = false;
+    config
+        .upsert_provider(disabled)
+        .expect("disabled provider admits");
+    let saved = config.to_json();
+    assert!(saved.contains("\"enabled\":false"));
+    let back = UserConfig::from_json(&saved).expect("disabled round trip parses");
+    assert!(!back.provider("acme").unwrap().enabled);
+    assert_eq!(summary(&back)["providers"][0]["enabled"], false);
+
+    for bad in ["1", r#""false""#, "null"] {
+        let text = format!(
+            r#"{{"revision":2,"providers":[{{"id":"acme","display_name":"acme display","adapter":"direct","protocol":"chat_completions","endpoint":null,"credential":{{"env":"NEXUS_TEST_KEY"}},"default_model":"default-model","enabled":{bad}}}],"models":[]}}"#
+        );
+        assert!(
+            UserConfig::from_json(&text).is_err(),
+            "enabled must be a boolean: {bad}"
+        );
+    }
+}
+
+#[test]
 fn revision_one_migrates_chat_profiles_and_revision_two_requires_protocol() {
     let legacy = r#"{"revision":1,"providers":[{"id":"acme","display_name":"acme display","adapter":"direct","endpoint":"https://api.example.com","credential":{"env":"NEXUS_TEST_KEY"},"default_model":"default-model"}],"models":[]}"#;
     let migrated = UserConfig::from_json(legacy).expect("revision one migrates");

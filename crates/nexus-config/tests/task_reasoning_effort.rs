@@ -167,6 +167,7 @@ fn default_document_and_summary_remain_unchanged() {
     );
     let mut expected_summary = doc;
     expected_summary["providers"][0]["context_window_tokens"] = Value::Null;
+    expected_summary["providers"][0]["enabled"] = Value::Bool(true);
     expected_summary["models"][0]["context_window_tokens"] = Value::Null;
     expected_summary["models"][0]["max_output_tokens"] = Value::Null;
     assert_eq!(summary(&config), expected_summary);

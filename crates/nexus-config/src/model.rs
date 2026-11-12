@@ -243,6 +243,9 @@ pub struct ProviderProfile {
     /// Optional task-request fallback; currently supported only by Ollama Chat Completions.
     /// Explicit request hints take precedence; this does not control reasoning visibility.
     pub task_reasoning_effort: Option<ReasoningEffort>,
+    /// Whether new sessions may select this provider. Disabled entries remain
+    /// configured, including their models and stored credential.
+    pub enabled: bool,
 }
 
 impl ProviderProfile {
@@ -286,6 +289,7 @@ impl ProviderProfile {
             default_model: default_model.into(),
             context_window_tokens: None,
             task_reasoning_effort: None,
+            enabled: true,
         };
         profile.validate()?;
         Ok(profile)
@@ -1091,6 +1095,9 @@ fn provider_json(profile: &ProviderProfile) -> Value {
             Value::String(effort.as_str().to_owned()),
         );
     }
+    if !profile.enabled {
+        object.insert("enabled".to_owned(), Value::Bool(false));
+    }
     Value::Object(object)
 }
 
@@ -1211,6 +1218,7 @@ fn parse_provider(
             "default_model",
             "context_window_tokens",
             "task_reasoning_effort",
+            "enabled",
         ],
     )?;
     let credential = object
@@ -1251,6 +1259,11 @@ fn parse_provider(
     )?;
     profile.context_window_tokens = parse_window_tokens(object)?;
     profile.task_reasoning_effort = parse_task_reasoning_effort(object)?;
+    profile.enabled = match object.get("enabled") {
+        None => true,
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => return Err(invalid("provider enabled flag is invalid")),
+    };
     profile.validate()?;
     Ok(profile)
 }

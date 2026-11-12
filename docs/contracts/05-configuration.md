@@ -164,6 +164,16 @@ The TUI resolves the same precedence from its per-run selection snapshot;
 restart it to load external configuration-file edits. Historical accepted
 reasoning remains archived and encoded by the existing adapter behavior.
 
+### Provider availability
+
+The optional provider-level `enabled` boolean defaults to `true`; the saved
+document omits the field when enabled so existing documents keep their shape.
+Setting it to `false` keeps the provider, its models, endpoint, and credential
+configured, but new session selection is refused with a static diagnostic. The
+redacted summary always reports the effective flag. Web and TUI resolution both
+enforce it. Disabling a provider does not alter sessions that are already bound
+to it, and an update that omits the flag preserves the previous value.
+
 For Ollama 0.32.14, the OpenAI compatibility conversion maps `"none"` to
 `think=false`; model support and actual compliance must still be verified.
 References: [versioned conversion source](https://github.com/ollama/ollama/blob/v0.32.14/openai/openai.go)

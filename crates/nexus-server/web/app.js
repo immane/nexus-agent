@@ -47,6 +47,7 @@ const dom = {
   providerAdapter: document.querySelector('#provider-adapter'),
   providerProtocol: document.querySelector('#provider-protocol'),
   providerEndpoint: document.querySelector('#provider-endpoint'),
+  providerEnabled: document.querySelector('#provider-enabled'),
   providerCredentialKind: document.querySelector('#provider-credential-kind'),
   providerCredentialName: document.querySelector('#provider-credential-name'),
   providerTokenField: document.querySelector('#provider-token-field'),
@@ -462,6 +463,11 @@ function markUnauthorized() {
 
 function buildChoices(config) {
   const models = Array.isArray(config?.models) ? config.models : [];
+  const disabledProviders = new Set(
+    (Array.isArray(config?.providers) ? config.providers : [])
+      .filter((provider) => provider && provider.enabled === false)
+      .map((provider) => provider.id),
+  );
   if (!models.length) {
     return [{
       demo: true,
@@ -474,6 +480,7 @@ function buildChoices(config) {
   const byId = new Map();
   for (const entry of models) {
     if (!entry || typeof entry.id !== 'string' || typeof entry.provider !== 'string') continue;
+    if (disabledProviders.has(entry.provider)) continue;
     if (!byId.has(entry.id)) byId.set(entry.id, entry);
   }
   const ordered = [];
@@ -721,10 +728,11 @@ function renderProviderList() {
     const credential = provider.credential && typeof provider.credential === 'object'
       ? provider.credential.env || provider.credential.stored || 'unknown'
       : 'unknown';
+    const state = provider.enabled === false ? 'disabled' : 'enabled';
     text.append(node(
       'span',
       'config-item-meta',
-      `${provider.id} · ${provider.adapter}/${provider.protocol} · ${provider.endpoint || 'no endpoint'} · ref: ${credential}`,
+      `${provider.id} · ${provider.adapter}/${provider.protocol} · ${provider.endpoint || 'no endpoint'} · ref: ${credential} · ${state}`,
     ));
     item.append(text);
     const actions = node('div', 'config-item-actions');
@@ -794,6 +802,7 @@ function resetProviderForm() {
   dom.providerAdapter.value = 'direct';
   dom.providerProtocol.value = 'chat_completions';
   dom.providerEndpoint.value = '';
+  dom.providerEnabled.value = 'true';
   dom.providerCredentialKind.value = 'env';
   dom.providerCredentialName.value = '';
   dom.providerApiToken.value = '';
@@ -815,6 +824,7 @@ function editProvider(id) {
   dom.providerAdapter.value = provider.adapter || 'direct';
   dom.providerProtocol.value = provider.protocol || 'chat_completions';
   dom.providerEndpoint.value = provider.endpoint || '';
+  dom.providerEnabled.value = provider.enabled === false ? 'false' : 'true';
   const credential = provider.credential && typeof provider.credential === 'object'
     ? provider.credential
     : {};
@@ -3271,6 +3281,7 @@ dom.providerForm.addEventListener('submit', async (event) => {
     adapter: dom.providerAdapter.value,
     protocol: dom.providerProtocol.value,
     endpoint,
+    enabled: dom.providerEnabled.value === 'true',
     credential,
     default_model: defaultModel,
     context_window_tokens: contextWindow,

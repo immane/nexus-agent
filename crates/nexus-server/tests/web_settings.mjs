@@ -275,6 +275,22 @@ test('provider deletion uses the authenticated DELETE route and updates the list
   assert.equal(dom.deleteProvider.hidden, true);
 });
 
+test('provider enabled status is loaded and saved without affecting other fields', async () => {
+  const { dom, state, requests, submit, run } = thinkingFixture();
+  run("editProvider('local')");
+  assert.equal(dom.providerEnabled.value, 'true');
+  dom.providerEnabled.value = 'false';
+  await submit('providerForm');
+  assert.equal(requests.at(-1).body.enabled, false);
+  assert.equal(state.config.providers[0].enabled, false);
+  run("editProvider('local')");
+  assert.equal(dom.providerEnabled.value, 'false');
+  dom.providerEnabled.value = 'true';
+  await submit('providerForm');
+  assert.equal(requests.at(-1).body.enabled, true);
+  assert.equal(requests.at(-1).body.credential.env, 'LOCAL_KEY');
+});
+
 test('failed thinking saves leave config unchanged and preserve drafts; auth errors disconnect', async () => {
   for (const scope of ['thinking', 'provider', 'model']) {
     for (const status of [400, 401]) {

@@ -923,6 +923,9 @@ impl Server {
             (profile, vendor, context_management)
         };
         let (profile, vendor, context_management) = profile;
+        if !profile.enabled {
+            return Err(SessionError::new(400, "selected provider is disabled"));
+        }
         let vendor = vendor.unwrap_or(profile.default_model.clone());
         let credential_value =
             resolve_credential_at(&profile.credential, self.credentials_path().as_deref())
@@ -1621,6 +1624,13 @@ impl Server {
                 return json_response(400, &json::error_body("task reasoning effort is invalid"));
             }
         };
+        let enabled = match body.get("enabled") {
+            None | Some(Value::Null) => existing.as_ref().is_none_or(|profile| profile.enabled),
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => {
+                return json_response(400, &json::error_body("provider enabled flag is invalid"));
+            }
+        };
         let api_token = match body.get("api_token") {
             None | Some(Value::Null) => None,
             Some(Value::String(value))
@@ -1657,6 +1667,7 @@ impl Server {
         let mut profile = profile;
         profile.context_window_tokens = context_window;
         profile.task_reasoning_effort = task_reasoning_effort;
+        profile.enabled = enabled;
         let provider_id = profile.id.clone();
         let mut next = config.clone();
         if let Err(error) = next.upsert_provider(profile) {

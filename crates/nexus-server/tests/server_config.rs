@@ -990,6 +990,31 @@ fn provider_tokens_are_stored_updated_and_removed_with_the_provider() {
     let (status, summary) = get(port, "/config");
     assert_eq!(status, 200);
     assert!(!summary.to_string().contains("secret-two"));
+
+    let (status, summary) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"beta","enabled":false}"#,
+    );
+    assert_eq!(status, 200, "provider disables: {summary}");
+    assert_eq!(summary["providers"][0]["enabled"], false);
+    let (status, body) = post(port, "/sessions", r#"{"provider":"beta"}"#);
+    assert_eq!(
+        status, 400,
+        "a disabled provider cannot be selected: {body}"
+    );
+    let (status, summary) = post(
+        port,
+        "/config/providers",
+        r#"{"id":"beta","display_name":"Renamed"}"#,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        summary["providers"][0]["enabled"], false,
+        "an edit without the flag preserves the disabled state"
+    );
+    let (status, _) = post(port, "/config/providers", r#"{"id":"beta","enabled":true}"#);
+    assert_eq!(status, 200);
     let (status, session) = post(port, "/sessions", r#"{"provider":"beta"}"#);
     assert_eq!(
         status, 201,

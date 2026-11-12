@@ -456,6 +456,7 @@ pub fn summary(config: &UserConfig) -> serde_json::Value {
                 "credential": profile.credential.to_json(),
                 "default_model": profile.default_model,
                 "context_window_tokens": profile.context_window_tokens,
+                "enabled": profile.enabled,
             });
             if let Some(effort) = profile.task_reasoning_effort {
                 provider["task_reasoning_effort"] = effort.as_str().into();

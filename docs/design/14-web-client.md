@@ -204,6 +204,11 @@ owned the matching stored credential, removes that entry. A provider still named
 by a model is a conflict. Model removal is not provided through the web API;
 removal remains an explicit configuration-file edit.
 
+The provider form also exposes an Enabled/Disabled status. Disabled providers
+remain listed and configured, but their models are omitted from new-session
+choices and the server refuses a direct selection with a static error. The
+summary reports the effective flag. Existing sessions keep their bound adapter.
+
 Updates retain optional context limits when the form leaves them untouched.
 Model defaults and provider ownership are validated by `nexus-config`; an
 unknown provider, dangling reference, invalid endpoint, or inconsistent context

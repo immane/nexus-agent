@@ -182,6 +182,9 @@
           </div>
           <label for="provider-endpoint">Endpoint <span class="muted">(optional)</span></label>
           <input id="provider-endpoint" maxlength="512" autocomplete="off" spellcheck="false" placeholder="https://api.example.com">
+          <label for="provider-enabled">Status</label>
+          <select id="provider-enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select>
+          <p class="hint">Disabled providers stay configured but cannot be selected for new sessions.</p>
           <div class="form-grid">
             <div><label for="provider-credential-kind">Credential kind</label><select id="provider-credential-kind"><option value="env">Environment variable</option><option value="stored">Stored reference</option></select></div>
             <div><label for="provider-credential-name">Credential name</label><input id="provider-credential-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY"></div>
