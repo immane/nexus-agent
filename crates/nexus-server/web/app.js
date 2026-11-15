@@ -31,7 +31,8 @@ const dom = {
   composerProject: document.querySelector('.composer-project'),
   projectLabel: document.querySelector('#project-label'),
   projectBadge: document.querySelector('#project-badge'),
-  sidebarProjects: document.querySelector('#sidebar-projects'),
+  sidebarTree: document.querySelector('#sidebar-tree'),
+  treeCount: document.querySelector('#tree-count'),
   addProjectSidebar: document.querySelector('#add-project-sidebar'),
   projectsNote: document.querySelector('#projects-note'),
   projectList: document.querySelector('#project-list'),
@@ -85,13 +86,6 @@ const dom = {
   welcome: document.querySelector('#welcome'),
   conversation: document.querySelector('#conversation'),
   conversationTitle: document.querySelector('#conversation-title'),
-  sessionCount: document.querySelector('#session-count'),
-  sessionItem: document.querySelector('#session-item'),
-  sessionItemTitle: document.querySelector('#session-item-title'),
-  sessionItemMeta: document.querySelector('#session-item-meta'),
-  noSessionNote: document.querySelector('#no-session-note'),
-  savedSessions: document.querySelector('#saved-sessions'),
-  savedCount: document.querySelector('#saved-count'),
   newSession: document.querySelector('#new-session'),
   newSessionMobile: document.querySelector('#new-session-mobile'),
 };
@@ -107,6 +101,8 @@ const state = {
   projects: null,
   projectChoices: [],
   projectSelection: null,
+  sessionProjectId: null,
+  collapsedProjects: new Set(),
   savedSessions: [],
   savedPersistence: false,
   historyLoading: false,
@@ -455,7 +451,7 @@ function markUnauthorized() {
   setConnectionStatus('Authentication required', 'error');
   dom.connectionDetail.textContent = 'Authentication failed. Enter the current server bearer token.';
   setRunStatus('Authentication required', 'error');
-  renderSavedSessions();
+  renderSidebarTree();
   updateControls();
 }
 
@@ -553,74 +549,289 @@ function populateProjects() {
 
 function updateProjectDisplay() {
   const enabled = Boolean(state.projects?.enabled);
-  const label = state.projectSelection
-    ? state.projectSelection.label
+  const current = state.session && enabled
+    ? state.projectChoices.find((choice) => choice.id === state.sessionProjectId) || null
+    : null;
+  const selected = state.session ? current : state.projectSelection;
+  const label = selected
+    ? selected.label
     : enabled ? 'No project' : 'Projects disabled';
-  dom.projectLabel.textContent = label;
-  dom.projectBadge.textContent = enabled && state.projectSelection ? label : '';
-  dom.projectBadge.hidden = !state.connected || !enabled || !state.projectSelection;
+  dom.projectLabel.textContent = state.session && enabled && !current ? 'No project' : label;
+  dom.projectBadge.textContent = enabled && selected ? selected.label : '';
+  dom.projectBadge.hidden = !state.connected || !enabled || !selected;
 }
 
-function renderSidebarProjects() {
-  dom.sidebarProjects.replaceChildren();
+const COLLAPSED_PROJECTS_KEY = 'nexus.collapsed-projects';
+const UNASSIGNED_PROJECT_KEY = 'unassigned';
+
+function projectCollapseKey(id) {
+  return id ? `project:${id}` : UNASSIGNED_PROJECT_KEY;
+}
+
+function readCollapsedProjects() {
+  try {
+    const value = JSON.parse(localStorage.getItem(COLLAPSED_PROJECTS_KEY) || '[]');
+    return new Set(Array.isArray(value) ? value.filter((entry) => typeof entry === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeCollapsedProjects() {
+  try {
+    localStorage.setItem(COLLAPSED_PROJECTS_KEY, JSON.stringify([...state.collapsedProjects]));
+  } catch {
+    // Expansion state is a convenience; rendering remains usable without it.
+  }
+}
+
+function ensureProjectExpanded(id) {
+  if (!state.collapsedProjects.delete(projectCollapseKey(id))) return;
+  writeCollapsedProjects();
+}
+
+function compareSessionEntries(left, right) {
+  if (left.current !== right.current) return left.current ? -1 : 1;
+  const messages = (right.messages || 0) - (left.messages || 0);
+  if (messages) return messages;
+  return String(left.title || '').localeCompare(String(right.title || ''));
+}
+
+function buildSessionGroups() {
+  const enabled = Boolean(state.projects?.enabled);
+  const groups = [];
+  const byId = new Map();
+  if (enabled) {
+    for (const choice of state.projectChoices) {
+      const group = {
+        id: choice.id,
+        label: choice.label,
+        path: choice.path || '',
+        sessions: [],
+      };
+      groups.push(group);
+      byId.set(choice.id, group);
+    }
+  }
+  const unassigned = {
+    id: '',
+    label: enabled ? 'No project' : 'Sessions',
+    path: '',
+    sessions: [],
+  };
+  const savedById = new Map();
+  for (const saved of state.savedSessions) {
+    if (saved && typeof saved.session === 'string') savedById.set(saved.session, saved);
+  }
+  const entries = [];
+  if (state.session) {
+    const saved = savedById.get(state.session);
+    savedById.delete(state.session);
+    entries.push({
+      session: state.session,
+      title: state.sessionTitle || saved?.title || 'New conversation',
+      messages: Number(saved?.messages) || 0,
+      active: state.active,
+      current: true,
+      saved: Boolean(saved),
+      project: enabled ? (state.sessionProjectId || '') : '',
+    });
+  }
+  for (const saved of savedById.values()) {
+    const meta = savedSessionMeta(saved.session) || {};
+    const project = typeof meta.project === 'string' && meta.project
+      ? meta.project
+      : typeof saved.project === 'string' ? saved.project : '';
+    entries.push({
+      session: saved.session,
+      title: saved.title || (typeof meta.title === 'string' ? meta.title : '') || 'Saved session',
+      messages: Number(saved.messages) || 0,
+      active: saved.active === true,
+      current: false,
+      saved: true,
+      project: enabled ? project : '',
+    });
+  }
+  for (const entry of entries) {
+    const group = enabled ? byId.get(entry.project) : null;
+    (group || unassigned).sessions.push(entry);
+  }
+  for (const group of groups) group.sessions.sort(compareSessionEntries);
+  unassigned.sessions.sort(compareSessionEntries);
+  const selected = enabled ? (state.sessionProjectId || '') : '';
+  return { groups, unassigned, currentProject: byId.has(selected) ? selected : '' };
+}
+
+function sessionTreeMeta(entry) {
+  if (entry.current) return `${describeModelLabel()} · ${currentSessionStateLabel()}`;
+  return `${entry.messages || 0} items · ${entry.active ? 'open' : 'saved'}`;
+}
+
+function appendSessionTreeItem(panel, entry, savedBusy) {
+  const item = node('div', 'tree-session');
+  item.dataset.session = entry.session;
+  item.dataset.state = entry.current
+    ? state.active ? 'active' : 'current'
+    : entry.active ? 'open' : 'idle';
+  const open = node('button', 'tree-session-open');
+  open.type = 'button';
+  open.disabled = savedBusy;
+  open.title = entry.title || 'Saved session';
+  open.append(node('span', 'tree-session-title', entry.title || 'Saved session'));
+  open.append(node('span', 'tree-session-meta', sessionTreeMeta(entry)));
+  if (entry.current) open.setAttribute('aria-current', 'true');
+  open.addEventListener('click', () => void openSavedSession(entry.session));
+  item.append(open);
+  if (entry.saved) {
+    const remove = node('button', 'tree-session-delete', '×');
+    remove.type = 'button';
+    remove.title = 'Delete saved session';
+    remove.setAttribute('aria-label', 'Delete saved session');
+    remove.disabled = savedBusy;
+    remove.addEventListener('click', () => void deleteSavedSession(entry.session));
+    item.append(remove);
+  }
+  panel.append(item);
+}
+
+function renderProjectGroup(group, index, { savedBusy, projectBusy, currentProject }) {
+  const expanded = !state.collapsedProjects.has(projectCollapseKey(group.id));
+  const panelId = `project-sessions-${index}`;
+  const section = node('section', 'tree-project');
+  section.dataset.project = group.id;
+  const row = node('div', 'tree-project-row');
+  const current = Boolean(state.session) && group.id === currentProject;
+  const selected = !state.session && group.id === (state.projectSelection?.id || '');
+  row.dataset.state = current ? 'current' : selected ? 'selected' : 'idle';
+
+  const toggle = node('button', 'tree-project-toggle');
+  toggle.type = 'button';
+  toggle.disabled = !state.connected || projectBusy;
+  toggle.setAttribute('aria-expanded', String(expanded));
+  toggle.setAttribute('aria-controls', panelId);
+  if (group.path) toggle.title = group.path;
+  const chevron = node('span', 'tree-chevron', '›');
+  chevron.setAttribute('aria-hidden', 'true');
+  toggle.append(chevron);
+  toggle.append(node('span', 'tree-project-name', group.label));
+  toggle.append(node('span', 'tree-project-count', String(group.sessions.length)));
+  toggle.addEventListener('click', () => toggleProjectGroup(group.id));
+  row.append(toggle);
+
+  if (group.id) {
+    const add = node('button', 'tree-project-add', '＋');
+    add.type = 'button';
+    add.disabled = !state.connected || projectBusy;
+    add.title = `New session in ${group.label}`;
+    add.setAttribute('aria-label', `New session in ${group.label}`);
+    add.addEventListener('click', () => startSessionInProject(group.id));
+    row.append(add);
+  }
+
+  const panel = node('div', 'tree-sessions');
+  panel.id = panelId;
+  panel.setAttribute('role', 'group');
+  panel.setAttribute('aria-label', `Sessions in ${group.label}`);
+  panel.hidden = !expanded;
+  if (!group.sessions.length) {
+    panel.append(node('p', 'tree-empty', 'No sessions yet.'));
+  } else {
+    for (const entry of group.sessions) appendSessionTreeItem(panel, entry, savedBusy);
+  }
+  section.append(row, panel);
+  return section;
+}
+
+function renderSidebarTree() {
+  dom.sidebarTree.replaceChildren();
   if (!state.connected) {
-    dom.sidebarProjects.append(node('p', 'sidebar-empty', 'Connect to load projects.'));
+    dom.treeCount.textContent = '0';
+    dom.sidebarTree.append(node('p', 'sidebar-empty', 'Connect to load projects.'));
     return;
   }
-  if (!state.projects?.enabled) {
-    dom.sidebarProjects.append(node('p', 'sidebar-empty', 'Real tools are disabled on this server.'));
-    return;
+  const { groups, unassigned, currentProject } = buildSessionGroups();
+  const visible = [...groups];
+  if (unassigned.sessions.length) visible.push(unassigned);
+  const total = visible.reduce((count, group) => count + group.sessions.length, 0);
+  dom.treeCount.textContent = String(total);
+
+  const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
+  const projectBusy = state.active || state.submitting || state.connecting;
+  visible.forEach((group, index) => {
+    dom.sidebarTree.append(renderProjectGroup(group, index, { savedBusy, projectBusy, currentProject }));
+  });
+  if (!visible.length) {
+    dom.sidebarTree.append(node(
+      'p',
+      'sidebar-empty',
+      state.projects?.enabled ? 'No projects available.' : 'Sessions will appear here after you start one.',
+    ));
   }
-  if (!state.projectChoices.length) {
-    dom.sidebarProjects.append(node('p', 'sidebar-empty', 'No projects available.'));
-    return;
+  if (!state.savedPersistence) {
+    dom.sidebarTree.append(node(
+      'p',
+      'tree-note',
+      'History is off. Start the server with --session-store DIRECTORY to keep sessions.',
+    ));
   }
-  for (const choice of state.projectChoices) {
-    const button = node('button', 'project-item');
-    button.type = 'button';
-    button.dataset.project = choice.id;
-    button.dataset.state = state.projectSelection?.id === choice.id ? 'active' : 'idle';
-    button.title = choice.path;
-    button.append(node('span', 'project-item-title', choice.label));
-    button.append(node('span', 'project-item-meta', choice.path));
-    button.addEventListener('click', () => selectProject(choice.id));
-    dom.sidebarProjects.append(button);
-  }
-  updateSidebarProjectControls();
 }
 
 function updateSidebarProjectControls() {
   const busy = state.active || state.submitting || state.connecting;
-  for (const button of dom.sidebarProjects.querySelectorAll('.project-item')) {
+  for (const button of dom.sidebarTree.querySelectorAll('.tree-project-toggle')) {
+    button.disabled = !state.connected || busy;
+  }
+  for (const button of dom.sidebarTree.querySelectorAll('.tree-project-add')) {
     button.disabled = !state.connected || busy;
   }
   dom.addProjectSidebar.disabled = !state.connected || !state.projects?.enabled;
 }
 
-function selectProject(id) {
-  if (!state.connected || !state.projects?.enabled || state.active || state.submitting || state.connecting) {
-    return;
+function selectProjectChoice(id) {
+  const choice = state.projectChoices.find((entry) => entry.id === id);
+  if (!choice) return false;
+  state.projectSelection = choice;
+  populateProjects();
+  return true;
+}
+
+function toggleProjectGroup(id) {
+  if (!state.connected || state.active || state.submitting || state.connecting) return;
+  const key = projectCollapseKey(id);
+  const collapsed = !state.collapsedProjects.has(key);
+  if (collapsed) state.collapsedProjects.add(key);
+  else state.collapsedProjects.delete(key);
+  writeCollapsedProjects();
+  for (const section of dom.sidebarTree.querySelectorAll('.tree-project')) {
+    if ((section.dataset.project || '') !== id) continue;
+    const toggle = section.querySelector('.tree-project-toggle');
+    const panel = section.querySelector('.tree-sessions');
+    if (toggle) toggle.setAttribute('aria-expanded', String(!collapsed));
+    if (panel) panel.hidden = collapsed;
+    break;
   }
+  updateControls();
+}
+
+function startSessionInProject(id) {
+  if (!state.connected || state.active || state.submitting || state.connecting) return;
   const choice = state.projectChoices.find((entry) => entry.id === id);
   if (!choice) return;
-  if (state.projectSelection?.id === id) {
-    dom.project.value = String(state.projectChoices.indexOf(choice));
-    return;
-  }
   if (state.session) {
-    if (!window.confirm(`Switch to ${choice.label}? This starts a new session; the current session remains available in saved history.`)) {
+    if (!window.confirm(`Start a new session in ${choice.label}? The current session remains available in saved history.`)) {
       return;
     }
     state.projectSelection = choice;
+    ensureProjectExpanded(id);
     startNewSession({ force: true });
     return;
   }
-  state.projectSelection = choice;
-  populateProjects();
-  renderSidebarProjects();
-  updateProjectDisplay();
+  selectProjectChoice(id);
+  ensureProjectExpanded(id);
+  renderSidebarTree();
   updateSessionDisplay();
   updateControls();
+  dom.message.focus();
 }
 
 function setFormStatus(element, text, stateName) {
@@ -690,7 +901,7 @@ function renderProjectsList() {
           state.projects = payload;
           populateProjects();
           renderProjectsList();
-          renderSidebarProjects();
+          renderSidebarTree();
           updateControls();
           updateSessionDisplay();
           setFormStatus(dom.projectStatus, `Removed ${project.name}.`, 'ok');
@@ -893,7 +1104,7 @@ function editModel(id) {
 function renderConfigEditors({ hydrateThinking = false } = {}) {
   if (hydrateThinking) dom.taskThinking.value = state.config?.task_reasoning_effort ?? 'inherit';
   renderProjectsList();
-  renderSidebarProjects();
+  renderSidebarTree();
   renderProviderList();
   renderModelList();
   updateProjectDisplay();
@@ -1050,7 +1261,7 @@ async function connect(candidate) {
     state.projects = projects;
     populateModels();
     populateProjects();
-    renderSidebarProjects();
+    renderSidebarTree();
     renderConfigEditors({ hydrateThinking: true });
     dom.token.value = '';
     setConnectionStatus('Connected', 'ok');
@@ -1125,30 +1336,47 @@ function disconnect() {
   dom.connectionDetail.textContent = forgotten
     ? 'Disconnected. The saved server token has been removed from this browser.'
     : 'Disconnected. Browser storage could not be cleared; clear this site\'s data in your browser to forget the token.';
-  renderSavedSessions();
+  renderSidebarTree();
   updateControls();
 }
 
 /* Session and controls */
 
-function updateSessionDisplay() {
-  const exists = Boolean(state.session);
-  const stateLabel = state.inFlightUnknown
+function currentSessionStateLabel() {
+  return state.inFlightUnknown
     ? 'Unknown'
     : state.active
       ? state.cancelling ? 'Cancelling' : state.pendingApprovalSeen ? 'Awaiting approval' : 'Running'
       : state.runTerminal ? selectedOutcome(state.lastOutcome) : 'Ready';
-  dom.sessionCount.textContent = exists ? '1' : '0';
-  dom.noSessionNote.hidden = exists;
-  dom.sessionItem.hidden = !exists;
-  if (exists) {
-    dom.sessionItemTitle.textContent = state.sessionTitle || 'New conversation';
-    const projectLabel = state.projects?.enabled && state.projectSelection
-      ? `${state.projectSelection.label} · `
-      : '';
-    dom.sessionItemMeta.textContent = `${projectLabel}${describeModelLabel()} · ${stateLabel}`;
-    dom.sessionItem.dataset.state = state.active ? 'active' : 'idle';
+}
+
+function syncCurrentSessionTree() {
+  for (const item of dom.sidebarTree.querySelectorAll('.tree-session')) {
+    if (item.dataset.session !== state.session) continue;
+    item.dataset.state = state.active ? 'active' : 'current';
+    const [title] = item.querySelectorAll('.tree-session-title');
+    if (title) title.textContent = state.sessionTitle || 'New conversation';
+    const [meta] = item.querySelectorAll('.tree-session-meta');
+    if (meta) meta.textContent = `${describeModelLabel()} · ${currentSessionStateLabel()}`;
   }
+}
+
+function updateProjectTreeState() {
+  let projectId = state.session ? (state.sessionProjectId || '') : null;
+  if (projectId && !state.projectChoices.some((choice) => choice.id === projectId)) projectId = '';
+  for (const section of dom.sidebarTree.querySelectorAll('.tree-project')) {
+    const [row] = section.querySelectorAll('.tree-project-row');
+    if (!row) continue;
+    const id = section.dataset.project || '';
+    row.dataset.state = state.session
+      ? id === projectId ? 'current' : 'idle'
+      : id === (state.projectSelection?.id || '') ? 'selected' : 'idle';
+  }
+}
+
+function updateSessionDisplay() {
+  syncCurrentSessionTree();
+  updateProjectTreeState();
   dom.conversationTitle.textContent = state.sessionTitle || 'New conversation';
 }
 
@@ -1163,7 +1391,7 @@ async function refreshSavedSessions() {
   if (!state.connected) {
     state.savedPersistence = false;
     state.savedSessions = [];
-    renderSavedSessions();
+    renderSidebarTree();
     return;
   }
   try {
@@ -1175,49 +1403,7 @@ async function refreshSavedSessions() {
     state.savedSessions = [];
     if (error instanceof ApiError && error.status === 401) markUnauthorized();
   }
-  renderSavedSessions();
-}
-
-function renderSavedSessions() {
-  dom.savedCount.textContent = String(state.savedSessions.length);
-  dom.savedSessions.replaceChildren();
-  if (!state.connected) {
-    dom.savedSessions.append(node('p', 'sidebar-empty', 'Connect to load saved sessions.'));
-    return;
-  }
-  if (!state.savedPersistence) {
-    dom.savedSessions.append(node(
-      'p',
-      'sidebar-empty',
-      'Persistence is disabled. Start the server with --session-store DIRECTORY.',
-    ));
-    return;
-  }
-  if (!state.savedSessions.length) {
-    dom.savedSessions.append(node('p', 'sidebar-empty', 'No saved sessions yet.'));
-    return;
-  }
-  for (const saved of state.savedSessions) {
-    const id = typeof saved.session === 'string' ? saved.session : '';
-    if (!id) continue;
-    const item = node('div', 'saved-item');
-    item.dataset.state = state.session === id ? 'current' : saved.active ? 'open' : 'idle';
-    const open = node('button', 'saved-open');
-    open.type = 'button';
-    open.disabled = state.active || state.submitting || state.connecting || state.historyLoading;
-    open.append(node('span', 'saved-title', saved.title || 'Saved session'));
-    open.append(node('span', 'saved-meta', `${saved.messages || 0} items · ${saved.active ? 'open' : 'saved'}`));
-    open.addEventListener('click', () => void openSavedSession(id));
-    item.append(open);
-    const remove = node('button', 'saved-delete', '×');
-    remove.type = 'button';
-    remove.title = 'Delete saved session';
-    remove.setAttribute('aria-label', 'Delete saved session');
-    remove.disabled = state.active || state.submitting || state.connecting || state.historyLoading;
-    remove.addEventListener('click', () => void deleteSavedSession(id));
-    item.append(remove);
-    dom.savedSessions.append(item);
-  }
+  renderSidebarTree();
 }
 
 async function deleteSavedSession(id) {
@@ -1332,8 +1518,17 @@ async function openSavedSession(id, { automatic = false } = {}) {
     choice = state.choices.find((entry) => !entry.demo
       && entry.provider === meta.provider && entry.model === meta.model) || choice;
   }
-  const project = (meta.project && state.projectChoices.find((entry) => entry.id === meta.project))
-    || state.projectSelection;
+  const hasProjectMeta = Object.prototype.hasOwnProperty.call(meta, 'project');
+  let project = null;
+  if (state.projects?.enabled) {
+    if (hasProjectMeta) {
+      project = typeof meta.project === 'string' && meta.project
+        ? state.projectChoices.find((entry) => entry.id === meta.project) || null
+        : null;
+    } else {
+      project = state.projectSelection;
+    }
+  }
   const body = {};
   if (choice && !choice.demo) {
     body.provider = choice.provider;
@@ -1350,17 +1545,20 @@ async function openSavedSession(id, { automatic = false } = {}) {
     state.session = reply?.session || id;
     state.sessionProvider = body.provider || null;
     state.sessionModel = body.model || null;
+    state.sessionProjectId = project?.id || null;
     state.selection = choice || state.selection;
     if (project) state.projectSelection = project;
+    ensureProjectExpanded(state.sessionProjectId || '');
     const listed = state.savedSessions.find((saved) => saved.session === state.session);
     state.sessionTitle = typeof meta.title === 'string' ? meta.title : (listed?.title || 'Saved session');
     rememberSession(state.session, {
       title: state.sessionTitle,
       provider: state.sessionProvider,
       model: state.sessionModel,
-      project: project?.id || null,
+      project: state.sessionProjectId,
     });
     rememberCurrentSession(state.session);
+    renderSidebarTree();
     updateSessionDisplay();
     await loadSessionHistory(state.session);
     setRunStatus('Ready', 'ok');
@@ -1411,7 +1609,10 @@ function updateControls() {
         ? 'A run is active. You can draft the next task…'
         : 'Describe a task…';
   const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
-  for (const button of dom.savedSessions.querySelectorAll('button')) {
+  for (const button of dom.sidebarTree.querySelectorAll('.tree-session-open')) {
+    button.disabled = savedBusy;
+  }
+  for (const button of dom.sidebarTree.querySelectorAll('.tree-session-delete')) {
     button.disabled = savedBusy;
   }
   for (const record of state.approvals.values()) {
@@ -1486,12 +1687,12 @@ function startNewSession({ force = false } = {}) {
   state.session = null;
   state.sessionProvider = null;
   state.sessionModel = null;
+  state.sessionProjectId = null;
   state.sessionTitle = '';
   rememberCurrentSession('');
   if (state.connected) {
     populateModels();
     populateProjects();
-    renderSidebarProjects();
   }
   dom.conversation.replaceChildren();
   dom.conversation.hidden = true;
@@ -1501,7 +1702,7 @@ function startNewSession({ force = false } = {}) {
   updateJumpLatest();
   dom.message.value = '';
   updateSessionDisplay();
-  renderSavedSessions();
+  renderSidebarTree();
   updateControls();
   setRunStatus('Ready', 'ok');
   dom.message.focus();
@@ -1534,13 +1735,18 @@ async function ensureSession() {
   state.session = reply.session;
   state.sessionProvider = state.selection.demo ? null : state.selection.provider;
   state.sessionModel = state.selection.demo ? null : state.selection.model;
+  state.sessionProjectId = state.projects?.enabled && state.projectSelection
+    ? state.projectSelection.id
+    : null;
+  ensureProjectExpanded(state.sessionProjectId || '');
   rememberSession(state.session, {
     title: state.sessionTitle || 'New conversation',
     provider: state.sessionProvider,
     model: state.sessionModel,
-    project: state.projects?.enabled && state.projectSelection ? state.projectSelection.id : null,
+    project: state.sessionProjectId,
   });
   rememberCurrentSession(state.session);
+  renderSidebarTree();
   updateSessionDisplay();
   void refreshSavedSessions();
 }
@@ -3179,7 +3385,7 @@ dom.model.addEventListener('change', () => {
 dom.project.addEventListener('change', () => {
   const index = Number(dom.project.value);
   state.projectSelection = state.projectChoices[index] || null;
-  renderSidebarProjects();
+  renderSidebarTree();
   updateProjectDisplay();
   updateControls();
 });
@@ -3208,7 +3414,7 @@ dom.projectForm.addEventListener('submit', async (event) => {
       }
     }
     renderProjectsList();
-    renderSidebarProjects();
+    renderSidebarTree();
     dom.projectName.value = '';
     dom.projectPath.value = '';
     setFormStatus(dom.projectStatus, `Added ${payload.project?.name || name}.`, 'ok');
@@ -3450,6 +3656,7 @@ async function cancelRun() {
 
 /* Initial state */
 
+state.collapsedProjects = readCollapsedProjects();
 updateSessionDisplay();
 updateControls();
 updateJumpLatest();
