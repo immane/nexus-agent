@@ -96,7 +96,7 @@ function thinkingFixture(config = {}) {
     setFormStatus(element, message, status) { element.textContent = message; element.dataset.state = status; },
     optionalCount(element) { return element.value ? Number(element.value) : null; },
     markUnauthorized() { state.connected = false; },
-    renderProjectsList() {}, renderSidebarProjects() {}, renderProviderList() {}, renderModelList() {},
+    renderProjectsList() {}, renderSidebarTree() {}, renderProviderList() {}, renderModelList() {},
     updateProjectDisplay() {}, updateModelDisplay() {}, updateSidebarProjectControls() {},
     updateComposerActivity() {}, updateConnectionDetail() {}, populateModels() {}, updateSessionDisplay() {},
   });

@@ -25,20 +25,10 @@
         <strong>Local workspace</strong>
         <span class="muted">Served by nexus-server</span>
       </div>
-      <div class="section-label">PROJECTS <button class="section-add" id="add-project-sidebar" type="button" aria-label="Add project" disabled>＋</button></div>
-      <div class="project-list" id="sidebar-projects" aria-label="Projects"><p class="sidebar-empty">Connect to load projects.</p></div>
       <button class="new-session" id="new-session" type="button" disabled>＋ New session</button>
-      <div class="section-label">SESSIONS <span id="session-count">0</span></div>
-      <div class="session-list" id="session-list">
-        <p class="sidebar-empty" id="no-session-note">No active session.<br>Choose a saved session or start a new one.</p>
-        <div class="session-item" id="session-item" hidden>
-          <span class="session-item-title" id="session-item-title">New conversation</span>
-          <span class="session-item-meta" id="session-item-meta">Ready</span>
-        </div>
-      </div>
-      <div class="section-label">SAVED <span id="saved-count">0</span></div>
-      <div class="saved-list" id="saved-sessions" aria-label="Saved sessions">
-        <p class="sidebar-empty" id="saved-note">Connect to load saved sessions.</p>
+      <div class="section-label">PROJECTS <span class="section-actions"><span id="tree-count">0</span><button class="section-add" id="add-project-sidebar" type="button" aria-label="Add project" disabled>＋</button></span></div>
+      <div class="project-tree" id="sidebar-tree" aria-label="Projects and sessions">
+        <p class="sidebar-empty" id="sidebar-note">Connect to load projects.</p>
       </div>
     </div>
     <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span> Local only <span class="badge">ALPHA</span></div>

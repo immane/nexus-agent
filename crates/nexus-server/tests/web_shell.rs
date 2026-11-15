@@ -78,6 +78,7 @@ fn embedded_assets_keep_host_origin_and_api_authentication_checks() {
                     assert!(body.contains("rel=\"manifest\""));
                     assert!(body.contains("id=\"install-app\""));
                     assert!(body.contains("Live session client"));
+                    assert!(body.contains("id=\"sidebar-tree\""));
                 }
                 "/assets/app.css" => assert!(head.contains("text/css; charset=utf-8")),
                 "/assets/manifest.webmanifest" => {

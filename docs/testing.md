@@ -82,8 +82,8 @@ The embedded Web client's regressions run separately with Node.js:
 `node --test crates/nexus-server/tests/web_*.mjs`. They exercise settings
 navigation, tool argument presentation, literal code content, bounded
 replacement diffs, streaming/final output, disclosure states, and the install
-prompt flow, saved-session rendering, live-thinking disclosure and bounded
-streaming previews, and busy-state wiring with a small DOM
+prompt flow, project-tree saved-session grouping and rendering, live-thinking
+disclosure and bounded streaming previews, and busy-state wiring with a small DOM
 double. Provider settings coverage includes stored-token create/update, no
 secret echo, deletion through the authenticated route, a conflict when a model
 still references the provider, and enabled/disabled selection enforcement. Thinking also has a stylesheet contract
