@@ -182,7 +182,17 @@ Run the low-value and ignored checks explicitly:
 cargo nextest run --workspace --all-features --locked --offline --run-ignored all
 ```
 
-CI runs the complete suite once, including default behavior tests. Routine local
+CI runs the complete suite once, including default behavior tests, with one
+explicit exception: `nexus-container`'s
+`gateway::tests::offline_gateway_and_shared_namespace_have_no_external_routes`
+requires a Docker daemon and an explicitly selected cached gateway image
+(`NEXUS_TEST_GATEWAY_IMAGE`). The hosted jobs do not provision them, so their
+filter excludes only this test; all other ignored checks still run. Run the
+[container network check](../containers/README.md#tool-network-selection)
+separately on a provisioned host. The unfiltered command above includes it and
+fails if its required image is not configured.
+
+Routine local
 validation does not enable `low-value-tests` or run ignored checks. Compile the
 optional target when changing the test-only keymap or doing a complete review.
 

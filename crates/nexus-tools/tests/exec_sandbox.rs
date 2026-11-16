@@ -56,6 +56,42 @@ fn context_with_scope(scope: &str) -> ToolContext {
     .unwrap()
 }
 
+fn read_fixture_headers(reader: &mut impl std::io::Read) -> std::io::Result<()> {
+    let mut headers = [0; 4096];
+    let mut used = 0;
+    while used < headers.len() {
+        let count = reader.read(&mut headers[used..])?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        used += count;
+        if headers[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            return Ok(());
+        }
+    }
+    Err(std::io::ErrorKind::InvalidData.into())
+}
+
+#[test]
+fn loopback_fixture_reads_fragmented_headers_and_rejects_incomplete_or_oversized_requests() {
+    use std::io::{Cursor, Read};
+    let first = Cursor::new(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r");
+    let last = Cursor::new(b"\n");
+    read_fixture_headers(&mut first.chain(last)).unwrap();
+    assert_eq!(
+        read_fixture_headers(&mut Cursor::new(b"GET / HTTP/1.1\r\n"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        read_fixture_headers(&mut Cursor::new([b'x'; 4097]))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
 /// A bounded loopback fixture proves success and denial against the same live
 /// service, without touching external DNS, proxies, or a public endpoint.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -95,8 +131,11 @@ fn network_policy_reaches_live_service_only_when_enabled() {
                         socket
                             .set_write_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
-                        let _ = socket.read(&mut [0; 4096]);
-                        let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nnetwork-ok");
+                        // Drain the complete request before closing: unread TCP
+                        // bytes can turn the response's EOF into a reset.
+                        if read_fixture_headers(&mut socket).is_ok() {
+                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nnetwork-ok");
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5))
