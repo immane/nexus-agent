@@ -1385,6 +1385,7 @@ impl Server {
         let mut document = serde_json::json!({
             "enabled": enabled,
             "mode": mode,
+            "network_access": if mode == "fakes" { Value::Null } else { Value::Bool(self.tools_settings.network_access) },
             "projects": [],
         });
         if enabled {
@@ -2690,6 +2691,7 @@ mod tests {
         let (mut server, _runtime) = server_with_gated_config();
         assert_eq!(server.tools_settings, ToolsSettings::default());
         let settings = ToolsSettings {
+            network_access: false,
             list_entry_limit: 1,
             search_file_bytes: 4,
         };

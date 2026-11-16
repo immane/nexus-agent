@@ -101,6 +101,7 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<Request, ProtocolError> {
             .get("search_file_bytes")
             .and_then(Value::as_u64)
             .ok_or(ProtocolError::InvalidRequest)?,
+        ..nexus_config::ToolsSettings::default()
     };
     tools
         .validate()

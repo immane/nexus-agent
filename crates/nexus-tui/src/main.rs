@@ -211,12 +211,13 @@ fn load_session_config() -> io::Result<SessionConfig> {
         StartupAction::Help => startup_usage(true),
         StartupAction::Usage => startup_usage(false),
     };
-    let settings = nexus_config::load_settings(
+    let mut settings = nexus_config::load_settings(
         nexus_config::SettingsProfile::Tui,
         args.base_config.as_deref(),
         &args.config_overlays,
     )
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    settings.override_tool_network(args.network_access);
     let mut session = session_config_at_with_settings(resolve_path(None), settings)?;
     if args.check_config {
         println!("Configuration is valid.");
@@ -244,6 +245,17 @@ fn load_session_config() -> io::Result<SessionConfig> {
     session.execution = args.execution;
     session.gateway_image = effective_gateway;
     session.workload_image = effective_workload;
+    if !session.demo {
+        eprintln!(
+            "nexus-tui: tool network {} ({:?}; filesystem and approvals unchanged)",
+            if session.settings.tools().network_access {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            session.execution
+        );
+    }
     Ok(session)
 }
 
@@ -405,6 +417,7 @@ fn boot_model(config: &UserConfig) -> Option<String> {
 /// with a not-configured diagnostic instead of a silent fake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartupArgs {
+    network_access: Option<bool>,
     strict_tools: bool,
     /// Jail for real file reads and writes. Explicit `--tools-root`, else
     /// the working directory by default; `None` (tests only) keeps every
@@ -438,6 +451,7 @@ enum StartupAction {
 /// which the historical parser ignored) is usage, never a silent boot
 /// into scripted mode on a mistyped flag.
 fn parse_startup_args(argv: &[String]) -> StartupAction {
+    let mut network_access = None;
     let mut tools_root: Option<std::path::PathBuf> = None;
     let mut demo = false;
     let mut strict_tools = false;
@@ -456,6 +470,16 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
             "--demo" if cfg!(feature = "demo") => demo = true,
             "--demo" => return StartupAction::Usage,
             "--strict-tools" => strict_tools = true,
+            "--network" => {
+                if network_access.is_some() {
+                    return StartupAction::Usage;
+                }
+                network_access = match args.next().map(String::as_str) {
+                    Some("enabled") => Some(true),
+                    Some("disabled") => Some(false),
+                    _ => return StartupAction::Usage,
+                };
+            }
             "--execution" | "--run" => {
                 if execution_set {
                     return StartupAction::Usage;
@@ -514,6 +538,7 @@ fn parse_startup_args(argv: &[String]) -> StartupAction {
         }
     }
     StartupAction::Run(StartupArgs {
+        network_access,
         tools_root,
         demo,
         strict_tools,
@@ -536,6 +561,7 @@ fn startup_usage(help: bool) -> ! {
             "Usage: nexus-tui [OPTIONS]\n\n",
             "Modes:\n",
             "  --execution <MODE>  Select local (default) or container execution\n",
+            "  --network <MODE>    Tool network enabled (default) or disabled; providers unaffected\n",
             "  --run <MODE>        Alias for --execution\n",
             "{}\n",
             "Workspace and tools:\n",
@@ -1639,6 +1665,7 @@ struct Frontend {
     g_pending: bool,
     /// Clipboard I/O boundary; input tests inject a writer without a desktop session.
     clipboard_writer: fn(&str, nexus_config::tui_settings::ClipboardMode) -> bool,
+    tool_network_access: bool,
 }
 
 impl Frontend {
@@ -1670,6 +1697,7 @@ impl Frontend {
             pointer_press: None,
             g_pending: false,
             clipboard_writer: yank_to_clipboard,
+            tool_network_access: true,
         }
     }
 
@@ -1681,6 +1709,7 @@ impl Frontend {
             active_model: config.active_model,
             run_models: HashMap::new(),
             demo: config.demo,
+            tool_network_access: config.settings.tools().network_access,
             ..Self::new(session)
         };
         front
@@ -1813,7 +1842,17 @@ impl Frontend {
         let message = {
             let handle = self.live.as_ref().expect("live handle attached");
             let selection = handle.lock().expect("live selection lockable");
-            wiring_notice(&selection, tools_root, execution)
+            let mut notice = wiring_notice(&selection, tools_root, execution);
+            if tools_root.is_some() && !selection.demo {
+                notice.push_str(if !self.tool_network_access {
+                    "; tool network disabled (providers unaffected)"
+                } else if execution == ExecutionMode::Container {
+                    "; tool network enabled (experimental public-egress gateway)"
+                } else {
+                    "; tool network enabled (host reachability)"
+                });
+            }
+            notice
         };
         self.state.notice(&message);
     }
@@ -9833,6 +9872,30 @@ mod cov_live_wiring {
             .chain(args.iter().copied())
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn startup_tool_network_is_explicit_and_rejects_invalid_or_duplicate_flags() {
+        for (flags, expected) in [
+            (vec![], None),
+            (vec!["--network", "enabled"], Some(true)),
+            (vec!["--network", "disabled", "--strict-tools"], Some(false)),
+        ] {
+            let StartupAction::Run(args) = parse_startup_args(&argv(&flags)) else {
+                panic!("valid network flag");
+            };
+            assert_eq!(args.network_access, expected);
+        }
+        for flags in [
+            vec!["--network"],
+            vec!["--network", "true"],
+            vec!["--network", "disabled", "--network", "enabled"],
+        ] {
+            assert!(matches!(
+                parse_startup_args(&argv(&flags)),
+                StartupAction::Usage
+            ));
+        }
     }
 
     /// Unwraps the `Run` variant, asserting the branch was taken.

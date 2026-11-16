@@ -2,6 +2,16 @@
 
 ## Normal workflow
 
+Tool-network regression tests cover configuration inheritance/CLI overrides and
+macOS sandboxed TCP/UDP loopback connectivity/denial in strict and development
+modes, including a spawned child and IPv6 TCP when available. The UDP test uses
+`cc` to build a project-local client. They use a reachable local control service,
+not public endpoints. Linux sandbox variants remain ignored
+until explicitly provisioned; run `network_policy_reaches_live_service` with
+`--run-ignored all` on such a host. The container offline namespace/readiness
+check is also opt-in: see [container network checks](../containers/README.md#tool-network-selection).
+The `--network disabled` flag disables tool networking, not provider requests.
+
 Release packaging has offline stdlib-only regression tests:
 `python3 scripts/test-release.py`. These cover archive determinism, checksums,
 installation, tampering and symlink rejection without compiling Rust. An actual

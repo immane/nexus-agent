@@ -8,7 +8,7 @@
   (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
   tools (`host_read`/`host_list`/`host_search`/`host_write`/`host_patch`) plus
-  sandboxed `argv` execution (`host_exec`: no shell, no network,
+  sandboxed `argv` execution (`host_exec`: no implicit shell, configurable network,
   `sandbox-exec` on macOS, `bwrap` on Linux) via `nexus-tools`, with shared
   project/temp/protected-path rules in `nexus-permissions`. Operations inside
   the project root and temp directories are automatic; other paths need
@@ -431,7 +431,7 @@ temp directories need no approval, while file access to other paths parks on
 an approval card (`a` allows once, `s` grants that directory for the
 session, `d` denies). `host_exec` takes an `argv` array with no shell, reads
 broadly except protected credential paths, writes only the project/temp
-roots or a declared approved directory, and has no network access.
+roots or a declared approved directory, and enables networking by default.
 `--strict-tools` restores the strict policy: project-jailed reads with
 per-call confirmation for writes and exec. `--demo` only affects provider
 wiring and transcript fallback, not tool mode. File tools now bind access to
@@ -441,6 +441,61 @@ be preserved or replacement fails closed. Atomic visibility is not crash
 durability; external-writer conflict detection is best-effort, not a universal
 race guarantee. These filesystem changes have macOS evidence only; Linux
 validation remains blocked. See the [migration record](docs/tasks/08-architecture-migration.md).
+
+### Tool network access
+
+**Migration:** local real tools previously denied networking. They now enable it
+by default, in both development and strict modes. To retain the previous offline
+behavior, pass `--network disabled` to `nexus-tui` or `nexus-server`, or supply an
+operational settings overlay before upgrading/restarting:
+
+```json
+{
+  "revision": 1,
+  "defaults": {
+    "tools": { "network_access": false }
+  }
+}
+```
+
+```sh
+nexus-tui --network disabled
+nexus-server --network disabled --tools real --tools-root /absolute/project \
+  --auth-token-env NEXUS_SERVER_TOKEN
+# Or use the operational overlay, not the provider/model config.json:
+nexus-tui --config-overlay /absolute/offline.jsonc
+```
+
+`--network enabled|disabled` overrides the operational base/overlays. Duplicate
+or invalid flags fail explicitly. `--print-effective-config` includes this CLI
+override in `tools.network_access`. The policy is bound to new sessions at
+startup; restarting or restoring a transcript does not revive old approvals.
+There is no model-call network flag, live toggle, or unsandboxed retry.
+
+Local online tools use host routing and can reach loopback, LAN/VPN, and metadata
+services; Linux shares the host network namespace, including listener binding.
+On macOS the added permission is outbound-only, not general inbound access.
+Do not treat online local execution as hostile-code isolation or prevention of
+source-code uploads. The filesystem sandbox, protected paths, cleared
+environment, write scopes, deadlines, and approvals remain enforced. Strict
+execution still prompts even when networking is enabled.
+
+Container online mode keeps the existing experimental public-egress gateway,
+host/LAN/metadata restrictions, and IPv6 denial. Offline mode creates that
+gateway with `--network none`; workloads share the isolated namespace and retain
+only local DNS readiness. It does not publish ports or use host networking.
+Container security validation remains incomplete, particularly native Linux.
+
+This is **tool offline mode**, not application-wide offline mode: provider
+requests and discovery remain separate, and the Web server stays on
+`127.0.0.1`. No provider/server tokens, SSH agent, or host proxy variables are
+automatically passed to commands. Public dependency downloads may work while
+authenticated registries, private Git, proxy-only environments, or external
+cache directories still require separate support/approval. TLS verification is
+not disabled. Cancelling a command cannot recall uploaded data or undo a remote
+write; do not blindly retry uncertain network operations.
+
+### Bounded file reads
 
 `host_read` returns bounded UTF-8 **byte pages**, on both host and container
 backends. Arguments are `path`, optional zero-based byte `offset` (default `0`),

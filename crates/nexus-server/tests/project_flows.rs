@@ -124,6 +124,24 @@ fn fake_server() -> Server {
 }
 
 #[test]
+fn project_metadata_reports_offline_tools_without_changing_project_availability() {
+    let root = temp_root("offline");
+    let mut server = development_server(&root, None);
+    server
+        .set_tools_settings(&nexus_config::ToolsSettings {
+            network_access: false,
+            ..Default::default()
+        })
+        .unwrap();
+    let port = spawn(server);
+    let (status, body) = get(port, "/projects", true);
+    assert_eq!(status, 200);
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["network_access"], false);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn projects_are_validated_persisted_and_bound_to_sessions() {
     let root = temp_root("catalog");
     let extra = root.join("extra");
@@ -140,6 +158,7 @@ fn projects_are_validated_persisted_and_bound_to_sessions() {
     assert_eq!(status, 200, "projects are reported: {body}");
     assert_eq!(body["enabled"], true);
     assert_eq!(body["mode"], "development");
+    assert_eq!(body["network_access"], true);
     assert_eq!(body["default"]["id"], "default");
     assert_eq!(
         body["default"]["path"].as_str().expect("default path"),
@@ -222,6 +241,7 @@ fn fake_or_container_modes_refuse_projects_without_exposing_paths() {
     assert_eq!(status, 200, "fake mode reports availability: {body}");
     assert_eq!(body["enabled"], false);
     assert_eq!(body["mode"], "fakes");
+    assert!(body["network_access"].is_null());
     assert!(body.get("default").is_none());
     assert_eq!(body["projects"].as_array().unwrap().len(), 0);
 

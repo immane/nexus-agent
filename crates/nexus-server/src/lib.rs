@@ -113,6 +113,8 @@
 //! - `GET /projects` reports whether local real tools are enabled, the tool
 //!   mode, the reserved startup workspace, and admitted project roots. It
 //!   exposes no project paths in fake or container mode.
+//!   `network_access` reports the startup tool-network setting (`null` for
+//!   fake tools); it does not describe provider networking or a live toggle.
 //! - `POST /projects` with `{"name":"...","path":"/absolute/dir"}` admits one
 //!   existing canonical directory. The filesystem root, home/ancestor paths,
 //!   and known credential directories are refused. `DELETE /projects/{id}`

@@ -9,6 +9,7 @@ Source: choices explicitly confirmed by the project owner after the [project fou
 | Area | Accepted requirement |
 | --- | --- |
 | Tool permissions | Development mode defaults to automatic project/temp operations and sandboxed exec; file tools accessing external directories require approval, with optional session-only directory grants. Preserve strict mode with project-jailed reads and confirmation for mutations/exec. |
+| Tool networking (2026-11-17 amendment) | Default local and container tools to enabled networking with an explicit offline selection. Preserve filesystem restrictions and command approvals. Local host reachability and experimental container public-egress restrictions differ; do not expose the Web server. See [network design](../16-tool-network-access.md). |
 | TUI | Use the official Grok Build full-screen interaction style as a reference, with an independently implemented lightweight Rust frontend. |
 | Sessions | Automatically save locally outside the project; start a new conversation by default and restore history only on explicit selection. |
 | Entry points | Ship both the TUI and a headless entry point using the same runtime and policy boundary. |
@@ -18,7 +19,7 @@ Source: choices explicitly confirmed by the project owner after the [project fou
 
 ## Consequences
 
-Automatic access remains subject to scope and host restrictions. Development exec may read most non-protected host files without prompting; external writes require a declared approved directory, and network is disabled. A working directory is not an OS permission boundary. Strict commands require confirmation even when they appear read-only. Headless calls requiring confirmation are denied when no explicit approval handler is configured. Session directory grants never persist across restart or restore.
+Automatic access remains subject to scope and host restrictions. Development exec may read most non-protected host files without prompting; external writes require a declared approved directory. The 2026-11-17 amendment replaces the previous offline default with default enabled tool networking; an explicit offline selection does not change provider networking. A working directory is not an OS permission boundary. Strict commands require confirmation even when they appear read-only. Headless calls requiring confirmation are denied when no explicit approval handler is configured. Session directory grants never persist across restart or restore.
 
 Automatic session writes are host-managed persistence under the configured storage policy, not model-directed permission to modify arbitrary files. Restoring history does not replay operations, restart interrupted work, or reinstate old call approvals.
 

@@ -40,6 +40,16 @@ flowchart LR
 
 ## Purpose and Scope
 
+Network policy amendment (2026-11-17): tool networking defaults to enabled using
+the existing public-egress gateway restrictions. Operational
+`tools.network_access: false` or `--network disabled` creates the gateway with
+`--network none`; workloads still share its namespace, use local DNS readiness,
+and retain all filesystem/capability restrictions. No port publishing or host
+networking is added. This reuses the current gateway image and worker protocol
+v2; file-worker messages carry budgets only, never network authority. Docker
+Desktop offline namespace/readiness has been checked, not native Linux isolation.
+See [default tool network access](16-tool-network-access.md).
+
 Provide two build variants: local-only by default, and local plus container support through an additive Cargo feature. At startup, select the execution backend independently of the agent's build/plan mode. Keep the provider, frontend, and authoritative runtime on the host; execute every registered container file/process tool inside the session's isolated environment.
 
 The isolation objective is to expose only the selected host workspace, not to prevent access to the container's own operating-system files. Shells and compilers must read the image's libraries and toolchain. Writable container-local home, temporary storage, and caches are permitted. Container execution is not privileged execution and is not a guarantee against kernel, runtime, or VM vulnerabilities.

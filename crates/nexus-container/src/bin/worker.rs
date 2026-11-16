@@ -100,7 +100,8 @@ mod tests {
         std::fs::write(root.join("a"), "early\nlate\n").unwrap();
         std::fs::write(root.join("b"), "other\n").unwrap();
         let execute = |operation: &str, arguments: Value, settings: &ToolsSettings| {
-            let wire = json!({"version":2,"operation":operation,"arguments":arguments,"output_limit":4096,"tools":settings});
+            let wire = json!({"version":2,"operation":operation,"arguments":arguments,"output_limit":4096,
+                "tools":{"list_entry_limit":settings.list_entry_limit,"search_file_bytes":settings.search_file_bytes}});
             let mut output = Vec::new();
             run_with_root(wire.to_string().as_bytes(), &mut output, &root).unwrap();
             serde_json::from_slice::<Value>(&output).unwrap()["result"].clone()
@@ -108,6 +109,7 @@ mod tests {
         let reduced = ToolsSettings {
             list_entry_limit: 1,
             search_file_bytes: 6,
+            ..ToolsSettings::default()
         };
         let list = execute("host_list", json!({"path":"."}), &reduced);
         assert_eq!(list["status"], "Succeeded");

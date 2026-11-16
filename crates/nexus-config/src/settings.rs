@@ -231,17 +231,25 @@ impl ServerSettings {
     }
 }
 
-/// Filesystem tool ceilings. Settings may reduce, but never raise, hard caps.
+/// Tool network selection and filesystem ceilings. Budgets may only reduce hard caps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolsSettings {
+    /// Tool subprocess networking, independent of provider access and approvals.
+    #[serde(default = "network_enabled")]
+    pub network_access: bool,
     pub list_entry_limit: usize,
     pub search_file_bytes: u64,
+}
+
+fn network_enabled() -> bool {
+    true
 }
 
 impl Default for ToolsSettings {
     fn default() -> Self {
         Self {
+            network_access: true,
             list_entry_limit: 10_000,
             search_file_bytes: 1_048_576,
         }
@@ -272,6 +280,13 @@ pub struct EffectiveSettings {
 }
 
 impl EffectiveSettings {
+    /// Applies an explicit operator CLI override before constructing sessions.
+    pub fn override_tool_network(&mut self, enabled: Option<bool>) {
+        if let Some(enabled) = enabled {
+            self.tools.network_access = enabled;
+        }
+    }
+
     /// Returns the effective run limits.
     #[must_use]
     pub fn limits(&self) -> Limits {
@@ -297,7 +312,7 @@ impl EffectiveSettings {
         &self.server
     }
 
-    /// Returns filesystem tool operational ceilings.
+    /// Returns tool network selection and filesystem operational ceilings.
     #[must_use]
     pub fn tools(&self) -> &ToolsSettings {
         &self.tools
@@ -891,6 +906,39 @@ mod tests {
             assert_eq!(settings.tui(), &TuiSettings::default());
             assert_eq!(settings.provider_retry_backoff(), &[1, 2, 5, 10, 30, 60]);
         }
+    }
+
+    #[test]
+    fn tool_network_defaults_layers_and_cli_override_are_independent_of_budgets() {
+        let mut settings = SettingsProfile::Tui.defaults();
+        assert!(settings.tools().network_access);
+        let limits = settings.limits();
+        let provider = settings.provider().clone();
+        let offline = r#"{"revision":1,"defaults":{"tools":{"network_access":false}}}"#;
+        apply_layer(&mut settings, offline, SettingsProfile::Tui).unwrap();
+        assert!(!settings.tools().network_access);
+        let budgets = r#"{"revision":1,"defaults":{"tools":{"list_entry_limit":5}}}"#;
+        apply_layer(&mut settings, budgets, SettingsProfile::Tui).unwrap();
+        assert!(!settings.tools().network_access);
+        settings.override_tool_network(None);
+        assert!(!settings.tools().network_access);
+        settings.override_tool_network(Some(true));
+        assert!(settings.tools().network_access);
+        assert_eq!(settings.tools().list_entry_limit, 5);
+        assert_eq!(settings.limits(), limits);
+        assert_eq!(settings.provider(), &provider);
+        assert_eq!(
+            serde_json::from_str::<Value>(&settings_json(&settings)).unwrap()["tools"]["network_access"],
+            true
+        );
+        for value in ["null", "1", "\"enabled\""] {
+            let invalid =
+                format!(r#"{{"revision":1,"defaults":{{"tools":{{"network_access":{value}}}}}}}"#);
+            assert!(apply_layer(&mut settings, &invalid, SettingsProfile::Tui).is_err());
+        }
+        let legacy: ToolsSettings =
+            serde_json::from_str(r#"{"list_entry_limit":1,"search_file_bytes":2}"#).unwrap();
+        assert!(legacy.network_access);
     }
 
     #[test]

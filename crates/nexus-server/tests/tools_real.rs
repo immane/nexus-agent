@@ -36,6 +36,39 @@ impl Drop for FixtureRoot {
     }
 }
 
+#[test]
+fn network_cli_override_is_reflected_in_effective_startup_settings() {
+    let root = FixtureRoot::new();
+    let base = root.0.join("offline.jsonc");
+    std::fs::write(
+        &base,
+        r#"{"revision":1,"defaults":{"tools":{"network_access":false}}}"#,
+    )
+    .unwrap();
+    for (flags, expected) in [
+        (vec![], false),
+        (vec!["--network", "enabled"], true),
+        (vec!["--network", "disabled"], false),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_nexus-server"))
+            .arg("--config")
+            .arg(root.0.join("missing-user-config.json"))
+            .arg("--base-config")
+            .arg(&base)
+            .arg("--print-effective-config")
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let settings: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(settings["tools"]["network_access"], expected);
+    }
+}
+
 fn address(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
@@ -301,6 +334,7 @@ fn configured_tool_bounds_execute_in_strict_and_development_sessions() {
             .set_tools_settings(&nexus_config::ToolsSettings {
                 list_entry_limit: 1,
                 search_file_bytes: 4,
+                ..nexus_config::ToolsSettings::default()
             })
             .unwrap();
         server

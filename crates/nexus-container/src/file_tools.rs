@@ -448,6 +448,7 @@ mod tests {
         let settings = nexus_config::ToolsSettings {
             list_entry_limit: 2,
             search_file_bytes: 7,
+            ..nexus_config::ToolsSettings::default()
         };
         let tools = container_file_tools(
             ContainerWorkerClient::new(Capture(Arc::clone(&requests)))

@@ -21,7 +21,7 @@ pub fn strict_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentError> {
     strict_tools_with_settings(root, &ToolsSettings::default())
 }
 
-/// Constructs strict tools with validated filesystem operational ceilings.
+/// Constructs strict tools with filesystem ceilings and a fixed network policy.
 pub fn strict_tools_with_settings(
     root: &Path,
     settings: &ToolsSettings,
@@ -36,7 +36,9 @@ pub fn strict_tools_with_settings(
         )),
         ToolRegistration::mutation(Arc::new(ScopedWriter::with_root(root)?)),
         ToolRegistration::mutation(Arc::new(ScopedPatcher::with_root(root)?)),
-        ToolRegistration::process(Arc::new(SandboxedExecutor::with_root(root)?)),
+        ToolRegistration::process(Arc::new(
+            SandboxedExecutor::with_root(root)?.with_network_access(settings.network_access),
+        )),
     ])
 }
 
@@ -46,14 +48,14 @@ pub fn development_tools(root: &Path) -> Result<Vec<ToolRegistration>, AgentErro
     development_tools_with_settings(root, &ToolsSettings::default())
 }
 
-/// Constructs development tools with validated filesystem operational ceilings.
+/// Constructs development tools with filesystem ceilings and a fixed network policy.
 pub fn development_tools_with_settings(
     root: &Path,
     settings: &ToolsSettings,
 ) -> Result<Vec<ToolRegistration>, AgentError> {
     let mut tools = development_file_tools_with_settings(root, settings)?;
     tools.push(ToolRegistration::process(Arc::new(
-        SandboxedExecutor::development(root)?,
+        SandboxedExecutor::development(root)?.with_network_access(settings.network_access),
     )));
     Ok(tools)
 }

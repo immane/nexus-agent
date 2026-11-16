@@ -4,6 +4,24 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import vm from 'node:vm';
 
+test('project settings display reported tool networking without guessing old-server defaults', () => {
+  const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const state = { projects: { enabled: true, mode: 'development', projects: [] } };
+  const dom = Object.fromEntries(['projectName', 'projectPath', 'addProject', 'projectsNote', 'projectStatus']
+    .map(key => [key, {}]));
+  dom.projectList = { replaceChildren() {} };
+  const context = vm.createContext({ state, dom, configModeLabel: () => 'Development tools' });
+  vm.runInContext(source.slice(source.indexOf('function renderProjectsList('), source.indexOf('function renderProviderList(')), context);
+  for (const [value, label] of [[undefined, 'not reported'], [true, 'enabled (host reachability)'], [false, 'disabled']]) {
+    state.projects.network_access = value;
+    vm.runInContext('renderProjectsList()', context);
+    assert.ok(dom.projectsNote.textContent.includes(`tool network ${label}`));
+  }
+  state.projects = { enabled: false, mode: 'container', network_access: false };
+  vm.runInContext('renderProjectsList()', context);
+  assert.ok(dom.projectsNote.textContent.includes('Tool network disabled'));
+});
+
 test('settings categories select one panel, retain form drafts and reset scrolling', () => {
   const html = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');

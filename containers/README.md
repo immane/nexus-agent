@@ -1,5 +1,33 @@
 # Container execution prototypes and gateway checks
 
+## Tool network selection
+
+TUI/server tool networking defaults to enabled, using the existing experimental
+gateway policy below. `--network disabled` or an operational
+`defaults.tools.network_access: false` overlay starts the gateway with
+`--network none`. Workloads still share that isolated namespace; local
+`gateway.test` DNS and firewall readiness do not need external connectivity.
+The worker protocol stays at v2 and carries file budgets only, not network
+authority. Existing compatible gateway/worker images need no rebuild for this
+switch. No host network, published ports, or host proxy/credential inheritance
+is added. This does not disable the host's provider requests.
+
+An opt-in check uses a cached immutable gateway image without pulling/building
+or sending public traffic:
+
+```sh
+NEXUS_TEST_GATEWAY_IMAGE=sha256:<cached-gateway-image-id> \
+  cargo nextest run -p nexus-container offline_gateway_and_shared_namespace \
+  --run-ignored all --locked --offline
+```
+
+It checks offline readiness, the Docker `none` mode, absence of external IPv4
+and default IPv6 routes, only loopback being up, and local DNS from a separate
+capability-free container sharing the namespace. This passed on Docker Desktop;
+it is not proof of native Linux isolation or of every outbound denial case.
+
+## Online gateway prototype
+
 This directory contains gateway and workload image prototypes plus opt-in
 gateway checks. Container execution is selectable only in container-enabled
 TUI/server builds with explicit startup options; it remains an unvalidated
