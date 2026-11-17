@@ -107,6 +107,10 @@ first saved user item. History rendering is bounded; filesystem effects and old
 approval grants are never replayed. The provider/model/project binding is kept
 in browser storage because the session checkpoint format does not carry Web
 bindings; a different browser must select valid bindings before restoring.
+An idle runtime opened with different provider/model/project settings is replaced
+under the same saved identity, so the requested bindings take effect without a
+server restart; stored history is reloaded and no tool is replayed. A live run or
+attached event stream still refuses the change until it is idle.
 Without `--session-store`, the list reports persistence as disabled.
 
 The bearer token is entered in Settings and saved in same-origin `localStorage`

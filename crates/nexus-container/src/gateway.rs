@@ -513,6 +513,18 @@ impl ContainerEnvironment {
         image: &str,
         blocked_cidrs: &[String],
     ) -> Result<Self, ContainerError> {
+        Self::prepare_with_network(workspace, docker, image, blocked_cidrs, true)
+    }
+
+    /// Offline gateways have no external interface. The existing image's local
+    /// DNS/firewall readiness probe works without contacting an upstream.
+    pub fn prepare_with_network(
+        workspace: &Path,
+        docker: &Path,
+        image: &str,
+        blocked_cidrs: &[String],
+        network_access: bool,
+    ) -> Result<Self, ContainerError> {
         if !workspace.is_absolute() {
             return Err(ContainerError::InvalidWorkspace);
         }
@@ -600,13 +612,13 @@ impl ContainerEnvironment {
                 "--env",
                 &format!("GATEWAY_BLOCKED_IPV4_CIDRS={cidrs}"),
                 "--env",
-                if docker_desktop_proxy {
+                if network_access && docker_desktop_proxy {
                     "GATEWAY_DOCKER_DESKTOP_PROXY=1"
                 } else {
                     "GATEWAY_DOCKER_DESKTOP_PROXY=0"
                 },
                 "--network",
-                "bridge",
+                if network_access { "bridge" } else { "none" },
                 "--cap-drop",
                 "ALL",
                 "--cap-add",
@@ -1041,6 +1053,45 @@ pub(crate) fn run_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires local Docker and NEXUS_TEST_GATEWAY_IMAGE pointing to a cached immutable gateway image"]
+    fn offline_gateway_and_shared_namespace_have_no_external_routes() {
+        let image = std::env::var("NEXUS_TEST_GATEWAY_IMAGE")
+            .expect("explicit cached gateway image required");
+        let docker = crate::workload::resolve_docker_executable().expect("local Docker required");
+        let workspace =
+            std::env::temp_dir().join(format!("nexus-offline-gateway-test-{}", std::process::id()));
+        std::fs::create_dir(&workspace).unwrap();
+        let gateway = ContainerEnvironment::prepare_with_network(
+            &workspace,
+            &docker,
+            &image,
+            &["127.0.0.0/8".into()],
+            false,
+        )
+        .expect("offline gateway must pass local DNS/firewall readiness");
+        let id = gateway.container_id().unwrap();
+        let mode = run_bounded(
+            gateway.base(),
+            &["inspect", "--format", "{{.HostConfig.NetworkMode}}", id],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(mode).unwrap().trim(), "none");
+        // Test the workload's namespace-sharing path with a capability-free
+        // process, not just the gateway's create arguments. No public traffic,
+        // workspace mount, image build, or pull is needed.
+        let output = run_bounded(gateway.base(), &[
+            "run", "--rm", "--pull=never", "--network", &format!("container:{id}"),
+            "--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--read-only",
+            "--entrypoint", "sh", &image, "-ec",
+            "test -z \"$(ip -4 route)\"; test -z \"$(ip -6 route show default)\"; test \"$(ip -o link show up | wc -l)\" -eq 1; ip -o link show up | grep -q ' lo:'; nslookup gateway.test 127.0.0.1 >/dev/null; echo offline-ok",
+        ], Duration::from_secs(20)).expect("shared namespace must be offline and local DNS must remain healthy");
+        assert!(String::from_utf8(output).unwrap().contains("offline-ok"));
+        gateway.close().expect("owned gateway cleanup");
+        std::fs::remove_dir(workspace).unwrap();
+    }
 
     #[test]
     fn lifecycle_timeouts_cover_slow_docker_desktop_mutations_without_being_unbounded() {

@@ -222,7 +222,15 @@ impl serde::Serialize for RequestEnvelope<'_> {
         state.serialize_field("operation", self.operation)?;
         state.serialize_field("arguments", self.arguments)?;
         state.serialize_field("output_limit", &self.output_limit)?;
-        state.serialize_field("tools", self.tools)?;
+        // Network policy belongs to the host-owned gateway, not this file-only
+        // worker protocol. Keep v2 budgets compatible with existing images.
+        state.serialize_field(
+            "tools",
+            &serde_json::json!({
+                "list_entry_limit": self.tools.list_entry_limit,
+                "search_file_bytes": self.tools.search_file_bytes,
+            }),
+        )?;
         state.end()
     }
 }
@@ -333,6 +341,7 @@ mod tests {
     #[test]
     fn reduced_settings_are_retained_and_sent_for_every_operation() {
         let mut settings = ToolsSettings {
+            network_access: false,
             list_entry_limit: 2,
             search_file_bytes: 7,
         };
@@ -369,6 +378,7 @@ mod tests {
             assert_eq!(
                 request.tools,
                 ToolsSettings {
+                    network_access: true,
                     list_entry_limit: 2,
                     search_file_bytes: 7
                 }
@@ -381,18 +391,22 @@ mod tests {
     fn invalid_settings_are_rejected_before_dispatch() {
         for settings in [
             ToolsSettings {
+                network_access: true,
                 list_entry_limit: 0,
                 search_file_bytes: 1,
             },
             ToolsSettings {
+                network_access: true,
                 list_entry_limit: 10001,
                 search_file_bytes: 1,
             },
             ToolsSettings {
+                network_access: true,
                 list_entry_limit: 1,
                 search_file_bytes: 0,
             },
             ToolsSettings {
+                network_access: true,
                 list_entry_limit: 1,
                 search_file_bytes: 1048577,
             },
@@ -430,7 +444,7 @@ mod tests {
         let decoded: Value = serde_json::from_slice(&client.transport.request).unwrap();
         assert_eq!(
             decoded,
-            json!({"version":PROTOCOL_VERSION,"operation":"host_write","arguments":{"path":"a","content":"x"},"output_limit":12,"tools":ToolsSettings::default()})
+            json!({"version":PROTOCOL_VERSION,"operation":"host_write","arguments":{"path":"a","content":"x"},"output_limit":12,"tools":{"list_entry_limit":10000,"search_file_bytes":1048576}})
         );
         for (op, args) in [
             ("host_read", json!({"path":"a"})),

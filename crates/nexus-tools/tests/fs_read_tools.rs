@@ -243,6 +243,7 @@ fn configured_factories_apply_both_limits_and_defaults_preserve_old_caps() {
     let settings = ToolsSettings {
         list_entry_limit: 1,
         search_file_bytes: 8,
+        ..ToolsSettings::default()
     };
     for tools in [
         nexus_tools::strict_tools_with_settings(&root.0, &settings).unwrap(),

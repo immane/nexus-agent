@@ -215,6 +215,7 @@ impl Command {
 pub struct CommandResponse {
     request: RequestId,
     reply: CommandReply,
+    error: Option<AgentError>,
     run: Option<RunId>,
     sessions: Vec<crate::SessionMetadata>,
     has_sessions: bool,
@@ -230,6 +231,7 @@ impl CommandResponse {
         Self {
             request,
             reply,
+            error: None,
             run,
             sessions: Vec::new(),
             has_sessions: false,
@@ -237,6 +239,19 @@ impl CommandResponse {
             restored_history: Vec::new(),
             restored_omitted_items: 0,
         }
+    }
+
+    /// Attaches a safe diagnostic explaining a command refusal.
+    #[must_use]
+    pub fn with_error(mut self, error: AgentError) -> Self {
+        self.error = Some(error);
+        self
+    }
+
+    /// Returns a diagnostic when the command could not be accepted.
+    #[must_use]
+    pub fn error(&self) -> Option<&AgentError> {
+        self.error.as_ref()
     }
 
     /// Attaches bounded metadata returned by an explicit session listing.
@@ -1246,6 +1261,7 @@ mod cov_commands_private {
         let response = CommandResponse {
             request: RequestId::new("req-1").expect("valid"),
             reply: CommandReply::Accepted,
+            error: None,
             run: None,
             sessions: Vec::new(),
             has_sessions: false,
@@ -1255,6 +1271,24 @@ mod cov_commands_private {
         };
         assert_eq!(response.request().as_str(), "req-1");
         assert_eq!(response.reply(), CommandReply::Accepted);
+        assert!(response.run().is_none());
+        assert!(response.error().is_none());
+    }
+
+    #[test]
+    fn command_refusal_retains_safe_diagnostic_and_correlation() {
+        let request = RequestId::new("req-storage").unwrap();
+        let error = AgentError::new(
+            ErrorCategory::StorageFailure,
+            "session store requires reopening",
+            RetryGuidance::DoNotRetry,
+        )
+        .unwrap();
+        let response = CommandResponse::new(request.clone(), CommandReply::Rejected, None)
+            .with_error(error.clone());
+        assert_eq!(response.request(), &request);
+        assert_eq!(response.reply(), CommandReply::Rejected);
+        assert_eq!(response.error(), Some(&error));
         assert!(response.run().is_none());
     }
 }

@@ -21,6 +21,25 @@ const DRAIN_QUANTUM: usize = 64 * 1024;
 const MAX_PROBE_OWNERS: usize = 4;
 static PROBE_OWNERS: AtomicUsize = AtomicUsize::new(0);
 const EXEC_SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1}},"required":["argv"],"additionalProperties":false}"#;
+const DEVELOPMENT_EXEC_SCHEMA: &str = r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"write_dir":{"type":"string","minLength":1}},"required":["argv"],"additionalProperties":false}"#;
+
+fn exec_spec(development: bool, network_access: bool) -> ToolSpec {
+    let network = if network_access {
+        "enabled with host reachability"
+    } else {
+        "disabled"
+    };
+    let permissions = if development {
+        "Project and temporary writes are automatic; declare write_dir for an approved external directory. Other files are broadly readable except protected paths."
+    } else {
+        "Project read/write. Requires approval."
+    };
+    ToolSpec::new(
+        ToolId::new(HOST_EXEC_TOOL, M0_REVISION).expect("static tool id"),
+        format!("Run argv without a shell in a mandatory OS filesystem sandbox. Network {network}. {permissions}"),
+        if development { DEVELOPMENT_EXEC_SCHEMA } else { EXEC_SCHEMA },
+    ).expect("static exec description")
+}
 
 /// Sandboxed executor used by the real-tools composition roots.
 pub struct SandboxedExecutor {
@@ -30,6 +49,7 @@ pub struct SandboxedExecutor {
     spec: ToolSpec,
     development: Option<nexus_permissions::DirectoryPolicy>,
     path: std::ffi::OsString,
+    network_access: bool,
 }
 
 #[derive(Clone)]
@@ -72,18 +92,14 @@ impl SandboxedExecutor {
             return Err(error(ErrorCategory::InvalidInput, "exec root is invalid"));
         }
         let backend = find_backend();
-        let spec = ToolSpec::new(
-            ToolId::new(HOST_EXEC_TOOL, M0_REVISION).expect("static tool id"),
-            "Run argv without a shell inside a mandatory OS sandbox (project read/write, no network). Requires approval.",
-            EXEC_SCHEMA,
-        )
-        .map_err(|_| error(ErrorCategory::Internal, "exec description is invalid"))?;
+        let spec = exec_spec(false, true);
         Ok(Self {
             root,
             backend,
             probe: OnceLock::new(),
             spec,
             development: None,
+            network_access: true,
             path: "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
         })
     }
@@ -97,11 +113,16 @@ impl SandboxedExecutor {
                 .map_err(|_| error(ErrorCategory::InvalidInput, "permissions root is invalid"))?,
         );
         executor.path = std::env::var_os("PATH").unwrap_or_else(|| executor.path.clone());
-        executor.spec = ToolSpec::new(ToolId::new(HOST_EXEC_TOOL, M0_REVISION).expect("static tool id"),
-            "Run argv in the development OS sandbox, no shell or network. Project and temporary writes are automatic; declare write_dir to request an external writable directory. Other files are broadly readable except protected paths.",
-            r#"{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"write_dir":{"type":"string","minLength":1}},"required":["argv"],"additionalProperties":false}"#)
-            .map_err(|_| error(ErrorCategory::Internal, "exec description is invalid"))?;
+        executor.spec = exec_spec(true, true);
         Ok(executor)
+    }
+
+    /// Binds the operator's network policy before the first sandbox probe.
+    pub fn with_network_access(mut self, enabled: bool) -> Self {
+        self.network_access = enabled;
+        self.probe = OnceLock::new();
+        self.spec = exec_spec(self.development.is_some(), enabled);
+        self
     }
 
     // Verify only the selected profile. No fallback to another mode or to
@@ -412,10 +433,16 @@ impl SandboxedExecutor {
         match &self.backend {
             #[cfg(target_os = "macos")]
             Backend::MacOs(sandbox) => {
-                let profile = self.development.as_ref().map_or_else(
+                let mut profile = self.development.as_ref().map_or_else(
                     || mac_profile(&self.root),
                     |policy| mac_development_profile(policy, write_dir),
                 );
+                if self.network_access {
+                    // DNS uses the system resolver service; filesystem authority
+                    // remains defined by the selected profile above.
+                    profile.push_str("(allow network-outbound)\n(allow system-socket)\n");
+                    profile.push_str("(allow file-read* (subpath \"/private/etc/ssl\"))\n(allow file-read* (literal \"/private/etc/hosts\") (literal \"/private/etc/resolv.conf\") (literal \"/private/var/run/resolv.conf\") (literal \"/private/etc/services\") (literal \"/private/etc/protocols\") (literal \"/private/var/select/sh\"))\n");
+                }
                 let mut command = Command::new(sandbox);
                 command.arg("-p").arg(profile).arg("--").args(argv);
                 command
@@ -435,10 +462,22 @@ impl SandboxedExecutor {
                     "--dev",
                     "/dev",
                 ]);
+                if self.network_access {
+                    command.arg("--share-net");
+                }
                 for path in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
                     if self.development.is_none() && Path::new(path).exists() {
                         command.args(["--ro-bind", path, path]);
                     }
+                }
+                if self.network_access
+                    && self.development.is_none()
+                    && let Ok(resolver) = std::fs::canonicalize("/etc/resolv.conf")
+                    && !resolver.starts_with("/etc")
+                {
+                    // systemd commonly symlinks resolv.conf into /run. Expose
+                    // only that resolver file, not all runtime state/sockets.
+                    command.arg("--ro-bind").arg(&resolver).arg(&resolver);
                 }
                 if let Some(policy) = &self.development {
                     for path in policy
@@ -838,6 +877,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_selection_only_changes_network_namespace_sharing() {
+        let root = std::env::temp_dir().join(format!("nexus-network-args-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        for enabled in [false, true] {
+            let mut executor = SandboxedExecutor::with_root(&root)
+                .unwrap()
+                .with_network_access(enabled);
+            // Command construction can be tested without a provisioned bwrap.
+            executor.backend = super::Backend::Linux("/usr/bin/bwrap".into());
+            let command = executor.command(&["/usr/bin/true"], None);
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            for required in [
+                "--unshare-all",
+                "--new-session",
+                "--die-with-parent",
+                "--proc",
+                "--dev",
+                "--bind",
+            ] {
+                assert!(args.iter().any(|arg| arg == required));
+            }
+            assert_eq!(
+                args.iter().filter(|arg| *arg == "--share-net").count(),
+                usize::from(enabled)
+            );
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn executor_construction_defers_sandbox_probe() {

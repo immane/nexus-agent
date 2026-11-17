@@ -804,7 +804,7 @@ pub fn tool_registrations(
     )
 }
 
-/// Prepares container tools with validated, per-request file-tool budgets.
+/// Prepares container tools with file-tool budgets and a session gateway network policy.
 /// Protocol v2 requires rebuilt worker images; older workers fail closed.
 pub fn tool_registrations_with_settings(
     workspace: &Path,
@@ -819,12 +819,19 @@ pub fn tool_registrations_with_settings(
     crate::gateway::validate_image_reference(workload_image)?;
     let docker = resolve_docker_executable()
         .ok_or(crate::gateway::ContainerError::InvalidDockerExecutable)?;
-    let blocked_cidrs = crate::gateway::discover_host_ipv4_cidrs()?;
-    let gateway = crate::gateway::ContainerEnvironment::prepare(
+    let blocked_cidrs = if settings.network_access {
+        crate::gateway::discover_host_ipv4_cidrs()?
+    } else {
+        // No external interface exists in offline mode. Keep the gateway's
+        // mandatory CIDR input and local-only readiness policy valid.
+        vec!["127.0.0.0/8".to_owned()]
+    };
+    let gateway = crate::gateway::ContainerEnvironment::prepare_with_network(
         workspace,
         &docker,
         gateway_image,
         &blocked_cidrs,
+        settings.network_access,
     )?;
     let nonce = gateway
         .identity()
@@ -972,7 +979,9 @@ impl ContainerWorkloadSession {
                 .expect("settings validated before workload preparation"),
             Some(poison_handler),
         );
-        let exec = files.exec_adapter();
+        let exec = files
+            .exec_adapter()
+            .with_network_access(settings.network_access);
         Ok(Self {
             workload,
             resources,
@@ -1200,18 +1209,22 @@ mod tests {
     fn rejects_invalid_settings_before_images_or_docker_preparation() {
         for settings in [
             nexus_config::ToolsSettings {
+                network_access: true,
                 list_entry_limit: 0,
                 search_file_bytes: 1,
             },
             nexus_config::ToolsSettings {
+                network_access: true,
                 list_entry_limit: 1,
                 search_file_bytes: 0,
             },
             nexus_config::ToolsSettings {
+                network_access: true,
                 list_entry_limit: 10001,
                 search_file_bytes: 1,
             },
             nexus_config::ToolsSettings {
+                network_access: true,
                 list_entry_limit: 1,
                 search_file_bytes: 1048577,
             },

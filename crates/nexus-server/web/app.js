@@ -878,12 +878,14 @@ function renderProjectsList() {
   dom.addProject.disabled = !enabled;
   if (!enabled) {
     dom.projectsNote.textContent = state.projects?.mode === 'container'
-      ? 'Container tools are active. Per-project roots are not available in container mode.'
+      ? `Container tools are active. Tool network ${state.projects.network_access === false ? 'disabled' : state.projects.network_access === true ? 'enabled (experimental public-egress gateway)' : 'not reported'}. Per-project roots are not available in container mode.`
       : 'Real tools are not enabled. Start nexus-server with --tools real --tools-root PATH to bind projects.';
     dom.projectStatus.textContent = '';
     return;
   }
-  dom.projectsNote.textContent = `${configModeLabel(state.projects.mode)} · sessions use the selected root for project/temp tools.`;
+  const network = state.projects.network_access === false ? 'disabled'
+    : state.projects.network_access === true ? 'enabled (host reachability)' : 'not reported';
+  dom.projectsNote.textContent = `${configModeLabel(state.projects.mode)} · tool network ${network} · sessions use the selected root for project/temp tools.`;
   const addItem = (project, removable) => {
     const item = node('div', 'config-item');
     const text = node('div', 'config-item-text');

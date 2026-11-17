@@ -57,6 +57,23 @@ impl ContainerExecTool<DockerExecTransport> {
 }
 
 impl<T: ExecTransport> ContainerExecTool<T> {
+    pub(crate) fn with_network_access(mut self, enabled: bool) -> Self {
+        self.spec = ToolSpec::new(
+            ToolId::new(TOOL, REVISION).expect("static tool id"),
+            format!(
+                "{DESCRIPTION} Network {}.",
+                if enabled {
+                    "enabled through the experimental public-egress gateway"
+                } else {
+                    "disabled (isolated gateway namespace)"
+                }
+            ),
+            SCHEMA,
+        )
+        .expect("static tool spec");
+        self
+    }
+
     fn with_transport(transport: T) -> Self {
         Self {
             session: Arc::new(ContainerSession::new(transport)),

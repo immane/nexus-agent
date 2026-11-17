@@ -70,8 +70,12 @@ jobs:
       # Optional low-value targets are not even built by default locally.
       # CI also exercises ignored redundancy checks so they cannot rot.
       # Run the full suite once, rather than repeating the behavioral suite.
+      # The Docker isolation check requires an explicitly provisioned cached
+      # gateway image and daemon; keep it opt-in on both hosted platforms.
       - name: Tests (complete suite)
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast --run-ignored all
+        run: >-
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --run-ignored all
+          -E 'not (package(=nexus-container) and test(=gateway::tests::offline_gateway_and_shared_namespace_have_no_external_routes))'
 
       - name: Benchmark tooling tests (offline)
         run: python3 -B -m unittest discover -s tools/benchmarks -p 'test_*.py'

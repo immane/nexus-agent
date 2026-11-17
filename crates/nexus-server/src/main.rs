@@ -41,7 +41,7 @@ const MAX_CONNECTIONS: usize = 64;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: nexus-server [--port N] [--config PATH] [--base-config PATH] [--config-overlay PATH ...] [--check-config|--print-effective-config] [--session-store DIRECTORY] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
+        "usage: nexus-server [--port N] [--config PATH] [--base-config PATH] [--config-overlay PATH ...] [--check-config|--print-effective-config] [--session-store DIRECTORY] [--tools fake|real] [--tools-root PATH] [--strict-tools] [--network enabled|disabled] [--execution local|container] [--gateway-image IMAGE@sha256:DIGEST] [--container-image IMAGE@sha256:DIGEST] [--benchmark-pilot] [--auth-token-env NAME] [--help]"
     );
     eprintln!("  Serves the M0 test-only demo API on 127.0.0.1:N (default {DEFAULT_PORT}).");
     eprintln!("  --config overrides NEXUS_CONFIG and the platform config path.");
@@ -82,6 +82,7 @@ enum CliAction {
     /// Serve on this loopback port with this optional explicit config path
     /// and tool wiring.
     Run {
+        network_access: Option<bool>,
         port: Option<u16>,
         config: Option<String>,
         tools: Option<nexus_config::ServerToolsMode>,
@@ -109,6 +110,7 @@ enum ExecutionMode {
 }
 
 fn parse_args(argv: &[String]) -> CliAction {
+    let mut network_access = None;
     let mut port = None;
     let mut config: Option<String> = None;
     let mut tools = None;
@@ -129,6 +131,16 @@ fn parse_args(argv: &[String]) -> CliAction {
         match arg.as_str() {
             "--help" | "-h" => return CliAction::Usage,
             "--strict-tools" => strict_tools = true,
+            "--network" => {
+                if network_access.is_some() {
+                    return CliAction::Usage;
+                }
+                network_access = match args.next().map(String::as_str) {
+                    Some("enabled") => Some(true),
+                    Some("disabled") => Some(false),
+                    _ => return CliAction::Usage,
+                };
+            }
             "--session-store" => {
                 if session_store.is_some() {
                     return CliAction::Usage;
@@ -221,6 +233,7 @@ fn parse_args(argv: &[String]) -> CliAction {
         }
     }
     CliAction::Run {
+        network_access,
         port,
         config,
         tools,
@@ -335,6 +348,7 @@ fn load_user_config(explicit: Option<&str>) -> (UserConfig, Option<PathBuf>) {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let (
+        network_access,
         port,
         explicit_config,
         tools,
@@ -352,6 +366,7 @@ fn main() {
         print_effective_config,
     ) = match parse_args(&argv) {
         CliAction::Run {
+            network_access,
             port,
             config,
             tools,
@@ -368,6 +383,7 @@ fn main() {
             check_config,
             print_effective_config,
         } => (
+            network_access,
             port,
             config,
             tools,
@@ -392,12 +408,13 @@ fn main() {
     } else {
         nexus_config::SettingsProfile::Server
     };
-    let settings =
+    let mut settings =
         nexus_config::load_settings(settings_profile, base_config.as_deref(), &config_overlays)
             .unwrap_or_else(|error| {
                 eprintln!("nexus-server: invalid operational settings ({error})");
                 std::process::exit(2);
             });
+    settings.override_tool_network(network_access);
     if check_config {
         println!("Configuration is valid.");
         std::process::exit(0);
@@ -570,6 +587,14 @@ fn main() {
         format!("{configured} configured provider(s) available for bound sessions")
     };
     if tools_real {
+        eprintln!(
+            "nexus-server: tool network {} ({execution:?}; filesystem and approvals unchanged)",
+            if settings.tools().network_access {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         // Fail fast on an unreadable jail: a missing default working
         // directory and an explicit bad root are both startup errors.
         let root = tools_root.unwrap_or_else(|| ".".to_owned());
@@ -712,6 +737,33 @@ mod cov_main_args {
         parse_args, resolve_launch_options, valid_startup_selection,
     };
     use nexus_core::Limits;
+
+    #[test]
+    fn tool_network_flag_defaults_and_validation() {
+        let argv = |args: &[&str]| {
+            std::iter::once("nexus-server")
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for (flags, expected) in [
+            (vec![], None),
+            (vec!["--network", "enabled"], Some(true)),
+            (vec!["--network", "disabled", "--strict-tools"], Some(false)),
+        ] {
+            let CliAction::Run { network_access, .. } = parse_args(&argv(&flags)) else {
+                panic!("valid network flag");
+            };
+            assert_eq!(network_access, expected);
+        }
+        for flags in [
+            vec!["--network"],
+            vec!["--network", "false"],
+            vec!["--network", "enabled", "--network", "disabled"],
+        ] {
+            assert!(matches!(parse_args(&argv(&flags)), CliAction::Usage));
+        }
+    }
 
     #[test]
     fn connection_admission_stops_at_the_hard_cap_and_reopens_on_release() {

@@ -56,6 +56,362 @@ fn context_with_scope(scope: &str) -> ToolContext {
     .unwrap()
 }
 
+fn read_fixture_headers(reader: &mut impl std::io::Read) -> std::io::Result<()> {
+    let mut headers = [0; 4096];
+    let mut used = 0;
+    while used < headers.len() {
+        let count = reader.read(&mut headers[used..])?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        used += count;
+        if headers[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            return Ok(());
+        }
+    }
+    Err(std::io::ErrorKind::InvalidData.into())
+}
+
+#[test]
+fn loopback_fixture_waits_for_a_request_that_arrives_after_accept() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = std::thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                // BSD/macOS inherits the listener's nonblocking flag into the
+                // accepted socket; a timed read must be blocking first.
+                Ok((mut socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    read_fixture_headers(&mut socket).unwrap();
+                    socket.write_all(b"ok").unwrap();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        }
+    });
+    let mut control = std::net::TcpStream::connect(address).unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    control
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    control.read_to_string(&mut response).unwrap();
+    assert_eq!(response, "ok");
+    worker.join().unwrap();
+}
+
+#[test]
+fn loopback_fixture_reads_fragmented_headers_and_rejects_incomplete_or_oversized_requests() {
+    use std::io::{Cursor, Read};
+    let first = Cursor::new(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r");
+    let last = Cursor::new(b"\n");
+    read_fixture_headers(&mut first.chain(last)).unwrap();
+    assert_eq!(
+        read_fixture_headers(&mut Cursor::new(b"GET / HTTP/1.1\r\n"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        read_fixture_headers(&mut Cursor::new([b'x'; 4097]))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
+/// A bounded loopback fixture proves success and denial against the same live
+/// service, without touching external DNS, proxies, or a public endpoint.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires an explicitly provisioned Linux sandbox and curl"
+)]
+fn network_policy_reaches_live_service_only_when_enabled() {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use std::time::Instant;
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        let listener = match std::net::TcpListener::bind(bind) {
+            Ok(listener) => listener,
+            Err(error)
+                if bind.starts_with('[')
+                    && error.kind() == std::io::ErrorKind::AddrNotAvailable =>
+            {
+                eprintln!("IPv6 loopback is unavailable; IPv4 checks still apply");
+                continue;
+            }
+            Err(error) => panic!("loopback fixture unavailable: {error}"),
+        };
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        // macOS inherits the listener's nonblocking flag. Reset
+                        // it before the timed read; otherwise WouldBlock closes
+                        // the socket while the client's request is still unread.
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        socket
+                            .set_write_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        // Drain the complete request before closing: unread TCP
+                        // bytes can turn the response's EOF into a reset.
+                        if read_fixture_headers(&mut socket).is_ok() {
+                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nnetwork-ok");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            }
+        });
+        // Control request demonstrates that the server is actually reachable.
+        let mut control = std::net::TcpStream::connect(address).unwrap();
+        control
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        control
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        control.read_to_string(&mut response).unwrap();
+        assert!(response.ends_with("network-ok"));
+        for development in [false, true] {
+            let root = TempRoot::new();
+            std::fs::write(root.0.join(".env"), "network-test-secret").unwrap();
+            for enabled in [false, true] {
+                let executor = if development {
+                    SandboxedExecutor::development(&root.0)
+                } else {
+                    SandboxedExecutor::with_root(&root.0)
+                }
+                .unwrap()
+                .with_network_access(enabled);
+                assert!(
+                    executor.sandbox_available(),
+                    "required sandbox must initialize"
+                );
+                if development {
+                    let protected = executor.execute(
+                        &call(r#"{"argv":["/bin/cat",".env"]}"#),
+                        &context_with_scope("exec:workspace"),
+                    );
+                    assert!(!protected.content().contains("network-test-secret"));
+                }
+                // Explicitly launching a shell here also checks that a child gets
+                // the same network policy; the tool does not insert this shell.
+                let destination = if address.is_ipv4() {
+                    format!("localhost:{}", address.port())
+                } else {
+                    address.to_string()
+                };
+                let command = format!(
+                    "/usr/bin/curl --noproxy '*' --max-time 1 --fail --silent http://{destination}/"
+                );
+                let outcome = executor.execute(
+                    &call(&serde_json::json!({"argv":["/bin/sh","-c",command]}).to_string()),
+                    &context_with_scope(if development {
+                        "exec:workspace"
+                    } else {
+                        "command:network-test"
+                    }),
+                );
+                if enabled {
+                    assert_eq!(
+                        outcome.status(),
+                        ExecutionStatus::Succeeded,
+                        "{}",
+                        outcome.content()
+                    );
+                    assert!(outcome.content().contains("network-ok"));
+                } else {
+                    assert_eq!(
+                        outcome.status(),
+                        ExecutionStatus::Failed,
+                        "{}",
+                        outcome.content()
+                    );
+                    assert!(!outcome.content().contains("network-ok"));
+                }
+            }
+        }
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn tool_network_is_an_operator_snapshot_not_a_model_argument() {
+    let root = TempRoot::new();
+    for tools in [
+        nexus_tools::strict_tools_with_settings(
+            &root.0,
+            &nexus_config::ToolsSettings {
+                network_access: false,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+        nexus_tools::development_tools_with_settings(
+            &root.0,
+            &nexus_config::ToolsSettings {
+                network_access: false,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    ] {
+        let spec = tools.last().unwrap().port().describe();
+        assert!(spec.description().contains("Network disabled"));
+    }
+    let executor = SandboxedExecutor::development(&root.0)
+        .unwrap()
+        .with_network_access(false);
+    let result = executor.execute(
+        &call(r#"{"argv":["/usr/bin/true"],"network_access":true}"#),
+        &context_with_scope("exec:workspace"),
+    );
+    assert_eq!(result.status(), ExecutionStatus::Failed);
+    let enabled = executor.with_network_access(true);
+    assert!(enabled.describe().description().contains("Network enabled"));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires an explicitly provisioned Linux sandbox and C compiler"
+)]
+fn network_policy_controls_udp_replies_as_well_as_tcp() {
+    use std::sync::{Arc, atomic::AtomicBool};
+    use std::time::Instant;
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let address = socket.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut bytes = [0; 64];
+        while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+            match socket.recv_from(&mut bytes) {
+                Ok((count, peer)) => {
+                    socket.send_to(&bytes[..count], peer).unwrap();
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => panic!("UDP fixture failed: {error}"),
+            }
+        }
+    });
+    let control = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    control.send_to(b"control", address).unwrap();
+    assert_eq!(control.recv(&mut [0; 64]).unwrap(), 7);
+    for development in [false, true] {
+        let root = TempRoot::new();
+        // A project-local native client avoids interpreter/toolchain-launcher
+        // reads outside strict-mode roots. Rust already requires a C linker.
+        let source = root.0.join("udp.c");
+        let client = root.0.join("udp-client");
+        std::fs::write(&source, r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct timeval timeout = {0, 500000};
+    if (s < 0 || setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) return 3;
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(atoi(argv[1]));
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(s, (struct sockaddr *)&peer, sizeof(peer)) || send(s, "udp-ok", 6, 0) != 6) return 4;
+    char response[64];
+    if (recv(s, response, sizeof(response), 0) != 6 || memcmp(response, "udp-ok", 6)) return 5;
+    close(s);
+    puts("udp-ok");
+    return 0;
+}
+"#).unwrap();
+        let compiled = std::process::Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&client)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let client = client.canonicalize().unwrap();
+        for enabled in [false, true] {
+            let executor = if development {
+                SandboxedExecutor::development(&root.0)
+            } else {
+                SandboxedExecutor::with_root(&root.0)
+            }
+            .unwrap()
+            .with_network_access(enabled);
+            let outcome = executor.execute(
+                &call(&serde_json::json!({"argv":[client.to_str().unwrap(),address.port().to_string()]}).to_string()),
+                &context_with_scope(if development { "exec:workspace" } else { "command:network-test" }),
+            );
+            if enabled {
+                assert_eq!(
+                    outcome.status(),
+                    ExecutionStatus::Succeeded,
+                    "{}",
+                    outcome.content()
+                );
+                assert!(outcome.content().contains("udp-ok"));
+            } else {
+                assert_eq!(outcome.status(), ExecutionStatus::Failed);
+                assert!(!outcome.content().contains("udp-ok"));
+            }
+        }
+    }
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap();
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn argv_runs_inside_the_configured_sandbox_root() {
@@ -136,7 +492,9 @@ fn linux_sandbox_confines_files_and_network() {
     let outside = TempRoot::new();
     let secret = outside.0.join("secret.txt");
     std::fs::write(&secret, "outside-secret").unwrap();
-    let executor = SandboxedExecutor::with_root(&root.0).unwrap();
+    let executor = SandboxedExecutor::with_root(&root.0)
+        .unwrap()
+        .with_network_access(false);
     assert!(
         executor.sandbox_available(),
         "Linux sandbox backend is required"
@@ -407,7 +765,9 @@ fn mac_sandbox_allows_project_writes_but_denies_other_project_reads_and_writes()
 #[test]
 fn mac_sandbox_denies_network_access() {
     let root = TempRoot::new();
-    let executor = SandboxedExecutor::with_root(&root.0).unwrap();
+    let executor = SandboxedExecutor::with_root(&root.0)
+        .unwrap()
+        .with_network_access(false);
     assert!(executor.sandbox_available());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -427,7 +787,9 @@ fn mac_sandbox_denies_network_access() {
 fn development_python_runs_with_stdlib_temp_files_and_protected_credentials() {
     let root = TempRoot::new();
     std::fs::write(root.0.join(".env"), "sandbox-secret").unwrap();
-    let executor = SandboxedExecutor::development(&root.0).unwrap();
+    let executor = SandboxedExecutor::development(&root.0)
+        .unwrap()
+        .with_network_access(false);
     assert!(executor.sandbox_available());
     let mut interpreters = 0;
     for python in ["python3", "python"] {

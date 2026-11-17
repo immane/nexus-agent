@@ -458,8 +458,12 @@ API relay is separate from tool plugins: a relay is a provider implementation be
 
 The coding distribution provides scoped reads, listing, and search, full-file
 writes, exact-text patches, and command execution. The local backend accepts
-`argv` without an implicit shell and denies network access through
-`sandbox-exec` on macOS or `bwrap` on Linux. Container-backed `host_exec` accepts
+`argv` without an implicit shell and retains its mandatory filesystem sandbox
+through `sandbox-exec` on macOS or `bwrap` on Linux. **Tool networking is enabled
+by default**, independently of filesystem permissions and execution approvals;
+use `--network disabled` to preserve offline tool execution. Local online tools
+can reach host/LAN/metadata services according to host routing; on Linux they
+can also bind host-network listeners. Container-backed `host_exec` accepts
 either `argv` or an explicit `shell_command` (Bash); its network policy belongs
 to the selected container environment. In local development mode project/temp
 operations are automatic and external paths are approval-gated; `--strict-tools`
@@ -467,6 +471,12 @@ restores per-call confirmation for every mutation and execution. Container mode
 uses its separate workspace-scoped policy. Workflow, context selection, storage,
 and frontend replacement retain explicit boundaries without allowing arbitrary
 mutation of runtime internals.
+
+Container online tools retain the experimental public-egress gateway policy;
+offline sessions use an isolated gateway namespace without external routes.
+The switch does not disable provider requests or expose the loopback Web server.
+No host credentials or proxy environment variables are automatically forwarded.
+See [tool networking](QUICKSTART.md#tool-network-access) for migration and limits.
 
 **An extensible core does not make every enabled plugin free.** Optional integrations should initialize on demand; heavy dependencies should remain outside the minimal build. Native dynamic-library loading, WASM runtimes, and arbitrary lifecycle hooks are not initial-core goals.
 

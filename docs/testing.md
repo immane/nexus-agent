@@ -2,6 +2,16 @@
 
 ## Normal workflow
 
+Tool-network regression tests cover configuration inheritance/CLI overrides and
+macOS sandboxed TCP/UDP loopback connectivity/denial in strict and development
+modes, including a spawned child and IPv6 TCP when available. The UDP test uses
+`cc` to build a project-local client. They use a reachable local control service,
+not public endpoints. Linux sandbox variants remain ignored
+until explicitly provisioned; run `network_policy_reaches_live_service` with
+`--run-ignored all` on such a host. The container offline namespace/readiness
+check is also opt-in: see [container network checks](../containers/README.md#tool-network-selection).
+The `--network disabled` flag disables tool networking, not provider requests.
+
 Release packaging has offline stdlib-only regression tests:
 `python3 scripts/test-release.py`. These cover archive determinism, checksums,
 installation, tampering and symlink rejection without compiling Rust. An actual
@@ -13,6 +23,13 @@ Run checks for the affected packages, **sequentially**. Concurrent Cargo builds,
 tests, and clippy commands share the target directory lock and do not accelerate
 validation. Avoid checking the same code immediately before clippy (which already
 checks it).
+
+Cancellation/storage regressions in `nexus-runtime` cover completed writes after
+cancellation or deadline expiry, saved tool outcomes followed by another run in
+the same session without replay, and blocked writers that remain protected even
+after late completion. Server tests assert storage refusals return HTTP 503 with
+an explicit diagnostic and mint no run. These tests use local stores and gated
+workers, not live providers.
 
 Small-context runtime regressions include metadata-only budget diagnostics for
 pre-reduction, protected-floor, summary-candidate, retained-view, and final
@@ -172,7 +189,17 @@ Run the low-value and ignored checks explicitly:
 cargo nextest run --workspace --all-features --locked --offline --run-ignored all
 ```
 
-CI runs the complete suite once, including default behavior tests. Routine local
+CI runs the complete suite once, including default behavior tests, with one
+explicit exception: `nexus-container`'s
+`gateway::tests::offline_gateway_and_shared_namespace_have_no_external_routes`
+requires a Docker daemon and an explicitly selected cached gateway image
+(`NEXUS_TEST_GATEWAY_IMAGE`). The hosted jobs do not provision them, so their
+filter excludes only this test; all other ignored checks still run. Run the
+[container network check](../containers/README.md#tool-network-selection)
+separately on a provisioned host. The unfiltered command above includes it and
+fails if its required image is not configured.
+
+Routine local
 validation does not enable `low-value-tests` or run ignored checks. Compile the
 optional target when changing the test-only keymap or doing a complete review.
 
