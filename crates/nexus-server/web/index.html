@@ -35,16 +35,16 @@
   </aside>
   <div class="shell">
     <header class="topbar">
-      <div class="crumb"><span class="muted">Workspace</span><span class="separator">/</span><strong id="conversation-title">New conversation</strong></div>
+      <nav class="crumb" aria-label="Current session"><span class="muted">Workspace</span><span class="separator">/</span><span class="project-crumb" id="project-badge">No project</span><span class="separator">/</span><strong id="conversation-title">New conversation</strong></nav>
       <div class="toolbar">
-        <span class="project-badge" id="project-badge" hidden></span>
         <span class="model-badge" id="model-badge" hidden></span>
         <span class="status" id="connection-status" role="status">Not connected</span>
         <button class="icon-button" id="new-session-mobile" type="button" aria-label="New session" disabled>＋</button>
-        <button id="open-settings" type="button">Settings</button>
+        <button class="settings-button" id="open-settings" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 3-1 3-3 1-2 3 2 2-1 3 2 3 3-1 3 2 3-2 3 1 2-3-1-3 2-2-2-3-3-1-1-3Z"/><circle cx="12" cy="11" r="3"/></svg><span>Settings</span></button>
       </div>
     </header>
     <main id="main" tabindex="-1">
+      <div class="session-loading" id="session-loading" role="status" hidden><span class="loading-spinner" aria-hidden="true"></span><span>Loading session…</span></div>
       <section class="welcome" id="welcome" aria-labelledby="welcome-title">
         <span class="eyebrow">A SMALL CORE. AN OPEN WORKSPACE.</span>
         <h1 id="welcome-title">Space to build.</h1>
@@ -84,7 +84,6 @@
           </div>
         </div>
       </form>
-      <p class="footnote">Saved sessions restore their transcript; active runs are not resumed after reload.</p>
     </section>
   </div>
   <dialog id="settings" aria-labelledby="settings-title">
@@ -106,15 +105,22 @@
     <section class="settings-panel" id="appearance-panel" aria-labelledby="appearance-title">
     <h3 id="appearance-title">Appearance</h3>
     <p class="muted">Appearance and your server connection are remembered in this browser.</p>
-    <label for="theme">Color palette</label>
-    <select id="theme">
-      <option value="system">System</option>
-      <option value="graphite">Graphite · dark</option>
-      <option value="paper">Paper · light</option>
-      <option value="forest">Forest · dark</option>
-      <option value="sand">Sand · light</option>
-    </select>
-    <div class="palette" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    <fieldset class="theme-picker" id="theme" aria-describedby="theme-hint">
+      <legend>Color palette</legend>
+      <p class="hint" id="theme-hint">Choose a look. Changes apply immediately; use arrow keys to browse.</p>
+      <div class="theme-grid">
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="system" checked><span class="theme-preview" data-theme="system" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">System <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Follow your device</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="graphite"><span class="theme-preview" data-theme="graphite" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Graphite <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · neutral</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="midnight"><span class="theme-preview" data-theme="midnight" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Midnight <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · blue</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="forest"><span class="theme-preview" data-theme="forest" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Forest <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · green</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="ocean"><span class="theme-preview" data-theme="ocean" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Ocean <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · teal</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="amethyst"><span class="theme-preview" data-theme="amethyst" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Amethyst <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · violet</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="paper"><span class="theme-preview" data-theme="paper" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Paper <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · neutral</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="sand"><span class="theme-preview" data-theme="sand" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Sand <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · warm</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="blossom"><span class="theme-preview" data-theme="blossom" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Blossom <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · rose</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="lavender"><span class="theme-preview" data-theme="lavender" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Lavender <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · lilac</span></label>
+      </div>
+    </fieldset>
     </section>
     <form class="settings-panel" id="connection-form" aria-labelledby="connection-title" hidden>
       <h3 id="connection-title">Server connection</h3>
@@ -146,25 +152,27 @@
         <p class="muted" id="projects-note">Projects bind a session to an allowed local directory. Real tools are not enabled on this server.</p>
         <div class="config-list" id="project-list"></div>
         <form class="config-form" id="project-form">
-          <div class="form-grid">
-            <div><label for="project-name">Project name</label><input id="project-name" maxlength="128" autocomplete="off" placeholder="My project"></div>
-            <div><label for="project-path">Absolute path</label><input id="project-path" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="/absolute/project"></div>
-          </div>
-          <p class="hint">Must be an existing directory. The filesystem root, home/ancestor directories, and known credential directories are refused.</p>
+          <label for="project-path">Project folder</label>
+          <div class="folder-selection"><input id="project-path" readonly placeholder="No folder selected" aria-describedby="project-folder-hint"><button id="choose-project-folder" type="button">Choose folder…</button></div>
+          <p class="hint" id="project-folder-hint">Opens a folder dialog on the computer running Nexus server. No files are uploaded. The filesystem root, home/ancestor directories, and known credential directories are refused.</p>
+          <label for="project-name">Project name <span class="muted">(optional)</span></label><input id="project-name" maxlength="128" autocomplete="off" placeholder="Uses the folder name" aria-describedby="project-name-hint">
+          <p class="hint" id="project-name-hint">Leave blank to use the selected folder's name.</p>
           <div class="dialog-actions"><button class="primary" id="add-project" type="submit">Add project</button></div>
           <p class="dialog-status status" id="project-status" role="status"></p>
         </form>
       </div>
     </section>
     <section class="settings-panel" id="providers-block" aria-labelledby="providers-title" hidden>
-      <h3 id="providers-title">Providers</h3>
+      <div class="config-heading"><div><h3 id="providers-title">Providers</h3><p class="muted">Connect an API service, then add the models you want to use.</p></div><button class="primary" id="new-provider" type="button">＋ Add provider</button></div>
       <div class="config-content">
-        <p class="muted">The configuration stores credential references only. A stored provider token is written to the local credentials file and is never shown again in this interface.</p>
         <div class="config-list" id="provider-list"></div>
-        <form class="config-form" id="provider-form">
+        <form class="config-form config-editor" id="provider-form" hidden aria-labelledby="provider-editor-title">
+          <div class="editor-heading"><div><span class="eyebrow" id="provider-editor-mode">NEW PROVIDER</span><h4 id="provider-editor-title">Add provider</h4></div><button id="cancel-provider" type="button">Cancel</button></div>
+          <fieldset class="editor-fields" id="provider-fields">
+          <h5>Connection</h5>
           <div class="form-grid">
-            <div><label for="provider-id">Provider ID</label><input id="provider-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="openai-main"></div>
-            <div><label for="provider-display">Display name</label><input id="provider-display" maxlength="128" autocomplete="off" placeholder="OpenAI"></div>
+            <div><label for="provider-id">Provider ID</label><input id="provider-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="openai-main" required aria-describedby="provider-id-hint"><p class="hint" id="provider-id-hint">Unique local ID. Cannot be renamed after creation.</p></div>
+            <div><label for="provider-display">Display name</label><input id="provider-display" maxlength="128" autocomplete="off" placeholder="OpenAI" required></div>
           </div>
           <div class="form-grid">
             <div><label for="provider-adapter">Adapter</label><select id="provider-adapter"><option value="direct">Direct</option><option value="relay">Relay</option></select></div>
@@ -175,20 +183,25 @@
           <label for="provider-enabled">Status</label>
           <select id="provider-enabled"><option value="true">Enabled</option><option value="false">Disabled</option></select>
           <p class="hint">Disabled providers stay configured but cannot be selected for new sessions.</p>
+          <h5>Authentication</h5>
           <div class="form-grid">
-            <div><label for="provider-credential-kind">Credential kind</label><select id="provider-credential-kind"><option value="env">Environment variable</option><option value="stored">Stored reference</option></select></div>
-            <div><label for="provider-credential-name">Credential name</label><input id="provider-credential-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY"></div>
+            <div><label for="provider-credential-kind">API key source</label><select id="provider-credential-kind"><option value="env">Server environment variable</option><option value="stored">Save API key locally</option></select></div>
+            <div><label id="provider-credential-label" for="provider-credential-name">Environment variable name</label><input id="provider-credential-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY" required></div>
           </div>
+          <p class="hint" id="provider-credential-hint">Set this variable in the server's environment, not in your browser.</p>
           <div id="provider-token-field" hidden>
             <label for="provider-api-token">API token <span class="muted">(stored locally; leave blank to keep the current token)</span></label>
             <input id="provider-api-token" type="password" maxlength="16384" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="Paste a token to add or replace it">
             <p class="hint">Saved beside the configuration with owner-only permissions. The token stays out of the configuration document and is never returned by the API.</p>
           </div>
+          <h5>Default model</h5>
+          <p class="hint">The vendor's model name used as this provider's default. Add a model entry in Models to make it selectable in the composer.</p>
           <div class="form-grid">
-            <div><label for="provider-default-model">Default model</label><input id="provider-default-model" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5"></div>
+            <div><label for="provider-default-model">Default model</label><input id="provider-default-model" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5" required></div>
             <div><label for="provider-context-window">Context window <span class="muted">(optional)</span></label><input id="provider-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
           </div>
           <p class="hint">The provider window applies only to its default model; model entries can override it.</p>
+          <details class="editor-advanced" id="provider-advanced"><summary>Advanced · thinking override</summary>
           <label for="provider-task-thinking">Task thinking <span class="muted">(optional override)</span></label>
           <select id="provider-task-thinking" aria-describedby="provider-thinking-hint">
             <option value="inherit">Default (inherit)</option>
@@ -196,26 +209,32 @@
             <option value="none">Off</option>
           </select>
           <p class="hint" id="provider-thinking-hint">Inherit uses the global setting. Model overrides take priority. Only detected Ollama / Direct / Chat Completions supports overrides; low effort may merely enable thinking. Applies to new Web sessions.</p>
+          </details>
           <div class="dialog-actions">
             <button class="primary" id="save-provider" type="submit">Save provider</button>
-            <button id="new-provider" type="button">New provider</button>
-            <button class="danger" id="delete-provider" type="button" hidden>Delete provider</button>
+            <button class="danger" id="delete-provider" type="button" aria-describedby="provider-delete-hint" hidden>Delete provider</button>
           </div>
-          <p class="dialog-status status" id="provider-status" role="status"></p>
+          <p class="hint" id="provider-delete-hint" hidden></p>
+          </fieldset>
         </form>
+        <p class="dialog-status status" id="provider-status" role="status"></p>
       </div>
     </section>
     <section class="settings-panel" id="models-block" aria-labelledby="models-title" hidden>
-        <h3 id="models-title">Models</h3>
-        <p class="muted">Choose a configured provider and the vendor's model name. Changes apply to new sessions.</p>
-        <div class="config-list" id="model-list"></div>
-        <form class="config-form" id="model-form">
+         <div class="config-heading"><div><h3 id="models-title">Models</h3><p class="muted">Models available in the conversation's model selector.</p></div><button class="primary" id="new-model" type="button">＋ Add model</button></div>
+         <div class="config-empty-guide" id="model-provider-guide" hidden><strong>Add a provider first</strong><p class="muted">A model needs an API connection and credentials.</p><button id="model-add-provider" type="button">Go to Providers →</button></div>
+         <div class="config-list" id="model-list"></div>
+         <form class="config-form config-editor" id="model-form" hidden aria-labelledby="model-editor-title">
+           <div class="editor-heading"><div><span class="eyebrow" id="model-editor-mode">NEW MODEL</span><h4 id="model-editor-title">Add model</h4></div><button id="cancel-model" type="button">Cancel</button></div>
+           <fieldset class="editor-fields" id="model-fields">
           <div class="form-grid">
-            <div><label for="model-id">Model ID</label><input id="model-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="fast"></div>
+             <div><label for="model-id">Local model ID</label><input id="model-id" maxlength="64" autocomplete="off" spellcheck="false" placeholder="fast" required aria-describedby="model-id-hint"><p class="hint" id="model-id-hint">Unique local alias, not the vendor's model name. Cannot be renamed.</p></div>
             <div><label for="model-provider">Provider</label><select id="model-provider"></select></div>
           </div>
           <label for="model-name">Vendor model name</label>
-          <input id="model-name" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5-mini">
+           <input id="model-name" maxlength="128" autocomplete="off" spellcheck="false" placeholder="gpt-5-mini" required>
+           <p class="hint">Exact model name sent to the provider's API.</p>
+           <details class="editor-advanced" id="model-advanced"><summary>Advanced · token limits and thinking</summary>
           <div class="form-grid">
             <div><label for="model-context-window">Context window <span class="muted">(optional)</span></label><input id="model-context-window" type="number" min="1" step="1" autocomplete="off" placeholder="128000"></div>
             <div><label for="model-max-output">Max output tokens <span class="muted">(optional)</span></label><input id="model-max-output" type="number" min="1" step="1" autocomplete="off" placeholder="8192"></div>
@@ -227,13 +246,14 @@
             <option value="none">Off</option>
           </select>
           <p class="hint" id="model-thinking-hint">Inherit uses the provider setting, then the global setting. Only detected Ollama / Direct / Chat Completions supports overrides; low effort may merely enable thinking. Applies to new Web sessions.</p>
+          </details>
           <div class="dialog-actions">
             <button class="primary" id="save-model" type="submit">Save model</button>
-            <button id="new-model" type="button">New model</button>
           </div>
-          <p class="dialog-status status" id="model-status" role="status"></p>
+          </fieldset>
         </form>
-        <p class="hint">Changes apply to new sessions. Existing sessions keep their original provider, model, and tools.</p>
+        <p class="dialog-status status" id="model-status" role="status"></p>
+        <p class="hint">Configuration edits apply when a session is created or restored. Select a model in the composer for the next task; switching an existing session requires session storage. Active runs and project tools stay unchanged.</p>
     </section>
     <section class="settings-panel info-box" id="about-panel" aria-labelledby="about-title" hidden>
       <h3 id="about-title">About Nexus</h3>

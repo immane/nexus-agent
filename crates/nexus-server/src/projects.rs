@@ -126,17 +126,25 @@ impl ProjectCatalog {
         self.projects.iter().find(|project| project.id == id)
     }
 
-    /// Adds a canonical existing directory. Duplicate canonical paths are
+    /// Adds a canonical existing directory. A blank name uses its folder name.
+    /// Duplicate canonical paths are
     /// refused so two labels cannot accidentally describe the same root.
     pub fn add(&mut self, name: &str, path: &Path) -> Result<Project, ProjectError> {
-        let name = name.trim();
+        let path = validate_project_root(path)?;
+        let name = if name.trim().is_empty() {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .trim()
+        } else {
+            name.trim()
+        };
         if name.is_empty()
             || name.len() > MAX_PROJECT_NAME_BYTES
             || name.bytes().any(|byte| byte.is_ascii_control())
         {
             return Err(invalid("project name is invalid"));
         }
-        let path = validate_project_root(path)?;
         if self.projects.iter().any(|project| project.path == path) {
             return Err(error(
                 ProjectErrorKind::Conflict,

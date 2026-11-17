@@ -172,6 +172,20 @@ user's home or any ancestor of it, common system roots, and known credential
 directories. This is not secret detection; a project may still contain sensitive
 files.
 
+In Settings, **Choose folder…** calls authenticated `POST /projects/pick-folder`
+with an empty object. A native directory dialog opens on the server's desktop,
+not on a remote browser's device, and never uploads folder contents. macOS uses
+`osascript`; Linux uses `zenity` or `kdialog` when installed. Unsupported/headless
+environments return an explicit HTTP 503 diagnostic. One dialog at a time is
+allowed (HTTP 409 for a second request), and the process is stopped/reaped after
+two minutes. Cancellation returns `{"cancelled":true}`; a valid selection returns
+its canonical `path` and folder `name`, after the same root safety validation.
+Selection does not register a project or grant tools. The path field is read-only;
+the separate **Add project** action sends `POST /projects`. An omitted or blank
+`name` defaults to the folder name; a non-string name remains invalid. Existing
+catalog entries retain their names and format. Picker cancellation/errors preserve
+the draft and must not be retried automatically.
+
 Project metadata is persisted in `projects.json` next to the user configuration,
 with owner-only permissions on Unix. A missing configuration path keeps project
 edits in memory only. `DELETE /projects/{id}` refuses the startup project and a

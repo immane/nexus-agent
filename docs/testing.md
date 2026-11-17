@@ -103,9 +103,22 @@ prompt flow, project-tree saved-session grouping and rendering, live-thinking
 disclosure and bounded streaming previews, and busy-state wiring with a small DOM
 double. Provider settings coverage includes stored-token create/update, no
 secret echo, deletion through the authenticated route, a conflict when a model
-still references the provider, and enabled/disabled selection enforcement. Thinking also has a stylesheet contract
+still references the provider, and enabled/disabled selection enforcement.
+Editor regressions cover separate list/create/edit states, unsaved draft protection,
+duplicate-ID refusal, cross-editor save locking, failure preservation, and deletion
+dependency hints. Palette tests cover the radio-card inventory, restored selection,
+immediate application/persistence, system fallback, and unavailable browser storage.
+Thinking also has a stylesheet contract
 check for the clipped preview and bounded expanded panel; these do not replace
-browser layout checks.
+browser layout checks. Navigation tests cover direct session selection, restore
+loading and failure cleanup, conflicting-action guards, and next-task model
+switching with preserved session/project identity and explicit storage errors.
+Project tests cover omitted/blank default names, authenticated native-picker
+gating, serialized dialogs, safe result validation, cancellation, timeouts and
+unavailable desktop tools. Node tests cover read-only folder selection, optional
+names, preserved custom names/drafts, stale replies and overlapping-submit guards.
+Picker tests use injected results and local subprocess fixtures, not interactive
+desktop dialogs; the actual macOS/Linux desktop integration needs manual checking.
 `nexus-openai`'s `runtime_keeps_wire_prefix_stable_as_occupancy_and_calibration_change`
 regression captures loopback HTTP requests from the real runtime and adapter,
 with a known window and usage-driven estimator calibration, rather than using

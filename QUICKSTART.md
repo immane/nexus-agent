@@ -3,7 +3,7 @@
 ## Status snapshot
 
 - See `git status` and `git log` for the current worktree and revision.
-- Implementation stage: **0.2.8-alpha**, built on the M0 runtime:
+- Implementation stage: **0.2.9-alpha**, built on the M0 runtime:
   Chat Completions, OpenAI Responses, and Anthropic Messages adapters
   (`nexus-openai`, HTTP or
   HTTPS through the system `openssl` TLS bridge) and development-mode file
@@ -740,7 +740,14 @@ Open **Settings** to enter the 64-hex-character bearer token. Projects form a
 tree in the left sidebar; expand a project to reach its sessions. The **+**
 beside a project starts a new session in that project, while the **+** in the
 Projects heading opens the project section in Settings, where roots are added or
-removed. A project is an existing absolute directory used as the session's local
+removed. Use **Choose folder…** to open a native directory dialog on the computer
+running the server; the path is read-only in the Web form and no files are
+uploaded. The project name is optional and defaults to the folder name. Native
+selection requires a macOS desktop session, or Linux with `zenity` or `kdialog`;
+headless servers and unsupported platforms report an explicit error. Only one
+dialog can be open at a time, with a two-minute timeout. Cancelling keeps the
+current selection, and choosing a folder does not register it until **Add project**.
+A project is an existing absolute directory used as the session's local
 tool root. The server refuses the filesystem root, the user's home or an
 ancestor, common system roots, and known credential directories. Projects are
 stored in `projects.json` next to the configured `config.json`, with owner-only
@@ -748,17 +755,28 @@ permissions; removing a project is refused while a retained session still
 references it. Starting a new session in a different project while a session
 exists asks for confirmation first.
 
-The same Settings dialog can add or update providers/models. Provider and model
-edits accept credential *references* (environment-variable or stored-entry
-names), never secret values. Changes apply to new sessions; live sessions keep
-their original provider, model, and tool root. There is no web deletion for
-providers or models; edit `config.json` to remove them.
+In **Settings → Providers / Models**, choose **Add** or **Edit** to open a
+dedicated editor; **Cancel** returns to the list. Unsaved edits are protected
+when replacing a draft or leaving the page. Advanced limits/thinking are
+collapsed unless the edited entry already has overrides. A provider's **+ Model**
+action opens a new model with that provider selected. Local IDs cannot be renamed,
+and a new entry cannot silently overwrite an existing ID.
+
+Providers support environment-variable credential references or an API key saved
+privately on the server. Stored keys are never returned to the browser. Providers
+can be deleted once all referencing models are reassigned; model deletion still
+requires editing `config.json`. Configuration edits apply to new or restored
+sessions. The composer model selector changes the next task's model in an existing
+session when `--session-store` is enabled; active runs and project tools are unchanged.
 
 After a successful connection, the bearer token is saved in same-origin browser
 storage and reused on launch. Disconnect removes it; invalid saved credentials
 are cleared on authentication failure. Same-origin scripts can read it, so use
 only a trusted local browser profile. If storage is unavailable, the connection
-works in memory only. Palette preferences are also persisted.
+works in memory only. **Settings → Appearance** offers clickable palette previews:
+Graphite, Midnight, Forest, Ocean and Amethyst (dark), Paper, Sand, Blossom and
+Lavender (light), or System to follow the device. Changes apply immediately and
+are remembered in this browser; the radio cards also support arrow-key selection.
 The static shell is public, but API authentication and Host/Origin checks remain
 enforced. Assistant text renders a bounded Markdown subset (headings, emphasis,
 lists, quotes, fenced code, tables, and safe links); raw HTML, images, and syntax

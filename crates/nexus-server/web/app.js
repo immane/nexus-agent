@@ -39,10 +39,18 @@ const dom = {
   projectForm: document.querySelector('#project-form'),
   projectName: document.querySelector('#project-name'),
   projectPath: document.querySelector('#project-path'),
+  chooseProjectFolder: document.querySelector('#choose-project-folder'),
   addProject: document.querySelector('#add-project'),
   projectStatus: document.querySelector('#project-status'),
   providerList: document.querySelector('#provider-list'),
   providerForm: document.querySelector('#provider-form'),
+  providerFields: document.querySelector('#provider-fields'),
+  providerEditorTitle: document.querySelector('#provider-editor-title'),
+  providerEditorMode: document.querySelector('#provider-editor-mode'),
+  providerAdvanced: document.querySelector('#provider-advanced'),
+  cancelProvider: document.querySelector('#cancel-provider'),
+  providerCredentialLabel: document.querySelector('#provider-credential-label'),
+  providerCredentialHint: document.querySelector('#provider-credential-hint'),
   providerId: document.querySelector('#provider-id'),
   providerDisplay: document.querySelector('#provider-display'),
   providerAdapter: document.querySelector('#provider-adapter'),
@@ -59,9 +67,17 @@ const dom = {
   saveProvider: document.querySelector('#save-provider'),
   newProvider: document.querySelector('#new-provider'),
   deleteProvider: document.querySelector('#delete-provider'),
+  providerDeleteHint: document.querySelector('#provider-delete-hint'),
   providerStatus: document.querySelector('#provider-status'),
   modelList: document.querySelector('#model-list'),
   modelForm: document.querySelector('#model-form'),
+  modelFields: document.querySelector('#model-fields'),
+  modelEditorTitle: document.querySelector('#model-editor-title'),
+  modelEditorMode: document.querySelector('#model-editor-mode'),
+  modelAdvanced: document.querySelector('#model-advanced'),
+  cancelModel: document.querySelector('#cancel-model'),
+  modelProviderGuide: document.querySelector('#model-provider-guide'),
+  modelAddProvider: document.querySelector('#model-add-provider'),
   modelId: document.querySelector('#model-id'),
   modelProvider: document.querySelector('#model-provider'),
   modelName: document.querySelector('#model-name'),
@@ -83,6 +99,7 @@ const dom = {
   runStatus: document.querySelector('#run-status'),
   usage: document.querySelector('#usage-status'),
   main: document.querySelector('#main'),
+  sessionLoading: document.querySelector('#session-loading'),
   welcome: document.querySelector('#welcome'),
   conversation: document.querySelector('#conversation'),
   conversationTitle: document.querySelector('#conversation-title'),
@@ -96,11 +113,14 @@ const state = {
   credential: '',
   config: null,
   thinkingSaving: false,
+  configSaving: false,
   choices: [],
   selection: null,
   projects: null,
   projectChoices: [],
   projectSelection: null,
+  projectPicking: false,
+  projectSaving: false,
   sessionProjectId: null,
   collapsedProjects: new Set(),
   savedSessions: [],
@@ -141,13 +161,15 @@ let textFrame = 0;
 
 /* Appearance */
 
-const themes = new Set(['system', 'graphite', 'paper', 'forest', 'sand']);
+const themes = new Set(['system', 'graphite', 'paper', 'forest', 'sand', 'midnight', 'ocean', 'amethyst', 'blossom', 'lavender']);
 
 function applyTheme(value) {
   const selected = themes.has(value) ? value : 'system';
   if (selected === 'system') delete dom.root.dataset.theme;
   else dom.root.dataset.theme = selected;
-  dom.theme.value = selected;
+  for (const input of dom.theme.querySelectorAll('input[name="theme"]')) {
+    input.checked = input.value === selected;
+  }
 }
 
 try {
@@ -156,10 +178,12 @@ try {
   applyTheme('system');
 }
 
-dom.theme.addEventListener('change', () => {
-  applyTheme(dom.theme.value);
+dom.theme.addEventListener('change', (event) => {
+  const input = event.target;
+  if (input.name !== 'theme' || !input.checked || !themes.has(input.value)) return;
+  applyTheme(input.value);
   try {
-    localStorage.setItem('nexus.theme', dom.theme.value);
+    localStorage.setItem('nexus.theme', input.value);
   } catch {
     // Appearance remains usable when browser storage is unavailable.
   }
@@ -557,8 +581,9 @@ function updateProjectDisplay() {
     ? selected.label
     : enabled ? 'No project' : 'Projects disabled';
   dom.projectLabel.textContent = state.session && enabled && !current ? 'No project' : label;
-  dom.projectBadge.textContent = enabled && selected ? selected.label : '';
-  dom.projectBadge.hidden = !state.connected || !enabled || !selected;
+  dom.projectBadge.textContent = enabled && selected ? selected.label : 'No project';
+  dom.projectBadge.hidden = false;
+  dom.projectBadge.title = selected?.path || '';
 }
 
 const COLLAPSED_PROJECTS_KEY = 'nexus.collapsed-projects';
@@ -873,9 +898,7 @@ function configModeLabel(mode) {
 function renderProjectsList() {
   dom.projectList.replaceChildren();
   const enabled = Boolean(state.projects?.enabled);
-  dom.projectName.disabled = !enabled;
-  dom.projectPath.disabled = !enabled;
-  dom.addProject.disabled = !enabled;
+  updateProjectFormControls();
   if (!enabled) {
     dom.projectsNote.textContent = state.projects?.mode === 'container'
       ? `Container tools are active. Tool network ${state.projects.network_access === false ? 'disabled' : state.projects.network_access === true ? 'enabled (experimental public-egress gateway)' : 'not reported'}. Per-project roots are not available in container mode.`
@@ -928,6 +951,44 @@ function renderProjectsList() {
   for (const project of state.projects.projects || []) addItem(project, true);
 }
 
+function updateProjectFormControls() {
+  const busy = Boolean(state.projectPicking || state.projectSaving);
+  const available = state.connected && state.projects?.enabled;
+  dom.projectName.disabled = dom.projectPath.disabled = !available || busy;
+  dom.chooseProjectFolder.disabled = !available || busy;
+  dom.chooseProjectFolder.textContent = state.projectPicking ? 'Choosing folder…' : 'Choose folder…';
+  dom.addProject.disabled = !available || busy || !dom.projectPath.value;
+  dom.addProject.textContent = state.projectSaving ? 'Adding…' : 'Add project';
+  dom.projectForm.setAttribute('aria-busy', String(busy));
+}
+
+async function chooseProjectFolder() {
+  if (!state.connected || !state.projects?.enabled || state.projectPicking || state.projectSaving) return;
+  const generation = state.connectGeneration;
+  state.projectPicking = true;
+  updateControls();
+  setFormStatus(dom.projectStatus, 'Choose a folder in the dialog on the server’s desktop…', 'busy');
+  try {
+    const result = await api('/projects/pick-folder', { method: 'POST', body: {} });
+    if (!state.connected || generation !== state.connectGeneration) return;
+    if (result?.cancelled) {
+      setFormStatus(dom.projectStatus, 'Folder selection cancelled.');
+      return;
+    }
+    if (typeof result?.path !== 'string' || !result.path || typeof result?.name !== 'string' || !result.name) {
+      throw new Error('The server did not return a project folder.');
+    }
+    dom.projectPath.value = result.path;
+    dom.projectName.placeholder = result.name;
+    setFormStatus(dom.projectStatus, `Selected ${result.name}. Add the project when ready.`, 'ok');
+  } catch (error) {
+    if (generation === state.connectGeneration) setFormStatus(dom.projectStatus, error.message, 'error');
+  } finally {
+    state.projectPicking = false;
+    updateControls();
+  }
+}
+
 function renderProviderList() {
   dom.providerList.replaceChildren();
   const providers = Array.isArray(state.config?.providers) ? state.config.providers : [];
@@ -936,26 +997,35 @@ function renderProviderList() {
   }
   for (const provider of providers) {
     const item = node('div', 'config-item');
+    item.dataset.selected = String(dom.providerForm.dataset.original === provider.id && !dom.providerForm.hidden);
     const text = node('div', 'config-item-text');
     text.append(node('span', 'config-item-title', provider.display_name || provider.id));
-    const credential = provider.credential && typeof provider.credential === 'object'
-      ? provider.credential.env || provider.credential.stored || 'unknown'
-      : 'unknown';
-    const state = provider.enabled === false ? 'disabled' : 'enabled';
+    const count = state.config?.models?.filter((model) => model.provider === provider.id).length || 0;
+    const availability = provider.enabled === false ? 'Disabled' : 'Enabled';
     text.append(node(
       'span',
       'config-item-meta',
-      `${provider.id} · ${provider.adapter}/${provider.protocol} · ${provider.endpoint || 'no endpoint'} · ref: ${credential} · ${state}`,
+      `${provider.id} · ${availability} · ${count} model${count === 1 ? '' : 's'}`,
     ));
+    text.append(node('span', 'config-item-meta', `${provider.protocol} · ${provider.endpoint || 'Default endpoint'}`));
     item.append(text);
     const actions = node('div', 'config-item-actions');
     const edit = node('button', '', 'Edit');
     edit.type = 'button';
+    edit.setAttribute('aria-label', `Edit provider ${provider.display_name || provider.id}`);
+    edit.setAttribute('aria-pressed', item.dataset.selected);
     edit.addEventListener('click', () => editProvider(provider.id));
-    const remove = node('button', 'danger', 'Delete');
-    remove.type = 'button';
-    remove.addEventListener('click', () => deleteProvider(provider.id));
-    actions.append(edit, remove);
+    const addModel = node('button', '', '＋ Model');
+    addModel.type = 'button';
+    addModel.setAttribute('aria-label', `Add model for ${provider.display_name || provider.id}`);
+    addModel.addEventListener('click', () => {
+      if (!resetModelForm({ open: true })) return;
+      dom.modelProvider.value = provider.id;
+      selectSettingsSection('models-block');
+      dom.modelName.focus();
+    });
+    edit.disabled = addModel.disabled = Boolean(state.configSaving || state.thinkingSaving || !state.connected);
+    actions.append(edit, addModel);
     item.append(actions);
     dom.providerList.append(item);
   }
@@ -970,13 +1040,18 @@ function renderModelList() {
   }
   for (const model of models) {
     const item = node('div', 'config-item');
+    item.dataset.selected = String(dom.modelForm.dataset.original === model.id && !dom.modelForm.hidden);
     const text = node('div', 'config-item-text');
     text.append(node('span', 'config-item-title', model.name || model.id));
-    text.append(node('span', 'config-item-meta', `${model.id} · provider ${model.provider}`));
+    const provider = providers.find((entry) => entry.id === model.provider);
+    text.append(node('span', 'config-item-meta', `${model.id} · ${provider?.display_name || model.provider}${provider?.enabled === false ? ' · Provider disabled' : ''}`));
     item.append(text);
     const actions = node('div', 'config-item-actions');
     const edit = node('button', '', 'Edit');
     edit.type = 'button';
+    edit.setAttribute('aria-label', `Edit model ${model.name || model.id}`);
+    edit.setAttribute('aria-pressed', item.dataset.selected);
+    edit.disabled = Boolean(state.configSaving || state.thinkingSaving || !state.connected);
     edit.addEventListener('click', () => editModel(model.id));
     actions.append(edit);
     item.append(actions);
@@ -985,7 +1060,7 @@ function renderModelList() {
   const previous = dom.modelProvider.value;
   dom.modelProvider.replaceChildren();
   for (const provider of providers) {
-    const option = node('option', '', provider.display_name || provider.id);
+    const option = node('option', '', `${provider.display_name || provider.id}${provider.enabled === false ? ' (disabled)' : ''}`);
     option.value = provider.id;
     dom.modelProvider.append(option);
   }
@@ -994,20 +1069,55 @@ function renderModelList() {
   } else if (providers.length) {
     dom.modelProvider.value = providers[0].id;
   }
-  dom.saveModel.disabled = !providers.length;
+  dom.modelProviderGuide.hidden = Boolean(providers.length);
+  dom.saveModel.disabled = !providers.length || !state.connected || Boolean(state.configSaving);
+  dom.newModel.disabled = !providers.length || !state.connected || Boolean(state.configSaving || state.thinkingSaving);
 }
 
 function updateProviderCredentialFields() {
   const stored = dom.providerCredentialKind.value === 'stored';
   dom.providerTokenField.hidden = !stored;
   dom.providerCredentialName.placeholder = stored ? 'stored-name' : 'OPENAI_API_KEY';
+  dom.providerCredentialLabel.textContent = stored ? 'Local key reference' : 'Environment variable name';
+  dom.providerCredentialHint.textContent = stored
+    ? 'The API key is saved privately on this server, never returned to the browser. The reference is a local name, not the key itself.'
+    : "Set this variable in the server's environment, not in your browser.";
   if (stored && !dom.providerCredentialName.value) {
     dom.providerCredentialName.value = dom.providerId.value.trim();
   }
   if (!stored) dom.providerApiToken.value = '';
 }
 
-function resetProviderForm() {
+function canLeaveEditor(form) {
+  if (state.configSaving || state.thinkingSaving) return false;
+  return form.dataset.dirty !== 'true' || globalThis.confirm('Discard unsaved changes in this editor?');
+}
+
+function updateConfigBusy() {
+  const busy = Boolean(state.configSaving || state.thinkingSaving || !state.connected);
+  dom.providerFields.disabled = dom.modelFields.disabled = busy;
+  dom.newProvider.disabled = dom.cancelProvider.disabled = dom.cancelModel.disabled = busy;
+  dom.newModel.disabled = busy || !state.config?.providers?.length;
+  for (const list of [dom.providerList, dom.modelList]) {
+    for (const button of list.querySelectorAll('button')) button.disabled = busy;
+  }
+  dom.providerForm.setAttribute('aria-busy', String(state.configSaving === 'provider'));
+  dom.modelForm.setAttribute('aria-busy', String(state.configSaving === 'model'));
+  dom.saveProvider.textContent = state.configSaving === 'provider' ? 'Saving…'
+    : dom.providerForm.dataset.original ? 'Save changes' : 'Create provider';
+  dom.saveModel.textContent = state.configSaving === 'model' ? 'Saving…'
+    : dom.modelForm.dataset.original ? 'Save changes' : 'Create model';
+}
+
+function resetProviderForm({ open = false, force = false } = {}) {
+  if (!force && !canLeaveEditor(dom.providerForm)) return false;
+  dom.providerForm.hidden = !open;
+  dom.providerList.hidden = open;
+  dom.providerForm.dataset.dirty = 'false';
+  dom.providerEditorMode.textContent = 'NEW PROVIDER';
+  dom.providerEditorTitle.textContent = 'Add provider';
+  dom.saveProvider.textContent = 'Create provider';
+  dom.providerAdvanced.open = false;
   dom.providerForm.dataset.original = '';
   dom.providerId.readOnly = false;
   dom.providerId.value = '';
@@ -1020,16 +1130,28 @@ function resetProviderForm() {
   dom.providerCredentialName.value = '';
   dom.providerApiToken.value = '';
   dom.deleteProvider.hidden = true;
+  dom.providerDeleteHint.hidden = true;
   updateProviderCredentialFields();
   dom.providerDefaultModel.value = '';
   dom.providerContextWindow.value = '';
   dom.providerTaskThinking.value = 'inherit';
   setFormStatus(dom.providerStatus, '');
+  renderProviderList();
+  if (open) dom.providerId.focus();
+  return true;
 }
 
-function editProvider(id) {
+function editProvider(id, { force = false } = {}) {
   const provider = state.config?.providers?.find((entry) => entry.id === id);
   if (!provider) return;
+  if (!force && !canLeaveEditor(dom.providerForm)) return;
+  dom.providerForm.hidden = false;
+  dom.providerList.hidden = true;
+  dom.providerForm.dataset.dirty = 'false';
+  dom.providerEditorMode.textContent = 'EDIT PROVIDER';
+  dom.providerEditorTitle.textContent = provider.display_name || provider.id;
+  dom.saveProvider.textContent = 'Save changes';
+  dom.providerAdvanced.open = provider.task_reasoning_effort != null;
   dom.providerForm.dataset.original = id;
   dom.providerId.readOnly = true;
   dom.providerId.value = provider.id;
@@ -1045,17 +1167,31 @@ function editProvider(id) {
   dom.providerCredentialName.value = credential.stored || credential.env || '';
   dom.providerApiToken.value = '';
   dom.deleteProvider.hidden = false;
+  const usedBy = state.config?.models?.filter((model) => model.provider === id) || [];
+  dom.deleteProvider.disabled = Boolean(usedBy.length);
+  dom.deleteProvider.title = usedBy.length ? `Used by: ${usedBy.map((model) => model.id).join(', ')}. Reassign these models before deleting this provider.` : 'Delete this provider';
+  dom.providerDeleteHint.hidden = !usedBy.length;
+  dom.providerDeleteHint.textContent = usedBy.length
+    ? `Used by ${usedBy.map((model) => model.id).join(', ')}. Reassign these models in Models before deleting this provider.` : '';
   updateProviderCredentialFields();
   dom.providerDefaultModel.value = provider.default_model || '';
   dom.providerContextWindow.value = provider.context_window_tokens ?? '';
   dom.providerTaskThinking.value = provider.task_reasoning_effort ?? 'inherit';
   setFormStatus(dom.providerStatus, `Editing ${provider.display_name || provider.id}.`);
+  renderProviderList();
+  dom.providerDisplay.focus();
 }
 
 async function deleteProvider(id) {
-  if (!id || !state.connected) return;
+  if (!id || !state.connected || state.configSaving || state.thinkingSaving) return;
+  if (state.config?.models?.some((model) => model.provider === id)) {
+    setFormStatus(dom.providerStatus, 'Reassign this provider’s models before deleting it.', 'error');
+    return;
+  }
   if (!globalThis.confirm(`Delete provider ${id}? Models that still reference it must be removed first.`)) return;
   dom.deleteProvider.disabled = true;
+  state.configSaving = 'provider';
+  updateControls();
   setFormStatus(dom.providerStatus, `Deleting ${id}…`, 'busy');
   try {
     const summary = await api(`/config/providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
@@ -1063,7 +1199,7 @@ async function deleteProvider(id) {
     updateConnectionDetail();
     populateModels();
     renderConfigEditors();
-    resetProviderForm();
+    resetProviderForm({ force: true });
     setFormStatus(dom.providerStatus, `Deleted ${id}.`, 'ok');
     updateSessionDisplay();
     updateControls();
@@ -1071,11 +1207,21 @@ async function deleteProvider(id) {
     setFormStatus(dom.providerStatus, error.message, 'error');
     if (error instanceof ApiError && error.status === 401) markUnauthorized();
   } finally {
+    state.configSaving = false;
+    updateControls();
     dom.deleteProvider.disabled = false;
   }
 }
 
-function resetModelForm() {
+function resetModelForm({ open = false, force = false } = {}) {
+  if (!force && !canLeaveEditor(dom.modelForm)) return false;
+  dom.modelForm.hidden = !open;
+  dom.modelList.hidden = open;
+  dom.modelForm.dataset.dirty = 'false';
+  dom.modelEditorMode.textContent = 'NEW MODEL';
+  dom.modelEditorTitle.textContent = 'Add model';
+  dom.saveModel.textContent = 'Create model';
+  dom.modelAdvanced.open = false;
   dom.modelForm.dataset.original = '';
   dom.modelId.readOnly = false;
   dom.modelId.value = '';
@@ -1085,11 +1231,22 @@ function resetModelForm() {
   dom.modelTaskThinking.value = 'inherit';
   if (dom.modelProvider.options.length) dom.modelProvider.selectedIndex = 0;
   setFormStatus(dom.modelStatus, '');
+  renderModelList();
+  if (open) dom.modelId.focus();
+  return true;
 }
 
-function editModel(id) {
+function editModel(id, { force = false } = {}) {
   const model = state.config?.models?.find((entry) => entry.id === id);
   if (!model) return;
+  if (!force && !canLeaveEditor(dom.modelForm)) return;
+  dom.modelForm.hidden = false;
+  dom.modelList.hidden = true;
+  dom.modelForm.dataset.dirty = 'false';
+  dom.modelEditorMode.textContent = 'EDIT MODEL';
+  dom.modelEditorTitle.textContent = model.name || model.id;
+  dom.saveModel.textContent = 'Save changes';
+  dom.modelAdvanced.open = model.context_window_tokens != null || model.max_output_tokens != null || model.task_reasoning_effort != null;
   dom.modelForm.dataset.original = id;
   dom.modelId.readOnly = true;
   dom.modelId.value = model.id;
@@ -1101,6 +1258,8 @@ function editModel(id) {
   dom.modelMaxOutput.value = model.max_output_tokens ?? '';
   dom.modelTaskThinking.value = model.task_reasoning_effort ?? 'inherit';
   setFormStatus(dom.modelStatus, `Editing ${model.name || model.id}.`);
+  renderModelList();
+  dom.modelName.focus();
 }
 
 function renderConfigEditors({ hydrateThinking = false } = {}) {
@@ -1121,9 +1280,7 @@ function populateModels() {
           ? !state.sessionProvider
           : choice.provider === state.sessionProvider && choice.model === state.sessionModel)
     : null;
-  let selected = state.session
-    ? sessionChoice
-    : state.choices.find((choice) => choiceKey(choice) === previous);
+  let selected = state.choices.find((choice) => choiceKey(choice) === previous) || sessionChoice;
   if (state.session && !selected) {
     selected = {
       demo: !state.sessionProvider,
@@ -1280,7 +1437,7 @@ async function connect(candidate) {
     if (!state.session && last && state.savedSessions.some((saved) => saved.session === last)) {
       // Let connect() finish clearing `state.connecting` before restoring.
       setTimeout(() => {
-        if (!state.session) void openSavedSession(last, { automatic: true });
+        if (!state.session) void openSavedSession(last);
       }, 0);
     }
     return true;
@@ -1507,13 +1664,9 @@ function renderHistory(items) {
   updateJumpLatest();
 }
 
-async function openSavedSession(id, { automatic = false } = {}) {
+async function openSavedSession(id) {
   if (!state.connected || !id || state.active || state.submitting || state.connecting || state.historyLoading) return;
   if (state.session === id) return;
-  if (!automatic && dom.conversation.childElementCount > 0
-    && !window.confirm('Open this saved session? The current transcript stays available in saved history.')) {
-    return;
-  }
   const meta = savedSessionMeta(id) || {};
   let choice = state.selection;
   if (meta.provider && meta.model) {
@@ -1538,6 +1691,7 @@ async function openSavedSession(id, { automatic = false } = {}) {
   }
   if (state.projects?.enabled && project) body.project = project.id;
   state.historyLoading = true;
+  dom.main.scrollTop = 0;
   setRunStatus('Restoring session…', 'busy');
   updateControls();
   try {
@@ -1549,6 +1703,7 @@ async function openSavedSession(id, { automatic = false } = {}) {
     state.sessionModel = body.model || null;
     state.sessionProjectId = project?.id || null;
     state.selection = choice || state.selection;
+    populateModels();
     if (project) state.projectSelection = project;
     ensureProjectExpanded(state.sessionProjectId || '');
     const listed = state.savedSessions.find((saved) => saved.session === state.session);
@@ -1579,19 +1734,25 @@ async function openSavedSession(id, { automatic = false } = {}) {
 
 function updateControls() {
   updateComposerActivity();
+  updateConfigBusy();
+  updateProjectFormControls();
+  dom.sessionLoading.hidden = !state.historyLoading;
+  dom.main.setAttribute('aria-busy', String(state.historyLoading));
+  dom.main.dataset.loading = String(state.historyLoading);
   const connected = state.connected;
-  const busy = state.active || state.submitting || state.connecting;
+  const busy = state.active || state.submitting || state.connecting || state.historyLoading;
   const blocked = state.inFlightUnknown;
   const canNewSession = connected && !busy && !blocked;
 
   dom.newSession.disabled = !canNewSession;
   dom.newSessionMobile.disabled = !canNewSession;
-  dom.message.disabled = !connected || blocked;
+  dom.message.disabled = !connected || blocked || state.historyLoading;
   dom.send.disabled = !connected || busy || blocked || !state.selection || !dom.message.value.trim();
   const projectEnabled = Boolean(state.projects?.enabled);
-  dom.model.disabled = !connected || busy || Boolean(state.session);
-  dom.model.hidden = Boolean(state.session);
-  dom.modelLabel.hidden = !state.session;
+  dom.model.disabled = !connected || state.connecting || state.historyLoading || state.submitting || blocked;
+  dom.model.hidden = false;
+  dom.model.title = 'Model for the next task; active runs keep their current model';
+  dom.modelLabel.hidden = true;
   dom.project.disabled = !connected || busy || Boolean(state.session) || !projectEnabled;
   dom.project.hidden = Boolean(state.session) || !projectEnabled;
   dom.projectLabel.hidden = !state.session || !projectEnabled;
@@ -1600,9 +1761,9 @@ function updateControls() {
   dom.cancel.disabled = !connected || !state.active || state.cancelling || state.cancelRequested || !state.run;
   dom.cancel.textContent = state.cancelling || state.cancelRequested ? 'Cancelling…' : 'Cancel';
   dom.connect.disabled = state.connecting;
-  dom.disconnect.disabled = !connected || busy;
-  dom.taskThinking.disabled = !connected || state.thinkingSaving;
-  dom.saveThinking.disabled = !connected || state.thinkingSaving;
+  dom.disconnect.disabled = !connected || busy || state.projectPicking || state.projectSaving;
+  dom.taskThinking.disabled = !connected || state.thinkingSaving || Boolean(state.configSaving);
+  dom.saveThinking.disabled = !connected || state.thinkingSaving || Boolean(state.configSaving);
   dom.message.placeholder = !connected
     ? 'Connect to start a task…'
     : blocked
@@ -1671,7 +1832,7 @@ function stopStream() {
 }
 
 function startNewSession({ force = false } = {}) {
-  if (!state.connected || state.active || state.submitting || state.connecting) return;
+  if (!state.connected || state.active || state.submitting || state.connecting || state.historyLoading) return;
   if (state.inFlightUnknown && !force) {
     addNotice(
       'error',
@@ -1720,8 +1881,23 @@ function setSessionTitleFromInput(text) {
 }
 
 async function ensureSession() {
-  if (state.session) return;
   if (!state.selection) throw new ApiError(400, 'Select a model before sending.');
+  if (state.session) {
+    const provider = state.selection.demo ? null : state.selection.provider;
+    const model = state.selection.demo ? null : state.selection.model;
+    if (provider === state.sessionProvider && model === state.sessionModel) return;
+    if (!state.savedPersistence) {
+      throw new ApiError(409, 'Switching models in an existing session requires --session-store. Start a new session to use this model.');
+    }
+    const body = {};
+    if (provider) Object.assign(body, { provider, model });
+    if (state.sessionProjectId) body.project = state.sessionProjectId;
+    await api(`/sessions/${encodeURIComponent(state.session)}/restore`, { method: 'POST', body });
+    state.sessionProvider = provider;
+    state.sessionModel = model;
+    rememberSession(state.session, { provider, model });
+    return;
+  }
   const body = {};
   if (!state.selection.demo) {
     body.provider = state.selection.provider;
@@ -1758,7 +1934,7 @@ async function ensureSession() {
 async function sendMessage() {
   const draft = dom.message.value;
   const text = draft.trim();
-  if (!text || !state.connected || state.active || state.submitting || state.connecting || state.inFlightUnknown) return;
+  if (!text || !state.connected || state.active || state.submitting || state.connecting || state.historyLoading || state.inFlightUnknown) return;
   state.submitting = true;
   state.pinned = true;
   let submittingRun = false;
@@ -3364,7 +3540,7 @@ dom.addProjectSidebar.addEventListener('click', () => {
   if (!dom.settings.open) dom.settings.showModal();
   selectSettingsSection('projects-block');
   requestAnimationFrame(() => {
-    dom.projectName.focus();
+    dom.chooseProjectFolder.focus();
   });
 });
 dom.settings.addEventListener('close', () => {
@@ -3392,19 +3568,23 @@ dom.project.addEventListener('change', () => {
   updateControls();
 });
 
+dom.chooseProjectFolder.addEventListener('click', () => void chooseProjectFolder());
 dom.projectForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (!state.projects?.enabled) return;
+  if (!state.connected || !state.projects?.enabled || state.projectPicking || state.projectSaving) return;
   const name = dom.projectName.value.trim();
-  const path = dom.projectPath.value.trim();
-  if (!name || !path) {
-    setFormStatus(dom.projectStatus, 'Project name and absolute path are required.', 'error');
+  const path = dom.projectPath.value;
+  if (!path) {
+    setFormStatus(dom.projectStatus, 'Choose a project folder first.', 'error');
     return;
   }
-  dom.addProject.disabled = true;
+  state.projectSaving = true;
+  updateControls();
   setFormStatus(dom.projectStatus, 'Adding project…', 'busy');
   try {
-    const payload = await api('/projects', { method: 'POST', body: { name, path } });
+    const body = { path };
+    if (name) body.name = name;
+    const payload = await api('/projects', { method: 'POST', body });
     state.projects = payload;
     populateProjects();
     const added = payload.project?.id;
@@ -3419,6 +3599,7 @@ dom.projectForm.addEventListener('submit', async (event) => {
     renderSidebarTree();
     dom.projectName.value = '';
     dom.projectPath.value = '';
+    dom.projectName.placeholder = 'Uses the folder name';
     setFormStatus(dom.projectStatus, `Added ${payload.project?.name || name}.`, 'ok');
     updateProjectDisplay();
     updateSessionDisplay();
@@ -3427,18 +3608,34 @@ dom.projectForm.addEventListener('submit', async (event) => {
     setFormStatus(dom.projectStatus, error.message, 'error');
     if (error instanceof ApiError && error.status === 401) markUnauthorized();
   } finally {
-    dom.addProject.disabled = !state.projects?.enabled;
+    state.projectSaving = false;
+    updateControls();
   }
 });
 
-dom.newProvider.addEventListener('click', resetProviderForm);
-dom.newModel.addEventListener('click', resetModelForm);
+dom.newProvider.addEventListener('click', () => resetProviderForm({ open: true }));
+dom.newModel.addEventListener('click', () => {
+  if (!state.config?.providers?.length) return;
+  resetModelForm({ open: true });
+});
+dom.cancelProvider.addEventListener('click', () => resetProviderForm());
+dom.cancelModel.addEventListener('click', () => resetModelForm());
+dom.modelAddProvider.addEventListener('click', () => selectSettingsSection('providers-block'));
+for (const form of [dom.providerForm, dom.modelForm]) {
+  const markDirty = () => {
+    form.dataset.dirty = 'true';
+    const provider = form === dom.providerForm;
+    setFormStatus(provider ? dom.providerStatus : dom.modelStatus, 'Unsaved changes', 'busy');
+  };
+  form.addEventListener('input', markDirty);
+  form.addEventListener('change', markDirty);
+}
 dom.providerCredentialKind.addEventListener('change', updateProviderCredentialFields);
 dom.deleteProvider.addEventListener('click', () => deleteProvider(dom.providerForm.dataset.original));
 
 dom.thinkingForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  if (!state.connected || state.thinkingSaving) return;
+  if (!state.connected || state.thinkingSaving || state.configSaving) return;
   const effort = dom.taskThinking.value;
   state.thinkingSaving = true;
   updateControls();
@@ -3465,7 +3662,13 @@ dom.thinkingForm.addEventListener('submit', async (event) => {
 
 dom.providerForm.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (!state.connected || state.configSaving || state.thinkingSaving) return;
   const id = dom.providerId.value.trim();
+  if (!dom.providerForm.dataset.original && state.config?.providers?.some((provider) => provider.id === id)) {
+    setFormStatus(dom.providerStatus, 'This provider ID already exists. Choose another ID or edit the existing provider.', 'error');
+    dom.providerId.focus();
+    return;
+  }
   const displayName = dom.providerDisplay.value.trim();
   const defaultModel = dom.providerDefaultModel.value.trim();
   const credentialName = dom.providerCredentialName.value.trim();
@@ -3499,6 +3702,8 @@ dom.providerForm.addEventListener('submit', async (event) => {
     body.api_token = dom.providerApiToken.value;
   }
   dom.saveProvider.disabled = true;
+  state.configSaving = 'provider';
+  updateControls();
   setFormStatus(dom.providerStatus, 'Saving provider…', 'busy');
   try {
     const summary = await api('/config/providers', { method: 'POST', body });
@@ -3506,10 +3711,7 @@ dom.providerForm.addEventListener('submit', async (event) => {
     updateConnectionDetail();
     populateModels();
     renderConfigEditors();
-    dom.providerForm.dataset.original = id;
-    dom.providerId.readOnly = true;
-    dom.providerApiToken.value = '';
-    dom.deleteProvider.hidden = false;
+    editProvider(id, { force: true });
     setFormStatus(dom.providerStatus, `Saved ${displayName}. Changes apply to new sessions.`, 'ok');
     updateSessionDisplay();
     updateControls();
@@ -3517,13 +3719,21 @@ dom.providerForm.addEventListener('submit', async (event) => {
     setFormStatus(dom.providerStatus, error.message, 'error');
     if (error instanceof ApiError && error.status === 401) markUnauthorized();
   } finally {
+    state.configSaving = false;
+    updateControls();
     dom.saveProvider.disabled = false;
   }
 });
 
 dom.modelForm.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (!state.connected || state.configSaving || state.thinkingSaving) return;
   const id = dom.modelId.value.trim();
+  if (!dom.modelForm.dataset.original && state.config?.models?.some((model) => model.id === id)) {
+    setFormStatus(dom.modelStatus, 'This model ID already exists. Choose another ID or edit the existing model.', 'error');
+    dom.modelId.focus();
+    return;
+  }
   const provider = dom.modelProvider.value;
   const name = dom.modelName.value.trim();
   if (!id || !provider || !name) {
@@ -3540,6 +3750,8 @@ dom.modelForm.addEventListener('submit', async (event) => {
     return;
   }
   dom.saveModel.disabled = true;
+  state.configSaving = 'model';
+  updateControls();
   setFormStatus(dom.modelStatus, 'Saving model…', 'busy');
   try {
     const summary = await api('/config/models', {
@@ -3557,8 +3769,7 @@ dom.modelForm.addEventListener('submit', async (event) => {
     updateConnectionDetail();
     populateModels();
     renderConfigEditors();
-    dom.modelForm.dataset.original = id;
-    dom.modelId.readOnly = true;
+    editModel(id, { force: true });
     setFormStatus(dom.modelStatus, `Saved ${name}. Changes apply to new sessions.`, 'ok');
     updateSessionDisplay();
     updateControls();
@@ -3566,6 +3777,8 @@ dom.modelForm.addEventListener('submit', async (event) => {
     setFormStatus(dom.modelStatus, error.message, 'error');
     if (error instanceof ApiError && error.status === 401) markUnauthorized();
   } finally {
+    state.configSaving = false;
+    updateControls();
     dom.saveModel.disabled = !state.config?.providers?.length;
   }
 });
@@ -3595,6 +3808,12 @@ dom.jumpLatest.addEventListener('click', () => {
   scrollToBottomSoon();
   updateJumpLatest();
   dom.message.focus();
+});
+
+window.addEventListener('beforeunload', (event) => {
+  if (dom.providerForm.dataset.dirty !== 'true' && dom.modelForm.dataset.dirty !== 'true' && !state.configSaving) return;
+  event.preventDefault();
+  event.returnValue = '';
 });
 
 window.addEventListener('pagehide', () => {

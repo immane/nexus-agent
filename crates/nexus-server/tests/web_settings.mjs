@@ -7,9 +7,10 @@ import vm from 'node:vm';
 test('project settings display reported tool networking without guessing old-server defaults', () => {
   const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   const state = { projects: { enabled: true, mode: 'development', projects: [] } };
-  const dom = Object.fromEntries(['projectName', 'projectPath', 'addProject', 'projectsNote', 'projectStatus']
+  const dom = Object.fromEntries(['projectName', 'projectPath', 'addProject', 'chooseProjectFolder', 'projectsNote', 'projectStatus']
     .map(key => [key, {}]));
   dom.projectList = { replaceChildren() {} };
+  dom.projectForm = { setAttribute() {} };
   const context = vm.createContext({ state, dom, configModeLabel: () => 'Development tools' });
   vm.runInContext(source.slice(source.indexOf('function renderProjectsList('), source.indexOf('function renderProviderList(')), context);
   for (const [value, label] of [[undefined, 'not reported'], [true, 'enabled (host reachability)'], [false, 'disabled']]) {
@@ -64,6 +65,8 @@ function thinkingFixture(config = {}) {
     .map(([, key]) => [key, {
       value: '', dataset: {}, options: [], disabled: false, textContent: '', listeners: {},
       addEventListener(type, listener) { this.listeners[type] = listener; },
+      setAttribute(name, value) { this[name] = value; },
+      focus() {},
       querySelectorAll() { return []; },
     }]));
   const sections = [...html.matchAll(/data-settings-section="([^"]+)"/g)].map(([, id]) => id);
@@ -85,9 +88,10 @@ function thinkingFixture(config = {}) {
   let failure = null;
   let release;
   let wait = null;
+  let discard = true;
   const context = vm.createContext({
     dom, state,
-    confirm: () => true,
+    confirm: () => discard,
     fetch: async (path, options) => {
       const body = options.body === undefined ? undefined : JSON.parse(options.body);
       requests.push({ path, ...options, body });
@@ -120,6 +124,7 @@ function thinkingFixture(config = {}) {
   });
   const run = (code) => vm.runInContext(code, context);
   run(source.slice(source.indexOf('class ApiError '), source.indexOf('function markUnauthorized(')));
+  run(source.slice(source.indexOf('function updateProjectFormControls('), source.indexOf('function renderProviderList(')));
   run(source.slice(source.indexOf('function updateProviderCredentialFields('), source.indexOf('function populateModels(')));
   run(source.slice(source.indexOf('function updateControls('), source.indexOf('function resetRunState(')));
   run(source.slice(source.indexOf('function selectSettingsSection('), source.indexOf('/* Wiring */')));
@@ -131,6 +136,7 @@ function thinkingFixture(config = {}) {
     fail(status, message) { failure = { status, message }; },
     pause() { wait = new Promise((resolve) => { release = resolve; }); },
     resume() { release(); },
+    allowDiscard(value) { discard = value; },
   };
 }
 
@@ -279,8 +285,101 @@ test('provider API tokens save only with a stored reference and clear after succ
   assert.equal(dom.providerTokenField.hidden, true);
 });
 
+test('editors separate list, create and edit modes and protect unsaved drafts', () => {
+  const f = thinkingFixture();
+  assert.equal(f.dom.providerForm.hidden, true);
+  assert.equal(f.dom.modelForm.hidden, true);
+  f.dom.newProvider.listeners.click();
+  assert.equal(f.dom.providerForm.hidden, false);
+  assert.equal(f.dom.providerEditorMode.textContent, 'NEW PROVIDER');
+  assert.equal(f.dom.saveProvider.textContent, 'Create provider');
+  f.dom.providerDisplay.value = 'Draft connection';
+  f.dom.providerForm.listeners.input();
+  f.allowDiscard(false);
+  f.run("editProvider('local')");
+  assert.equal(f.dom.providerDisplay.value, 'Draft connection');
+  f.dom.cancelProvider.listeners.click();
+  assert.equal(f.dom.providerForm.hidden, false);
+  f.allowDiscard(true);
+  f.dom.cancelProvider.listeners.click();
+  assert.equal(f.dom.providerForm.hidden, true);
+  assert.equal(f.dom.providerForm.dataset.dirty, 'false');
+  f.run("editProvider('local')");
+  assert.equal(f.dom.providerEditorMode.textContent, 'EDIT PROVIDER');
+  assert.equal(f.dom.providerId.readOnly, true);
+  assert.equal(f.dom.saveProvider.textContent, 'Save changes');
+  f.dom.newModel.listeners.click();
+  assert.equal(f.dom.modelForm.hidden, false);
+  assert.equal(f.dom.modelAdvanced.open, false);
+  f.dom.modelForm.listeners.change();
+  f.allowDiscard(false);
+  f.run("editModel('fast')");
+  assert.equal(f.dom.modelEditorMode.textContent, 'NEW MODEL');
+  f.allowDiscard(true);
+  f.run("editModel('fast')");
+  assert.equal(f.dom.modelEditorMode.textContent, 'EDIT MODEL');
+});
+
+test('new entries cannot silently replace an existing provider or model ID', async () => {
+  const f = thinkingFixture();
+  f.dom.newProvider.listeners.click();
+  f.dom.providerId.value = 'local';
+  await f.submit('providerForm');
+  assert.match(f.dom.providerStatus.textContent, /already exists/);
+  f.dom.newModel.listeners.click();
+  f.dom.modelId.value = 'fast';
+  await f.submit('modelForm');
+  assert.match(f.dom.modelStatus.textContent, /already exists/);
+  assert.equal(f.requests.length, 0);
+});
+
+test('saving freezes editors, prevents duplicate writes, preserves failures and clears successful drafts', async () => {
+  const f = thinkingFixture();
+  f.run("editProvider('local')");
+  f.dom.providerForm.listeners.input();
+  f.pause();
+  const pending = f.submit('providerForm');
+  assert.equal(f.dom.providerFields.disabled, true);
+  assert.equal(f.dom.modelFields.disabled, true);
+  assert.equal(f.dom.newProvider.disabled, true);
+  assert.equal(f.dom.cancelProvider.disabled, true);
+  assert.equal(f.dom.saveThinking.disabled, true);
+  assert.equal(f.dom.saveProvider.textContent, 'Saving…');
+  await f.submit('providerForm');
+  await f.submit('thinkingForm');
+  f.dom.newProvider.listeners.click();
+  assert.equal(f.dom.providerId.value, 'local');
+  assert.equal(f.requests.length, 1);
+  f.resume();
+  await pending;
+  assert.equal(f.dom.providerFields.disabled, false);
+  assert.equal(f.dom.providerForm.dataset.dirty, 'false');
+  assert.equal(f.dom.saveProvider.textContent, 'Save changes');
+
+  f.run("editModel('fast')");
+  f.dom.modelName.value = 'draft-model';
+  f.dom.modelForm.listeners.input();
+  f.fail(500, 'Cannot save');
+  await f.submit('modelForm');
+  assert.equal(f.dom.modelFields.disabled, false);
+  assert.equal(f.dom.modelName.value, 'draft-model');
+  assert.equal(f.dom.modelForm.dataset.dirty, 'true');
+  assert.equal(f.dom.modelStatus.dataset.state, 'error');
+});
+
+test('referenced providers explain deletion refusal without sending a request', async () => {
+  const f = thinkingFixture();
+  f.run("editProvider('local')");
+  assert.equal(f.dom.deleteProvider.disabled, true);
+  assert.equal(f.dom.providerDeleteHint.hidden, false);
+  assert.match(f.dom.providerDeleteHint.textContent, /fast/);
+  await f.dom.deleteProvider.listeners.click();
+  assert.equal(f.requests.length, 0);
+  assert.match(f.dom.providerStatus.textContent, /Reassign/);
+});
+
 test('provider deletion uses the authenticated DELETE route and updates the list', async () => {
-  const { dom, state, requests, run } = thinkingFixture();
+  const { dom, state, requests, run } = thinkingFixture({ models: [] });
   run("editProvider('local')");
   assert.equal(dom.deleteProvider.hidden, false);
   await dom.deleteProvider.listeners.click();

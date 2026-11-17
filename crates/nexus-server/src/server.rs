@@ -397,6 +397,7 @@ pub struct Server {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     pending_sessions: AtomicUsize,
     next_restore: AtomicU64,
+    project_picker: Mutex<()>,
     /// The live configuration document. Every read and write goes through
     /// this one lock so a run's usage record and the redacted summary can
     /// never observe a half-applied change.
@@ -484,6 +485,7 @@ impl Server {
             sessions: Mutex::new(HashMap::new()),
             pending_sessions: AtomicUsize::new(0),
             next_restore: AtomicU64::new(1),
+            project_picker: Mutex::new(()),
             config: Mutex::new(UserConfig::default_config()),
             config_path: None,
             limits: nexus_config::SettingsProfile::Server.default_limits(),
@@ -1230,6 +1232,9 @@ impl Server {
             Route::UpsertModel => Some(self.upsert_model(body)),
             Route::Projects => Some(json_response(200, &self.projects_body())),
             Route::AddProject => Some(self.add_project(body)),
+            Route::PickProjectFolder => {
+                Some(self.pick_project_folder(crate::project_picker::pick_folder))
+            }
             Route::RemoveProject { project } => Some(self.remove_project(project)),
             Route::NotFound => Some(json_response(404, &json::error_body("unknown route"))),
         }
@@ -1447,6 +1452,44 @@ impl Server {
         body_json(document)
     }
 
+    fn pick_project_folder(
+        &self,
+        picker: impl FnOnce() -> Result<Option<PathBuf>, crate::project_picker::PickerError>,
+    ) -> Response {
+        if self.auth_token.is_none() {
+            return json_response(
+                503,
+                &json::error_body("server authentication is not configured"),
+            );
+        }
+        if !matches!(
+            self.tools_mode,
+            ToolsMode::Development { .. } | ToolsMode::RealFiles { .. }
+        ) {
+            return json_response(409, &json::error_body("projects are not enabled"));
+        }
+        let Ok(_guard) = self.project_picker.try_lock() else {
+            return json_response(
+                409,
+                &json::error_body("a folder dialog is already open on the server"),
+            );
+        };
+        match picker() {
+            Ok(Some(path)) => match crate::projects::validate_project_root(&path) {
+                Ok(path) => json_response(
+                    200,
+                    &body_json(serde_json::json!({
+                        "path": path.to_str(),
+                        "name": path.file_name().and_then(|name| name.to_str()),
+                    })),
+                ),
+                Err(error) => json_response(400, &json::error_body(error.message())),
+            },
+            Ok(None) => json_response(200, &body_json(serde_json::json!({ "cancelled": true }))),
+            Err(error) => json_response(503, &json::error_body(error.message())),
+        }
+    }
+
     /// Adds one validated project root. Requires local real tools and a
     /// writable catalog path for durable admission.
     fn add_project(&self, body: &Value) -> Response {
@@ -1462,9 +1505,10 @@ impl Server {
         ) {
             return json_response(409, &json::error_body("projects are not enabled"));
         }
-        let name = match body_str(body, "name") {
-            Some(name) => name,
-            None => return json_response(400, &json::error_body("project name is invalid")),
+        let name = match body.get("name") {
+            None => "",
+            Some(Value::String(name)) => name,
+            Some(_) => return json_response(400, &json::error_body("project name is invalid")),
         };
         let path = match body_str(body, "path") {
             Some(path) => path,
@@ -2475,6 +2519,8 @@ enum Route<'a> {
     Projects,
     /// `POST /projects`: add one validated project root.
     AddProject,
+    /// `POST /projects/pick-folder`: native chooser on the server desktop.
+    PickProjectFolder,
     /// `DELETE /projects/{id}`.
     RemoveProject { project: &'a str },
     /// Anything else.
@@ -2527,6 +2573,7 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
         ("POST", ["", "config", "models"]) => Route::UpsertModel,
         ("GET", ["", "projects"]) => Route::Projects,
         ("POST", ["", "projects"]) => Route::AddProject,
+        ("POST", ["", "projects", "pick-folder"]) => Route::PickProjectFolder,
         ("DELETE", ["", "projects", project]) if !project.is_empty() => {
             Route::RemoveProject { project }
         }
@@ -2727,6 +2774,87 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    #[test]
+    fn project_picker_validates_results_and_serializes_dialogs_without_registering_projects() {
+        use crate::project_picker::PickerError;
+        let (mut server, _runtime) = server_with_gated_config();
+        assert_eq!(
+            server
+                .pick_project_folder(|| panic!("no authentication"))
+                .status,
+            503
+        );
+        server.set_auth_token(&"a".repeat(64)).unwrap();
+        assert_eq!(
+            server
+                .pick_project_folder(|| panic!("no real tools"))
+                .status,
+            409
+        );
+        let root = std::env::temp_dir().join(format!(
+            "nexus-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        server
+            .set_tools_mode(ToolsMode::Development { root: root.clone() })
+            .unwrap();
+        let selected = server.pick_project_folder(|| Ok(Some(root.clone())));
+        assert_eq!(selected.status, 200);
+        let selected: Value = serde_json::from_slice(&selected.body).unwrap();
+        assert_eq!(
+            selected["path"],
+            std::fs::canonicalize(&root).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            selected["name"],
+            root.file_name().unwrap().to_str().unwrap()
+        );
+        assert!(server.projects.lock().unwrap().projects().is_empty());
+        assert_eq!(
+            server
+                .pick_project_folder(|| Ok(Some(PathBuf::from("/"))))
+                .status,
+            400
+        );
+        assert_eq!(
+            server
+                .pick_project_folder(|| Ok(Some(PathBuf::from("relative"))))
+                .status,
+            400
+        );
+        assert_eq!(
+            server
+                .pick_project_folder(|| Err(PickerError::TimedOut))
+                .status,
+            503
+        );
+        let cancelled = server.pick_project_folder(|| {
+            assert_eq!(
+                server
+                    .pick_project_folder(|| panic!("second dialog"))
+                    .status,
+                409
+            );
+            Ok(None)
+        });
+        assert_eq!(cancelled.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&cancelled.body).unwrap()["cancelled"],
+            true
+        );
+        assert_eq!(
+            server.pick_project_folder(|| Ok(None)).status,
+            200,
+            "dialog lock released"
+        );
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn tools_settings_are_atomic_and_rejected_with_sessions_or_reservations() {
