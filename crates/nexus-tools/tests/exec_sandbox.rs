@@ -73,6 +73,47 @@ fn read_fixture_headers(reader: &mut impl std::io::Read) -> std::io::Result<()> 
 }
 
 #[test]
+fn loopback_fixture_waits_for_a_request_that_arrives_after_accept() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = std::thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                // BSD/macOS inherits the listener's nonblocking flag into the
+                // accepted socket; a timed read must be blocking first.
+                Ok((mut socket, _)) => {
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    read_fixture_headers(&mut socket).unwrap();
+                    socket.write_all(b"ok").unwrap();
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        }
+    });
+    let mut control = std::net::TcpStream::connect(address).unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    control
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    control.read_to_string(&mut response).unwrap();
+    assert_eq!(response, "ok");
+    worker.join().unwrap();
+}
+
+#[test]
 fn loopback_fixture_reads_fragmented_headers_and_rejects_incomplete_or_oversized_requests() {
     use std::io::{Cursor, Read};
     let first = Cursor::new(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r");
@@ -125,6 +166,10 @@ fn network_policy_reaches_live_service_only_when_enabled() {
             while !stopped.load(Ordering::Acquire) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
+                        // macOS inherits the listener's nonblocking flag. Reset
+                        // it before the timed read; otherwise WouldBlock closes
+                        // the socket while the client's request is still unread.
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
