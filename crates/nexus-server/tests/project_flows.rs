@@ -124,6 +124,46 @@ fn fake_server() -> Server {
 }
 
 #[test]
+fn project_names_default_to_folder_names_and_picker_requires_auth_and_local_tools() {
+    let root = temp_root("default-name");
+    let extra = root.join("Folder with spaces");
+    let second = root.join("second");
+    std::fs::create_dir(&extra).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let port = spawn(development_server(&root, None));
+    let (status, body) = post(
+        port,
+        "/projects",
+        &serde_json::json!({ "path": extra }).to_string(),
+    );
+    assert_eq!(status, 201, "omitted name uses the folder: {body}");
+    assert_eq!(body["project"]["name"], "Folder with spaces");
+    let (status, body) = post(
+        port,
+        "/projects",
+        &serde_json::json!({ "path": second, "name": "  " }).to_string(),
+    );
+    assert_eq!(status, 201);
+    assert_eq!(body["project"]["name"], "second");
+    let (status, _) = post(
+        port,
+        "/projects",
+        &serde_json::json!({ "path": second, "name": 42 }).to_string(),
+    );
+    assert_eq!(status, 400, "non-string names are still invalid");
+    let (status, _) = round_trip(
+        port,
+        &format!(
+            "POST /projects/pick-folder HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\ncontent-length: 2\r\n\r\n{{}}"
+        ),
+    );
+    assert_eq!(status, 401, "unauthenticated callers cannot open a dialog");
+    let (status, _) = post(spawn(fake_server()), "/projects/pick-folder", "{}");
+    assert_eq!(status, 409, "fake tools cannot open a native dialog");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn project_metadata_reports_offline_tools_without_changing_project_availability() {
     let root = temp_root("offline");
     let mut server = development_server(&root, None);

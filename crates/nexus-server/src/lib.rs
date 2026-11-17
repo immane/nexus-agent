@@ -148,6 +148,7 @@
 mod auth;
 pub mod http;
 pub mod json;
+mod project_picker;
 pub mod projects;
 pub mod server;
 mod web;
