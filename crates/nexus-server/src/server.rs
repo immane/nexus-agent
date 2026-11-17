@@ -693,12 +693,37 @@ impl Server {
                 || existing.model.as_deref() != model
                 || existing.project.as_deref() != project
             {
-                return Err(SessionError::new(
-                    409,
-                    "session is open with different settings",
-                ));
+                // A session is bound for its lifetime, but an idle runtime may
+                // be replaced under the same saved identity. Live work and SSE
+                // subscribers still refuse a silent rebinding.
+                if !self.session_is_reclaimable(&existing) {
+                    return Err(SessionError::new(
+                        409,
+                        "session is active with different settings; retry after it is idle",
+                    ));
+                }
+                let removed = {
+                    let mut sessions = self.sessions.lock().expect("sessions lockable");
+                    let replaceable = sessions.get(id).is_some_and(|current| {
+                        Arc::ptr_eq(current, &existing)
+                            && Arc::strong_count(current) == 2
+                            && !*current.streaming.lock().expect("stream flag lockable")
+                    });
+                    replaceable.then(|| sessions.remove(id)).flatten()
+                };
+                let Some(removed) = removed else {
+                    return Err(SessionError::new(
+                        409,
+                        "session is active with different settings; retry after it is idle",
+                    ));
+                };
+                if let Some(run) = removed.last_run.lock().expect("last run lockable").clone() {
+                    self.record_model_use(run.as_str());
+                }
+                drop(removed);
+            } else {
+                return Ok(id.to_owned());
             }
-            return Ok(id.to_owned());
         }
         if store.load_session(&session).is_err() {
             return Err(SessionError::new(404, "saved session was not found"));
@@ -963,6 +988,33 @@ impl Server {
         self.cleanup_idle_sessions_at(Instant::now());
     }
 
+    /// Whether an idle session owns no live work: no attached SSE subscriber,
+    /// no unconfirmed worker, and no active run. Used by idle maintenance and
+    /// by an explicit restore that replaces a differently-bound idle runtime.
+    fn session_is_reclaimable(&self, session: &Session) -> bool {
+        if *session.streaming.lock().expect("stream flag lockable") {
+            return false;
+        }
+        let last_run = session.last_run.lock().expect("last run lockable").clone();
+        let Some(run) = last_run else {
+            return true;
+        };
+        let request = GetSnapshotCommand {
+            request: session.request_id(),
+            run,
+        };
+        let runtime = session.runtime.lock().expect("runtime lockable");
+        if self.handle.block_on(runtime.has_unconfirmed_work()) {
+            return false;
+        }
+        let (reply, snapshot) = self.handle.block_on(runtime.get_snapshot(request));
+        matches!(
+            (reply.reply(), snapshot),
+            (CommandReply::Accepted, Some(snapshot))
+                if snapshot.lifecycle() != nexus_core::RunLifecycle::Active
+        )
+    }
+
     fn cleanup_idle_sessions_at(&self, now: Instant) {
         let idle = Duration::from_secs(self.server_settings.session_idle_seconds);
         let candidates = {
@@ -986,27 +1038,7 @@ impl Server {
                 .lock()
                 .expect("last run lockable")
                 .clone();
-            let reclaimable = match last_run.as_ref() {
-                None => true,
-                Some(run) => {
-                    let request = GetSnapshotCommand {
-                        request: candidate.request_id(),
-                        run: run.clone(),
-                    };
-                    let runtime = candidate.runtime.lock().expect("runtime lockable");
-                    if self.handle.block_on(runtime.has_unconfirmed_work()) {
-                        false
-                    } else {
-                        let (reply, snapshot) = self.handle.block_on(runtime.get_snapshot(request));
-                        matches!(
-                            (reply.reply(), snapshot),
-                            (CommandReply::Accepted, Some(snapshot))
-                                if snapshot.lifecycle() != nexus_core::RunLifecycle::Active
-                        )
-                    }
-                }
-            };
-            if !reclaimable {
+            if !self.session_is_reclaimable(&candidate) {
                 continue;
             }
             let removed = {
@@ -1937,6 +1969,13 @@ impl Server {
         let reply = self.handle.block_on(runtime.submit(command));
         let status = match reply.reply() {
             CommandReply::Accepted => 201,
+            CommandReply::Rejected
+                if reply.error().is_some_and(|error| {
+                    error.category() == nexus_core::ErrorCategory::StorageFailure
+                }) =>
+            {
+                503
+            }
             _ => crate::json::reply_status(reply.reply()),
         };
         // Only an accepted run may be recorded: a rejected, busy, or
@@ -1960,12 +1999,15 @@ impl Server {
                 );
             }
         }
-        let body = match reply.run() {
+        let mut body = match reply.run() {
             Some(run) => {
                 serde_json::json!({ "reply": crate::json::reply_name(reply.reply()), "run": run.as_str() })
             }
             None => serde_json::json!({ "reply": crate::json::reply_name(reply.reply()) }),
         };
+        if let Some(error) = reply.error() {
+            body["error"] = serde_json::Value::String(error.message().to_owned());
+        }
         Some(json_response(status, &body_json(body)))
     }
 
@@ -2968,6 +3010,170 @@ mod tests {
         drop(server);
         drop(executor);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn idle_restore_rebinds_different_settings_but_refuses_a_streaming_session() {
+        use nexus_core::{
+            ModelContextItem, STORE_FORMAT_REVISION, SessionCheckpoint, SessionStore,
+        };
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-server-restore-rebind-{}-{nonce}",
+            std::process::id()
+        ));
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = SessionId::new("sess-web-rebind-1").unwrap();
+        let run = RunId::new("run-rebind-1").unwrap();
+        let mut store = nexus_session::FileSessionStore::open(directory.join("store")).unwrap();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    STORE_FORMAT_REVISION,
+                    1,
+                    Vec::new(),
+                    WEB_PROFILE,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_source_items(
+                &session,
+                &run,
+                &[ModelContextItem::user_text("saved task").unwrap()],
+            )
+            .unwrap();
+        drop(store);
+
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut server = Server::new(executor.handle().clone());
+        server.set_session_store(SessionStoreHandle::new(Box::new(
+            nexus_session::FileSessionStore::open(directory.join("store")).unwrap(),
+        )));
+        server
+            .set_tools_mode(ToolsMode::Development {
+                root: workspace.clone(),
+            })
+            .unwrap();
+        let token = match server.restore_session(session.as_str(), None, None, None) {
+            Ok(token) => token,
+            Err(error) => panic!(
+                "initial restore failed: HTTP {} {}",
+                error.status(),
+                error.message()
+            ),
+        };
+        let first = server.sessions.lock().unwrap()[&token].clone();
+        assert_eq!(first.provider, None);
+        assert_eq!(first.project, None);
+
+        // Repeating matching settings is a no-op, even with a live subscriber.
+        *first.streaming.lock().unwrap() = true;
+        assert_eq!(
+            match server.restore_session(session.as_str(), None, None, None) {
+                Ok(token) => token,
+                Err(error) => panic!(
+                    "matching restore failed: HTTP {} {}",
+                    error.status(),
+                    error.message()
+                ),
+            },
+            token
+        );
+        assert!(Arc::ptr_eq(
+            &first,
+            &server.sessions.lock().unwrap()[&token]
+        ));
+
+        // A live subscriber still blocks replacing the runtime's settings.
+        let error = server
+            .restore_session(session.as_str(), None, None, Some(DEFAULT_PROJECT_ID))
+            .unwrap_err();
+        assert_eq!(error.status(), 409);
+        assert!(error.message().contains("active with different settings"));
+        *first.streaming.lock().unwrap() = false;
+        // Mirrors the request path: only the map and the lookup's own Arc may
+        // reference an idle runtime when it is replaced.
+        let first_ptr = Arc::as_ptr(&first);
+        drop(first);
+
+        // Once idle, the differently-bound runtime is replaced under the same
+        // saved identity; the reloaded history comes from the store.
+        assert_eq!(
+            match server.restore_session(session.as_str(), None, None, Some(DEFAULT_PROJECT_ID)) {
+                Ok(token) => token,
+                Err(error) => panic!(
+                    "idle rebind failed: HTTP {} {}",
+                    error.status(),
+                    error.message()
+                ),
+            },
+            token
+        );
+        let rebound = server.sessions.lock().unwrap()[&token].clone();
+        assert!(!std::ptr::eq(first_ptr, Arc::as_ptr(&rebound)));
+        assert_eq!(rebound.provider, None);
+        assert_eq!(rebound.project.as_deref(), Some(DEFAULT_PROJECT_ID));
+
+        drop(rebound);
+        drop(server);
+        drop(executor);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn submit_storage_failure_reports_recovery_error_without_minting_a_run() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-server-storage-refusal-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut server = Server::new(executor.handle().clone());
+        server.set_session_store(SessionStoreHandle::new(Box::new(store)));
+        let token = server.create_session().unwrap();
+        let entry = server.session(&token).unwrap();
+        let server = Arc::new(server);
+        // Fail this test's initial durable input write, before any model work.
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, "block storage directory").unwrap();
+        let response = server
+            .submit_run(&entry, &serde_json::json!({"input":"continue"}))
+            .unwrap();
+        assert_eq!(response.status, 503);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["reply"], "rejected");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+        );
+        assert!(body.get("run").is_none());
+        assert!(entry.last_run.lock().unwrap().is_none());
+        assert!(server.run_models.lock().unwrap().is_empty());
+        drop(entry);
+        drop(server);
+        drop(executor);
+        std::fs::remove_file(directory).unwrap();
     }
 
     #[test]

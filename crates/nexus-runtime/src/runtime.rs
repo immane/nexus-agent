@@ -66,6 +66,9 @@ use context_compaction::{PendingCompaction, prepare_context_request};
 
 // Observation time for cooperative cleanup, not additional execution authority.
 const TOOL_CLEANUP_GRACE: Duration = Duration::from_secs(2);
+// Observe an already-started durable write after cancellation without granting
+// new model/tool work or waiting indefinitely on a blocked filesystem.
+const STORE_CLEANUP_GRACE: Duration = Duration::from_millis(250);
 
 /// Single-run lifecycle states (design 02-execution baseline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +130,7 @@ struct Shared {
     tool_order: Vec<String>,
     tool_definitions: Vec<ToolSpec>,
     session_store: Option<Arc<StdMutex<Box<dyn SessionStore + Send>>>>,
-    /// An interrupted write must be reconciled by reopening, never retried.
+    /// A write unresolved after cleanup must be reconciled by reopening, never retried.
     store_uncertain: AtomicBool,
     state: Mutex<State>,
     data_tx: mpsc::Sender<RunEvent>,
@@ -970,7 +973,11 @@ impl Runtime {
             return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
         }
         if self.shared.store_uncertain.load(Ordering::SeqCst) {
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None)
+                .with_error(runtime_error(
+                    ErrorCategory::StorageFailure,
+                    "session store write is unresolved; reopen the store and restore the saved session before continuing",
+                ));
         }
         let run_n = self.shared.run_counter.fetch_add(1, Ordering::SeqCst);
         let run = RunId::new(format!("r{:x}-{run_n}", self.shared.incarnation))
@@ -1140,7 +1147,7 @@ impl Runtime {
     ) -> CommandResponse {
         // Reserve the active slot before I/O, but never hold the state lock
         // while waiting for the blocking store. Concurrent commands stay live.
-        if let Err(_error) = self
+        if let Err(error) = self
             .persist_session_input(
                 &command.session,
                 &command.profile,
@@ -1158,7 +1165,8 @@ impl Runtime {
             {
                 state.active = None;
             }
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None)
+                .with_error(error);
         }
         if self.shared.session_store.is_some() {
             self.shared
@@ -3890,9 +3898,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// Blocking writes cannot be preempted. Stop waiting at live cancellation
-    /// or the run deadline, retain the worker, and refuse further store use
-    /// until the host reopens/reconciles it.
+    /// Blocking writes cannot be preempted. On cancellation/deadline, allow a
+    /// bounded observation-only grace period. Only an unresolved worker requires
+    /// quarantine and reopening; an observed commit remains safe to continue.
     async fn await_store<T: Send + 'static>(
         &self,
         run: &RunId,
@@ -3907,29 +3915,43 @@ impl Runtime {
                 .map(|active| (active.token.clone(), active.wake.clone(), active.deadline))
         };
         let mut interrupted = RunOutcome::Cancelled;
-        if let Some((token, wake, deadline)) = control {
+        let completed = if let Some((token, wake, deadline)) = control {
             loop {
                 if token.is_cancelled() {
-                    break;
+                    break None;
                 }
                 if StdInstant::now() >= deadline {
                     interrupted = RunOutcome::LimitReached;
-                    break;
+                    break None;
                 }
                 tokio::select! {
                     result = &mut worker => {
-                        return match result {
-                            Ok(result) => result,
-                            Err(_) => {
-                                self.shared.store_uncertain.store(true, Ordering::SeqCst);
-                                Err(runtime_error(ErrorCategory::StorageFailure, "session store worker failed; reopen required"))
-                            }
-                        };
+                        break Some(result);
                     }
                     () = wake.notified() => {}
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
                 }
             }
+        } else {
+            None
+        };
+        let completed = match completed {
+            Some(result) => Some(result),
+            None => tokio::time::timeout(STORE_CLEANUP_GRACE, &mut worker)
+                .await
+                .ok(),
+        };
+        if let Some(result) = completed {
+            return match result {
+                Ok(result) => result,
+                Err(_) => {
+                    self.shared.store_uncertain.store(true, Ordering::SeqCst);
+                    Err(runtime_error(
+                        ErrorCategory::StorageFailure,
+                        "session store worker failed; reopen required",
+                    ))
+                }
+            };
         }
         let error = runtime_error(
             ErrorCategory::StorageFailure,
@@ -13308,6 +13330,29 @@ mod cov_runtime_topup_private {
     }
 
     #[test]
+    fn cancelled_or_expired_run_observes_completed_store_write_without_poisoning() {
+        for cancel in [true, false] {
+            let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
+            let run = run_id("completed-store");
+            let mut active = active_for(&run);
+            if cancel {
+                active.token.cancel();
+            } else {
+                active.deadline = StdInstant::now();
+            }
+            test_rt().block_on(async {
+                install(&bed, active).await;
+                let worker = tokio::task::spawn_blocking(|| Ok::<_, AgentError>(42));
+                assert_eq!(bed.runtime.await_store(&run, worker).await.unwrap(), 42);
+                assert!(!bed.shared.store_uncertain.load(Ordering::SeqCst));
+                let state = bed.shared.state.lock().await;
+                assert!(state.quarantine.is_empty());
+                assert!(state.active.as_ref().unwrap().persistence_error.is_none());
+            });
+        }
+    }
+
+    #[test]
     fn interrupted_store_worker_is_owned_and_does_not_block_runtime_state() {
         for cancel in [true, false] {
             let bed = make_bed(Limits::m0_test(), true, Vec::new(), None, None);
@@ -13364,6 +13409,22 @@ mod cov_runtime_topup_private {
                     bed.shared.store_uncertain.load(Ordering::SeqCst),
                     "late completion does not make an interrupted write safe to retry"
                 );
+                let reply = bed
+                    .runtime
+                    .submit(
+                        SubmitCommand::new(
+                            RequestId::new("req-unresolved-store").unwrap(),
+                            session_id(),
+                            "continue",
+                            "profile",
+                        )
+                        .unwrap(),
+                    )
+                    .await;
+                assert_eq!(reply.reply(), CommandReply::Rejected);
+                let error = reply.error().expect("storage refusal explains recovery");
+                assert_eq!(error.category(), ErrorCategory::StorageFailure);
+                assert!(error.message().contains("restore the saved session"));
             });
         }
     }
@@ -13550,6 +13611,132 @@ mod cov_runtime_topup_private {
         assert_eq!(
             records[3].item(),
             &ModelContextItem::assistant_text("item-0", "finished after read").unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cancelled_tool_result_is_saved_and_same_session_accepts_next_run() {
+        let directory = std::env::temp_dir().join(format!(
+            "nexus-runtime-cancel-continue-{}-{}",
+            std::process::id(),
+            next_incarnation()
+        ));
+        let mut store = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let run = run_id("cancel-during-tool");
+        let call = read_call(&run, call_id("cancel-during-tool"));
+        let mut active = active_for(&run);
+        let session = active.session.clone();
+        store
+            .initialize_session(
+                &SessionCheckpoint::new(
+                    session.clone(),
+                    STORE_FORMAT_REVISION,
+                    0,
+                    Vec::new(),
+                    active.profile.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        active.conversation = vec![
+            ModelContextItem::user_text("read something").unwrap(),
+            ModelContextItem::assistant_call("item-0", "prov-ref-0", call.clone()).unwrap(),
+        ];
+        store
+            .append_source_items(&session, &run, &active.conversation)
+            .unwrap();
+        active.source_cursor = active.conversation.len();
+        active.current = Some(current_call(&call, None));
+        let read = Arc::new(ScriptedTool::new("host_read", None));
+        let provider = Arc::new(ScriptedProvider::new(vec![stop_turn("continued")]));
+        let (runtime, mut streams) = Runtime::try_new_with_session_store(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: true,
+            },
+            provider,
+            vec![ToolRegistration::read(read.clone())],
+            ModelInstructions::default(),
+            Box::new(store),
+        )
+        .unwrap();
+        test_rt().block_on(async {
+            {
+                let mut state = runtime.shared.state.lock().await;
+                state.durable_sessions.insert(session.clone());
+                state.active = Some(active);
+            }
+            assert!(matches!(
+                runtime.on_executing(&run).await,
+                Ok(RunState::RecordingResult)
+            ));
+            assert_eq!(
+                runtime
+                    .cancel(CancelCommand {
+                        request: RequestId::new("req-cancel-result").unwrap(),
+                        run: run.clone(),
+                    })
+                    .await
+                    .reply(),
+                CommandReply::Accepted
+            );
+            runtime
+                .set_terminal(&run, RunOutcome::Cancelled, None)
+                .await;
+            assert!(matches!(
+                runtime.on_recording(&run).await,
+                Ok(RunState::Finished)
+            ));
+            runtime.finish_run(&run, RunOutcome::Cancelled, None).await;
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    assert_eq!(finished.outcome(), RunOutcome::Cancelled);
+                    assert_eq!(finished.persistence(), PersistenceState::Saved);
+                    break;
+                }
+            }
+            assert!(!runtime.shared.store_uncertain.load(Ordering::SeqCst));
+            let reply = runtime
+                .submit(
+                    SubmitCommand::new(
+                        RequestId::new("req-continue-after-cancel").unwrap(),
+                        session.clone(),
+                        "continue",
+                        "cov-profile",
+                    )
+                    .unwrap(),
+                )
+                .await;
+            assert_eq!(reply.reply(), CommandReply::Accepted);
+            loop {
+                let event = streams.control.recv().await.unwrap();
+                if let EventPayload::RunFinished(finished) = event.payload() {
+                    assert_eq!(finished.outcome(), RunOutcome::Completed);
+                    assert_eq!(finished.persistence(), PersistenceState::Saved);
+                    break;
+                }
+            }
+        });
+        assert_eq!(
+            read.execution_count(),
+            1,
+            "continuation never replays the tool"
+        );
+        drop(runtime);
+        let reopened = nexus_session::FileSessionStore::open(&directory).unwrap();
+        let records = reopened.load_source_records(&session, 0, 10).unwrap();
+        assert_eq!(records.len(), 5);
+        assert!(matches!(
+            records[2].item(),
+            ModelContextItem::ToolResult { .. }
+        ));
+        assert_eq!(
+            records[3].item(),
+            &ModelContextItem::user_text("continue").unwrap()
         );
         drop(reopened);
         std::fs::remove_dir_all(directory).unwrap();

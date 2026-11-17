@@ -24,6 +24,13 @@ tests, and clippy commands share the target directory lock and do not accelerate
 validation. Avoid checking the same code immediately before clippy (which already
 checks it).
 
+Cancellation/storage regressions in `nexus-runtime` cover completed writes after
+cancellation or deadline expiry, saved tool outcomes followed by another run in
+the same session without replay, and blocked writers that remain protected even
+after late completion. Server tests assert storage refusals return HTTP 503 with
+an explicit diagnostic and mint no run. These tests use local stores and gated
+workers, not live providers.
+
 Small-context runtime regressions include metadata-only budget diagnostics for
 pre-reduction, protected-floor, summary-candidate, retained-view, and final
 request stages. `cargo nextest run -p nexus-runtime budget_ --locked --offline`

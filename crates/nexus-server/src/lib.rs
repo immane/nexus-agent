@@ -53,6 +53,8 @@
 //! - `POST /sessions/{sid}/runs` with `{"input": "...", "profile?": "..."}`
 //!   -> `201 {"reply":"Accepted","run":"..."}` on acceptance,
 //!   `409` while the session's run slot is busy, `400` on invalid input.
+//!   Storage refusals return `503` with a safe `error` message. An unresolved
+//!   write requires reopening the store and restoring history, not blind retry.
 //! - `GET /sessions/{sid}/snapshot?run=<rid>` -> `200` with the bounded
 //!   snapshot, or the reply status (`404` for unknown runs).
 //! - `POST /sessions/{sid}/runs/{rid}/cancel` -> the runtime reply.

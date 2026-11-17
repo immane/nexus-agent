@@ -27,6 +27,12 @@ Machine-readable result/event output needs a documented wire revision before rel
 
 Replies distinguish accepted, rejected, already finalized, stale/unknown target, and busy outcomes as applicable. Every processed command has a correlated response; disconnected clients cannot assume they received it.
 
+Command replies may include a bounded safe `AgentError` diagnostic. Submit
+storage failures retain that diagnostic instead of looking like invalid input.
+The Web server returns HTTP 503 with `reply` and `error` for these refusals;
+the client displays the error without automatically resubmitting. Unresolved
+writes require reopening the store and explicitly restoring saved history.
+
 `Submit` returns a host-issued `RunId`. `RequestId` is correlation, not a promise of exactly-once processing. A frontend MUST resolve uncertain submission status instead of blindly resubmitting. Repeated approval/cancellation commands cannot cause duplicate tool dispatch.
 
 A second run is rejected as busy in the baseline. Changing this behavior requires a bounded scheduling contract, not an implicit submission queue.

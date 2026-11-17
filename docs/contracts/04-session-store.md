@@ -35,6 +35,14 @@ Runtime exposes an opt-in constructor that initializes a checkpoint, persists
 accepted user input, complete assistant context items, and tool results, and
 writes tool intents before dispatch. Source items are committed before the run
 advances to dispatch/another model turn; write failure terminates the run.
+On cancellation or deadline expiry, runtime observes an already-started storage
+worker for up to 250 ms per write. A confirmed commit does not poison the
+session: cancelled tool outcomes and source records can finish saving, and the
+next run may continue normally. This grace period grants no model/tool execution
+authority and never retries the write. If the worker remains unresolved, runtime
+retains it, marks persistence failed, and refuses new submissions until the
+host reopens/reconciles the store and explicitly restores history. Late completion
+after that bound does not automatically clear the protection.
 TUI storage uses the platform default user data directory outside the project.
 Its bounded metadata index is opened at startup; each session's history and
 operation journal live in an independent file and are decoded only when that
