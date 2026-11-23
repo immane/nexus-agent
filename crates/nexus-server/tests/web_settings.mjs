@@ -9,9 +9,16 @@ test('project settings display reported tool networking without guessing old-ser
   const state = { projects: { enabled: true, mode: 'development', projects: [] } };
   const dom = Object.fromEntries(['projectName', 'projectPath', 'addProject', 'chooseProjectFolder', 'projectsNote', 'projectStatus']
     .map(key => [key, {}]));
-  dom.projectList = { replaceChildren() {} };
+  dom.projectList = {
+    children: [],
+    replaceChildren() { this.children = []; },
+    append(child) { this.children.push(child); },
+  };
   dom.projectForm = { setAttribute() {} };
-  const context = vm.createContext({ state, dom, configModeLabel: () => 'Development tools' });
+  const context = vm.createContext({
+    state, dom, configModeLabel: () => 'Development tools',
+    node: (tag, _class, text) => ({ tag, text }),
+  });
   vm.runInContext(source.slice(source.indexOf('function renderProjectsList('), source.indexOf('function renderProviderList(')), context);
   for (const [value, label] of [[undefined, 'not reported'], [true, 'enabled (host reachability)'], [false, 'disabled']]) {
     state.projects.network_access = value;
@@ -21,6 +28,15 @@ test('project settings display reported tool networking without guessing old-ser
   state.projects = { enabled: false, mode: 'container', network_access: false };
   vm.runInContext('renderProjectsList()', context);
   assert.ok(dom.projectsNote.textContent.includes('Tool network disabled'));
+  state.projects = { enabled: false, mode: 'fakes' };
+  vm.runInContext('renderProjectsList()', context);
+  assert.deepEqual(dom.projectList.children, []);
+  state.projects.desktop_project_picker = true;
+  vm.runInContext('renderProjectsList()', context);
+  assert.match(dom.projectsNote.textContent, /Local tools are off/);
+  assert.deepEqual(dom.projectList.children, [
+    { tag: 'a', text: 'Open Project…', href: 'nexus-agent://open-project' },
+  ]);
 });
 
 test('settings categories select one panel, retain form drafts and reset scrolling', () => {

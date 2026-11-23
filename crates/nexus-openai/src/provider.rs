@@ -1447,7 +1447,10 @@ fn spawn_tls(
 ) -> Result<TlsSource, ProviderEvent> {
     check_live(context, deadline)?;
     let target = join_host_port(host, port);
-    let mut command = std::process::Command::new("openssl");
+    let executable = std::env::var_os("NEXUS_OPENSSL_EXECUTABLE")
+        .filter(|path| std::path::Path::new(path).is_absolute())
+        .unwrap_or_else(|| "openssl".into());
+    let mut command = std::process::Command::new(executable);
     command
         .arg("s_client")
         .arg("-connect")

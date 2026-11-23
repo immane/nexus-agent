@@ -45,3 +45,48 @@ test('blocked storage leaves manual in-memory connection available', () => {
   assert.equal(run(`saveCredential('a'.repeat(64))`), false);
   assert.equal(run(`saveCredential('')`), false);
 });
+
+test('desktop login clears the fragment before exchanging the one-use code', async () => {
+  const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const code = 'c'.repeat(64);
+  const calls = [];
+  const replacements = [];
+  const context = vm.createContext({
+    URLSearchParams,
+    TOKEN_PATTERN: /^[a-f\d]{64}$/i,
+    location: { hash: `#nexus-login=${code}`, pathname: '/', search: '' },
+    history: { replaceState: (...args) => replacements.push(args) },
+    api: async (...args) => {
+      calls.push(args);
+      return { token: 'd'.repeat(64) };
+    },
+  });
+  const start = source.indexOf('async function redeemDesktopLoginCode()');
+  const end = source.indexOf('void (async () => {', start);
+  vm.runInContext(source.slice(start, end), context);
+
+  const exchange = vm.runInContext('redeemDesktopLoginCode()', context);
+  assert.deepEqual(replacements, [[null, '', '/']]);
+  assert.equal(await exchange, 'd'.repeat(64));
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [[
+    '/desktop-login',
+    { method: 'POST', credential: '', body: { code } },
+  ]]);
+});
+
+test('malformed desktop login fragments are removed without an API request', async () => {
+  const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  let requested = false;
+  const context = vm.createContext({
+    URLSearchParams,
+    TOKEN_PATTERN: /^[a-f\d]{64}$/i,
+    location: { hash: '#nexus-login=invalid', pathname: '/', search: '' },
+    history: { replaceState() {} },
+    api: async () => { requested = true; },
+  });
+  const start = source.indexOf('async function redeemDesktopLoginCode()');
+  const end = source.indexOf('void (async () => {', start);
+  vm.runInContext(source.slice(start, end), context);
+  assert.equal(await vm.runInContext('redeemDesktopLoginCode()', context), '');
+  assert.equal(requested, false);
+});

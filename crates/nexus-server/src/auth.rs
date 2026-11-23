@@ -39,6 +39,10 @@ impl AuthToken {
             .fold(0u8, |difference, (left, right)| difference | (left ^ right))
             == 0
     }
+
+    pub(crate) fn expose_for_desktop_login(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Whether a request can proceed at the HTTP trust boundary.
