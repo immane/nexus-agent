@@ -347,6 +347,15 @@ fn load_user_config(explicit: Option<&str>) -> (UserConfig, Option<PathBuf>) {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    if let [_, flag, path] = argv.as_slice()
+        && flag == "--check-project-root"
+    {
+        if nexus_server::projects::validate_project_root(std::path::Path::new(path)).is_err() {
+            eprintln!("nexus-server: project directory is unavailable or is not an allowed root");
+            std::process::exit(2);
+        }
+        return;
+    }
     let (
         network_access,
         port,
@@ -538,6 +547,11 @@ fn main() {
             std::process::exit(1);
         });
     let mut server = Server::new(runtime.handle().clone());
+    let desktop_launcher =
+        std::env::var_os("NEXUS_DESKTOP_LAUNCHER").is_some_and(|value| value == "1");
+    if desktop_launcher {
+        server.set_desktop_launcher();
+    }
     if let Err(error) = server.set_limits(settings.limits()) {
         eprintln!("nexus-server: invalid runtime limits ({error})");
         std::process::exit(2);
@@ -598,13 +612,18 @@ fn main() {
         // Fail fast on an unreadable jail: a missing default working
         // directory and an explicit bad root are both startup errors.
         let root = tools_root.unwrap_or_else(|| ".".to_owned());
+        let root = if desktop_launcher {
+            nexus_server::projects::validate_project_root(std::path::Path::new(&root))
+                .unwrap_or_else(|_| {
+                    eprintln!("nexus-server: desktop project directory is not an allowed root");
+                    std::process::exit(2);
+                })
+        } else {
+            PathBuf::from(root)
+        };
         let mode = match execution {
-            ExecutionMode::Local if strict_tools => ToolsMode::RealFiles {
-                root: PathBuf::from(&root),
-            },
-            ExecutionMode::Local => ToolsMode::Development {
-                root: PathBuf::from(&root),
-            },
+            ExecutionMode::Local if strict_tools => ToolsMode::RealFiles { root: root.clone() },
+            ExecutionMode::Local => ToolsMode::Development { root: root.clone() },
             ExecutionMode::Container => {
                 #[cfg(feature = "container")]
                 {
@@ -625,7 +644,10 @@ fn main() {
             }
         };
         if let Err(error) = server.set_tools_mode(mode) {
-            eprintln!("nexus-server: real tool root is unusable ({error}): {root}");
+            eprintln!(
+                "nexus-server: real tool root is unusable ({error}): {}",
+                root.display()
+            );
             std::process::exit(1);
         }
         if execution == ExecutionMode::Container {
@@ -633,11 +655,13 @@ fn main() {
                 "SECURITY WARNING: container isolation is not validated on native Linux; workspace is live-mounted and public egress/host-LAN-metadata denial are unverified."
             );
             eprintln!(
-                "nexus-server loopback API on 127.0.0.1:{port} (container tools at {root}, {providers}, authenticated; never expose)"
+                "nexus-server loopback API on 127.0.0.1:{port} (container tools at {}, {providers}, authenticated; never expose)",
+                root.display()
             );
         } else {
             eprintln!(
-                "nexus-server loopback API on 127.0.0.1:{port} (real tools at {root}, strict={strict_tools}, {providers}, authenticated; never expose)"
+                "nexus-server loopback API on 127.0.0.1:{port} (real tools at {}, strict={strict_tools}, {providers}, authenticated; never expose)",
+                root.display()
             );
         }
     } else {

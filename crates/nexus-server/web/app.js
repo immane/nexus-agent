@@ -900,9 +900,16 @@ function renderProjectsList() {
   const enabled = Boolean(state.projects?.enabled);
   updateProjectFormControls();
   if (!enabled) {
-    dom.projectsNote.textContent = state.projects?.mode === 'container'
+    dom.projectsNote.textContent = state.projects?.desktop_project_picker === true
+      ? 'Local tools are off. Open a project to enable them for that folder.'
+      : state.projects?.mode === 'container'
       ? `Container tools are active. Tool network ${state.projects.network_access === false ? 'disabled' : state.projects.network_access === true ? 'enabled (experimental public-egress gateway)' : 'not reported'}. Per-project roots are not available in container mode.`
       : 'Real tools are not enabled. Start nexus-server with --tools real --tools-root PATH to bind projects.';
+    if (state.projects?.desktop_project_picker === true) {
+      const open = node('a', '', 'Open Project…');
+      open.href = 'nexus-agent://open-project';
+      dom.projectList.append(open);
+    }
     dom.projectStatus.textContent = '';
     return;
   }
@@ -3889,4 +3896,27 @@ updateControls();
 updateJumpLatest();
 setConnectionStatus('Connecting…', 'busy');
 setRunStatus('Connecting…', 'busy');
-void connect(readSavedCredential());
+async function redeemDesktopLoginCode() {
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  const code = fragment.get('nexus-login') || '';
+  if (!code) return '';
+  history.replaceState(null, '', `${location.pathname}${location.search}`);
+  if (!TOKEN_PATTERN.test(code)) return '';
+  try {
+    const reply = await api('/desktop-login', {
+      method: 'POST',
+      credential: '',
+      body: { code },
+    });
+    return typeof reply?.token === 'string' && TOKEN_PATTERN.test(reply.token)
+      ? reply.token
+      : '';
+  } catch {
+    return '';
+  }
+}
+
+void (async () => {
+  const credential = await redeemDesktopLoginCode();
+  void connect(credential || readSavedCredential());
+})();

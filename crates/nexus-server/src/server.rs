@@ -425,6 +425,14 @@ pub struct Server {
     /// Optional catalog file. `None` keeps project additions in memory.
     projects_path: Option<PathBuf>,
     auth_token: Option<AuthToken>,
+    desktop_launcher: bool,
+    desktop_login: Mutex<Option<DesktopLogin>>,
+}
+
+struct DesktopLogin {
+    code: String,
+    token: String,
+    expires_at: std::time::Instant,
 }
 
 /// Session creation failure with its HTTP status and static diagnostic.
@@ -499,6 +507,8 @@ impl Server {
             projects: Mutex::new(ProjectCatalog::default()),
             projects_path: None,
             auth_token: None,
+            desktop_launcher: false,
+            desktop_login: Mutex::new(None),
         }
     }
 
@@ -616,6 +626,50 @@ impl Server {
     pub fn set_auth_token(&mut self, token: &str) -> Result<(), &'static str> {
         self.auth_token = Some(AuthToken::parse(token)?);
         Ok(())
+    }
+
+    /// Advertises the desktop folder chooser to the embedded Web client.
+    pub fn set_desktop_launcher(&mut self) {
+        self.desktop_launcher = true;
+    }
+
+    /// Replaces the pending one-use launcher code. Callers must already have
+    /// passed the normal bearer-authentication boundary.
+    pub fn issue_desktop_login(&self, code: &str) -> Result<(), &'static str> {
+        if code.len() != 64 || !code.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("desktop login code must be 64 hexadecimal characters");
+        }
+        let token = self
+            .auth_token
+            .as_ref()
+            .ok_or("server authentication is not configured")?;
+        *self.desktop_login.lock().expect("desktop login lockable") = Some(DesktopLogin {
+            code: code.to_owned(),
+            token: token.expose_for_desktop_login().to_owned(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(120),
+        });
+        Ok(())
+    }
+
+    fn redeem_desktop_login(&self, code: &str) -> Option<String> {
+        let mut login = self.desktop_login.lock().expect("desktop login lockable");
+        let pending = login.as_ref()?;
+        if std::time::Instant::now() >= pending.expires_at {
+            login.take();
+            return None;
+        }
+        let expected = pending.code.as_bytes();
+        let candidate = code.as_bytes();
+        if expected.len() != candidate.len()
+            || expected
+                .iter()
+                .zip(candidate)
+                .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+                != 0
+        {
+            return None;
+        }
+        Some(login.take().expect("login code is present").token)
     }
 
     /// Creates a session with a fresh demo-wired runtime and returns its
@@ -1077,7 +1131,10 @@ impl Server {
         let response = match http::read_request(&mut stream) {
             Ok(request) => {
                 let health = request.method == "GET" && request.route_path() == "/health";
+                let desktop_login =
+                    request.method == "POST" && request.route_path() == "/desktop-login";
                 let public = health
+                    || desktop_login
                     || (request.method == "GET"
                         && crate::web::asset(request.route_path()).is_some());
                 let required = !public
@@ -1144,6 +1201,39 @@ impl Server {
         let body = &parsed;
         match route_path(&request.method, &request.path) {
             Route::Health => Some(json_response(200, &body_json(crate::json::health_json()))),
+            Route::DesktopLogin => {
+                let Some(code) = body_str(body, "code") else {
+                    return Some(json_response(
+                        401,
+                        &json::error_body("desktop login failed"),
+                    ));
+                };
+                let Some(token) = self.redeem_desktop_login(code) else {
+                    return Some(json_response(
+                        401,
+                        &json::error_body("desktop login failed"),
+                    ));
+                };
+                Some(json_response(
+                    200,
+                    &body_json(serde_json::json!({ "token": token })),
+                ))
+            }
+            Route::IssueDesktopLogin => {
+                let Some(code) = body_str(body, "code") else {
+                    return Some(json_response(
+                        400,
+                        &json::error_body("invalid login request"),
+                    ));
+                };
+                match self.issue_desktop_login(code) {
+                    Ok(()) => Some(json_response(204, b"")),
+                    Err(_) => Some(json_response(
+                        400,
+                        &json::error_body("invalid login request"),
+                    )),
+                }
+            }
             Route::ListSessions => Some(self.saved_sessions()),
             Route::CreateSession => {
                 let (provider, model, project) = match selected_identities(body) {
@@ -1425,6 +1515,9 @@ impl Server {
             "network_access": if mode == "fakes" { Value::Null } else { Value::Bool(self.tools_settings.network_access) },
             "projects": [],
         });
+        if self.desktop_launcher && mode == "fakes" {
+            document["desktop_project_picker"] = Value::Bool(true);
+        }
         if enabled {
             if let Some(root) = default_root {
                 let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
@@ -2477,6 +2570,10 @@ pub enum Decision {
 enum Route<'a> {
     /// `GET /health`.
     Health,
+    /// `POST /desktop-login`: one-use local launcher credential exchange.
+    DesktopLogin,
+    /// `POST /desktop-login/issue`: authenticated launcher code rotation.
+    IssueDesktopLogin,
     /// `GET /sessions`: saved session metadata.
     ListSessions,
     /// `POST /sessions`.
@@ -2534,6 +2631,8 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
     let segments: Vec<&str> = path.split('/').collect();
     match (method, segments.as_slice()) {
         ("GET", ["", "health"]) => Route::Health,
+        ("POST", ["", "desktop-login"]) => Route::DesktopLogin,
+        ("POST", ["", "desktop-login", "issue"]) => Route::IssueDesktopLogin,
         ("GET", ["", "sessions"]) => Route::ListSessions,
         ("POST", ["", "sessions"]) => Route::CreateSession,
         ("POST", ["", "sessions", session, "restore"]) => Route::RestoreSaved { session },
@@ -2774,6 +2873,20 @@ mod tests {
     use super::*;
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile};
     use nexus_core::{ErrorCategory, FinishReason, TurnId};
+
+    #[test]
+    fn desktop_login_code_is_one_use_and_failed_guesses_do_not_consume_it() {
+        let (mut server, _runtime) = server_with_gated_config();
+        let token = "a".repeat(64);
+        let code = "b".repeat(64);
+        server.set_auth_token(&token).unwrap();
+        server.issue_desktop_login(&code).unwrap();
+
+        assert_eq!(server.redeem_desktop_login(&"c".repeat(64)), None);
+        assert_eq!(server.redeem_desktop_login(&code), Some(token));
+        assert_eq!(server.redeem_desktop_login(&code), None);
+        assert!(server.issue_desktop_login("short").is_err());
+    }
 
     #[test]
     fn project_picker_validates_results_and_serializes_dialogs_without_registering_projects() {

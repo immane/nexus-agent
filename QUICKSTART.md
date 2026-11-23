@@ -98,6 +98,26 @@ remains experimental and local execution remains the default. Extracted-install
 smoke checks have been run on macOS arm64 and Linux x86_64 reference hosts;
 other architectures and older OS/glibc versions have not been validated.
 
+For the experimental Apple Silicon menu-bar app and drag-to-Applications DMG,
+run `scripts/package-macos-dmg.sh` on an arm64 Mac with matching Xcode/Swift and
+Rust toolchains. The app starts the loopback server, opens the Web client, and
+keeps its server token in the macOS Keychain; the browser receives only a
+one-use login code in the URL fragment. The menu can reopen the interface,
+restart the server, select an installed browser Web App, show logs, or quit
+(which stops the server). Restart can stop a stale `nexus-server` owned by the
+current user and listening on `127.0.0.1:8471`; other listeners are left alone.
+Local tools are off until you choose **Open Project…** in the menu bar or in
+Web Settings → Projects. Confirming a folder restarts the service, interrupts
+active tasks, and remembers the folder as the startup workspace. Add or switch
+additional project folders in the Web client without restarting.
+HTTPS model providers currently require OpenSSL with `s_client` hostname and
+IP verification. The Apple Silicon app finds Homebrew's `openssl@3` without
+relying on the shell's `PATH`; install it with `brew install openssl@3` if
+needed. Certificate verification remains enabled.
+App data and saved sessions live outside the app
+bundle. This script currently produces an **unsigned, unnotarized** DMG for
+local testing; it is not ready for direct public distribution.
+
 ### Experimental container mode
 
 An explicit prototype path is available with container-enabled builds, including
