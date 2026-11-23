@@ -245,6 +245,18 @@ input {
   padding: 8px 12px;
 }
 
+/* Dropdown controls stay flat; the raised background marks the field. */
+select {
+  border-color: transparent;
+}
+
+/* Focus uses a fill cue instead of the thick accent outline. */
+select:focus {
+  outline: none;
+  box-shadow: none;
+  background-color: var(--accent-soft);
+}
+
 button {
   cursor: pointer;
 }
