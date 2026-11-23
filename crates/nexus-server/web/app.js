@@ -3237,19 +3237,25 @@ async function decide(record, approve) {
 
 /* Usage */
 
+// Token counts are displayed in thousands with at most two decimal places;
+// trailing zeros are dropped so 1_200 renders as "1.2k" rather than "1.20k".
+function formatTokenCount(value) {
+  return `${Math.round((value / 1000) * 100) / 100}k`;
+}
+
 function usageParts() {
   const parts = [];
   if (state.lastUsage?.input !== null && state.lastUsage?.input !== undefined) {
-    parts.push(`${state.lastUsage.input} in`);
+    parts.push(`${formatTokenCount(state.lastUsage.input)} in`);
   }
   if (state.lastUsage?.output !== null && state.lastUsage?.output !== undefined) {
-    parts.push(`${state.lastUsage.output} out`);
+    parts.push(`${formatTokenCount(state.lastUsage.output)} out`);
   }
   if (state.lastUsage?.cacheRead !== null && state.lastUsage?.cacheRead !== undefined) {
-    parts.push(`${state.lastUsage.cacheRead} cache read`);
+    parts.push(`${formatTokenCount(state.lastUsage.cacheRead)} cache read`);
   }
   if (state.lastUsage?.cacheWrite !== null && state.lastUsage?.cacheWrite !== undefined) {
-    parts.push(`${state.lastUsage.cacheWrite} cache write`);
+    parts.push(`${formatTokenCount(state.lastUsage.cacheWrite)} cache write`);
   }
   return parts;
 }
