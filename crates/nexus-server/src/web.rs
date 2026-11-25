@@ -37,7 +37,7 @@ pub(crate) const HEADERS: &str = concat!(
     "x-frame-options: DENY\r\n",
     "referrer-policy: no-referrer\r\n",
     "content-security-policy: default-src 'none'; script-src 'self'; ",
-    "style-src 'self'; img-src 'self' data: https:; connect-src 'self'; ",
+    "style-src 'self'; img-src 'self' data: blob: https:; connect-src 'self'; ",
     "manifest-src 'self'; worker-src 'self'; base-uri 'none'; ",
     "form-action 'none'; frame-ancestors 'none'\r\n",
 );
@@ -106,7 +106,11 @@ mod tests {
         assert!(HEADERS.contains("frame-ancestors 'none'"));
         assert!(HEADERS.contains("x-frame-options: DENY"));
         assert!(HEADERS.contains("default-src 'none'"));
-        assert!(HEADERS.contains("style-src 'self'; img-src 'self' data: https:; connect-src 'self';"));
+        assert!(
+            HEADERS.contains(
+                "style-src 'self'; img-src 'self' data: blob: https:; connect-src 'self';"
+            )
+        );
         assert!(HEADERS.contains("manifest-src 'self'"));
         assert!(HEADERS.contains("worker-src 'self'"));
         assert!(HEADERS.contains("x-content-type-options: nosniff"));

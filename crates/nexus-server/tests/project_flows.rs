@@ -20,6 +20,14 @@ fn address(port: u16) -> String {
 }
 
 fn round_trip(port: u16, raw: &str) -> (u16, Value) {
+    let (status, _, payload) = round_trip_bytes(port, raw);
+    (
+        status,
+        serde_json::from_slice(&payload).expect("JSON response body"),
+    )
+}
+
+fn round_trip_bytes(port: u16, raw: &str) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(address(port)).expect("loopback connects");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -27,18 +35,18 @@ fn round_trip(port: u16, raw: &str) -> (u16, Value) {
     stream.write_all(raw.as_bytes()).expect("request writes");
     let mut body = Vec::new();
     stream.read_to_end(&mut body).expect("response reads");
-    let text = String::from_utf8_lossy(&body);
-    let (head, payload) = text.split_once("\r\n\r\n").expect("framed response");
+    let separator = body
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("framed response");
+    let head = String::from_utf8(body[..separator].to_vec()).expect("response headers are text");
     let status = head
         .split_whitespace()
         .nth(1)
         .expect("status line")
         .parse()
         .expect("numeric status");
-    (
-        status,
-        serde_json::from_str(payload).expect("JSON response body"),
-    )
+    (status, head, body.split_off(separator + 4))
 }
 
 fn get(port: u16, path: &str, authenticated: bool) -> (u16, Value) {
@@ -121,6 +129,105 @@ fn fake_server() -> Server {
     std::mem::forget(runtime);
     server.set_auth_token(TOKEN).expect("token validates");
     server
+}
+
+#[test]
+fn project_image_previews_require_authentication_and_stay_inside_the_session_project() {
+    let root = temp_root("image-preview");
+    let project = root.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let png = include_bytes!("../web/icon-192.png");
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+    std::fs::write(project.join("plot 1.png"), png).unwrap();
+    std::fs::write(project.join("plot.svg"), svg).unwrap();
+    std::fs::write(project.join("fake.png"), b"not an image").unwrap();
+    std::fs::write(root.join("outside.png"), png).unwrap();
+    std::fs::write(root.join("default.png"), png).unwrap();
+    let large = std::fs::File::create(project.join("big.png")).unwrap();
+    large.set_len(4 * 1024 * 1024 + 1).unwrap();
+    std::os::unix::fs::symlink(root.join("outside.png"), project.join("link.png")).unwrap();
+    std::fs::hard_link(root.join("outside.png"), project.join("hard.png")).unwrap();
+    let port = spawn(development_server(&root, None));
+    let (status, body) = post(
+        port,
+        "/projects",
+        &serde_json::json!({ "path": project }).to_string(),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = post(
+        port,
+        "/sessions",
+        &serde_json::json!({ "project": body["project"]["id"] }).to_string(),
+    );
+    assert_eq!(status, 201, "{body}");
+    let session = body["session"].as_str().unwrap();
+    let endpoint = format!("/sessions/{session}/project-image");
+    let preview = |path: &str, authorization: &str, origin: &str| {
+        let body = serde_json::json!({ "path": path }).to_string();
+        round_trip_bytes(
+            port,
+            &format!(
+                "POST {endpoint} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n{authorization}{origin}content-length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+    let auth = format!("authorization: Bearer {TOKEN}\r\n");
+    assert_eq!(preview("plot 1.png", "", "").0, 401);
+    assert_eq!(
+        preview("plot 1.png", &auth, "origin: http://example.invalid\r\n").0,
+        403
+    );
+    let (status, head, body) = preview("plot 1.png", &auth, "");
+    assert_eq!(status, 200);
+    assert!(head.contains("content-type: application/octet-stream"));
+    assert!(head.contains("content-disposition: attachment"));
+    assert!(head.contains("cache-control: no-store"));
+    assert!(head.contains("x-content-type-options: nosniff"));
+    assert_eq!(body, png);
+    let absolute = project.canonicalize().unwrap().join("plot.svg");
+    let (status, _, body) = preview(absolute.to_str().unwrap(), &auth, "");
+    assert_eq!(status, 200);
+    assert_eq!(body, svg);
+    for path in [
+        "../outside.png",
+        "link.png",
+        "hard.png",
+        "fake.png",
+        "big.png",
+    ] {
+        assert_eq!(preview(path, &auth, "").0, 404, "{path}");
+    }
+    let absolute = root.canonicalize().unwrap().join("outside.png");
+    assert_eq!(preview(absolute.to_str().unwrap(), &auth, "").0, 404);
+
+    let (status, body) = post(port, "/sessions", "{}");
+    assert_eq!(status, 201, "{body}");
+    let session = body["session"].as_str().unwrap();
+    let payload = r#"{"path":"default.png"}"#;
+    let (status, _, body) = round_trip_bytes(
+        port,
+        &format!(
+            "POST /sessions/{session}/project-image HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\n{auth}content-length: {}\r\n\r\n{payload}",
+            payload.len()
+        ),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body, png);
+
+    let fake = spawn(fake_server());
+    let (_, body) = post(fake, "/sessions", "{}");
+    let session = body["session"].as_str().unwrap();
+    assert_eq!(
+        post(
+            fake,
+            &format!("/sessions/{session}/project-image"),
+            r#"{"path":"plot.svg"}"#
+        )
+        .0,
+        404
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

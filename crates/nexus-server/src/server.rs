@@ -62,7 +62,7 @@ use nexus_core::{
 use nexus_fakes::{FakeProvider, FakeTool};
 use nexus_runtime::transport::{OrderedEventConsumer, is_control_payload};
 use nexus_runtime::{EventStreams, Policy, Runtime, RuntimeConfig, SessionStoreHandle};
-use nexus_tools::ScopedReader;
+use nexus_tools::{ProjectImageReader, ScopedReader};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -199,6 +199,7 @@ pub struct Session {
     /// Project id selected at creation, when the client supplied one. The
     /// root is already captured by the session's tool registrations.
     project: Option<String>,
+    project_images: Option<ProjectImageReader>,
     runtime: Mutex<Runtime>,
     data: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
     control: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
@@ -419,6 +420,7 @@ pub struct Server {
     /// Tool wiring for sessions created after the call. Startup-only: set
     /// before serving, alongside [`Server::set_config`].
     tools_mode: ToolsMode,
+    default_image_root: Option<PathBuf>,
     /// Web-selectable project roots. Empty by default; the startup tool root
     /// is exposed separately as the reserved `default` project.
     projects: Mutex<ProjectCatalog>,
@@ -504,6 +506,7 @@ impl Server {
             run_models: Mutex::new(HashMap::new()),
             completion_watchers: Arc::new(AtomicUsize::new(0)),
             tools_mode: ToolsMode::Fakes,
+            default_image_root: None,
             projects: Mutex::new(ProjectCatalog::default()),
             projects_path: None,
             auth_token: None,
@@ -540,6 +543,14 @@ impl Server {
         if let ToolsMode::Development { root } = &mode {
             Policy::development(root)?;
         }
+        self.default_image_root = match &mode {
+            ToolsMode::RealFiles { root } | ToolsMode::Development { root } => {
+                std::path::absolute(root)
+                    .ok()
+                    .and_then(|root| crate::projects::validate_project_root(&root).ok())
+            }
+            _ => None,
+        };
         self.tools_mode = mode;
         Ok(())
     }
@@ -843,6 +854,19 @@ impl Server {
         };
         let token = session.as_str().to_owned();
         let (policy, tools) = self.session_tools(project_root.as_deref())?;
+        let project_images = project_root
+            .as_deref()
+            .or(self.default_image_root.as_deref())
+            .and_then(ProjectImageReader::bind);
+        let instructions = if project_images.is_some() {
+            ModelInstructions::new(
+                "",
+                "The Nexus Web chat can display PNG, JPEG, WebP, and SVG files in the current project. To show a generated image, include a Markdown image with a project-relative path, such as ![Plot](assets/plot.png). Do not run an app to open it or convert it to text.",
+            )
+            .expect("static instructions fit the model instruction budget")
+        } else {
+            ModelInstructions::default()
+        };
         let config = RuntimeConfig {
             limits: self.limits,
             policy,
@@ -857,10 +881,10 @@ impl Server {
                 config,
                 provider,
                 tools,
-                ModelInstructions::default(),
+                instructions,
                 store.clone(),
             ),
-            None => Runtime::try_new(config, provider, tools),
+            None => Runtime::try_new_with_instructions(config, provider, tools, instructions),
         }
         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
         if restore {
@@ -885,6 +909,7 @@ impl Server {
             provider: bound_provider,
             model: bound_model,
             project: bound_project,
+            project_images,
             runtime: Mutex::new(runtime),
             data: Mutex::new(streams.data),
             control: Mutex::new(streams.control),
@@ -1291,6 +1316,23 @@ impl Server {
                     .map_or(100, |value| value.clamp(1, 100));
                 Some(self.saved_history(session, after, limit))
             }
+            Route::ProjectImage { session } => self.with_session(session, |entry| {
+                let Some(path) = body_str(body, "path") else {
+                    return Some(json_response(
+                        400,
+                        &json::error_body("image path is required"),
+                    ));
+                };
+                let response = entry
+                    .project_images
+                    .as_ref()
+                    .and_then(|reader| reader.read(path))
+                    .map_or_else(
+                        || json_response(404, &json::error_body("project image is unavailable")),
+                        |bytes| Response::new(200, "application/octet-stream", bytes),
+                    );
+                Some(response)
+            }),
             Route::DeleteSaved { session } => Some(self.delete_saved_session(session)),
             Route::SubmitRun { session } => {
                 self.with_session(session, |entry| self.submit_run(&entry, body))
@@ -2582,6 +2624,8 @@ enum Route<'a> {
     RestoreSaved { session: &'a str },
     /// `GET /sessions/{sid}/history?after=<seq>&limit=<n>`.
     SavedHistory { session: &'a str },
+    /// `POST /sessions/{sid}/project-image` with a project-local image path.
+    ProjectImage { session: &'a str },
     /// `DELETE /sessions/{sid}`.
     DeleteSaved { session: &'a str },
     /// `POST /sessions/{sid}/runs`.
@@ -2637,6 +2681,9 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
         ("POST", ["", "sessions"]) => Route::CreateSession,
         ("POST", ["", "sessions", session, "restore"]) => Route::RestoreSaved { session },
         ("GET", ["", "sessions", session, "history"]) => Route::SavedHistory { session },
+        ("POST", ["", "sessions", session, "project-image"]) if !session.is_empty() => {
+            Route::ProjectImage { session }
+        }
         ("DELETE", ["", "sessions", session]) if !session.is_empty() => {
             Route::DeleteSaved { session }
         }

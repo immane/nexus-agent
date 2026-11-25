@@ -76,9 +76,10 @@ unordered lists, task markers, blockquotes, horizontal rules, links, autolinks,
 and pipe tables. Link targets are limited to `http`, `https`, and `mailto`;
 unsafe or malformed targets remain plain text. Raw HTML is displayed as text.
 Inline Markdown images (`![alt](url)`) can display same-origin images; external
-HTTPS images require an explicit click and send no referrer. Local filesystem
-paths are not exposed. Math uses the browser's native MathML, with no external
-assets. It supports `$...$` and `\(...\)` inline, and `$$...$$` and `\[...\]` on
+HTTPS images require an explicit click and send no referrer. Completed replies
+and restored history also preview project images, for example
+`![Plot](resources/assets/plot.svg)`. Math uses the browser's native MathML, with
+no external assets. It supports `$...$` and `\(...\)` inline, and `$$...$$` and `\[...\]` on
 their own lines. Common symbols, scripts, fractions, and square roots are
 supported; unsupported expressions remain text. Footnotes and syntax highlighting
 are not implemented.
@@ -151,6 +152,17 @@ must still be running after launch. The installed app reuses its saved bearer
 token where browser storage is shared, or requires connecting once if isolated.
 
 ## Projects and runtime mode
+
+Project image previews use authenticated `POST /sessions/{id}/project-image`
+with `{"path":"resources/assets/plot.svg"}`. Paths resolve against the session's
+bound local project, not the currently selected project or the server's working
+directory. An absolute path is accepted only within the canonical project root;
+`file://`, traversal, symlinks, hard links, and protected paths are not supported.
+PNG, JPEG, WebP, and SVG are limited to 4 MiB each. The server returns opaque,
+non-cacheable bytes; the Web client decodes bytes as an image and draws them to
+a canvas without attaching SVG markup or exposing a navigable SVG URL. Previews
+load when visible (up to four per message); unavailable files keep their alt text.
+History previews show the current file, not a saved snapshot of its bytes.
 
 The operator must start the server with local real tools
 (`--tools real --tools-root PATH`, plus `--auth-token-env`). The web client cannot

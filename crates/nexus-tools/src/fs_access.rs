@@ -67,6 +67,10 @@ impl BoundRoot {
         })
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn replacement_metadata(&self) -> ReplacementMetadata {
         self.replacement_metadata
     }

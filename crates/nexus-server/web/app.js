@@ -1616,7 +1616,7 @@ function renderHistoricalAssistant(text) {
   head.append(node('span', '', 'NEXUS'));
   const body = node('div', 'message-body');
   const prose = node('div', 'prose');
-  renderMarkdown(prose, text);
+  renderMarkdown(prose, text, state.session);
   body.append(prose);
   article.append(head, body);
   appendNode(article);
@@ -1624,6 +1624,7 @@ function renderHistoricalAssistant(text) {
 
 function renderHistory(items) {
   flushText();
+  projectImageObserver?.disconnect();
   dom.conversation.replaceChildren();
   dom.conversation.hidden = true;
   dom.welcome.hidden = false;
@@ -1864,6 +1865,7 @@ function startNewSession({ force = false } = {}) {
     populateModels();
     populateProjects();
   }
+  projectImageObserver?.disconnect();
   dom.conversation.replaceChildren();
   dom.conversation.hidden = true;
   dom.welcome.hidden = false;
@@ -2251,8 +2253,94 @@ function appendMarkdownLink(parent, label, url, depth, inLink = false) {
 }
 
 const MARKDOWN_IMAGE = /!\[((?:\\[\[\]\\]|[^[\]\\\n])*)\]\([ \t]*(?:<([^<>\n]+)>|((?:[^\s()<>]|\([^\s()<>]*\))+))(?:[ \t]+(?:"([^"\n]*)"|'([^'\n]*)'))?[ \t]*\)/y;
+const PROJECT_IMAGE_TYPES = new Map([
+  ['png', 'image/png'],
+  ['jpg', 'image/jpeg'],
+  ['jpeg', 'image/jpeg'],
+  ['webp', 'image/webp'],
+  ['svg', 'image/svg+xml'],
+]);
+let projectImageObserver;
+let projectImageQueue = Promise.resolve();
+
+function projectImageTarget(target) {
+  if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(target)
+    || /^\/assets\/icon-(?:192|512)\.png(?:[?#]|$)/.test(target)) return null;
+  let path;
+  try {
+    path = decodeURIComponent(target);
+  } catch {
+    path = target;
+  }
+  const type = PROJECT_IMAGE_TYPES.get(path.split('.').at(-1)?.toLowerCase());
+  return type && path.includes('.') ? { path, type } : null;
+}
+
+async function loadProjectImage(placeholder, session, target) {
+  const credential = state.credential;
+  if (!placeholder.isConnected || state.session !== session || !credential) return;
+  const { path, type } = projectImageTarget(target);
+  let url;
+  try {
+    const response = await fetch(`/sessions/${encodeURIComponent(session)}/project-image`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${credential}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+      signal: AbortSignal.timeout(10000),
+      cache: 'no-store',
+      credentials: 'omit',
+      redirect: 'error',
+    });
+    if (!response.ok || response.headers.get('content-type') !== 'application/octet-stream') {
+      throw new Error('Image unavailable');
+    }
+    const bytes = await response.blob();
+    if (!placeholder.isConnected || state.session !== session || state.credential !== credential) return;
+    url = URL.createObjectURL(bytes.slice(0, bytes.size, type));
+    const image = document.createElement('img');
+    image.src = url;
+    await image.decode();
+    if (!placeholder.isConnected || state.session !== session || state.credential !== credential) return;
+    // Keep the blob URL private to the image decoder, especially for untrusted SVG.
+    const canvas = node('canvas', 'md-image');
+    const scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+    canvas.setAttribute('role', 'img');
+    canvas.setAttribute('aria-label', placeholder.textContent);
+    placeholder.replaceWith(canvas);
+  } catch {
+    placeholder.append(document.createTextNode(' (project image unavailable)'));
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+  }
+}
+
+function observeProjectImages(container, session) {
+  const previews = Array.from(container.querySelectorAll('[data-project-image]')).slice(0, 4);
+  if (!previews.length) return;
+  projectImageObserver ??= new IntersectionObserver((entries, observer) => {
+    for (const { target, isIntersecting } of entries) {
+      if (!isIntersecting) continue;
+      observer.unobserve(target);
+      const { session, projectImage } = target.dataset;
+      projectImageQueue = projectImageQueue.then(() => loadProjectImage(target, session, projectImage));
+    }
+  });
+  for (const preview of previews) {
+    preview.dataset.session = session;
+    projectImageObserver.observe(preview);
+  }
+}
 
 function appendMarkdownImage(parent, label, target, title, inLink) {
+  if (projectImageTarget(target)) {
+    const placeholder = node('span', 'md-project-image', label || 'Project image');
+    placeholder.dataset.projectImage = target;
+    parent.append(placeholder);
+    return;
+  }
   let url;
   try {
     url = new URL(target, location.href);
@@ -2885,10 +2973,11 @@ function appendMarkdownBlocks(parent, lines) {
   }
 }
 
-function renderMarkdown(container, text) {
+function renderMarkdown(container, text, projectSession = null) {
   flushText();
   container.replaceChildren();
   appendMarkdownBlocks(container, text.replace(/\r\n?/g, '\n').split('\n'));
+  if (projectSession && state.credential) observeProjectImages(container, projectSession);
 }
 
 function assistantWarning(record) {
@@ -2913,7 +3002,7 @@ function renderAssistant(record, final) {
   if (useMarkdown) {
     record.mdRendered = true;
     record.prose.classList.remove('plain-text');
-    renderMarkdown(record.prose, record.text);
+    renderMarkdown(record.prose, record.text, final ? state.session : null);
   } else {
     record.mdRendered = false;
     record.prose.classList.add('plain-text');
