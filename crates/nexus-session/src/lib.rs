@@ -1391,6 +1391,64 @@ impl SessionStore for FileSessionStore {
             .ok_or_else(|| store_error("session was not found"))
     }
 
+    fn delete_session(&mut self, session: &SessionId) -> Result<(), AgentError> {
+        self.ensure_available()?;
+        if !self
+            .sessions
+            .iter()
+            .any(|checkpoint| checkpoint.session() == session)
+        {
+            return Err(store_error("session was not found"));
+        }
+        // Fold the journal into the current snapshot before removing records.
+        // Otherwise a crash before journal cleanup could replay deleted items.
+        if open_operations(&self.operations_path, false, false)?.is_some() {
+            self.commit(
+                self.sessions.clone(),
+                self.intents.clone(),
+                self.outcomes.clone(),
+                self.source_records.clone(),
+            )?;
+        }
+        let mut runs = self
+            .source_records
+            .iter()
+            .filter(|record| record.session() == session)
+            .map(SourceRecord::run)
+            .collect::<HashSet<_>>();
+        // Older records may lack session attribution, or reuse a run id.
+        // Only remove operations whose ownership can be established.
+        for record in self
+            .source_records
+            .iter()
+            .filter(|record| record.session() != session)
+        {
+            runs.remove(record.run());
+        }
+        self.commit(
+            self.sessions
+                .iter()
+                .filter(|checkpoint| checkpoint.session() != session)
+                .cloned()
+                .collect(),
+            self.intents
+                .iter()
+                .filter(|record| !runs.contains(&record.run))
+                .cloned()
+                .collect(),
+            self.outcomes
+                .iter()
+                .filter(|record| !runs.contains(&record.run))
+                .cloned()
+                .collect(),
+            self.source_records
+                .iter()
+                .filter(|record| record.session() != session)
+                .cloned()
+                .collect(),
+        )
+    }
+
     fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError> {
         self.ensure_available()?;
         nexus_core::store::check_format_revision(checkpoint.format_revision())?;
@@ -2462,6 +2520,50 @@ mod tests {
             "profile-a",
         )
         .expect("valid checkpoint")
+    }
+
+    #[test]
+    fn file_store_deletion_survives_reopen_with_journaled_history() {
+        let directory = directory("file-delete-journal");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let deleted = checkpoint_for("session-delete", 1, "delete");
+        let kept = checkpoint_for("session-keep", 1, "keep");
+        for checkpoint in [&deleted, &kept] {
+            store.initialize_session(checkpoint).unwrap();
+        }
+        for (checkpoint, run) in [(&deleted, "delete-run"), (&kept, "keep-run")] {
+            let run = RunId::new(run).unwrap();
+            store
+                .append_source_items(
+                    checkpoint.session(),
+                    &run,
+                    &[ModelContextItem::user_text("original input").unwrap()],
+                )
+                .unwrap();
+            store
+                .record_intent(&ToolIntentRecord {
+                    run,
+                    call: CallId::new("call").unwrap(),
+                    tool: ToolId::new("write", M0_REVISION).unwrap(),
+                    args: NormalizedArgs::new("{}").unwrap(),
+                    scope: ApprovedScope::new("write").unwrap(),
+                })
+                .unwrap();
+        }
+        assert!(store.operations_path.exists());
+        store.delete_session(deleted.session()).unwrap();
+        assert!(store.delete_session(deleted.session()).is_err());
+        drop(store);
+
+        let store = FileSessionStore::open(&directory).unwrap();
+        assert!(store.load_session(deleted.session()).is_err());
+        assert_eq!(store.load_session(kept.session()).unwrap(), kept);
+        assert_eq!(store.source_records.len(), 1);
+        assert_eq!(store.source_records[0].session(), kept.session());
+        assert_eq!(store.intents.len(), 1);
+        assert_eq!(store.intents[0].run.as_str(), "keep-run");
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

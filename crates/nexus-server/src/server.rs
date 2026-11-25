@@ -924,6 +924,16 @@ impl Server {
         if sessions.contains_key(&token) {
             return Err(SessionError::new(409, "session is already open"));
         }
+        // A delete may have committed after the runtime loaded the checkpoint.
+        // Recheck under the same map lock used by deletion before publishing it.
+        if restore
+            && self
+                .session_store
+                .as_ref()
+                .is_some_and(|store| store.load_session(&entry.session).is_err())
+        {
+            return Err(SessionError::new(404, "saved session was not found"));
+        }
         sessions.insert(token.clone(), entry);
         drop(sessions);
         drop(admission);
@@ -1070,8 +1080,8 @@ impl Server {
     }
 
     /// Whether an idle session owns no live work: no attached SSE subscriber,
-    /// no unconfirmed worker, and no active run. Used by idle maintenance and
-    /// by an explicit restore that replaces a differently-bound idle runtime.
+    /// no unconfirmed worker, and no active run. Used before removing or
+    /// replacing an idle runtime.
     fn session_is_reclaimable(&self, session: &Session) -> bool {
         if *session.streaming.lock().expect("stream flag lockable") {
             return false;
@@ -1480,7 +1490,7 @@ impl Server {
         )
     }
 
-    /// Deletes one saved session that is not currently open.
+    /// Deletes history and closes its open runtime if no work is in progress.
     fn delete_saved_session(&self, session: &str) -> Response {
         let Some(store) = self.session_store.clone() else {
             return json_response(409, &json::error_body("session persistence is not enabled"));
@@ -1491,18 +1501,61 @@ impl Server {
                 return json_response(400, &json::error_body("session identity is invalid"));
             }
         };
-        if self
+        let busy = || {
+            json_response(
+                409,
+                &json::error_body("session is busy; try again after the run finishes"),
+            )
+        };
+        let id = session.as_str();
+        let candidate = self
             .sessions
             .lock()
             .expect("sessions lockable")
-            .contains_key(session.as_str())
+            .get(id)
+            .cloned();
+        let last_run = candidate
+            .as_ref()
+            .and_then(|entry| entry.last_run.lock().expect("last run lockable").clone());
+        if candidate
+            .as_ref()
+            .is_some_and(|entry| !self.session_is_reclaimable(entry))
         {
-            return json_response(409, &json::error_body("close the active session first"));
+            return busy();
         }
-        match store.delete_session(&session) {
-            Ok(()) => json_response(200, &body_json(serde_json::json!({ "reply": "deleted" }))),
-            Err(_) => json_response(404, &json::error_body("saved session was not found")),
+        {
+            let mut sessions = self.sessions.lock().expect("sessions lockable");
+            if let Some(current) = sessions.get(id) {
+                let unchanged = candidate.as_ref().is_some_and(|entry| {
+                    Arc::ptr_eq(current, entry)
+                        && Arc::strong_count(current) == 2
+                        && !*current.streaming.lock().expect("stream flag lockable")
+                        && *current.last_run.lock().expect("last run lockable") == last_run
+                });
+                if !unchanged {
+                    return busy();
+                }
+            }
+            // Prevent new lookups or restores from publishing until deletion
+            // commits. A failed store operation leaves the runtime open.
+            let Ok(saved) = store.list_sessions(nexus_core::store::MAX_SESSIONS) else {
+                return json_response(503, &json::error_body("session store is unavailable"));
+            };
+            if !saved.iter().any(|entry| entry.session == session) {
+                return json_response(404, &json::error_body("saved session was not found"));
+            }
+            if store.delete_session(&session).is_err() {
+                return json_response(
+                    503,
+                    &json::error_body("session deletion could not be confirmed"),
+                );
+            }
+            sessions.remove(id);
         }
+        if let Some(run) = last_run {
+            self.record_model_use(run.as_str());
+        }
+        json_response(200, &body_json(serde_json::json!({ "reply": "deleted" })))
     }
 
     /// Returns the redacted configuration summary: identities, labels,
@@ -3295,6 +3348,8 @@ mod tests {
             Some("accepted")
         );
         drop(entry);
+        assert_eq!(server.delete_saved_session(session.as_str()).status, 409);
+        assert_eq!(server.saved_history(session.as_str(), 0, 100).status, 200);
         drop(server);
         drop(executor);
         std::fs::remove_dir_all(directory).unwrap();
@@ -3390,6 +3445,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status(), 409);
         assert!(error.message().contains("active with different settings"));
+        assert_eq!(server.delete_saved_session(&token).status, 409);
         *first.streaming.lock().unwrap() = false;
         // Mirrors the request path: only the map and the lookup's own Arc may
         // reference an idle runtime when it is replaced.
@@ -3414,7 +3470,18 @@ mod tests {
         assert_eq!(rebound.provider, None);
         assert_eq!(rebound.project.as_deref(), Some(DEFAULT_PROJECT_ID));
 
+        assert_eq!(server.delete_saved_session(&token).status, 409);
         drop(rebound);
+        assert_eq!(server.delete_saved_session(&token).status, 200);
+        assert!(server.session(&token).is_none());
+        assert_eq!(server.saved_history(&token, 0, 100).status, 404);
+        assert_eq!(
+            server
+                .restore_session(&token, None, None, None)
+                .unwrap_err()
+                .status(),
+            404
+        );
         drop(server);
         drop(executor);
         std::fs::remove_dir_all(directory).unwrap();

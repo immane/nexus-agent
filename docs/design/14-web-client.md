@@ -113,8 +113,10 @@ active run is not reattached merely by restoring its saved history.
 When the server starts with `--session-store DIRECTORY`, the sidebar lists saved
 sessions from `GET /sessions`, reads bounded pages from
 `GET /sessions/{id}/history`, restores context without replaying tools, and can
-delete a non-live session with `DELETE /sessions/{id}`. Titles come from the
-first saved user item. History rendering is bounded; filesystem effects and old
+delete a saved session with `DELETE /sessions/{id}`. This also closes an open
+runtime if it is idle; a run or attached event stream returns `409` without
+deleting history. Titles come from the first saved user item. History rendering
+is bounded; filesystem effects and old
 approval grants are never replayed. The provider/model/project binding is kept
 in browser storage because the session checkpoint format does not carry Web
 bindings; a different browser must select valid bindings before restoring.
