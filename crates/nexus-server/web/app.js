@@ -32,7 +32,9 @@ const dom = {
   projectLabel: document.querySelector('#project-label'),
   projectBadge: document.querySelector('#project-badge'),
   sidebarTree: document.querySelector('#sidebar-tree'),
-  treeCount: document.querySelector('#tree-count'),
+  sidebar: document.querySelector('#sidebar'),
+  sidebarBackdrop: document.querySelector('#sidebar-backdrop'),
+  toggleSidebar: document.querySelector('#toggle-sidebar'),
   addProjectSidebar: document.querySelector('#add-project-sidebar'),
   projectsNote: document.querySelector('#projects-note'),
   projectList: document.querySelector('#project-list'),
@@ -89,7 +91,6 @@ const dom = {
   modelStatus: document.querySelector('#model-status'),
   model: document.querySelector('#model'),
   modelLabel: document.querySelector('#model-label'),
-  modelBadge: document.querySelector('#model-badge'),
   message: document.querySelector('#message'),
   composer: document.querySelector('#composer'),
   composerActivity: document.querySelector('#composer-activity'),
@@ -101,6 +102,9 @@ const dom = {
   main: document.querySelector('#main'),
   sessionLoading: document.querySelector('#session-loading'),
   welcome: document.querySelector('#welcome'),
+  welcomeContext: document.querySelector('#welcome-context'),
+  welcomeConnect: document.querySelector('#welcome-connect'),
+  treeLabel: document.querySelector('#tree-label'),
   conversation: document.querySelector('#conversation'),
   conversationTitle: document.querySelector('#conversation-title'),
   newSession: document.querySelector('#new-session'),
@@ -292,10 +296,24 @@ function describeModelLabel() {
 }
 
 function updateModelDisplay() {
-  const label = describeModelLabel();
-  dom.modelBadge.textContent = label;
-  dom.modelBadge.hidden = !state.connected || !state.selection;
-  dom.modelLabel.textContent = label;
+  dom.modelLabel.textContent = describeModelLabel();
+  updateWelcome();
+}
+
+// The empty state summarizes what the next task will use instead of
+// repeating it in the top bar.
+function updateWelcome() {
+  dom.welcomeConnect.hidden = state.connected || state.connecting;
+  if (!state.connected) {
+    dom.welcomeContext.textContent = state.connecting
+      ? 'Connecting to your local Nexus server…'
+      : 'Connect to your local Nexus server to start.';
+    return;
+  }
+  const parts = [];
+  if (state.projects?.enabled) parts.push(state.projectSelection?.label || 'No project');
+  parts.push(describeModelLabel());
+  dom.welcomeContext.textContent = `Next task uses ${parts.join(' · ')}.`;
 }
 
 function selectedOutcome(outcome) {
@@ -582,7 +600,7 @@ function updateProjectDisplay() {
     : enabled ? 'No project' : 'Projects disabled';
   dom.projectLabel.textContent = state.session && enabled && !current ? 'No project' : label;
   dom.projectBadge.textContent = enabled && selected ? selected.label : 'No project';
-  dom.projectBadge.hidden = false;
+  dom.projectBadge.hidden = !enabled;
   dom.projectBadge.title = selected?.path || '';
 }
 
@@ -613,6 +631,17 @@ function writeCollapsedProjects() {
 function ensureProjectExpanded(id) {
   if (!state.collapsedProjects.delete(projectCollapseKey(id))) return;
   writeCollapsedProjects();
+}
+
+// Navigation labels show the words of a prompt, not its Markdown markers.
+// Single `*`/`_` stay because they are common in identifiers and globs.
+function plainTitle(text) {
+  return String(text || '')
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__|~~|`)/g, '')
+    .replace(/^\s*(#{1,6}|>|[-*+])\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function compareSessionEntries(left, right) {
@@ -669,7 +698,7 @@ function buildSessionGroups() {
       : typeof saved.project === 'string' ? saved.project : '';
     entries.push({
       session: saved.session,
-      title: saved.title || (typeof meta.title === 'string' ? meta.title : '') || 'Saved session',
+      title: plainTitle(saved.title || (typeof meta.title === 'string' ? meta.title : '')) || 'Saved session',
       messages: Number(saved.messages) || 0,
       active: saved.active === true,
       current: false,
@@ -701,9 +730,11 @@ function appendSessionTreeItem(panel, entry, savedBusy) {
   const open = node('button', 'tree-session-open');
   open.type = 'button';
   open.disabled = savedBusy;
-  open.title = entry.title || 'Saved session';
+  const meta = sessionTreeMeta(entry);
+  open.title = `${entry.title || 'Saved session'}\n${meta}`;
   open.append(node('span', 'tree-session-title', entry.title || 'Saved session'));
-  open.append(node('span', 'tree-session-meta', sessionTreeMeta(entry)));
+  // Rows stay single-line; the meta text remains available to assistive tech.
+  open.append(node('span', 'tree-session-meta', meta));
   if (entry.current) open.setAttribute('aria-current', 'true');
   open.addEventListener('click', () => void openSavedSession(entry.session));
   item.append(open);
@@ -735,16 +766,15 @@ function renderProjectGroup(group, index, { savedBusy, projectBusy, currentProje
   toggle.setAttribute('aria-expanded', String(expanded));
   toggle.setAttribute('aria-controls', panelId);
   if (group.path) toggle.title = group.path;
-  const chevron = node('span', 'tree-chevron', '›');
-  chevron.setAttribute('aria-hidden', 'true');
-  toggle.append(chevron);
+  const folder = node('span', 'tree-folder');
+  folder.setAttribute('aria-hidden', 'true');
+  toggle.append(folder);
   toggle.append(node('span', 'tree-project-name', group.label));
-  toggle.append(node('span', 'tree-project-count', String(group.sessions.length)));
   toggle.addEventListener('click', () => toggleProjectGroup(group.id));
   row.append(toggle);
 
   if (group.id) {
-    const add = node('button', 'tree-project-add', '＋');
+    const add = node('button', 'tree-project-add');
     add.type = 'button';
     add.disabled = !state.connected || projectBusy;
     add.title = `New session in ${group.label}`;
@@ -769,35 +799,41 @@ function renderProjectGroup(group, index, { savedBusy, projectBusy, currentProje
 
 function renderSidebarTree() {
   dom.sidebarTree.replaceChildren();
+  const projectsEnabled = Boolean(state.projects?.enabled);
+  dom.treeLabel.textContent = state.connected && !projectsEnabled ? 'Sessions' : 'Projects';
   if (!state.connected) {
-    dom.treeCount.textContent = '0';
     dom.sidebarTree.append(node('p', 'sidebar-empty', 'Connect to load projects.'));
     return;
   }
   const { groups, unassigned, currentProject } = buildSessionGroups();
   const visible = [...groups];
   if (unassigned.sessions.length) visible.push(unassigned);
-  const total = visible.reduce((count, group) => count + group.sessions.length, 0);
-  dom.treeCount.textContent = String(total);
 
   const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
   const projectBusy = state.active || state.submitting || state.connecting;
-  visible.forEach((group, index) => {
-    dom.sidebarTree.append(renderProjectGroup(group, index, { savedBusy, projectBusy, currentProject }));
-  });
+  if (projectsEnabled) {
+    visible.forEach((group, index) => {
+      dom.sidebarTree.append(renderProjectGroup(group, index, { savedBusy, projectBusy, currentProject }));
+    });
+  } else {
+    // Without projects there is only one group, so its header adds nothing.
+    const list = node('div', 'tree-sessions tree-flat');
+    list.setAttribute('role', 'group');
+    list.setAttribute('aria-label', 'Sessions');
+    for (const entry of unassigned.sessions) appendSessionTreeItem(list, entry, savedBusy);
+    if (unassigned.sessions.length) dom.sidebarTree.append(list);
+  }
   if (!visible.length) {
     dom.sidebarTree.append(node(
       'p',
       'sidebar-empty',
-      state.projects?.enabled ? 'No projects available.' : 'Sessions will appear here after you start one.',
+      projectsEnabled ? 'No projects available.' : 'Sessions will appear here after you start one.',
     ));
   }
   if (!state.savedPersistence) {
-    dom.sidebarTree.append(node(
-      'p',
-      'tree-note',
-      'History is off. Start the server with --session-store DIRECTORY to keep sessions.',
-    ));
+    const note = node('p', 'tree-note', 'History is off. Start the server with ');
+    note.append(node('code', '', '--session-store DIR'), document.createTextNode(' to keep sessions.'));
+    dom.sidebarTree.append(note);
   }
 }
 
@@ -810,6 +846,7 @@ function updateSidebarProjectControls() {
     button.disabled = !state.connected || busy;
   }
   dom.addProjectSidebar.disabled = !state.connected || !state.projects?.enabled;
+  dom.addProjectSidebar.hidden = state.connected && !state.projects?.enabled;
 }
 
 function selectProjectChoice(id) {
@@ -1612,6 +1649,7 @@ async function loadSessionHistory(id) {
 
 function renderHistoricalAssistant(text) {
   const article = node('article', 'message assistant');
+  if (continuesAssistantReply()) article.dataset.continued = 'true';
   const head = node('div', 'message-head');
   head.append(node('span', '', 'NEXUS'));
   const body = node('div', 'message-body');
@@ -1715,7 +1753,7 @@ async function openSavedSession(id) {
     if (project) state.projectSelection = project;
     ensureProjectExpanded(state.sessionProjectId || '');
     const listed = state.savedSessions.find((saved) => saved.session === state.session);
-    state.sessionTitle = typeof meta.title === 'string' ? meta.title : (listed?.title || 'Saved session');
+    state.sessionTitle = plainTitle(typeof meta.title === 'string' ? meta.title : listed?.title) || 'Saved session';
     rememberSession(state.session, {
       title: state.sessionTitle,
       provider: state.sessionProvider,
@@ -1882,7 +1920,7 @@ function startNewSession({ force = false } = {}) {
 
 function setSessionTitleFromInput(text) {
   if (state.sessionTitle) return;
-  const compact = text.replace(/\s+/g, ' ').trim();
+  const compact = plainTitle(text);
   state.sessionTitle = compact.length > MAX_TITLE_CHARS
     ? `${compact.slice(0, MAX_TITLE_CHARS).trimEnd()}…`
     : compact;
@@ -2006,6 +2044,16 @@ function appendUserMessage(text) {
   const body = node('div', 'message-body', text);
   article.append(head, body);
   appendNode(article);
+}
+
+// True when an assistant message already follows the latest user message,
+// so a new assistant item continues the same reply visually.
+function continuesAssistantReply() {
+  for (let element = dom.conversation.lastElementChild; element; element = element.previousElementSibling) {
+    if (element.classList.contains('user')) return false;
+    if (element.classList.contains('assistant')) return true;
+  }
+  return false;
 }
 
 /* SSE */
@@ -3396,6 +3444,7 @@ function appendAssistantText(detail) {
   if (!record) {
     markStreamingDone();
     const article = node('article', 'message assistant');
+    if (continuesAssistantReply()) article.dataset.continued = 'true';
     article.dataset.streaming = 'true';
     const head = node('div', 'message-head');
     head.append(node('span', '', 'NEXUS'));
@@ -3944,8 +3993,8 @@ function updateUsage(detail) {
     finality: typeof detail.finality === 'string' ? detail.finality : '',
   };
   const parts = usageParts();
-  dom.usage.textContent = parts.length ? `Usage: ${parts.join(' / ')}` : 'Usage: unknown';
-  dom.usage.hidden = false;
+  dom.usage.textContent = parts.length ? `Usage: ${parts.join(' / ')}` : '';
+  dom.usage.hidden = !parts.length;
 }
 
 /* Terminal state */
@@ -3987,18 +4036,32 @@ function finishRun(detail, { fromSnapshot = false } = {}) {
   void verifyTerminalSnapshot(session, run, lastSeq, fromSnapshot);
 }
 
+function persistenceLabel(value) {
+  switch (value) {
+    case 'Saved':
+      return 'Saved';
+    case 'Ephemeral':
+      return 'Not saved';
+    case 'SaveFailed':
+      return 'Save failed';
+    default:
+      return `Persistence: ${value}`;
+  }
+}
+
 function appendRunSummary(detail, fromSnapshot) {
   const card = node('div', 'run-card');
   const outcome = node('span', 'run-outcome', selectedOutcome(detail.outcome));
   outcome.dataset.outcome = detail.outcome || 'unknown';
   card.append(outcome);
-  card.append(node('span', '', fromSnapshot ? 'Confirmed by snapshot' : 'Run finished'));
-
-  if (detail.persistence) {
-    card.append(node('span', '', `Persistence: ${detail.persistence}`));
-  }
+  if (fromSnapshot) card.append(node('span', 'run-fact', 'Confirmed by snapshot'));
   const parts = usageParts();
-  card.append(node('span', '', parts.length ? `Usage: ${parts.join(' / ')}` : 'Usage: not reported'));
+  card.append(node('span', 'run-fact', parts.length ? parts.join(' / ') : 'Usage not reported'));
+  if (detail.persistence) {
+    const persistence = node('span', 'run-fact', persistenceLabel(detail.persistence));
+    persistence.dataset.persistence = detail.persistence;
+    card.append(persistence);
+  }
   if (detail.error && typeof detail.error === 'object') {
     const errorBlock = node('div', 'run-detail');
     errorBlock.append(node('div', '', `${detail.error.category || 'Error'} · ${retryLabel(detail.error.retry)}`));
@@ -4190,6 +4253,48 @@ async function reconcileAfterLoss(error) {
   );
 }
 
+/* Sidebar visibility */
+
+const SIDEBAR_KEY = 'nexus.sidebar';
+const narrowSidebar = window.matchMedia('(max-width: 720px)');
+
+// Wide layouts remember the collapsed state; narrow layouts use a drawer that
+// starts closed and is never persisted.
+function readSidebarPreference() {
+  try {
+    return localStorage.getItem(SIDEBAR_KEY) !== 'closed';
+  } catch {
+    return true;
+  }
+}
+
+function setSidebarOpen(open, { persist = false } = {}) {
+  document.body.dataset.sidebar = open ? 'open' : 'closed';
+  const label = open ? 'Hide sidebar' : 'Show sidebar';
+  dom.toggleSidebar.setAttribute('aria-expanded', String(open));
+  dom.toggleSidebar.setAttribute('aria-label', label);
+  dom.toggleSidebar.title = label;
+  dom.sidebarBackdrop.hidden = !(open && narrowSidebar.matches);
+  dom.sidebar.inert = !open;
+  if (!persist || narrowSidebar.matches) return;
+  try {
+    localStorage.setItem(SIDEBAR_KEY, open ? 'open' : 'closed');
+  } catch {
+    // The preference is a convenience; the toggle still works for this page.
+  }
+}
+
+function applySidebarLayout() {
+  setSidebarOpen(narrowSidebar.matches ? false : readSidebarPreference());
+}
+
+function closeNarrowSidebar() {
+  if (narrowSidebar.matches && document.body.dataset.sidebar === 'open') {
+    setSidebarOpen(false);
+    dom.toggleSidebar.focus();
+  }
+}
+
 /* Settings navigation */
 
 function selectSettingsSection(id) {
@@ -4217,6 +4322,24 @@ dom.openSettings.addEventListener('click', () => {
   });
 });
 dom.closeSettings.addEventListener('click', () => dom.settings.close());
+dom.welcomeConnect.addEventListener('click', () => dom.openSettings.click());
+dom.toggleSidebar.addEventListener('click', () => {
+  const open = document.body.dataset.sidebar !== 'open';
+  setSidebarOpen(open, { persist: true });
+  if (open && narrowSidebar.matches) dom.newSession.focus();
+});
+dom.sidebarBackdrop.addEventListener('click', closeNarrowSidebar);
+narrowSidebar.addEventListener('change', applySidebarLayout);
+dom.sidebar.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeNarrowSidebar();
+});
+// Choosing something in the drawer returns to the conversation.
+dom.sidebar.addEventListener('click', (event) => {
+  if (event.target.closest('.tree-session-open, .tree-project-add, #new-session, #add-project-sidebar')) {
+    closeNarrowSidebar();
+  }
+});
+applySidebarLayout();
 dom.addProjectSidebar.addEventListener('click', () => {
   if (!dom.settings.open) dom.settings.showModal();
   selectSettingsSection('projects-block');

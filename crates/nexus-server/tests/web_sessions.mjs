@@ -64,7 +64,7 @@ function fixture() {
   };
   const dom = {
     sidebarTree: new Element('div'),
-    treeCount: new Element('span'),
+    treeLabel: new Element('span'),
     addProjectSidebar: new Element('button'),
   };
   const context = vm.createContext({
@@ -75,7 +75,10 @@ function fixture() {
       setItem: (key, value) => storage.set(key, String(value)),
       removeItem: (key) => storage.delete(key),
     },
-    document: { createElement: (tag) => new Element(tag) },
+    document: {
+      createElement: (tag) => new Element(tag),
+      createTextNode: (text) => new Element('#text', text),
+    },
   });
   vm.runInContext(`
     const node = ${source.slice(source.indexOf('function node('), source.indexOf('function clip('))}
@@ -90,6 +93,7 @@ function fixture() {
     dom,
     storage,
     run: () => vm.runInContext('renderSidebarTree()', context),
+    evaluate: (code) => vm.runInContext(code, context),
     setIndex: (index) => storage.set('nexus.sessions', JSON.stringify(index)),
   };
 }
@@ -99,7 +103,6 @@ test('project tree renders projects with their sessions nested underneath', () =
   state.connected = false;
   run();
   assert.match(dom.sidebarTree.textContent, /Connect to load projects/);
-  assert.equal(dom.treeCount.textContent, '0');
 
   state.connected = true;
   state.savedSessions = [
@@ -111,7 +114,6 @@ test('project tree renders projects with their sessions nested underneath', () =
   setIndex({ 'sess-a': { project: 'proj-a' }, 'sess-b': { project: 'proj-b' } });
   run();
 
-  assert.equal(dom.treeCount.textContent, '2');
   const projects = dom.sidebarTree.querySelectorAll('.tree-project');
   assert.equal(projects.length, 2);
   const [alpha, beta] = projects;
@@ -179,4 +181,23 @@ test('saved actions disable during live work', () => {
   vm.runInContext(source.slice(start, end), context);
   assert.equal(item.children[0].disabled, true);
   assert.equal(item.children[1].disabled, true);
+});
+
+test('without projects the sidebar lists sessions directly under a sessions label', () => {
+  const { state, dom, run } = fixture();
+  state.projects = { enabled: false };
+  state.savedSessions = [{ session: 'sess-c', title: 'Loose task', messages: 2, active: false }];
+  run();
+
+  assert.equal(dom.treeLabel.textContent, 'Sessions');
+  assert.equal(dom.sidebarTree.querySelectorAll('.tree-project').length, 0);
+  const [item] = dom.sidebarTree.querySelectorAll('.tree-session');
+  assert.match(item.textContent, /Loose task/);
+});
+
+test('session titles drop Markdown markers but keep identifier punctuation', () => {
+  const { evaluate } = fixture();
+  assert.equal(evaluate("plainTitle('Summarize this project and **run** a tool')"), 'Summarize this project and run a tool');
+  assert.equal(evaluate("plainTitle('## Fix `parse_args` in [main](src/main.rs)')"), 'Fix parse_args in main');
+  assert.equal(evaluate("plainTitle('rename *.rs files and my_var')"), 'rename *.rs files and my_var');
 });

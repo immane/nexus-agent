@@ -139,6 +139,32 @@ attaches while another is streaming receives `409`; the UI shows that conflict
 and does not treat it as a run failure. Disconnecting an SSE read does not cancel
 the run.
 
+## Layout
+
+The empty conversation shows what the next task will use (project and model)
+and a short list of input tips; while disconnected it offers a Connect button
+that opens Settings → Connection. The top bar shows the session's project chip
+(only when projects are enabled), a plain-text title, and a connection status
+dot; the selected model is shown only in the composer. Session titles drop
+Markdown markers such as `**`, backticks, headings, and link syntax, but keep
+single `*`/`_` characters.
+
+The sidebar follows a flat thread-list layout: a New session row, then projects
+as folder rows with their sessions indented as single-line titles. The current
+session has a filled row, a running session shows a spinner, and a saved
+session whose runtime is still loaded on the server shows a small dot; model and status text stay in the
+row tooltip and accessible name. Add and delete actions appear on hover or focus.
+Without projects, sessions are listed directly under a Sessions label. Rows show
+no timestamps because `GET /sessions` does not report one.
+
+A panel-icon button at the start of the top bar toggles the sidebar. On wide
+screens it collapses the sidebar and the choice is kept in `localStorage`
+(`nexus.sidebar`). At 720px and below the sidebar is an overlay drawer that
+starts closed; the backdrop, Escape, or choosing a session closes it. Consecutive assistant items after one user message share
+a single speaker label. Approval cards compact after a decision. On narrow
+screens the top bar stays on one row, with icon-only New session and Settings
+buttons and a status dot whose text remains available to assistive technology.
+
 ## Installed web app
 
 The composer shows animated activity bars and a breathing outer border during
@@ -184,7 +210,7 @@ highlighted. Selecting a different project while a session exists starts a new
 session after confirmation; the previous session remains available in saved
 history when persistence is enabled. The Settings
 dialog manages project admission/removal, and a sidebar `+` shortcut opens that
-section. On narrow screens the sidebar collapses and the composer exposes an
+section. On narrow screens the sidebar becomes a drawer and the composer exposes an
 equivalent project selector.
 
 The startup tool root is exposed as the reserved `default` project. Additional
@@ -289,8 +315,8 @@ contracts:
 | `tool-output` | Incremental bounded output |
 | `tool-finished` | Typed status, effect, evidence, output, truncation |
 | `approval-required` | Approval card with exact approval/call identities |
-| `usage` | Inline usage counters; unknown stays unknown |
-| `run-finished` | Terminal outcome and optional typed error |
+| `usage` | Inline usage counters, shown only once a counter is reported; unknown values are never filled in |
+| `run-finished` | Terminal outcome, reported usage or "Usage not reported", persistence (`Saved`, `Not saved`, `Save failed`), and optional typed error |
 
 Sequence numbers are tracked per run. Duplicate sequence numbers are ignored;
 gaps produce an explicit incomplete-transcript notice. A terminal event always
