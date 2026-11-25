@@ -2382,15 +2382,84 @@ const MATH_IDENTIFIERS = new Map(Array.from(
   'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma tau upsilon phi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega'.split(' '),
   (name, index) => [name, 'αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΥΦΨΩ'[index]],
 ));
+for (const [name, symbol] of Object.entries({
+  epsilon: 'ϵ', varepsilon: 'ε', vartheta: 'ϑ', varpi: 'ϖ', varrho: 'ϱ', varsigma: 'ς',
+  phi: 'ϕ', varphi: 'φ', varkappa: 'ϰ', ell: 'ℓ', hbar: 'ℏ', imath: 'ı', jmath: 'ȷ',
+  Re: 'ℜ', Im: 'ℑ', aleph: 'ℵ', wp: '℘', emptyset: '∅', varnothing: '∅',
+})) MATH_IDENTIFIERS.set(name, symbol);
 const MATH_OPERATORS = new Map(Object.entries({
   times: '×', cdot: '⋅', div: '÷', pm: '±', mp: '∓', le: '≤', leq: '≤',
-  ge: '≥', geq: '≥', ne: '≠', neq: '≠', approx: '≈', equiv: '≡', in: '∈',
-  notin: '∉', subset: '⊂', subseteq: '⊆', cup: '∪', cap: '∩', to: '→',
-  rightarrow: '→', leftarrow: '←', Rightarrow: '⇒', Leftrightarrow: '⇔',
-  sum: '∑', prod: '∏', int: '∫', infty: '∞', partial: '∂', nabla: '∇',
-  forall: '∀', exists: '∃', ldots: '…', cdots: '⋯',
+  ge: '≥', geq: '≥', ne: '≠', neq: '≠', approx: '≈', equiv: '≡', sim: '∼',
+  simeq: '≃', cong: '≅', asymp: '≍', propto: '∝', ll: '≪', gg: '≫',
+  prec: '≺', succ: '≻', preceq: '≼', succeq: '≽',
+  in: '∈', ni: '∋', notin: '∉', subset: '⊂', subseteq: '⊆', supset: '⊃',
+  supseteq: '⊇', subsetneq: '⊊', cup: '∪', cap: '∩', setminus: '∖',
+  wedge: '∧', land: '∧', vee: '∨', lor: '∨', neg: '¬', lnot: '¬',
+  forall: '∀', exists: '∃', nexists: '∄', top: '⊤', bot: '⊥', perp: '⊥',
+  parallel: '∥', mid: '∣', nmid: '∤', colon: ':',
+  to: '→', gets: '←', rightarrow: '→', leftarrow: '←', leftrightarrow: '↔',
+  Rightarrow: '⇒', Leftarrow: '⇐', Leftrightarrow: '⇔', implies: '⟹', iff: '⟺',
+  longrightarrow: '⟶', longleftarrow: '⟵', longleftrightarrow: '⟷',
+  Longrightarrow: '⟹', Longleftarrow: '⟸', Longleftrightarrow: '⟺',
+  mapsto: '↦', longmapsto: '⟼', uparrow: '↑', downarrow: '↓', updownarrow: '↕',
+  hookrightarrow: '↪', hookleftarrow: '↩', rightleftharpoons: '⇌',
+  sum: '∑', prod: '∏', coprod: '∐', bigcup: '⋃', bigcap: '⋂',
+  bigvee: '⋁', bigwedge: '⋀', bigoplus: '⨁', bigotimes: '⨂', bigodot: '⨀',
+  int: '∫', iint: '∬', iiint: '∭', oint: '∮', oiint: '∯',
+  infty: '∞', partial: '∂', nabla: '∇', prime: '′', degree: '°',
+  dots: '…', ldots: '…', cdots: '⋯', vdots: '⋮', ddots: '⋱',
+  ast: '∗', star: '⋆', circ: '∘', bullet: '•', oplus: '⊕', ominus: '⊖',
+  otimes: '⊗', oslash: '⊘', odot: '⊙', triangle: '△', angle: '∠',
+  triangleq: '≜', square: '□', Box: '□', diamond: '⋄', therefore: '∴',
+  because: '∵', opencorner: '⌜', checkmark: '✓',
 }));
-const MATH_FUNCTIONS = new Set('sin cos tan log ln exp lim min max'.split(' '));
+const MATH_FUNCTIONS = new Set(
+  'sin cos tan cot sec csc arcsin arccos arctan sinh cosh tanh coth log ln lg exp lim liminf limsup min max sup inf det gcd arg deg dim ker Pr hom'.split(' '),
+);
+const MATH_LIMITS = new Set('sum prod coprod bigcup bigcap bigvee bigwedge bigoplus bigotimes bigodot lim liminf limsup min max sup inf'.split(' '));
+const MATH_SPACES = new Map([
+  ['\\,', '0.167em'], ['\\:', '0.222em'], ['\\;', '0.278em'],
+  ['\\ ', '0.333em'], ['\\enspace', '0.5em'], ['\\quad', '1em'], ['\\qquad', '2em'],
+  ['\\thinspace', '0.167em'], ['\\medspace', '0.222em'], ['\\thickspace', '0.278em'],
+]);
+const MATH_FIXED_DELIMITERS = new Set('()[]{}|');
+const MATH_DELIMITERS = new Map(Object.entries({
+  lbrace: '{', rbrace: '}', lbrack: '[', rbrack: ']', langle: '⟨', rangle: '⟩',
+  lvert: '|', rvert: '|', vert: '|', lVert: '‖', rVert: '‖', Vert: '‖',
+  lfloor: '⌊', rfloor: '⌋', lceil: '⌈', rceil: '⌉', backslash: '∖',
+  uparrow: '↑', downarrow: '↓', updownarrow: '↕',
+}));
+for (const value of MATH_DELIMITERS.values()) MATH_FIXED_DELIMITERS.add(value);
+MATH_FIXED_DELIMITERS.add('∥');
+const MATH_ACCENTS = new Map(Object.entries({
+  hat: '^', widehat: '^', tilde: '~', widetilde: '~', bar: '¯', overline: '¯',
+  vec: '→', overrightarrow: '→', overleftarrow: '←', overleftrightarrow: '↔',
+  dot: '˙', ddot: '¨', dddot: '⃛', breve: '˘', check: 'ˇ', acute: '´', grave: '`',
+  underleftarrow: '←', underrightarrow: '→', underline: '_', overbrace: '⏞', underbrace: '⏟',
+}));
+const MATH_ENVIRONMENTS = new Map(Object.entries({
+  matrix: '', pmatrix: '()', bmatrix: '[]', Bmatrix: '{}', vmatrix: '||',
+  Vmatrix: '‖‖', smallmatrix: '', cases: '{', dcases: '{',
+  aligned: '', align: '', 'align*': '', split: '', alignedat: '', alignat: '', 'alignat*': '',
+  gathered: '', gather: '', 'gather*': '', equation: '', 'equation*': '', array: '',
+}));
+const MATH_ALIGNMENTS = new Set(['aligned', 'align', 'align*', 'split', 'alignedat', 'alignat', 'alignat*']);
+const MATH_ALPHABETS = new Map([
+  ['mathbf', [0x1d400, 0x1d41a, 0x1d7ce, 0x1d6a8, 0x1d6c2]],
+  ['boldsymbol', [0x1d468, 0x1d482, 0x1d7ce, 0x1d71c, 0x1d736]],
+  ['mathit', [0x1d434, 0x1d44e]], ['mathbb', [0x1d538, 0x1d552, 0x1d7d8]],
+  ['mathcal', [0x1d49c, 0x1d4b6]], ['mathscr', [0x1d49c, 0x1d4b6]],
+  ['mathfrak', [0x1d504, 0x1d51e]], ['mathsf', [0x1d5a0, 0x1d5ba, 0x1d7e2]],
+  ['mathtt', [0x1d670, 0x1d68a, 0x1d7f6]], ['mathrm', []],
+]);
+const MATH_LETTER_EXCEPTIONS = new Map([
+  [0x1d455, 'ℎ'], [0x1d49d, 'ℬ'], [0x1d4a0, 'ℰ'], [0x1d4a1, 'ℱ'],
+  [0x1d4a3, 'ℋ'], [0x1d4a4, 'ℐ'], [0x1d4a7, 'ℒ'], [0x1d4a8, 'ℳ'],
+  [0x1d4ad, 'ℛ'], [0x1d4ba, 'ℯ'], [0x1d4bc, 'ℊ'], [0x1d4c4, 'ℴ'],
+  [0x1d506, 'ℭ'], [0x1d50b, 'ℌ'], [0x1d50c, 'ℑ'], [0x1d515, 'ℜ'],
+  [0x1d51d, 'ℨ'], [0x1d53a, 'ℂ'], [0x1d53f, 'ℍ'], [0x1d545, 'ℕ'],
+  [0x1d547, 'ℙ'], [0x1d548, 'ℚ'], [0x1d549, 'ℝ'], [0x1d551, 'ℤ'],
+]);
 
 function mathElement(name, ...children) {
   const element = document.createElementNS(MATH_NAMESPACE, name);
@@ -2398,11 +2467,22 @@ function mathElement(name, ...children) {
   return element;
 }
 
+function mathOperator(value, stretchy = false) {
+  const operator = mathElement('mo', value);
+  if (stretchy || MATH_FIXED_DELIMITERS.has(value)) {
+    operator.setAttribute('stretchy', String(stretchy));
+  }
+  return operator;
+}
+
 function buildMarkdownMath(source, display) {
   if (!source.trim() || source.length > MATH_SOURCE_LIMIT) return null;
-  const token = /\s*(\\[A-Za-z]+|\\[{},|%$]|\d+(?:\.\d+)?|[\s\S])/y;
+  const token = /(\\(?:[A-Za-z]+|.)|\d+(?:\.\d+)?|.)/syu;
+  const textGroup = /\{((?:\\[{}\\%$#_&]|[^{}\\])*)\}/y;
   const input = source.trim();
   let index = 0;
+  let alphabet;
+  const operatorLimits = new WeakSet();
   const invalid = new Error('Unsupported math');
 
   function peek() {
@@ -2410,64 +2490,307 @@ function buildMarkdownMath(source, display) {
     return input[index];
   }
 
-  function take() {
+  function nextToken() {
+    peek();
     token.lastIndex = index;
-    const match = token.exec(input);
-    if (!match) throw invalid;
-    index = token.lastIndex;
-    return match[1];
+    return token.exec(input)?.[0];
   }
 
-  function group(depth) {
-    if (peek() !== '{') throw invalid;
-    return atom(depth);
+  function take() {
+    const value = nextToken();
+    if (!value) throw invalid;
+    index += value.length;
+    return value;
   }
 
-  function atom(depth, script = false) {
+  function rawGroup(pattern) {
+    if (take() !== '{') throw invalid;
+    const end = input.indexOf('}', index);
+    if (end < 0) throw invalid;
+    const value = input.slice(index, end);
+    if (!pattern.test(value)) throw invalid;
+    index = end + 1;
+    return value;
+  }
+
+  function styled(child, style, level) {
+    const wrapper = mathElement('mstyle', child);
+    if (style !== undefined) wrapper.setAttribute('displaystyle', String(style));
+    if (level !== undefined) wrapper.setAttribute('scriptlevel', level);
+    return wrapper;
+  }
+
+  function letter(value) {
+    let text = value;
+    if (alphabet) {
+      const ascii = value.charCodeAt(0);
+      const group = /^[A-Z]$/.test(value) ? [0, 65] : /^[a-z]$/.test(value) ? [1, 97]
+        : /^[Α-Ω]$/.test(value) ? [3, 0x391] : /^[α-ω]$/.test(value) ? [4, 0x3b1] : null;
+      if (group && alphabet[group[0]]) {
+        const transformed = alphabet[group[0]] + ascii - group[1];
+        text = MATH_LETTER_EXCEPTIONS.get(transformed) || String.fromCodePoint(transformed);
+      }
+    }
+    const element = mathElement('mi', text);
+    if ((alphabet && text === value) || text !== value) element.setAttribute('mathvariant', 'normal');
+    return element;
+  }
+
+  function delimiter() {
+    const value = take();
+    if (value === '.') return '';
+    if (value === '\\|') return '‖';
+    if (/^\\[{}]$/.test(value)) return value[1];
+    if (/^[()[\]|⟨⟩‖⌊⌋⌈⌉]$/.test(value)) return value;
+    const mapped = value.startsWith('\\') && MATH_DELIMITERS.get(value.slice(1));
+    if (!mapped) throw invalid;
+    return mapped;
+  }
+
+  function fenced(content, left, right) {
+    if (!left && !right) return content;
+    const row = mathElement('mrow');
+    if (left) row.append(mathOperator(left, true));
+    row.append(content);
+    if (right) row.append(mathOperator(right, true));
+    return row;
+  }
+
+  function table(depth, displayStyle) {
+    const name = rawGroup(/^[a-zA-Z]+\*?$/);
+    if (!MATH_ENVIRONMENTS.has(name)) throw invalid;
+    const columns = name === 'array' ? rawGroup(/^[lcr|]{1,24}$/).replace(/\|/g, '') : '';
+    if (name === 'array' && !columns) throw invalid;
+    if (name.startsWith('alignat') || name === 'alignedat') rawGroup(/^[1-9]\d?$/);
+    const layout = mathElement('mtable');
+    const isCases = name === 'cases' || name === 'dcases';
+    const aligned = MATH_ALIGNMENTS.has(name);
+    const singleColumn = /^(?:gather|equation)/.test(name);
+    const maxColumns = singleColumn ? 1 : isCases ? 2 : columns.length || 24;
+    for (let rowIndex = 0; rowIndex < 64; rowIndex += 1) {
+      const row = mathElement('mtr');
+      for (let column = 0; column < maxColumns; column += 1) {
+        const wrap = sequence(depth + 1, value => value === '&' || value === '\\\\' || value === '\\end',
+          name === 'dcases' || aligned || (singleColumn && displayStyle));
+        const cell = mathElement('mtd', wrap);
+        const alignment = columns[column] || (isCases ? 'l' : aligned ? (column % 2 ? 'l' : 'r') : 'c');
+        cell.setAttribute('class', `md-math-${alignment}`);
+        row.append(cell);
+        if (nextToken() !== '&') break;
+        take();
+        if (column + 1 === maxColumns) throw invalid;
+      }
+      layout.append(row);
+      if (nextToken() === '\\\\') {
+        take();
+        const gap = input.slice(index).match(/^\s*\[\s*-?\d+(?:\.\d+)?(?:em|ex|pt|px|mm|cm)\s*\]/);
+        if (gap) index += gap[0].length;
+        if (nextToken() !== '\\end') continue;
+      }
+      if (take() !== '\\end' || rawGroup(/^[a-zA-Z]+\*?$/) !== name) throw invalid;
+      const [left, right] = MATH_ENVIRONMENTS.get(name);
+      return fenced(name === 'smallmatrix' ? styled(layout, false, '+1')
+        : (name === 'dcases' || aligned) ? styled(layout, true) : layout, left, right);
+    }
+    throw invalid;
+  }
+
+  function atom(depth, single = false, displayStyle = false) {
     if (depth > 24) throw invalid;
-    const value = script && /^\d$/.test(peek() || '') ? input[index++] : take();
+    const value = single && /^\d$/.test(peek() || '') ? input[index++] : take();
     if (value === '{') {
-      const row = sequence(depth + 1);
-      if (peek() !== '}') throw invalid;
-      index += 1;
+      const row = sequence(depth + 1, undefined, displayStyle);
+      if (take() !== '}') throw invalid;
       return row;
     }
-    if (value === '\\frac') return mathElement('mfrac', group(depth + 1), group(depth + 1));
-    if (value === '\\sqrt') return mathElement('msqrt', group(depth + 1));
-    if (value === '\\,') {
+    if (value === '\\left') {
+      const left = delimiter();
+      const content = mathElement('mrow');
+      const end = command => command === '\\middle' || command === '\\right';
+      if (left) content.append(mathOperator(left, true));
+      content.append(sequence(depth + 1, end, displayStyle));
+      while (nextToken() === '\\middle') {
+        take();
+        const middle = delimiter();
+        if (middle) content.append(mathOperator(middle, true));
+        content.append(sequence(depth + 1, end, displayStyle));
+      }
+      if (take() !== '\\right') throw invalid;
+      const right = delimiter();
+      // Keep middle delimiters in the same row as the outer fences.
+      if (right) content.append(mathOperator(right, true));
+      return content;
+    }
+    if (value === '\\begin') return table(depth, displayStyle);
+    if (value === '\\sqrt') {
+      if (peek() !== '[') return mathElement('msqrt', atom(depth + 1, true));
+      take();
+      const degree = sequence(depth + 1, part => part === ']');
+      if (take() !== ']') throw invalid;
+      return mathElement('mroot', atom(depth + 1, true), degree);
+    }
+    if (['\\frac', '\\dfrac', '\\tfrac', '\\binom', '\\dbinom', '\\tbinom'].includes(value)) {
+      let fraction = mathElement('mfrac', atom(depth + 1, true), atom(depth + 1, true));
+      if (value.endsWith('binom')) {
+        fraction.setAttribute('linethickness', '0');
+        fraction = fenced(fraction, '(', ')');
+      }
+      return value[1] === 'd' ? styled(fraction, true) : value[1] === 't' ? styled(fraction, false) : fraction;
+    }
+    if (['\\text', '\\mbox', '\\textnormal', '\\operatorname', '\\tag'].includes(value)) {
+      const starred = (value === '\\operatorname' || value === '\\tag') && peek() === '*';
+      if (starred) take();
+      peek();
+      textGroup.lastIndex = index;
+      const text = textGroup.exec(input);
+      if (!text) throw invalid;
+      index = textGroup.lastIndex;
+      const label = text[1].replace(/\\([{}\\%$#_&])/g, '$1');
+      const element = mathElement(value === '\\operatorname' ? 'mo' : 'mtext',
+        value === '\\tag' && !starred ? ` (${label})` : label);
+      if (value === '\\operatorname' && starred) operatorLimits.add(element);
+      if (value === '\\tag') element.setAttribute('class', 'md-math-tag');
+      return element;
+    }
+    if (MATH_SPACES.has(value)) {
       const space = mathElement('mspace');
-      space.setAttribute('width', '0.167em');
+      space.setAttribute('width', MATH_SPACES.get(value));
       return space;
     }
     const name = value.slice(1);
     if (value.startsWith('\\')) {
-      if (MATH_IDENTIFIERS.has(name)) return mathElement('mi', MATH_IDENTIFIERS.get(name));
-      if (MATH_OPERATORS.has(name)) return mathElement('mo', MATH_OPERATORS.get(name));
-      if (MATH_FUNCTIONS.has(name)) return mathElement('mi', name);
-      if (/^[{}|%$]$/.test(name)) return mathElement('mo', name);
+      if (MATH_ALPHABETS.has(name) || name === 'bm') {
+        const previous = alphabet;
+        alphabet = MATH_ALPHABETS.get(name === 'bm' ? 'boldsymbol' : name);
+        const content = atom(depth + 1, true, displayStyle);
+        alphabet = previous;
+        return content;
+      }
+      if (MATH_ACCENTS.has(name)) {
+        const below = name.startsWith('under');
+        const accent = mathElement('mo', MATH_ACCENTS.get(name));
+        const wide = /^(?:over|under|wide)/.test(name);
+        accent.setAttribute('stretchy', String(wide));
+        const accented = mathElement(below ? 'munder' : 'mover', atom(depth + 1, true), accent);
+        accented.setAttribute(below ? 'accentunder' : 'accent', 'true');
+        if (name.endsWith('brace')) operatorLimits.add(accented);
+        return accented;
+      }
+      if (['overset', 'stackrel', 'underset'].includes(name)) {
+        const script = atom(depth + 1, true);
+        return mathElement(name === 'underset' ? 'munder' : 'mover', atom(depth + 1, true), script);
+      }
+      if (name === 'not') {
+        const relation = take();
+        const symbol = relation.startsWith('\\') ? MATH_OPERATORS.get(relation.slice(1)) : relation;
+        if (!symbol || !/^[\p{Sm}=<>]$/u.test(symbol)) throw invalid;
+        const negations = { '=': '≠', '∈': '∉', '∋': '∌', '≡': '≢', '⊂': '⊄', '⊆': '⊈', '∥': '∦', '∣': '∤' };
+        return mathOperator(negations[symbol] || `${symbol}\u0338`);
+      }
+      if (name === 'boxed' || name === 'phantom') {
+        const child = atom(depth + 1, true, displayStyle);
+        const wrapper = mathElement(name === 'boxed' ? 'mrow' : 'mphantom', child);
+        if (name === 'boxed') wrapper.setAttribute('class', 'md-math-box');
+        return wrapper;
+      }
+      if (name === 'substack') {
+        if (take() !== '{') throw invalid;
+        const layout = mathElement('mtable');
+        for (let rowIndex = 0; rowIndex < 64; rowIndex += 1) {
+          const line = sequence(depth + 1, part => part === '\\\\', false);
+          layout.append(mathElement('mtr', mathElement('mtd', line)));
+          const separator = take();
+          if (separator === '}') return styled(layout, false, '1');
+          if (separator !== '\\\\') throw invalid;
+        }
+        throw invalid;
+      }
+      if (name === 'xrightarrow' || name === 'xleftarrow') {
+        let below;
+        if (peek() === '[') {
+          take();
+          below = sequence(depth + 1, part => part === ']');
+          if (take() !== ']') throw invalid;
+        }
+        const arrow = mathOperator(name === 'xrightarrow' ? '→' : '←', true);
+        const above = atom(depth + 1, true);
+        return below ? mathElement('munderover', arrow, below, above) : mathElement('mover', arrow, above);
+      }
+      if (/^(?:big|Big|bigg|Bigg)[lmr]?$/.test(name)) {
+        const sizes = { big: '1.2em', Big: '1.5em', bigg: '1.8em', Bigg: '2.2em' };
+        const content = delimiter();
+        if (!content) return mathElement('mrow');
+        const operator = mathOperator(content, true);
+        const size = sizes[name.replace(/[lmr]$/, '')];
+        operator.setAttribute('minsize', size);
+        operator.setAttribute('maxsize', size);
+        return operator;
+      }
+      if (MATH_IDENTIFIERS.has(name)) return letter(MATH_IDENTIFIERS.get(name));
+      if (MATH_OPERATORS.has(name)) return mathOperator(MATH_OPERATORS.get(name));
+      if (MATH_FUNCTIONS.has(name)) return mathElement('mo', name);
+      if (MATH_DELIMITERS.has(name)) return mathOperator(MATH_DELIMITERS.get(name));
+      if (name === 'notag' || name === 'nonumber') return mathElement('mrow');
+      if (name === '|') return mathOperator('‖');
+      if (/^[{}%$#&_!]$/.test(name)) return name === '!' ? mathElement('mrow') : mathOperator(name);
       throw invalid;
     }
-    if (/^\d/.test(value)) return mathElement('mn', value);
-    if (/^\p{L}$/u.test(value)) return mathElement('mi', value);
-    if (/^[+\-−*=<>×÷±≤≥≠∑∫∞()[\]|!.,:;/]$/.test(value)) return mathElement('mo', value);
+    if (/^\d/.test(value)) {
+      const digits = alphabet?.[2];
+      return mathElement('mn', digits ? value.replace(/\d/g, digit => String.fromCodePoint(digits + Number(digit))) : value);
+    }
+    if (/^\p{L}$/u.test(value)) return letter(value);
+    if (/^[+\-−*=<>()[\]|!.,:;/\p{Sm}]$/u.test(value)) return mathOperator(value === '-' ? '−' : value);
     throw invalid;
   }
 
-  function sequence(depth) {
+  function sequence(depth, stop = () => false, displayStyle = display, allowInfix = true) {
+    if (depth > 24) throw invalid;
     const row = mathElement('mrow');
-    while (peek() && peek() !== '}') {
-      const base = atom(depth);
+    let command;
+    while ((command = nextToken()) && command !== '}' && !stop(command)) {
+      if (['\\over', '\\atop', '\\choose'].includes(command)) {
+        if (!allowInfix) throw invalid;
+        take();
+        const fraction = mathElement('mfrac', row, sequence(depth + 1, stop, false, false));
+        if (command !== '\\over') fraction.setAttribute('linethickness', '0');
+        return command === '\\choose' ? fenced(fraction, '(', ')') : fraction;
+      }
+      if (['\\displaystyle', '\\textstyle', '\\scriptstyle', '\\scriptscriptstyle'].includes(command)) {
+        take();
+        const large = command === '\\displaystyle';
+        const level = command === '\\scriptstyle' ? '1' : command === '\\scriptscriptstyle' ? '2' : '0';
+        row.append(styled(sequence(depth + 1, stop, large, allowInfix), large, level));
+        break;
+      }
+      const base = atom(depth, false, displayStyle);
       let sub;
       let sup;
-      while (peek() === '_' || peek() === '^') {
-        const marker = input[index++];
-        if ((marker === '_' && sub) || (marker === '^' && sup)) throw invalid;
-        if (marker === '_') sub = atom(depth + 1, true);
-        else sup = atom(depth + 1, true);
+      let primes = '';
+      let limits = operatorLimits.has(base) && /brace$/.test(command)
+        || (displayStyle && (operatorLimits.has(base) || MATH_LIMITS.has(command.slice(1))));
+      let modifier = nextToken();
+      if (['\\limits', '\\nolimits', '\\displaylimits'].includes(modifier)) {
+        take();
+        limits = modifier === '\\limits' || (modifier === '\\displaylimits' && displayStyle);
       }
-      row.append(sub && sup ? mathElement('msubsup', base, sub, sup)
-        : sub ? mathElement('msub', base, sub)
-          : sup ? mathElement('msup', base, sup) : base);
+      while ((modifier = nextToken()) && ['_', '^', "'", '′', '″', '‴'].includes(modifier)) {
+        take();
+        if (modifier === '_' || modifier === '^') {
+          if ((modifier === '_' && sub) || (modifier === '^' && sup)) throw invalid;
+          if (modifier === '_') sub = atom(depth + 1, true);
+          else sup = atom(depth + 1, true);
+        } else {
+          primes += modifier === "'" ? '′' : modifier;
+        }
+      }
+      if (primes) {
+        const prime = mathOperator(primes);
+        sup = sup ? mathElement('mrow', prime, sup) : prime;
+      }
+      row.append(sub && sup ? mathElement(limits ? 'munderover' : 'msubsup', base, sub, sup)
+        : sub ? mathElement(limits ? 'munder' : 'msub', base, sub)
+          : sup ? mathElement(limits ? 'mover' : 'msup', base, sup) : base);
     }
     return row;
   }
@@ -2736,13 +3059,15 @@ function splitTableRow(line) {
   if (text.endsWith('|')) text = text.slice(0, -1);
   const cells = [];
   let current = '';
-  let escaped = false;
-  for (const character of text) {
-    if (escaped) {
-      current += character;
-      escaped = false;
-    } else if (character === '\\') {
-      escaped = true;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    const math = (character === '$' || character === '\\') && matchInlineMath(text, index);
+    if (math) {
+      current += text.slice(index, math.after);
+      index = math.after - 1;
+    } else if (character === '\\' && index + 1 < text.length) {
+      current += text.slice(index, index + 2);
+      index += 1;
     } else if (character === '|') {
       cells.push(current);
       current = '';
@@ -2779,21 +3104,44 @@ function startsMarkdownBlock(lines, index) {
 
 function matchDisplayMath(lines, start) {
   const first = lines[start].trim();
+  const name = first.match(/^\\begin\{([a-zA-Z]+\*?)\}/)?.[1];
+  const environment = MATH_ENVIRONMENTS.has(name) ? name : null;
   const open = first.startsWith('$$') ? '$$' : first.startsWith('\\[') ? '\\[' : null;
-  if (!open) return null;
-  const close = open === '$$' ? '$$' : '\\]';
+  if (!open && !environment) return null;
   if (first.length > MATH_SOURCE_LIMIT + 4) return null;
-  if (first.length > 2 && first.endsWith(close)) {
+  if (environment && !open) {
+    let depth = 0;
+    let size = 0;
+    for (let index = start; index < lines.length; index += 1) {
+      const line = lines[index].trim();
+      size += lines[index].length + 1;
+      if (size > MATH_SOURCE_LIMIT || !line || matchFence(line)) return null;
+      for (const match of line.matchAll(/\\(begin|end)\{([a-zA-Z]+\*?)\}/g)) {
+        if (match[2] !== environment) continue;
+        depth += match[1] === 'begin' ? 1 : -1;
+        if (depth === 0) {
+          if (match.index + match[0].length !== line.length) return null;
+          return { source: lines.slice(start, index + 1).join('\n'), end: index };
+        }
+      }
+    }
+    return null;
+  }
+  const close = open === '$$' ? '$$' : '\\]';
+  if (first.length >= 4 && first.endsWith(close)) {
     return { source: first.slice(2, -2), end: start };
   }
-  if (first !== open) return null;
-  let size = 0;
+  const source = [first.slice(2)];
+  let size = source[0].length;
   for (let index = start + 1; index < lines.length; index += 1) {
-    if (lines[index].trim() === close) {
-      return { source: lines.slice(start + 1, index).join('\n'), end: index };
+    const line = lines[index].trimEnd();
+    size += line.length + 1;
+    if (size > MATH_SOURCE_LIMIT || !line.trim() || matchFence(line)) return null;
+    if (line.endsWith(close)) {
+      source.push(line.slice(0, -2));
+      return { source: source.join('\n'), end: index };
     }
-    size += lines[index].length + 1;
-    if (size > MATH_SOURCE_LIMIT || !lines[index].trim() || matchFence(lines[index])) return null;
+    source.push(line);
   }
   return null;
 }

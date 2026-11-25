@@ -1112,6 +1112,17 @@ p {
   white-space: pre-wrap;
 }
 
+.md-math-l { text-align: left; }
+.md-math-c { text-align: center; }
+.md-math-r { text-align: right; }
+
+.md-math-box {
+  border: 1px solid currentColor;
+  padding: 0.12em 0.25em;
+}
+
+.md-math-tag { padding-inline-start: 1em; }
+
 .md-table-wrap {
   margin: 0.7em 0 1em;
   overflow-x: auto;

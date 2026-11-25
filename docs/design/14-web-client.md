@@ -80,9 +80,14 @@ HTTPS images require an explicit click and send no referrer. Completed replies
 and restored history also preview project images, for example
 `![Plot](resources/assets/plot.svg)`. Math uses the browser's native MathML, with
 no external assets. It supports `$...$` and `\(...\)` inline, and `$$...$$` and `\[...\]` on
-their own lines. Common symbols, scripts, fractions, and square roots are
-supported; unsupported expressions remain text. Footnotes and syntax highlighting
-are not implemented.
+their own lines. The built-in TeX subset includes common symbols and functions,
+scripts and operator limits, fractions, indexed roots, binomials, accents,
+font commands, plain `\text{...}`, and `\left...\right` fences. It also supports
+matrix and array variants, `cases`, and multi-line `align`/`gather` variants
+inside display delimiters or as standalone blocks. It does not implement
+macros, packages, document preambles, automatic numbering, or cross-references.
+Unsupported expressions remain text. Footnotes and syntax highlighting are
+not implemented.
 
 Successful tool cards collapse after completion; failed or interrupted results
 stay expanded. The path-only `host_read` and `host_list` calls are suppressed
