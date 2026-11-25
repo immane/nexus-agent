@@ -102,8 +102,10 @@ For the experimental Apple Silicon menu-bar app and drag-to-Applications DMG,
 run `scripts/package-macos-dmg.sh` on an arm64 Mac with matching Xcode/Swift and
 Rust toolchains. The app starts the loopback server, opens the Web client, and
 keeps its server token in the macOS Keychain; the browser receives only a
-one-use login code in the URL fragment. The menu can reopen the interface,
-restart the server, select an installed browser Web App, show logs, or quit
+one-use login code in the URL fragment. If **Open Nexus** does not show a page
+after choosing an installed Web App, use **Open in Default Browser** to bypass
+that choice once, or **Forget Installed Web App** to make **Open Nexus** use
+the browser again. The menu can also restart the server, show logs, or quit
 (which stops the server). Restart can stop a stale `nexus-server` owned by the
 current user and listening on `127.0.0.1:8471`; other listeners are left alone.
 Local tools are off until you choose **Open Project…** in the menu bar or in

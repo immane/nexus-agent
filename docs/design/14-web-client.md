@@ -59,8 +59,8 @@ guessing.
 The shell uses:
 
 - native HTML, CSS, and ES modules with no third-party runtime;
-- a same-origin CSP with no inline scripts or styles and `frame-ancestors
-  'none'`;
+- a CSP with same-origin scripts, styles, and connections, no inline scripts
+  or styles, and `frame-ancestors 'none'`; external HTTPS images require a click;
 - text nodes for all model, tool, approval, and error content (never
   `innerHTML`); the Markdown renderer builds DOM nodes and never parses raw HTML;
 - `fetch` with `ReadableStream` instead of `EventSource`, because the bearer
@@ -75,8 +75,13 @@ text, strikethrough, inline code, fenced code with a language label, ordered and
 unordered lists, task markers, blockquotes, horizontal rules, links, autolinks,
 and pipe tables. Link targets are limited to `http`, `https`, and `mailto`;
 unsafe or malformed targets remain plain text. Raw HTML is displayed as text.
-Images, footnotes, math, nested list structures, and syntax highlighting are not
-implemented.
+Inline Markdown images (`![alt](url)`) can display same-origin images; external
+HTTPS images require an explicit click and send no referrer. Local filesystem
+paths are not exposed. Math uses the browser's native MathML, with no external
+assets. It supports `$...$` and `\(...\)` inline, and `$$...$$` and `\[...\]` on
+their own lines. Common symbols, scripts, fractions, and square roots are
+supported; unsupported expressions remain text. Footnotes and syntax highlighting
+are not implemented.
 
 Successful tool cards collapse after completion; failed or interrupted results
 stay expanded. The path-only `host_read` and `host_list` calls are suppressed
@@ -329,8 +334,9 @@ new session never claims to cancel work that may still be executing.
   stricter web-addition path checks.
 - Provider/model removal is not exposed over HTTP. Existing sessions are not
   updated by configuration edits.
-- Markdown is a deliberately bounded subset. Images, footnotes, math, nested
-  list structures, raw HTML, and syntax highlighting are not rendered.
+- Markdown is a deliberately bounded subset, not a full CommonMark or LaTeX
+  implementation. Footnotes, nested list structures, raw HTML, and syntax
+  highlighting are not rendered.
 - Very long assistant items switch to plain text while streaming and may take a
   noticeable moment to format when the final Markdown pass runs.
 - The demo wiring is test-only; no provider behavior is simulated beyond what

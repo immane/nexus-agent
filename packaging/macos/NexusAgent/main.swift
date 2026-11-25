@@ -61,9 +61,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(status)
         menu.addItem(.separator())
         menu.addItem(item("Open Nexus", #selector(openInterface)))
+        menu.addItem(item("Open in Default Browser", #selector(openInDefaultBrowser)))
         menu.addItem(item("Open Project…", #selector(chooseProject)))
         menu.addItem(item("Restart Service", #selector(restartServer)))
         menu.addItem(item("Choose Installed Web App…", #selector(chooseWebApp)))
+        if UserDefaults.standard.string(forKey: "selectedWebApp") != nil {
+            menu.addItem(item("Forget Installed Web App", #selector(forgetWebApp)))
+        }
         menu.addItem(item("View Service Log", #selector(showLog)))
         menu.addItem(.separator())
         menu.addItem(item("Quit Nexus", #selector(quit)))
@@ -77,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return result
     }
 
-    private func startServer() {
+    private func startServer(preferWebApp: Bool = true) {
         guard server == nil else { return }
         do {
             try FileManager.default.createDirectory(at: supportURL, withIntermediateDirectories: true)
@@ -132,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try process.run()
             server = process
             rebuildMenu()
-            Task { await waitUntilReadyAndOpen(process) }
+            Task { await waitUntilReadyAndOpen(process, preferWebApp: preferWebApp) }
         } catch {
             server = nil
             rebuildMenu()
@@ -140,7 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func waitUntilReadyAndOpen(_ process: Process) async {
+    private func waitUntilReadyAndOpen(_ process: Process, preferWebApp: Bool) async {
         let healthURL = URL(string: "http://127.0.0.1:\(port)/health")!
         for _ in 0..<100 {
             guard server === process, process.isRunning, !restarting else { return }
@@ -150,7 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                    server === process, process.isRunning, !restarting {
                     if !openedOnLaunch {
                         openedOnLaunch = true
-                        await openInterfaceWithLogin()
+                        await openInterfaceWithLogin(preferWebApp: preferWebApp)
                     }
                     return
                 }
@@ -163,13 +167,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openInterface() {
-        Task { await openInterfaceWithLogin() }
+        Task { await openInterfaceWithLogin(preferWebApp: true) }
     }
 
-    private func openInterfaceWithLogin() async {
+    @objc private func openInDefaultBrowser() {
+        Task { await openInterfaceWithLogin(preferWebApp: false) }
+    }
+
+    private func openInterfaceWithLogin(preferWebApp: Bool) async {
         guard !restarting else { return }
         guard server?.isRunning == true else {
-            startServer()
+            openedOnLaunch = false
+            startServer(preferWebApp: preferWebApp)
             return
         }
         let code: String
@@ -183,20 +192,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         components.fragment = "nexus-login=\(code)"
         guard let url = components.url else { return }
 
-        if let selected = UserDefaults.standard.string(forKey: "selectedWebApp"),
-           FileManager.default.fileExists(atPath: selected) {
-            do {
-                _ = try await NSWorkspace.shared.open(
-                    [url],
-                    withApplicationAt: URL(fileURLWithPath: selected),
-                    configuration: NSWorkspace.OpenConfiguration()
-                )
-                return
-            } catch {
-                UserDefaults.standard.removeObject(forKey: "selectedWebApp")
+        if preferWebApp, let selected = UserDefaults.standard.string(forKey: "selectedWebApp") {
+            if FileManager.default.fileExists(atPath: selected) {
+                do {
+                    _ = try await NSWorkspace.shared.open(
+                        [url],
+                        withApplicationAt: URL(fileURLWithPath: selected),
+                        configuration: NSWorkspace.OpenConfiguration()
+                    )
+                    return
+                } catch {
+                    // Fall back to the default browser if the selected app cannot be opened.
+                }
+            }
+            if UserDefaults.standard.string(forKey: "selectedWebApp") == selected {
+                forgetWebApp()
             }
         }
-        NSWorkspace.shared.open(url)
+        if !NSWorkspace.shared.open(url) {
+            showError("Could Not Open Nexus", detail: "macOS could not open the Nexus page in your default browser.")
+        }
     }
 
     private func issueLoginCode() async throws -> String {
@@ -325,16 +340,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func chooseWebApp() {
+        NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.title = "Choose an Installed Nexus Web App"
+        panel.message = "Choose the app installed for the Nexus website, not a regular browser application."
         panel.prompt = "Choose"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.application]
         if panel.runModal() == .OK, let url = panel.url {
             UserDefaults.standard.set(url.path, forKey: "selectedWebApp")
+            rebuildMenu()
             openInterface()
         }
+    }
+
+    @objc private func forgetWebApp() {
+        UserDefaults.standard.removeObject(forKey: "selectedWebApp")
+        rebuildMenu()
     }
 
     @objc private func showLog() {

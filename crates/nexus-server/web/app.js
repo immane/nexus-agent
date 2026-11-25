@@ -2250,6 +2250,173 @@ function appendMarkdownLink(parent, label, url, depth, inLink = false) {
   parent.append(link);
 }
 
+const MARKDOWN_IMAGE = /!\[((?:\\[\[\]\\]|[^[\]\\\n])*)\]\([ \t]*(?:<([^<>\n]+)>|((?:[^\s()<>]|\([^\s()<>]*\))+))(?:[ \t]+(?:"([^"\n]*)"|'([^'\n]*)'))?[ \t]*\)/y;
+
+function appendMarkdownImage(parent, label, target, title, inLink) {
+  let url;
+  try {
+    url = new URL(target, location.href);
+  } catch {
+    // Keep the description when the URL is invalid.
+  }
+  const sameOrigin = url?.origin === location.origin;
+  if (!url || url.username || url.password
+    || !(url.protocol === 'https:' || (sameOrigin && url.protocol === 'http:'))) {
+    parent.append(document.createTextNode(label || 'Image'));
+    return;
+  }
+  const image = node('img', 'md-image');
+  image.alt = label;
+  if (title) image.title = title;
+  image.loading = 'lazy';
+  image.decoding = 'async';
+  image.referrerPolicy = 'no-referrer';
+  if (sameOrigin) {
+    image.src = url.href;
+    parent.append(image);
+  } else if (!inLink) {
+    const load = node('button', 'md-image-load', label ? `Load image: ${label}` : 'Load image');
+    load.type = 'button';
+    load.title = url.hostname;
+    load.addEventListener('click', () => {
+      image.src = url.href;
+      load.replaceWith(image);
+    }, { once: true });
+    parent.append(load);
+  } else {
+    parent.append(document.createTextNode(label || 'Image'));
+  }
+}
+
+const MATH_SOURCE_LIMIT = 4096;
+const MATH_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
+const MATH_IDENTIFIERS = new Map(Array.from(
+  'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma tau upsilon phi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega'.split(' '),
+  (name, index) => [name, 'αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΥΦΨΩ'[index]],
+));
+const MATH_OPERATORS = new Map(Object.entries({
+  times: '×', cdot: '⋅', div: '÷', pm: '±', mp: '∓', le: '≤', leq: '≤',
+  ge: '≥', geq: '≥', ne: '≠', neq: '≠', approx: '≈', equiv: '≡', in: '∈',
+  notin: '∉', subset: '⊂', subseteq: '⊆', cup: '∪', cap: '∩', to: '→',
+  rightarrow: '→', leftarrow: '←', Rightarrow: '⇒', Leftrightarrow: '⇔',
+  sum: '∑', prod: '∏', int: '∫', infty: '∞', partial: '∂', nabla: '∇',
+  forall: '∀', exists: '∃', ldots: '…', cdots: '⋯',
+}));
+const MATH_FUNCTIONS = new Set('sin cos tan log ln exp lim min max'.split(' '));
+
+function mathElement(name, ...children) {
+  const element = document.createElementNS(MATH_NAMESPACE, name);
+  element.append(...children);
+  return element;
+}
+
+function buildMarkdownMath(source, display) {
+  if (!source.trim() || source.length > MATH_SOURCE_LIMIT) return null;
+  const token = /\s*(\\[A-Za-z]+|\\[{},|%$]|\d+(?:\.\d+)?|[\s\S])/y;
+  const input = source.trim();
+  let index = 0;
+  const invalid = new Error('Unsupported math');
+
+  function peek() {
+    while (index < input.length && /\s/.test(input[index])) index += 1;
+    return input[index];
+  }
+
+  function take() {
+    token.lastIndex = index;
+    const match = token.exec(input);
+    if (!match) throw invalid;
+    index = token.lastIndex;
+    return match[1];
+  }
+
+  function group(depth) {
+    if (peek() !== '{') throw invalid;
+    return atom(depth);
+  }
+
+  function atom(depth, script = false) {
+    if (depth > 24) throw invalid;
+    const value = script && /^\d$/.test(peek() || '') ? input[index++] : take();
+    if (value === '{') {
+      const row = sequence(depth + 1);
+      if (peek() !== '}') throw invalid;
+      index += 1;
+      return row;
+    }
+    if (value === '\\frac') return mathElement('mfrac', group(depth + 1), group(depth + 1));
+    if (value === '\\sqrt') return mathElement('msqrt', group(depth + 1));
+    if (value === '\\,') {
+      const space = mathElement('mspace');
+      space.setAttribute('width', '0.167em');
+      return space;
+    }
+    const name = value.slice(1);
+    if (value.startsWith('\\')) {
+      if (MATH_IDENTIFIERS.has(name)) return mathElement('mi', MATH_IDENTIFIERS.get(name));
+      if (MATH_OPERATORS.has(name)) return mathElement('mo', MATH_OPERATORS.get(name));
+      if (MATH_FUNCTIONS.has(name)) return mathElement('mi', name);
+      if (/^[{}|%$]$/.test(name)) return mathElement('mo', name);
+      throw invalid;
+    }
+    if (/^\d/.test(value)) return mathElement('mn', value);
+    if (/^\p{L}$/u.test(value)) return mathElement('mi', value);
+    if (/^[+\-−*=<>×÷±≤≥≠∑∫∞()[\]|!.,:;/]$/.test(value)) return mathElement('mo', value);
+    throw invalid;
+  }
+
+  function sequence(depth) {
+    const row = mathElement('mrow');
+    while (peek() && peek() !== '}') {
+      const base = atom(depth);
+      let sub;
+      let sup;
+      while (peek() === '_' || peek() === '^') {
+        const marker = input[index++];
+        if ((marker === '_' && sub) || (marker === '^' && sup)) throw invalid;
+        if (marker === '_') sub = atom(depth + 1, true);
+        else sup = atom(depth + 1, true);
+      }
+      row.append(sub && sup ? mathElement('msubsup', base, sub, sup)
+        : sub ? mathElement('msub', base, sub)
+          : sup ? mathElement('msup', base, sup) : base);
+    }
+    return row;
+  }
+
+  try {
+    const row = sequence(0);
+    if (peek()) return null;
+    const math = mathElement('math', row);
+    if (display) math.setAttribute('display', 'block');
+    return math;
+  } catch (error) {
+    if (error !== invalid) throw error;
+    return null;
+  }
+}
+
+function matchInlineMath(text, start) {
+  const dollar = text[start] === '$';
+  if (dollar ? (text[start - 1] === '$' || !/[^\s$]/.test(text[start + 1] || ''))
+    : !text.startsWith('\\(', start)) return null;
+  const body = start + (dollar ? 1 : 2);
+  for (let index = body; index < text.length && index - body <= MATH_SOURCE_LIMIT; index += 1) {
+    if (text[index] === '`') return null;
+    if (text[index] === '\\') {
+      if (!dollar && text[index + 1] === ')') return { body, end: index, after: index + 2 };
+      if (!dollar && text[index + 1] === '(') return null;
+      index += 1;
+    } else if (dollar && text[index] === '$') {
+      if (index > body && !/\s/.test(text[index - 1]) && !/[\d$]/.test(text[index + 1] || '')) {
+        return { body, end: index, after: index + 1 };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
 function appendInlineMarkdown(parent, text, depth = 0, inLink = false) {
   if (!text) return;
   if (depth > 12) {
@@ -2268,10 +2435,38 @@ function appendInlineMarkdown(parent, text, depth = 0, inLink = false) {
   while (index < text.length) {
     const character = text[index];
 
-    if (character === '\\' && index + 1 < text.length && /[\\`*{}\[\]()#+\-.!_>~|]/.test(text[index + 1])) {
+    if (character === '$' || character === '\\') {
+      const match = matchInlineMath(text, index);
+      if (match) {
+        flush();
+        parent.append(buildMarkdownMath(text.slice(match.body, match.end), false)
+          || document.createTextNode(text.slice(index, match.after)));
+        index = match.after;
+        continue;
+      }
+      if (text.startsWith('\\(', index) || text.startsWith('\\[', index)) {
+        buffer += text.slice(index, index + 2);
+        index += 2;
+        continue;
+      }
+    }
+
+    if (character === '\\' && index + 1 < text.length && /[\\`*{}\[\]()#+\-.!_>~|$]/.test(text[index + 1])) {
       buffer += text[index + 1];
       index += 2;
       continue;
+    }
+
+    if (character === '!' && text[index + 1] === '[') {
+      MARKDOWN_IMAGE.lastIndex = index;
+      const image = MARKDOWN_IMAGE.exec(text);
+      if (image) {
+        flush();
+        appendMarkdownImage(parent, image[1].replace(/\\([\[\]\\])/g, '$1'),
+          image[2] ?? image[3], image[4] ?? image[5], inLink);
+        index += image[0].length;
+        continue;
+      }
     }
 
     if (character === '`') {
@@ -2487,10 +2682,32 @@ function tableSeparator(line) {
 function startsMarkdownBlock(lines, index) {
   const line = lines[index];
   if (!line || !line.trim()) return true;
-  if (matchFence(line) || matchHeading(line) || isHorizontalRule(line) || matchBlockquote(line) || matchListItem(line)) {
+  if (matchFence(line) || matchHeading(line) || isHorizontalRule(line) || matchBlockquote(line) || matchListItem(line)
+    || matchDisplayMath(lines, index)) {
     return true;
   }
   return line.includes('|') && index + 1 < lines.length && tableSeparator(lines[index + 1]) !== null;
+}
+
+function matchDisplayMath(lines, start) {
+  const first = lines[start].trim();
+  const open = first.startsWith('$$') ? '$$' : first.startsWith('\\[') ? '\\[' : null;
+  if (!open) return null;
+  const close = open === '$$' ? '$$' : '\\]';
+  if (first.length > MATH_SOURCE_LIMIT + 4) return null;
+  if (first.length > 2 && first.endsWith(close)) {
+    return { source: first.slice(2, -2), end: start };
+  }
+  if (first !== open) return null;
+  let size = 0;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === close) {
+      return { source: lines.slice(start + 1, index).join('\n'), end: index };
+    }
+    size += lines[index].length + 1;
+    if (size > MATH_SOURCE_LIMIT || !lines[index].trim() || matchFence(lines[index])) return null;
+  }
+  return null;
 }
 
 function appendMarkdownBlocks(parent, lines) {
@@ -2524,6 +2741,20 @@ function appendMarkdownBlocks(parent, lines) {
       codeBlock.append(pre);
       parent.append(codeBlock);
       index = closed ? end + 1 : lines.length;
+      continue;
+    }
+
+    const displayMath = matchDisplayMath(lines, index);
+    if (displayMath) {
+      const math = buildMarkdownMath(displayMath.source, true);
+      if (math) {
+        const wrapper = node('div', 'md-math-display');
+        wrapper.append(math);
+        parent.append(wrapper);
+      } else {
+        parent.append(node('p', 'md-math-source', lines.slice(index, displayMath.end + 1).join('\n')));
+      }
+      index = displayMath.end + 1;
       continue;
     }
 

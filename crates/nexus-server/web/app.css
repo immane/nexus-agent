@@ -1092,6 +1092,26 @@ p {
   background: transparent;
 }
 
+.md-image {
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+}
+
+.md-image-load {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.md-math-display {
+  margin: 0.7em 0;
+  overflow-x: auto;
+}
+
+.md-math-source {
+  white-space: pre-wrap;
+}
+
 .md-table-wrap {
   margin: 0.7em 0 1em;
   overflow-x: auto;
