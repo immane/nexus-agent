@@ -70,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(item("View Service Log", #selector(showLog)))
         menu.addItem(.separator())
+        menu.addItem(item("About Nexus Agent", #selector(showAbout)))
         menu.addItem(item("Quit Nexus", #selector(quit)))
         statusItem.menu = menu
         statusItem.button?.toolTip = server?.isRunning == true ? "Nexus Agent is running" : "Nexus Agent is stopped"
@@ -362,6 +363,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showLog() {
         NSWorkspace.shared.open(logURL)
+    }
+
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
     }
 
     @objc private func quit() {

@@ -105,8 +105,9 @@ keeps its server token in the macOS Keychain; the browser receives only a
 one-use login code in the URL fragment. If **Open Nexus** does not show a page
 after choosing an installed Web App, use **Open in Default Browser** to bypass
 that choice once, or **Forget Installed Web App** to make **Open Nexus** use
-the browser again. The menu can also restart the server, show logs, or quit
-(which stops the server). Restart can stop a stale `nexus-server` owned by the
+the browser again. **About Nexus Agent** shows the installed app version. The
+menu can also restart the server, show logs, or quit (which stops the server).
+Restart can stop a stale `nexus-server` owned by the
 current user and listening on `127.0.0.1:8471`; other listeners are left alone.
 Local tools are off until you choose **Open Project…** in the menu bar or in
 Web Settings → Projects. Confirming a folder restarts the service, interrupts
