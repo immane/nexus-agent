@@ -1591,6 +1591,51 @@ impl Runtime {
         Ok(())
     }
 
+    /// Offers a child result to the inbox while its parent state is stable.
+    ///
+    /// The callback may accept or decline the result. It must not block,
+    /// start a run, or re-enter this runtime. Callers coordinating with
+    /// another lock must acquire that lock before calling this method.
+    pub async fn offer_exploration(
+        &self,
+        parent: &RunId,
+        job: &RequestId,
+        accept: impl FnOnce(crate::ExplorationParent, &crate::ExplorationResult) -> bool,
+    ) -> crate::ExplorationClaim {
+        use crate::{ExplorationClaim, ExplorationParent};
+
+        let state = self.shared.state.lock().await;
+        let (owner, jobs) = if let Some(active) =
+            state.active.as_ref().filter(|active| &active.run == parent)
+        {
+            if active.cancelled || active.token.is_cancelled() {
+                return ExplorationClaim::ParentStopped;
+            }
+            match active.terminal {
+                Some(RunOutcome::Completed) => return ExplorationClaim::Deferred,
+                Some(_) => return ExplorationClaim::ParentStopped,
+                None if StdInstant::now() >= active.deadline => return ExplorationClaim::Deferred,
+                None => {}
+            }
+            (ExplorationParent::Active, &active.explorations)
+        } else if let Some(last) = state.last.as_ref().filter(|last| &last.run == parent) {
+            if last.outcome != RunOutcome::Completed {
+                return ExplorationClaim::ParentStopped;
+            }
+            let owner = if state.active.is_some() {
+                ExplorationParent::NewerRunActive
+            } else {
+                ExplorationParent::IdleAfterSuccess
+            };
+            (owner, &last.explorations)
+        } else {
+            return ExplorationClaim::Unknown;
+        };
+        jobs.get(job).map_or(ExplorationClaim::Unknown, |job| {
+            job.try_deliver(|result| accept(owner, result))
+        })
+    }
+
     /// Consumes one child result, only within its original parent run.
     pub async fn await_exploration(
         &self,

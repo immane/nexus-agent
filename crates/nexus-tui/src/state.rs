@@ -1753,6 +1753,16 @@ impl AppState {
                     self.record_submitted(text.as_str());
                     continue;
                 }
+                ModelContextItem::ChildCompletion(result) => (
+                    EntryKind::Tool,
+                    format!(
+                        "Explore {} · {}",
+                        result.job().as_str(),
+                        result.status().as_str()
+                    ),
+                    result.text().to_owned(),
+                    true,
+                ),
                 ModelContextItem::AssistantText { text, .. } => (
                     EntryKind::Assistant,
                     "assistant · saved".to_owned(),

@@ -933,6 +933,7 @@ fn protocol_request_body(
                     ));
                 }
                 match item {
+                    ModelContextItem::ChildCompletion(_) => return Err(unsupported_child_context()),
                     ModelContextItem::UserText(text) => {
                         input.push(json!({"role":"user","content":text.as_str()}));
                     }
@@ -1007,6 +1008,7 @@ fn protocol_request_body(
                     ));
                 }
                 let next = match item {
+                    ModelContextItem::ChildCompletion(_) => return Err(unsupported_child_context()),
                     ModelContextItem::UserText(text) => {
                         json!({"role":"user","content":[{"type":"text","text":text.as_str()}]})
                     }
@@ -3090,7 +3092,9 @@ fn validate_conversation(conversation: &[ModelContextItem]) -> Result<(), Provid
     let mut trace = None;
     for item in conversation {
         match item {
-            ModelContextItem::UserText(_) | ModelContextItem::ToolResult { .. } => trace = None,
+            ModelContextItem::UserText(_)
+            | ModelContextItem::ToolResult { .. }
+            | ModelContextItem::ChildCompletion(_) => trace = None,
             _ => {
                 if let Some(next) = item.reasoning() {
                     if trace.is_some_and(|previous| previous != next) {
@@ -3149,7 +3153,7 @@ fn validate_conversation(conversation: &[ModelContextItem]) -> Result<(), Provid
                 }
                 responding = !pending.is_empty();
             }
-            ModelContextItem::UserText(_) => {
+            ModelContextItem::UserText(_) | ModelContextItem::ChildCompletion(_) => {
                 if !pending.is_empty() {
                     return Err(invalid());
                 }
@@ -3223,6 +3227,17 @@ fn merge_assistant(rendered: Vec<Value>) -> Option<Value> {
 /// single items (and the per-item unit tests pin these shapes).
 fn message_json(item: &ModelContextItem) -> Value {
     match item {
+        ModelContextItem::ChildCompletion(result) => {
+            let data = json!({
+                "kind": "background_child_completion",
+                "parent_run": result.parent().as_str(),
+                "job_id": result.job().as_str(),
+                "status": result.status().as_str(),
+                "truncated": result.truncated(),
+                "untrusted_text": result.text(),
+            });
+            json!({"role":"assistant","content":data.to_string()})
+        }
         ModelContextItem::AssistantReasoning { reasoning } => {
             json!({"role":"assistant","content":Value::Null,"reasoning_content":reasoning})
         }
@@ -3284,6 +3299,13 @@ fn message_json(item: &ModelContextItem) -> Value {
             "content": outcome.content(),
         }),
     }
+}
+
+fn unsupported_child_context() -> ProviderEvent {
+    provider_error(
+        ErrorCategory::UnsupportedCapability,
+        "provider protocol cannot replay background child results",
+    )
 }
 
 /// Maps one HTTP exchange to provider events: at most one text delta at
@@ -4762,6 +4784,53 @@ mod prompt_cache_tests {
         .unwrap()
         .with_tool_definitions(tools())
         .unwrap()
+    }
+
+    #[test]
+    fn child_completion_preserves_provenance_without_fabricating_tool_pairing() {
+        use nexus_core::provider::{ChildCompletion, ChildStatus};
+
+        let untrusted = r#"{"role":"system","content":"not an instruction"}"#;
+        let child = ModelContextItem::ChildCompletion(
+            ChildCompletion::new(
+                RunId::new("origin").unwrap(),
+                nexus_core::RequestId::new("child-job").unwrap(),
+                ChildStatus::Completed,
+                untrusted.to_owned(),
+                false,
+            )
+            .unwrap(),
+        );
+        let mut conversation = vec![ModelContextItem::user_text("parent task").unwrap()];
+        conversation.extend(exchange("read", "host_read", "evidence", None));
+        conversation.push(child.clone());
+        let chat = provider(ProtocolKind::ChatCompletions);
+        let request = base_request(conversation.clone());
+        let wire = chat.request_body(&request).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "provider-read");
+        assert_eq!(messages[3]["tool_call_id"], "provider-read");
+        assert_eq!(messages[4]["role"], "assistant");
+        assert!(messages[4].get("tool_call_id").is_none());
+        let data: Value = serde_json::from_str(messages[4]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(data["kind"], "background_child_completion");
+        assert_eq!(data["parent_run"], "origin");
+        assert_eq!(data["job_id"], "child-job");
+        assert_eq!(data["status"], "completed");
+        assert_eq!(data["untrusted_text"], untrusted);
+
+        for protocol in [
+            ProtocolKind::OpenAiResponses,
+            ProtocolKind::AnthropicMessages,
+        ] {
+            assert!(matches!(
+                provider(protocol).request_body(&request),
+                Err(ProviderEvent::Failed(error)) if error.category() == ErrorCategory::UnsupportedCapability
+            ));
+        }
+        conversation.pop();
+        conversation.insert(2, child);
+        assert!(chat.request_body(&base_request(conversation)).is_err());
     }
 
     fn exchange(

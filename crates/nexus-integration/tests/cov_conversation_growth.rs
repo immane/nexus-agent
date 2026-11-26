@@ -81,6 +81,7 @@ fn read(item: &str, provider_ref: &str, path: &str) -> CallCandidate {
 fn kind(item: &ModelContextItem) -> &'static str {
     match item {
         ModelContextItem::UserText(_) => "user",
+        ModelContextItem::ChildCompletion(_) => "child-completion",
         ModelContextItem::AssistantText { .. } => "text",
         ModelContextItem::AssistantCall { .. } => "call",
         ModelContextItem::AssistantDeniedCall { .. } => "denied-call",

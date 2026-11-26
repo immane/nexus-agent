@@ -1875,6 +1875,14 @@ fn source_record_value(record: &SourceRecord) -> Value {
 fn context_item_value(item: &ModelContextItem) -> Value {
     match item {
         ModelContextItem::UserText(text) => json!({ "kind": "user_text", "text": text.as_str() }),
+        ModelContextItem::ChildCompletion(result) => json!({
+            "kind": "child_completion",
+            "parent_run": result.parent().as_str(),
+            "job_id": result.job().as_str(),
+            "status": result.status().as_str(),
+            "text": result.text(),
+            "truncated": result.truncated(),
+        }),
         ModelContextItem::AssistantText {
             item_key,
             text,
@@ -1959,6 +1967,30 @@ fn parse_context_item(value: &Value) -> Result<ModelContextItem, AgentError> {
         "user_text" => {
             check_keys(value, &["kind", "text"])?;
             ModelContextItem::user_text(string(field(value, "text")?)?)
+        }
+        "child_completion" => {
+            use nexus_core::provider::{ChildCompletion, ChildStatus};
+
+            check_keys(
+                value,
+                &[
+                    "kind",
+                    "parent_run",
+                    "job_id",
+                    "status",
+                    "text",
+                    "truncated",
+                ],
+            )?;
+            Ok(ModelContextItem::ChildCompletion(ChildCompletion::new(
+                RunId::new(string(field(value, "parent_run")?)?)
+                    .map_err(|_| store_error("child completion parent identity is invalid"))?,
+                nexus_core::RequestId::new(string(field(value, "job_id")?)?)
+                    .map_err(|_| store_error("child completion job identity is invalid"))?,
+                ChildStatus::parse(&string(field(value, "status")?)?)?,
+                string(field(value, "text")?)?,
+                boolean(field(value, "truncated")?)?,
+            )?))
         }
         "assistant_text" => {
             check_keys(value, &["kind", "item_key", "text", "reasoning"])?;
@@ -2482,6 +2514,33 @@ fn capacity_error(message: &'static str) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_completion_source_round_trips_and_rejects_invalid_provenance() {
+        use nexus_core::provider::{ChildCompletion, ChildStatus};
+
+        let item = ModelContextItem::ChildCompletion(
+            ChildCompletion::new(
+                RunId::new("original-parent").unwrap(),
+                nexus_core::RequestId::new("job-one").unwrap(),
+                ChildStatus::Completed,
+                "untrusted evidence".into(),
+                true,
+            )
+            .unwrap(),
+        );
+        let mut value = context_item_value(&item);
+        assert_eq!(value["kind"], "child_completion");
+        assert_eq!(parse_context_item(&value).unwrap(), item);
+        value["job_id"] = json!("invalid identity!");
+        assert!(parse_context_item(&value).is_err());
+        value["job_id"] = json!("job-one");
+        value["status"] = json!("cancelled");
+        assert!(
+            parse_context_item(&value).is_err(),
+            "cancelled results cannot have answer text"
+        );
+    }
     use nexus_core::{M0_REVISION, NormalizedArgs, ToolCall, TurnId};
 
     fn directory(label: &str) -> PathBuf {

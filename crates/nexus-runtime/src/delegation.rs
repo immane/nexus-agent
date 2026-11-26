@@ -53,7 +53,7 @@ impl Explorations {
 
     pub(crate) fn cancel_all(&self) {
         for job in self.0.values() {
-            job.cancel.send_replace(true);
+            job.stop();
         }
     }
 }
@@ -62,6 +62,35 @@ enum Completion {
     Pending,
     Finished(ExplorationResult),
     Collected,
+    ParentStopped,
+}
+
+/// Outcome of a synchronous attempt to hand a child result to the inbox.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExplorationClaim {
+    /// The job has not finished.
+    Pending,
+    /// The inbox declined the handoff; the result remains available.
+    Deferred,
+    /// The inbox accepted and consumed the result.
+    Accepted,
+    /// Another delivery path has already consumed the result.
+    Collected,
+    /// The parent stopped and no result can be delivered.
+    ParentStopped,
+    /// The runtime no longer knows this parent or job.
+    Unknown,
+}
+
+/// Parent state at the moment of an inbox offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplorationParent {
+    /// The originating run is still active.
+    Active,
+    /// The originating run finished successfully and no newer run is active.
+    IdleAfterSuccess,
+    /// A newer run is active; delivery must not steer that run.
+    NewerRunActive,
 }
 
 pub(crate) struct Job {
@@ -77,36 +106,85 @@ impl Job {
         })
     }
 
-    pub(crate) async fn take(&self) -> ExplorationWait {
-        let mut receiver = self.completion.subscribe();
-        let mut cancellation = self.cancel.subscribe();
-        loop {
-            if *cancellation.borrow() {
-                return ExplorationWait::ParentStopped;
+    fn stop(&self) {
+        self.completion.send_replace(Completion::ParentStopped);
+        self.cancel.send_replace(true);
+    }
+
+    fn finish(&self, result: ExplorationResult) {
+        self.completion.send_if_modified(|state| {
+            if matches!(state, Completion::Pending) {
+                *state = Completion::Finished(result);
+                true
+            } else {
+                false
             }
-            let mut answer = None;
-            self.completion.send_if_modified(|state| match state {
-                Completion::Pending => false,
-                Completion::Collected => {
-                    answer = Some(ExplorationWait::Collected);
-                    false
-                }
+        });
+    }
+
+    /// Claims under the same lock as cancellation and explicit waits. Admission
+    /// must be synchronous, local, and must not re-enter the job. A declined
+    /// handoff retains the payload for another attempt or explicit wait.
+    pub(crate) fn try_deliver(
+        &self,
+        accept: impl FnOnce(&ExplorationResult) -> bool,
+    ) -> ExplorationClaim {
+        self.claim(|result| if accept(&result) { Ok(()) } else { Err(result) })
+    }
+
+    fn claim(
+        &self,
+        accept: impl FnOnce(ExplorationResult) -> Result<(), ExplorationResult>,
+    ) -> ExplorationClaim {
+        use ExplorationClaim as Claim;
+
+        let mut claim = Claim::Pending;
+        self.completion.send_if_modified(|state| {
+            claim = match state {
+                Completion::Pending => Claim::Pending,
+                Completion::Collected => Claim::Collected,
+                Completion::ParentStopped => Claim::ParentStopped,
                 Completion::Finished(_) => {
-                    if let Completion::Finished(result) =
+                    let Completion::Finished(result) =
                         std::mem::replace(state, Completion::Collected)
-                    {
-                        answer = Some(ExplorationWait::Finished(result));
+                    else {
+                        unreachable!("matched finished state");
+                    };
+                    match accept(result) {
+                        Ok(()) => Claim::Accepted,
+                        Err(result) => {
+                            *state = Completion::Finished(result);
+                            Claim::Deferred
+                        }
                     }
-                    true
                 }
-            });
-            if let Some(answer) = answer {
-                return answer;
-            }
-            tokio::select! {
-                biased;
-                _ = cancellation.wait_for(|value| *value) => return ExplorationWait::ParentStopped,
-                _ = receiver.changed() => {}
+            };
+            claim == Claim::Accepted
+        });
+        claim
+    }
+
+    pub(crate) async fn take(&self) -> ExplorationWait {
+        use ExplorationClaim as Claim;
+
+        let mut receiver = self.completion.subscribe();
+        loop {
+            let mut result = None;
+            match self.claim(|value| {
+                result = Some(value);
+                Ok(())
+            }) {
+                Claim::Accepted => {
+                    return ExplorationWait::Finished(result.expect("claim accepted result"));
+                }
+                Claim::Collected => return ExplorationWait::Collected,
+                Claim::ParentStopped => return ExplorationWait::ParentStopped,
+                Claim::Deferred | Claim::Unknown => {
+                    unreachable!("explicit wait owns the job and accepts its result")
+                }
+                Claim::Pending => {
+                    let _ = receiver.changed().await;
+                }
             }
         }
     }
@@ -165,7 +243,7 @@ impl Job {
         } else {
             stopped(RunOutcome::Failed, false)
         };
-        self.completion.send_replace(Completion::Finished(result));
+        self.finish(result);
     }
 }
 
@@ -188,5 +266,69 @@ async fn completed(runtime: &Runtime, session: &SessionId) -> ExplorationResult 
         timed_out: false,
         text,
         truncated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exploration_claim_retains_declined_handoff_for_explicit_wait() {
+        let job = Job::new();
+        assert_eq!(
+            job.try_deliver(|_| panic!("pending result offered")),
+            ExplorationClaim::Pending
+        );
+        job.finish(stopped(RunOutcome::Refused, false));
+        assert_eq!(job.try_deliver(|_| false), ExplorationClaim::Deferred);
+        assert_eq!(
+            job.take().await,
+            ExplorationWait::Finished(stopped(RunOutcome::Refused, false))
+        );
+        assert_eq!(
+            job.try_deliver(|_| panic!("collected result offered twice")),
+            ExplorationClaim::Collected
+        );
+    }
+
+    #[tokio::test]
+    async fn exploration_claim_races_explicit_wait_without_delivering_twice() {
+        let job = Job::new();
+        let waiter = tokio::spawn({
+            let job = job.clone();
+            async move { job.take().await }
+        });
+        job.finish(stopped(RunOutcome::Refused, false));
+        let offer = job.try_deliver(|_| true);
+        match offer {
+            ExplorationClaim::Accepted => {
+                assert_eq!(waiter.await.unwrap(), ExplorationWait::Collected)
+            }
+            ExplorationClaim::Collected => assert!(matches!(
+                waiter.await.unwrap(),
+                ExplorationWait::Finished(_)
+            )),
+            other => panic!("unexpected claim: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exploration_claim_suppresses_results_on_both_sides_of_parent_stop() {
+        for finish_first in [false, true] {
+            let job = Job::new();
+            if finish_first {
+                job.finish(stopped(RunOutcome::Refused, false));
+            }
+            job.stop();
+            if !finish_first {
+                job.finish(stopped(RunOutcome::Failed, false));
+            }
+            assert_eq!(
+                job.try_deliver(|_| panic!("stopped parent must not get a result")),
+                ExplorationClaim::ParentStopped
+            );
+            assert_eq!(job.take().await, ExplorationWait::ParentStopped);
+        }
     }
 }

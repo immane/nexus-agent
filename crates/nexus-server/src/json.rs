@@ -248,6 +248,15 @@ pub fn history_item_json(record: &SourceRecord) -> Value {
             value["text"] = Value::String(text.as_str().to_owned());
             value
         }
+        ModelContextItem::ChildCompletion(result) => {
+            let mut value = base("child-completion");
+            value["parent_run"] = json!(result.parent().as_str());
+            value["job_id"] = json!(result.job().as_str());
+            value["status"] = json!(result.status().as_str());
+            value["text"] = json!(result.text());
+            value["truncated"] = json!(result.truncated());
+            value
+        }
         ModelContextItem::AssistantText { text, .. } => {
             let mut value = base("assistant");
             value["text"] = Value::String(text.as_str().to_owned());

@@ -1690,6 +1690,11 @@ function renderHistory(items) {
       appendUserMessage(item.text);
     } else if (item.kind === 'assistant' && typeof item.text === 'string') {
       renderHistoricalAssistant(item.text);
+    } else if (item.kind === 'child-completion' && typeof item.text === 'string') {
+      const result = node('details', 'message');
+      result.append(node('summary', '', `Explore ${item.job_id} · ${item.status}`));
+      result.append(node('pre', '', item.text));
+      appendNode(result);
     } else if (item.kind === 'tool-call' && typeof item.call === 'string') {
       startTool({
         call: item.call,

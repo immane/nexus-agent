@@ -1,7 +1,11 @@
 # Session inbox: steer, queue, and side questions
 
 Status: ordinary user queue, steering and standalone `/btw` implemented;
-child completion delivery remains planned.
+child completion delivery has a runtime claim primitive and typed context,
+saved-history and Chat Completions encodings, but is not wired to inbox
+admission. Explicit `delegate_await` remains the only user-facing child
+result path. The other protocols reject this replay item rather than
+coercing it into a user message or unmatched tool response.
 The intended inbox handles ordinary user submissions and delivers
 [child completion results](12-background-delegation.md). Users will be able
 to steer or queue without enabling subagents or session persistence.

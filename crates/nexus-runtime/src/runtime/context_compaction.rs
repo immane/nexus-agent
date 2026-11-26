@@ -50,6 +50,9 @@ impl BudgetPayloadBytes {
             bytes.reasoning = bytes.reasoning.saturating_add(reasoning);
             let (category, content) = match item {
                 ModelContextItem::UserText(text) => (&mut bytes.user_text, text.as_str().len()),
+                ModelContextItem::ChildCompletion(result) => {
+                    (&mut bytes.retained_evidence, result.text().len())
+                }
                 ModelContextItem::AssistantText { item_key, text, .. } => {
                     let category = if item_key.as_str() == nexus_context::MEMORY_KEY
                         && text.as_str().starts_with(nexus_context::MEMORY_LABEL)
