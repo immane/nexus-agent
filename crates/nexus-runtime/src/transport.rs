@@ -36,6 +36,7 @@ pub fn is_control_payload(payload: &EventPayload) -> bool {
     matches!(
         payload,
         EventPayload::RunStarted { .. }
+            | EventPayload::UserSteered { .. }
             | EventPayload::ContextReduced { .. }
             | EventPayload::ApprovalRequired(_)
             | EventPayload::ToolStarted(_)
@@ -590,6 +591,7 @@ mod cov_transport_private {
             // explicit channel decision rather than a silent fallthrough.
             let expected = match payload {
                 EventPayload::RunStarted { .. }
+                | EventPayload::UserSteered { .. }
                 | EventPayload::ContextReduced { .. }
                 | EventPayload::ApprovalRequired(_)
                 | EventPayload::ToolStarted(_)

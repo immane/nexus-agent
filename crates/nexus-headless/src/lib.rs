@@ -607,6 +607,7 @@ fn is_mandatory(payload: &EventPayload) -> bool {
     matches!(
         payload,
         EventPayload::RunStarted { .. }
+            | EventPayload::UserSteered { .. }
             | EventPayload::ContextReduced { .. }
             | EventPayload::ModelRequestStarted { .. }
             | EventPayload::ModelRequestFinished { .. }
@@ -924,6 +925,9 @@ fn format_event(event: &RunEvent) -> String {
     match event.payload() {
         EventPayload::RunStarted { request } => {
             format!("{head}run-started request={}", request.as_str())
+        }
+        EventPayload::UserSteered { request, .. } => {
+            format!("{head}user-steered request={}", request.as_str())
         }
         EventPayload::AssistantTextDelta(text) => format!(
             "{}text item={} text-len={} text={}",

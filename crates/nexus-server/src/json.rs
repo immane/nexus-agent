@@ -122,6 +122,10 @@ pub fn event_json(event: &RunEvent) -> Value {
         EventPayload::RunStarted { request } => {
             ("run-started", json!({ "request": request.as_str() }))
         }
+        EventPayload::UserSteered { request, text } => (
+            "user-steered",
+            json!({ "id": request.as_str(), "text": text }),
+        ),
         EventPayload::AssistantTextDelta(fragment) => (
             "assistant-text",
             json!({ "turn": fragment.turn.as_str(), "item": fragment.item_key, "text": fragment.text }),

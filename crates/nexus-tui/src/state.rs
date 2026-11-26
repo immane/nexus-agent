@@ -1311,6 +1311,9 @@ impl AppState {
                 self.status = "running".to_owned();
                 self.push_system(format!("run {} started", event.run().as_str()));
             }
+            EventPayload::UserSteered { .. } => {
+                self.push_system("Additional user input was accepted.".to_owned());
+            }
             EventPayload::AssistantTextDelta(fragment) => {
                 self.streaming = true;
                 let clean = sanitize(&fragment.text);
