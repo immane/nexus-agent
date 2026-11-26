@@ -69,7 +69,7 @@ impl Controls {
             let (name, description, schema) = if start {
                 (
                     "delegate_start",
-                    "Start a read-only background project task. Role explore investigates; propose suggests one exact text replacement. Thinking: inherit, off, or low. Collect the result with delegate_await.",
+                    "Start a read-only background task. Explore can answer directly or investigate the project. Propose suggests one exact text replacement. Collect the result with delegate_await. Omit thinking to inherit configured settings; use off or low only on supported Ollama Direct / Chat Completions endpoints.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -389,12 +389,20 @@ pub(crate) fn child_resolver(
             let selected = selection
                 .config
                 .exploration_model(parent, requested, &allowed_models, thinking)
-                .map_err(|_| "delegation model or thinking is not allowed")?;
+                .map_err(|error| error.message())?;
             let adapter = nexus_openai::OpenAiProvider::for_exploration(
                 &selected,
                 &selection.provider_settings,
             )
-            .map_err(|_| "delegation model or thinking is unsupported")?;
+            .map_err(|error| {
+                if error.category() == nexus_core::ErrorCategory::UnsupportedCapability
+                    && !matches!(thinking, ExplorationThinking::Inherit)
+                {
+                    "Selected endpoint does not support explicit thinking. Omit thinking to inherit settings if acceptable."
+                } else {
+                    "delegation model or inherited thinking is unsupported"
+                }
+            })?;
             let credential = nexus_config::resolve_credential_at(
                 &selected.provider.credential,
                 credentials.as_deref(),

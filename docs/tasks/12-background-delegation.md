@@ -100,11 +100,13 @@ collection. On other protocols only `await` is available. `propose` requires
 
 | Operation | Inputs | Result |
 | --- | --- | --- |
-| `delegate_start` | `role` (`explore`, later `propose`), `task`, optional `model` (configured model ID), optional `thinking` (`inherit`, `off`, `low`), optional `delivery` (`steer` by default, or `queue`) | An opaque job ID and `accepted`. This means admitted, not completed. Returns without waiting on the child provider. `delivery` affects only the result, never launch timing. Invalid or over-budget calls do not create jobs. |
+| `delegate_start` | `role` (`explore` or `propose`), `task`, optional `model` (configured model ID), optional `thinking` (`inherit`, or `off`/`low` where supported), optional Web `delivery` (`await`, `steer`, or `queue` as described above) | An opaque job ID and `accepted`. This means admitted, not completed. Returns without waiting on the child provider. `delivery` affects only the result, never launch timing. Invalid or over-budget calls do not create jobs. |
 | `delegate_await` | `job_id` from this parent run | A bounded typed result. If the job is pending, suspend the parent at this tool call without polling the model. If already terminal, return immediately. The same ID is never executed again by awaiting it. |
 
-`Explore` returns a short conclusion, project-relative file/line references,
-and any important uncertainty. `Propose` may additionally suggest one exact
+`Explore` follows the requested output format and answers directly when the
+task does not need project evidence. For project investigations, it includes
+relevant project-relative references and important uncertainty.
+`Propose` may additionally suggest one exact
 replacement in an existing UTF-8 file: a relative path, `old_text`, and
 `new_text`. Validate shape, size, path scope, and any referenced file before
 returning a successful structured proposal; malformed output is not a valid
@@ -150,7 +152,8 @@ independent children before awaiting any of them.
   settings. An explicit `off` or `low` overrides that resolution for this job
   only. Validate the effective value with the selected adapter before any
   inference or network discovery. Reject unsupported values instead of
-  silently ignoring them. Current explicit support is limited to recognized
+  silently ignoring them. Omit `thinking` when inheritance is acceptable.
+  Current explicit support is limited to recognized
   Ollama Direct / Chat Completions; `low` can mean only “thinking on” for a
   boolean-capability model. Do not introduce extra effort levels. Freeze model,
   credentials reference resolution, effective effort, and limits for the

@@ -613,7 +613,13 @@ impl UserConfig {
             ExplorationThinking::Off => Some(ReasoningEffort::Disabled),
             ExplorationThinking::Low => Some(ReasoningEffort::Low),
         };
-        validate_task_reasoning_effort(&profile, effort)?;
+        validate_task_reasoning_effort(&profile, effort).map_err(|error| {
+            if matches!(thinking, ExplorationThinking::Inherit) {
+                error
+            } else {
+                invalid("Selected endpoint does not support explicit thinking. Omit thinking to inherit settings if acceptable.")
+            }
+        })?;
         profile.task_reasoning_effort = effort;
         Ok(ExplorationModel {
             id: entry.id.clone(),

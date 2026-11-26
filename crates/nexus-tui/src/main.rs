@@ -8184,12 +8184,11 @@ mod cov_main_topup {
     #[test]
     fn an_unwritable_config_path_is_a_notice_and_never_a_crash() {
         let config = configured(2, &[], &[]);
-        // A path whose parent does not exist: `save` cannot create it.
-        config.user_config.lock().expect("config lockable").path = Some(
-            std::env::temp_dir()
-                .join("nexus-tui-missing-parent")
-                .join("config.json"),
-        );
+        let directory = temp_config_dir("failed-save");
+        // Atomic replacement cannot overwrite a directory.
+        let path = directory.join("config.json");
+        std::fs::create_dir(&path).expect("blocking directory is creatable");
+        config.user_config.lock().expect("config lockable").path = Some(path);
         let (run, mut front) = frontend_with(config);
         front.active_model = Some("m1".to_owned());
         front.run_models.insert(run.clone(), "m1".to_owned());
@@ -8207,6 +8206,7 @@ mod cov_main_topup {
             lines.contains("finished: Completed"),
             "the run's outcome is still presented: {lines}"
         );
+        std::fs::remove_dir_all(&directory).expect("temporary directory removed");
     }
 
     #[test]
