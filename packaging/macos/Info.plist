@@ -24,7 +24,7 @@
         </dict>
     </array>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.9</string>
+    <string>0.3.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>LSMinimumSystemVersion</key>
