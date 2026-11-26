@@ -6,20 +6,21 @@
 [![Stage: Alpha](https://img.shields.io/badge/Stage-0.3.0--alpha-orange.svg)](docs/tasks/08-architecture-migration.md)
 
 A Rust coding agent with live model integrations, native terminal sessions,
-coding tools, and optional container execution. Designed around very fast startup
-and a minimal core, with broader capabilities in replaceable tools and adapters,
-not an ever-growing engine. External plugins remain planned.
+an embedded Web client, coding tools, read-only background delegation, and
+optional container execution. Designed around very fast startup and a minimal
+core, with broader capabilities in replaceable tools and adapters, not an
+ever-growing engine. External plugins remain planned.
 
 <div align="center">
 <img src="docs/images/demo.gif" alt="Nexus Agent terminal demo" width="100%" />
 </div>
 
-[Quickstart](QUICKSTART.md) · [Vision](#vision) · [Documentation](docs/index.md) · [Contributing](CONTRIBUTING.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
+[Quickstart](QUICKSTART.md) · [Releases](https://github.com/immane/nexus-agent/releases) · [Vision](#vision) · [Documentation](docs/index.md) · [Contributing](CONTRIBUTING.md) · [Architecture](#architecture) · [Extensions](#extensions) · [Project status](#project-status)
 
 Developer checks and optional low-value tests: [Testing](docs/testing.md).
 
 > [!IMPORTANT]
-> Nexus Agent is **0.3.0-alpha**, with the scoped M0–M4 gates complete over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist sessions and exposes saved-session listing, history, restore, and deletion to the embedded Web client. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **The scoped M0–M4 gates are complete for their recorded scopes; Beta readiness and cross-platform production/security readiness are not claimed.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
+> Nexus Agent is **0.3.0-alpha**, with the scoped M0–M4 gates complete over the shared runtime, live Chat Completions, OpenAI Responses, and Anthropic Messages adapters, development-mode file tools, and sandboxed command execution. The TUI and loopback HTTP/SSE server support configured providers; headless remains a scripted test runner. Eligible local Web/desktop project sessions can start read-only Explore/Propose helpers, and the Web session inbox supports queued prompts, explicit Steer, and standalone `/btw`; the TUI exposes explicit helper collection only, and headless does not register delegation. Normal interactive TUI sessions use local persistent storage and support explicit history restoration; the server can optionally persist sessions and exposes saved-session listing, history, restore, and deletion to the embedded Web client. External plugins are not implemented. Real tools default to automatic project/temp operations; external paths need approval, and `--strict-tools` enables stricter confirmation. See [QUICKSTART.md](QUICKSTART.md) for setup and [migration status](docs/tasks/08-architecture-migration.md) for evidence: filesystem and actual sandbox tests now pass on the macOS and Linux reference environments; deliberately detached descendants remain outside the documented cleanup guarantee and their effects are reported as uncertain. **The scoped M0–M4 gates are complete for their recorded scopes; Beta readiness and cross-platform production/security readiness are not claimed.** See [M0 gates](docs/tasks/04-m0-gates.md) for the accepted scope, separately retained first-execution security scan, and deferred cold-cache measurement. The broader architecture below includes planned features, not just implemented ones.
 
 <div align="center">
 <img src="docs/images/web.jpg" alt="Nexus Agent embedded web client" width="100%" />
@@ -122,11 +123,12 @@ binary hashes, idle CPU/wakeup, input/cancellation and queue/dispatch observatio
 are in the [accepted M0 evidence](docs/tasks/04-m0-gates.md). Fixtures do not
 establish real-model throughput or a complete coding-session baseline.
 
-### Native release sizes
+### Native release sizes (M0 close)
 
-Actual local `.tar.gz` artifacts were built with rustc **1.99.0**, locked
-dependencies and the standard release profile. These installer-aligned builds
-enable `nexus-tui/container` and `nexus-server/container`; they are **not the
+Actual local `.tar.gz` artifacts from the M0-close measurement
+(`0.2.4-alpha`) were built with rustc **1.99.0**, locked dependencies and the
+standard release profile. These installer-aligned builds enable
+`nexus-tui/container` and `nexus-server/container`; they are **not the
 default-feature performance binaries above**. All values below are bytes:
 
 | Artifact / installed file | macOS arm64 | Linux x86_64 |
@@ -145,6 +147,10 @@ claims**. Extracted installation and command smoke checks passed on both
 reference hosts, not on every OS/glibc version. Per-file hashes and build metadata:
 [macOS](docs/tasks/evidence/distribution-release-macos-m0-close.json) ·
 [Linux](docs/tasks/evidence/distribution-release-linux-m0-close.json).
+
+Current `0.3.0-alpha` downloads, sizes, and checksums are on the
+[`v0.3.0-alpha` release](https://github.com/immane/nexus-agent/releases/tag/v0.3.0-alpha);
+they are separate from these M0-close measurements.
 
 ### Raspberry Pi 3 test profile
 
@@ -385,7 +391,7 @@ Accepted in [Decision 01](docs/design/decisions/01-first-release-defaults.md); d
 
 ## Using the Frontends
 
-All frontends use the same runtime policy boundary, but their wiring differs: the TUI supports live providers and real tools; the server supports live providers with fake tools by default; headless uses scripted fakes only. Read-only mode in the TUI/headless is enforced at tool dispatch, not by convention.
+All frontends use the same runtime policy boundary, but their wiring differs: the TUI supports live providers and real tools; the server supports live providers and uses fake tools by default, with real project tools requiring explicit `--tools real --tools-root PATH`; headless uses scripted fakes only. Read-only modes in the TUI/headless are enforced at tool dispatch, not by convention.
 
 ```sh
 cargo run -p nexus-headless --locked --offline -- "hello"
@@ -408,6 +414,14 @@ for platform checks, runtime dependencies and unsigned-artifact limitations.
 
 Configure a model before submitting in the TUI; an unconfigured launch does not silently return fake replies. Provider credentials are resolved on submission, not at startup. The TUI's `demo` Cargo feature is off by default, including in release builds; enable it explicitly to use `--demo`. This permits demo fallback but does not disable real tools or override a selected live model. Its interactive canned prompt runs automatically only when no model is selected. Cargo's `--offline` does not disable runtime API requests. See the [Quickstart](QUICKSTART.md).
 
+### Web client
+
+The server embeds the browser client at `http://127.0.0.1:8471/`; it needs no separate frontend build. It connects to the loopback server with the bearer token for authenticated sessions, selects a configured model and, when local real tools are enabled, an admitted project, and streams the live transcript, tool activity, approvals, cancellation, and usage. With `--session-store`, the sidebar lists saved sessions and can restore or delete them; active runs are not reattached after reload.
+
+The composer keeps the session usable while a run is active: **Send** queues the prompt, **Steer** delivers it before the next safe model request, and `/btw <question>` opens a standalone answer without changing history. Pending items can be removed before delivery, and a paused queue can be resumed. The context meter shows the latest request estimate, while the teamwork switch, helper cards, and reply footer expose delegation and usage separately from the parent. Markdown images and project-image previews open in a full-screen dark overlay, and fenced code blocks use a small built-in highlighter rather than a third-party runtime.
+
+Real project tools remain an explicit server startup choice (`--tools real --tools-root PATH`); the page cannot turn fake tools into real ones. See [web client](docs/design/14-web-client.md) and [session inbox](docs/tasks/13-session-prompt-queue.md).
+
 ### Agent modes
 
 | Mode | Tool policy |
@@ -428,6 +442,14 @@ One-shot headless runs take `--mode plan|build|<custom>`. Further modes come fro
 ```
 
 This fragment extends a complete user configuration. Built-in ids cannot be redefined, and unknown mode ids or dangling defaults fail explicitly instead of falling back silently. `default_mode` initializes the TUI; headless defaults to `build` unless `--mode` is supplied.
+
+### Background delegation
+
+Eligible local Web/desktop sessions (a bound project and a supported configured model) expose read-only **Explore** and **Propose** helpers by default; the parent starts a job with `delegate_start` and collects it with `delegate_await`. A child receives a bounded task brief and project-jailed read/list/search tools, not the parent transcript, approvals, or temporary scopes. It cannot write, execute commands, or start more helpers. **Propose** is await-only and returns one exact suggested replacement as data; the parent re-reads the file and applies it with its normal patch tool.
+
+The parent's bound model is the default. An alternate model must be explicitly requested and listed in `server.exploration_models`; per-job thinking is limited to supported values. On Chat Completions, Explore delivery defaults to **Steer** at the parent's next safe model boundary; `queue` waits for successful parent completion. A result is claimed once across await and inbox delivery, queued results expire after about a minute, and cancelled or failed parents suppress pending results. Other protocols use explicit await. The local TUI registers the same read-only tools but offers only explicit await because it has no inbox. Headless remains fake/test-only and does not register delegation.
+
+See [background delegation](docs/tasks/12-background-delegation.md).
 
 ### TUI presentation
 
@@ -534,6 +556,8 @@ for inheritance, API updates, and support limitations.
 ## Safety and Trust
 
 The runtime enforces permissions, resource scopes, deadlines, and output limits. Tool access categories come from host registration, not model-visible descriptions. Model output is data, not a permission grant.
+
+Read-only background helpers do not inherit approval grants. Their read/list/search tools are bound to the admitted project and reject external or protected paths; no write, exec, or delegation tool is registered in a child.
 
 The TUI, ordinary server, and scripted headless runner default to one hour per
 tool call within a 24-hour run budget; each tool deadline is clamped to the
@@ -726,6 +750,9 @@ M1–M5 migration gates above.
 - [x] Default-inherit task-thinking configuration with global/provider/model precedence, Web Settings controls, and opt-in Ollama support; display preferences and historical reasoning replay remain separate.
 - [x] Normal interactive TUI local persistence and explicit saved-history restoration; opt-in server persistence with Web saved-session listing, history, restore, and deletion.
 - [x] Opt-in container gateway/worker/workload composition, workspace tools, explicit shell commands, and lifecycle/quarantine handling.
+- [x] Read-only Explore/Propose background delegation in eligible local Web/desktop/TUI sessions, with project-jailed reads, model/thinking allowlisting, typed provenance, and single-claim delivery.
+- [x] Web session inbox with queued prompts, explicit Steer, standalone `/btw`, and typed child-result delivery.
+- [x] Web presentation for full-screen image previews and lightweight fenced-code highlighting.
 - [x] SWE-bench preparation, isolated model attempts, worker preflight, heartbeat diagnostics, and separate official scoring, with resolved task evidence above.
 - [ ] Native Linux container host/LAN, metadata, IPv6/DNS, public-egress, and lifecycle recovery validation before secure/production-use claims.
 - [ ] Recovery of active execution; restoring history does not resume processes or replay uncertain tool calls.
@@ -744,6 +771,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and pull-request guida
 | [Project foundation](docs/design/decisions/00-project-foundation.md) | Confirmed goals and scope. |
 | [First-release defaults](docs/design/decisions/01-first-release-defaults.md) | Accepted permissions, UI, sessions, entry points, authentication, relay scope, and code simplicity. |
 | [TUI and headless frontends](docs/design/07-tui.md) | Grok Build-style layout, approvals, history, and script entry point. |
+| [Built-in web client](docs/design/14-web-client.md) | Embedded browser client, project selection, configuration, streaming, recovery, and known limits. |
+| [Background delegation](docs/tasks/12-background-delegation.md) | Read-only Explore/Propose helpers, model and permission boundaries, and delivery. |
+| [Session inbox](docs/tasks/13-session-prompt-queue.md) | Queue, Steer, `/btw`, and child-result handoff. |
 | [API relay](docs/design/08-api-relay.md) | Relay provider plugins and existing-service/local-executor boundaries. |
 | [Implementation readiness](docs/design/09-implementation-readiness.md) | Engineering gates, M0 acceptance, and concise-code review. |
 | [Architecture migration](docs/tasks/08-architecture-migration.md) | Implemented consolidation slices, protocol extension evidence, and platform blockers. |
