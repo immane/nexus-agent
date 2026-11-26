@@ -9,6 +9,8 @@ The runtime foundation uses an ephemeral child runtime for each accepted
 exploration and a run-owned job registry. It accepts a host-selected provider
 and host-supplied project-jailed read registrations, returns a bounded result
 at most once, and signals all unfinished children on parent cancellation.
+The tools crate supplies a project-local read/list/search set that rejects
+external targets and protected paths without consulting parent grants.
 There is no configured model resolution, Web tool registration, child inbox
 handoff, proposal application, or background recovery yet. The host must
 enforce the parent tool-call budget and project scope before exposing this

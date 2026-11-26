@@ -51,7 +51,7 @@ mod fs_access;
 mod project_image;
 pub use development::{
     development_file_tools, development_file_tools_with_settings, development_tools,
-    development_tools_with_settings, strict_tools, strict_tools_with_settings,
+    development_tools_with_settings, project_read_tools, strict_tools, strict_tools_with_settings,
 };
 pub mod fs;
 
