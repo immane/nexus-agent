@@ -16,6 +16,7 @@
   <script type="module" src="/assets/app.js"></script>
 </head>
 <body>
+  <div class="app-backdrop" id="app-backdrop" aria-hidden="true" hidden></div>
   <a class="skip" href="#main">Skip to conversation</a>
   <aside class="sidebar" id="sidebar" aria-label="Workspace navigation">
     <a class="brand" href="/" aria-label="Nexus home"><span class="mark" aria-hidden="true">N</span> nexus<span class="badge">WEB</span></a>
@@ -148,16 +149,48 @@
       <p class="hint" id="theme-hint">Choose a look. Changes apply immediately; use arrow keys to browse.</p>
       <div class="theme-grid">
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="system" checked><span class="theme-preview" data-theme="system" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">System <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Follow your device</span></label>
+        <span class="theme-group-label" aria-hidden="true">Dark</span>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="graphite"><span class="theme-preview" data-theme="graphite" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Graphite <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · neutral</span></label>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="midnight"><span class="theme-preview" data-theme="midnight" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Midnight <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · blue</span></label>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="forest"><span class="theme-preview" data-theme="forest" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Forest <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · green</span></label>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="ocean"><span class="theme-preview" data-theme="ocean" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Ocean <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · teal</span></label>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="amethyst"><span class="theme-preview" data-theme="amethyst" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Amethyst <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · violet</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="ink"><span class="theme-preview" data-theme="ink" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Ink <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · true black</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="fjord"><span class="theme-preview" data-theme="fjord" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Fjord <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · arctic</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="twilight"><span class="theme-preview" data-theme="twilight" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Twilight <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · indigo</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="mocha"><span class="theme-preview" data-theme="mocha" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Mocha <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · pastel</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="ember"><span class="theme-preview" data-theme="ember" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Ember <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · amber</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="dusk"><span class="theme-preview" data-theme="dusk" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Dusk <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Dark · rose</span></label>
+        <span class="theme-group-label" aria-hidden="true">Light</span>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="paper"><span class="theme-preview" data-theme="paper" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Paper <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · neutral</span></label>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="sand"><span class="theme-preview" data-theme="sand" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Sand <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · warm</span></label>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="blossom"><span class="theme-preview" data-theme="blossom" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Blossom <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · rose</span></label>
         <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="lavender"><span class="theme-preview" data-theme="lavender" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Lavender <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · lilac</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="mint"><span class="theme-preview" data-theme="mint" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Mint <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · fresh</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="sky"><span class="theme-preview" data-theme="sky" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Sky <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · blue</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="latte"><span class="theme-preview" data-theme="latte" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Latte <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · pastel</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="peach"><span class="theme-preview" data-theme="peach" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Peach <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · coral</span></label>
+        <label class="theme-card"><input class="sr-only" type="radio" name="theme" value="solar"><span class="theme-preview" data-theme="solar" aria-hidden="true"><i></i><i></i><i></i></span><span class="theme-card-name">Solar <span class="theme-check" aria-hidden="true">✓</span></span><span class="theme-card-detail">Light · cream</span></label>
       </div>
+    </fieldset>
+    <fieldset class="background-picker" id="background-picker" aria-describedby="background-hint">
+      <legend>Background</legend>
+      <p class="hint" id="background-hint">Use your own image behind the workspace. It is resized to at most 2560 px and stored only in this browser; it is never uploaded to the server.</p>
+      <div class="background-row">
+        <div class="background-preview" id="background-preview" data-empty="true"><span>No image</span></div>
+        <div class="background-controls">
+          <div class="dialog-actions">
+            <input class="sr-only" id="background-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" tabindex="-1">
+            <button class="primary" id="background-choose" type="button">Choose image…</button>
+            <button id="background-remove" type="button" disabled>Remove</button>
+          </div>
+          <label for="background-dim">Dim <span class="muted" id="background-dim-value"></span></label>
+          <input id="background-dim" type="range" min="0" max="90" step="5" value="55">
+          <label for="background-blur">Blur <span class="muted" id="background-blur-value"></span></label>
+          <input id="background-blur" type="range" min="0" max="24" step="2" value="0">
+        </div>
+      </div>
+      <p class="dialog-status status" id="background-status" role="status"></p>
     </fieldset>
     </section>
     <form class="settings-panel" id="connection-form" aria-labelledby="connection-title" hidden>

@@ -40,7 +40,11 @@ function fixture(saved, blocked = false) {
 }
 
 test('theme cards replace the dropdown and share the supported palette identities', () => {
-  assert.equal(values.length, 10);
+  assert.equal(values.length, 21);
+  assert.deepEqual([...new Set(values)].sort(), [...vm.runInContext(
+    `${source.slice(source.indexOf('const themes = '), source.indexOf('function applyTheme('))}; [...themes]`,
+    vm.createContext({}),
+  )].sort(), 'every card is a supported palette and vice versa');
   assert.equal(new Set(values).size, values.length);
   assert.ok(!html.includes('<select id="theme"'));
   assert.match(html, /<fieldset class="theme-picker" id="theme"/);

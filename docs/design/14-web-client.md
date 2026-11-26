@@ -22,11 +22,19 @@ The client supports:
   context notices, tool activity, usage, approvals, cancellation, and terminal
   outcomes;
 - reconciling an uncertain stream failure with `GET /snapshot`;
-- five color palettes with the selected palette kept in `localStorage`.
+- twenty color palettes (eleven dark, nine light) plus System, grouped in the picker, with the selected palette kept in `localStorage`. A test keeps every palette's text, muted text, accent, and button labels at WCAG AA contrast (4.5:1).
+- an optional custom background image with dim and blur controls (Settings →
+  Appearance). The image is decoded, resized to at most 2560 px on its longest
+  edge, and re-encoded as JPEG in the browser (dropping metadata), then stored
+  as a Blob in same-origin IndexedDB; dim and blur stay in `localStorage`. PNG,
+  JPEG, WebP, GIF, and AVIF up to 40 MB are accepted; SVG is not. Nothing is
+  sent to the server. While an image is active, the sidebar, top bar, and
+  composer become translucent with a backdrop blur. If storage is blocked, the
+  image applies to the current page only and the status says so.
 
 The client supports saved-session listing and restore when the server enables
 persistence. It does not implement concurrent multi-session editing, file
-browsing, syntax highlighting, background polling, offline API access, or a
+browsing, a full syntax parser, background polling, offline API access, or a
 release asset-compression pipeline. Its Service Worker is network-only.
 
 ## Boundaries
@@ -93,8 +101,7 @@ font commands, plain `\text{...}`, and `\left...\right` fences. It also supports
 matrix and array variants, `cases`, and multi-line `align`/`gather` variants
 inside display delimiters or as standalone blocks. It does not implement
 macros, packages, document preambles, automatic numbering, or cross-references.
-Unsupported expressions remain text. Footnotes and syntax highlighting are
-not implemented.
+Unsupported expressions remain text. Footnotes are not implemented.
 
 Successful tool cards collapse after completion; failed or interrupted results
 stay expanded. The path-only `host_read` and `host_list` calls are suppressed
