@@ -175,6 +175,7 @@ struct Shared {
     run_counter: AtomicU64,
     terminal_changed: Notify,
     side_question_active: AtomicBool,
+    exploration_workers: crate::delegation::ExplorationWorkers,
 }
 
 struct SideQuestionGuard(Arc<Shared>);
@@ -379,6 +380,7 @@ struct ActiveRun {
     /// tool dispatch, so a read-only run can never execute a write no
     /// matter which frontend submitted it.
     read_only: bool,
+    child_follow_up: bool,
     started: StdInstant,
     deadline: StdInstant,
     token: CancellationToken,
@@ -842,6 +844,7 @@ impl Runtime {
             run_counter: AtomicU64::new(1),
             terminal_changed: Notify::new(),
             side_question_active: AtomicBool::new(false),
+            exploration_workers: Default::default(),
         });
         Ok((
             Self { shared },
@@ -1015,8 +1018,46 @@ impl Runtime {
         if command.validate().is_err() {
             return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
         }
+        let Ok(item) = ModelContextItem::user_text(command.input) else {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        self.submit_source(
+            command.request,
+            command.session,
+            command.profile,
+            command.read_only,
+            item,
+        )
+        .await
+    }
+
+    /// Starts a read-only, tool-free follow-up using typed, host-owned input.
+    pub async fn submit_child_completion(
+        &self,
+        request: RequestId,
+        session: SessionId,
+        result: nexus_core::provider::ChildCompletion,
+    ) -> CommandResponse {
+        self.submit_source(
+            request,
+            session,
+            "child-follow-up".into(),
+            true,
+            ModelContextItem::ChildCompletion(result.into_follow_up()),
+        )
+        .await
+    }
+
+    async fn submit_source(
+        &self,
+        request: RequestId,
+        session: SessionId,
+        profile: String,
+        read_only: bool,
+        item: ModelContextItem,
+    ) -> CommandResponse {
         if self.shared.store_uncertain.load(Ordering::SeqCst) {
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None)
+            return CommandResponse::new(request, CommandReply::Rejected, None)
                 .with_error(runtime_error(
                     ErrorCategory::StorageFailure,
                     "session store write is unresolved; reopen the store and restore the saved session before continuing",
@@ -1027,32 +1068,25 @@ impl Runtime {
             .expect("counter id is valid");
         let now = StdInstant::now();
         let Some(deadline) = now.checked_add(self.shared.limits.run_duration) else {
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
-        };
-        let Ok(user_item) = ModelContextItem::user_text(command.input.clone()) else {
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+            return CommandResponse::new(request, CommandReply::Rejected, None);
         };
         let mut state = self.shared.state.lock().await;
         if let Some(active) = state.active.as_ref() {
-            return CommandResponse::new(
-                command.request.clone(),
-                CommandReply::Busy,
-                Some(active.run.clone()),
-            );
+            return CommandResponse::new(request, CommandReply::Busy, Some(active.run.clone()));
         }
         if state.restore_busy {
-            return CommandResponse::new(command.request.clone(), CommandReply::Busy, None);
+            return CommandResponse::new(request, CommandReply::Busy, None);
         }
         if let Some(quarantined) = state.quarantine.first() {
             return CommandResponse::new(
-                command.request.clone(),
+                request,
                 CommandReply::Busy,
                 Some(quarantined.run.clone()),
             );
         }
         if self.shared.outbox_events.load(Ordering::SeqCst) != 0 {
             let run = state.last.as_ref().map(|last| last.run.clone());
-            return CommandResponse::new(command.request.clone(), CommandReply::Busy, run);
+            return CommandResponse::new(request, CommandReply::Busy, run);
         }
         // Exhaustion belongs to the previous run. Its outbox is empty here,
         // so the next accepted run starts with a fresh control budget.
@@ -1064,27 +1098,24 @@ impl Runtime {
         for exchange in state
             .history
             .iter()
-            .filter(|exchange| exchange.session == command.session)
+            .filter(|exchange| exchange.session == session)
         {
             conversation.extend(exchange.items.iter().cloned());
         }
         let session_omitted_items = state
             .history_omissions
             .iter()
-            .filter(|omission| omission.session == command.session)
+            .filter(|omission| omission.session == session)
             .map(|omission| omission.removed_items)
             .sum::<usize>();
         let history_omitted_items =
             session_omitted_items.saturating_add(state.history_omission_fallback_items);
         let history_omitted = history_omitted_items > 0;
         let history_len = conversation.len();
-        conversation.push(user_item);
+        let child_follow_up = matches!(&item, ModelContextItem::ChildCompletion(_));
+        conversation.push(item.clone());
         let source_cursor = conversation.len();
-        let already_initialized = state.durable_sessions.contains(&command.session);
-        let source_input = conversation
-            .last()
-            .expect("the user item was appended")
-            .clone();
+        let already_initialized = state.durable_sessions.contains(&session);
         let context_note = if history_omitted {
             CONTEXT_NOTICE_TEXT.to_owned()
         } else {
@@ -1104,7 +1135,7 @@ impl Runtime {
             .history
             .iter()
             .rev()
-            .filter(|exchange| exchange.session == command.session)
+            .filter(|exchange| exchange.session == session)
             .find_map(|exchange| exchange.derived_memory.clone());
         let (context_management, discovery) = self.shared.provider.context_management_for_run();
         state.active = Some(ActiveRun {
@@ -1120,10 +1151,11 @@ impl Runtime {
             phase: RunState::Preparing,
             run: run.clone(),
             run_n,
-            session: command.session.clone(),
-            request: command.request.clone(),
-            profile: command.profile.clone(),
-            read_only: command.read_only,
+            session: session.clone(),
+            request: request.clone(),
+            profile: profile.clone(),
+            read_only,
+            child_follow_up,
             started: now,
             deadline,
             token: CancellationToken::new(),
@@ -1172,19 +1204,30 @@ impl Runtime {
         // A caller abandoning its reply must not abandon the reserved slot or
         // detach the storage worker. Admission stays owned by the runtime.
         let admitting = self.clone();
-        let request = command.request.clone();
+        let fallback_request = request.clone();
         tokio::spawn(async move {
             admitting
-                .complete_admission(command, run, source_input, already_initialized, discovery)
+                .complete_admission(
+                    request,
+                    session,
+                    profile,
+                    run,
+                    item,
+                    already_initialized,
+                    discovery,
+                )
                 .await
         })
         .await
-        .unwrap_or_else(|_| CommandResponse::new(request, CommandReply::Rejected, None))
+        .unwrap_or_else(|_| CommandResponse::new(fallback_request, CommandReply::Rejected, None))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn complete_admission(
         &self,
-        command: SubmitCommand,
+        request: RequestId,
+        session: SessionId,
+        profile: String,
         run: RunId,
         source_input: ModelContextItem,
         already_initialized: bool,
@@ -1193,13 +1236,7 @@ impl Runtime {
         // Reserve the active slot before I/O, but never hold the state lock
         // while waiting for the blocking store. Concurrent commands stay live.
         if let Err(error) = self
-            .persist_session_input(
-                &command.session,
-                &command.profile,
-                &run,
-                &source_input,
-                already_initialized,
-            )
+            .persist_session_input(&session, &profile, &run, &source_input, already_initialized)
             .await
         {
             let mut state = self.shared.state.lock().await;
@@ -1210,8 +1247,7 @@ impl Runtime {
             {
                 state.active = None;
             }
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None)
-                .with_error(error);
+            return CommandResponse::new(request, CommandReply::Rejected, None).with_error(error);
         }
         if self.shared.session_store.is_some() {
             self.shared
@@ -1219,7 +1255,7 @@ impl Runtime {
                 .lock()
                 .await
                 .durable_sessions
-                .insert(command.session.clone());
+                .insert(session);
         }
         let driver = self.clone();
         let run_for_task = run.clone();
@@ -1235,7 +1271,7 @@ impl Runtime {
                 driver.on_driver_failure(&run_for_task, join).await;
             }
         });
-        CommandResponse::new(command.request.clone(), CommandReply::Accepted, Some(run))
+        CommandResponse::new(request, CommandReply::Accepted, Some(run))
     }
 
     /// Stops future dispatch and signals active work. Idempotent: repeats
@@ -1491,11 +1527,14 @@ impl Runtime {
             provider,
             tools,
             crate::ExplorationDelivery::Await,
+            crate::ExplorationRole::Explore,
         )
         .await
+        .map(|_| ())
     }
 
     /// Starts an exploration with an explicit host-authorized delivery mode.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_exploration_with_delivery(
         &self,
         parent: &RunId,
@@ -1504,8 +1543,16 @@ impl Runtime {
         provider: Arc<dyn ProviderPort + Send + Sync>,
         tools: Vec<ToolRegistration>,
         delivery: crate::ExplorationDelivery,
-    ) -> Result<(), AgentError> {
+        role: crate::ExplorationRole,
+    ) -> Result<Option<crate::ExplorationHandoff>, AgentError> {
         use crate::delegation::{Job, MAX_BRIEF_BYTES, MAX_DURATION, MAX_RESULT_BYTES};
+        if role == crate::ExplorationRole::Propose && delivery != crate::ExplorationDelivery::Await
+        {
+            return Err(runtime_error(
+                ErrorCategory::UnsupportedCapability,
+                "proposals require explicit collection",
+            ));
+        }
         let brief = brief.trim();
         if brief.is_empty() || brief.len() > MAX_BRIEF_BYTES {
             return Err(runtime_error(
@@ -1574,7 +1621,14 @@ impl Runtime {
             tools,
             ModelInstructions::new(
                 "",
-                "Explore the assigned task using read-only evidence. Return a short conclusion, project-relative file references, and uncertainty.",
+                match role {
+                    crate::ExplorationRole::Explore => {
+                        "Explore the assigned task using read-only evidence. Return a short conclusion, project-relative file references, and uncertainty."
+                    }
+                    crate::ExplorationRole::Propose => {
+                        "Use only read-only evidence. Return exactly one JSON object with string fields path, old_text, and new_text. The path must be project-relative and existing, old_text must match exactly once, and new_text must differ. Do not include Markdown fences or apply the change."
+                    }
+                },
             )?,
         )?;
         let child_session = SessionId::new(format!("explore-{:x}", child.shared.incarnation))
@@ -1607,9 +1661,15 @@ impl Runtime {
                 "exploration deadline already elapsed",
             ));
         }
+        let handoff = (delivery != crate::ExplorationDelivery::Await)
+            .then(|| crate::ExplorationHandoff::new(job.clone()));
+        let worker =
+            self.shared
+                .exploration_workers
+                .track(parent.clone(), job_id.clone(), job.clone());
         active.explorations.insert(job_id, job.clone(), delivery);
-        tokio::spawn(job.run(child, streams, command, deadline));
-        Ok(())
+        tokio::spawn(job.run(child, streams, command, deadline, worker, role));
+        Ok(handoff)
     }
 
     /// Offers a child result to the inbox while its parent state is stable.
@@ -1877,6 +1937,29 @@ impl Runtime {
         state.active.is_some()
             || !state.quarantine.is_empty()
             || self.shared.side_question_active.load(Ordering::Acquire)
+            || self.live_exploration_workers() > 0
+    }
+
+    /// Number of child supervisors still running or waiting for worker exit.
+    pub fn live_exploration_workers(&self) -> usize {
+        self.shared.exploration_workers.len()
+    }
+
+    /// Signals all live children on session shutdown, including older parents.
+    pub fn stop_explorations(&self) {
+        self.shared.exploration_workers.stop();
+    }
+
+    pub(crate) async fn wait_for_worker_exit(&self) {
+        loop {
+            let notified = self.shared.terminal_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.has_unconfirmed_work().await {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn stale_or_finalized(
@@ -1896,10 +1979,20 @@ impl Runtime {
     }
 
     async fn drive(&self, run: RunId, discovery: Option<nexus_core::ContextWindowDiscovery>) {
-        let request = {
+        let (request, child) = {
             let state = self.shared.state.lock().await;
             match state.active.as_ref() {
-                Some(active) if active.run == run => active.request.clone(),
+                Some(active) if active.run == run => (
+                    active.request.clone(),
+                    match active.conversation.get(active.history_len) {
+                        Some(ModelContextItem::ChildCompletion(result))
+                            if active.child_follow_up =>
+                        {
+                            Some(result.clone())
+                        }
+                        _ => None,
+                    },
+                ),
                 _ => return,
             }
         };
@@ -1907,6 +2000,15 @@ impl Runtime {
             .publish_control(&run, EventPayload::RunStarted { request })
             .await
             .is_err()
+        {
+            self.finish_run(&run, RunOutcome::Cancelled, None).await;
+            return;
+        }
+        if let Some(child) = child
+            && self
+                .publish_control(&run, EventPayload::ChildDelivered(child))
+                .await
+                .is_err()
         {
             self.finish_run(&run, RunOutcome::Cancelled, None).await;
             return;
@@ -3330,7 +3432,12 @@ impl Runtime {
             // including unknown-tool and invalid-argument denials.
             active.calls_used += 1;
             let call = self.next_call_id(active)?;
-            let Some(registered) = self.shared.tools.get(candidate.tool_name()) else {
+            let Some(registered) = self
+                .shared
+                .tools
+                .get(candidate.tool_name())
+                .filter(|_| !active.child_follow_up)
+            else {
                 let outcome = bound_outcome(&self.shared, denied_outcome("unknown tool"));
                 denied_results.push(denied_context(
                     active,
@@ -4529,6 +4636,7 @@ impl Runtime {
                 .await
                 .quarantine
                 .retain(|meta| !(meta.run == run && meta.call.is_none()));
+            shared.terminal_changed.notify_waiters();
         });
         Err(error)
     }
@@ -4786,7 +4894,7 @@ impl Runtime {
                     })
                     .collect();
                 items.retain(|item| match item {
-                    ModelContextItem::UserText(_) => true,
+                    item if item.starts_exchange() => true,
                     ModelContextItem::AssistantCall { call, .. } => {
                         complete_dispatched_calls.contains(call.call())
                     }
@@ -4832,7 +4940,7 @@ impl Runtime {
                 }
                 let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
                 for item in items {
-                    if exchanges.is_empty() || matches!(item, ModelContextItem::UserText(_)) {
+                    if exchanges.is_empty() || item.starts_exchange() {
                         exchanges.push(Vec::new());
                     }
                     exchanges.last_mut().expect("exchange exists").push(item);
@@ -4918,6 +5026,9 @@ impl Runtime {
                 }
             }
         }
+        if outcome == RunOutcome::Completed {
+            active.explorations.parent_completed();
+        }
         state.last = Some(FinishedRun {
             run: active.run.clone(),
             session: active.session.clone(),
@@ -4985,6 +5096,7 @@ impl Runtime {
             state
                 .quarantine
                 .retain(|meta| !(meta.run == run && meta.call.as_ref() == Some(&call)));
+            shared.terminal_changed.notify_waiters();
             // A worker can return after the runtime stopped waiting. If its
             // shared backend is now unusable, stop an active run before it
             // dispatches again; a future run is also protected by the
@@ -5198,9 +5310,7 @@ fn restore_items(source: Vec<ModelContextItem>) -> Result<Vec<ModelContextItem>,
         }
     }
     if !context_calls_are_paired(&restored)
-        || restored
-            .first()
-            .is_some_and(|item| !matches!(item, ModelContextItem::UserText(_)))
+        || restored.first().is_some_and(|item| !item.starts_exchange())
     {
         return Err(());
     }
@@ -5240,7 +5350,7 @@ fn bounded_restored_history(
 fn split_history_exchanges(items: &[ModelContextItem]) -> Vec<Vec<ModelContextItem>> {
     let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
     for item in items {
-        if matches!(item, ModelContextItem::UserText(_)) {
+        if item.starts_exchange() {
             exchanges.push(Vec::new());
         }
         if let Some(exchange) = exchanges.last_mut() {
@@ -8758,6 +8868,8 @@ mod cov_runtime_private {
             timed_out: false,
             text: "child evidence".into(),
             truncated: false,
+            role: crate::ExplorationRole::Explore,
+            usage: None,
         });
         assert!(runtime.deliver_steering(&unrelated).await.is_ok());
         assert!(streams.control.try_recv().is_err());
@@ -9066,6 +9178,7 @@ mod cov_runtime_private {
             request: RequestId::new("req-cov-private").expect("valid request id"),
             profile: "cov-profile".to_owned(),
             read_only: false,
+            child_follow_up: false,
             started: StdInstant::now(),
             deadline: StdInstant::now() + Duration::from_secs(60),
             token: CancellationToken::new(),
@@ -10872,6 +10985,7 @@ mod cov_runtime_topup_private {
             request: RequestId::new("req-cov-topup").expect("valid request id"),
             profile: "cov-profile".to_owned(),
             read_only: false,
+            child_follow_up: false,
             started: now,
             deadline: now + Duration::from_secs(60),
             token: CancellationToken::new(),

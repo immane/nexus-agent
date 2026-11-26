@@ -1875,14 +1875,26 @@ fn source_record_value(record: &SourceRecord) -> Value {
 fn context_item_value(item: &ModelContextItem) -> Value {
     match item {
         ModelContextItem::UserText(text) => json!({ "kind": "user_text", "text": text.as_str() }),
-        ModelContextItem::ChildCompletion(result) => json!({
-            "kind": "child_completion",
-            "parent_run": result.parent().as_str(),
-            "job_id": result.job().as_str(),
-            "status": result.status().as_str(),
-            "text": result.text(),
-            "truncated": result.truncated(),
-        }),
+        ModelContextItem::ChildCompletion(result) => {
+            let mut value = json!({
+                "kind": "child_completion",
+                "parent_run": result.parent().as_str(),
+                "job_id": result.job().as_str(),
+                "status": result.status().as_str(),
+                "text": result.text(),
+                "truncated": result.truncated(),
+                "follow_up": result.is_follow_up(),
+            });
+            if let Some(usage) = result.usage() {
+                if let Some(input) = usage.input_tokens() {
+                    value["usage_input"] = json!(input);
+                }
+                if let Some(output) = usage.output_tokens() {
+                    value["usage_output"] = json!(output);
+                }
+            }
+            value
+        }
         ModelContextItem::AssistantText {
             item_key,
             text,
@@ -1971,18 +1983,25 @@ fn parse_context_item(value: &Value) -> Result<ModelContextItem, AgentError> {
         "child_completion" => {
             use nexus_core::provider::{ChildCompletion, ChildStatus};
 
-            check_keys(
-                value,
-                &[
-                    "kind",
-                    "parent_run",
-                    "job_id",
-                    "status",
-                    "text",
-                    "truncated",
-                ],
-            )?;
-            Ok(ModelContextItem::ChildCompletion(ChildCompletion::new(
+            let mut keys = vec![
+                "kind",
+                "parent_run",
+                "job_id",
+                "status",
+                "text",
+                "truncated",
+            ];
+            if value.get("follow_up").is_some() {
+                keys.push("follow_up");
+            }
+            if value.get("usage_input").is_some() {
+                keys.push("usage_input");
+            }
+            if value.get("usage_output").is_some() {
+                keys.push("usage_output");
+            }
+            check_keys(value, &keys)?;
+            let item = ChildCompletion::new(
                 RunId::new(string(field(value, "parent_run")?)?)
                     .map_err(|_| store_error("child completion parent identity is invalid"))?,
                 nexus_core::RequestId::new(string(field(value, "job_id")?)?)
@@ -1990,7 +2009,29 @@ fn parse_context_item(value: &Value) -> Result<ModelContextItem, AgentError> {
                 ChildStatus::parse(&string(field(value, "status")?)?)?,
                 string(field(value, "text")?)?,
                 boolean(field(value, "truncated")?)?,
-            )?))
+            )?;
+            let item = if value
+                .get("follow_up")
+                .map(boolean)
+                .transpose()?
+                .unwrap_or(false)
+            {
+                item.into_follow_up()
+            } else {
+                item
+            };
+            let input = value.get("usage_input").map(number).transpose()?;
+            let output = value.get("usage_output").map(number).transpose()?;
+            let item = if input.is_some() || output.is_some() {
+                item.with_usage(nexus_core::Usage::new(
+                    input,
+                    output,
+                    nexus_core::UsageFinality::Final,
+                ))
+            } else {
+                item
+            };
+            Ok(ModelContextItem::ChildCompletion(item))
         }
         "assistant_text" => {
             check_keys(value, &["kind", "item_key", "text", "reasoning"])?;
@@ -2527,10 +2568,17 @@ mod tests {
                 "untrusted evidence".into(),
                 true,
             )
-            .unwrap(),
+            .unwrap()
+            .with_usage(nexus_core::Usage::new(
+                Some(7),
+                Some(3),
+                nexus_core::UsageFinality::Final,
+            )),
         );
         let mut value = context_item_value(&item);
         assert_eq!(value["kind"], "child_completion");
+        assert_eq!(value["usage_input"], 7);
+        assert_eq!(value["usage_output"], 3);
         assert_eq!(parse_context_item(&value).unwrap(), item);
         value["job_id"] = json!("invalid identity!");
         assert!(parse_context_item(&value).is_err());

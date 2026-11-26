@@ -8,12 +8,17 @@ use nexus_config::{
     resolve_credential_at,
 };
 use nexus_core::{
-    AgentError, EffectState, Evidence, ExecutionStatus, M0_REVISION, RequestId, ToolCall,
-    ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
+    AgentError, EffectState, Evidence, ExecutionStatus, M0_REVISION, NormalizedArgs, RequestId,
+    RunId, ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
 };
 use nexus_runtime::runtime::WeakRuntime;
-use nexus_runtime::{ExplorationDelivery, ExplorationWait, Runtime};
+use nexus_runtime::{
+    ExplorationDelivery, ExplorationHandoff, ExplorationProposal, ExplorationRole, ExplorationWait,
+    Runtime,
+};
 use serde_json::{Value, json};
+
+type HandoffHandler = dyn Fn(RunId, RequestId, ExplorationHandoff) + Send + Sync;
 
 pub(super) struct Controls {
     handle: tokio::runtime::Handle,
@@ -25,6 +30,7 @@ pub(super) struct Controls {
     credentials: Option<PathBuf>,
     reads: Vec<ToolRegistration>,
     supports_child_completion: bool,
+    handoff: OnceLock<Box<HandoffHandler>>,
 }
 
 impl Controls {
@@ -50,6 +56,7 @@ impl Controls {
             credentials,
             reads: nexus_tools::project_read_tools(root, settings)?,
             supports_child_completion,
+            handoff: OnceLock::new(),
         }))
     }
 
@@ -57,12 +64,19 @@ impl Controls {
         assert!(self.runtime.set(runtime.downgrade()).is_ok());
     }
 
+    pub(super) fn bind_handoff(
+        &self,
+        handler: impl Fn(RunId, RequestId, ExplorationHandoff) + Send + Sync + 'static,
+    ) {
+        self.handoff.get_or_init(|| Box::new(handler));
+    }
+
     pub(super) fn registrations(self: &Arc<Self>) -> [ToolRegistration; 2] {
         [true, false].map(|start| {
             let (name, description, mut schema) = if start {
                 (
                     "delegate_start",
-                    "Start a background read-only task in this project. Role must be explore. Thinking may be inherit, off, or low. Starts immediately; use delegate_await to retrieve the result.",
+                    "Start a read-only project task. Role explore investigates; propose suggests one exact text replacement and requires delegate_await. Thinking: inherit, off, or low.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -78,7 +92,7 @@ impl Controls {
             } else {
                 (
                     "delegate_await",
-                    "Wait for and collect one Explore result started in this run.",
+                    "Wait for and collect one background task result started in this run.",
                     json!({
                         "type": "object",
                         "properties": {"job_id":{"type":"string"}},
@@ -146,19 +160,33 @@ impl Control {
         let args: Value = serde_json::from_str(call.args().as_str())
             .map_err(|_| "invalid exploration arguments")?;
         if self.start {
-            if args["role"].as_str() != Some("explore") {
-                return Err("unsupported exploration role");
-            }
+            let role = match args["role"].as_str() {
+                Some("explore") => ExplorationRole::Explore,
+                Some("propose") => ExplorationRole::Propose,
+                _ => return Err("unsupported exploration role"),
+            };
             let task = args["task"].as_str().ok_or("missing exploration task")?;
             let delivery = match args.get("delivery") {
+                None if controls.supports_child_completion && role == ExplorationRole::Explore => {
+                    ExplorationDelivery::Steer
+                }
                 None => ExplorationDelivery::Await,
+                Some(value) if value.as_str() == Some("await") => ExplorationDelivery::Await,
                 Some(value)
-                    if value.as_str() == Some("steer") && controls.supports_child_completion =>
+                    if controls.supports_child_completion && value.as_str() == Some("steer") =>
                 {
                     ExplorationDelivery::Steer
                 }
+                Some(value)
+                    if controls.supports_child_completion && value.as_str() == Some("queue") =>
+                {
+                    ExplorationDelivery::Queue
+                }
                 Some(_) => return Err("unsupported exploration delivery"),
             };
+            if role == ExplorationRole::Propose && delivery != ExplorationDelivery::Await {
+                return Err("proposals require explicit collection");
+            }
             let thinking = match args.get("thinking") {
                 None => ExplorationThinking::Inherit,
                 Some(value) => match value.as_str() {
@@ -204,7 +232,7 @@ impl Control {
                 .iter()
                 .map(|tool| ToolRegistration::read(tool.port().clone()))
                 .collect();
-            controls.handle.block_on(async {
+            let handoff = controls.handle.block_on(async {
                 context
                     .check_active()
                     .map_err(|_| "exploration call stopped")?;
@@ -216,10 +244,16 @@ impl Control {
                         Arc::new(adapter.with_resolved_credential(credential)),
                         tools,
                         delivery,
+                        role,
                     )
                     .await
                     .map_err(|_| "exploration could not start")
             })?;
+            if let Some(handoff) = handoff
+                && let Some(handler) = controls.handoff.get()
+            {
+                handler(call.run().clone(), job_id, handoff);
+            }
             return Ok(accepted);
         }
         let id = args["job_id"].as_str().ok_or("missing job identity")?;
@@ -239,8 +273,30 @@ impl Control {
         let value = match result {
             ExplorationWait::Finished(result) => {
                 let status = result.status().as_str();
+                if result.role == ExplorationRole::Propose && status == "completed" {
+                    let proposal = result
+                        .proposal()
+                        .ok_or("child returned an invalid proposal")?;
+                    if !proposal_matches_project(&controls.reads, &proposal, call, context) {
+                        return Err(
+                            "proposal target is stale, ambiguous, unavailable, or too large to verify",
+                        );
+                    }
+                    return bounded_json(
+                        json!({
+                            "job_id": id, "status": status, "proposal": {
+                                "path":proposal.path, "old_text":proposal.old_text, "new_text":proposal.new_text,
+                            },
+                            "input_tokens":result.usage.and_then(|usage| usage.input_tokens()),
+                            "output_tokens":result.usage.and_then(|usage| usage.output_tokens()),
+                        }),
+                        context.output_budget_bytes(),
+                    );
+                }
                 json!({
                     "job_id": id, "status": status, "text": result.text, "truncated": result.truncated,
+                    "input_tokens":result.usage.and_then(|usage| usage.input_tokens()),
+                    "output_tokens":result.usage.and_then(|usage| usage.output_tokens()),
                 })
             }
             ExplorationWait::Collected => json!({"job_id":id,"status":"collected"}),
@@ -249,6 +305,43 @@ impl Control {
         };
         bounded_json(value, context.output_budget_bytes())
     }
+}
+
+fn proposal_matches_project(
+    tools: &[ToolRegistration],
+    proposal: &ExplorationProposal,
+    call: &ToolCall,
+    context: &ToolContext,
+) -> bool {
+    if context.check_active().is_err() {
+        return false;
+    }
+    let Some(reader) = tools
+        .iter()
+        .find(|tool| tool.port().describe().id().name() == "host_read")
+    else {
+        return false;
+    };
+    let Ok(args) = NormalizedArgs::new(json!({"path":proposal.path,"limit":16_384}).to_string())
+    else {
+        return false;
+    };
+    let read = ToolCall::new(
+        call.run().clone(),
+        call.turn().clone(),
+        call.call().clone(),
+        reader.port().describe().id().clone(),
+        args,
+    );
+    let outcome = reader.port().execute(&read, context);
+    outcome.status() == ExecutionStatus::Succeeded
+        && !outcome.is_truncated()
+        && outcome
+            .content()
+            .match_indices(&proposal.old_text)
+            .take(2)
+            .count()
+            == 1
 }
 
 fn bounded_json(mut value: Value, budget: usize) -> Result<(String, bool), &'static str> {

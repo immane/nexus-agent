@@ -1,15 +1,16 @@
 # Session inbox: steer, queue, and side questions
 
-Status: ordinary user queue, steering and standalone `/btw` implemented;
-Chat Completions also supports an explicit child `delivery: "steer"` at the
-originating run's next safe model boundary. Explicit `delegate_await` races
-for the same result. Inbox Queue delivery, idle wake and the planned default
-Steer behavior are not implemented yet. Omission remains await-only. Other
-protocols reject typed replay rather than coercing it into a user message
-or unmatched tool response.
-The intended inbox handles ordinary user submissions and delivers
-[child completion results](12-background-delegation.md). Users will be able
-to steer or queue without enabling subagents or session persistence.
+Status: ordinary user queue, steering and standalone `/btw` implemented.
+Chat Completions also supports child `delivery: "steer"` (the default) at the
+originating run's next safe model boundary, and `delivery: "queue"` or an
+undelivered Steer after successful parent completion. Explicit
+`delegate_await` races for the same result. Queued child results enter the
+inbox as typed follow-ups, wake an idle session, and expire after 60 seconds
+without starting. Other protocols reject typed replay rather than coercing it
+into a user message or unmatched tool response.
+The inbox handles ordinary user submissions and delivers
+[child completion results](12-background-delegation.md). Users can steer or
+queue without enabling subagents or session persistence.
 
 ### Implemented slice
 
@@ -27,7 +28,9 @@ bound to a configured model; it opens a separate answer and usage display.
 `delivery: "steer"` additionally requires the target `run` ID, and
 `user-steered` identifies text accepted at a safe model boundary. Opaque
 provider continuation defers the input to the next run rather than being
-rewritten. No synthetic child inbox item is exposed in this slice.
+rewritten. A queued child result is listed with `kind: "child-completion"`,
+its job and originating parent, and no user `input`; the inbox also reports
+`pending_child_results` and cumulative `expired_child_results`.
 
 ## OpenCode reference and Nexus controls
 
@@ -130,7 +133,11 @@ in the inbox.
   enabling automatic child delivery; fail explicitly if provenance or
   message pairing cannot be preserved. Awaited results retain ordinary
   tool pairing. Visible completion notifications alone don't trigger an
-  extra inference outside inbox admission.
+  extra inference outside inbox admission. The implemented Chat Completions
+  encoding uses a user-role transport message whose content begins with an
+  explicit untrusted-child-result label; the typed transcript item stays
+  distinct from user text, and the Web and saved history show its job and
+  parent provenance.
 
 ## UI, recovery, and delivery slices
 
@@ -148,10 +155,13 @@ in the inbox.
 3. **Side question:** show a separate answer without editing the transcript.
    Verify no extra tool call, no history mutation, unchanged model binding,
    cancellation and failure independence, and explicit unknown usage.
-4. **Child delivery:** use the same timing gates and show the child origin.
-   Exercise both modes, out-of-order completions, delivery vs. `await`,
-   successful idle wake, old-run isolation, failed-parent suppression, and
-   the no-recursion rule. No new model request may race an active run.
+4. **Child delivery:** implemented for Chat Completions. The child origin is
+   shown in the inbox and transcript; both modes share the one-claim rule;
+   a successful idle parent is woken by a typed, tool-free follow-up; failed
+   or cancelled parents suppress results; expired results never start work.
+   Out-of-order completions, active-run isolation, and no recursion are
+   covered by scripted runtime and HTTP tests. Aggregate presentation and
+   live-provider checks remain open.
 
 Use deterministic fixtures, not live inference. Document accepted HTTP and
 Web behavior when implemented. Follow [development testing](../testing.md)

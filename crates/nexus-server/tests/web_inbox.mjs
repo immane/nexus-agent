@@ -10,6 +10,7 @@ function fixture() {
   const submitted = [];
   const rendered = [];
   const messages = [];
+  const children = [];
   const state = { session: 'session', run: 'first', active: true, connected: true };
   const dom = {
     message: { value: 'second task' },
@@ -23,6 +24,7 @@ function fixture() {
   };
   const context = vm.createContext({
     state, dom,
+    document: { hidden: false },
     crypto: { randomUUID: () => 'draft' },
     api: async (path, options) => {
       if (options?.method === 'POST') {
@@ -34,6 +36,7 @@ function fixture() {
       return inbox;
     },
     renderPromptInbox: input => rendered.push(input),
+    renderChildCompletion: item => children.push(item),
     appendUserMessage: text => messages.push(text),
     ensureSession: async () => {},
     attachStream: async () => {},
@@ -44,7 +47,7 @@ function fixture() {
     renderMarkdown: (element, answer) => { element.textContent = answer; },
   });
   vm.runInContext(functions, context);
-  return { state, dom, inbox, submitted, rendered, messages, run: code => vm.runInContext(code, context) };
+  return { state, dom, inbox, submitted, rendered, messages, children, run: code => vm.runInContext(code, context) };
 }
 
 test('sending while active queues without displaying the waiting prompt as a user turn', async () => {
@@ -70,6 +73,22 @@ test('the next accepted inbox run is adopted once without submitting it again', 
   assert.equal(f.state.active, true);
   assert.deepEqual(f.messages, ['second task']);
   assert.equal(f.submitted.length, 0);
+});
+
+test('an adopted child follow-up is displayed without a fabricated user turn', async () => {
+  const f = fixture();
+  f.state.active = false;
+  f.inbox.recent.push({
+    id: 'child-item', kind: 'child-completion', parent_run: 'first',
+    run: 'child-run', job_id: 'job-1', status: 'completed',
+  });
+  f.inbox.items = [];
+  await f.run('refreshPromptInbox(state.session, { adopt: true })');
+  assert.equal(f.state.run, 'child-run');
+  assert.equal(f.state.active, true);
+  assert.deepEqual(f.messages, []);
+  assert.equal(f.children.length, 1);
+  assert.equal(f.children[0].job_id, 'job-1');
 });
 
 test('/btw opens a separate answer without queueing or adding a user turn', async () => {

@@ -268,6 +268,8 @@ pub struct ChildCompletion {
     status: ChildStatus,
     text: String,
     truncated: bool,
+    follow_up: bool,
+    usage: Option<Usage>,
 }
 
 impl ChildCompletion {
@@ -293,6 +295,8 @@ impl ChildCompletion {
             status,
             text,
             truncated,
+            follow_up: false,
+            usage: None,
         })
     }
 
@@ -316,9 +320,41 @@ impl ChildCompletion {
     pub fn truncated(&self) -> bool {
         self.truncated
     }
+
+    /// Marks the result as the typed input of a new background follow-up.
+    pub fn into_follow_up(mut self) -> Self {
+        self.follow_up = true;
+        self
+    }
+
+    /// Whether the result starts a new exchange rather than steering one.
+    pub fn is_follow_up(&self) -> bool {
+        self.follow_up
+    }
+
+    /// Attaches observed child inference usage; unknown counters stay null.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Observed child inference usage, independent of the parent's counters.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
+    }
 }
 
 impl ModelContextItem {
+    /// Starts a new task exchange, without treating background data as user text.
+    pub fn starts_exchange(&self) -> bool {
+        match self {
+            Self::UserText(_) => true,
+            Self::ChildCompletion(result) => result.is_follow_up(),
+            _ => false,
+        }
+    }
+
     /// Builds a reasoning-only assistant record without inventing content.
     pub fn assistant_reasoning(reasoning: String) -> Result<Self, AgentError> {
         validate_reasoning(Some(&reasoning))?;
@@ -448,10 +484,14 @@ impl ModelContextItem {
             }
             Self::UserText(text) => text.as_str().len(),
             Self::ChildCompletion(result) => {
+                // Reserve the fixed provider envelope that labels the payload
+                // as untrusted background data on the wire.
+                const ENVELOPE_BYTES: usize = 512;
                 result.parent.as_str().len()
                     + result.job.as_str().len()
                     + result.status.as_str().len()
                     + result.text.len()
+                    + ENVELOPE_BYTES
             }
             Self::AssistantText {
                 item_key,

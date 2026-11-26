@@ -383,6 +383,15 @@ fn configured_tool_bounds_execute_in_strict_and_development_sessions() {
 
 #[test]
 fn exploration_runs_through_normal_tool_pairing_and_only_sees_project_reads() {
+    exploration_delivery_fixture(false);
+}
+
+#[test]
+fn exploration_queue_wakes_idle_session_with_typed_tool_free_follow_up() {
+    exploration_delivery_fixture(true);
+}
+
+fn exploration_delivery_fixture(queue: bool) {
     use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile, UserConfig};
     use serde_json::json;
     use std::io::BufRead;
@@ -471,22 +480,38 @@ fn exploration_runs_through_normal_tool_pairing_and_only_sees_project_reads() {
                         tool(
                             "delegate_start",
                             "start",
-                            json!({"role":"explore","task":"read fixture file","model":"child"}),
+                            json!({"role":"explore","task":"read fixture file","model":"child","delivery":if queue { "queue" } else { "await" }}),
                         )
                     }
                     2 => {
                         let result: Value = serde_json::from_str(last.as_str().unwrap()).unwrap();
                         assert_eq!(result["status"], "accepted");
-                        tool(
-                            "delegate_await",
-                            "await",
-                            json!({"job_id":result["job_id"]}),
-                        )
+                        if queue {
+                            answer("parent done")
+                        } else {
+                            tool(
+                                "delegate_await",
+                                "await",
+                                json!({"job_id":result["job_id"]}),
+                            )
+                        }
                     }
                     3 => {
-                        let result: Value = serde_json::from_str(last.as_str().unwrap()).unwrap();
-                        assert_eq!(result["status"], "completed");
-                        assert_eq!(result["text"], "fixture confirmed");
+                        let content = last.as_str().unwrap();
+                        if queue {
+                            let content = content.split_once('\n').unwrap().1;
+                            let result: Value = serde_json::from_str(content).unwrap();
+                            assert_eq!(result["status"], "completed");
+                            assert_eq!(result["kind"], "background_child_completion");
+                            assert_eq!(result["untrusted_text"], "fixture confirmed");
+                            assert_eq!(result["follow_up"], true);
+                            assert!(request.get("tools").is_none());
+                            assert_eq!(messages.last().unwrap()["role"], "user");
+                        } else {
+                            let result: Value = serde_json::from_str(content).unwrap();
+                            assert_eq!(result["status"], "completed");
+                            assert_eq!(result["text"], "fixture confirmed");
+                        }
                         answer("done")
                     }
                     _ => panic!("unexpected parent turn"),
@@ -496,6 +521,211 @@ fn exploration_runs_through_normal_tool_pairing_and_only_sees_project_reads() {
             write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
         assert_eq!((parent_turn, child_turn), (3, 2));
+    });
+
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let mut server = nexus_server::Server::new(executor.handle().clone());
+    let mut config = UserConfig::default_config();
+    config
+        .add_provider(
+            ProviderProfile::new(
+                "mock",
+                "Mock",
+                AdapterKind::Direct,
+                Some(endpoint),
+                CredentialRef::stored("mock").unwrap(),
+                "parent-model",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    for (id, name) in [("parent", "parent-model"), ("child", "child-model")] {
+        config
+            .add_model(ModelEntry::new(id, "mock", name).unwrap())
+            .unwrap();
+    }
+    let private = FixtureRoot::new();
+    nexus_config::store_stored_credential_at(
+        &private.0.join("credentials.json"),
+        "mock",
+        "fixture-token",
+    )
+    .unwrap();
+    server.set_config(config, Some(private.0.join("config.json")));
+    server
+        .set_limits(nexus_core::Limits {
+            run_duration: Duration::from_secs(8),
+            per_tool_timeout: Duration::from_secs(5),
+            ..nexus_core::Limits::m0_test()
+        })
+        .unwrap();
+    server
+        .set_server_settings(&nexus_config::ServerSettings {
+            exploration_models: vec!["child".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    server
+        .set_tools_mode(nexus_server::ToolsMode::Development {
+            root: root.0.clone(),
+        })
+        .unwrap();
+    server.set_auth_token(&"a".repeat(64)).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::sync::Arc::new(server);
+    let web = std::thread::spawn(move || {
+        for _ in 0..if queue { 5 } else { 3 } {
+            server.handle_connection(listener.accept().unwrap().0);
+        }
+    });
+    let (status, session) = post(
+        port,
+        "/sessions",
+        r#"{"provider":"mock","model":"parent","project":"default"}"#,
+    );
+    assert_eq!(status, 201, "{session}");
+    let session = session["session"].as_str().unwrap();
+    let (status, run) = post(
+        port,
+        &format!("/sessions/{session}/runs"),
+        r#"{"input":"parent transcript"}"#,
+    );
+    assert_eq!(status, 201, "{run}");
+    let parent = run["run"].as_str().unwrap();
+    let wanted = if queue { 1 } else { 2 };
+    let outcomes = tool_outcomes(port, session, parent, wanted);
+    assert_eq!(outcomes.len(), wanted);
+    mock.join().unwrap();
+    if queue {
+        let (status, inbox) = round_trip(
+            port,
+            &format!(
+                "GET /sessions/{session}/inbox HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {}\r\n\r\n",
+                "a".repeat(64),
+            ),
+        );
+        assert_eq!(status, 200);
+        let recent = inbox["recent"].as_array().unwrap();
+        let follow_up = recent
+            .iter()
+            .find(|item| item["kind"] == "child-completion")
+            .unwrap();
+        assert_eq!(follow_up["parent_run"], parent);
+        assert!(follow_up.get("input").is_none());
+        tool_outcomes(port, session, follow_up["run"].as_str().unwrap(), 0);
+    }
+    web.join().unwrap();
+}
+
+#[test]
+fn propose_returns_a_verified_exact_replacement_without_touching_the_file() {
+    proposal_fixture(true);
+}
+
+#[test]
+fn propose_rejects_an_old_text_that_no_longer_matches() {
+    proposal_fixture(false);
+}
+
+fn proposal_fixture(matches: bool) {
+    use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile, UserConfig};
+    use serde_json::json;
+    use std::io::BufRead;
+
+    let root = FixtureRoot::new();
+    std::fs::write(root.0.join("a"), "real-bytes-123").unwrap();
+    let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    upstream.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", upstream.local_addr().unwrap());
+    let mock = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut parent_turn = 0;
+        let mut child_turn = 0;
+        let mut job_id = String::new();
+        for _ in 0..4 {
+            let mut socket = loop {
+                match upstream.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut input = std::io::BufReader::new(&mut socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(input.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse().unwrap());
+                }
+            }
+            let mut bytes = vec![0; length.unwrap()];
+            input.read_exact(&mut bytes).unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let messages = request["messages"].as_array().unwrap();
+            let last = &messages.last().unwrap()["content"];
+            let body = if request["model"] == "child-model" {
+                assert_eq!(child_turn, 0);
+                child_turn += 1;
+                let old = if matches { "real-bytes" } else { "absent" };
+                assert!(request.get("tools").is_some());
+                json!({"choices":[{"message":{"role":"assistant","content":
+                    json!({"path":"a","old_text":old,"new_text":"changed-bytes"}).to_string()
+                },"finish_reason":"stop"}]})
+            } else {
+                parent_turn += 1;
+                match parent_turn {
+                    1 => json!({"choices":[{"message":{"role":"assistant","tool_calls":[
+                        {"id":"start","type":"function","function":{"name":"delegate_start","arguments":
+                            json!({"role":"propose","task":"suggest a replacement","model":"child","delivery":"await"}).to_string()}}
+                    ]},"finish_reason":"tool_calls"}]}),
+                    2 => {
+                        let started: Value = serde_json::from_str(last.as_str().unwrap()).unwrap();
+                        assert_eq!(started["status"], "accepted");
+                        job_id = started["job_id"].as_str().unwrap().to_owned();
+                        json!({"choices":[{"message":{"role":"assistant","tool_calls":[
+                            {"id":"await","type":"function","function":{"name":"delegate_await","arguments":
+                                json!({"job_id":started["job_id"]}).to_string()}}
+                        ]},"finish_reason":"tool_calls"}]})
+                    }
+                    3 => {
+                        if matches {
+                            let result: Value =
+                                serde_json::from_str(last.as_str().unwrap()).unwrap();
+                            assert_eq!(result["job_id"], job_id);
+                            assert_eq!(result["status"], "completed");
+                            assert_eq!(result["proposal"]["path"], "a");
+                            assert_eq!(result["proposal"]["new_text"], "changed-bytes");
+                        } else {
+                            assert!(
+                                last.as_str().unwrap().contains("stale"),
+                                "unexpected await content: {last}"
+                            );
+                        }
+                        json!({"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]})
+                    }
+                    _ => panic!("unexpected parent turn"),
+                }
+            };
+            let body = body.to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        assert_eq!((parent_turn, child_turn), (3, 1));
     });
 
     let executor = tokio::runtime::Builder::new_multi_thread()
@@ -567,11 +797,23 @@ fn exploration_runs_through_normal_tool_pairing_and_only_sees_project_reads() {
     let (status, run) = post(
         port,
         &format!("/sessions/{session}/runs"),
-        r#"{"input":"parent transcript"}"#,
+        r#"{"input":"propose a change"}"#,
     );
     assert_eq!(status, 201, "{run}");
     let outcomes = tool_outcomes(port, session, run["run"].as_str().unwrap(), 2);
-    assert_eq!(outcomes.len(), 2);
+    if matches {
+        let awaited: Value =
+            serde_json::from_str(outcomes[1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(awaited["status"], "completed");
+        assert_eq!(awaited["proposal"]["old_text"], "real-bytes");
+    } else {
+        assert_eq!(outcomes[1]["status"], "Failed");
+        assert!(outcomes[1]["content"].as_str().unwrap().contains("stale"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("a")).unwrap(),
+        "real-bytes-123"
+    );
     mock.join().unwrap();
     web.join().unwrap();
 }

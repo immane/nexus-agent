@@ -18,7 +18,8 @@ pub mod runtime;
 pub mod transport;
 
 pub use delegation::{
-    ExplorationClaim, ExplorationDelivery, ExplorationParent, ExplorationResult, ExplorationWait,
+    ExplorationClaim, ExplorationDelivery, ExplorationHandoff, ExplorationParent,
+    ExplorationProposal, ExplorationResult, ExplorationRole, ExplorationWait,
 };
 pub use policy::Policy;
 pub use runtime::{RunState, Runtime, RuntimeConfig, SessionStoreHandle};

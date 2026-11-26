@@ -1,10 +1,11 @@
 # Background delegation
 
-Status: eligible Web/desktop sessions expose read-only Explore via
-`delegate_start` and `delegate_await`, plus explicit next-boundary Steer on
-Chat Completions. Queue delivery, idle wake and Propose remain planned.
-This is product behavior; [03 - Subagents](03-subagents.md)
-describes how to divide development work on this repository.
+Status: eligible Web/desktop sessions expose read-only Explore and Propose via
+`delegate_start` and `delegate_await`, plus automatic Steer/Queue delivery on
+Chat Completions. Propose returns data only; the parent applies any edit
+through its ordinary tools. This is product behavior;
+[03 - Subagents](03-subagents.md) describes how to divide development work on
+this repository.
 
 The runtime foundation uses an ephemeral child runtime for each accepted
 exploration and a run-owned job registry. It accepts a host-selected provider
@@ -20,10 +21,22 @@ configured providers in bound local projects. Additional models must be
 explicitly selected and listed in the operational `server.exploration_models`
 array. A provider-only session needs an explicit allowed model because its
 parent has no configured model ID. `delegate_await` uses the ordinary tool
-deadline; a timed-out wait does not consume a pending result. `delivery:
-"steer"` can hand off at a safe model boundary on Chat Completions; it does
-not yet queue or wake the session if the parent finishes first. Omission
-still requires an explicit wait.
+deadline; a timed-out wait does not consume a pending result.
+
+On Chat Completions the default Explore delivery is `steer`: the result is
+offered at the parent's next safe model boundary. `queue` waits for the
+parent to complete successfully, then enters the session inbox as a typed
+follow-up. Undelivered Steer results follow the same path after a successful
+parent. A queued result expires after 60 seconds if it cannot start; expired
+results are counted in the inbox status but never run. The follow-up run is
+read-only, receives no tool definitions, and cannot start more children.
+Child inference usage is reported separately from the parent's counters.
+Other protocols remain await-only or explicit `steer` disabled until typed
+replay is supported.
+
+Still open: aggregate presentation of child status beyond inbox counts,
+live-provider validation, concurrency and resource measurements, and
+recovery after restart (unconsumed results are not durable).
 
 ## Goal and first release
 
@@ -70,9 +83,10 @@ work triggered by child-only input.
 
 ## Caller contract
 
-The table describes the target contract. Only explicit `delivery: "steer"`
-on Chat Completions is implemented; `queue`, default Steer and `propose`
-are pending.
+The table describes the shipped Explore/Propose behavior. On Chat Completions
+`delivery` defaults to `steer`; `queue` is explicit; `await` forces explicit
+collection. On other protocols only `await` is available. `propose` requires
+`await`, returns one validated suggestion, and never writes.
 
 | Operation | Inputs | Result |
 | --- | --- | --- |
@@ -214,27 +228,30 @@ limits on the number of children.
 | Time | Child gets at most 45 seconds and never more than the parent's remaining time; child tool deadline capped at 5 seconds |
 | Work | At most 4 child model turns and 12 child tool calls, also capped by the host's configured limits; count child summaries/auxiliary model calls or disable them for this path |
 | Context | Task ≤ 4 KiB, collected result including proposal ≤ 8 KiB, at most 8 file references; child context and tool output have their own bounded byte caps |
-| Inference | Establish the individual child envelope at admission. Start with an 8K input envelope per child request and a 1K generation cap where supported; do not claim a hard token or pricing cap from estimates or unsupported controls |
+| Inference | No separate child input/generation cap beyond the selected model's configured context and output settings; report only provider-observed usage, never zero for unknown |
 | Status | Keep compact status and unconsumed child results for up to 60 seconds after both parent and children are terminal, or until session cleanup. Expiry is not dispatch; non-exited workers remain supervised independently |
 
-Use existing runtime and adapter controls where they fit. Count child
-inference, including retries that actually reach the provider, separately from
-parent inference. Reuse transport limits, surface provider rate limits and
-resource failures, and don't add delegation-level retry or delayed dispatch.
-If the existing adapter retries other transport failures, distinguish its
-attempts from child starts. There is no pooled billing balance; per-child
-bounds don't cap aggregate spend. If a per-child limit can't be enforced,
-narrow the supported path or report the limitation; never present unavailable
-usage as zero. No billing integration.
+Use existing runtime and adapter controls where they fit. The implemented
+child limits are the 45-second cap, 4 model turns, 12 tool calls, a 5-second
+per-tool deadline, a 4 KiB brief, and an 8 KiB collected result. Input and
+generation token envelopes are not separately capped beyond the selected
+model's configured context and output settings; the host does not claim a
+pricing bound. Count child inference, including retries that actually reach
+the provider, separately from parent inference. Reuse transport limits,
+surface provider rate limits and resource failures, and don't add
+delegation-level retry or delayed dispatch. If the existing adapter retries
+other transport failures, distinguish its attempts from child starts. There
+is no pooled billing balance; per-child bounds don't cap aggregate spend.
+Never present unavailable usage as zero. No billing integration.
 
 ## Implementation order
 
 | Slice | Work and exit condition |
 | --- | --- |
-| A. Offline jobs and wait | Add a small runtime-owned registry and completion/wait path; demonstrate overlapping jobs with scripted providers. Keep synchronous tool ports unchanged. If an ordinary waiter would hold an operation permit needed by a child or block cancellation, use a narrow async wait at the runtime dispatch boundary; don't add a generalized async tool API. Parent run/approval/sequence behavior and the no-delegation path stay unchanged. |
-| B. Default read-only composition | Wire only eligible local Web/desktop sessions. Reuse provider selection and tool/path policies; take the minimum of parent deadline and child limits. Validate model/effort without inference and exercise supported protocol fixtures. Integrate multi-job ownership, cancellation, shutdown and idle cleanup before exposing the tools by default. |
-| C. Inbox handoff and proposals | Reuse tool cards and the session inbox timing rules. Verify late results wake only an eligible session and that explicit `await` cannot double-deliver. Add `Propose` as bounded data and test stale or malformed replacements; don't introduce a generic patch engine or approval path for child writes. |
-| D. Verify readiness | Run offline correctness, concurrency and lightweight checks for each delivered slice. If the gates fail, fix the issue or hold the release; don't add an undocumented cap or silently turn the feature into opt-in. Compare matched real tasks only if live inference is authorized. |
+| A. Offline jobs and wait | Implemented. A runtime-owned registry and completion/wait path; overlapping scripted jobs; synchronous tool ports unchanged. |
+| B. Default read-only composition | Implemented for eligible local Web/desktop sessions, including multi-job ownership, cancellation, shutdown and idle cleanup. |
+| C. Inbox handoff and proposals | Implemented for Chat Completions: explicit await cannot double-deliver; late results queue and wake an idle session; Propose is bounded data with host re-read validation and no write path. |
+| D. Verify readiness | Partially verified offline: package checks, scripted end-to-end delivery, cancellation, expiry and proposal tests. Live-provider, concurrency stress and lightweight resource gates are still outstanding. |
 
 Place ownership and wake logic beside the current runtime execution loop,
 provider/model bindings beside the server's existing session composition, and

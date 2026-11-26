@@ -363,7 +363,7 @@ fn request_for(
     memory: Option<&str>,
     summary: bool,
 ) -> Result<ModelRequest, Terminal> {
-    let enabled = if summary {
+    let enabled = if summary || active.child_follow_up {
         Vec::new()
     } else {
         shared
@@ -399,7 +399,7 @@ fn request_for(
     .map_err(Terminal::failed)?
     .with_conversation(conversation_with_memory(items, memory).map_err(Terminal::failed)?)
     .map_err(Terminal::failed)?;
-    if summary {
+    if summary || active.child_follow_up {
         Ok(request)
     } else {
         request

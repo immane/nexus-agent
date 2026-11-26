@@ -1,11 +1,11 @@
 //! Run-owned, in-memory supervision of background read-only exploration.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nexus_core::provider::{ChildCompletion, ChildStatus};
-use nexus_core::{CancelCommand, RequestId, RunId, RunOutcome, SessionId, SubmitCommand};
+use nexus_core::{CancelCommand, RequestId, RunId, RunOutcome, SessionId, SubmitCommand, Usage};
 use tokio::sync::watch;
 
 use crate::{EventStreams, Runtime};
@@ -13,6 +13,50 @@ use crate::{EventStreams, Runtime};
 pub(crate) const MAX_BRIEF_BYTES: usize = 4096;
 pub(crate) const MAX_RESULT_BYTES: usize = ChildCompletion::MAX_TEXT_BYTES;
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(45);
+
+type WorkerId = (RunId, RequestId);
+type WorkerMap = HashMap<WorkerId, Arc<Job>>;
+
+#[derive(Default)]
+pub(crate) struct ExplorationWorkers(Arc<Mutex<WorkerMap>>);
+
+impl ExplorationWorkers {
+    pub(crate) fn track(&self, parent: RunId, id: RequestId, job: Arc<Job>) -> ExplorationWorker {
+        let key = (parent, id);
+        self.0
+            .lock()
+            .expect("child workers lock")
+            .insert(key.clone(), job);
+        ExplorationWorker {
+            workers: self.0.clone(),
+            key,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().expect("child workers lock").len()
+    }
+
+    pub(crate) fn stop(&self) {
+        for job in self.0.lock().expect("child workers lock").values() {
+            job.stop();
+        }
+    }
+}
+
+pub(crate) struct ExplorationWorker {
+    workers: Arc<Mutex<WorkerMap>>,
+    key: WorkerId,
+}
+
+impl Drop for ExplorationWorker {
+    fn drop(&mut self) {
+        self.workers
+            .lock()
+            .expect("child workers lock")
+            .remove(&self.key);
+    }
+}
 
 /// Terminal output of a read-only exploration. Non-completed jobs return no text.
 #[derive(Debug, PartialEq, Eq)]
@@ -25,6 +69,20 @@ pub struct ExplorationResult {
     pub text: String,
     /// The result was cut to its finite byte budget.
     pub truncated: bool,
+    /// Whether the caller must validate a structured proposal before display.
+    pub role: ExplorationRole,
+    /// Child inference usage, kept separate from the parent's counters.
+    pub usage: Option<Usage>,
+}
+
+/// Which read-only instructions to give the child.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ExplorationRole {
+    /// Return a short investigation result.
+    #[default]
+    Explore,
+    /// Return one suggested replacement, never a workspace mutation.
+    Propose,
 }
 
 impl ExplorationResult {
@@ -41,8 +99,63 @@ impl ExplorationResult {
             RunOutcome::LimitReached => ChildStatus::LimitReached,
         }
     }
+
+    /// Parses one bounded exact replacement from a successful Propose job.
+    /// The host still has to validate the referenced project file.
+    pub fn proposal(&self) -> Option<ExplorationProposal> {
+        if self.role != ExplorationRole::Propose
+            || self.status() != ChildStatus::Completed
+            || self.truncated
+        {
+            return None;
+        }
+        ExplorationProposal::parse(&self.text)
+    }
 }
 
+/// Structured suggestion, not permission to modify a file.
+#[derive(Debug)]
+pub struct ExplorationProposal {
+    /// Project-relative file.
+    pub path: String,
+    /// Exact existing text.
+    pub old_text: String,
+    /// Suggested replacement.
+    pub new_text: String,
+}
+
+impl ExplorationProposal {
+    fn parse(text: &str) -> Option<Self> {
+        use std::path::{Component, Path};
+
+        let value = nexus_validation::parse_object(text, MAX_RESULT_BYTES).ok()?;
+        let fields = value.as_object()?;
+        if fields.len() != 3 {
+            return None;
+        }
+        let path = fields.get("path")?.as_str()?.to_owned();
+        let old_text = fields.get("old_text")?.as_str()?.to_owned();
+        let new_text = fields.get("new_text")?.as_str()?.to_owned();
+        if path.is_empty()
+            || path.len() > 1024
+            || path.contains(['\0', '\\'])
+            || !Path::new(&path)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+            || old_text.is_empty()
+            || old_text.len() > 4096
+            || new_text.len() > 4096
+            || old_text == new_text
+        {
+            return None;
+        }
+        Some(Self {
+            path,
+            old_text,
+            new_text,
+        })
+    }
+}
 /// How a child result may be collected.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ExplorationDelivery {
@@ -51,6 +164,8 @@ pub enum ExplorationDelivery {
     Await,
     /// Offer at the next safe request boundary of the originating parent.
     Steer,
+    /// Offer only after the originating parent completes successfully.
+    Queue,
 }
 
 /// Result of waiting for a job owned by the supplied parent run.
@@ -90,6 +205,12 @@ impl Explorations {
         }
     }
 
+    pub(crate) fn parent_completed(&self) {
+        for job in self.jobs.values() {
+            job.parent_completed.send_replace(true);
+        }
+    }
+
     pub(crate) fn has_steering(&self) -> bool {
         !self.steering.is_empty()
     }
@@ -111,6 +232,11 @@ impl Explorations {
                         result.text.clone(),
                         result.truncated,
                     )
+                    .map(|item| {
+                        result
+                            .usage
+                            .map_or(item.clone(), |usage| item.with_usage(usage))
+                    })
                     .is_ok_and(&mut accept)
                 }),
                 ExplorationClaim::Pending | ExplorationClaim::Deferred
@@ -157,6 +283,47 @@ pub enum ExplorationParent {
 pub(crate) struct Job {
     cancel: watch::Sender<bool>,
     completion: watch::Sender<Completion>,
+    parent_completed: watch::Sender<bool>,
+}
+
+/// A non-consuming notification and atomic claim for automatic queue delivery.
+#[derive(Clone)]
+pub struct ExplorationHandoff(Arc<Job>);
+
+impl ExplorationHandoff {
+    pub(crate) fn new(job: Arc<Job>) -> Self {
+        Self(job)
+    }
+
+    /// Waits for successful parent completion and an unclaimed child result.
+    pub async fn ready(&self) -> bool {
+        let mut parent = self.0.parent_completed.subscribe();
+        let mut completion = self.0.completion.subscribe();
+        loop {
+            match &*completion.borrow_and_update() {
+                Completion::Finished(_) if *parent.borrow_and_update() => return true,
+                Completion::Collected | Completion::ParentStopped => return false,
+                _ => {}
+            }
+            tokio::select! {
+                _ = parent.changed() => {}
+                _ = completion.changed() => {}
+            }
+        }
+    }
+
+    /// Claims only if the parent succeeded and the inbox accepts the result.
+    pub fn offer(&self, accept: impl FnOnce(&ExplorationResult) -> bool) -> ExplorationClaim {
+        if !*self.0.parent_completed.borrow() {
+            return ExplorationClaim::Deferred;
+        }
+        self.0.try_deliver(accept)
+    }
+
+    /// Drops an unclaimed result at the end of its handoff window.
+    pub fn expire(&self) -> bool {
+        self.offer(|_| true) == ExplorationClaim::Accepted
+    }
 }
 
 impl Job {
@@ -164,6 +331,7 @@ impl Job {
         Arc::new(Self {
             cancel: watch::channel(false).0,
             completion: watch::channel(Completion::Pending).0,
+            parent_completed: watch::channel(false).0,
         })
     }
 
@@ -256,6 +424,8 @@ impl Job {
         streams: EventStreams,
         command: SubmitCommand,
         deadline: Instant,
+        _worker: ExplorationWorker,
+        role: ExplorationRole,
     ) {
         let mut cancellation = self.cancel.subscribe();
         let session = command.session.clone();
@@ -272,6 +442,7 @@ impl Job {
             let mut stop = None;
             let mut control_open = true;
             let mut data_open = true;
+            let mut usage = None;
             let outcome = loop {
                 tokio::select! {
                     result = &mut terminal => break result.unwrap_or(RunOutcome::Failed),
@@ -290,21 +461,31 @@ impl Job {
                         }).await;
                     }
                     // The child must be able to publish even if nobody awaits it.
-                    event = control.recv(), if control_open => control_open = event.is_some(),
+                    event = control.recv(), if control_open => {
+                        if let Some(event) = &event
+                            && let nexus_core::EventPayload::UsageUpdated(observed) = event.payload()
+                        {
+                            usage = Some(*observed);
+                        }
+                        control_open = event.is_some();
+                    }
                     event = data.recv(), if data_open => data_open = event.is_some(),
                 }
             };
-            if let Some(timed_out) = stop {
+            let mut result = if let Some(timed_out) = stop {
                 stopped(RunOutcome::Cancelled, timed_out)
             } else if outcome == RunOutcome::Completed {
                 completed(&runtime, &session).await
             } else {
                 stopped(outcome, false)
-            }
+            };
+            result.usage = usage;
+            result
         } else {
             stopped(RunOutcome::Failed, false)
         };
-        self.finish(result);
+        self.finish(ExplorationResult { role, ..result });
+        runtime.wait_for_worker_exit().await;
     }
 }
 
@@ -314,6 +495,8 @@ fn stopped(outcome: RunOutcome, timed_out: bool) -> ExplorationResult {
         timed_out,
         text: String::new(),
         truncated: false,
+        role: ExplorationRole::Explore,
+        usage: None,
     }
 }
 
@@ -327,6 +510,8 @@ async fn completed(runtime: &Runtime, session: &SessionId) -> ExplorationResult 
         timed_out: false,
         text,
         truncated,
+        role: ExplorationRole::Explore,
+        usage: None,
     }
 }
 

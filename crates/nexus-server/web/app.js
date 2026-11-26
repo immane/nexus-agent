@@ -1680,6 +1680,11 @@ function renderHistoricalAssistant(text) {
 function renderChildCompletion(item) {
   const result = node('details', 'message');
   result.append(node('summary', '', `Explore ${item.job_id} · ${item.status}`));
+  if (Number.isFinite(item.input_tokens) || Number.isFinite(item.output_tokens)) {
+    const input = Number.isFinite(item.input_tokens) ? item.input_tokens : '—';
+    const output = Number.isFinite(item.output_tokens) ? item.output_tokens : '—';
+    result.append(node('div', 'meta', `Usage: ${input} / ${output} (in / out)`));
+  }
   result.append(node('pre', '', item.text));
   appendNode(result);
 }
@@ -2014,14 +2019,18 @@ async function ensureSession() {
 function renderPromptInbox(inbox) {
   state.inbox = inbox;
   const items = inbox?.items || [];
+  const expired = inbox?.expired_child_results || 0;
   dom.promptInbox.replaceChildren();
-  dom.promptInbox.hidden = !items.length;
+  dom.promptInbox.hidden = !items.length && !expired;
+  if (expired) dom.promptInbox.append(node('div', '', `${expired} Explore result${expired === 1 ? '' : 's'} expired.`));
   if (!items.length) return;
   dom.promptInbox.append(node('div', '', inbox.paused || 'Pending prompts'));
   const session = state.session;
   for (const [index, item] of items.entries()) {
     const row = node('div', 'prompt-inbox-row');
-    row.append(node('span', '', item.delivery === 'steer' ? `Steer: ${item.input}` : item.input));
+    const label = item.kind === 'child-completion' ? `Explore ${item.job_id} · ${item.status}`
+      : item.delivery === 'steer' ? `Steer: ${item.input}` : item.input;
+    row.append(node('span', '', label));
     const actions = node('span');
     if (index === 0 && inbox.paused) {
       const resume = node('button', '', 'Resume');
@@ -2058,7 +2067,8 @@ async function refreshPromptInbox(session = state.session, { adopt = false, foll
   if (!session || !state.connected) return;
   const previous = state.run;
   try {
-    for (let attempt = 0; attempt < (follow ? 12 : 1); attempt += 1) {
+    const until = Date.now() + 60_000;
+    for (let attempt = 0; ; attempt += 1) {
       const inbox = await api(`/sessions/${encodeURIComponent(session)}/inbox`);
       if (state.session !== session || state.run !== previous) return;
       renderPromptInbox(inbox);
@@ -2067,15 +2077,20 @@ async function refreshPromptInbox(session = state.session, { adopt = false, foll
         const recent = inbox.recent || [];
         const previousIndex = recent.findIndex(item => item.run === previous);
         const next = previousIndex >= 0 ? recent[previousIndex + 1]
-          : previous === null ? recent.find(item => item.run === inbox.active_run) : null;
+          : previous === null ? recent.find(item => item.run === inbox.active_run)
+            : recent.find(item => item.kind === 'child-completion' && item.parent_run === previous);
         if (next) {
           startDisplayingRun(next.run, next.input);
+          if (next.kind === 'child-completion') renderChildCompletion(next);
           return;
         }
       }
-      if (!follow || inbox.paused || !inbox.items?.length) return;
-      await new Promise(resolve => setTimeout(resolve, 150));
-      if (state.session !== session || state.run !== previous) return;
+      const waitingForChild = inbox.pending_child_results > 0;
+      if (!follow || inbox.paused || Date.now() >= until
+          || (!waitingForChild && (!inbox.items?.length || attempt >= 11))
+          || document.hidden) return;
+      await new Promise(resolve => setTimeout(resolve, waitingForChild ? 2000 : 150));
+      if (state.session !== session || state.run !== previous || document.hidden) return;
     }
   } catch (error) {
     if (state.session === session && error?.status !== 404) {
@@ -2087,8 +2102,10 @@ async function refreshPromptInbox(session = state.session, { adopt = false, foll
 function startDisplayingRun(run, text) {
   stopStream();
   resetRunState();
-  setSessionTitleFromInput(text);
-  appendUserMessage(text);
+  if (typeof text === 'string') {
+    setSessionTitleFromInput(text);
+    appendUserMessage(text);
+  }
   state.run = run;
   state.active = true;
   updateSessionDisplay();

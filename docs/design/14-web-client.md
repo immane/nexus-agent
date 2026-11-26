@@ -318,14 +318,20 @@ standalone answer based on accepted conversation text. It does not use tools,
 enter session history, interrupt the current run, or enqueue a prompt.
 
 In a bound local project with an eligible configured model, the assistant can
-start background **Explore** jobs and explicitly collect them by job ID. The
-child can only read, list, and search that project. The parent model is the
-default; additional models require an administrator's `server.exploration_models`
-allowlist. Collected results appear as ordinary tool results. On Chat
-Completions, the assistant may instead request `delivery: "steer"`; a result
-that arrives before the originating task's next safe model boundary appears
-as a separate Explore record. It does not yet queue a follow-up after that
-task ends. See [background delegation](../tasks/12-background-delegation.md).
+start background **Explore** jobs and collect them by job ID or by automatic
+delivery. The child can only read, list, and search that project. The parent
+model is the default; additional models require an administrator's
+`server.exploration_models` allowlist. Collected results appear as ordinary
+tool results. On Chat Completions, Explore uses `delivery: "steer"` by
+default: a result that arrives before the originating task's next safe model
+boundary appears as a separate Explore record. `queue`, or an undelivered
+steer after a successful task, enters the session's pending list with its
+job and status, then starts a read-only follow-up even if the page is idle.
+The follow-up cannot start more children, and an unstarted result expires
+after about a minute and is reported as expired rather than silently run.
+A **Propose** child returns one suggested exact replacement; the parent
+re-reads the file and may apply it with its normal patch tool. The child
+never writes. See [background delegation](../tasks/12-background-delegation.md).
 
 The client consumes the existing event JSON without inventing additional wire
 contracts:

@@ -300,11 +300,16 @@ pub fn history_item_json(record: &SourceRecord) -> Value {
 }
 
 fn child_result_json(result: &nexus_core::provider::ChildCompletion) -> Value {
-    json!({
+    let mut value = json!({
         "parent_run": result.parent().as_str(), "job_id": result.job().as_str(),
         "status": result.status().as_str(), "text": result.text(),
         "truncated": result.truncated(),
-    })
+    });
+    if let Some(usage) = result.usage() {
+        value["input_tokens"] = json!(usage.input_tokens());
+        value["output_tokens"] = json!(usage.output_tokens());
+    }
+    value
 }
 
 /// Encodes a bounded snapshot: lifecycle, last sequence, pending approval
