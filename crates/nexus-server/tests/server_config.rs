@@ -829,11 +829,11 @@ fn an_unconfigured_server_reports_no_identities() {
 /// the response says the document was not written.
 #[test]
 fn a_failed_save_reports_500_while_the_edit_stays_live() {
-    // A path whose parent does not exist makes the atomic write fail
-    // deterministically, without depending on filesystem permissions.
-    let directory = temp_config("failed-save");
-    let unreachable = directory.join("missing-dir").join("config.json");
-    let port = spawn_server(configured(resolvable_probe()), Some(unreachable));
+    // A directory at the destination makes atomic replacement fail without
+    // depending on filesystem permissions.
+    let path = temp_config("failed-save");
+    std::fs::create_dir(&path).expect("blocking directory is creatable");
+    let port = spawn_server(configured(resolvable_probe()), Some(path.clone()));
 
     let (status, reply) = post(port, "/config/favourites", r#"{"id":"fast"}"#);
     assert_eq!(status, 500, "the edit could not be persisted: {reply}");
@@ -845,7 +845,8 @@ fn a_failed_save_reports_500_while_the_edit_stays_live() {
         serde_json::json!(["fast"]),
         "the edit is live in memory even though the save failed"
     );
-    let _ = std::fs::remove_dir_all(&directory);
+    assert!(path.is_dir(), "the destination was not replaced");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 /// Provider and model upserts are authenticated, validated, persisted, and
@@ -938,8 +939,12 @@ fn providers_and_models_can_be_added_and_updated_over_http() {
 /// model still references the provider.
 #[test]
 fn provider_tokens_are_stored_updated_and_removed_with_the_provider() {
-    let path = temp_config("provider-token");
+    let fixture = temp_config("provider-token");
+    let root = fixture.parent().unwrap();
+    let directory = root.join(".config").join("nexus-agent");
+    let path = directory.join("config.json");
     let credentials = path.with_file_name("credentials.json");
+    assert!(!directory.exists(), "first launch has no config directory");
     let port = spawn_server(UserConfig::default_config(), Some(path.clone()));
 
     let stored = |id: &str, token: Option<&str>| {
@@ -972,6 +977,32 @@ fn provider_tokens_are_stored_updated_and_removed_with_the_provider() {
     let on_disk: Value =
         serde_json::from_str(&std::fs::read_to_string(&credentials).unwrap()).unwrap();
     assert_eq!(on_disk["beta"], "secret-one");
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("secret-one")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for dir in [directory.parent().unwrap(), &directory] {
+            assert_eq!(dir.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        for file in [&path, &credentials] {
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    let reopened = spawn_server(read_back(&path), Some(path.clone()));
+    let (status, summary) = get(reopened, "/config");
+    assert_eq!(status, 200);
+    assert!(!summary.to_string().contains("secret-one"));
+    let (status, session) = post(reopened, "/sessions", r#"{"provider":"beta"}"#);
+    assert_eq!(
+        status, 201,
+        "fresh server resolves the saved token: {session}"
+    );
 
     let (status, summary) = post(
         port,
@@ -1069,7 +1100,7 @@ fn provider_tokens_are_stored_updated_and_removed_with_the_provider() {
     assert_eq!(on_disk["beta"], "secret-two");
     let (status, _) = delete(port, "/config/providers/gamma");
     assert_eq!(status, 404, "repeat deletion is unknown");
-    let _ = std::fs::remove_dir_all(path.parent().expect("temp directory"));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

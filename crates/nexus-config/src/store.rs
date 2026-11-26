@@ -181,14 +181,26 @@ pub fn save(config: &UserConfig, path: &Path) -> Result<(), ConfigError> {
 }
 
 /// Atomic owner-only replacement shared by the configuration and stored
-/// credentials. A uniquely named sibling is written, flushed, restricted, and
-/// renamed so readers never observe a partial document.
+/// credentials. Missing parent directories are created on first save. A
+/// uniquely named sibling is written, flushed, restricted, and renamed so
+/// readers never observe a partial document.
 fn write_atomic(path: &Path, contents: &[u8], message: &'static str) -> Result<(), ConfigError> {
     let io_error = || ConfigError {
         kind: ConfigErrorKind::Io,
         message,
     };
     let parent = path.parent().ok_or_else(io_error)?;
+    // A bare filename already has the current directory as its parent.
+    if !parent.as_os_str().is_empty() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(parent).map_err(|_| io_error())?;
+    }
     let pid = std::process::id();
     let mut attempts = 0;
     loop {
