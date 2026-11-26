@@ -606,6 +606,7 @@ fn reason_phrases_cover_the_emitted_statuses() {
     for (status, phrase) in [
         (200, "OK"),
         (201, "Created"),
+        (202, "Accepted"),
         (400, "Bad Request"),
         (408, "Request Timeout"),
         (404, "Not Found"),

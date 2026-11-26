@@ -58,6 +58,7 @@
     </main>
     <section class="composer-region" aria-label="Message composer">
       <button class="jump-latest" id="jump-latest" type="button" hidden>Jump to latest ↓</button>
+      <div class="prompt-inbox" id="prompt-inbox" aria-label="Queued prompts" hidden></div>
       <form class="composer" id="composer">
         <label class="sr-only" for="message">Message</label>
         <textarea id="message" rows="2" disabled placeholder="Connect to start a task…"></textarea>
@@ -77,12 +78,19 @@
             <select id="model" disabled aria-label="Model"></select>
             <span class="model-label" id="model-label" hidden></span>
             <button class="danger" id="cancel-run" type="button" hidden disabled>Cancel</button>
+            <button id="steer-run" type="button" hidden disabled>Steer</button>
             <button class="primary" id="send" type="submit" disabled>Send ↑</button>
           </div>
         </div>
       </form>
     </section>
   </div>
+  <dialog id="side-question" aria-labelledby="side-question-title">
+    <div class="dialog-heading"><h2 id="side-question-title">Side question</h2></div>
+    <div class="prose" id="side-question-answer"></div>
+    <p id="side-question-usage"></p>
+    <form method="dialog"><button type="submit">Close</button></form>
+  </dialog>
   <dialog id="settings" aria-labelledby="settings-title">
     <div class="dialog-heading">
       <h2 id="settings-title">Settings</h2>

@@ -93,6 +93,11 @@ const dom = {
   modelLabel: document.querySelector('#model-label'),
   message: document.querySelector('#message'),
   composer: document.querySelector('#composer'),
+  promptInbox: document.querySelector('#prompt-inbox'),
+  steerRun: document.querySelector('#steer-run'),
+  sideQuestion: document.querySelector('#side-question'),
+  sideQuestionAnswer: document.querySelector('#side-question-answer'),
+  sideQuestionUsage: document.querySelector('#side-question-usage'),
   composerActivity: document.querySelector('#composer-activity'),
   send: document.querySelector('#send'),
   cancel: document.querySelector('#cancel-run'),
@@ -140,6 +145,8 @@ const state = {
   cancelling: false,
   cancelRequested: false,
   inFlightUnknown: false,
+  inbox: null,
+  askingAside: false,
   runTerminal: false,
   streaming: false,
   streamController: null,
@@ -1641,7 +1648,17 @@ async function loadSessionHistory(id) {
     if (!complete) after = next;
     pages += 1;
   }
-  renderHistory(items);
+  let inbox = null;
+  try {
+    inbox = await api(`/sessions/${encodeURIComponent(id)}/inbox`);
+  } catch (error) {
+    if (error?.status !== 404) addNotice('warning', 'Could not recover queued prompts.', 'inbox-refresh');
+  }
+  if (state.session !== id) return;
+  renderPromptInbox(inbox);
+  const active = inbox?.recent?.find(item => item.run === inbox.active_run);
+  renderHistory(active ? items.filter(item => item.run !== active.run) : items);
+  if (active) startDisplayingRun(active.run, active.input);
   if (!complete) {
     addNotice('warning', 'Only the first 500 saved history items were loaded.', 'history-truncated');
   }
@@ -1764,7 +1781,7 @@ async function openSavedSession(id) {
     renderSidebarTree();
     updateSessionDisplay();
     await loadSessionHistory(state.session);
-    setRunStatus('Ready', 'ok');
+    if (!state.active) setRunStatus('Ready', 'ok');
     await refreshSavedSessions();
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) markUnauthorized();
@@ -1793,7 +1810,13 @@ function updateControls() {
   dom.newSession.disabled = !canNewSession;
   dom.newSessionMobile.disabled = !canNewSession;
   dom.message.disabled = !connected || blocked || state.historyLoading;
-  dom.send.disabled = !connected || busy || blocked || !state.selection || !dom.message.value.trim();
+  dom.send.disabled = !connected || state.submitting || state.connecting || state.historyLoading
+    || blocked || (!state.session && !state.selection) || !dom.message.value.trim();
+  dom.send.textContent = state.active || state.inbox?.items?.length ? 'Queue ↑' : 'Send ↑';
+  if (dom.steerRun) {
+    dom.steerRun.hidden = !state.active;
+    dom.steerRun.disabled = dom.send.disabled || !state.run || state.cancelRequested;
+  }
   const projectEnabled = Boolean(state.projects?.enabled);
   dom.model.disabled = !connected || state.connecting || state.historyLoading || state.submitting || blocked;
   dom.model.hidden = false;
@@ -1815,7 +1838,7 @@ function updateControls() {
     : blocked
       ? 'Resolve the previous submission first…'
       : state.active
-        ? 'A run is active. You can draft the next task…'
+        ? 'A run is active. Send to queue the next task…'
         : 'Describe a task…';
   const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
   for (const button of dom.sidebarTree.querySelectorAll('.tree-session-open')) {
@@ -1894,6 +1917,7 @@ function startNewSession({ force = false } = {}) {
   stopStream();
   resetRunState();
   state.session = null;
+  renderPromptInbox(null);
   state.sessionProvider = null;
   state.sessionModel = null;
   state.sessionProjectId = null;
@@ -1978,43 +2002,161 @@ async function ensureSession() {
 
 /* Sending */
 
-async function sendMessage() {
+function renderPromptInbox(inbox) {
+  state.inbox = inbox;
+  const items = inbox?.items || [];
+  dom.promptInbox.replaceChildren();
+  dom.promptInbox.hidden = !items.length;
+  if (!items.length) return;
+  dom.promptInbox.append(node('div', '', inbox.paused || 'Pending prompts'));
+  const session = state.session;
+  for (const [index, item] of items.entries()) {
+    const row = node('div', 'prompt-inbox-row');
+    row.append(node('span', '', item.delivery === 'steer' ? `Steer: ${item.input}` : item.input));
+    const actions = node('span');
+    if (index === 0 && inbox.paused) {
+      const resume = node('button', '', 'Resume');
+      resume.type = 'button';
+      resume.addEventListener('click', () => void changePromptInbox(session, item.id, true));
+      actions.append(resume);
+    }
+    const remove = node('button', '', 'Remove');
+    remove.type = 'button';
+    remove.addEventListener('click', () => void changePromptInbox(session, item.id, false));
+    actions.append(remove);
+    row.append(actions);
+    dom.promptInbox.append(row);
+  }
+}
+
+async function changePromptInbox(session, id, resume) {
+  if (!session || session !== state.session || state.submitting) return;
+  state.submitting = true;
+  updateControls();
+  try {
+    const path = `/sessions/${encodeURIComponent(session)}/inbox/${encodeURIComponent(id)}`;
+    await api(resume ? `${path}/start` : path, { method: resume ? 'POST' : 'DELETE' });
+    await refreshPromptInbox(session, { adopt: resume });
+  } catch (error) {
+    addNotice('error', `Could not update queued prompts: ${error.message}`, 'inbox-update');
+  } finally {
+    state.submitting = false;
+    updateControls();
+  }
+}
+
+async function refreshPromptInbox(session = state.session, { adopt = false, follow = false } = {}) {
+  if (!session || !state.connected) return;
+  const previous = state.run;
+  try {
+    for (let attempt = 0; attempt < (follow ? 12 : 1); attempt += 1) {
+      const inbox = await api(`/sessions/${encodeURIComponent(session)}/inbox`);
+      if (state.session !== session || state.run !== previous) return;
+      renderPromptInbox(inbox);
+      updateControls();
+      if (adopt && !state.active) {
+        const recent = inbox.recent || [];
+        const previousIndex = recent.findIndex(item => item.run === previous);
+        const next = previousIndex >= 0 ? recent[previousIndex + 1]
+          : previous === null ? recent.find(item => item.run === inbox.active_run) : null;
+        if (next) {
+          startDisplayingRun(next.run, next.input);
+          return;
+        }
+      }
+      if (!follow || inbox.paused || !inbox.items?.length) return;
+      await new Promise(resolve => setTimeout(resolve, 150));
+      if (state.session !== session || state.run !== previous) return;
+    }
+  } catch (error) {
+    if (state.session === session && error?.status !== 404) {
+      addNotice('warning', 'Could not refresh queued prompts.', 'inbox-refresh');
+    }
+  }
+}
+
+function startDisplayingRun(run, text) {
+  stopStream();
+  resetRunState();
+  setSessionTitleFromInput(text);
+  appendUserMessage(text);
+  state.run = run;
+  state.active = true;
+  updateSessionDisplay();
+  setRunStatus('Starting…', 'busy');
+  updateControls();
+  void attachStream();
+}
+
+async function askSideQuestion(draft, question) {
+  if (!question) {
+    addNotice('warning', 'Enter a question after /btw.', 'side-question-input');
+    return;
+  }
+  if (!state.session || state.askingAside) return;
+  const session = state.session;
+  state.askingAside = true;
+  dom.sideQuestionAnswer.textContent = 'Asking the model…';
+  dom.sideQuestionUsage.textContent = '';
+  if (!dom.sideQuestion.open) dom.sideQuestion.showModal();
+  try {
+    const reply = await api(`/sessions/${encodeURIComponent(session)}/side-question`, {
+      method: 'POST', body: { question },
+    });
+    if (state.session !== session) return;
+    renderMarkdown(dom.sideQuestionAnswer, reply.answer || '');
+    const usage = [reply.usage?.input, reply.usage?.output];
+    dom.sideQuestionUsage.textContent = usage.every(value => !Number.isFinite(value))
+      ? 'Usage not reported'
+      : `Usage: ${usage.map(value => Number.isFinite(value) ? formatTokenCount(value) : '—').join(' / ')} (in / out)`;
+    if (dom.message.value === draft) dom.message.value = '';
+  } catch (error) {
+    if (state.session === session) dom.sideQuestionAnswer.textContent = error.message;
+  } finally {
+    state.askingAside = false;
+    updateControls();
+  }
+}
+
+async function sendMessage({ steer = false } = {}) {
   const draft = dom.message.value;
   const text = draft.trim();
-  if (!text || !state.connected || state.active || state.submitting || state.connecting || state.historyLoading || state.inFlightUnknown) return;
+  if (!text || !state.connected || state.submitting || state.connecting || state.historyLoading || state.inFlightUnknown) return;
+  if (steer && (!state.active || !state.run || state.cancelRequested)) return;
+  if (/^\/btw(?:\s|$)/.test(text)) {
+    await askSideQuestion(draft, text.slice(4).trim());
+    return;
+  }
   state.submitting = true;
   state.pinned = true;
   let submittingRun = false;
-  setRunStatus(state.session ? 'Starting run…' : 'Creating session…', 'busy');
+  if (!state.active) setRunStatus(state.session ? 'Starting run…' : 'Creating session…', 'busy');
   updateControls();
 
   try {
     await ensureSession();
-    setRunStatus('Starting run…', 'busy');
+    if (!state.active) setRunStatus('Starting run…', 'busy');
     submittingRun = true;
     const reply = await api(`/sessions/${encodeURIComponent(state.session)}/runs`, {
       method: 'POST',
-      body: { input: text },
+      body: { input: text, delivery: steer ? 'steer' : 'queue', submission_id: crypto.randomUUID(),
+        ...(steer ? { run: state.run } : {}) },
     });
+    if (reply?.reply === 'queued' || reply?.reply === 'steering') {
+      if (dom.message.value === draft) dom.message.value = '';
+      await refreshPromptInbox(state.session, { adopt: !state.active });
+      return;
+    }
     if (!reply || reply.reply !== 'accepted' || typeof reply.run !== 'string') {
       throw new ApiError(200, reply?.reply || 'Server did not accept the run.');
     }
 
-    stopStream();
-    resetRunState();
-    setSessionTitleFromInput(text);
-    appendUserMessage(text);
     if (dom.message.value === draft) dom.message.value = '';
-    state.run = reply.run;
-    state.active = true;
-    updateSessionDisplay();
-    setRunStatus('Starting…', 'busy');
-    updateControls();
-    void attachStream();
+    startDisplayingRun(reply.run, text);
   } catch (error) {
     if (error instanceof ApiError) {
       addNotice('error', `Request failed: ${error.message}`, null);
-      setRunStatus(error.status === 401 ? 'Authentication required' : 'Request failed', 'error');
+      if (!state.active) setRunStatus(error.status === 401 ? 'Authentication required' : 'Request failed', 'error');
       if (error.status === 401) markUnauthorized();
     } else if (submittingRun) {
       state.inFlightUnknown = true;
@@ -2126,7 +2268,10 @@ async function attachStream({ automatic = false } = {}) {
   if (generation !== state.streamGeneration) return;
   state.streaming = false;
   flushText();
-  if (state.runTerminal) return;
+  if (state.runTerminal) {
+    void refreshPromptInbox(session, { adopt: true, follow: true });
+    return;
+  }
   await reconcileAfterLoss(new Error('The event stream closed before the run finished.'));
 }
 
@@ -2207,6 +2352,13 @@ function handleEvent(event) {
   const kind = event.kind;
   const detail = event.detail && typeof event.detail === 'object' ? event.detail : {};
   switch (kind) {
+    case 'user-steered':
+      if (typeof detail.text === 'string') {
+        markStreamingDone();
+        appendUserMessage(detail.text);
+        void refreshPromptInbox();
+      }
+      break;
     case 'run-started':
       setRunStatus('Running', 'busy');
       break;
@@ -4034,6 +4186,7 @@ function finishRun(detail, { fromSnapshot = false } = {}) {
   updateJumpLatest();
   void refreshSavedSessions();
   void verifyTerminalSnapshot(session, run, lastSeq, fromSnapshot);
+  if (fromSnapshot) void refreshPromptInbox(session, { adopt: true, follow: true });
 }
 
 function persistenceLabel(value) {
@@ -4597,6 +4750,7 @@ dom.composer.addEventListener('submit', (event) => {
   event.preventDefault();
   void sendMessage();
 });
+dom.steerRun.addEventListener('click', () => void sendMessage({ steer: true }));
 
 dom.cancel.addEventListener('click', () => void cancelRun());
 dom.newSession.addEventListener('click', () => startNewSession());

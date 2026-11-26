@@ -372,6 +372,165 @@ fn spawn_server() -> u16 {
     port
 }
 
+#[test]
+fn inbox_automatically_runs_queued_prompts_one_at_a_time() {
+    let port = spawn_server();
+    let session = create_session(port);
+    let first = submit(
+        port,
+        &session,
+        r#"{"input":"first","delivery":"queue","submission_id":"first"}"#,
+    );
+    let mut stream = Stream::attach(port, &session, &first);
+    for id in ["second", "third"] {
+        let (status, _) = post(
+            port,
+            &runs_path(&session),
+            &serde_json::json!({
+                "input": id, "delivery": "queue", "submission_id": id
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 202);
+    }
+    let path = format!("/sessions/{session}/inbox");
+    let find_start = |id: &str| {
+        let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            let (status, body) = get(port, &path);
+            assert_eq!(status, 200);
+            if let Some(entry) = body["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == id)
+            {
+                return entry["run"].as_str().unwrap().to_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued run did not start: {body}"
+            );
+            std::thread::yield_now();
+        }
+    };
+    drive_granted(port, &session, &first, &mut stream);
+    let second = find_start("second");
+    assert_ne!(first, second);
+    let (_, queued) = get(port, &path);
+    assert_eq!(queued["items"][0]["id"], "third");
+    let mut stream = Stream::attach(port, &session, &second);
+    drive_granted(port, &session, &second, &mut stream);
+    let third = find_start("third");
+    assert_ne!(second, third);
+    assert_eq!(get(port, &path).1["items"], serde_json::json!([]));
+    let mut stream = Stream::attach(port, &session, &third);
+    drive_granted(port, &session, &third, &mut stream);
+}
+
+#[test]
+fn steering_waits_for_approval_and_enters_the_same_run_once() {
+    let port = spawn_server();
+    let session = create_session(port);
+    let run = submit(port, &session, r#"{"input":"first"}"#);
+    let mut stream = Stream::attach(port, &session, &run);
+    let notice = loop {
+        let event = stream.next();
+        if event["kind"] == "approval-required" {
+            break event;
+        }
+        assert_ne!(event["kind"], "run-finished");
+    };
+    let (approval, call) = grant_identity(&notice);
+    let body = serde_json::json!({
+        "input": "check the edge case", "delivery": "steer", "run": run, "submission_id": "follow-up",
+    }).to_string();
+    let (status, reply) = post(port, &runs_path(&session), &body);
+    assert_eq!(status, 202);
+    assert_eq!(reply["reply"], "steering");
+    assert_eq!(post(port, &runs_path(&session), &body), (status, reply));
+    let (_, snapshot) = get(port, &snapshot_path(&session, &run));
+    assert!(pending_approvals(&snapshot).contains(&approval));
+    assert_eq!(
+        post(
+            port,
+            &decision_path(&session, &run, "approve"),
+            &identity(approval, call)
+        )
+        .0,
+        200
+    );
+
+    let observed = drive_granted(port, &session, &run, &mut stream);
+    let position = observed
+        .iter()
+        .position(|event| event["kind"] == "user-steered")
+        .unwrap();
+    assert!(
+        observed[..position]
+            .iter()
+            .any(|event| event["kind"] == "tool-finished")
+    );
+    assert_eq!(observed[position]["run"], run);
+    assert_eq!(observed[position]["detail"]["text"], "check the edge case");
+    assert!(
+        observed[position + 1..]
+            .iter()
+            .any(|event| event["kind"] == "model-request-started")
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| event["kind"] == "user-steered")
+            .count(),
+        1
+    );
+    assert_eq!(
+        get(port, &format!("/sessions/{session}/inbox")).1["items"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn cancelled_run_turns_undelivered_steering_into_paused_queue_input() {
+    let port = spawn_server();
+    let session = create_session(port);
+    let run = submit(port, &session, r#"{"input":"first"}"#);
+    let mut stream = Stream::attach(port, &session, &run);
+    loop {
+        let event = stream.next();
+        if event["kind"] == "approval-required" {
+            break;
+        }
+        assert_ne!(event["kind"], "run-finished");
+    }
+    let body = serde_json::json!({
+        "input": "later", "delivery": "steer", "run": run, "submission_id": "later",
+    })
+    .to_string();
+    assert_eq!(post(port, &runs_path(&session), &body).0, 202);
+    assert_eq!(post(port, &cancel_path(&session, &run), "{}").0, 200);
+    let events = stream.drive_to_terminal(|_| {});
+    assert!(events.iter().all(|event| event["kind"] != "user-steered"));
+    let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+    loop {
+        let (_, inbox) = get(port, &format!("/sessions/{session}/inbox"));
+        if inbox["paused"].is_string() {
+            assert_eq!(
+                inbox["items"],
+                serde_json::json!([{ "id": "later", "input": "later" }])
+            );
+            assert!(inbox["active_run"].is_null());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "steering fallback was not paused"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// A refused grant is a decision, not a failure: the run never dispatches the
 /// refused call, records the refusal as a not-started outcome, and still
 /// reaches its own terminal outcome. The stream carries the refusal and no

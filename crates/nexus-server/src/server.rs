@@ -39,7 +39,7 @@
 //! and `record_use` is applied in memory before the save is attempted so
 //! the two can never disagree about what was used.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -215,6 +215,254 @@ pub struct Session {
     delivery: Mutex<Vec<SseDelivery>>,
     last_activity: Mutex<Instant>,
     last_run: Mutex<Option<RunId>>,
+    inbox: Mutex<PromptInbox>,
+}
+
+const MAX_WAITING_PROMPTS: usize = 16;
+const MAX_WAITING_PROMPT_BYTES: usize = 128 * 1024;
+const MAX_PROMPT_RECEIPTS: usize = 32;
+const MAX_PROMPT_RECEIPT_BYTES: usize = 128 * 1024;
+
+#[derive(Default)]
+struct PromptInbox {
+    waiting: VecDeque<PendingPrompt>,
+    receipts: VecDeque<PromptReceipt>,
+    watching: Option<RunId>,
+    ready: bool,
+    paused: Option<&'static str>,
+}
+
+struct PendingPrompt {
+    id: RequestId,
+    command: SubmitCommand,
+    steer_run: Option<RunId>,
+    steering: Option<nexus_runtime::runtime::SteeringReceipt>,
+}
+
+struct PromptReceipt {
+    id: RequestId,
+    // Keep the original identity but not the text of a removed prompt.
+    state: PromptReceiptState,
+}
+
+enum PromptReceiptState {
+    Removed,
+    Steered {
+        command: SubmitCommand,
+        target: RunId,
+    },
+    Started {
+        command: SubmitCommand,
+        run: RunId,
+        stream_done: bool,
+        steer_run: Option<RunId>,
+    },
+}
+
+impl PromptReceiptState {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Removed => 0,
+            Self::Started { command, .. } | Self::Steered { command, .. } => {
+                command.input.len() + command.profile.len()
+            }
+        }
+    }
+}
+
+impl PromptInbox {
+    fn remember(&mut self, id: RequestId, state: PromptReceiptState) {
+        let mut bytes = state.bytes()
+            + self
+                .receipts
+                .iter()
+                .map(|entry| entry.state.bytes())
+                .sum::<usize>();
+        while self.receipts.len() >= MAX_PROMPT_RECEIPTS || bytes > MAX_PROMPT_RECEIPT_BYTES {
+            let Some(oldest) = self.receipts.pop_front() else {
+                break;
+            };
+            bytes -= oldest.state.bytes();
+        }
+        self.receipts.push_back(PromptReceipt { id, state });
+    }
+
+    fn repeat(
+        &self,
+        id: &RequestId,
+        command: &SubmitCommand,
+        target: Option<&RunId>,
+    ) -> Option<Response> {
+        let same_input = |previous: &SubmitCommand| {
+            previous.input == command.input && previous.profile == command.profile
+        };
+        if let Some(entry) = self.waiting.iter().find(|entry| &entry.id == id) {
+            return Some(
+                if same_input(&entry.command) && entry.steer_run.as_ref() == target {
+                    if entry.steering.is_some() {
+                        Self::steering(id)
+                    } else {
+                        Self::queued(id)
+                    }
+                } else {
+                    Self::conflicting_id()
+                },
+            );
+        }
+        self.receipts
+            .iter()
+            .find(|entry| &entry.id == id)
+            .map(|entry| match &entry.state {
+                PromptReceiptState::Started {
+                    command: previous,
+                    run,
+                    steer_run,
+                    ..
+                } if same_input(previous) && steer_run.as_ref() == target => json_response(
+                    201,
+                    &body_json(serde_json::json!({ "reply": "accepted", "run": run.as_str() })),
+                ),
+                PromptReceiptState::Steered {
+                    command: previous,
+                    target: run,
+                } if same_input(previous) && Some(run) == target => Self::steering(id),
+                PromptReceiptState::Removed => json_response(
+                    409,
+                    &json::error_body("submission was removed; use a new id"),
+                ),
+                _ => Self::conflicting_id(),
+            })
+    }
+
+    fn conflicting_id() -> Response {
+        json_response(
+            409,
+            &json::error_body("submission id already identifies another input"),
+        )
+    }
+
+    fn queued(id: &RequestId) -> Response {
+        json_response(
+            202,
+            &body_json(serde_json::json!({ "reply": "queued", "id": id.as_str() })),
+        )
+    }
+
+    fn steering(id: &RequestId) -> Response {
+        json_response(
+            202,
+            &body_json(serde_json::json!({ "reply": "steering", "id": id.as_str() })),
+        )
+    }
+
+    fn has_room(&self, command: &SubmitCommand) -> bool {
+        let bytes: usize = self
+            .waiting
+            .iter()
+            .map(|entry| entry.command.input.len())
+            .sum();
+        self.waiting.len() < MAX_WAITING_PROMPTS
+            && bytes + command.input.len() <= MAX_WAITING_PROMPT_BYTES
+    }
+
+    fn push(&mut self, id: RequestId, command: SubmitCommand) -> Response {
+        if !self.has_room(&command) {
+            return json_response(409, &json::error_body("session inbox is full"));
+        }
+        let reply = Self::queued(&id);
+        self.waiting.push_back(PendingPrompt {
+            id,
+            command,
+            steer_run: None,
+            steering: None,
+        });
+        reply
+    }
+
+    fn list(&self, active_run: Option<&RunId>) -> Response {
+        let items: Vec<_> = self
+            .waiting
+            .iter()
+            .filter(|entry| {
+                !entry
+                    .steering
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.consumed())
+            })
+            .map(|entry| {
+                let mut item =
+                    serde_json::json!({ "id": entry.id.as_str(), "input": entry.command.input });
+                if entry.steering.is_some() {
+                    item["delivery"] = Value::String("steer".into());
+                }
+                item
+            })
+            .collect();
+        let recent: Vec<_> = self.receipts.iter().filter_map(|entry| match &entry.state {
+            PromptReceiptState::Started { command, run, .. } => {
+                Some(serde_json::json!({ "id": entry.id.as_str(), "run": run.as_str(), "input": command.input }))
+            }
+            PromptReceiptState::Removed | PromptReceiptState::Steered { .. } => None,
+        }).collect();
+        json_response(
+            200,
+            &body_json(serde_json::json!({
+            "items": items, "recent": recent, "paused": self.paused,
+            "active_run": active_run.map(RunId::as_str),
+            })),
+        )
+    }
+
+    fn remove(&mut self, id: &str) -> Response {
+        if let Some(index) = self
+            .waiting
+            .iter()
+            .position(|entry| entry.id.as_str() == id)
+        {
+            if self.waiting[index]
+                .steering
+                .as_ref()
+                .is_some_and(|receipt| !receipt.withdraw())
+            {
+                return json_response(
+                    409,
+                    &json::error_body("steering input was already delivered"),
+                );
+            }
+            let entry = self.waiting.remove(index).expect("located waiting entry");
+            self.remember(entry.id, PromptReceiptState::Removed);
+        }
+        if self.waiting.is_empty() {
+            self.ready = false;
+            self.paused = None;
+        }
+        json_response(200, &body_json(serde_json::json!({ "reply": "removed" })))
+    }
+
+    fn settle_steering(&mut self, terminal: bool) {
+        let mut pending = VecDeque::new();
+        for mut entry in std::mem::take(&mut self.waiting) {
+            if entry
+                .steering
+                .as_ref()
+                .is_some_and(|receipt| receipt.consumed())
+            {
+                self.remember(
+                    entry.id,
+                    PromptReceiptState::Steered {
+                        command: entry.command,
+                        target: entry.steer_run.expect("steered entry has a target"),
+                    },
+                );
+                continue;
+            }
+            if terminal {
+                entry.steering = None;
+            }
+            pending.push_back(entry);
+        }
+        self.waiting = pending;
+    }
 }
 
 struct SseDelivery {
@@ -919,6 +1167,7 @@ impl Server {
             delivery: Mutex::new(Vec::new()),
             last_activity: Mutex::new(Instant::now()),
             last_run: Mutex::new(None),
+            inbox: Mutex::new(PromptInbox::default()),
         });
         let mut sessions = self.sessions.lock().expect("sessions lockable");
         if sessions.contains_key(&token) {
@@ -1347,6 +1596,64 @@ impl Server {
             Route::SubmitRun { session } => {
                 self.with_session(session, |entry| self.submit_run(&entry, body))
             }
+            Route::SideQuestion { session } => self.with_session(session, |entry| {
+                if entry.provider.is_none() {
+                    return Some(json_response(
+                        409,
+                        &json::error_body("side questions need a configured model"),
+                    ));
+                }
+                let runtime = entry.runtime.lock().expect("runtime lockable").clone();
+                let question = body_str(body, "question").unwrap_or("");
+                Some(
+                    match self
+                        .handle
+                        .block_on(runtime.side_question(&entry.session, question))
+                    {
+                        Ok((answer, usage)) => json_response(
+                            200,
+                            &body_json(serde_json::json!({
+                                "answer": answer, "usage": json::usage_json(&usage)
+                            })),
+                        ),
+                        Err(error) => {
+                            let status = match error.category() {
+                                nexus_core::ErrorCategory::InvalidInput => 400,
+                                nexus_core::ErrorCategory::ResourceLimit => 409,
+                                _ => 503,
+                            };
+                            json_response(
+                                status,
+                                &body_json(serde_json::json!({ "error": error.message() })),
+                            )
+                        }
+                    },
+                )
+            }),
+            Route::ListInbox { session } => self.with_session(session, |entry| {
+                let mut inbox = entry.inbox.lock().expect("inbox lockable");
+                inbox.settle_steering(false);
+                let last = entry.last_run.lock().expect("last run lockable").clone();
+                let active = last.filter(|run| {
+                    let runtime = entry.runtime.lock().expect("runtime lockable");
+                    let (_, snapshot) =
+                        self.handle
+                            .block_on(runtime.get_snapshot(GetSnapshotCommand {
+                                request: entry.request_id(),
+                                run: run.clone(),
+                            }));
+                    snapshot.is_some_and(|snapshot| {
+                        snapshot.lifecycle() == nexus_core::RunLifecycle::Active
+                    })
+                });
+                Some(inbox.list(active.as_ref()))
+            }),
+            Route::RemoveInbox { session, id } => self.with_session(session, |entry| {
+                Some(entry.inbox.lock().expect("inbox lockable").remove(id))
+            }),
+            Route::StartInbox { session, id } => {
+                self.with_session(session, |entry| Some(self.start_inbox_head(&entry, id)))
+            }
             Route::Snapshot { session } => self.with_session(session, |entry| {
                 let run = request.query("run").unwrap_or("");
                 self.snapshot(&entry, run)
@@ -1362,7 +1669,11 @@ impl Server {
             Route::Events { session, run } => match self.session(session) {
                 // The stream loop owns the connection on success (`None`)
                 // and closes it; a refusal (400/409) must still be framed.
-                Some(entry) => self.stream_events(&entry, run, stream),
+                Some(entry) => {
+                    let response = self.stream_events(&entry, run, stream);
+                    self.drain_ready_inbox(&entry);
+                    response
+                }
                 None => Some(json_response(404, &json::error_body("unknown session"))),
             },
             Route::Config => Some(self.config_summary()),
@@ -2143,6 +2454,36 @@ impl Server {
             };
         let input = body_str(body, "input").unwrap_or("");
         let profile = body_str(body, "profile").unwrap_or(WEB_PROFILE);
+        let steer_run = if body_str(body, "delivery") == Some("steer") {
+            let Some(run) = body_str(body, "run").and_then(|id| RunId::new(id).ok()) else {
+                return Some(json_response(
+                    400,
+                    &json::error_body("steering requires a valid active run id"),
+                ));
+            };
+            Some(run)
+        } else {
+            None
+        };
+        let queue_id = match body.get("delivery") {
+            None => None,
+            Some(value) if matches!(value.as_str(), Some("queue" | "steer")) => {
+                let id = body_str(body, "submission_id").and_then(|id| RequestId::new(id).ok());
+                let Some(id) = id else {
+                    return Some(json_response(
+                        400,
+                        &json::error_body("queue delivery requires a valid submission id"),
+                    ));
+                };
+                Some(id)
+            }
+            Some(_) => {
+                return Some(json_response(
+                    400,
+                    &json::error_body("submit delivery is invalid"),
+                ));
+            }
+        };
         let command = match SubmitCommand::new(
             session.request_id(),
             session.session.clone(),
@@ -2157,6 +2498,196 @@ impl Server {
                 ));
             }
         };
+        let mut inbox = session.inbox.lock().expect("inbox lockable");
+        inbox.settle_steering(false);
+        if let Some(id) = &queue_id
+            && let Some(reply) = inbox.repeat(id, &command, steer_run.as_ref())
+        {
+            return Some(reply);
+        }
+        if let Some(run) = steer_run {
+            let id = queue_id.expect("steering requires an input id");
+            if !inbox.has_room(&command) {
+                return Some(json_response(
+                    409,
+                    &json::error_body("session inbox is full"),
+                ));
+            }
+            let receipt = {
+                let runtime = session.runtime.lock().expect("runtime lockable");
+                self.handle
+                    .block_on(runtime.steer(&run, id.clone(), &command.input))
+            };
+            let Some(receipt) = receipt else {
+                return Some(json_response(
+                    409,
+                    &json::error_body("the run no longer accepts steering; send again to queue"),
+                ));
+            };
+            let response = PromptInbox::steering(&id);
+            inbox.waiting.push_back(PendingPrompt {
+                id,
+                command,
+                steer_run: Some(run),
+                steering: Some(receipt),
+            });
+            self.watch_inbox_run(session, &mut inbox);
+            return Some(response);
+        }
+        if !inbox.waiting.is_empty()
+            || (queue_id.is_some() && *session.streaming.lock().expect("stream flag lockable"))
+        {
+            return Some(match queue_id {
+                Some(id) => {
+                    let response = inbox.push(id, command);
+                    if response.status == 202 {
+                        self.watch_inbox_run(session, &mut inbox);
+                    }
+                    response
+                }
+                None => json_response(
+                    409,
+                    &body_json(
+                        serde_json::json!({ "reply": "busy", "error": "session has queued prompts" }),
+                    ),
+                ),
+            });
+        }
+        Some(self.launch_run(session, model, command, &mut inbox, queue_id, true))
+    }
+
+    fn start_inbox_head(self: &Arc<Self>, session: &Arc<Session>, id: &str) -> Response {
+        let mut inbox = session.inbox.lock().expect("inbox lockable");
+        if let Some(PromptReceipt {
+            state: PromptReceiptState::Started { run, .. },
+            ..
+        }) = inbox.receipts.iter().find(|entry| entry.id.as_str() == id)
+        {
+            return json_response(
+                201,
+                &body_json(serde_json::json!({ "reply": "accepted", "run": run.as_str() })),
+            );
+        }
+        let Some(entry) = inbox
+            .waiting
+            .front()
+            .filter(|entry| entry.id.as_str() == id && entry.steering.is_none())
+        else {
+            return json_response(
+                409,
+                &json::error_body("only the current inbox head can start"),
+            );
+        };
+        if *session.streaming.lock().expect("stream flag lockable") {
+            return json_response(
+                409,
+                &json::error_body("earlier event stream is still attached"),
+            );
+        }
+        let command = entry.command.clone();
+        let id = entry.id.clone();
+        let response = self.launch_run(
+            session,
+            session.model.clone(),
+            command,
+            &mut inbox,
+            Some(id),
+            false,
+        );
+        if response.status == 201 {
+            inbox.waiting.pop_front();
+            inbox.ready = false;
+            inbox.paused = None;
+            self.watch_inbox_run(session, &mut inbox);
+        }
+        response
+    }
+
+    fn watch_inbox_run(self: &Arc<Self>, session: &Arc<Session>, inbox: &mut PromptInbox) {
+        if inbox.waiting.is_empty() || inbox.paused.is_some() || inbox.ready {
+            return;
+        }
+        let Some(run) = session.last_run.lock().expect("last run lockable").clone() else {
+            return;
+        };
+        if inbox.watching.as_ref() == Some(&run) {
+            return;
+        }
+        inbox.watching = Some(run.clone());
+        let runtime = session.runtime.lock().expect("runtime lockable").clone();
+        let session_id = session.session.as_str().to_owned();
+        let session = Arc::downgrade(session);
+        let server = Arc::downgrade(self);
+        self.handle.spawn(async move {
+            let outcome = runtime.wait_for_terminal(&run).await;
+            tokio::task::spawn_blocking(move || {
+                let Some(server) = server.upgrade() else {
+                    return;
+                };
+                let Some(entry) = server.session(&session_id) else {
+                    return;
+                };
+                if !session.ptr_eq(&Arc::downgrade(&entry)) {
+                    return;
+                }
+                let session = entry;
+                let mut inbox = session.inbox.lock().expect("inbox lockable");
+                if inbox.watching.as_ref() != Some(&run) {
+                    return;
+                }
+                inbox.watching = None;
+                inbox.settle_steering(true);
+                if inbox.waiting.is_empty() {
+                    return;
+                }
+                if outcome == Some(nexus_core::RunOutcome::Completed) {
+                    inbox.ready = true;
+                    server.drain_inbox_locked(&session, &mut inbox);
+                } else {
+                    inbox.paused = Some("Previous run did not complete successfully.");
+                }
+            });
+        });
+    }
+
+    fn drain_ready_inbox(self: &Arc<Self>, session: &Arc<Session>) {
+        let mut inbox = session.inbox.lock().expect("inbox lockable");
+        self.drain_inbox_locked(session, &mut inbox);
+    }
+
+    fn drain_inbox_locked(self: &Arc<Self>, session: &Arc<Session>, inbox: &mut PromptInbox) {
+        if !inbox.ready || *session.streaming.lock().expect("stream flag lockable") {
+            return;
+        }
+        inbox.ready = false;
+        let Some(entry) = inbox.waiting.front() else {
+            return;
+        };
+        let response = self.launch_run(
+            session,
+            session.model.clone(),
+            entry.command.clone(),
+            inbox,
+            Some(entry.id.clone()),
+            false,
+        );
+        if response.status == 201 {
+            inbox.waiting.pop_front();
+            self.watch_inbox_run(session, inbox);
+        } else {
+            inbox.paused = Some("Could not start the next queued prompt.");
+        }
+    }
+
+    fn launch_run(
+        self: &Arc<Self>,
+        session: &Arc<Session>,
+        model: Option<String>,
+        command: SubmitCommand,
+        inbox: &mut PromptInbox,
+        queue_id: Option<RequestId>,
+        queue_if_busy: bool,
+    ) -> Response {
         // Keep the global lock order runtime -> usage map. A run can finish
         // before this request thread resumes from `submit`; holding the map
         // lock ensures its SSE consumer cannot remove a not-yet-registered
@@ -2168,10 +2699,7 @@ impl Server {
             .expect("pending lockable")
             .can_receive_more()
         {
-            return Some(json_response(
-                409,
-                &json::error_body("session event backlog is full"),
-            ));
+            return json_response(409, &json::error_body("session event backlog is full"));
         }
         // Before a newer accepted run can replace Runtime's single retained
         // `last` snapshot, settle the previous run's usage association if it
@@ -2193,12 +2721,22 @@ impl Server {
         }
         let mut run_models = self.run_models.lock().expect("run model map lockable");
         if model.is_some() && run_models.len() >= MAX_USAGE_ASSOCIATIONS {
-            return Some(json_response(
-                503,
-                &json::error_body("usage association capacity is full"),
-            ));
+            return json_response(503, &json::error_body("usage association capacity is full"));
         }
+        let original = queue_id.as_ref().map(|_| command.clone());
         let reply = self.handle.block_on(runtime.submit(command));
+        if queue_if_busy
+            && reply.reply() == CommandReply::Busy
+            && let (Some(id), Some(command)) = (&queue_id, &original)
+        {
+            let response = inbox.push(id.clone(), command.clone());
+            drop(run_models);
+            drop(runtime);
+            if response.status == 202 {
+                self.watch_inbox_run(session, inbox);
+            }
+            return response;
+        }
         let status = match reply.reply() {
             CommandReply::Accepted => 201,
             CommandReply::Rejected
@@ -2222,6 +2760,25 @@ impl Server {
             && let Some(run) = reply.run()
         {
             *session.last_run.lock().expect("last run lockable") = Some(run.clone());
+            if let (Some(id), Some(command)) = (queue_id, original) {
+                let steer_run = if queue_if_busy {
+                    None
+                } else {
+                    inbox
+                        .waiting
+                        .front()
+                        .and_then(|entry| entry.steer_run.clone())
+                };
+                inbox.remember(
+                    id,
+                    PromptReceiptState::Started {
+                        command,
+                        run: run.clone(),
+                        stream_done: false,
+                        steer_run,
+                    },
+                );
+            }
             if model.is_some() {
                 Self::watch_run_completion(
                     Arc::downgrade(self),
@@ -2240,7 +2797,7 @@ impl Server {
         if let Some(error) = reply.error() {
             body["error"] = serde_json::Value::String(error.message().to_owned());
         }
-        Some(json_response(status, &body_json(body)))
+        json_response(status, &body_json(body))
     }
 
     /// Watches a bound-model run independently of its SSE client. The
@@ -2424,6 +2981,10 @@ impl Server {
             Ok(run) => run,
             Err(_) => return Some(json_response(400, &json::error_body("run id is invalid"))),
         };
+        let admission = session.inbox.lock().expect("inbox lockable");
+        let admitted_with_inbox = admission.receipts.iter().any(|entry| {
+            matches!(&entry.state, PromptReceiptState::Started { run: started, stream_done: false, .. } if started == &run)
+        });
         // Refuse unknown/evicted run ids before claiming the subscriber or
         // touching shared event receivers. Only active and most-recent runs
         // remain observable in Runtime's existing snapshot contract.
@@ -2433,7 +2994,10 @@ impl Server {
         };
         let runtime = session.runtime.lock().expect("runtime lockable");
         let (reply, _) = self.handle.block_on(runtime.get_snapshot(request));
-        if reply.reply() != CommandReply::Accepted && !Self::has_retained_event(session, &run) {
+        if reply.reply() != CommandReply::Accepted
+            && !admitted_with_inbox
+            && !Self::has_retained_event(session, &run)
+        {
             return Some(json_response(404, &json::error_body("unknown run")));
         }
         drop(runtime);
@@ -2448,19 +3012,20 @@ impl Server {
             *streaming = true;
         }
         let _subscriber = SubscriberGuard(&session.streaming);
-        let mut delivery = session.delivery.lock().expect("delivery lockable");
-        let index = match delivery
+        drop(admission);
+        let mut deliveries = session.delivery.lock().expect("delivery lockable");
+        let index = match deliveries
             .iter()
             .position(|state| state.ordering.active_run() == Some(&run))
         {
             Some(index) => index,
             None => {
-                if delivery.len() == MAX_RETAINED_STREAMS {
-                    if let Some(index) = delivery
+                if deliveries.len() == MAX_RETAINED_STREAMS {
+                    if let Some(index) = deliveries
                         .iter()
                         .position(|state| state.ordering.is_finalized())
                     {
-                        delivery.remove(index);
+                        deliveries.remove(index);
                     } else {
                         return Some(json_response(
                             409,
@@ -2468,11 +3033,11 @@ impl Server {
                         ));
                     }
                 }
-                delivery.push(SseDelivery::new(&run));
-                delivery.len() - 1
+                deliveries.push(SseDelivery::new(&run));
+                deliveries.len() - 1
             }
         };
-        let delivery = &mut delivery[index];
+        let delivery = &mut deliveries[index];
         if http::write_sse_headers(stream).is_err() {
             return None;
         }
@@ -2558,6 +3123,25 @@ impl Server {
                 delivery.terminal = Some(event);
             } else {
                 delivery.retain(event);
+            }
+        }
+        let delivered = delivery.ordering.is_finalized();
+        drop(control);
+        drop(data);
+        drop(deliveries);
+        if delivered {
+            let mut inbox = session.inbox.lock().expect("inbox lockable");
+            for receipt in &mut inbox.receipts {
+                if let PromptReceiptState::Started {
+                    run: started,
+                    stream_done,
+                    ..
+                } = &mut receipt.state
+                    && started == &run
+                {
+                    *stream_done = true;
+                    break;
+                }
             }
         }
         None
@@ -2683,6 +3267,14 @@ enum Route<'a> {
     DeleteSaved { session: &'a str },
     /// `POST /sessions/{sid}/runs`.
     SubmitRun { session: &'a str },
+    /// `POST /sessions/{sid}/side-question`.
+    SideQuestion { session: &'a str },
+    /// `GET /sessions/{sid}/inbox`.
+    ListInbox { session: &'a str },
+    /// `DELETE /sessions/{sid}/inbox/{id}`.
+    RemoveInbox { session: &'a str, id: &'a str },
+    /// `POST /sessions/{sid}/inbox/{id}/start`.
+    StartInbox { session: &'a str, id: &'a str },
     /// `GET /sessions/{sid}/snapshot?run=<rid>`.
     Snapshot { session: &'a str },
     /// `POST /sessions/{sid}/runs/{rid}/cancel`.
@@ -2741,6 +3333,22 @@ fn route_path<'a>(method: &str, path: &'a str) -> Route<'a> {
             Route::DeleteSaved { session }
         }
         ("POST", ["", "sessions", session, "runs"]) => Route::SubmitRun { session },
+        ("POST", ["", "sessions", session, "side-question"]) if !session.is_empty() => {
+            Route::SideQuestion { session }
+        }
+        ("GET", ["", "sessions", session, "inbox"]) if !session.is_empty() => {
+            Route::ListInbox { session }
+        }
+        ("DELETE", ["", "sessions", session, "inbox", id])
+            if !session.is_empty() && !id.is_empty() =>
+        {
+            Route::RemoveInbox { session, id }
+        }
+        ("POST", ["", "sessions", session, "inbox", id, "start"])
+            if !session.is_empty() && !id.is_empty() =>
+        {
+            Route::StartInbox { session, id }
+        }
         ("GET", ["", "sessions", session, "snapshot"]) => Route::Snapshot { session },
         ("POST", ["", "sessions", session, "runs", run, "cancel"]) => {
             Route::Cancel { session, run }
@@ -4055,6 +4663,24 @@ mod tests {
             }
         );
         assert_eq!(
+            route_path("GET", "/sessions/s/inbox"),
+            Route::ListInbox { session: "s" }
+        );
+        assert_eq!(
+            route_path("DELETE", "/sessions/s/inbox/p"),
+            Route::RemoveInbox {
+                session: "s",
+                id: "p"
+            }
+        );
+        assert_eq!(
+            route_path("POST", "/sessions/s/inbox/p/start"),
+            Route::StartInbox {
+                session: "s",
+                id: "p"
+            }
+        );
+        assert_eq!(
             route_path("GET", "/sessions/sess-web-1/snapshot?run=r1"),
             Route::Snapshot {
                 session: "sess-web-1"
@@ -4465,6 +5091,127 @@ mod tests {
                 .expect("sessions lockable")
                 .contains_key(&token),
             "expired idle session is reclaimed"
+        );
+    }
+
+    #[test]
+    fn inbox_keeps_fifo_and_retries_do_not_start_duplicate_runs() {
+        let (server, _executor) = server_with_gated_config();
+        let server = Arc::new(server);
+        let session = server.session(&server.create_session().unwrap()).unwrap();
+        let submit = |id: &str, text: &str| {
+            server
+                .submit_run(
+                    &session,
+                    &serde_json::json!({
+                        "input": text, "delivery": "queue", "submission_id": id
+                    }),
+                )
+                .unwrap()
+        };
+
+        let first = submit("prompt-a", "first");
+        assert_eq!(first.status, 201);
+        assert_eq!(submit("prompt-a", "first").body, first.body);
+        assert_eq!(submit("prompt-a", "changed").status, 409);
+        assert_eq!(submit("prompt-b", "second").status, 202);
+        assert_eq!(submit("prompt-b", "second").status, 202);
+        assert_eq!(submit("prompt-c", "third").status, 202);
+        assert_eq!(server.start_inbox_head(&session, "prompt-c").status, 409);
+        assert_eq!(server.start_inbox_head(&session, "prompt-b").status, 409);
+        {
+            let mut inbox = session.inbox.lock().unwrap();
+            let reply: Value = serde_json::from_slice(&inbox.list(None).body).unwrap();
+            assert_eq!(
+                reply["items"],
+                serde_json::json!([
+                    { "id": "prompt-b", "input": "second" },
+                    { "id": "prompt-c", "input": "third" },
+                ])
+            );
+            assert_eq!(inbox.remove("prompt-b").status, 200);
+        }
+        assert_eq!(submit("prompt-b", "second").status, 409);
+        assert_eq!(
+            server
+                .submit_run(&session, &serde_json::json!({"input":"skip FIFO"}))
+                .unwrap()
+                .status,
+            409
+        );
+
+        let active: Value = serde_json::from_slice(&first.body).unwrap();
+        assert_eq!(
+            server
+                .cancel(&session, active["run"].as_str().unwrap())
+                .unwrap()
+                .status,
+            200
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let next = loop {
+            let reply = server.start_inbox_head(&session, "prompt-c");
+            if reply.status == 201 {
+                break reply;
+            }
+            assert_eq!(reply.status, 409);
+            assert!(Instant::now() < deadline, "cancelled run never settled");
+            std::thread::yield_now();
+        };
+        assert_eq!(
+            server.start_inbox_head(&session, "prompt-c").body,
+            next.body
+        );
+        assert!(session.inbox.lock().unwrap().waiting.is_empty());
+    }
+
+    #[test]
+    fn inbox_limits_waiting_text_and_entry_count() {
+        let mut inbox = PromptInbox::default();
+        let session = SessionId::new("session-inbox-bounds").unwrap();
+        let command = |input: String| {
+            SubmitCommand::new(
+                RequestId::new("request").unwrap(),
+                session.clone(),
+                input,
+                WEB_PROFILE,
+            )
+            .unwrap()
+        };
+        for id in 0..MAX_WAITING_PROMPTS {
+            assert_eq!(
+                inbox
+                    .push(
+                        RequestId::new(format!("req-{id}")).unwrap(),
+                        command("a".into())
+                    )
+                    .status,
+                202
+            );
+        }
+        assert_eq!(
+            inbox
+                .push(RequestId::new("overflow").unwrap(), command("a".into()))
+                .status,
+            409
+        );
+        inbox.waiting.clear();
+        for id in ["one", "two"] {
+            assert_eq!(
+                inbox
+                    .push(
+                        RequestId::new(id).unwrap(),
+                        command("a".repeat(MAX_WAITING_PROMPT_BYTES / 2))
+                    )
+                    .status,
+                202
+            );
+        }
+        assert_eq!(
+            inbox
+                .push(RequestId::new("overflow").unwrap(), command("a".into()))
+                .status,
+            409
         );
     }
 

@@ -1721,6 +1721,22 @@ pre {
   animation: composer-breathe 2s ease-in-out infinite;
 }
 
+.prompt-inbox {
+  width: min(100%, 860px);
+  max-height: 12rem;
+  overflow: auto;
+  margin: 0 auto 0.5rem;
+  font-size: 0.85rem;
+}
+
+.prompt-inbox-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+  overflow-wrap: anywhere;
+}
+
 .composer-activity {
   display: inline-flex;
   flex: none;
