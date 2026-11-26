@@ -300,12 +300,30 @@ are already bound.
 
 ## Event handling
 
+In the Web composer, sending while a run is active queues the prompt in that
+session. Waiting prompts can be removed without entering the transcript.
+Successful completion starts the next prompt after the previous event stream
+releases its subscriber; cancellation, failure, or a rejected start pauses the
+queue until Resume. A page refresh can recover the live inbox from the server;
+the inbox is not persisted across a server restart.
+
+The separate **Steer** action binds a message to the active run without
+interrupting generation, tools, or approvals. It enters the transcript at the
+next safe model boundary. An undispatched steer becomes a queued prompt when
+its target run ends; if that run did not succeed, the queue pauses. Adapters
+using opaque continuation defer steering rather than rewriting continuation.
+
+`/btw <question>` in an existing session with a configured model opens a
+standalone answer based on accepted conversation text. It does not use tools,
+enter session history, interrupt the current run, or enqueue a prompt.
+
 The client consumes the existing event JSON without inventing additional wire
 contracts:
 
 | Event | Presentation |
 | --- | --- |
 | `run-started` | Running status |
+| `user-steered` | User text accepted at an active run's model boundary |
 | `assistant-text` | Incremental assistant text, keyed by turn and item |
 | `assistant-reasoning` | Live thinking, keyed by turn and item; collapsed last-line preview, expandable scrolling text |
 | `reasoning-redacted` | Compatibility status for older servers; no hidden content |
