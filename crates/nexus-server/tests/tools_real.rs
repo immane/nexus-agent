@@ -380,3 +380,198 @@ fn configured_tool_bounds_execute_in_strict_and_development_sessions() {
         );
     }
 }
+
+#[test]
+fn exploration_runs_through_normal_tool_pairing_and_only_sees_project_reads() {
+    use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile, UserConfig};
+    use serde_json::json;
+    use std::io::BufRead;
+
+    let root = FixtureRoot::new();
+    let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    upstream.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", upstream.local_addr().unwrap());
+    let mock = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut parent_turn = 0;
+        let mut child_turn = 0;
+        let tool = |name: &str, id: &str, args: Value| {
+            json!({"choices":[{"message":{"role":"assistant","tool_calls":[
+                {"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}
+            ]},"finish_reason":"tool_calls"}]})
+        };
+        let answer = |text| json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
+        for _ in 0..5 {
+            let mut socket = loop {
+                match upstream.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut input = std::io::BufReader::new(&mut socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(input.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = Some(value.trim().parse().unwrap());
+                }
+            }
+            let mut bytes = vec![0; length.unwrap()];
+            input.read_exact(&mut bytes).unwrap();
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            let messages = request["messages"].as_array().unwrap();
+            let last = &messages.last().unwrap()["content"];
+            let body = if request["model"] == "child-model" {
+                let mut names = request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                names.sort_unstable();
+                assert_eq!(names, ["host_list", "host_read", "host_search"]);
+                assert!(
+                    messages
+                        .iter()
+                        .all(|message| message["content"] != "parent transcript")
+                );
+                child_turn += 1;
+                if child_turn == 1 {
+                    assert_eq!(last, "read fixture file");
+                    tool("host_read", "read", json!({"path":"a"}))
+                } else {
+                    assert_eq!(last, "real-bytes-123");
+                    answer("fixture confirmed")
+                }
+            } else {
+                assert_eq!(request["model"], "parent-model");
+                parent_turn += 1;
+                match parent_turn {
+                    1 => {
+                        assert!(
+                            request["tools"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|tool| tool["function"]["name"] == "delegate_start")
+                        );
+                        tool(
+                            "delegate_start",
+                            "start",
+                            json!({"role":"explore","task":"read fixture file","model":"child"}),
+                        )
+                    }
+                    2 => {
+                        let result: Value = serde_json::from_str(last.as_str().unwrap()).unwrap();
+                        assert_eq!(result["status"], "accepted");
+                        tool(
+                            "delegate_await",
+                            "await",
+                            json!({"job_id":result["job_id"]}),
+                        )
+                    }
+                    3 => {
+                        let result: Value = serde_json::from_str(last.as_str().unwrap()).unwrap();
+                        assert_eq!(result["status"], "completed");
+                        assert_eq!(result["text"], "fixture confirmed");
+                        answer("done")
+                    }
+                    _ => panic!("unexpected parent turn"),
+                }
+            };
+            let body = body.to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        assert_eq!((parent_turn, child_turn), (3, 2));
+    });
+
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let mut server = nexus_server::Server::new(executor.handle().clone());
+    let mut config = UserConfig::default_config();
+    config
+        .add_provider(
+            ProviderProfile::new(
+                "mock",
+                "Mock",
+                AdapterKind::Direct,
+                Some(endpoint),
+                CredentialRef::stored("mock").unwrap(),
+                "parent-model",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    for (id, name) in [("parent", "parent-model"), ("child", "child-model")] {
+        config
+            .add_model(ModelEntry::new(id, "mock", name).unwrap())
+            .unwrap();
+    }
+    let private = FixtureRoot::new();
+    nexus_config::store_stored_credential_at(
+        &private.0.join("credentials.json"),
+        "mock",
+        "fixture-token",
+    )
+    .unwrap();
+    server.set_config(config, Some(private.0.join("config.json")));
+    server
+        .set_limits(nexus_core::Limits {
+            run_duration: Duration::from_secs(8),
+            per_tool_timeout: Duration::from_secs(5),
+            ..nexus_core::Limits::m0_test()
+        })
+        .unwrap();
+    server
+        .set_server_settings(&nexus_config::ServerSettings {
+            exploration_models: vec!["child".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    server
+        .set_tools_mode(nexus_server::ToolsMode::Development {
+            root: root.0.clone(),
+        })
+        .unwrap();
+    server.set_auth_token(&"a".repeat(64)).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::sync::Arc::new(server);
+    let web = std::thread::spawn(move || {
+        for _ in 0..3 {
+            server.handle_connection(listener.accept().unwrap().0);
+        }
+    });
+    let (status, session) = post(
+        port,
+        "/sessions",
+        r#"{"provider":"mock","model":"parent","project":"default"}"#,
+    );
+    assert_eq!(status, 201, "{session}");
+    let session = session["session"].as_str().unwrap();
+    let (status, run) = post(
+        port,
+        &format!("/sessions/{session}/runs"),
+        r#"{"input":"parent transcript"}"#,
+    );
+    assert_eq!(status, 201, "{run}");
+    let outcomes = tool_outcomes(port, session, run["run"].as_str().unwrap(), 2);
+    assert_eq!(outcomes.len(), 2);
+    mock.join().unwrap();
+    web.join().unwrap();
+}

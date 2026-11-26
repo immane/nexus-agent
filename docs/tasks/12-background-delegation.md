@@ -1,9 +1,9 @@
 # Background delegation
 
-Status: offline runtime foundation implemented; delegation is not exposed to
-Web clients or models. The remaining behavior is a proposed implementation
-plan. This is product behavior; [03 - Subagents](03-subagents.md) describes how
-to divide development work on this repository.
+Status: eligible Web/desktop sessions expose read-only Explore via
+`delegate_start` and `delegate_await`. Automatic result delivery and Propose
+remain planned. This is product behavior; [03 - Subagents](03-subagents.md)
+describes how to divide development work on this repository.
 
 The runtime foundation uses an ephemeral child runtime for each accepted
 exploration and a run-owned job registry. It accepts a host-selected provider
@@ -14,11 +14,13 @@ external targets and protected paths without consulting parent grants.
 Offline model selection checks the admitted parent model identity or a
 host-supplied allowlist, resolves the selected model's context and thinking
 settings, and validates the adapter without credentials or discovery.
-The server does not yet supply the allowlist or expose delegation tools;
-child inbox handoff, proposal application, and background recovery are also
-not implemented. The host must
-enforce the parent tool-call budget and project scope before exposing this
-primitive to a model.
+The server uses the normal tool-call budget and restricts registration to
+configured providers in bound local projects. Additional models must be
+explicitly selected and listed in the operational `server.exploration_models`
+array. A provider-only session needs an explicit allowed model because its
+parent has no configured model ID. `delegate_await` uses the ordinary tool
+deadline; a timed-out wait does not consume a pending result. There is no
+`delivery` argument or automatic handoff in this slice.
 
 ## Goal and first release
 
@@ -65,8 +67,8 @@ work triggered by child-only input.
 
 ## Caller contract
 
-Names and bounds below are proposed; freeze them only after the offline slice
-proves the behavior.
+The table describes the target contract. `delivery` and the `propose` role
+are not accepted by the current Explore-only tools.
 
 | Operation | Inputs | Result |
 | --- | --- | --- |

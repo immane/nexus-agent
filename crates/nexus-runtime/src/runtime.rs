@@ -110,6 +110,16 @@ pub struct Runtime {
     shared: Arc<Shared>,
 }
 
+/// Non-owning reference for host tools registered inside the same runtime.
+pub struct WeakRuntime(std::sync::Weak<Shared>);
+
+impl WeakRuntime {
+    /// Returns the owning runtime if it is still live.
+    pub fn upgrade(&self) -> Option<Runtime> {
+        self.0.upgrade().map(|shared| Runtime { shared })
+    }
+}
+
 /// Receipt for a steering input. Accepted input becomes consumed at a model boundary.
 #[derive(Clone)]
 pub struct SteeringReceipt(Arc<std::sync::atomic::AtomicU8>);
@@ -1457,6 +1467,11 @@ impl Runtime {
             }
             changed.await;
         }
+    }
+
+    /// Creates a non-owning reference without forming a runtime/tool cycle.
+    pub fn downgrade(&self) -> WeakRuntime {
+        WeakRuntime(Arc::downgrade(&self.shared))
     }
 
     /// Starts a child runtime using a provider and project-local read tools chosen by the host.

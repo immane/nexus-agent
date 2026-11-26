@@ -66,6 +66,9 @@ use nexus_tools::{ProjectImageReader, ScopedReader};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+#[path = "exploration.rs"]
+mod exploration;
+
 /// Validates the bearer-token syntax used by the server binary.
 ///
 /// The token itself must be obtained through a secret-safe channel such as
@@ -650,7 +653,7 @@ pub struct Server {
     /// The live configuration document. Every read and write goes through
     /// this one lock so a run's usage record and the redacted summary can
     /// never observe a half-applied change.
-    config: Mutex<UserConfig>,
+    config: Arc<Mutex<UserConfig>>,
     /// File the configuration is persisted to. `None` keeps every change in
     /// memory: a server without a configured path never writes a file.
     config_path: Option<PathBuf>,
@@ -744,7 +747,7 @@ impl Server {
             pending_sessions: AtomicUsize::new(0),
             next_restore: AtomicU64::new(1),
             project_picker: Mutex::new(()),
-            config: Mutex::new(UserConfig::default_config()),
+            config: Arc::new(Mutex::new(UserConfig::default_config())),
             config_path: None,
             limits: nexus_config::SettingsProfile::Server.default_limits(),
             provider_settings: ProviderSettings::default(),
@@ -1101,17 +1104,51 @@ impl Server {
             Some(id) => Some(self.select_provider(id, model)?),
         };
         let token = session.as_str().to_owned();
-        let (policy, tools) = self.session_tools(project_root.as_deref())?;
+        let (mut policy, mut tools) = self.session_tools(project_root.as_deref())?;
+        let exploration = match (&provider, bound_project.as_ref(), &self.tools_mode) {
+            (
+                Some((adapter, binding)),
+                Some(_),
+                ToolsMode::Development { root } | ToolsMode::RealFiles { root },
+            ) if adapter.capabilities().text
+                && adapter.capabilities().tool_calls
+                && (binding.is_some() || !self.server_settings.exploration_models.is_empty()) =>
+            {
+                exploration::Controls::new(
+                    self.handle.clone(),
+                    self.config.clone(),
+                    binding.clone(),
+                    self.server_settings.exploration_models.clone(),
+                    self.provider_settings.clone(),
+                    self.credentials_path(),
+                    project_root.as_deref().unwrap_or(root),
+                    &self.tools_settings,
+                )
+                .ok()
+            }
+            _ => None,
+        };
+        if let Some(exploration) = &exploration {
+            tools.extend(exploration.registrations());
+            policy = policy.with_exploration();
+        }
         let project_images = project_root
             .as_deref()
             .or(self.default_image_root.as_deref())
             .and_then(ProjectImageReader::bind);
-        let instructions = if project_images.is_some() {
-            ModelInstructions::new(
-                "",
-                "The Nexus Web chat can display PNG, JPEG, WebP, and SVG files in the current project. To show a generated image, include a Markdown image with a project-relative path, such as ![Plot](assets/plot.png). Do not run an app to open it or convert it to text.",
-            )
-            .expect("static instructions fit the model instruction budget")
+        let image_note = if project_images.is_some() {
+            "The Nexus Web chat can display PNG, JPEG, WebP, and SVG files in the current project. To show a generated image, include a Markdown image with a project-relative path, such as ![Plot](assets/plot.png). Do not run an app to open it or convert it to text."
+        } else {
+            ""
+        };
+        let explore_note = if exploration.is_some() {
+            "Use delegate_start for independent read-only project exploration. To retrieve a result, explicitly call delegate_await with its job ID. Results are not delivered automatically."
+        } else {
+            ""
+        };
+        let instructions = if !image_note.is_empty() || !explore_note.is_empty() {
+            ModelInstructions::new("", format!("{image_note}\n{explore_note}").trim())
+                .expect("static instructions fit the model instruction budget")
         } else {
             ModelInstructions::default()
         };
@@ -1121,7 +1158,7 @@ impl Server {
             has_approval_handler: true,
         };
         let provider: Arc<dyn nexus_core::ProviderPort + Send + Sync> = match provider {
-            Some(adapter) => Arc::new(adapter),
+            Some((adapter, _)) => Arc::new(adapter),
             None => Arc::new(PerRunProvider::new()),
         };
         let (runtime, streams): (Runtime, EventStreams) = match &self.session_store {
@@ -1135,6 +1172,9 @@ impl Server {
             None => Runtime::try_new_with_instructions(config, provider, tools, instructions),
         }
         .map_err(|_| SessionError::new(500, "demo wiring is invalid"))?;
+        if let Some(exploration) = exploration {
+            exploration.bind(&runtime);
+        }
         if restore {
             let n = self.next_restore.fetch_add(1, Ordering::SeqCst);
             let request = RequestId::new(format!("req-web-restore-{n}"))
@@ -1257,13 +1297,19 @@ impl Server {
         &self,
         id: &str,
         model: Option<&str>,
-    ) -> Result<nexus_openai::OpenAiProvider, SessionError> {
+    ) -> Result<
+        (
+            nexus_openai::OpenAiProvider,
+            Option<(ProviderProfile, ModelEntry)>,
+        ),
+        SessionError,
+    > {
         let unknown_provider = || SessionError::new(400, "selected provider is unknown");
         let profile = {
             let config = self.config.lock().expect("config lockable");
             let profile = config.provider(id).ok_or_else(unknown_provider)?.clone();
-            let (profile, vendor) = match model {
-                None => (profile, None),
+            let entry = match model {
+                None => None,
                 Some(name) => {
                     let entry = config
                         .model(name)
@@ -1274,7 +1320,7 @@ impl Server {
                             "selected model belongs to another provider",
                         ));
                     }
-                    (profile, Some(entry.name.clone()))
+                    Some(entry.clone())
                 }
             };
             let context_management = config.context_management_for(id, model).map_err(|_| {
@@ -1285,27 +1331,30 @@ impl Server {
                 config.task_reasoning_effort_for(id, model).map_err(|_| {
                     SessionError::new(400, "selected model thinking configuration is invalid")
                 })?;
-            (profile, vendor, context_management)
+            (profile, entry, context_management)
         };
-        let (profile, vendor, context_management) = profile;
+        let (profile, entry, context_management) = profile;
         if !profile.enabled {
             return Err(SessionError::new(400, "selected provider is disabled"));
         }
-        let vendor = vendor.unwrap_or(profile.default_model.clone());
+        let vendor = entry
+            .as_ref()
+            .map_or(profile.default_model.as_str(), |entry| &entry.name);
         let credential_value =
             resolve_credential_at(&profile.credential, self.credentials_path().as_deref())
                 .map_err(|_| SessionError::new(503, "provider credential is unavailable"))?;
-        nexus_openai::OpenAiProvider::from_profile(&profile, &vendor)
+        nexus_openai::OpenAiProvider::from_profile(&profile, vendor)
             .and_then(|adapter| adapter.with_operational_settings(&self.provider_settings))
             .map(|adapter| {
                 let adapter = adapter
                     .with_resolved_credential(credential_value)
                     .with_context_management(context_management);
-                if adapter.supports_context_discovery() {
+                let adapter = if adapter.supports_context_discovery() {
                     adapter.discover_context_management()
                 } else {
                     adapter
-                }
+                };
+                (adapter, entry.map(|entry| (profile, entry)))
             })
             .map_err(|_| SessionError::new(400, "selected provider is invalid"))
     }
@@ -3734,6 +3783,7 @@ mod tests {
             max_sessions: 2,
             session_idle_seconds: 10,
             session_cleanup_interval_seconds: 3,
+            exploration_models: Vec::new(),
         };
         server.set_server_settings(&settings).unwrap();
         for invalid in [
@@ -4843,12 +4893,14 @@ mod tests {
             let defaults = server
                 .select_provider("configured", None)
                 .unwrap_or_else(|_| panic!("configured default adapter must resolve"))
+                .0
                 .context_management();
             assert_eq!(defaults.policy.trigger_percent(), 70);
             assert_eq!(defaults.window.unwrap().tokens(), 94_208);
             let selected = server
                 .select_provider("configured", Some("other"))
                 .unwrap_or_else(|_| panic!("configured selected adapter must resolve"))
+                .0
                 .context_management();
             assert_eq!(selected.policy.trigger_percent(), 60);
             assert_eq!(selected.policy.target_percent(), 5);

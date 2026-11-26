@@ -204,6 +204,9 @@ pub struct ServerSettings {
     pub max_sessions: usize,
     pub session_idle_seconds: u64,
     pub session_cleanup_interval_seconds: u64,
+    /// Additional configured model IDs allowed for background exploration.
+    #[serde(default)]
+    pub exploration_models: Vec<String>,
 }
 
 impl Default for ServerSettings {
@@ -213,6 +216,7 @@ impl Default for ServerSettings {
             max_sessions: 128,
             session_idle_seconds: 1_800,
             session_cleanup_interval_seconds: 60,
+            exploration_models: Vec::new(),
         }
     }
 }
@@ -224,6 +228,13 @@ impl ServerSettings {
             || !(1..=128).contains(&self.max_sessions)
             || !(1..=86_400).contains(&self.session_idle_seconds)
             || !(1..=86_400).contains(&self.session_cleanup_interval_seconds)
+            || self
+                .exploration_models
+                .iter()
+                .enumerate()
+                .any(|(index, id)| {
+                    !crate::model::is_id_text(id) || self.exploration_models[..index].contains(id)
+                })
         {
             return Err(invalid("server settings are invalid"));
         }
@@ -1220,6 +1231,7 @@ mod tests {
                 max_sessions: 128,
                 session_idle_seconds: 1_800,
                 session_cleanup_interval_seconds: 60,
+                exploration_models: Vec::new(),
             }
         );
         apply_layer(&mut settings, r#"{"revision":1,"defaults":{"server":{"max_connections":32,"max_sessions":64,"session_idle_seconds":900,"session_cleanup_interval_seconds":30}},"profiles":{"server":{"server":{"max_connections":16,"session_idle_seconds":600}},"tui":{"server":{"max_sessions":2}}}}"#, SettingsProfile::Server).unwrap();
@@ -1230,6 +1242,7 @@ mod tests {
                 max_sessions: 64,
                 session_idle_seconds: 600,
                 session_cleanup_interval_seconds: 30,
+                exploration_models: Vec::new(),
             }
         );
         apply_layer(&mut settings, r#"{"revision":1,"defaults":{"server":{"max_sessions":8}},"profiles":{"server":{"server":{"session_cleanup_interval_seconds":5}}}}"#, SettingsProfile::Server).unwrap();
@@ -1240,6 +1253,7 @@ mod tests {
                 max_sessions: 8,
                 session_idle_seconds: 600,
                 session_cleanup_interval_seconds: 5,
+                exploration_models: Vec::new(),
             }
         );
     }
