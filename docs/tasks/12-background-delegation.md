@@ -1,8 +1,18 @@
 # Background delegation
 
-Status: proposed implementation plan, not an accepted runtime contract or a
-shipped feature. This is product behavior; [03 - Subagents](03-subagents.md)
-describes how to divide development work on this repository.
+Status: offline runtime foundation implemented; delegation is not exposed to
+Web clients or models. The remaining behavior is a proposed implementation
+plan. This is product behavior; [03 - Subagents](03-subagents.md) describes how
+to divide development work on this repository.
+
+The runtime foundation uses an ephemeral child runtime for each accepted
+exploration and a run-owned job registry. It accepts a host-selected provider
+and host-supplied project-jailed read registrations, returns a bounded result
+at most once, and signals all unfinished children on parent cancellation.
+There is no configured model resolution, Web tool registration, child inbox
+handoff, proposal application, or background recovery yet. The host must
+enforce the parent tool-call budget and project scope before exposing this
+primitive to a model.
 
 ## Goal and first release
 

@@ -387,6 +387,7 @@ struct ActiveRun {
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
     steering: VecDeque<(RequestId, ModelContextItem, SteeringReceipt)>,
+    explorations: crate::delegation::Explorations,
     /// Index of the first context item not yet committed to source history.
     source_cursor: usize,
     history_len: usize,
@@ -426,6 +427,7 @@ struct FinishedRun {
     outcomes: Vec<OutcomeSummary>,
     truncated: bool,
     terminal_delivered: bool,
+    explorations: crate::delegation::Explorations,
 }
 
 /// Terminal decision produced by one state-machine step.
@@ -1129,6 +1131,7 @@ impl Runtime {
             continuation: None,
             conversation,
             steering: VecDeque::new(),
+            explorations: Default::default(),
             source_cursor,
             history_len,
             inherited_history: history_len > 0,
@@ -1235,6 +1238,7 @@ impl Runtime {
             Some(active) if active.run == command.run => {
                 active.cancelled = true;
                 active.token.cancel();
+                active.explorations.cancel_all();
                 active.wake.notify_one();
                 CommandResponse::new(
                     command.request.clone(),
@@ -1453,6 +1457,181 @@ impl Runtime {
             }
             changed.await;
         }
+    }
+
+    /// Starts a child runtime using a provider and project-local read tools chosen by the host.
+    /// The caller must supply project-jailed tool registrations and charge normal parent admission.
+    pub async fn start_exploration(
+        &self,
+        parent: &RunId,
+        job_id: RequestId,
+        brief: &str,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+    ) -> Result<(), AgentError> {
+        use crate::delegation::{Job, MAX_BRIEF_BYTES, MAX_DURATION, MAX_RESULT_BYTES};
+        let brief = brief.trim();
+        if brief.is_empty() || brief.len() > MAX_BRIEF_BYTES {
+            return Err(runtime_error(
+                ErrorCategory::InvalidInput,
+                "exploration brief is invalid",
+            ));
+        }
+        if !provider.capabilities().text
+            || (!tools.is_empty() && !provider.capabilities().tool_calls)
+            || tools.iter().any(|tool| {
+                tool.access() != ToolAccess::Read
+                    || !matches!(
+                        tool.port().describe().id().name(),
+                        "host_read" | "host_list" | "host_search"
+                    )
+            })
+        {
+            return Err(runtime_error(
+                ErrorCategory::UnsupportedCapability,
+                "exploration requires read-only project tools and a supported model",
+            ));
+        }
+        let now = StdInstant::now();
+        let state = self.shared.state.lock().await;
+        let parent_deadline = state
+            .active
+            .as_ref()
+            .filter(|active| {
+                &active.run == parent && active.terminal.is_none() && !active.token.is_cancelled()
+            })
+            .map(|active| active.deadline)
+            .ok_or_else(|| {
+                runtime_error(
+                    ErrorCategory::InvalidInput,
+                    "exploration parent is not active",
+                )
+            })?;
+        drop(state);
+        let deadline = parent_deadline.min(now + MAX_DURATION);
+        let duration = deadline.saturating_duration_since(now);
+        if duration.is_zero() {
+            return Err(runtime_error(
+                ErrorCategory::Timeout,
+                "exploration deadline already elapsed",
+            ));
+        }
+        let mut limits = self.shared.limits;
+        limits.run_duration = duration.min(limits.run_duration);
+        limits.per_tool_timeout = limits
+            .per_tool_timeout
+            .min(Duration::from_secs(5))
+            .min(limits.run_duration);
+        limits.max_model_turns_per_run = limits.max_model_turns_per_run.min(4);
+        limits.max_tool_calls_per_run = limits.max_tool_calls_per_run.min(12);
+        limits.max_tool_calls_per_turn = limits
+            .max_tool_calls_per_turn
+            .min(limits.max_tool_calls_per_run);
+        limits.max_tool_output_bytes = limits.max_tool_output_bytes.min(MAX_RESULT_BYTES);
+        let (child, streams) = Self::try_new_with_instructions(
+            RuntimeConfig {
+                limits,
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            provider,
+            tools,
+            ModelInstructions::new(
+                "",
+                "Explore the assigned task using read-only evidence. Return a short conclusion, project-relative file references, and uncertainty.",
+            )?,
+        )?;
+        let child_session = SessionId::new(format!("explore-{:x}", child.shared.incarnation))
+            .expect("generated exploration session ID");
+        let command = SubmitCommand::new(job_id.clone(), child_session, brief, "explore")?
+            .with_read_only(true);
+        let job = Job::new();
+        let mut state = self.shared.state.lock().await;
+        let active = state
+            .active
+            .as_mut()
+            .filter(|active| {
+                &active.run == parent && active.terminal.is_none() && !active.token.is_cancelled()
+            })
+            .ok_or_else(|| {
+                runtime_error(
+                    ErrorCategory::InvalidInput,
+                    "exploration parent is not active",
+                )
+            })?;
+        if active.explorations.get(&job_id).is_some() {
+            return Err(runtime_error(
+                ErrorCategory::InvalidInput,
+                "exploration id already exists",
+            ));
+        }
+        if StdInstant::now() >= deadline {
+            return Err(runtime_error(
+                ErrorCategory::Timeout,
+                "exploration deadline already elapsed",
+            ));
+        }
+        active.explorations.insert(job_id, job.clone());
+        tokio::spawn(job.run(child, streams, command, deadline));
+        Ok(())
+    }
+
+    /// Consumes one child result, only within its original parent run.
+    pub async fn await_exploration(
+        &self,
+        parent: &RunId,
+        job: &RequestId,
+    ) -> crate::ExplorationWait {
+        let owned = {
+            let state = self.shared.state.lock().await;
+            state
+                .active
+                .as_ref()
+                .filter(|active| &active.run == parent)
+                .and_then(|active| active.explorations.get(job))
+                .or_else(|| {
+                    state
+                        .last
+                        .as_ref()
+                        .filter(|last| &last.run == parent)
+                        .and_then(|last| last.explorations.get(job))
+                })
+        };
+        match owned {
+            Some(job) => job.take().await,
+            None => crate::ExplorationWait::Unknown,
+        }
+    }
+
+    pub(crate) async fn exploration_answer(
+        &self,
+        session: &SessionId,
+        limit: usize,
+    ) -> Option<(String, bool)> {
+        let state = self.shared.state.lock().await;
+        let exchange = state
+            .history
+            .iter()
+            .rev()
+            .find(|exchange| &exchange.session == session)?;
+        let start = exchange
+            .items
+            .iter()
+            .rposition(|item| !matches!(item, ModelContextItem::AssistantText { .. }))
+            .map_or(0, |index| index + 1);
+        let mut answer = String::new();
+        for item in &exchange.items[start..] {
+            if let ModelContextItem::AssistantText { text, .. } = item {
+                let text = text.as_str();
+                let remaining = limit.saturating_sub(answer.len());
+                let end = text.floor_char_boundary(remaining.min(text.len()));
+                answer.push_str(&text[..end]);
+                if end < text.len() {
+                    return Some((answer, true));
+                }
+            }
+        }
+        (!answer.trim().is_empty()).then_some((answer, false))
     }
 
     /// Stages bounded user input for the named run, without waking a provider or tool.
@@ -4342,6 +4521,9 @@ impl Runtime {
         } else {
             (outcome, error)
         };
+        if outcome != RunOutcome::Completed {
+            active.explorations.cancel_all();
+        }
         if let Some((call, decided)) = active.outcome_slot.take() {
             let dispatched = active
                 .current
@@ -4645,6 +4827,7 @@ impl Runtime {
             outcomes: active.outcomes.clone(),
             truncated: active.data_dropped || delivery_truncated,
             terminal_delivered,
+            explorations: active.explorations,
         });
         self.shared.terminal_changed.notify_waiters();
     }
@@ -8441,6 +8624,157 @@ mod cov_runtime_private {
     /// channels; the covered helpers never invoke it.
     struct NoopProvider;
 
+    struct GatedExplorationProvider {
+        name: &'static str,
+        started: mpsc::UnboundedSender<&'static str>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ProviderPort for GatedExplorationProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            NoopProvider.capabilities()
+        }
+
+        fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
+            assert!(request.enabled_tools().is_empty());
+            assert_eq!(request.conversation().len(), 1);
+            self.started.send(self.name).unwrap();
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            if let Err(error) = context.check_active() {
+                return vec![ProviderEvent::Failed(error)];
+            }
+            vec![
+                ProviderEvent::TextDelta {
+                    item_key: "answer".into(),
+                    text: self.name.into(),
+                },
+                ProviderEvent::TurnFinished(
+                    nexus_core::TurnFinished::try_new(
+                        nexus_core::FinishReason::Stop,
+                        Usage::new(None, None, nexus_core::UsageFinality::Final),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            ]
+        }
+    }
+
+    #[test]
+    fn explorations_overlap_and_deliver_out_of_order_once_to_their_parent() {
+        let (runtime, _streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let parent = RunId::new("parent-exploration").unwrap();
+            let unrelated = RunId::new("unrelated-run").unwrap();
+            runtime.shared.state.lock().await.active = Some(active_for(&parent));
+            let (tx, mut started) = mpsc::unbounded_channel();
+            let gated = |name| {
+                let (release, rx) = std::sync::mpsc::channel();
+                (
+                    release,
+                    Arc::new(GatedExplorationProvider {
+                        name,
+                        started: tx.clone(),
+                        release: StdMutex::new(rx),
+                    }),
+                )
+            };
+            let a = RequestId::new("job-a").unwrap();
+            let b = RequestId::new("job-b").unwrap();
+            let c = RequestId::new("job-c").unwrap();
+            let (release_a, provider_a) = gated("answer-a");
+            let (release_b, provider_b) = gated("answer-b");
+            let (release_c, provider_c) = gated("answer-c");
+            runtime
+                .start_exploration(&parent, a.clone(), "explore a", provider_a, vec![])
+                .await
+                .unwrap();
+            runtime
+                .start_exploration(&parent, b.clone(), "explore b", provider_b, vec![])
+                .await
+                .unwrap();
+            assert!(
+                runtime
+                    .start_exploration(
+                        &parent,
+                        a.clone(),
+                        "duplicate",
+                        Arc::new(NoopProvider),
+                        vec![]
+                    )
+                    .await
+                    .is_err()
+            );
+            let first = tokio::time::timeout(Duration::from_secs(3), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let second = tokio::time::timeout(Duration::from_secs(3), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first, second);
+            runtime
+                .start_exploration(&parent, c.clone(), "explore c", provider_c, vec![])
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(3), started.recv())
+                    .await
+                    .unwrap(),
+                Some("answer-c")
+            );
+            assert_eq!(
+                runtime.await_exploration(&unrelated, &b).await,
+                crate::ExplorationWait::Unknown
+            );
+            release_b.send(()).unwrap();
+            let crate::ExplorationWait::Finished(result) =
+                runtime.await_exploration(&parent, &b).await
+            else {
+                panic!("expected exploration result");
+            };
+            assert_eq!(result.outcome, RunOutcome::Completed);
+            assert_eq!(result.text, "answer-b");
+            assert_eq!(
+                runtime.await_exploration(&parent, &b).await,
+                crate::ExplorationWait::Collected
+            );
+            runtime
+                .cancel(CancelCommand {
+                    request: RequestId::new("cancel-parent").unwrap(),
+                    run: parent.clone(),
+                })
+                .await;
+            assert_eq!(
+                runtime.await_exploration(&parent, &a).await,
+                crate::ExplorationWait::ParentStopped
+            );
+            assert_eq!(
+                runtime.await_exploration(&parent, &c).await,
+                crate::ExplorationWait::ParentStopped
+            );
+            release_a.send(()).unwrap();
+            release_c.send(()).unwrap();
+        });
+    }
+
     #[test]
     fn side_question_uses_accepted_text_without_mutating_the_run_or_starting_tools() {
         struct AsideProvider;
@@ -8592,6 +8926,7 @@ mod cov_runtime_private {
             continuation: None,
             conversation: Vec::new(),
             steering: VecDeque::new(),
+            explorations: Default::default(),
             source_cursor: 0,
             history_len: 0,
             inherited_history: false,
@@ -10397,6 +10732,7 @@ mod cov_runtime_topup_private {
             continuation: None,
             conversation: Vec::new(),
             steering: VecDeque::new(),
+            explorations: Default::default(),
             source_cursor: 0,
             history_len: 0,
             inherited_history: false,
