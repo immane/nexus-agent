@@ -106,6 +106,16 @@ const dom = {
   jumpLatest: document.querySelector('#jump-latest'),
   runStatus: document.querySelector('#run-status'),
   toolsMode: document.querySelector('#tools-mode'),
+  appBackdrop: document.querySelector('#app-backdrop'),
+  backgroundPreview: document.querySelector('#background-preview'),
+  backgroundFile: document.querySelector('#background-file'),
+  backgroundChoose: document.querySelector('#background-choose'),
+  backgroundRemove: document.querySelector('#background-remove'),
+  backgroundDim: document.querySelector('#background-dim'),
+  backgroundDimValue: document.querySelector('#background-dim-value'),
+  backgroundBlur: document.querySelector('#background-blur'),
+  backgroundBlurValue: document.querySelector('#background-blur-value'),
+  backgroundStatus: document.querySelector('#background-status'),
   helperStatus: document.querySelector('#helper-status'),
   contextMeter: document.querySelector('#context-meter'),
   contextRing: document.querySelector('#context-ring'),
@@ -209,7 +219,11 @@ let textFrame = 0;
 
 /* Appearance */
 
-const themes = new Set(['system', 'graphite', 'paper', 'forest', 'sand', 'midnight', 'ocean', 'amethyst', 'blossom', 'lavender']);
+const themes = new Set([
+  'system',
+  'graphite', 'midnight', 'forest', 'ocean', 'amethyst', 'ink', 'fjord', 'twilight', 'mocha', 'ember', 'dusk',
+  'paper', 'sand', 'blossom', 'lavender', 'mint', 'sky', 'latte', 'peach', 'solar',
+]);
 
 function applyTheme(value) {
   const selected = themes.has(value) ? value : 'system';
@@ -4790,6 +4804,181 @@ async function reconcileAfterLoss(error) {
     { label: 'Reconnect stream', run: () => attachStream({ automatic: true }) },
   );
 }
+
+/* Custom background */
+
+// The image never leaves the browser: it is decoded, resized, and re-encoded
+// locally (dropping metadata), then kept as a Blob in IndexedDB. Dim and blur
+// are small settings in localStorage.
+const BACKGROUND_SETTINGS_KEY = 'nexus.background';
+const BACKGROUND_DB = 'nexus-appearance';
+const BACKGROUND_STORE = 'images';
+const BACKGROUND_MAX_EDGE = 2560;
+const BACKGROUND_MAX_INPUT_BYTES = 40 * 1024 * 1024;
+const BACKGROUND_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif']);
+const BACKGROUND_DEFAULTS = { dim: 55, blur: 0 };
+let backgroundUrl = '';
+
+function clampStep(value, min, max, step, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(number / step) * step));
+}
+
+function parseBackgroundSettings(raw) {
+  let value = {};
+  try {
+    value = JSON.parse(raw || '{}') || {};
+  } catch {
+    value = {};
+  }
+  return {
+    dim: clampStep(value.dim, 0, 90, 5, BACKGROUND_DEFAULTS.dim),
+    blur: clampStep(value.blur, 0, 24, 2, BACKGROUND_DEFAULTS.blur),
+  };
+}
+
+// Scales dimensions down so the longest edge fits; never scales up.
+function fitWithin(width, height, maxEdge) {
+  const longest = Math.max(width, height);
+  if (!(longest > maxEdge)) return { width: Math.round(width), height: Math.round(height) };
+  const scale = maxEdge / longest;
+  return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
+}
+
+function openBackgroundStore() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error('IndexedDB is unavailable'));
+      return;
+    }
+    const request = indexedDB.open(BACKGROUND_DB, 1);
+    request.onupgradeneeded = () => request.result.createObjectStore(BACKGROUND_STORE);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('IndexedDB could not be opened'));
+  });
+}
+
+async function backgroundTransaction(mode, action) {
+  const db = await openBackgroundStore();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(BACKGROUND_STORE, mode);
+      const request = action(transaction.objectStore(BACKGROUND_STORE));
+      transaction.oncomplete = () => resolve(request?.result);
+      transaction.onerror = () => reject(transaction.error || new Error('Background storage failed'));
+      transaction.onabort = () => reject(transaction.error || new Error('Background storage was aborted'));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function encodeBackground(file) {
+  if (!BACKGROUND_TYPES.has(file.type)) throw new Error('Choose a PNG, JPEG, WebP, GIF, or AVIF image.');
+  if (file.size > BACKGROUND_MAX_INPUT_BYTES) throw new Error('Choose an image smaller than 40 MB.');
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch {
+    throw new Error('This image could not be decoded.');
+  }
+  const size = fitWithin(bitmap.width, bitmap.height, BACKGROUND_MAX_EDGE);
+  const canvas = document.createElement('canvas');
+  canvas.width = size.width;
+  canvas.height = size.height;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0, size.width, size.height);
+  bitmap.close?.();
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.86));
+  if (!blob) throw new Error('This image could not be converted.');
+  return blob;
+}
+
+function applyBackgroundSettings(settings) {
+  dom.root.style.setProperty('--backdrop-dim', String(settings.dim / 100));
+  dom.root.style.setProperty('--backdrop-blur', `${settings.blur}px`);
+  dom.backgroundDim.value = String(settings.dim);
+  dom.backgroundBlur.value = String(settings.blur);
+  dom.backgroundDimValue.textContent = `${settings.dim}%`;
+  dom.backgroundBlurValue.textContent = settings.blur ? `${settings.blur} px` : 'Off';
+}
+
+function showBackground(blob) {
+  if (backgroundUrl) URL.revokeObjectURL(backgroundUrl);
+  backgroundUrl = blob ? URL.createObjectURL(blob) : '';
+  const image = backgroundUrl ? `url("${backgroundUrl}")` : '';
+  dom.appBackdrop.style.backgroundImage = image;
+  dom.backgroundPreview.style.backgroundImage = image;
+  dom.appBackdrop.hidden = !backgroundUrl;
+  dom.backgroundPreview.dataset.empty = String(!backgroundUrl);
+  dom.backgroundRemove.disabled = !backgroundUrl;
+  if (backgroundUrl) document.body.dataset.backdrop = 'image';
+  else delete document.body.dataset.backdrop;
+}
+
+function saveBackgroundSettings() {
+  const settings = parseBackgroundSettings(JSON.stringify({
+    dim: dom.backgroundDim.value, blur: dom.backgroundBlur.value,
+  }));
+  applyBackgroundSettings(settings);
+  try {
+    localStorage.setItem(BACKGROUND_SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    // The values still apply to this page.
+  }
+}
+
+async function chooseBackground(file) {
+  if (!file) return;
+  setFormStatus(dom.backgroundStatus, 'Preparing image…', 'busy');
+  dom.backgroundChoose.disabled = true;
+  try {
+    const blob = await encodeBackground(file);
+    showBackground(blob);
+    try {
+      await backgroundTransaction('readwrite', (store) => store.put(blob, 'current'));
+      setFormStatus(dom.backgroundStatus, 'Background saved in this browser.', 'ok');
+    } catch {
+      setFormStatus(dom.backgroundStatus, 'Background applied, but this browser could not store it; it resets on reload.', 'error');
+    }
+  } catch (error) {
+    setFormStatus(dom.backgroundStatus, error.message, 'error');
+  } finally {
+    dom.backgroundChoose.disabled = false;
+    dom.backgroundFile.value = '';
+  }
+}
+
+async function removeBackground() {
+  showBackground(null);
+  try {
+    await backgroundTransaction('readwrite', (store) => store.delete('current'));
+    setFormStatus(dom.backgroundStatus, 'Background removed.', 'ok');
+  } catch {
+    setFormStatus(dom.backgroundStatus, 'Background removed for this page; stored data could not be cleared.', 'error');
+  }
+}
+
+async function restoreBackground() {
+  try {
+    applyBackgroundSettings(parseBackgroundSettings(localStorage.getItem(BACKGROUND_SETTINGS_KEY)));
+  } catch {
+    applyBackgroundSettings({ ...BACKGROUND_DEFAULTS });
+  }
+  try {
+    const blob = await backgroundTransaction('readonly', (store) => store.get('current'));
+    if (blob instanceof Blob) showBackground(blob);
+  } catch {
+    // No stored background, or storage is blocked: keep the theme background.
+  }
+}
+
+dom.backgroundChoose.addEventListener('click', () => dom.backgroundFile.click());
+dom.backgroundFile.addEventListener('change', () => void chooseBackground(dom.backgroundFile.files?.[0]));
+dom.backgroundRemove.addEventListener('click', () => void removeBackground());
+dom.backgroundDim.addEventListener('input', saveBackgroundSettings);
+dom.backgroundBlur.addEventListener('input', saveBackgroundSettings);
+void restoreBackground();
 
 /* Composer status, menus, and reply usage */
 

@@ -182,6 +182,229 @@
   --shadow: 0 18px 60px rgb(52 45 70 / 16%);
 }
 
+:root[data-theme="ink"],
+.theme-preview[data-theme="ink"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --panel: #0b0b0d;
+  --raised: #151518;
+  --fg: #ededf0;
+  --muted: #a1a1aa;
+  --line: #26262b;
+  --line-strong: #3f3f46;
+  --accent: #7cc4ff;
+  --accent-ink: #04121f;
+  --accent-soft: #10243a;
+  --user-bg: #18181d;
+  --code-bg: #09090b;
+  --shadow: 0 18px 60px rgb(0 0 0 / 60%);
+}
+
+:root[data-theme="fjord"],
+.theme-preview[data-theme="fjord"] {
+  color-scheme: dark;
+  --bg: #22272f;
+  --panel: #282e38;
+  --raised: #303744;
+  --fg: #e5e9f0;
+  --muted: #a7b0c0;
+  --line: #3b4252;
+  --line-strong: #4c566a;
+  --accent: #88c0d0;
+  --accent-ink: #18262d;
+  --accent-soft: #2f4049;
+  --user-bg: #33404e;
+  --code-bg: #1c2027;
+  --danger: #f0a8ad;
+  --warning: #ebcb8b;
+}
+
+:root[data-theme="twilight"],
+.theme-preview[data-theme="twilight"] {
+  color-scheme: dark;
+  --bg: #16161e;
+  --panel: #1a1b26;
+  --raised: #232535;
+  --fg: #d7dcf5;
+  --muted: #9da4ca;
+  --line: #2c2f42;
+  --line-strong: #464c68;
+  --accent: #7dcfff;
+  --accent-ink: #0b2131;
+  --accent-soft: #1d2c42;
+  --user-bg: #272a4b;
+  --code-bg: #111118;
+  --danger: #f7a1b0;
+  --warning: #e8c38a;
+}
+
+:root[data-theme="mocha"],
+.theme-preview[data-theme="mocha"] {
+  color-scheme: dark;
+  --bg: #1e1e2e;
+  --panel: #232336;
+  --raised: #2c2c42;
+  --fg: #e2e4f3;
+  --muted: #a9adc8;
+  --line: #393a52;
+  --line-strong: #54566f;
+  --accent: #cba6f7;
+  --accent-ink: #251a38;
+  --accent-soft: #352d4d;
+  --user-bg: #33304a;
+  --code-bg: #181825;
+  --danger: #f5a3b5;
+  --warning: #f9d9a8;
+}
+
+:root[data-theme="ember"],
+.theme-preview[data-theme="ember"] {
+  color-scheme: dark;
+  --bg: #1a1512;
+  --panel: #221b17;
+  --raised: #2c231e;
+  --fg: #f2e8df;
+  --muted: #bca896;
+  --line: #3d3129;
+  --line-strong: #5a4a3e;
+  --accent: #f5b462;
+  --accent-ink: #2a1a06;
+  --accent-soft: #3e2d1b;
+  --user-bg: #382a1f;
+  --code-bg: #140f0c;
+  --danger: #f4a69a;
+  --warning: #f0cf86;
+}
+
+:root[data-theme="dusk"],
+.theme-preview[data-theme="dusk"] {
+  color-scheme: dark;
+  --bg: #1f1719;
+  --panel: #281d20;
+  --raised: #32252a;
+  --fg: #f3e5e8;
+  --muted: #c3a7ae;
+  --line: #45323a;
+  --line-strong: #654a53;
+  --accent: #f3a6b8;
+  --accent-ink: #3a1520;
+  --accent-soft: #4a2a33;
+  --user-bg: #40282f;
+  --code-bg: #180f12;
+  --danger: #f6a89e;
+  --warning: #ecc98d;
+}
+
+:root[data-theme="mint"],
+.theme-preview[data-theme="mint"] {
+  color-scheme: light;
+  --bg: #f4faf7;
+  --panel: #e9f4ee;
+  --raised: #ffffff;
+  --fg: #1f2d27;
+  --muted: #566b61;
+  --line: #cfe3d8;
+  --line-strong: #a6c7b6;
+  --accent: #1c7254;
+  --accent-ink: #ffffff;
+  --accent-soft: #d7efe4;
+  --user-bg: #d9efe5;
+  --code-bg: #e8f3ed;
+  --danger: #a53030;
+  --danger-soft: #f7e7e4;
+  --warning: #76570d;
+  --warning-soft: #f4edda;
+  --shadow: 0 18px 60px rgb(40 40 40 / 16%);
+}
+
+:root[data-theme="sky"],
+.theme-preview[data-theme="sky"] {
+  color-scheme: light;
+  --bg: #f5f8fc;
+  --panel: #eaf0f8;
+  --raised: #ffffff;
+  --fg: #1d2837;
+  --muted: #56657b;
+  --line: #d3deec;
+  --line-strong: #a9bcd5;
+  --accent: #245fa8;
+  --accent-ink: #ffffff;
+  --accent-soft: #dce8f8;
+  --user-bg: #dde8f7;
+  --code-bg: #ebf1f9;
+  --danger: #a53030;
+  --danger-soft: #f7e7e4;
+  --warning: #76570d;
+  --warning-soft: #f4edda;
+  --shadow: 0 18px 60px rgb(40 40 40 / 16%);
+}
+
+:root[data-theme="latte"],
+.theme-preview[data-theme="latte"] {
+  color-scheme: light;
+  --bg: #eff1f5;
+  --panel: #e6e9ef;
+  --raised: #fbfbfd;
+  --fg: #363950;
+  --muted: #62657c;
+  --line: #d4d7e1;
+  --line-strong: #acb0be;
+  --accent: #7432d6;
+  --accent-ink: #ffffff;
+  --accent-soft: #e6dcfa;
+  --user-bg: #e3e0f3;
+  --code-bg: #e6e9ef;
+  --danger: #a53030;
+  --danger-soft: #f7e7e4;
+  --warning: #76570d;
+  --warning-soft: #f4edda;
+  --shadow: 0 18px 60px rgb(40 40 40 / 16%);
+}
+
+:root[data-theme="peach"],
+.theme-preview[data-theme="peach"] {
+  color-scheme: light;
+  --bg: #fdf6f2;
+  --panel: #f8ebe4;
+  --raised: #fffbf9;
+  --fg: #3b2a24;
+  --muted: #77605a;
+  --line: #ecd8cf;
+  --line-strong: #d2b0a3;
+  --accent: #a33f24;
+  --accent-ink: #ffffff;
+  --accent-soft: #f8e0d6;
+  --user-bg: #f6e2d9;
+  --code-bg: #f6eae3;
+  --danger: #a53030;
+  --danger-soft: #f7e7e4;
+  --warning: #76570d;
+  --warning-soft: #f4edda;
+  --shadow: 0 18px 60px rgb(40 40 40 / 16%);
+}
+
+:root[data-theme="solar"],
+.theme-preview[data-theme="solar"] {
+  color-scheme: light;
+  --bg: #fdf6e3;
+  --panel: #f5eed8;
+  --raised: #fffcf2;
+  --fg: #2f3e44;
+  --muted: #5b6a6d;
+  --line: #e4dcc3;
+  --line-strong: #c9bf9f;
+  --accent: #176c67;
+  --accent-ink: #ffffff;
+  --accent-soft: #e0ecdc;
+  --user-bg: #ede5cb;
+  --code-bg: #f3ead2;
+  --danger: #a53030;
+  --danger-soft: #f7e7e4;
+  --warning: #76570d;
+  --warning-soft: #f4edda;
+  --shadow: 0 18px 60px rgb(40 40 40 / 16%);
+}
+
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]),
   .theme-preview[data-theme="system"] {
@@ -2508,6 +2731,7 @@ dialog input {
 .theme-picker legend { font-size: 13px; font-weight: 600; }
 .theme-picker > .hint { margin: 6px 0 16px; }
 .theme-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+.theme-group-label { grid-column: 1 / -1; margin: 6px 0 -4px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
 
 dialog .theme-card {
   position: relative;
@@ -3034,5 +3258,131 @@ dialog .theme-card {
   *::after {
     animation: none !important;
     transition: none !important;
+  }
+}
+
+/* Custom background */
+
+.app-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  background: var(--bg) center / cover no-repeat;
+}
+
+/* The image sits on a pseudo-element so blur does not blur the dim layer. */
+.app-backdrop::before,
+.app-backdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.app-backdrop::before {
+  background: inherit;
+  filter: blur(var(--backdrop-blur, 0px));
+  /* Slight overscan hides the transparent edge that blur creates. */
+  transform: scale(1.06);
+}
+
+.app-backdrop::after {
+  background: var(--bg);
+  opacity: var(--backdrop-dim, 0.55);
+}
+
+body[data-backdrop="image"] {
+  background: transparent;
+}
+
+body[data-backdrop="image"] .sidebar {
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+  backdrop-filter: blur(16px);
+}
+
+body[data-backdrop="image"] .topbar {
+  background: color-mix(in srgb, var(--bg) 35%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+body[data-backdrop="image"] .composer-region {
+  background: transparent;
+}
+
+body[data-backdrop="image"] .composer {
+  background: color-mix(in srgb, var(--panel) 84%, transparent);
+  backdrop-filter: blur(16px);
+}
+
+body[data-backdrop="image"] .tool-card,
+body[data-backdrop="image"] .helper-card,
+body[data-backdrop="image"] .approval-card,
+body[data-backdrop="image"] .notice {
+  backdrop-filter: blur(10px);
+}
+
+.background-picker {
+  margin: 28px 0 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.background-picker legend {
+  padding: 0;
+  font-weight: 600;
+}
+
+.background-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 240px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  margin-top: 12px;
+}
+
+.background-preview {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 16 / 10;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel) center / cover no-repeat;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.background-preview[data-empty="false"] span {
+  display: none;
+}
+
+.background-controls {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.background-controls .dialog-actions {
+  margin: 0 0 8px;
+}
+
+.background-controls label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.background-controls input[type="range"] {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent);
+}
+
+@media (max-width: 480px) {
+  .background-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
