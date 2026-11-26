@@ -376,6 +376,31 @@ impl ModelEntry {
     }
 }
 
+/// Thinking override for one exploration; inheritance uses the child's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplorationThinking {
+    /// Resolve model, provider, then global settings.
+    #[default]
+    Inherit,
+    /// Explicitly turn thinking off.
+    Off,
+    /// Request the adapter's low thinking level.
+    Low,
+}
+
+/// Offline configuration snapshot for one child invocation.
+#[derive(Debug, Clone)]
+pub struct ExplorationModel {
+    /// Selected configured model ID.
+    pub id: String,
+    /// Selected vendor model name.
+    pub vendor_model: String,
+    /// Enabled provider profile with the job's effective thinking setting.
+    pub provider: ProviderProfile,
+    /// Effective context settings of the selected model.
+    pub context_management: ContextManagementSettings,
+}
+
 /// Agent interaction mode: an identity plus its tool policy. The built-ins
 /// are `plan` (read-only) and `build` (full capability); further modes may
 /// be defined in configuration. `read_only` is enforced by the runtime at
@@ -539,6 +564,63 @@ impl UserConfig {
         Ok(model_effort
             .or(profile.task_reasoning_effort)
             .or(self.task_reasoning_effort))
+    }
+
+    /// Resolves a child model against the parent's profile and model snapshots
+    /// from session binding and a host-owned list of additional model IDs.
+    /// An unknown binding never falls back to a provider's default model.
+    ///
+    /// This does not resolve credentials or do discovery. The host must validate
+    /// the resulting profile with the adapter before doing either.
+    pub fn exploration_model(
+        &self,
+        parent: Option<(&ProviderProfile, &ModelEntry)>,
+        requested: Option<&str>,
+        allowed_models: &[String],
+        thinking: ExplorationThinking,
+    ) -> Result<ExplorationModel, ConfigError> {
+        let id = requested
+            .or(parent.map(|(_, model)| model.id.as_str()))
+            .ok_or(invalid("exploration requires an explicit allowed model"))?;
+        check_id("model id", id)?;
+        let entry = self
+            .model(id)
+            .ok_or(invalid("exploration model is unknown"))?;
+        let mut profile = self
+            .provider(&entry.provider)
+            .filter(|profile| profile.enabled)
+            .ok_or(invalid("exploration provider is unavailable"))?
+            .clone();
+        let matches_parent = parent.is_some_and(|(provider, model)| {
+            model.id == id
+                && model.provider == profile.id
+                && model.name == entry.name
+                && provider.id == profile.id
+                && provider.endpoint == profile.endpoint
+                && provider.adapter == profile.adapter
+                && provider.protocol == profile.protocol
+                && provider.credential == profile.credential
+        });
+        if !matches_parent
+            && (requested.is_none() || !allowed_models.iter().any(|allowed| allowed == id))
+        {
+            return Err(invalid("exploration model is not allowed"));
+        }
+        let effort = match thinking {
+            ExplorationThinking::Inherit => {
+                self.task_reasoning_effort_for(&entry.provider, Some(id))?
+            }
+            ExplorationThinking::Off => Some(ReasoningEffort::Disabled),
+            ExplorationThinking::Low => Some(ReasoningEffort::Low),
+        };
+        validate_task_reasoning_effort(&profile, effort)?;
+        profile.task_reasoning_effort = effort;
+        Ok(ExplorationModel {
+            id: entry.id.clone(),
+            vendor_model: entry.name.clone(),
+            provider: profile,
+            context_management: self.context_management_for(&entry.provider, Some(id))?,
+        })
     }
 
     /// Whether the local TUI reveals provider-returned reasoning by default.
@@ -1430,6 +1512,88 @@ fn parse_mode(object: &Map<String, Value>) -> Result<AgentMode, ConfigError> {
         require_str(object, "label")?.to_owned(),
         read_only,
     )
+}
+
+#[cfg(test)]
+mod exploration_model_tests {
+    use super::*;
+
+    fn config() -> UserConfig {
+        UserConfig::from_json(
+            r#"{
+                "revision":2,
+                "task_reasoning_effort":"low",
+                "providers":[
+                    {"id":"local","display_name":"Local","adapter":"direct","protocol":"chat_completions","endpoint":"http://localhost:11434/v1","credential":{"env":"NEXUS_TEST_UNUSED_TOKEN"},"default_model":"parent","task_reasoning_effort":"none"},
+                    {"id":"other","display_name":"Other","adapter":"direct","protocol":"chat_completions","endpoint":"http://other:11434/v1","credential":{"env":"NEXUS_TEST_UNUSED_TOKEN"},"default_model":"child"}
+                ],
+                "models":[
+                    {"id":"parent","provider":"local","name":"parent"},
+                    {"id":"child","provider":"other","name":"child","max_output_tokens":512,"task_reasoning_effort":"none"},
+                    {"id":"global","provider":"other","name":"global"}
+                ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn exploration_requires_bound_identity_or_explicit_allowlist() {
+        let config = config();
+        let profile = config.provider("local").unwrap();
+        let model = config.model("parent").unwrap();
+        let parent = Some((profile, model));
+        let allow = ["child".into()];
+        let select = |parent, requested, allow: &[String]| {
+            config.exploration_model(parent, requested, allow, ExplorationThinking::Inherit)
+        };
+        assert_eq!(select(parent, None, &[]).unwrap().vendor_model, "parent");
+        assert!(select(parent, Some("child"), &[]).is_err());
+        assert!(select(None, None, &allow).is_err());
+        assert!(select(None, Some("parent"), &[]).is_err());
+        let selected = select(None, Some("child"), &allow).unwrap();
+        assert_eq!(selected.provider.id, "other");
+        assert_eq!(selected.context_management.max_output_tokens, Some(512));
+        let mut stale_profile = profile.clone();
+        stale_profile.endpoint = Some("http://previous:11434/v1".into());
+        assert!(
+            config
+                .exploration_model(
+                    Some((&stale_profile, model)),
+                    None,
+                    &["parent".into()],
+                    ExplorationThinking::Inherit,
+                )
+                .is_err()
+        );
+        let mut disabled = config.clone();
+        disabled.providers[1].enabled = false;
+        assert!(
+            disabled
+                .exploration_model(None, Some("child"), &allow, ExplorationThinking::Off)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exploration_thinking_overrides_only_the_selected_snapshot() {
+        let config = config();
+        let allowed = ["parent".into(), "child".into(), "global".into()];
+        let select = |id, thinking| {
+            config
+                .exploration_model(None, Some(id), &allowed, thinking)
+                .unwrap()
+                .provider
+                .task_reasoning_effort
+        };
+        use ExplorationThinking::{Inherit, Low, Off};
+        assert_eq!(select("parent", Inherit), Some(ReasoningEffort::Disabled));
+        assert_eq!(select("child", Inherit), Some(ReasoningEffort::Disabled));
+        assert_eq!(select("global", Inherit), Some(ReasoningEffort::Low));
+        assert_eq!(select("child", Low), Some(ReasoningEffort::Low));
+        assert_eq!(select("global", Off), Some(ReasoningEffort::Disabled));
+        assert_eq!(select("child", Inherit), Some(ReasoningEffort::Disabled));
+    }
 }
 
 #[cfg(test)]

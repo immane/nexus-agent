@@ -322,6 +322,25 @@ impl OpenAiProvider {
         Ok(adapter)
     }
 
+    /// Validates a resolved exploration model without credentials or network
+    /// discovery. The caller installs the resolved credential after admission.
+    pub fn for_exploration(
+        selection: &nexus_config::ExplorationModel,
+        settings: &ProviderSettings,
+    ) -> Result<Self, AgentError> {
+        let adapter = Self::from_profile(&selection.provider, &selection.vendor_model)?
+            .with_operational_settings(settings)?
+            .with_context_management(selection.context_management);
+        let capabilities = adapter.capabilities();
+        if !capabilities.text || !capabilities.tool_calls {
+            return Err(provider_error_inner(
+                ErrorCategory::UnsupportedCapability,
+                "exploration requires text and tool calls",
+            ));
+        }
+        Ok(adapter)
+    }
+
     /// Binds timeout and retry settings without performing any network I/O.
     /// Apply this before context discovery so its timeout also takes effect.
     ///
@@ -4031,6 +4050,34 @@ mod reasoning_effort_tests {
             "model",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn exploration_adapter_checks_thinking_without_credentials_or_discovery() {
+        use nexus_config::{ExplorationModel, ProviderSettings};
+
+        let mut selection = ExplorationModel {
+            id: "child".into(),
+            vendor_model: "child-model".into(),
+            provider: profile("https://api.example.com/v1", ProtocolKind::ChatCompletions),
+            context_management: Default::default(),
+        };
+        let settings = ProviderSettings::default();
+        assert!(OpenAiProvider::for_exploration(&selection, &settings).is_ok());
+        selection.provider.task_reasoning_effort = Some(ReasoningEffort::Low);
+        let error = OpenAiProvider::for_exploration(&selection, &settings)
+            .err()
+            .expect("unsupported endpoint");
+        assert_eq!(
+            error.category(),
+            nexus_core::ErrorCategory::UnsupportedCapability
+        );
+
+        selection.provider.endpoint = Some("http://localhost:11434/v1".into());
+        let adapter = OpenAiProvider::for_exploration(&selection, &settings).unwrap();
+        let body = adapter.request_body(&request(false)).unwrap();
+        assert_eq!(body["model"], "child-model");
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     #[test]

@@ -11,8 +11,12 @@ and host-supplied project-jailed read registrations, returns a bounded result
 at most once, and signals all unfinished children on parent cancellation.
 The tools crate supplies a project-local read/list/search set that rejects
 external targets and protected paths without consulting parent grants.
-There is no configured model resolution, Web tool registration, child inbox
-handoff, proposal application, or background recovery yet. The host must
+Offline model selection checks the admitted parent model identity or a
+host-supplied allowlist, resolves the selected model's context and thinking
+settings, and validates the adapter without credentials or discovery.
+The server does not yet supply the allowlist or expose delegation tools;
+child inbox handoff, proposal application, and background recovery are also
+not implemented. The host must
 enforce the parent tool-call budget and project scope before exposing this
 primitive to a model.
 
