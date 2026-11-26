@@ -31,6 +31,31 @@ The client supports:
   sent to the server. While an image is active, the sidebar, top bar, and
   composer become translucent with a backdrop blur. If storage is blocked, the
   image applies to the current page only and the status says so.
+- **Use image colors** builds a full theme from a 48 px sample of the current
+  background in the browser: the largest color region tints the surfaces, and
+  the most vivid color covering at least 2% of the image becomes the accent
+  (near-gray images fall back to a calm accent from the base hue). **Match
+  image** picks a dark or light scheme from the image's average luminance;
+  **Dark** and **Light** force one. Text, muted text, accent, button labels,
+  and status colors are adjusted until they meet WCAG AA (4.5:1; body text 7:1)
+  against the surfaces they sit on. Swatches show the result. The colors are
+  applied as inline custom properties on the root, so turning the option off,
+  removing the image, or choosing a built-in theme restores the normal palette
+  without a reload. The brightness choice is kept in `localStorage`; no image or
+  colors are uploaded.
+- **Recently used** keeps up to five backgrounds in the same browser's
+  IndexedDB. Selecting a thumbnail applies the image and moves it to the
+  front; the active entry is marked, and a dashed tile adds another image while
+  there is room. Deleting a history entry does not remove the active background;
+  use **Remove** to clear the active image. The preview shows the dim level over
+  a small mock of the workspace.
+- **Text and layout** settings (Appearance) are kept in `localStorage`
+  (`nexus.interface`): interface text size (90/100/110/125%, applied with CSS
+  `zoom` on the page body), message text size (13–20 px, also scaling code and
+  tables), message width (720 px, 860 px, 1080 px, or full), line spacing, and
+  an animation switch that reduces motion regardless of the system setting.
+  Viewport-based heights and popover coordinates are divided by the zoom
+  factor so the composer and menus stay in place. Reset restores the defaults.
 
 The client supports saved-session listing and restore when the server enables
 persistence. It does not implement concurrent multi-session editing, file

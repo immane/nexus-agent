@@ -38,3 +38,16 @@ test('session loading shows its indicator without a dimmed or blurred overlay', 
   assert.match(loading, /display:\s*flex\s*;/);
   assert.doesNotMatch(loading, /(?:background(?:-color)?|backdrop-filter)\s*:/);
 });
+
+test('focusing a visually hidden setting cannot scroll the settings dialog out of its frame', () => {
+  // `overflow: hidden` boxes remain scrollable by focus; `clip` does not.
+  const dialog = rules.filter((entry) => entry.selectors === 'dialog').map((entry) => entry.body).join('\n');
+  assert.match(dialog, /overflow:\s*clip\s*;/);
+  assert.doesNotMatch(dialog, /overflow:\s*(auto|scroll)\s*;/);
+  // Hidden radios are positioned inside their own option, so focus scrolls
+  // at most the settings panel that contains them.
+  const all = (selector) => rules.filter((entry) => entry.selectors === selector).map((entry) => entry.body).join('\n');
+  for (const selector of ['.segmented label', '.settings-content', 'dialog .theme-card']) {
+    assert.match(all(selector), /position:\s*relative\s*;/, selector);
+  }
+});
