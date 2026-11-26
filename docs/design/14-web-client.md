@@ -78,7 +78,11 @@ unsafe or malformed targets remain plain text. Raw HTML is displayed as text.
 Inline Markdown images (`![alt](url)`) can display same-origin images; external
 HTTPS images require an explicit click and send no referrer. Completed replies
 and restored history also preview project images, for example
-`![Plot](resources/assets/plot.svg)`. Math uses the browser's native MathML, with
+`![Plot](resources/assets/plot.svg)`. Clicking a Markdown image or a project-image
+canvas opens a full-screen dark overlay with the image fitted to the viewport;
+clicking anywhere or pressing Escape closes it. Project-image canvases are
+rasterized to a PNG data URL for the overlay, so SVG markup is never attached
+as a page link. Math uses the browser's native MathML, with
 no external assets. It supports `$...$` and `\(...\)` inline, and `$$...$$` and `\[...\]` on
 their own lines. The built-in TeX subset includes common symbols and functions,
 scripts and operator limits, fractions, indexed roots, binomials, accents,

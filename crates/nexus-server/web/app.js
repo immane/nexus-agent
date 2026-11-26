@@ -98,6 +98,8 @@ const dom = {
   sideQuestion: document.querySelector('#side-question'),
   sideQuestionAnswer: document.querySelector('#side-question-answer'),
   sideQuestionUsage: document.querySelector('#side-question-usage'),
+  imageLightbox: document.querySelector('#image-lightbox'),
+  imageLightboxImage: document.querySelector('#image-lightbox-image'),
   composerActivity: document.querySelector('#composer-activity'),
   send: document.querySelector('#send'),
   cancel: document.querySelector('#cancel-run'),
@@ -2539,8 +2541,9 @@ async function loadProjectImage(placeholder, session, target) {
     canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
     canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
     canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
-    canvas.setAttribute('role', 'img');
-    canvas.setAttribute('aria-label', placeholder.textContent);
+    canvas.tabIndex = 0;
+    canvas.setAttribute('role', 'button');
+    canvas.setAttribute('aria-label', `Enlarge ${placeholder.textContent || 'project image'}`);
     placeholder.replaceWith(canvas);
   } catch {
     placeholder.append(document.createTextNode(' (project image unavailable)'));
@@ -2588,6 +2591,9 @@ function appendMarkdownImage(parent, label, target, title, inLink) {
   const image = node('img', 'md-image');
   image.alt = label;
   if (title) image.title = title;
+  image.tabIndex = 0;
+  image.setAttribute('role', 'button');
+  image.setAttribute('aria-label', label ? `Enlarge image: ${label}` : 'Enlarge image');
   image.loading = 'lazy';
   image.decoding = 'async';
   image.referrerPolicy = 'no-referrer';
@@ -2606,6 +2612,53 @@ function appendMarkdownImage(parent, label, target, title, inLink) {
   } else {
     parent.append(document.createTextNode(label || 'Image'));
   }
+}
+
+function imagePreviewSource(source) {
+  if (!source) return null;
+  if (source.tagName === 'CANVAS') {
+    try {
+      return {
+        src: source.toDataURL('image/png'),
+        alt: source.getAttribute('aria-label') || 'Project image',
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (source.tagName === 'IMG') {
+    const src = source.currentSrc || source.src;
+    return src ? { src, alt: source.alt || source.getAttribute('aria-label') || 'Image' } : null;
+  }
+  return null;
+}
+
+let imageLightboxReturnFocus = null;
+
+function enlargeImage(source) {
+  const preview = imagePreviewSource(source);
+  if (!preview || !dom.imageLightbox || !dom.imageLightboxImage) return false;
+  imageLightboxReturnFocus = source?.focus ? source : null;
+  dom.imageLightboxImage.src = preview.src;
+  dom.imageLightboxImage.alt = preview.alt;
+  dom.imageLightbox.hidden = false;
+  document.body.classList.add('image-lightbox-open');
+  dom.imageLightbox.focus?.();
+  return true;
+}
+
+function closeImageLightbox() {
+  if (!dom.imageLightbox || dom.imageLightbox.hidden) return;
+  dom.imageLightbox.hidden = true;
+  dom.imageLightboxImage?.removeAttribute('src');
+  document.body.classList.remove('image-lightbox-open');
+  const target = imageLightboxReturnFocus;
+  imageLightboxReturnFocus = null;
+  if (target?.isConnected !== false) target?.focus?.();
+}
+
+function imageFromEvent(event) {
+  return event.target?.closest?.('img.md-image, canvas.md-image') || null;
 }
 
 const MATH_SOURCE_LIMIT = 4096;
@@ -4534,6 +4587,28 @@ dom.addProjectSidebar.addEventListener('click', () => {
 });
 dom.settings.addEventListener('close', () => {
   dom.token.value = '';
+});
+
+dom.imageLightbox?.addEventListener('click', closeImageLightbox);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && dom.imageLightbox && !dom.imageLightbox.hidden) {
+    event.preventDefault();
+    closeImageLightbox();
+  }
+});
+dom.conversation.addEventListener('click', (event) => {
+  const image = imageFromEvent(event);
+  if (!image) return;
+  event.preventDefault();
+  event.stopPropagation();
+  enlargeImage(image);
+}, true);
+dom.conversation.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const image = imageFromEvent(event);
+  if (!image || event.target !== image) return;
+  event.preventDefault();
+  enlargeImage(image);
 });
 
 dom.connectionForm.addEventListener('submit', (event) => {

@@ -365,7 +365,9 @@ test('visible project SVGs use authenticated fetch and never expose the decoded 
   assert.equal(calls[0][1].headers.Authorization, 'Bearer test-token');
   assert.deepEqual(JSON.parse(calls[0][1].body), { path: 'assets/my chart.svg' });
   const [canvas] = find(root, 'canvas');
-  assert.equal(canvas.attributes['aria-label'], 'Chart');
+  assert.equal(canvas.attributes['aria-label'], 'Enlarge Chart');
+  assert.equal(canvas.attributes.role, 'button');
+  assert.equal(canvas.tabIndex, 0);
   assert.deepEqual(bitmap.slice(1), [0, 0, 1600, 800]);
   assert.deepEqual(revoked, ['blob:private']);
   assert.equal(find(root, 'img').length, 0);
