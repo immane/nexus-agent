@@ -1041,8 +1041,6 @@ main { position: relative; }
   justify-content: center;
   gap: 12px;
   color: var(--muted);
-  background: color-mix(in srgb, var(--bg) 92%, transparent);
-  backdrop-filter: blur(4px);
 }
 
 main[data-loading="true"] > .conversation,
@@ -3313,13 +3311,6 @@ body[data-backdrop="image"] .composer-region {
 body[data-backdrop="image"] .composer {
   background: color-mix(in srgb, var(--panel) 84%, transparent);
   backdrop-filter: blur(16px);
-}
-
-body[data-backdrop="image"] .tool-card,
-body[data-backdrop="image"] .helper-card,
-body[data-backdrop="image"] .approval-card,
-body[data-backdrop="image"] .notice {
-  backdrop-filter: blur(10px);
 }
 
 .background-picker {

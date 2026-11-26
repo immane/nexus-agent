@@ -24,3 +24,17 @@ test('framed controls keep their normal border', () => {
   assert.match(rule('.composer'), /border:\s*1px solid var\(--line\)\s*;/);
   assert.match(rule('.composer:focus-within'), /border-color:\s*var\(--accent\)\s*;/);
 });
+
+test('conversation results do not blur the backdrop', () => {
+  for (const { selectors, body } of rules) {
+    if (/\.(?:tool-card|helper-card|approval-card|notice|run-card)\b/.test(selectors)) {
+      assert.doesNotMatch(body, /backdrop-filter\s*:/);
+    }
+  }
+});
+
+test('session loading shows its indicator without a dimmed or blurred overlay', () => {
+  const loading = rule('.session-loading');
+  assert.match(loading, /display:\s*flex\s*;/);
+  assert.doesNotMatch(loading, /(?:background(?:-color)?|backdrop-filter)\s*:/);
+});
