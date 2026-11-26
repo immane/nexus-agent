@@ -73,10 +73,10 @@ impl Controls {
 
     pub(super) fn registrations(self: &Arc<Self>) -> [ToolRegistration; 2] {
         [true, false].map(|start| {
-            let (name, description, mut schema) = if start {
+            let (name, mut description, mut schema) = if start {
                 (
                     "delegate_start",
-                    "Start a read-only project task. Role explore investigates; propose suggests one exact text replacement and requires delegate_await. Thinking: inherit, off, or low.",
+                    "Start a read-only background task. Explore can answer directly or investigate the project. Propose suggests one exact text replacement and requires delegate_await. Omit thinking to inherit configured settings; use off or low only on supported Ollama Direct / Chat Completions endpoints.".to_owned(),
                     json!({
                         "type": "object",
                         "properties": {
@@ -92,7 +92,7 @@ impl Controls {
             } else {
                 (
                     "delegate_await",
-                    "Wait for and collect one background task result started in this run.",
+                    "Wait for and collect one background task result started in this run.".to_owned(),
                     json!({
                         "type": "object",
                         "properties": {"job_id":{"type":"string"}},
@@ -103,6 +103,7 @@ impl Controls {
             };
             if start && self.supports_child_completion {
                 schema["properties"]["delivery"] = json!({"type":"string"});
+                description.push_str(" Explore delivery defaults to steer, or choose queue to defer. Set delivery to await when collecting with delegate_await. Propose only supports await.");
             }
             let spec = ToolSpec::new(
                 ToolId::new(name, M0_REVISION).expect("static tool id"),
@@ -210,12 +211,20 @@ impl Control {
                     &controls.allowed_models,
                     thinking,
                 )
-                .map_err(|_| "exploration model or thinking is not allowed")?;
+                .map_err(|error| error.message())?;
             let adapter = nexus_openai::OpenAiProvider::for_exploration(
                 &selected,
                 &controls.provider_settings,
             )
-            .map_err(|_| "exploration model or thinking is unsupported")?;
+            .map_err(|error| {
+                if error.category() == nexus_core::ErrorCategory::UnsupportedCapability
+                    && !matches!(thinking, ExplorationThinking::Inherit)
+                {
+                    "Selected endpoint does not support explicit thinking. Omit thinking to inherit settings if acceptable."
+                } else {
+                    "exploration model or inherited thinking is unsupported"
+                }
+            })?;
             let credential = resolve_credential_at(
                 &selected.provider.credential,
                 controls.credentials.as_deref(),

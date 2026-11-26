@@ -1623,7 +1623,7 @@ impl Runtime {
                 "",
                 match role {
                     crate::ExplorationRole::Explore => {
-                        "Explore the assigned task using read-only evidence. Return a short conclusion, project-relative file references, and uncertainty."
+                        "Complete the assigned task concisely and follow its requested output format. If the task can be answered without project evidence, answer directly without using tools. If it needs project evidence, use only read-only tools and include relevant project-relative references and material uncertainty."
                     }
                     crate::ExplorationRole::Propose => {
                         "Use only read-only evidence. Return exactly one JSON object with string fields path, old_text, and new_text. The path must be project-relative and existing, old_text must match exactly once, and new_text must differ. Do not include Markdown fences or apply the change."

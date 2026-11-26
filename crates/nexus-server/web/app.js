@@ -115,7 +115,18 @@ const dom = {
   backgroundDimValue: document.querySelector('#background-dim-value'),
   backgroundBlur: document.querySelector('#background-blur'),
   backgroundBlurValue: document.querySelector('#background-blur-value'),
+  backgroundPalette: document.querySelector('#background-palette'),
+  backgroundPaletteStatus: document.querySelector('#background-palette-status'),
+  backgroundPaletteModes: document.querySelector('#background-palette-modes'),
+  backgroundPaletteSwatches: document.querySelector('#background-palette-swatches'),
+  backgroundHistory: document.querySelector('#background-history'),
+  backgroundHistoryList: document.querySelector('#background-history-list'),
   backgroundStatus: document.querySelector('#background-status'),
+  backgroundHistoryCount: document.querySelector('#background-history-count'),
+  interfaceSettings: document.querySelector('#interface-settings'),
+  interfaceReset: document.querySelector('#interface-reset'),
+  contentSize: document.querySelector('#content-size'),
+  contentSizeValue: document.querySelector('#content-size-value'),
   helperStatus: document.querySelector('#helper-status'),
   contextMeter: document.querySelector('#context-meter'),
   contextRing: document.querySelector('#context-ring'),
@@ -4805,19 +4816,105 @@ async function reconcileAfterLoss(error) {
   );
 }
 
+/* Interface settings */
+
+// Text size, message width, spacing, and motion are browser preferences.
+// Interface size uses CSS zoom on the page body, so popover coordinates and
+// viewport-based heights are corrected by the same factor.
+const INTERFACE_KEY = 'nexus.interface';
+const INTERFACE_DEFAULTS = { uiScale: 100, contentSize: 15, contentWidth: 'default', lineSpacing: 'default', motion: 'system' };
+const UI_SCALES = [90, 100, 110, 125];
+const CONTENT_WIDTHS = { narrow: '720px', default: '860px', wide: '1080px', full: '100%' };
+const LINE_SPACINGS = { compact: '1.55', default: '1.75', relaxed: '1.95' };
+
+function parseInterfaceSettings(raw) {
+  let value = {};
+  try {
+    value = JSON.parse(raw || '{}') || {};
+  } catch {
+    value = {};
+  }
+  const pick = (allowed, candidate, fallback) => Object.hasOwn(allowed, candidate) ? candidate : fallback;
+  const scale = Number(value.uiScale);
+  return {
+    uiScale: UI_SCALES.includes(scale) ? scale : INTERFACE_DEFAULTS.uiScale,
+    contentSize: clampStep(value.contentSize, 13, 20, 1, INTERFACE_DEFAULTS.contentSize),
+    contentWidth: pick(CONTENT_WIDTHS, value.contentWidth, INTERFACE_DEFAULTS.contentWidth),
+    lineSpacing: pick(LINE_SPACINGS, value.lineSpacing, INTERFACE_DEFAULTS.lineSpacing),
+    motion: value.motion === 'reduce' ? 'reduce' : 'system',
+  };
+}
+
+function interfaceZoom() {
+  return Number(getComputedStyle(dom.root).getPropertyValue('--ui-scale')) || 1;
+}
+
+function applyInterfaceSettings(settings) {
+  const style = dom.root.style;
+  style.setProperty('--ui-scale', String(settings.uiScale / 100));
+  style.setProperty('--content-font-size', `${settings.contentSize}px`);
+  style.setProperty('--content-width', CONTENT_WIDTHS[settings.contentWidth]);
+  style.setProperty('--content-line-height', LINE_SPACINGS[settings.lineSpacing]);
+  if (settings.motion === 'reduce') dom.root.dataset.motion = 'reduce';
+  else delete dom.root.dataset.motion;
+  const values = { 'ui-scale': String(settings.uiScale), 'content-width': settings.contentWidth,
+    'line-spacing': settings.lineSpacing, motion: settings.motion };
+  for (const input of dom.interfaceSettings.querySelectorAll('input[type="radio"]')) {
+    input.checked = values[input.name] === input.value;
+  }
+  dom.contentSize.value = String(settings.contentSize);
+  dom.contentSizeValue.textContent = `${settings.contentSize} px`;
+}
+
+function currentInterfaceSettings() {
+  const checked = (name) => dom.interfaceSettings.querySelector(`input[name="${name}"]:checked`)?.value;
+  return parseInterfaceSettings(JSON.stringify({
+    uiScale: checked('ui-scale'), contentSize: dom.contentSize.value,
+    contentWidth: checked('content-width'), lineSpacing: checked('line-spacing'), motion: checked('motion'),
+  }));
+}
+
+function saveInterfaceSettings(settings) {
+  applyInterfaceSettings(settings);
+  try {
+    localStorage.setItem(INTERFACE_KEY, JSON.stringify(settings));
+  } catch {
+    // The values still apply to this page.
+  }
+}
+
+try {
+  applyInterfaceSettings(parseInterfaceSettings(localStorage.getItem(INTERFACE_KEY)));
+} catch {
+  applyInterfaceSettings({ ...INTERFACE_DEFAULTS });
+}
+dom.interfaceSettings.addEventListener('change', () => saveInterfaceSettings(currentInterfaceSettings()));
+dom.contentSize.addEventListener('input', () => saveInterfaceSettings(currentInterfaceSettings()));
+dom.interfaceReset.addEventListener('click', () => saveInterfaceSettings({ ...INTERFACE_DEFAULTS }));
+
 /* Custom background */
 
 // The image never leaves the browser: it is decoded, resized, and re-encoded
 // locally (dropping metadata), then kept as a Blob in IndexedDB. Dim and blur
 // are small settings in localStorage.
 const BACKGROUND_SETTINGS_KEY = 'nexus.background';
+const BACKGROUND_PALETTE_KEY = 'nexus.backgroundPalette';
+const BACKGROUND_PALETTE_MODE_KEY = 'nexus.backgroundPaletteMode';
 const BACKGROUND_DB = 'nexus-appearance';
 const BACKGROUND_STORE = 'images';
+const BACKGROUND_HISTORY_LIMIT = 5;
 const BACKGROUND_MAX_EDGE = 2560;
 const BACKGROUND_MAX_INPUT_BYTES = 40 * 1024 * 1024;
 const BACKGROUND_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif']);
 const BACKGROUND_DEFAULTS = { dim: 55, blur: 0 };
 let backgroundUrl = '';
+let backgroundBlob = null;
+let backgroundPaletteRevision = 0;
+let backgroundPaletteMode = 'auto';
+let recentBackgrounds = [];
+let recentBackgroundUrls = [];
+let currentBackgroundId = null;
+let backgroundBusy = true;
 
 function clampStep(value, min, max, step, fallback) {
   const number = Number(value);
@@ -4844,6 +4941,233 @@ function fitWithin(width, height, maxEdge) {
   if (!(longest > maxEdge)) return { width: Math.round(width), height: Math.round(height) };
   const scale = maxEdge / longest;
   return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
+}
+
+// Color helpers for image palettes. Channels are 0–255; hue is degrees,
+// saturation and lightness are 0–1.
+function hexToRgb(hex) {
+  const value = Number.parseInt(hex.slice(1), 16);
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+}
+
+function rgbToHex([r, g, b]) {
+  return `#${[r, g, b].map((channel) => Math.round(Math.min(255, Math.max(0, channel))).toString(16).padStart(2, '0')).join('')}`;
+}
+
+function rgbToHsl([r, g, b]) {
+  const [red, green, blue] = [r / 255, g / 255, b / 255];
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  const lightness = (max + min) / 2;
+  if (max === min) return [0, 0, lightness];
+  const delta = max - min;
+  const saturation = delta / (1 - Math.abs(2 * lightness - 1));
+  const hue = max === red ? ((green - blue) / delta + 6) % 6 : max === green ? (blue - red) / delta + 2 : (red - green) / delta + 4;
+  return [hue * 60, Math.min(1, saturation), lightness];
+}
+
+function hslToHex(hue, saturation, lightness) {
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+  const x = chroma * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = lightness - chroma / 2;
+  const [r, g, b] = hue < 60 ? [chroma, x, 0] : hue < 120 ? [x, chroma, 0] : hue < 180 ? [0, chroma, x]
+    : hue < 240 ? [0, x, chroma] : hue < 300 ? [x, 0, chroma] : [chroma, 0, x];
+  return rgbToHex([(r + m) * 255, (g + m) * 255, (b + m) * 255]);
+}
+
+function relativeLuminance(hex) {
+  const linear = hexToRgb(hex).map((channel) => {
+    const value = channel / 255;
+    return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+}
+
+function contrastRatio(a, b) {
+  const [high, low] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+  return (high + 0.05) / (low + 0.05);
+}
+
+// Moves lightness away from the surfaces until the color reaches `minimum`
+// contrast against all of them, keeping hue and saturation.
+function readableColor(hue, saturation, lightness, surfaces, minimum, lighter) {
+  let value = lightness;
+  for (let step = 0; step < 100; step += 1) {
+    const color = hslToHex(hue, saturation, value);
+    if (surfaces.every((surface) => contrastRatio(color, surface) >= minimum)) return color;
+    value = lighter ? Math.min(1, value + 0.01) : Math.max(0, value - 0.01);
+  }
+  return lighter ? '#ffffff' : '#000000';
+}
+
+// Summarizes an image as its largest color region (base), its most vivid
+// well-represented color (accent), and its average lightness.
+function extractImageColors(pixels) {
+  const groups = new Map();
+  let visible = 0;
+  let lightness = 0;
+  for (let i = 0; i + 3 < pixels.length; i += 4) {
+    if (pixels[i + 3] < 128) continue;
+    const r = pixels[i];
+    const g = pixels[i + 1];
+    const b = pixels[i + 2];
+    const key = ((r >> 5) << 6) | ((g >> 5) << 3) | (b >> 5);
+    const group = groups.get(key) ?? { r: 0, g: 0, b: 0, count: 0 };
+    group.r += r;
+    group.g += g;
+    group.b += b;
+    group.count += 1;
+    groups.set(key, group);
+    visible += 1;
+    lightness += relativeLuminance(rgbToHex([r, g, b]));
+  }
+  if (!visible) return null;
+  const average = (group) => rgbToHex([group.r / group.count, group.g / group.count, group.b / group.count]);
+  const ranked = [...groups.values()].sort((a, b) => b.count - a.count);
+  const base = average(ranked[0]);
+  let accent = null;
+  let best = -1;
+  for (const group of ranked) {
+    // Ignore specks: an accent must cover at least 2% of the visible image.
+    if (group.count / visible < 0.02) continue;
+    const [, saturation, light] = rgbToHsl(hexToRgb(average(group)));
+    const vividness = saturation * (1 - Math.abs(2 * light - 1)) * Math.sqrt(group.count / visible);
+    if (vividness > best) {
+      best = vividness;
+      accent = average(group);
+    }
+  }
+  return { base, accent: accent || base, lightness: lightness / visible };
+}
+
+// Builds a full theme from extracted colors. Every text color is checked
+// against the surfaces it appears on so the result meets WCAG AA (4.5:1).
+function buildImagePalette(colors, mode = 'auto') {
+  const scheme = mode === 'light' || mode === 'dark' ? mode : colors.lightness > 0.45 ? 'light' : 'dark';
+  const [baseHue, baseSaturation] = rgbToHsl(hexToRgb(colors.base));
+  let [accentHue, accentSaturation] = rgbToHsl(hexToRgb(colors.accent));
+  // Near-gray images get a calm accent from the base hue rather than gray.
+  if (accentSaturation < 0.18) [accentHue, accentSaturation] = [baseHue, Math.max(baseSaturation, 0.35)];
+  const tint = Math.min(baseSaturation, scheme === 'dark' ? 0.3 : 0.35);
+  const vivid = Math.min(0.85, Math.max(0.45, accentSaturation));
+  const surface = (light, extra = 0) => hslToHex(baseHue, Math.min(1, tint + extra), light);
+  const dark = scheme === 'dark';
+  const palette = dark ? {
+    bg: surface(0.08), panel: surface(0.11), raised: surface(0.15),
+    line: surface(0.22), 'line-strong': surface(0.33), 'code-bg': surface(0.06),
+    'user-bg': hslToHex(accentHue, Math.min(vivid, 0.3), 0.19),
+    'accent-soft': hslToHex(accentHue, Math.min(vivid, 0.35), 0.2),
+  } : {
+    bg: surface(0.97), panel: surface(0.94), raised: surface(0.99),
+    line: surface(0.86), 'line-strong': surface(0.73), 'code-bg': surface(0.93),
+    'user-bg': hslToHex(accentHue, Math.min(vivid, 0.5), 0.91),
+    'accent-soft': hslToHex(accentHue, Math.min(vivid, 0.5), 0.9),
+  };
+  const surfaces = [palette.bg, palette.panel, palette.raised, palette['user-bg'], palette['accent-soft']];
+  palette.fg = readableColor(baseHue, Math.min(tint, 0.15), dark ? 0.92 : 0.15, surfaces, 7, dark);
+  palette.muted = readableColor(baseHue, Math.min(tint, 0.18), dark ? 0.68 : 0.42, [palette.bg, palette.panel, palette.raised], 4.5, dark);
+  palette.accent = readableColor(accentHue, vivid, dark ? 0.7 : 0.4, [palette.bg, palette.panel, palette['accent-soft']], 4.5, dark);
+  palette['accent-ink'] = readableColor(accentHue, Math.min(vivid, 0.6), dark ? 0.12 : 0.98, [palette.accent], 4.5, !dark);
+  palette.danger = readableColor(4, 0.7, dark ? 0.75 : 0.4, [palette.bg, palette.panel], 4.5, dark);
+  palette.warning = readableColor(40, 0.75, dark ? 0.72 : 0.3, [palette.bg, palette.panel], 4.5, dark);
+  palette['danger-soft'] = hslToHex(4, 0.45, dark ? 0.16 : 0.94);
+  palette['warning-soft'] = hslToHex(40, 0.5, dark ? 0.15 : 0.92);
+  return { scheme, palette };
+}
+
+const IMAGE_PALETTE_VARIABLES = ['bg', 'panel', 'raised', 'fg', 'muted', 'line', 'line-strong', 'accent',
+  'accent-ink', 'accent-soft', 'user-bg', 'code-bg', 'danger', 'danger-soft', 'warning', 'warning-soft'];
+
+async function sampleBackgroundPixels(blob) {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const { width, height } = fitWithin(bitmap.width, bitmap.height, 48);
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d');
+    context.drawImage(bitmap, 0, 0, width, height);
+    return context.getImageData(0, 0, width, height).data;
+  } finally {
+    bitmap.close();
+  }
+}
+
+function clearImagePalette() {
+  delete dom.root.dataset.backgroundPalette;
+  dom.root.style.removeProperty('--background-image-color');
+  dom.root.style.removeProperty('color-scheme');
+  for (const name of IMAGE_PALETTE_VARIABLES) dom.root.style.removeProperty(`--${name}`);
+}
+
+// Inline custom properties override the selected theme until cleared, so
+// turning the option off restores the theme without reloading.
+function applyImagePalette(colors) {
+  const { scheme, palette } = buildImagePalette(colors, backgroundPaletteMode);
+  dom.root.style.setProperty('--background-image-color', colors.base);
+  dom.root.style.setProperty('color-scheme', scheme);
+  for (const name of IMAGE_PALETTE_VARIABLES) dom.root.style.setProperty(`--${name}`, palette[name]);
+  dom.root.dataset.backgroundPalette = 'image';
+  return { scheme, palette };
+}
+
+function renderImagePaletteSwatches(result) {
+  if (!dom.backgroundPaletteSwatches) return;
+  dom.backgroundPaletteSwatches.replaceChildren();
+  dom.backgroundPaletteSwatches.hidden = !result;
+  if (!result) return;
+  for (const [name, label] of [['bg', 'Background'], ['panel', 'Panels'], ['accent', 'Accent'], ['fg', 'Text']]) {
+    const swatch = document.createElement('span');
+    swatch.className = 'palette-swatch';
+    swatch.style.background = result.palette[name];
+    swatch.title = `${label} ${result.palette[name]}`;
+    dom.backgroundPaletteSwatches.append(swatch);
+  }
+  const detail = document.createElement('span');
+  detail.className = 'palette-swatch-label';
+  detail.textContent = `${result.scheme === 'dark' ? 'Dark' : 'Light'} theme from image`;
+  dom.backgroundPaletteSwatches.append(detail);
+}
+
+async function refreshBackgroundPalette() {
+  const revision = ++backgroundPaletteRevision;
+  clearImagePalette();
+  renderImagePaletteSwatches(null);
+  setFormStatus(dom.backgroundPaletteStatus, '');
+  if (dom.backgroundPaletteModes) dom.backgroundPaletteModes.hidden = !dom.backgroundPalette.checked;
+  if (!backgroundBlob || !dom.backgroundPalette.checked) return;
+  try {
+    const colors = extractImageColors(await sampleBackgroundPixels(backgroundBlob));
+    if (revision !== backgroundPaletteRevision) return;
+    if (!colors) throw new Error('No visible colors');
+    renderImagePaletteSwatches(applyImagePalette(colors));
+  } catch {
+    if (revision !== backgroundPaletteRevision) return;
+    setFormStatus(dom.backgroundPaletteStatus, 'Could not extract image colors. The selected theme is still in use.', 'error');
+  }
+}
+
+function setBackgroundPalette(enabled) {
+  dom.backgroundPalette.checked = enabled;
+  try {
+    if (enabled) localStorage.setItem(BACKGROUND_PALETTE_KEY, 'image');
+    else localStorage.removeItem(BACKGROUND_PALETTE_KEY);
+  } catch {
+    // The selection still applies to this page.
+  }
+  void refreshBackgroundPalette();
+}
+
+function setBackgroundPaletteMode(mode) {
+  backgroundPaletteMode = mode === 'light' || mode === 'dark' ? mode : 'auto';
+  for (const input of dom.backgroundPaletteModes?.querySelectorAll('input') ?? []) {
+    input.checked = input.value === backgroundPaletteMode;
+  }
+  try {
+    localStorage.setItem(BACKGROUND_PALETTE_MODE_KEY, backgroundPaletteMode);
+  } catch {
+    // The selection still applies to this page.
+  }
 }
 
 function openBackgroundStore() {
@@ -4911,7 +5235,11 @@ function showBackground(blob) {
   dom.backgroundPreview.style.backgroundImage = image;
   dom.appBackdrop.hidden = !backgroundUrl;
   dom.backgroundPreview.dataset.empty = String(!backgroundUrl);
-  dom.backgroundRemove.disabled = !backgroundUrl;
+  dom.backgroundRemove.disabled = backgroundBusy || !blob;
+  backgroundBlob = blob;
+  dom.backgroundPalette.disabled = !blob;
+  if (blob) void refreshBackgroundPalette();
+  else setBackgroundPalette(false);
   if (backgroundUrl) document.body.dataset.backdrop = 'image';
   else delete document.body.dataset.backdrop;
 }
@@ -4928,31 +5256,134 @@ function saveBackgroundSettings() {
   }
 }
 
+function rememberBackground(entries, entry) {
+  return [entry, ...entries.filter(({ id }) => id !== entry.id)].slice(0, BACKGROUND_HISTORY_LIMIT);
+}
+
+function updateBackgroundControls() {
+  dom.backgroundChoose.disabled = backgroundBusy;
+  dom.backgroundRemove.disabled = backgroundBusy || !backgroundBlob;
+  for (const button of dom.backgroundHistoryList.querySelectorAll('button')) {
+    button.disabled = backgroundBusy;
+  }
+}
+
+function renderBackgroundHistory() {
+  dom.backgroundHistoryList.replaceChildren();
+  for (const url of recentBackgroundUrls) URL.revokeObjectURL(url);
+  recentBackgroundUrls = [];
+  recentBackgrounds.forEach((entry, index) => {
+    const active = entry.id === currentBackgroundId && Boolean(backgroundBlob);
+    const item = document.createElement('li');
+    item.className = 'background-tile';
+    if (active) item.dataset.active = 'true';
+    const apply = document.createElement('button');
+    apply.type = 'button';
+    apply.className = 'background-tile-apply';
+    apply.setAttribute('aria-pressed', String(active));
+    apply.setAttribute('aria-label', `${active ? 'Current background' : 'Use background'} ${index + 1}: ${entry.name}`);
+    apply.title = entry.name;
+    const thumbnail = document.createElement('img');
+    thumbnail.alt = '';
+    const url = URL.createObjectURL(entry.blob);
+    recentBackgroundUrls.push(url);
+    thumbnail.src = url;
+    const name = document.createElement('span');
+    name.className = 'background-tile-name';
+    name.textContent = entry.name;
+    apply.append(thumbnail, name);
+    apply.addEventListener('click', () => {
+      if (!active) void runBackgroundChange(() => useRecentBackground(entry));
+    });
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'background-tile-delete';
+    remove.textContent = '×';
+    remove.title = 'Delete from history';
+    remove.setAttribute('aria-label', `Delete background ${index + 1} from history: ${entry.name}`);
+    remove.addEventListener('click', () => void runBackgroundChange(() => deleteRecentBackground(entry.id)));
+    item.append(apply, remove);
+    dom.backgroundHistoryList.append(item);
+  });
+  if (recentBackgrounds.length < BACKGROUND_HISTORY_LIMIT) {
+    const item = document.createElement('li');
+    item.className = 'background-tile background-tile-add';
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'background-tile-apply';
+    add.setAttribute('aria-label', 'Add a background image');
+    add.textContent = '+';
+    add.addEventListener('click', () => dom.backgroundFile.click());
+    item.append(add);
+    dom.backgroundHistoryList.append(item);
+  }
+  dom.backgroundHistoryCount.textContent = `${recentBackgrounds.length} / ${BACKGROUND_HISTORY_LIMIT}`;
+  dom.backgroundHistory.hidden = recentBackgrounds.length === 0;
+  updateBackgroundControls();
+}
+
+async function runBackgroundChange(action) {
+  if (backgroundBusy) return;
+  backgroundBusy = true;
+  updateBackgroundControls();
+  try {
+    await action();
+  } catch {
+    setFormStatus(dom.backgroundStatus, 'Could not update background history in this browser.', 'error');
+  } finally {
+    backgroundBusy = false;
+    updateBackgroundControls();
+  }
+}
+
+async function useRecentBackground(entry) {
+  const next = rememberBackground(recentBackgrounds, entry);
+  showBackground(entry.blob);
+  currentBackgroundId = entry.id;
+  try {
+    await backgroundTransaction('readwrite', (store) => {
+      store.put(entry.blob, 'current');
+      store.put(entry.id, 'current-id');
+      return store.put(next, 'recent');
+    });
+    recentBackgrounds = next;
+    renderBackgroundHistory();
+    setFormStatus(dom.backgroundStatus, 'Background saved in this browser.', 'ok');
+  } catch {
+    setFormStatus(dom.backgroundStatus, 'Background applied, but this browser could not store it; it resets on reload.', 'error');
+  }
+}
+
+async function deleteRecentBackground(id) {
+  const next = recentBackgrounds.filter((entry) => entry.id !== id);
+  await backgroundTransaction('readwrite', (store) => store.put(next, 'recent'));
+  recentBackgrounds = next;
+  renderBackgroundHistory();
+  setFormStatus(dom.backgroundStatus, 'Background removed from history.', 'ok');
+}
+
 async function chooseBackground(file) {
   if (!file) return;
   setFormStatus(dom.backgroundStatus, 'Preparing image…', 'busy');
-  dom.backgroundChoose.disabled = true;
   try {
     const blob = await encodeBackground(file);
-    showBackground(blob);
-    try {
-      await backgroundTransaction('readwrite', (store) => store.put(blob, 'current'));
-      setFormStatus(dom.backgroundStatus, 'Background saved in this browser.', 'ok');
-    } catch {
-      setFormStatus(dom.backgroundStatus, 'Background applied, but this browser could not store it; it resets on reload.', 'error');
-    }
+    await useRecentBackground({ id: crypto.randomUUID(), name: file.name.slice(0, 120), blob });
   } catch (error) {
     setFormStatus(dom.backgroundStatus, error.message, 'error');
   } finally {
-    dom.backgroundChoose.disabled = false;
     dom.backgroundFile.value = '';
   }
 }
 
 async function removeBackground() {
   showBackground(null);
+  currentBackgroundId = null;
+  renderBackgroundHistory();
   try {
-    await backgroundTransaction('readwrite', (store) => store.delete('current'));
+    await backgroundTransaction('readwrite', (store) => {
+      store.delete('current-id');
+      return store.delete('current');
+    });
     setFormStatus(dom.backgroundStatus, 'Background removed.', 'ok');
   } catch {
     setFormStatus(dom.backgroundStatus, 'Background removed for this page; stored data could not be cleared.', 'error');
@@ -4960,6 +5391,7 @@ async function removeBackground() {
 }
 
 async function restoreBackground() {
+  updateBackgroundControls();
   try {
     applyBackgroundSettings(parseBackgroundSettings(localStorage.getItem(BACKGROUND_SETTINGS_KEY)));
   } catch {
@@ -4967,17 +5399,56 @@ async function restoreBackground() {
   }
   try {
     const blob = await backgroundTransaction('readonly', (store) => store.get('current'));
-    if (blob instanceof Blob) showBackground(blob);
+    if (blob instanceof Blob) {
+      try {
+        dom.backgroundPalette.checked = localStorage.getItem(BACKGROUND_PALETTE_KEY) === 'image';
+      } catch {
+        // Keep the image without applying a saved palette preference.
+      }
+      showBackground(blob);
+    }
+    const storedId = await backgroundTransaction('readonly', (store) => store.get('current-id'));
+    const recent = await backgroundTransaction('readonly', (store) => store.get('recent'));
+    if (Array.isArray(recent)) {
+      recentBackgrounds = recent.slice(0, BACKGROUND_HISTORY_LIMIT).filter((entry) =>
+        entry && typeof entry.id === 'string' && typeof entry.name === 'string' && entry.blob instanceof Blob);
+      // Older stores have no current-id; the front entry was the last one applied.
+      if (blob instanceof Blob) currentBackgroundId = typeof storedId === 'string' ? storedId : recentBackgrounds[0]?.id ?? null;
+    } else if (recent === undefined && blob instanceof Blob) {
+      const initial = [{ id: 'previous-background', name: 'Previous background', blob }];
+      await backgroundTransaction('readwrite', (store) => store.put(initial, 'recent'));
+      recentBackgrounds = initial;
+      currentBackgroundId = 'previous-background';
+    }
   } catch {
     // No stored background, or storage is blocked: keep the theme background.
+  } finally {
+    backgroundBusy = false;
+    renderBackgroundHistory();
   }
 }
 
 dom.backgroundChoose.addEventListener('click', () => dom.backgroundFile.click());
-dom.backgroundFile.addEventListener('change', () => void chooseBackground(dom.backgroundFile.files?.[0]));
-dom.backgroundRemove.addEventListener('click', () => void removeBackground());
+dom.backgroundFile.addEventListener('change', () => void runBackgroundChange(() => chooseBackground(dom.backgroundFile.files?.[0])));
+dom.backgroundRemove.addEventListener('click', () => void runBackgroundChange(removeBackground));
 dom.backgroundDim.addEventListener('input', saveBackgroundSettings);
 dom.backgroundBlur.addEventListener('input', saveBackgroundSettings);
+dom.backgroundPalette.addEventListener('change', () => setBackgroundPalette(dom.backgroundPalette.checked));
+dom.backgroundPaletteModes.addEventListener('change', ({ target }) => {
+  if (target.name !== 'background-palette-mode') return;
+  setBackgroundPaletteMode(target.value);
+  void refreshBackgroundPalette();
+});
+try {
+  setBackgroundPaletteMode(localStorage.getItem(BACKGROUND_PALETTE_MODE_KEY));
+} catch {
+  setBackgroundPaletteMode('auto');
+}
+dom.theme.addEventListener('change', ({ target }) => {
+  if (target.name === 'theme' && target.checked && themes.has(target.value)) {
+    setBackgroundPalette(false);
+  }
+});
 void restoreBackground();
 
 /* Composer status, menus, and reply usage */
@@ -5281,16 +5752,18 @@ function usageChip(detail) {
 // Popovers sit in the top layer; place them above their trigger and keep
 // them on screen. Positions use CSSOM, which the style CSP allows.
 function positionPopover(panel, anchor, align = 'end') {
+  // Rectangles are in viewport pixels; inline offsets are scaled by the page
+  // zoom, so convert back before assigning them.
+  const zoom = interfaceZoom();
   const rect = anchor.getBoundingClientRect();
-  const width = panel.offsetWidth;
-  const height = panel.offsetHeight;
+  const box = panel.getBoundingClientRect();
   const margin = 8;
-  let left = align === 'start' ? rect.left : rect.right - width;
-  left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
-  let top = rect.top - height - margin;
-  if (top < margin) top = Math.min(rect.bottom + margin, window.innerHeight - height - margin);
-  panel.style.left = `${left}px`;
-  panel.style.top = `${Math.max(margin, top)}px`;
+  let left = align === 'start' ? rect.left : rect.right - box.width;
+  left = Math.max(margin, Math.min(left, window.innerWidth - box.width - margin));
+  let top = rect.top - box.height - margin;
+  if (top < margin) top = Math.min(rect.bottom + margin, window.innerHeight - box.height - margin);
+  panel.style.left = `${left / zoom}px`;
+  panel.style.top = `${Math.max(margin, top) / zoom}px`;
 }
 
 function showMenuView(view) {

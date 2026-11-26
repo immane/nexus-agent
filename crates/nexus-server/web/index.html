@@ -144,6 +144,52 @@
     <section class="settings-panel" id="appearance-panel" aria-labelledby="appearance-title">
     <h3 id="appearance-title">Appearance</h3>
     <p class="muted">Appearance and your server connection are remembered in this browser.</p>
+    <section class="interface-settings" id="interface-settings" aria-labelledby="interface-title">
+      <div class="appearance-heading"><h4 id="interface-title">Text and layout</h4><button id="interface-reset" type="button">Reset</button></div>
+      <div class="interface-grid">
+      <fieldset class="segmented-field" aria-describedby="ui-scale-hint">
+        <legend>Interface text</legend>
+        <div class="segmented">
+          <label><input class="sr-only" type="radio" name="ui-scale" value="90"><span>Small</span></label>
+          <label><input class="sr-only" type="radio" name="ui-scale" value="100"><span>Default</span></label>
+          <label><input class="sr-only" type="radio" name="ui-scale" value="110"><span>Large</span></label>
+          <label><input class="sr-only" type="radio" name="ui-scale" value="125"><span>Larger</span></label>
+        </div>
+        <p class="hint" id="ui-scale-hint">Sidebar, controls, settings, and tool cards.</p>
+      </fieldset>
+      <div class="range-field">
+        <label for="content-size">Message text <span class="muted" id="content-size-value"></span></label>
+        <input id="content-size" type="range" min="13" max="20" step="1" value="15" aria-describedby="content-size-hint">
+        <p class="hint" id="content-size-hint">Replies and your messages, including code and tables.</p>
+      </div>
+      <fieldset class="segmented-field">
+        <legend>Message width</legend>
+        <div class="segmented">
+          <label><input class="sr-only" type="radio" name="content-width" value="narrow"><span>Narrow</span></label>
+          <label><input class="sr-only" type="radio" name="content-width" value="default"><span>Default</span></label>
+          <label><input class="sr-only" type="radio" name="content-width" value="wide"><span>Wide</span></label>
+          <label><input class="sr-only" type="radio" name="content-width" value="full"><span>Full</span></label>
+        </div>
+      </fieldset>
+      <fieldset class="segmented-field">
+        <legend>Line spacing</legend>
+        <div class="segmented">
+          <label><input class="sr-only" type="radio" name="line-spacing" value="compact"><span>Compact</span></label>
+          <label><input class="sr-only" type="radio" name="line-spacing" value="default"><span>Default</span></label>
+          <label><input class="sr-only" type="radio" name="line-spacing" value="relaxed"><span>Relaxed</span></label>
+        </div>
+      </fieldset>
+      <fieldset class="segmented-field" aria-describedby="motion-hint">
+        <legend>Animations</legend>
+        <div class="segmented">
+          <label><input class="sr-only" type="radio" name="motion" value="system"><span>Follow system</span></label>
+          <label><input class="sr-only" type="radio" name="motion" value="reduce"><span>Reduce</span></label>
+        </div>
+        <p class="hint" id="motion-hint">Reduce turns off spinners, streaming cursors, and transitions.</p>
+      </fieldset>
+      </div>
+      <p class="interface-sample" id="interface-sample" aria-hidden="true"><strong>Preview.</strong> The agent read <code>src/main.rs</code> and found the parser in a few seconds.</p>
+    </section>
     <fieldset class="theme-picker" id="theme" aria-describedby="theme-hint">
       <legend>Color palette</legend>
       <p class="hint" id="theme-hint">Choose a look. Changes apply immediately; use arrow keys to browse.</p>
@@ -177,18 +223,44 @@
       <legend>Background</legend>
       <p class="hint" id="background-hint">Use your own image behind the workspace. It is resized to at most 2560 px and stored only in this browser; it is never uploaded to the server.</p>
       <div class="background-row">
-        <div class="background-preview" id="background-preview" data-empty="true"><span>No image</span></div>
+        <div class="background-preview" id="background-preview" data-empty="true">
+          <span class="background-preview-empty">No image</span>
+          <span class="background-preview-sample" aria-hidden="true"><i></i><i></i><i></i></span>
+        </div>
         <div class="background-controls">
-          <div class="dialog-actions">
+          <div class="background-actions">
             <input class="sr-only" id="background-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" tabindex="-1">
             <button class="primary" id="background-choose" type="button">Choose image…</button>
             <button id="background-remove" type="button" disabled>Remove</button>
           </div>
-          <label for="background-dim">Dim <span class="muted" id="background-dim-value"></span></label>
-          <input id="background-dim" type="range" min="0" max="90" step="5" value="55">
-          <label for="background-blur">Blur <span class="muted" id="background-blur-value"></span></label>
-          <input id="background-blur" type="range" min="0" max="24" step="2" value="0">
+          <div class="range-field">
+            <label for="background-dim">Dim <span class="muted" id="background-dim-value"></span></label>
+            <input id="background-dim" type="range" min="0" max="90" step="5" value="55">
+          </div>
+          <div class="range-field">
+            <label for="background-blur">Blur <span class="muted" id="background-blur-value"></span></label>
+            <input id="background-blur" type="range" min="0" max="24" step="2" value="0">
+          </div>
+          <div class="toggle-field">
+            <label for="background-palette">Use image colors</label>
+            <input class="switch-input" id="background-palette" type="checkbox" role="switch" disabled aria-describedby="background-palette-hint">
+          </div>
+          <p class="hint" id="background-palette-hint">Build a theme from the image's main and most vivid colors. Text and buttons keep readable contrast. Turn this off or choose another theme to switch back.</p>
+          <fieldset class="segmented-field palette-modes" id="background-palette-modes" hidden>
+            <legend class="sr-only">Image theme brightness</legend>
+            <div class="segmented">
+              <label><input class="sr-only" type="radio" name="background-palette-mode" value="auto" checked><span>Match image</span></label>
+              <label><input class="sr-only" type="radio" name="background-palette-mode" value="dark"><span>Dark</span></label>
+              <label><input class="sr-only" type="radio" name="background-palette-mode" value="light"><span>Light</span></label>
+            </div>
+          </fieldset>
+          <div class="palette-swatches" id="background-palette-swatches" aria-hidden="true" hidden></div>
+          <p class="dialog-status status" id="background-palette-status" role="status"></p>
         </div>
+      </div>
+      <div class="background-history" id="background-history" hidden>
+        <div class="appearance-heading"><h4>Recently used</h4><span class="muted" id="background-history-count"></span></div>
+        <ul class="background-history-list" id="background-history-list" aria-label="Recently used backgrounds"></ul>
       </div>
       <p class="dialog-status status" id="background-status" role="status"></p>
     </fieldset>

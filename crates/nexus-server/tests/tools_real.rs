@@ -410,7 +410,7 @@ fn exploration_delivery_fixture(queue: bool) {
             ]},"finish_reason":"tool_calls"}]})
         };
         let answer = |text| json!({"choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}]});
-        for _ in 0..5 {
+        for _ in 0..6 {
             let mut socket = loop {
                 match upstream.accept() {
                     Ok((socket, _)) => break socket,
@@ -444,6 +444,7 @@ fn exploration_delivery_fixture(queue: bool) {
             let messages = request["messages"].as_array().unwrap();
             let last = &messages.last().unwrap()["content"];
             let body = if request["model"] == "child-model" {
+                assert!(request.get("reasoning_effort").is_none());
                 let mut names = request["tools"]
                     .as_array()
                     .unwrap()
@@ -459,6 +460,13 @@ fn exploration_delivery_fixture(queue: bool) {
                 );
                 child_turn += 1;
                 if child_turn == 1 {
+                    assert!(messages.iter().any(|message| {
+                        message["role"] == "system"
+                            && message["content"].as_str().is_some_and(|text| {
+                                text.contains("follow its requested output format")
+                                    && text.contains("answer directly without using tools")
+                            })
+                    }));
                     assert_eq!(last, "read fixture file");
                     tool("host_read", "read", json!({"path":"a"}))
                 } else {
@@ -470,12 +478,25 @@ fn exploration_delivery_fixture(queue: bool) {
                 parent_turn += 1;
                 match parent_turn {
                     1 => {
-                        assert!(
-                            request["tools"]
-                                .as_array()
-                                .unwrap()
-                                .iter()
-                                .any(|tool| tool["function"]["name"] == "delegate_start")
+                        let start = request["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|tool| tool["function"]["name"] == "delegate_start")
+                            .unwrap();
+                        let description = start["function"]["description"].as_str().unwrap();
+                        assert!(description.contains("Omit thinking"));
+                        assert!(description.contains("Set delivery to await"));
+                        tool(
+                            "delegate_start",
+                            "unsupported",
+                            json!({"role":"explore","task":"must not start","model":"child","thinking":"off"}),
+                        )
+                    }
+                    2 => {
+                        assert_eq!(
+                            last,
+                            "Selected endpoint does not support explicit thinking. Omit thinking to inherit settings if acceptable."
                         );
                         tool(
                             "delegate_start",
@@ -483,7 +504,7 @@ fn exploration_delivery_fixture(queue: bool) {
                             json!({"role":"explore","task":"read fixture file","model":"child","delivery":if queue { "queue" } else { "await" }}),
                         )
                     }
-                    2 => {
+                    3 => {
                         let result: Value = serde_json::from_str(last.as_str().unwrap()).unwrap();
                         assert_eq!(result["status"], "accepted");
                         if queue {
@@ -496,7 +517,7 @@ fn exploration_delivery_fixture(queue: bool) {
                             )
                         }
                     }
-                    3 => {
+                    4 => {
                         let content = last.as_str().unwrap();
                         if queue {
                             let content = content.split_once('\n').unwrap().1;
@@ -520,7 +541,7 @@ fn exploration_delivery_fixture(queue: bool) {
             let body = body.to_string();
             write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
-        assert_eq!((parent_turn, child_turn), (3, 2));
+        assert_eq!((parent_turn, child_turn), (4, 2));
     });
 
     let executor = tokio::runtime::Builder::new_multi_thread()
@@ -596,7 +617,7 @@ fn exploration_delivery_fixture(queue: bool) {
     );
     assert_eq!(status, 201, "{run}");
     let parent = run["run"].as_str().unwrap();
-    let wanted = if queue { 1 } else { 2 };
+    let wanted = if queue { 2 } else { 3 };
     let outcomes = tool_outcomes(port, session, parent, wanted);
     assert_eq!(outcomes.len(), wanted);
     mock.join().unwrap();

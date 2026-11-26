@@ -439,6 +439,10 @@ body {
 }
 
 body {
+  /* Interface size: zoom keeps every px-based control proportional. Height
+     and viewport units are divided by the same factor. */
+  zoom: var(--ui-scale, 1);
+  height: calc(100% / var(--ui-scale, 1));
   margin: 0;
   overflow: hidden;
   background: var(--bg);
@@ -958,7 +962,7 @@ body[data-sidebar="closed"] .sidebar {
 .shell {
   min-width: 0;
   min-height: 0;
-  height: 100dvh;
+  height: calc(100dvh / var(--ui-scale, 1));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1041,8 +1045,6 @@ main { position: relative; }
   justify-content: center;
   gap: 12px;
   color: var(--muted);
-  background: color-mix(in srgb, var(--bg) 92%, transparent);
-  backdrop-filter: blur(4px);
 }
 
 main[data-loading="true"] > .conversation,
@@ -1147,7 +1149,7 @@ main {
 }
 
 .welcome {
-  width: min(100%, 860px);
+  width: min(100%, var(--content-width, 860px));
   margin: 0 auto;
   padding: clamp(48px, 14vh, 140px) 0 40px;
 }
@@ -1220,7 +1222,7 @@ kbd,
 /* Conversation */
 
 .conversation {
-  width: min(100%, 860px);
+  width: min(100%, var(--content-width, 860px));
   margin: 0 auto;
   padding: 32px 0 48px;
   display: flex;
@@ -1255,6 +1257,8 @@ kbd,
 
 .message.user .message-body {
   max-width: 85%;
+  font-size: var(--content-font-size, 15px);
+  line-height: calc(var(--content-line-height, 1.75) - 0.15);
   padding: 12px 16px;
   border: 1px solid var(--line);
   border-radius: 14px 14px 4px 14px;
@@ -1274,8 +1278,8 @@ kbd,
 
 .prose {
   overflow-wrap: anywhere;
-  font-size: 15px;
-  line-height: 1.75;
+  font-size: var(--content-font-size, 15px);
+  line-height: var(--content-line-height, 1.75);
 }
 
 .prose.plain-text {
@@ -1378,7 +1382,7 @@ kbd,
   padding: 0;
   border: 0;
   background: transparent;
-  font-size: 12px;
+  font-size: 0.82em;
 }
 
 .md-code-block {
@@ -1477,7 +1481,7 @@ kbd,
 .prose table {
   border-collapse: collapse;
   min-width: 100%;
-  font-size: 12px;
+  font-size: 0.82em;
 }
 
 .prose th,
@@ -1994,7 +1998,7 @@ pre {
 
 .composer {
   position: relative;
-  width: min(100%, 860px);
+  width: min(100%, var(--content-width, 860px));
   margin: 0 auto;
   overflow: hidden;
   border: 1px solid var(--line);
@@ -2017,7 +2021,7 @@ pre {
 }
 
 .prompt-inbox {
-  width: min(100%, 860px);
+  width: min(100%, var(--content-width, 860px));
   max-height: 12rem;
   overflow: auto;
   margin: 0 auto 0.5rem;
@@ -2302,8 +2306,8 @@ textarea::placeholder {
   position: fixed;
   inset: auto;
   margin: 0;
-  width: min(340px, calc(100vw - 16px));
-  max-height: min(70vh, 520px);
+  width: min(340px, calc(100vw / var(--ui-scale, 1) - 16px));
+  max-height: min(calc(70vh / var(--ui-scale, 1)), 520px);
   overflow: auto;
   padding: 12px;
   border: 1px solid var(--line);
@@ -2395,7 +2399,7 @@ textarea::placeholder {
 }
 
 .model-menu {
-  width: min(300px, calc(100vw - 16px));
+  width: min(300px, calc(100vw / var(--ui-scale, 1) - 16px));
   padding: 6px;
 }
 
@@ -2651,9 +2655,12 @@ textarea::placeholder {
 
 dialog {
   width: min(1000px, calc(100% - 48px));
-  height: min(760px, calc(100dvh - 48px));
-  max-height: calc(100dvh - 48px);
+  height: min(760px, calc(100dvh / var(--ui-scale, 1) - 48px));
+  max-height: calc(100dvh / var(--ui-scale, 1) - 48px);
+  /* `clip` (unlike `hidden`) cannot be scrolled by focus or script, so a
+     focused control never shifts the whole dialog away from its frame. */
   overflow: hidden;
+  overflow: clip;
   padding: 0;
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -2808,6 +2815,9 @@ dialog .theme-card {
 }
 
 .settings-content {
+  /* Contains absolutely positioned visually hidden inputs, so focusing one
+     scrolls this panel rather than an outer box. */
+  position: relative;
   min-width: 0;
   overflow-y: auto;
   scrollbar-gutter: stable;
@@ -3062,7 +3072,7 @@ dialog .theme-card {
     position: fixed;
     inset: 0 auto 0 0;
     z-index: 20;
-    width: min(300px, 86vw);
+    width: min(300px, calc(86vw / var(--ui-scale, 1)));
     padding-top: calc(14px + env(safe-area-inset-top, 0px));
     padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     box-shadow: var(--shadow);
@@ -3084,7 +3094,7 @@ dialog .theme-card {
 
   .shell {
     grid-row: 1;
-    height: 100dvh;
+    height: calc(100dvh / var(--ui-scale, 1));
     min-height: 0;
   }
 
@@ -3213,8 +3223,8 @@ dialog .theme-card {
 
   dialog {
     width: calc(100% - 20px);
-    height: calc(100dvh - 20px);
-    max-height: calc(100dvh - 20px);
+    height: calc(100dvh / var(--ui-scale, 1) - 20px);
+    max-height: calc(100dvh / var(--ui-scale, 1) - 20px);
   }
 
   .settings-layout {
@@ -3315,13 +3325,6 @@ body[data-backdrop="image"] .composer {
   backdrop-filter: blur(16px);
 }
 
-body[data-backdrop="image"] .tool-card,
-body[data-backdrop="image"] .helper-card,
-body[data-backdrop="image"] .approval-card,
-body[data-backdrop="image"] .notice {
-  backdrop-filter: blur(10px);
-}
-
 .background-picker {
   margin: 28px 0 0;
   padding: 0;
@@ -3353,7 +3356,7 @@ body[data-backdrop="image"] .notice {
   font-size: 12px;
 }
 
-.background-preview[data-empty="false"] span {
+.background-preview[data-empty="false"] .background-preview-empty {
   display: none;
 }
 
@@ -3381,8 +3384,453 @@ body[data-backdrop="image"] .notice {
   accent-color: var(--accent);
 }
 
+.background-history-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 8px;
+  list-style: none;
+  padding: 0;
+}
+
+.background-history-list li {
+  display: grid;
+  gap: 4px;
+}
+
+.background-history-list button:first-child {
+  padding: 0;
+  overflow: hidden;
+}
+
+.background-history-list img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+}
+
 @media (max-width: 480px) {
   .background-row {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* Reduced motion chosen in Settings, independent of the system setting. */
+:root[data-motion="reduce"] *,
+:root[data-motion="reduce"] *::before,
+:root[data-motion="reduce"] *::after {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+}
+
+/* Appearance settings */
+
+.appearance-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.appearance-heading h4 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.appearance-heading button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.interface-settings {
+  display: grid;
+  gap: 14px;
+  margin: 22px 0 30px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.interface-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 22px;
+}
+
+.segmented-field {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.segmented-field legend,
+.range-field label,
+.toggle-field label {
+  margin-bottom: 6px;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.segmented-field .hint,
+.range-field .hint {
+  margin: 6px 0 0;
+  font-size: 11px;
+}
+
+.segmented {
+  display: flex;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg);
+}
+
+.segmented label {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+
+.segmented span {
+  display: block;
+  padding: 5px 8px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.segmented label:hover span {
+  color: var(--fg);
+}
+
+.segmented input:checked + span {
+  background: var(--raised);
+  color: var(--fg);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 18%);
+}
+
+.segmented input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.range-field {
+  display: grid;
+  min-width: 0;
+}
+
+.range-field label {
+  display: flex;
+  justify-content: space-between;
+}
+
+.range-field input[type="range"] {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent);
+}
+
+.interface-sample {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  font-size: var(--content-font-size, 15px);
+  line-height: var(--content-line-height, 1.75);
+}
+
+.interface-sample code {
+  padding: 0.1em 0.3em;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--code-bg);
+  font: 0.88em/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Background picker */
+
+.background-picker .background-row {
+  grid-template-columns: minmax(200px, 300px) minmax(0, 1fr);
+  gap: 22px;
+}
+
+.background-preview {
+  position: relative;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 4%);
+}
+
+/* The preview applies the same dim layer and a mock of the workspace. */
+.background-preview::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--bg);
+  opacity: var(--backdrop-dim, 0.55);
+}
+
+.background-preview[data-empty="true"]::after,
+.background-preview[data-empty="true"] .background-preview-sample {
+  display: none;
+}
+
+.background-preview-empty {
+  position: relative;
+  z-index: 1;
+}
+
+.background-preview-sample {
+  position: absolute;
+  inset: 14% 12%;
+  z-index: 1;
+  display: grid;
+  align-content: end;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 80%, transparent);
+}
+
+.background-preview-sample i {
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--muted);
+  opacity: 0.6;
+}
+
+.background-preview-sample i:first-child {
+  width: 45%;
+  justify-self: end;
+  background: var(--user-bg);
+  opacity: 1;
+}
+
+.background-preview-sample i:nth-child(2) { width: 80%; }
+.background-preview-sample i:last-child { width: 55%; background: var(--accent); opacity: 0.8; }
+
+.background-controls {
+  gap: 14px;
+}
+
+.background-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.toggle-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.toggle-field label {
+  margin: 0;
+}
+
+.background-controls > .hint {
+  margin: -8px 0 0;
+  font-size: 11px;
+}
+
+.background-controls > .dialog-status:empty {
+  display: none;
+}
+
+/* Checkbox styled as a switch; it keeps native keyboard and form behavior. */
+.switch-input {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--line-strong);
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.switch-input::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--raised);
+  transition: transform 140ms ease;
+}
+
+.switch-input:checked {
+  background: var(--accent);
+}
+
+.switch-input:checked::after {
+  transform: translateX(16px);
+}
+
+.switch-input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.background-history {
+  display: grid;
+  gap: 10px;
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.background-picker .background-history-list {
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.background-tile {
+  position: relative;
+  display: block;
+}
+
+.background-picker .background-tile-apply {
+  display: grid;
+  width: 100%;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  text-align: left;
+}
+
+.background-tile-apply img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  object-fit: cover;
+}
+
+.background-tile-name {
+  overflow: hidden;
+  padding: 5px 8px 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.background-tile-apply:hover:not(:disabled) {
+  border-color: var(--line-strong);
+}
+
+.background-tile[data-active="true"] .background-tile-apply {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.background-tile[data-active="true"] .background-tile-name {
+  color: var(--fg);
+}
+
+.background-tile[data-active="true"] .background-tile-name::before {
+  content: "✓ ";
+  color: var(--accent);
+}
+
+.background-tile-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgb(0 0 0 / 55%);
+  color: #ffffff;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.background-tile:hover .background-tile-delete,
+.background-tile-delete:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .background-tile-delete {
+    opacity: 1;
+  }
+}
+
+.background-tile-add .background-tile-apply {
+  place-items: center;
+  height: 100%;
+  min-height: 92px;
+  border-style: dashed;
+  background: transparent;
+  color: var(--muted);
+  font-size: 22px;
+}
+
+@media (max-width: 720px) {
+  .interface-grid,
+  .background-picker .background-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .segmented span {
+    padding: 6px 4px;
+  }
+}
+
+/* Image colors */
+
+.palette-modes {
+  margin-top: -4px;
+}
+
+.palette-swatches {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: -4px;
+}
+
+.palette-swatch {
+  width: 22px;
+  height: 22px;
+  border: 1px solid color-mix(in srgb, var(--fg) 18%, transparent);
+  border-radius: 6px;
+}
+
+.palette-swatch-label {
+  margin-left: 4px;
+  color: var(--muted);
+  font-size: 11px;
 }

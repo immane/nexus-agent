@@ -89,6 +89,8 @@ existing or new provider id. The value is written to `credentials.json` beside
 the server's configured document, never into the configuration document or its
 redacted summary. The file is strictly parsed before replacement, written
 atomically with owner-only permissions on Unix, and limited to 16 KiB per value.
+On first save, missing configuration directories are created with owner-only
+permissions on Unix; existing directory permissions are unchanged.
 Values containing control characters are refused so they cannot alter HTTP
 headers. Provider deletion removes an owned stored entry when it is no longer
 referenced; a provider still named by a model is refused. Credential cleanup
