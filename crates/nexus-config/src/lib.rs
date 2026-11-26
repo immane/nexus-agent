@@ -78,8 +78,8 @@ pub mod store;
 pub mod tui_settings;
 
 pub use model::{
-    AdapterKind, AgentMode, CredentialRef, MODE_BUILD, MODE_PLAN, ModelEntry, ProtocolKind,
-    ProviderProfile, UserConfig,
+    AdapterKind, AgentMode, CredentialRef, ExplorationModel, ExplorationThinking, MODE_BUILD,
+    MODE_PLAN, ModelEntry, ProtocolKind, ProviderProfile, UserConfig,
 };
 pub use settings::{
     EffectiveSettings, ExecutionMode, LaunchSettings, ProviderSettings, ServerSettings,

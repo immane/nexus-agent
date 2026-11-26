@@ -11,11 +11,16 @@
 
 #![forbid(unsafe_code)]
 
+mod delegation;
 pub mod policy;
 pub mod protocol;
 pub mod runtime;
 pub mod transport;
 
+pub use delegation::{
+    ExplorationClaim, ExplorationDelivery, ExplorationHandoff, ExplorationParent,
+    ExplorationProposal, ExplorationResult, ExplorationRole, ExplorationWait,
+};
 pub use policy::Policy;
 pub use runtime::{RunState, Runtime, RuntimeConfig, SessionStoreHandle};
 pub use transport::{CONTROL_CAPACITY, DATA_CAPACITY, EventStreams, event_is_live};

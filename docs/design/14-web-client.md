@@ -59,8 +59,8 @@ guessing.
 The shell uses:
 
 - native HTML, CSS, and ES modules with no third-party runtime;
-- a same-origin CSP with no inline scripts or styles and `frame-ancestors
-  'none'`;
+- a CSP with same-origin scripts, styles, and connections, no inline scripts
+  or styles, and `frame-ancestors 'none'`; external HTTPS images require a click;
 - text nodes for all model, tool, approval, and error content (never
   `innerHTML`); the Markdown renderer builds DOM nodes and never parses raw HTML;
 - `fetch` with `ReadableStream` instead of `EventSource`, because the bearer
@@ -73,10 +73,28 @@ The shell uses:
 The built-in Markdown renderer supports headings, paragraphs, emphasis, strong
 text, strikethrough, inline code, fenced code with a language label, ordered and
 unordered lists, task markers, blockquotes, horizontal rules, links, autolinks,
-and pipe tables. Link targets are limited to `http`, `https`, and `mailto`;
+and pipe tables. Labeled code blocks use a small built-in highlighter for
+comments, strings, numbers, keywords, function calls, and markup tags; `text`
+or unlabeled blocks stay plain. This is a compact heuristic, not a full parser,
+and it adds no third-party library. Link targets are limited to `http`, `https`, and `mailto`;
 unsafe or malformed targets remain plain text. Raw HTML is displayed as text.
-Images, footnotes, math, nested list structures, and syntax highlighting are not
-implemented.
+Inline Markdown images (`![alt](url)`) can display same-origin images; external
+HTTPS images require an explicit click and send no referrer. Completed replies
+and restored history also preview project images, for example
+`![Plot](resources/assets/plot.svg)`. Clicking a Markdown image or a project-image
+canvas opens a full-screen dark overlay with the image fitted to the viewport;
+clicking anywhere or pressing Escape closes it. Project-image canvases are
+rasterized to a PNG data URL for the overlay, so SVG markup is never attached
+as a page link. Math uses the browser's native MathML, with
+no external assets. It supports `$...$` and `\(...\)` inline, and `$$...$$` and `\[...\]` on
+their own lines. The built-in TeX subset includes common symbols and functions,
+scripts and operator limits, fractions, indexed roots, binomials, accents,
+font commands, plain `\text{...}`, and `\left...\right` fences. It also supports
+matrix and array variants, `cases`, and multi-line `align`/`gather` variants
+inside display delimiters or as standalone blocks. It does not implement
+macros, packages, document preambles, automatic numbering, or cross-references.
+Unsupported expressions remain text. Footnotes and syntax highlighting are
+not implemented.
 
 Successful tool cards collapse after completion; failed or interrupted results
 stay expanded. The path-only `host_read` and `host_list` calls are suppressed
@@ -102,8 +120,10 @@ active run is not reattached merely by restoring its saved history.
 When the server starts with `--session-store DIRECTORY`, the sidebar lists saved
 sessions from `GET /sessions`, reads bounded pages from
 `GET /sessions/{id}/history`, restores context without replaying tools, and can
-delete a non-live session with `DELETE /sessions/{id}`. Titles come from the
-first saved user item. History rendering is bounded; filesystem effects and old
+delete a saved session with `DELETE /sessions/{id}`. This also closes an open
+runtime if it is idle; a run or attached event stream returns `409` without
+deleting history. Titles come from the first saved user item. History rendering
+is bounded; filesystem effects and old
 approval grants are never replayed. The provider/model/project binding is kept
 in browser storage because the session checkpoint format does not carry Web
 bindings; a different browser must select valid bindings before restoring.
@@ -128,6 +148,32 @@ attaches while another is streaming receives `409`; the UI shows that conflict
 and does not treat it as a run failure. Disconnecting an SSE read does not cancel
 the run.
 
+## Layout
+
+The empty conversation shows what the next task will use (project and model)
+and a short list of input tips; while disconnected it offers a Connect button
+that opens Settings → Connection. The top bar shows the session's project chip
+(only when projects are enabled), a plain-text title, and a connection status
+dot; the selected model is shown only in the composer. Session titles drop
+Markdown markers such as `**`, backticks, headings, and link syntax, but keep
+single `*`/`_` characters.
+
+The sidebar follows a flat thread-list layout: a New session row, then projects
+as folder rows with their sessions indented as single-line titles. The current
+session has a filled row, a running session shows a spinner, and a saved
+session whose runtime is still loaded on the server shows a small dot; model and status text stay in the
+row tooltip and accessible name. Add and delete actions appear on hover or focus.
+Without projects, sessions are listed directly under a Sessions label. Rows show
+no timestamps because `GET /sessions` does not report one.
+
+A panel-icon button at the start of the top bar toggles the sidebar. On wide
+screens it collapses the sidebar and the choice is kept in `localStorage`
+(`nexus.sidebar`). At 720px and below the sidebar is an overlay drawer that
+starts closed; the backdrop, Escape, or choosing a session closes it. Consecutive assistant items after one user message share
+a single speaker label. Approval cards compact after a decision. On narrow
+screens the top bar stays on one row, with icon-only New session and Settings
+buttons and a status dot whose text remains available to assistive technology.
+
 ## Installed web app
 
 The composer shows animated activity bars and a breathing outer border during
@@ -147,6 +193,17 @@ token where browser storage is shared, or requires connecting once if isolated.
 
 ## Projects and runtime mode
 
+Project image previews use authenticated `POST /sessions/{id}/project-image`
+with `{"path":"resources/assets/plot.svg"}`. Paths resolve against the session's
+bound local project, not the currently selected project or the server's working
+directory. An absolute path is accepted only within the canonical project root;
+`file://`, traversal, symlinks, hard links, and protected paths are not supported.
+PNG, JPEG, WebP, and SVG are limited to 4 MiB each. The server returns opaque,
+non-cacheable bytes; the Web client decodes bytes as an image and draws them to
+a canvas without attaching SVG markup or exposing a navigable SVG URL. Previews
+load when visible (up to four per message); unavailable files keep their alt text.
+History previews show the current file, not a saved snapshot of its bytes.
+
 The operator must start the server with local real tools
 (`--tools real --tools-root PATH`, plus `--auth-token-env`). The web client cannot
 turn the scripted demo into real tools. `GET /projects` reports the mode:
@@ -162,7 +219,7 @@ highlighted. Selecting a different project while a session exists starts a new
 session after confirmation; the previous session remains available in saved
 history when persistence is enabled. The Settings
 dialog manages project admission/removal, and a sidebar `+` shortcut opens that
-section. On narrow screens the sidebar collapses and the composer exposes an
+section. On narrow screens the sidebar becomes a drawer and the composer exposes an
 equivalent project selector.
 
 The startup tool root is exposed as the reserved `default` project. Additional
@@ -250,16 +307,97 @@ are already bound.
 
 ## Event handling
 
+In the Web composer, sending while a run is active queues the prompt in that
+session. Waiting prompts can be removed without entering the transcript.
+Successful completion starts the next prompt after the previous event stream
+releases its subscriber; cancellation, failure, or a rejected start pauses the
+queue until Resume. A page refresh can recover the live inbox from the server;
+the inbox is not persisted across a server restart.
+
+The separate **Steer** action binds a message to the active run without
+interrupting generation, tools, or approvals. It enters the transcript at the
+next safe model boundary. An undispatched steer becomes a queued prompt when
+its target run ends; if that run did not succeed, the queue pauses. Adapters
+using opaque continuation defer steering rather than rewriting continuation.
+
+`/btw <question>` in an existing session with a configured model opens a
+standalone answer based on accepted conversation text. It does not use tools,
+enter session history, interrupt the current run, or enqueue a prompt.
+
+In a bound local project with an eligible configured model, the assistant can
+start background **Explore** jobs and collect them by job ID or by automatic
+delivery. The child can only read, list, and search that project. The parent
+model is the default; additional models require an administrator's
+`server.exploration_models` allowlist. Collected results appear as ordinary
+tool results. On Chat Completions, Explore uses `delivery: "steer"` by
+default: a result that arrives before the originating task's next safe model
+boundary appears as a separate Explore record. `queue`, or an undelivered
+steer after a successful task, enters the session's pending list with its
+job and status, then starts a read-only follow-up even if the page is idle.
+The follow-up cannot start more children, and an unstarted result expires
+after about a minute and is reported as expired rather than silently run.
+A **Propose** child returns one suggested exact replacement; the parent
+re-reads the file and may apply it with its normal patch tool. The child
+never writes. See [background delegation](../tasks/12-background-delegation.md).
+
+`delegate_start` and `delegate_await` render as **HELPER** and **COLLECT**
+cards showing the role and task instead of raw JSON. A collected result shows
+its text, or a verified proposal as a diff, plus helper usage; output that is
+not valid JSON keeps the raw view. While the parent runs, the composer counts
+helpers it started that have not reported; after it ends, the count comes from
+the inbox's `pending_child_results`. Helper usage is listed separately from the
+parent's counters.
+
+**Enable agent teamwork** in the model menu is a browser preference sent as
+`"delegation": false` on `POST /sessions` and `POST /sessions/{id}/restore`
+when turned off; omitted means enabled. The server still decides eligibility
+and returns the effective `delegation` boolean, which the menu explains when
+the model cannot use helpers. Changing it in an existing session rebinds an
+idle runtime the same way a model switch does, so it needs `--session-store`;
+otherwise it applies to the next new session.
+
+## Composer
+
+The composer keeps text entry on top and controls in one row below: the
+project selector (narrow screens only), the tool-mode chip (`Auto in project`
+for development, `Ask first` for strict, `Demo tools`, or `Container`), run
+status, and the helper count on the left; the context meter, model menu,
+Steer (while running), a round stop button, and a round send/queue button on
+the right. The native model `<select>` is kept hidden as the data source.
+
+The **context meter** shows the latest task request's
+`estimated_input_tokens / context_window_tokens` as a ring and percentage. Its
+popover adds the output reserve and the compaction trigger/target from the same
+event. It is a Nexus estimate, not provider usage, and has no
+system/tool/message breakdown because the event does not carry one. It is
+hidden until the session's first request and resets on a new or restored
+session.
+
+The **model menu** has Model and Effort submenus and the teamwork switch.
+Effort edits the global default through the same form as Settings → Thinking;
+the trigger shows the effective value for the selected model (model, provider,
+then global override).
+
+After a run, the **reply footer** offers copy (assistant text of that run),
+a usage chip such as `Usage 57.3K tok`, and the local time. The usage popover
+lists provider/model, cache hit rate, uncached and cached input, cache write,
+output, helper usage, and history persistence. Chat Completions and Responses
+count cached tokens inside input; Anthropic Messages reports them separately,
+and the total follows the provider protocol. Popovers use the native Popover
+API and are positioned by script with CSSOM, which the CSP allows.
+
 The client consumes the existing event JSON without inventing additional wire
 contracts:
 
 | Event | Presentation |
 | --- | --- |
 | `run-started` | Running status |
+| `user-steered` | User text accepted at an active run's model boundary |
+| `child-completion` | Helper result card with its task, status, and helper usage; each job renders once |
 | `assistant-text` | Incremental assistant text, keyed by turn and item |
 | `assistant-reasoning` | Live thinking, keyed by turn and item; collapsed last-line preview, expandable scrolling text |
 | `reasoning-redacted` | Compatibility status for older servers; no hidden content |
-| `model-request-started/finished` | Waiting/status transitions |
+| `model-request-started/finished` | Waiting/status transitions; a task request's estimate updates the context meter |
 | `model-response-discarded` | Warning notice |
 | `context-reduced` | Informational notice |
 | `tool-call-preview` | Preparing-tool status |
@@ -267,8 +405,8 @@ contracts:
 | `tool-output` | Incremental bounded output |
 | `tool-finished` | Typed status, effect, evidence, output, truncation |
 | `approval-required` | Approval card with exact approval/call identities |
-| `usage` | Inline usage counters; unknown stays unknown |
-| `run-finished` | Terminal outcome and optional typed error |
+| `usage` | Stored for the reply footer; unknown values are never filled in |
+| `run-finished` | Reply footer: copy, usage chip and breakdown, time; a non-completed outcome, `Save failed`, and any typed error are shown explicitly |
 
 Sequence numbers are tracked per run. Duplicate sequence numbers are ignored;
 gaps produce an explicit incomplete-transcript notice. A terminal event always
@@ -329,8 +467,9 @@ new session never claims to cancel work that may still be executing.
   stricter web-addition path checks.
 - Provider/model removal is not exposed over HTTP. Existing sessions are not
   updated by configuration edits.
-- Markdown is a deliberately bounded subset. Images, footnotes, math, nested
-  list structures, raw HTML, and syntax highlighting are not rendered.
+- Markdown is a deliberately bounded subset, not a full CommonMark or LaTeX
+  implementation. Footnotes, nested list structures, raw HTML, and syntax
+  highlighting are not rendered.
 - Very long assistant items switch to plain text while streaming and may take a
   noticeable moment to format when the final Markdown pass runs.
 - The demo wiring is test-only; no provider behavior is simulated beyond what

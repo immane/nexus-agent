@@ -32,7 +32,9 @@ const dom = {
   projectLabel: document.querySelector('#project-label'),
   projectBadge: document.querySelector('#project-badge'),
   sidebarTree: document.querySelector('#sidebar-tree'),
-  treeCount: document.querySelector('#tree-count'),
+  sidebar: document.querySelector('#sidebar'),
+  sidebarBackdrop: document.querySelector('#sidebar-backdrop'),
+  toggleSidebar: document.querySelector('#toggle-sidebar'),
   addProjectSidebar: document.querySelector('#add-project-sidebar'),
   projectsNote: document.querySelector('#projects-note'),
   projectList: document.querySelector('#project-list'),
@@ -89,18 +91,54 @@ const dom = {
   modelStatus: document.querySelector('#model-status'),
   model: document.querySelector('#model'),
   modelLabel: document.querySelector('#model-label'),
-  modelBadge: document.querySelector('#model-badge'),
   message: document.querySelector('#message'),
   composer: document.querySelector('#composer'),
+  promptInbox: document.querySelector('#prompt-inbox'),
+  steerRun: document.querySelector('#steer-run'),
+  sideQuestion: document.querySelector('#side-question'),
+  sideQuestionAnswer: document.querySelector('#side-question-answer'),
+  sideQuestionUsage: document.querySelector('#side-question-usage'),
+  imageLightbox: document.querySelector('#image-lightbox'),
+  imageLightboxImage: document.querySelector('#image-lightbox-image'),
   composerActivity: document.querySelector('#composer-activity'),
   send: document.querySelector('#send'),
   cancel: document.querySelector('#cancel-run'),
   jumpLatest: document.querySelector('#jump-latest'),
   runStatus: document.querySelector('#run-status'),
-  usage: document.querySelector('#usage-status'),
+  toolsMode: document.querySelector('#tools-mode'),
+  helperStatus: document.querySelector('#helper-status'),
+  contextMeter: document.querySelector('#context-meter'),
+  contextRing: document.querySelector('#context-ring'),
+  contextPercent: document.querySelector('#context-percent'),
+  contextPanel: document.querySelector('#context-panel'),
+  contextPanelPercent: document.querySelector('#context-panel-percent'),
+  contextPanelTotal: document.querySelector('#context-panel-total'),
+  contextBarFill: document.querySelector('#context-bar-fill'),
+  contextBarTrigger: document.querySelector('#context-bar-trigger'),
+  contextRows: document.querySelector('#context-rows'),
+  modelTrigger: document.querySelector('#model-trigger'),
+  modelTriggerName: document.querySelector('#model-trigger-name'),
+  modelTriggerEffort: document.querySelector('#model-trigger-effort'),
+  modelMenu: document.querySelector('#model-menu'),
+  menuMain: document.querySelector('#menu-main'),
+  menuModels: document.querySelector('#menu-models'),
+  menuEfforts: document.querySelector('#menu-efforts'),
+  menuModel: document.querySelector('#menu-model'),
+  menuModelValue: document.querySelector('#menu-model-value'),
+  menuModelOptions: document.querySelector('#menu-model-options'),
+  menuEffort: document.querySelector('#menu-effort'),
+  menuEffortValue: document.querySelector('#menu-effort-value'),
+  menuEffortOptions: document.querySelector('#menu-effort-options'),
+  menuEffortHelp: document.querySelector('#menu-effort-help'),
+  teamworkSwitch: document.querySelector('#teamwork-switch'),
+  teamworkInfo: document.querySelector('#teamwork-info'),
+  teamworkHelp: document.querySelector('#teamwork-help'),
   main: document.querySelector('#main'),
   sessionLoading: document.querySelector('#session-loading'),
   welcome: document.querySelector('#welcome'),
+  welcomeContext: document.querySelector('#welcome-context'),
+  welcomeConnect: document.querySelector('#welcome-connect'),
+  treeLabel: document.querySelector('#tree-label'),
   conversation: document.querySelector('#conversation'),
   conversationTitle: document.querySelector('#conversation-title'),
   newSession: document.querySelector('#new-session'),
@@ -136,6 +174,8 @@ const state = {
   cancelling: false,
   cancelRequested: false,
   inFlightUnknown: false,
+  inbox: null,
+  askingAside: false,
   runTerminal: false,
   streaming: false,
   streamController: null,
@@ -152,6 +192,14 @@ const state = {
   notices: new Map(),
   lastOutcome: null,
   lastUsage: null,
+  // Latest task-request estimate for the current session (not provider usage).
+  context: null,
+  // Background helper jobs started by the current run, keyed by job ID.
+  delegateJobs: new Map(),
+  // Browser preference for new bindings; the session keeps what it was bound with.
+  teamwork: true,
+  sessionDelegation: null,
+  sessionDelegationActive: null,
   pinned: true,
   connectGeneration: 0,
 };
@@ -292,10 +340,25 @@ function describeModelLabel() {
 }
 
 function updateModelDisplay() {
-  const label = describeModelLabel();
-  dom.modelBadge.textContent = label;
-  dom.modelBadge.hidden = !state.connected || !state.selection;
-  dom.modelLabel.textContent = label;
+  dom.modelLabel.textContent = describeModelLabel();
+  updateWelcome();
+  updateModelTrigger();
+}
+
+// The empty state summarizes what the next task will use instead of
+// repeating it in the top bar.
+function updateWelcome() {
+  dom.welcomeConnect.hidden = state.connected || state.connecting;
+  if (!state.connected) {
+    dom.welcomeContext.textContent = state.connecting
+      ? 'Connecting to your local Nexus server…'
+      : 'Connect to your local Nexus server to start.';
+    return;
+  }
+  const parts = [];
+  if (state.projects?.enabled) parts.push(state.projectSelection?.label || 'No project');
+  parts.push(describeModelLabel());
+  dom.welcomeContext.textContent = `Next task uses ${parts.join(' · ')}.`;
 }
 
 function selectedOutcome(outcome) {
@@ -582,7 +645,7 @@ function updateProjectDisplay() {
     : enabled ? 'No project' : 'Projects disabled';
   dom.projectLabel.textContent = state.session && enabled && !current ? 'No project' : label;
   dom.projectBadge.textContent = enabled && selected ? selected.label : 'No project';
-  dom.projectBadge.hidden = false;
+  dom.projectBadge.hidden = !enabled;
   dom.projectBadge.title = selected?.path || '';
 }
 
@@ -613,6 +676,17 @@ function writeCollapsedProjects() {
 function ensureProjectExpanded(id) {
   if (!state.collapsedProjects.delete(projectCollapseKey(id))) return;
   writeCollapsedProjects();
+}
+
+// Navigation labels show the words of a prompt, not its Markdown markers.
+// Single `*`/`_` stay because they are common in identifiers and globs.
+function plainTitle(text) {
+  return String(text || '')
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/(\*\*|__|~~|`)/g, '')
+    .replace(/^\s*(#{1,6}|>|[-*+])\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function compareSessionEntries(left, right) {
@@ -669,7 +743,7 @@ function buildSessionGroups() {
       : typeof saved.project === 'string' ? saved.project : '';
     entries.push({
       session: saved.session,
-      title: saved.title || (typeof meta.title === 'string' ? meta.title : '') || 'Saved session',
+      title: plainTitle(saved.title || (typeof meta.title === 'string' ? meta.title : '')) || 'Saved session',
       messages: Number(saved.messages) || 0,
       active: saved.active === true,
       current: false,
@@ -701,9 +775,11 @@ function appendSessionTreeItem(panel, entry, savedBusy) {
   const open = node('button', 'tree-session-open');
   open.type = 'button';
   open.disabled = savedBusy;
-  open.title = entry.title || 'Saved session';
+  const meta = sessionTreeMeta(entry);
+  open.title = `${entry.title || 'Saved session'}\n${meta}`;
   open.append(node('span', 'tree-session-title', entry.title || 'Saved session'));
-  open.append(node('span', 'tree-session-meta', sessionTreeMeta(entry)));
+  // Rows stay single-line; the meta text remains available to assistive tech.
+  open.append(node('span', 'tree-session-meta', meta));
   if (entry.current) open.setAttribute('aria-current', 'true');
   open.addEventListener('click', () => void openSavedSession(entry.session));
   item.append(open);
@@ -735,16 +811,15 @@ function renderProjectGroup(group, index, { savedBusy, projectBusy, currentProje
   toggle.setAttribute('aria-expanded', String(expanded));
   toggle.setAttribute('aria-controls', panelId);
   if (group.path) toggle.title = group.path;
-  const chevron = node('span', 'tree-chevron', '›');
-  chevron.setAttribute('aria-hidden', 'true');
-  toggle.append(chevron);
+  const folder = node('span', 'tree-folder');
+  folder.setAttribute('aria-hidden', 'true');
+  toggle.append(folder);
   toggle.append(node('span', 'tree-project-name', group.label));
-  toggle.append(node('span', 'tree-project-count', String(group.sessions.length)));
   toggle.addEventListener('click', () => toggleProjectGroup(group.id));
   row.append(toggle);
 
   if (group.id) {
-    const add = node('button', 'tree-project-add', '＋');
+    const add = node('button', 'tree-project-add');
     add.type = 'button';
     add.disabled = !state.connected || projectBusy;
     add.title = `New session in ${group.label}`;
@@ -769,35 +844,41 @@ function renderProjectGroup(group, index, { savedBusy, projectBusy, currentProje
 
 function renderSidebarTree() {
   dom.sidebarTree.replaceChildren();
+  const projectsEnabled = Boolean(state.projects?.enabled);
+  dom.treeLabel.textContent = state.connected && !projectsEnabled ? 'Sessions' : 'Projects';
   if (!state.connected) {
-    dom.treeCount.textContent = '0';
     dom.sidebarTree.append(node('p', 'sidebar-empty', 'Connect to load projects.'));
     return;
   }
   const { groups, unassigned, currentProject } = buildSessionGroups();
   const visible = [...groups];
   if (unassigned.sessions.length) visible.push(unassigned);
-  const total = visible.reduce((count, group) => count + group.sessions.length, 0);
-  dom.treeCount.textContent = String(total);
 
   const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
   const projectBusy = state.active || state.submitting || state.connecting;
-  visible.forEach((group, index) => {
-    dom.sidebarTree.append(renderProjectGroup(group, index, { savedBusy, projectBusy, currentProject }));
-  });
+  if (projectsEnabled) {
+    visible.forEach((group, index) => {
+      dom.sidebarTree.append(renderProjectGroup(group, index, { savedBusy, projectBusy, currentProject }));
+    });
+  } else {
+    // Without projects there is only one group, so its header adds nothing.
+    const list = node('div', 'tree-sessions tree-flat');
+    list.setAttribute('role', 'group');
+    list.setAttribute('aria-label', 'Sessions');
+    for (const entry of unassigned.sessions) appendSessionTreeItem(list, entry, savedBusy);
+    if (unassigned.sessions.length) dom.sidebarTree.append(list);
+  }
   if (!visible.length) {
     dom.sidebarTree.append(node(
       'p',
       'sidebar-empty',
-      state.projects?.enabled ? 'No projects available.' : 'Sessions will appear here after you start one.',
+      projectsEnabled ? 'No projects available.' : 'Sessions will appear here after you start one.',
     ));
   }
   if (!state.savedPersistence) {
-    dom.sidebarTree.append(node(
-      'p',
-      'tree-note',
-      'History is off. Start the server with --session-store DIRECTORY to keep sessions.',
-    ));
+    const note = node('p', 'tree-note', 'History is off. Start the server with ');
+    note.append(node('code', '', '--session-store DIR'), document.createTextNode(' to keep sessions.'));
+    dom.sidebarTree.append(note);
   }
 }
 
@@ -810,6 +891,7 @@ function updateSidebarProjectControls() {
     button.disabled = !state.connected || busy;
   }
   dom.addProjectSidebar.disabled = !state.connected || !state.projects?.enabled;
+  dom.addProjectSidebar.hidden = state.connected && !state.projects?.enabled;
 }
 
 function selectProjectChoice(id) {
@@ -1604,7 +1686,17 @@ async function loadSessionHistory(id) {
     if (!complete) after = next;
     pages += 1;
   }
-  renderHistory(items);
+  let inbox = null;
+  try {
+    inbox = await api(`/sessions/${encodeURIComponent(id)}/inbox`);
+  } catch (error) {
+    if (error?.status !== 404) addNotice('warning', 'Could not recover queued prompts.', 'inbox-refresh');
+  }
+  if (state.session !== id) return;
+  renderPromptInbox(inbox);
+  const active = inbox?.recent?.find(item => item.run === inbox.active_run);
+  renderHistory(active ? items.filter(item => item.run !== active.run) : items);
+  if (active) startDisplayingRun(active.run, active.input);
   if (!complete) {
     addNotice('warning', 'Only the first 500 saved history items were loaded.', 'history-truncated');
   }
@@ -1612,18 +1704,62 @@ async function loadSessionHistory(id) {
 
 function renderHistoricalAssistant(text) {
   const article = node('article', 'message assistant');
+  if (continuesAssistantReply()) article.dataset.continued = 'true';
   const head = node('div', 'message-head');
   head.append(node('span', '', 'NEXUS'));
   const body = node('div', 'message-body');
   const prose = node('div', 'prose');
-  renderMarkdown(prose, text);
+  renderMarkdown(prose, text, state.session);
   body.append(prose);
   article.append(head, body);
   appendNode(article);
 }
 
+// A helper result delivered at a model boundary or as a follow-up. The text is
+// untrusted model output, rendered only through the DOM-building Markdown path.
+function renderChildCompletion(item) {
+  const status = typeof item.status === 'string' ? item.status : 'unknown';
+  const job = typeof item.job_id === 'string' ? item.job_id : '';
+  const known = job ? state.delegateJobs.get(job) : null;
+  // An adopted follow-up and its own event can both report the same job.
+  if (known?.shown) return;
+  if (job) {
+    state.delegateJobs.set(job, { ...known, state: status, shown: true });
+    if (known?.statusElement) {
+      known.statusElement.textContent = `Result ${delegateStatusLabel(status).toLowerCase()}`;
+    }
+  }
+  const result = node('details', 'helper-card');
+  result.dataset.status = status;
+  const summary = node('summary');
+  summary.append(node('span', 'helper-card-icon'));
+  summary.append(node('span', 'helper-card-title', known?.task
+    ? `${delegateRoleLabel(known.role)} · ${known.task}`
+    : `Helper result${job ? ` · ${shortJob(job)}` : ''}`));
+  summary.append(node('span', 'helper-card-status', delegateStatusLabel(status)));
+  result.append(summary);
+  const body = node('div', 'helper-card-body');
+  if (typeof item.text === 'string' && item.text) {
+    const prose = node('div', 'prose');
+    renderMarkdown(prose, item.text);
+    body.append(prose);
+  } else {
+    body.append(node('p', 'tool-note', 'The result was delivered to the agent. Its text is available in saved history.'));
+  }
+  const facts = [];
+  const usage = delegateUsageText(item.input_tokens, item.output_tokens);
+  if (usage) facts.push(usage);
+  if (item.truncated === true) facts.push('Result truncated');
+  if (facts.length) body.append(node('div', 'tool-meta', facts.join(' · ')));
+  result.append(body);
+  appendNode(result);
+  renderHelperStatus();
+}
+
 function renderHistory(items) {
   flushText();
+  for (const job of state.delegateJobs.values()) job.shown = false;
+  projectImageObserver?.disconnect();
   dom.conversation.replaceChildren();
   dom.conversation.hidden = true;
   dom.welcome.hidden = false;
@@ -1634,6 +1770,8 @@ function renderHistory(items) {
       appendUserMessage(item.text);
     } else if (item.kind === 'assistant' && typeof item.text === 'string') {
       renderHistoricalAssistant(item.text);
+    } else if (item.kind === 'child-completion' && typeof item.text === 'string') {
+      renderChildCompletion(item);
     } else if (item.kind === 'tool-call' && typeof item.call === 'string') {
       startTool({
         call: item.call,
@@ -1697,6 +1835,7 @@ async function openSavedSession(id) {
     body.model = choice.model;
   }
   if (state.projects?.enabled && project) body.project = project.id;
+  if (state.teamwork === false) body.delegation = false;
   state.historyLoading = true;
   dom.main.scrollTop = 0;
   setRunStatus('Restoring session…', 'busy');
@@ -1709,12 +1848,15 @@ async function openSavedSession(id) {
     state.sessionProvider = body.provider || null;
     state.sessionModel = body.model || null;
     state.sessionProjectId = project?.id || null;
+    state.sessionDelegation = state.teamwork !== false;
+    state.sessionDelegationActive = typeof reply?.delegation === 'boolean' ? reply.delegation : null;
+    state.context = null;
     state.selection = choice || state.selection;
     populateModels();
     if (project) state.projectSelection = project;
     ensureProjectExpanded(state.sessionProjectId || '');
     const listed = state.savedSessions.find((saved) => saved.session === state.session);
-    state.sessionTitle = typeof meta.title === 'string' ? meta.title : (listed?.title || 'Saved session');
+    state.sessionTitle = plainTitle(typeof meta.title === 'string' ? meta.title : listed?.title) || 'Saved session';
     rememberSession(state.session, {
       title: state.sessionTitle,
       provider: state.sessionProvider,
@@ -1725,7 +1867,7 @@ async function openSavedSession(id) {
     renderSidebarTree();
     updateSessionDisplay();
     await loadSessionHistory(state.session);
-    setRunStatus('Ready', 'ok');
+    if (!state.active) setRunStatus('Ready', 'ok');
     await refreshSavedSessions();
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) markUnauthorized();
@@ -1754,11 +1896,21 @@ function updateControls() {
   dom.newSession.disabled = !canNewSession;
   dom.newSessionMobile.disabled = !canNewSession;
   dom.message.disabled = !connected || blocked || state.historyLoading;
-  dom.send.disabled = !connected || busy || blocked || !state.selection || !dom.message.value.trim();
+  dom.send.disabled = !connected || state.submitting || state.connecting || state.historyLoading
+    || blocked || (!state.session && !state.selection) || !dom.message.value.trim();
+  const sendLabel = state.active || state.inbox?.items?.length ? 'Queue' : 'Send';
+  dom.send.setAttribute('aria-label', sendLabel);
+  dom.send.title = state.active ? 'Queue for after the current run' : sendLabel;
+  if (dom.steerRun) {
+    dom.steerRun.hidden = !state.active;
+    dom.steerRun.disabled = dom.send.disabled || !state.run || state.cancelRequested;
+  }
   const projectEnabled = Boolean(state.projects?.enabled);
   dom.model.disabled = !connected || state.connecting || state.historyLoading || state.submitting || blocked;
-  dom.model.hidden = false;
+  // The native select is the data source; the composer shows the model menu trigger.
+  dom.model.hidden = true;
   dom.model.title = 'Model for the next task; active runs keep their current model';
+  dom.modelTrigger.disabled = !connected || state.connecting || state.historyLoading;
   dom.modelLabel.hidden = true;
   dom.project.disabled = !connected || busy || Boolean(state.session) || !projectEnabled;
   dom.project.hidden = Boolean(state.session) || !projectEnabled;
@@ -1766,7 +1918,7 @@ function updateControls() {
   dom.composerProject.hidden = !projectEnabled;
   dom.cancel.hidden = !state.active;
   dom.cancel.disabled = !connected || !state.active || state.cancelling || state.cancelRequested || !state.run;
-  dom.cancel.textContent = state.cancelling || state.cancelRequested ? 'Cancelling…' : 'Cancel';
+  dom.cancel.title = state.cancelling || state.cancelRequested ? 'Cancelling…' : 'Cancel run';
   dom.connect.disabled = state.connecting;
   dom.disconnect.disabled = !connected || busy || state.projectPicking || state.projectSaving;
   dom.taskThinking.disabled = !connected || state.thinkingSaving || Boolean(state.configSaving);
@@ -1776,8 +1928,8 @@ function updateControls() {
     : blocked
       ? 'Resolve the previous submission first…'
       : state.active
-        ? 'A run is active. You can draft the next task…'
-        : 'Describe a task…';
+        ? 'A run is active. Send to queue the next task, or Steer to redirect it…'
+        : 'Message or describe a task · /btw asks a side question';
   const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
   for (const button of dom.sidebarTree.querySelectorAll('.tree-session-open')) {
     button.disabled = savedBusy;
@@ -1823,8 +1975,9 @@ function resetRunState() {
   state.approvals.clear();
   state.noticeKeys.clear();
   state.notices.clear();
-  dom.usage.hidden = true;
-  dom.usage.textContent = '';
+  for (const [id, job] of state.delegateJobs) {
+    if (job.state !== 'running') state.delegateJobs.delete(id);
+  }
 }
 
 function stopStream() {
@@ -1855,15 +2008,21 @@ function startNewSession({ force = false } = {}) {
   stopStream();
   resetRunState();
   state.session = null;
+  renderPromptInbox(null);
   state.sessionProvider = null;
   state.sessionModel = null;
   state.sessionProjectId = null;
+  state.sessionDelegation = null;
+  state.sessionDelegationActive = null;
+  state.context = null;
+  state.delegateJobs.clear();
   state.sessionTitle = '';
   rememberCurrentSession('');
   if (state.connected) {
     populateModels();
     populateProjects();
   }
+  projectImageObserver?.disconnect();
   dom.conversation.replaceChildren();
   dom.conversation.hidden = true;
   dom.welcome.hidden = false;
@@ -1880,7 +2039,7 @@ function startNewSession({ force = false } = {}) {
 
 function setSessionTitleFromInput(text) {
   if (state.sessionTitle) return;
-  const compact = text.replace(/\s+/g, ' ').trim();
+  const compact = plainTitle(text);
   state.sessionTitle = compact.length > MAX_TITLE_CHARS
     ? `${compact.slice(0, MAX_TITLE_CHARS).trimEnd()}…`
     : compact;
@@ -1892,17 +2051,22 @@ async function ensureSession() {
   if (state.session) {
     const provider = state.selection.demo ? null : state.selection.provider;
     const model = state.selection.demo ? null : state.selection.model;
-    if (provider === state.sessionProvider && model === state.sessionModel) return;
+    const delegation = state.teamwork !== false;
+    if (provider === state.sessionProvider && model === state.sessionModel
+        && delegation === (state.sessionDelegation ?? true)) return;
     if (!state.savedPersistence) {
-      throw new ApiError(409, 'Switching models in an existing session requires --session-store. Start a new session to use this model.');
+      throw new ApiError(409, 'Switching models or teamwork in an existing session requires --session-store. Start a new session to apply it.');
     }
     const body = {};
     if (provider) Object.assign(body, { provider, model });
     if (state.sessionProjectId) body.project = state.sessionProjectId;
-    await api(`/sessions/${encodeURIComponent(state.session)}/restore`, { method: 'POST', body });
+    if (!delegation) body.delegation = false;
+    const restored = await api(`/sessions/${encodeURIComponent(state.session)}/restore`, { method: 'POST', body });
     state.sessionProvider = provider;
     state.sessionModel = model;
-    rememberSession(state.session, { provider, model });
+    state.sessionDelegation = delegation;
+    state.sessionDelegationActive = typeof restored?.delegation === 'boolean' ? restored.delegation : null;
+    rememberSession(state.session, { provider, model, delegation });
     return;
   }
   const body = {};
@@ -1913,6 +2077,7 @@ async function ensureSession() {
   if (state.projects?.enabled && state.projectSelection) {
     body.project = state.projectSelection.id;
   }
+  if (state.teamwork === false) body.delegation = false;
   const reply = await api('/sessions', { method: 'POST', body });
   if (!reply || typeof reply.session !== 'string' || !reply.session) {
     throw new ApiError(200, 'Server did not return a session identity.');
@@ -1923,6 +2088,8 @@ async function ensureSession() {
   state.sessionProjectId = state.projects?.enabled && state.projectSelection
     ? state.projectSelection.id
     : null;
+  state.sessionDelegation = state.teamwork !== false;
+  state.sessionDelegationActive = typeof reply.delegation === 'boolean' ? reply.delegation : null;
   ensureProjectExpanded(state.sessionProjectId || '');
   rememberSession(state.session, {
     title: state.sessionTitle || 'New conversation',
@@ -1938,43 +2105,174 @@ async function ensureSession() {
 
 /* Sending */
 
-async function sendMessage() {
+function renderPromptInbox(inbox) {
+  state.inbox = inbox;
+  renderHelperStatus();
+  const items = inbox?.items || [];
+  const expired = inbox?.expired_child_results || 0;
+  dom.promptInbox.replaceChildren();
+  dom.promptInbox.hidden = !items.length && !expired;
+  if (expired) dom.promptInbox.append(node('div', '', `${expired} helper result${expired === 1 ? '' : 's'} expired before delivery.`));
+  if (!items.length) return;
+  dom.promptInbox.append(node('div', '', inbox.paused || 'Pending prompts'));
+  const session = state.session;
+  for (const [index, item] of items.entries()) {
+    const row = node('div', 'prompt-inbox-row');
+    const label = item.kind === 'child-completion' ? `Helper result · ${delegateStatusLabel(item.status)}`
+      : item.delivery === 'steer' ? `Steer: ${item.input}` : item.input;
+    row.append(node('span', '', label));
+    const actions = node('span');
+    if (index === 0 && inbox.paused) {
+      const resume = node('button', '', 'Resume');
+      resume.type = 'button';
+      resume.addEventListener('click', () => void changePromptInbox(session, item.id, true));
+      actions.append(resume);
+    }
+    const remove = node('button', '', 'Remove');
+    remove.type = 'button';
+    remove.addEventListener('click', () => void changePromptInbox(session, item.id, false));
+    actions.append(remove);
+    row.append(actions);
+    dom.promptInbox.append(row);
+  }
+}
+
+async function changePromptInbox(session, id, resume) {
+  if (!session || session !== state.session || state.submitting) return;
+  state.submitting = true;
+  updateControls();
+  try {
+    const path = `/sessions/${encodeURIComponent(session)}/inbox/${encodeURIComponent(id)}`;
+    await api(resume ? `${path}/start` : path, { method: resume ? 'POST' : 'DELETE' });
+    await refreshPromptInbox(session, { adopt: resume });
+  } catch (error) {
+    addNotice('error', `Could not update queued prompts: ${error.message}`, 'inbox-update');
+  } finally {
+    state.submitting = false;
+    updateControls();
+  }
+}
+
+async function refreshPromptInbox(session = state.session, { adopt = false, follow = false } = {}) {
+  if (!session || !state.connected) return;
+  const previous = state.run;
+  try {
+    const until = Date.now() + 60_000;
+    for (let attempt = 0; ; attempt += 1) {
+      const inbox = await api(`/sessions/${encodeURIComponent(session)}/inbox`);
+      if (state.session !== session || state.run !== previous) return;
+      renderPromptInbox(inbox);
+      updateControls();
+      if (adopt && !state.active) {
+        const recent = inbox.recent || [];
+        const previousIndex = recent.findIndex(item => item.run === previous);
+        const next = previousIndex >= 0 ? recent[previousIndex + 1]
+          : previous === null ? recent.find(item => item.run === inbox.active_run)
+            : recent.find(item => item.kind === 'child-completion' && item.parent_run === previous);
+        if (next) {
+          startDisplayingRun(next.run, next.input);
+          if (next.kind === 'child-completion') renderChildCompletion(next);
+          return;
+        }
+      }
+      const waitingForChild = inbox.pending_child_results > 0;
+      if (!follow || inbox.paused || Date.now() >= until
+          || (!waitingForChild && (!inbox.items?.length || attempt >= 11))
+          || document.hidden) return;
+      await new Promise(resolve => setTimeout(resolve, waitingForChild ? 2000 : 150));
+      if (state.session !== session || state.run !== previous || document.hidden) return;
+    }
+  } catch (error) {
+    if (state.session === session && error?.status !== 404) {
+      addNotice('warning', 'Could not refresh queued prompts.', 'inbox-refresh');
+    }
+  }
+}
+
+function startDisplayingRun(run, text) {
+  stopStream();
+  resetRunState();
+  if (typeof text === 'string') {
+    setSessionTitleFromInput(text);
+    appendUserMessage(text);
+  }
+  state.run = run;
+  state.active = true;
+  updateSessionDisplay();
+  setRunStatus('Starting…', 'busy');
+  updateControls();
+  void attachStream();
+}
+
+async function askSideQuestion(draft, question) {
+  if (!question) {
+    addNotice('warning', 'Enter a question after /btw.', 'side-question-input');
+    return;
+  }
+  if (!state.session || state.askingAside) return;
+  const session = state.session;
+  state.askingAside = true;
+  dom.sideQuestionAnswer.textContent = 'Asking the model…';
+  dom.sideQuestionUsage.textContent = '';
+  if (!dom.sideQuestion.open) dom.sideQuestion.showModal();
+  try {
+    const reply = await api(`/sessions/${encodeURIComponent(session)}/side-question`, {
+      method: 'POST', body: { question },
+    });
+    if (state.session !== session) return;
+    renderMarkdown(dom.sideQuestionAnswer, reply.answer || '');
+    const usage = [reply.usage?.input, reply.usage?.output];
+    dom.sideQuestionUsage.textContent = usage.every(value => !Number.isFinite(value))
+      ? 'Usage not reported'
+      : `Usage: ${usage.map(value => Number.isFinite(value) ? formatTokenCount(value) : '—').join(' / ')} (in / out)`;
+    if (dom.message.value === draft) dom.message.value = '';
+  } catch (error) {
+    if (state.session === session) dom.sideQuestionAnswer.textContent = error.message;
+  } finally {
+    state.askingAside = false;
+    updateControls();
+  }
+}
+
+async function sendMessage({ steer = false } = {}) {
   const draft = dom.message.value;
   const text = draft.trim();
-  if (!text || !state.connected || state.active || state.submitting || state.connecting || state.historyLoading || state.inFlightUnknown) return;
+  if (!text || !state.connected || state.submitting || state.connecting || state.historyLoading || state.inFlightUnknown) return;
+  if (steer && (!state.active || !state.run || state.cancelRequested)) return;
+  if (/^\/btw(?:\s|$)/.test(text)) {
+    await askSideQuestion(draft, text.slice(4).trim());
+    return;
+  }
   state.submitting = true;
   state.pinned = true;
   let submittingRun = false;
-  setRunStatus(state.session ? 'Starting run…' : 'Creating session…', 'busy');
+  if (!state.active) setRunStatus(state.session ? 'Starting run…' : 'Creating session…', 'busy');
   updateControls();
 
   try {
     await ensureSession();
-    setRunStatus('Starting run…', 'busy');
+    if (!state.active) setRunStatus('Starting run…', 'busy');
     submittingRun = true;
     const reply = await api(`/sessions/${encodeURIComponent(state.session)}/runs`, {
       method: 'POST',
-      body: { input: text },
+      body: { input: text, delivery: steer ? 'steer' : 'queue', submission_id: crypto.randomUUID(),
+        ...(steer ? { run: state.run } : {}) },
     });
+    if (reply?.reply === 'queued' || reply?.reply === 'steering') {
+      if (dom.message.value === draft) dom.message.value = '';
+      await refreshPromptInbox(state.session, { adopt: !state.active });
+      return;
+    }
     if (!reply || reply.reply !== 'accepted' || typeof reply.run !== 'string') {
       throw new ApiError(200, reply?.reply || 'Server did not accept the run.');
     }
 
-    stopStream();
-    resetRunState();
-    setSessionTitleFromInput(text);
-    appendUserMessage(text);
     if (dom.message.value === draft) dom.message.value = '';
-    state.run = reply.run;
-    state.active = true;
-    updateSessionDisplay();
-    setRunStatus('Starting…', 'busy');
-    updateControls();
-    void attachStream();
+    startDisplayingRun(reply.run, text);
   } catch (error) {
     if (error instanceof ApiError) {
       addNotice('error', `Request failed: ${error.message}`, null);
-      setRunStatus(error.status === 401 ? 'Authentication required' : 'Request failed', 'error');
+      if (!state.active) setRunStatus(error.status === 401 ? 'Authentication required' : 'Request failed', 'error');
       if (error.status === 401) markUnauthorized();
     } else if (submittingRun) {
       state.inFlightUnknown = true;
@@ -2004,6 +2302,16 @@ function appendUserMessage(text) {
   const body = node('div', 'message-body', text);
   article.append(head, body);
   appendNode(article);
+}
+
+// True when an assistant message already follows the latest user message,
+// so a new assistant item continues the same reply visually.
+function continuesAssistantReply() {
+  for (let element = dom.conversation.lastElementChild; element; element = element.previousElementSibling) {
+    if (element.classList.contains('user')) return false;
+    if (element.classList.contains('assistant')) return true;
+  }
+  return false;
 }
 
 /* SSE */
@@ -2076,7 +2384,10 @@ async function attachStream({ automatic = false } = {}) {
   if (generation !== state.streamGeneration) return;
   state.streaming = false;
   flushText();
-  if (state.runTerminal) return;
+  if (state.runTerminal) {
+    void refreshPromptInbox(session, { adopt: true, follow: true });
+    return;
+  }
   await reconcileAfterLoss(new Error('The event stream closed before the run finished.'));
 }
 
@@ -2157,6 +2468,19 @@ function handleEvent(event) {
   const kind = event.kind;
   const detail = event.detail && typeof event.detail === 'object' ? event.detail : {};
   switch (kind) {
+    case 'user-steered':
+      if (typeof detail.text === 'string') {
+        markStreamingDone();
+        appendUserMessage(detail.text);
+        void refreshPromptInbox();
+      }
+      break;
+    case 'child-completion':
+      if (typeof detail.text === 'string') {
+        markStreamingDone();
+        renderChildCompletion(detail);
+      }
+      break;
     case 'run-started':
       setRunStatus('Running', 'busy');
       break;
@@ -2172,6 +2496,7 @@ function handleEvent(event) {
       break;
     case 'model-request-started':
       setRunStatus(detail.purpose === 'summary' ? 'Preparing context…' : 'Waiting for model…', 'busy');
+      if (detail.purpose !== 'summary') updateContextEstimate(detail);
       break;
     case 'model-request-finished':
       setRunStatus('Model response received', 'busy');
@@ -2250,6 +2575,633 @@ function appendMarkdownLink(parent, label, url, depth, inLink = false) {
   parent.append(link);
 }
 
+const MARKDOWN_IMAGE = /!\[((?:\\[\[\]\\]|[^[\]\\\n])*)\]\([ \t]*(?:<([^<>\n]+)>|((?:[^\s()<>]|\([^\s()<>]*\))+))(?:[ \t]+(?:"([^"\n]*)"|'([^'\n]*)'))?[ \t]*\)/y;
+const PROJECT_IMAGE_TYPES = new Map([
+  ['png', 'image/png'],
+  ['jpg', 'image/jpeg'],
+  ['jpeg', 'image/jpeg'],
+  ['webp', 'image/webp'],
+  ['svg', 'image/svg+xml'],
+]);
+let projectImageObserver;
+let projectImageQueue = Promise.resolve();
+
+function projectImageTarget(target) {
+  if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(target)
+    || /^\/assets\/icon-(?:192|512)\.png(?:[?#]|$)/.test(target)) return null;
+  let path;
+  try {
+    path = decodeURIComponent(target);
+  } catch {
+    path = target;
+  }
+  const type = PROJECT_IMAGE_TYPES.get(path.split('.').at(-1)?.toLowerCase());
+  return type && path.includes('.') ? { path, type } : null;
+}
+
+async function loadProjectImage(placeholder, session, target) {
+  const credential = state.credential;
+  if (!placeholder.isConnected || state.session !== session || !credential) return;
+  const { path, type } = projectImageTarget(target);
+  let url;
+  try {
+    const response = await fetch(`/sessions/${encodeURIComponent(session)}/project-image`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${credential}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+      signal: AbortSignal.timeout(10000),
+      cache: 'no-store',
+      credentials: 'omit',
+      redirect: 'error',
+    });
+    if (!response.ok || response.headers.get('content-type') !== 'application/octet-stream') {
+      throw new Error('Image unavailable');
+    }
+    const bytes = await response.blob();
+    if (!placeholder.isConnected || state.session !== session || state.credential !== credential) return;
+    url = URL.createObjectURL(bytes.slice(0, bytes.size, type));
+    const image = document.createElement('img');
+    image.src = url;
+    await image.decode();
+    if (!placeholder.isConnected || state.session !== session || state.credential !== credential) return;
+    // Keep the blob URL private to the image decoder, especially for untrusted SVG.
+    const canvas = node('canvas', 'md-image');
+    const scale = Math.min(1, 1600 / Math.max(image.naturalWidth, image.naturalHeight));
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+    canvas.tabIndex = 0;
+    canvas.setAttribute('role', 'button');
+    canvas.setAttribute('aria-label', `Enlarge ${placeholder.textContent || 'project image'}`);
+    placeholder.replaceWith(canvas);
+  } catch {
+    placeholder.append(document.createTextNode(' (project image unavailable)'));
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+  }
+}
+
+function observeProjectImages(container, session) {
+  const previews = Array.from(container.querySelectorAll('[data-project-image]')).slice(0, 4);
+  if (!previews.length) return;
+  projectImageObserver ??= new IntersectionObserver((entries, observer) => {
+    for (const { target, isIntersecting } of entries) {
+      if (!isIntersecting) continue;
+      observer.unobserve(target);
+      const { session, projectImage } = target.dataset;
+      projectImageQueue = projectImageQueue.then(() => loadProjectImage(target, session, projectImage));
+    }
+  });
+  for (const preview of previews) {
+    preview.dataset.session = session;
+    projectImageObserver.observe(preview);
+  }
+}
+
+function appendMarkdownImage(parent, label, target, title, inLink) {
+  if (projectImageTarget(target)) {
+    const placeholder = node('span', 'md-project-image', label || 'Project image');
+    placeholder.dataset.projectImage = target;
+    parent.append(placeholder);
+    return;
+  }
+  let url;
+  try {
+    url = new URL(target, location.href);
+  } catch {
+    // Keep the description when the URL is invalid.
+  }
+  const sameOrigin = url?.origin === location.origin;
+  if (!url || url.username || url.password
+    || !(url.protocol === 'https:' || (sameOrigin && url.protocol === 'http:'))) {
+    parent.append(document.createTextNode(label || 'Image'));
+    return;
+  }
+  const image = node('img', 'md-image');
+  image.alt = label;
+  if (title) image.title = title;
+  image.tabIndex = 0;
+  image.setAttribute('role', 'button');
+  image.setAttribute('aria-label', label ? `Enlarge image: ${label}` : 'Enlarge image');
+  image.loading = 'lazy';
+  image.decoding = 'async';
+  image.referrerPolicy = 'no-referrer';
+  if (sameOrigin) {
+    image.src = url.href;
+    parent.append(image);
+  } else if (!inLink) {
+    const load = node('button', 'md-image-load', label ? `Load image: ${label}` : 'Load image');
+    load.type = 'button';
+    load.title = url.hostname;
+    load.addEventListener('click', () => {
+      image.src = url.href;
+      load.replaceWith(image);
+    }, { once: true });
+    parent.append(load);
+  } else {
+    parent.append(document.createTextNode(label || 'Image'));
+  }
+}
+
+function imagePreviewSource(source) {
+  if (!source) return null;
+  if (source.tagName === 'CANVAS') {
+    try {
+      return {
+        src: source.toDataURL('image/png'),
+        alt: source.getAttribute('aria-label') || 'Project image',
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (source.tagName === 'IMG') {
+    const src = source.currentSrc || source.src;
+    return src ? { src, alt: source.alt || source.getAttribute('aria-label') || 'Image' } : null;
+  }
+  return null;
+}
+
+let imageLightboxReturnFocus = null;
+
+function enlargeImage(source) {
+  const preview = imagePreviewSource(source);
+  if (!preview || !dom.imageLightbox || !dom.imageLightboxImage) return false;
+  imageLightboxReturnFocus = source?.focus ? source : null;
+  dom.imageLightboxImage.src = preview.src;
+  dom.imageLightboxImage.alt = preview.alt;
+  dom.imageLightbox.hidden = false;
+  document.body.classList.add('image-lightbox-open');
+  dom.imageLightbox.focus?.();
+  return true;
+}
+
+function closeImageLightbox() {
+  if (!dom.imageLightbox || dom.imageLightbox.hidden) return;
+  dom.imageLightbox.hidden = true;
+  dom.imageLightboxImage?.removeAttribute('src');
+  document.body.classList.remove('image-lightbox-open');
+  const target = imageLightboxReturnFocus;
+  imageLightboxReturnFocus = null;
+  if (target?.isConnected !== false) target?.focus?.();
+}
+
+function imageFromEvent(event) {
+  return event.target?.closest?.('img.md-image, canvas.md-image') || null;
+}
+
+const MATH_SOURCE_LIMIT = 4096;
+const MATH_NAMESPACE = 'http://www.w3.org/1998/Math/MathML';
+const MATH_IDENTIFIERS = new Map(Array.from(
+  'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi pi rho sigma tau upsilon phi chi psi omega Gamma Delta Theta Lambda Xi Pi Sigma Upsilon Phi Psi Omega'.split(' '),
+  (name, index) => [name, 'αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΥΦΨΩ'[index]],
+));
+for (const [name, symbol] of Object.entries({
+  epsilon: 'ϵ', varepsilon: 'ε', vartheta: 'ϑ', varpi: 'ϖ', varrho: 'ϱ', varsigma: 'ς',
+  phi: 'ϕ', varphi: 'φ', varkappa: 'ϰ', ell: 'ℓ', hbar: 'ℏ', imath: 'ı', jmath: 'ȷ',
+  Re: 'ℜ', Im: 'ℑ', aleph: 'ℵ', wp: '℘', emptyset: '∅', varnothing: '∅',
+})) MATH_IDENTIFIERS.set(name, symbol);
+const MATH_OPERATORS = new Map(Object.entries({
+  times: '×', cdot: '⋅', div: '÷', pm: '±', mp: '∓', le: '≤', leq: '≤',
+  ge: '≥', geq: '≥', ne: '≠', neq: '≠', approx: '≈', equiv: '≡', sim: '∼',
+  simeq: '≃', cong: '≅', asymp: '≍', propto: '∝', ll: '≪', gg: '≫',
+  prec: '≺', succ: '≻', preceq: '≼', succeq: '≽',
+  in: '∈', ni: '∋', notin: '∉', subset: '⊂', subseteq: '⊆', supset: '⊃',
+  supseteq: '⊇', subsetneq: '⊊', cup: '∪', cap: '∩', setminus: '∖',
+  wedge: '∧', land: '∧', vee: '∨', lor: '∨', neg: '¬', lnot: '¬',
+  forall: '∀', exists: '∃', nexists: '∄', top: '⊤', bot: '⊥', perp: '⊥',
+  parallel: '∥', mid: '∣', nmid: '∤', colon: ':',
+  to: '→', gets: '←', rightarrow: '→', leftarrow: '←', leftrightarrow: '↔',
+  Rightarrow: '⇒', Leftarrow: '⇐', Leftrightarrow: '⇔', implies: '⟹', iff: '⟺',
+  longrightarrow: '⟶', longleftarrow: '⟵', longleftrightarrow: '⟷',
+  Longrightarrow: '⟹', Longleftarrow: '⟸', Longleftrightarrow: '⟺',
+  mapsto: '↦', longmapsto: '⟼', uparrow: '↑', downarrow: '↓', updownarrow: '↕',
+  hookrightarrow: '↪', hookleftarrow: '↩', rightleftharpoons: '⇌',
+  sum: '∑', prod: '∏', coprod: '∐', bigcup: '⋃', bigcap: '⋂',
+  bigvee: '⋁', bigwedge: '⋀', bigoplus: '⨁', bigotimes: '⨂', bigodot: '⨀',
+  int: '∫', iint: '∬', iiint: '∭', oint: '∮', oiint: '∯',
+  infty: '∞', partial: '∂', nabla: '∇', prime: '′', degree: '°',
+  dots: '…', ldots: '…', cdots: '⋯', vdots: '⋮', ddots: '⋱',
+  ast: '∗', star: '⋆', circ: '∘', bullet: '•', oplus: '⊕', ominus: '⊖',
+  otimes: '⊗', oslash: '⊘', odot: '⊙', triangle: '△', angle: '∠',
+  triangleq: '≜', square: '□', Box: '□', diamond: '⋄', therefore: '∴',
+  because: '∵', opencorner: '⌜', checkmark: '✓',
+}));
+const MATH_FUNCTIONS = new Set(
+  'sin cos tan cot sec csc arcsin arccos arctan sinh cosh tanh coth log ln lg exp lim liminf limsup min max sup inf det gcd arg deg dim ker Pr hom'.split(' '),
+);
+const MATH_LIMITS = new Set('sum prod coprod bigcup bigcap bigvee bigwedge bigoplus bigotimes bigodot lim liminf limsup min max sup inf'.split(' '));
+const MATH_SPACES = new Map([
+  ['\\,', '0.167em'], ['\\:', '0.222em'], ['\\;', '0.278em'],
+  ['\\ ', '0.333em'], ['\\enspace', '0.5em'], ['\\quad', '1em'], ['\\qquad', '2em'],
+  ['\\thinspace', '0.167em'], ['\\medspace', '0.222em'], ['\\thickspace', '0.278em'],
+]);
+const MATH_FIXED_DELIMITERS = new Set('()[]{}|');
+const MATH_DELIMITERS = new Map(Object.entries({
+  lbrace: '{', rbrace: '}', lbrack: '[', rbrack: ']', langle: '⟨', rangle: '⟩',
+  lvert: '|', rvert: '|', vert: '|', lVert: '‖', rVert: '‖', Vert: '‖',
+  lfloor: '⌊', rfloor: '⌋', lceil: '⌈', rceil: '⌉', backslash: '∖',
+  uparrow: '↑', downarrow: '↓', updownarrow: '↕',
+}));
+for (const value of MATH_DELIMITERS.values()) MATH_FIXED_DELIMITERS.add(value);
+MATH_FIXED_DELIMITERS.add('∥');
+const MATH_ACCENTS = new Map(Object.entries({
+  hat: '^', widehat: '^', tilde: '~', widetilde: '~', bar: '¯', overline: '¯',
+  vec: '→', overrightarrow: '→', overleftarrow: '←', overleftrightarrow: '↔',
+  dot: '˙', ddot: '¨', dddot: '⃛', breve: '˘', check: 'ˇ', acute: '´', grave: '`',
+  underleftarrow: '←', underrightarrow: '→', underline: '_', overbrace: '⏞', underbrace: '⏟',
+}));
+const MATH_ENVIRONMENTS = new Map(Object.entries({
+  matrix: '', pmatrix: '()', bmatrix: '[]', Bmatrix: '{}', vmatrix: '||',
+  Vmatrix: '‖‖', smallmatrix: '', cases: '{', dcases: '{',
+  aligned: '', align: '', 'align*': '', split: '', alignedat: '', alignat: '', 'alignat*': '',
+  gathered: '', gather: '', 'gather*': '', equation: '', 'equation*': '', array: '',
+}));
+const MATH_ALIGNMENTS = new Set(['aligned', 'align', 'align*', 'split', 'alignedat', 'alignat', 'alignat*']);
+const MATH_ALPHABETS = new Map([
+  ['mathbf', [0x1d400, 0x1d41a, 0x1d7ce, 0x1d6a8, 0x1d6c2]],
+  ['boldsymbol', [0x1d468, 0x1d482, 0x1d7ce, 0x1d71c, 0x1d736]],
+  ['mathit', [0x1d434, 0x1d44e]], ['mathbb', [0x1d538, 0x1d552, 0x1d7d8]],
+  ['mathcal', [0x1d49c, 0x1d4b6]], ['mathscr', [0x1d49c, 0x1d4b6]],
+  ['mathfrak', [0x1d504, 0x1d51e]], ['mathsf', [0x1d5a0, 0x1d5ba, 0x1d7e2]],
+  ['mathtt', [0x1d670, 0x1d68a, 0x1d7f6]], ['mathrm', []],
+]);
+const MATH_LETTER_EXCEPTIONS = new Map([
+  [0x1d455, 'ℎ'], [0x1d49d, 'ℬ'], [0x1d4a0, 'ℰ'], [0x1d4a1, 'ℱ'],
+  [0x1d4a3, 'ℋ'], [0x1d4a4, 'ℐ'], [0x1d4a7, 'ℒ'], [0x1d4a8, 'ℳ'],
+  [0x1d4ad, 'ℛ'], [0x1d4ba, 'ℯ'], [0x1d4bc, 'ℊ'], [0x1d4c4, 'ℴ'],
+  [0x1d506, 'ℭ'], [0x1d50b, 'ℌ'], [0x1d50c, 'ℑ'], [0x1d515, 'ℜ'],
+  [0x1d51d, 'ℨ'], [0x1d53a, 'ℂ'], [0x1d53f, 'ℍ'], [0x1d545, 'ℕ'],
+  [0x1d547, 'ℙ'], [0x1d548, 'ℚ'], [0x1d549, 'ℝ'], [0x1d551, 'ℤ'],
+]);
+
+function mathElement(name, ...children) {
+  const element = document.createElementNS(MATH_NAMESPACE, name);
+  element.append(...children);
+  return element;
+}
+
+function mathOperator(value, stretchy = false) {
+  const operator = mathElement('mo', value);
+  if (stretchy || MATH_FIXED_DELIMITERS.has(value)) {
+    operator.setAttribute('stretchy', String(stretchy));
+  }
+  return operator;
+}
+
+function buildMarkdownMath(source, display) {
+  if (!source.trim() || source.length > MATH_SOURCE_LIMIT) return null;
+  const token = /(\\(?:[A-Za-z]+|.)|\d+(?:\.\d+)?|.)/syu;
+  const textGroup = /\{((?:\\[{}\\%$#_&]|[^{}\\])*)\}/y;
+  const input = source.trim();
+  let index = 0;
+  let alphabet;
+  const operatorLimits = new WeakSet();
+  const invalid = new Error('Unsupported math');
+
+  function peek() {
+    while (index < input.length && /\s/.test(input[index])) index += 1;
+    return input[index];
+  }
+
+  function nextToken() {
+    peek();
+    token.lastIndex = index;
+    return token.exec(input)?.[0];
+  }
+
+  function take() {
+    const value = nextToken();
+    if (!value) throw invalid;
+    index += value.length;
+    return value;
+  }
+
+  function rawGroup(pattern) {
+    if (take() !== '{') throw invalid;
+    const end = input.indexOf('}', index);
+    if (end < 0) throw invalid;
+    const value = input.slice(index, end);
+    if (!pattern.test(value)) throw invalid;
+    index = end + 1;
+    return value;
+  }
+
+  function styled(child, style, level) {
+    const wrapper = mathElement('mstyle', child);
+    if (style !== undefined) wrapper.setAttribute('displaystyle', String(style));
+    if (level !== undefined) wrapper.setAttribute('scriptlevel', level);
+    return wrapper;
+  }
+
+  function letter(value) {
+    let text = value;
+    if (alphabet) {
+      const ascii = value.charCodeAt(0);
+      const group = /^[A-Z]$/.test(value) ? [0, 65] : /^[a-z]$/.test(value) ? [1, 97]
+        : /^[Α-Ω]$/.test(value) ? [3, 0x391] : /^[α-ω]$/.test(value) ? [4, 0x3b1] : null;
+      if (group && alphabet[group[0]]) {
+        const transformed = alphabet[group[0]] + ascii - group[1];
+        text = MATH_LETTER_EXCEPTIONS.get(transformed) || String.fromCodePoint(transformed);
+      }
+    }
+    const element = mathElement('mi', text);
+    if ((alphabet && text === value) || text !== value) element.setAttribute('mathvariant', 'normal');
+    return element;
+  }
+
+  function delimiter() {
+    const value = take();
+    if (value === '.') return '';
+    if (value === '\\|') return '‖';
+    if (/^\\[{}]$/.test(value)) return value[1];
+    if (/^[()[\]|⟨⟩‖⌊⌋⌈⌉]$/.test(value)) return value;
+    const mapped = value.startsWith('\\') && MATH_DELIMITERS.get(value.slice(1));
+    if (!mapped) throw invalid;
+    return mapped;
+  }
+
+  function fenced(content, left, right) {
+    if (!left && !right) return content;
+    const row = mathElement('mrow');
+    if (left) row.append(mathOperator(left, true));
+    row.append(content);
+    if (right) row.append(mathOperator(right, true));
+    return row;
+  }
+
+  function table(depth, displayStyle) {
+    const name = rawGroup(/^[a-zA-Z]+\*?$/);
+    if (!MATH_ENVIRONMENTS.has(name)) throw invalid;
+    const columns = name === 'array' ? rawGroup(/^[lcr|]{1,24}$/).replace(/\|/g, '') : '';
+    if (name === 'array' && !columns) throw invalid;
+    if (name.startsWith('alignat') || name === 'alignedat') rawGroup(/^[1-9]\d?$/);
+    const layout = mathElement('mtable');
+    const isCases = name === 'cases' || name === 'dcases';
+    const aligned = MATH_ALIGNMENTS.has(name);
+    const singleColumn = /^(?:gather|equation)/.test(name);
+    const maxColumns = singleColumn ? 1 : isCases ? 2 : columns.length || 24;
+    for (let rowIndex = 0; rowIndex < 64; rowIndex += 1) {
+      const row = mathElement('mtr');
+      for (let column = 0; column < maxColumns; column += 1) {
+        const wrap = sequence(depth + 1, value => value === '&' || value === '\\\\' || value === '\\end',
+          name === 'dcases' || aligned || (singleColumn && displayStyle));
+        const cell = mathElement('mtd', wrap);
+        const alignment = columns[column] || (isCases ? 'l' : aligned ? (column % 2 ? 'l' : 'r') : 'c');
+        cell.setAttribute('class', `md-math-${alignment}`);
+        row.append(cell);
+        if (nextToken() !== '&') break;
+        take();
+        if (column + 1 === maxColumns) throw invalid;
+      }
+      layout.append(row);
+      if (nextToken() === '\\\\') {
+        take();
+        const gap = input.slice(index).match(/^\s*\[\s*-?\d+(?:\.\d+)?(?:em|ex|pt|px|mm|cm)\s*\]/);
+        if (gap) index += gap[0].length;
+        if (nextToken() !== '\\end') continue;
+      }
+      if (take() !== '\\end' || rawGroup(/^[a-zA-Z]+\*?$/) !== name) throw invalid;
+      const [left, right] = MATH_ENVIRONMENTS.get(name);
+      return fenced(name === 'smallmatrix' ? styled(layout, false, '+1')
+        : (name === 'dcases' || aligned) ? styled(layout, true) : layout, left, right);
+    }
+    throw invalid;
+  }
+
+  function atom(depth, single = false, displayStyle = false) {
+    if (depth > 24) throw invalid;
+    const value = single && /^\d$/.test(peek() || '') ? input[index++] : take();
+    if (value === '{') {
+      const row = sequence(depth + 1, undefined, displayStyle);
+      if (take() !== '}') throw invalid;
+      return row;
+    }
+    if (value === '\\left') {
+      const left = delimiter();
+      const content = mathElement('mrow');
+      const end = command => command === '\\middle' || command === '\\right';
+      if (left) content.append(mathOperator(left, true));
+      content.append(sequence(depth + 1, end, displayStyle));
+      while (nextToken() === '\\middle') {
+        take();
+        const middle = delimiter();
+        if (middle) content.append(mathOperator(middle, true));
+        content.append(sequence(depth + 1, end, displayStyle));
+      }
+      if (take() !== '\\right') throw invalid;
+      const right = delimiter();
+      // Keep middle delimiters in the same row as the outer fences.
+      if (right) content.append(mathOperator(right, true));
+      return content;
+    }
+    if (value === '\\begin') return table(depth, displayStyle);
+    if (value === '\\sqrt') {
+      if (peek() !== '[') return mathElement('msqrt', atom(depth + 1, true));
+      take();
+      const degree = sequence(depth + 1, part => part === ']');
+      if (take() !== ']') throw invalid;
+      return mathElement('mroot', atom(depth + 1, true), degree);
+    }
+    if (['\\frac', '\\dfrac', '\\tfrac', '\\binom', '\\dbinom', '\\tbinom'].includes(value)) {
+      let fraction = mathElement('mfrac', atom(depth + 1, true), atom(depth + 1, true));
+      if (value.endsWith('binom')) {
+        fraction.setAttribute('linethickness', '0');
+        fraction = fenced(fraction, '(', ')');
+      }
+      return value[1] === 'd' ? styled(fraction, true) : value[1] === 't' ? styled(fraction, false) : fraction;
+    }
+    if (['\\text', '\\mbox', '\\textnormal', '\\operatorname', '\\tag'].includes(value)) {
+      const starred = (value === '\\operatorname' || value === '\\tag') && peek() === '*';
+      if (starred) take();
+      peek();
+      textGroup.lastIndex = index;
+      const text = textGroup.exec(input);
+      if (!text) throw invalid;
+      index = textGroup.lastIndex;
+      const label = text[1].replace(/\\([{}\\%$#_&])/g, '$1');
+      const element = mathElement(value === '\\operatorname' ? 'mo' : 'mtext',
+        value === '\\tag' && !starred ? ` (${label})` : label);
+      if (value === '\\operatorname' && starred) operatorLimits.add(element);
+      if (value === '\\tag') element.setAttribute('class', 'md-math-tag');
+      return element;
+    }
+    if (MATH_SPACES.has(value)) {
+      const space = mathElement('mspace');
+      space.setAttribute('width', MATH_SPACES.get(value));
+      return space;
+    }
+    const name = value.slice(1);
+    if (value.startsWith('\\')) {
+      if (MATH_ALPHABETS.has(name) || name === 'bm') {
+        const previous = alphabet;
+        alphabet = MATH_ALPHABETS.get(name === 'bm' ? 'boldsymbol' : name);
+        const content = atom(depth + 1, true, displayStyle);
+        alphabet = previous;
+        return content;
+      }
+      if (MATH_ACCENTS.has(name)) {
+        const below = name.startsWith('under');
+        const accent = mathElement('mo', MATH_ACCENTS.get(name));
+        const wide = /^(?:over|under|wide)/.test(name);
+        accent.setAttribute('stretchy', String(wide));
+        const accented = mathElement(below ? 'munder' : 'mover', atom(depth + 1, true), accent);
+        accented.setAttribute(below ? 'accentunder' : 'accent', 'true');
+        if (name.endsWith('brace')) operatorLimits.add(accented);
+        return accented;
+      }
+      if (['overset', 'stackrel', 'underset'].includes(name)) {
+        const script = atom(depth + 1, true);
+        return mathElement(name === 'underset' ? 'munder' : 'mover', atom(depth + 1, true), script);
+      }
+      if (name === 'not') {
+        const relation = take();
+        const symbol = relation.startsWith('\\') ? MATH_OPERATORS.get(relation.slice(1)) : relation;
+        if (!symbol || !/^[\p{Sm}=<>]$/u.test(symbol)) throw invalid;
+        const negations = { '=': '≠', '∈': '∉', '∋': '∌', '≡': '≢', '⊂': '⊄', '⊆': '⊈', '∥': '∦', '∣': '∤' };
+        return mathOperator(negations[symbol] || `${symbol}\u0338`);
+      }
+      if (name === 'boxed' || name === 'phantom') {
+        const child = atom(depth + 1, true, displayStyle);
+        const wrapper = mathElement(name === 'boxed' ? 'mrow' : 'mphantom', child);
+        if (name === 'boxed') wrapper.setAttribute('class', 'md-math-box');
+        return wrapper;
+      }
+      if (name === 'substack') {
+        if (take() !== '{') throw invalid;
+        const layout = mathElement('mtable');
+        for (let rowIndex = 0; rowIndex < 64; rowIndex += 1) {
+          const line = sequence(depth + 1, part => part === '\\\\', false);
+          layout.append(mathElement('mtr', mathElement('mtd', line)));
+          const separator = take();
+          if (separator === '}') return styled(layout, false, '1');
+          if (separator !== '\\\\') throw invalid;
+        }
+        throw invalid;
+      }
+      if (name === 'xrightarrow' || name === 'xleftarrow') {
+        let below;
+        if (peek() === '[') {
+          take();
+          below = sequence(depth + 1, part => part === ']');
+          if (take() !== ']') throw invalid;
+        }
+        const arrow = mathOperator(name === 'xrightarrow' ? '→' : '←', true);
+        const above = atom(depth + 1, true);
+        return below ? mathElement('munderover', arrow, below, above) : mathElement('mover', arrow, above);
+      }
+      if (/^(?:big|Big|bigg|Bigg)[lmr]?$/.test(name)) {
+        const sizes = { big: '1.2em', Big: '1.5em', bigg: '1.8em', Bigg: '2.2em' };
+        const content = delimiter();
+        if (!content) return mathElement('mrow');
+        const operator = mathOperator(content, true);
+        const size = sizes[name.replace(/[lmr]$/, '')];
+        operator.setAttribute('minsize', size);
+        operator.setAttribute('maxsize', size);
+        return operator;
+      }
+      if (MATH_IDENTIFIERS.has(name)) return letter(MATH_IDENTIFIERS.get(name));
+      if (MATH_OPERATORS.has(name)) return mathOperator(MATH_OPERATORS.get(name));
+      if (MATH_FUNCTIONS.has(name)) return mathElement('mo', name);
+      if (MATH_DELIMITERS.has(name)) return mathOperator(MATH_DELIMITERS.get(name));
+      if (name === 'notag' || name === 'nonumber') return mathElement('mrow');
+      if (name === '|') return mathOperator('‖');
+      if (/^[{}%$#&_!]$/.test(name)) return name === '!' ? mathElement('mrow') : mathOperator(name);
+      throw invalid;
+    }
+    if (/^\d/.test(value)) {
+      const digits = alphabet?.[2];
+      return mathElement('mn', digits ? value.replace(/\d/g, digit => String.fromCodePoint(digits + Number(digit))) : value);
+    }
+    if (/^\p{L}$/u.test(value)) return letter(value);
+    if (/^[+\-−*=<>()[\]|!.,:;/\p{Sm}]$/u.test(value)) return mathOperator(value === '-' ? '−' : value);
+    throw invalid;
+  }
+
+  function sequence(depth, stop = () => false, displayStyle = display, allowInfix = true) {
+    if (depth > 24) throw invalid;
+    const row = mathElement('mrow');
+    let command;
+    while ((command = nextToken()) && command !== '}' && !stop(command)) {
+      if (['\\over', '\\atop', '\\choose'].includes(command)) {
+        if (!allowInfix) throw invalid;
+        take();
+        const fraction = mathElement('mfrac', row, sequence(depth + 1, stop, false, false));
+        if (command !== '\\over') fraction.setAttribute('linethickness', '0');
+        return command === '\\choose' ? fenced(fraction, '(', ')') : fraction;
+      }
+      if (['\\displaystyle', '\\textstyle', '\\scriptstyle', '\\scriptscriptstyle'].includes(command)) {
+        take();
+        const large = command === '\\displaystyle';
+        const level = command === '\\scriptstyle' ? '1' : command === '\\scriptscriptstyle' ? '2' : '0';
+        row.append(styled(sequence(depth + 1, stop, large, allowInfix), large, level));
+        break;
+      }
+      const base = atom(depth, false, displayStyle);
+      let sub;
+      let sup;
+      let primes = '';
+      let limits = operatorLimits.has(base) && /brace$/.test(command)
+        || (displayStyle && (operatorLimits.has(base) || MATH_LIMITS.has(command.slice(1))));
+      let modifier = nextToken();
+      if (['\\limits', '\\nolimits', '\\displaylimits'].includes(modifier)) {
+        take();
+        limits = modifier === '\\limits' || (modifier === '\\displaylimits' && displayStyle);
+      }
+      while ((modifier = nextToken()) && ['_', '^', "'", '′', '″', '‴'].includes(modifier)) {
+        take();
+        if (modifier === '_' || modifier === '^') {
+          if ((modifier === '_' && sub) || (modifier === '^' && sup)) throw invalid;
+          if (modifier === '_') sub = atom(depth + 1, true);
+          else sup = atom(depth + 1, true);
+        } else {
+          primes += modifier === "'" ? '′' : modifier;
+        }
+      }
+      if (primes) {
+        const prime = mathOperator(primes);
+        sup = sup ? mathElement('mrow', prime, sup) : prime;
+      }
+      row.append(sub && sup ? mathElement(limits ? 'munderover' : 'msubsup', base, sub, sup)
+        : sub ? mathElement(limits ? 'munder' : 'msub', base, sub)
+          : sup ? mathElement(limits ? 'mover' : 'msup', base, sup) : base);
+    }
+    return row;
+  }
+
+  try {
+    const row = sequence(0);
+    if (peek()) return null;
+    const math = mathElement('math', row);
+    if (display) math.setAttribute('display', 'block');
+    return math;
+  } catch (error) {
+    if (error !== invalid) throw error;
+    return null;
+  }
+}
+
+function matchInlineMath(text, start) {
+  const dollar = text[start] === '$';
+  if (dollar ? (text[start - 1] === '$' || !/[^\s$]/.test(text[start + 1] || ''))
+    : !text.startsWith('\\(', start)) return null;
+  const body = start + (dollar ? 1 : 2);
+  for (let index = body; index < text.length && index - body <= MATH_SOURCE_LIMIT; index += 1) {
+    if (text[index] === '`') return null;
+    if (text[index] === '\\') {
+      if (!dollar && text[index + 1] === ')') return { body, end: index, after: index + 2 };
+      if (!dollar && text[index + 1] === '(') return null;
+      index += 1;
+    } else if (dollar && text[index] === '$') {
+      if (index > body && !/\s/.test(text[index - 1]) && !/[\d$]/.test(text[index + 1] || '')) {
+        return { body, end: index, after: index + 1 };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
 function appendInlineMarkdown(parent, text, depth = 0, inLink = false) {
   if (!text) return;
   if (depth > 12) {
@@ -2268,10 +3220,38 @@ function appendInlineMarkdown(parent, text, depth = 0, inLink = false) {
   while (index < text.length) {
     const character = text[index];
 
-    if (character === '\\' && index + 1 < text.length && /[\\`*{}\[\]()#+\-.!_>~|]/.test(text[index + 1])) {
+    if (character === '$' || character === '\\') {
+      const match = matchInlineMath(text, index);
+      if (match) {
+        flush();
+        parent.append(buildMarkdownMath(text.slice(match.body, match.end), false)
+          || document.createTextNode(text.slice(index, match.after)));
+        index = match.after;
+        continue;
+      }
+      if (text.startsWith('\\(', index) || text.startsWith('\\[', index)) {
+        buffer += text.slice(index, index + 2);
+        index += 2;
+        continue;
+      }
+    }
+
+    if (character === '\\' && index + 1 < text.length && /[\\`*{}\[\]()#+\-.!_>~|$]/.test(text[index + 1])) {
       buffer += text[index + 1];
       index += 2;
       continue;
+    }
+
+    if (character === '!' && text[index + 1] === '[') {
+      MARKDOWN_IMAGE.lastIndex = index;
+      const image = MARKDOWN_IMAGE.exec(text);
+      if (image) {
+        flush();
+        appendMarkdownImage(parent, image[1].replace(/\\([\[\]\\])/g, '$1'),
+          image[2] ?? image[3], image[4] ?? image[5], inLink);
+        index += image[0].length;
+        continue;
+      }
     }
 
     if (character === '`') {
@@ -2453,13 +3433,15 @@ function splitTableRow(line) {
   if (text.endsWith('|')) text = text.slice(0, -1);
   const cells = [];
   let current = '';
-  let escaped = false;
-  for (const character of text) {
-    if (escaped) {
-      current += character;
-      escaped = false;
-    } else if (character === '\\') {
-      escaped = true;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    const math = (character === '$' || character === '\\') && matchInlineMath(text, index);
+    if (math) {
+      current += text.slice(index, math.after);
+      index = math.after - 1;
+    } else if (character === '\\' && index + 1 < text.length) {
+      current += text.slice(index, index + 2);
+      index += 1;
     } else if (character === '|') {
       cells.push(current);
       current = '';
@@ -2487,10 +3469,138 @@ function tableSeparator(line) {
 function startsMarkdownBlock(lines, index) {
   const line = lines[index];
   if (!line || !line.trim()) return true;
-  if (matchFence(line) || matchHeading(line) || isHorizontalRule(line) || matchBlockquote(line) || matchListItem(line)) {
+  if (matchFence(line) || matchHeading(line) || isHorizontalRule(line) || matchBlockquote(line) || matchListItem(line)
+    || matchDisplayMath(lines, index)) {
     return true;
   }
   return line.includes('|') && index + 1 < lines.length && tableSeparator(lines[index + 1]) !== null;
+}
+
+function matchDisplayMath(lines, start) {
+  const first = lines[start].trim();
+  const name = first.match(/^\\begin\{([a-zA-Z]+\*?)\}/)?.[1];
+  const environment = MATH_ENVIRONMENTS.has(name) ? name : null;
+  const open = first.startsWith('$$') ? '$$' : first.startsWith('\\[') ? '\\[' : null;
+  if (!open && !environment) return null;
+  if (first.length > MATH_SOURCE_LIMIT + 4) return null;
+  if (environment && !open) {
+    let depth = 0;
+    let size = 0;
+    for (let index = start; index < lines.length; index += 1) {
+      const line = lines[index].trim();
+      size += lines[index].length + 1;
+      if (size > MATH_SOURCE_LIMIT || !line || matchFence(line)) return null;
+      for (const match of line.matchAll(/\\(begin|end)\{([a-zA-Z]+\*?)\}/g)) {
+        if (match[2] !== environment) continue;
+        depth += match[1] === 'begin' ? 1 : -1;
+        if (depth === 0) {
+          if (match.index + match[0].length !== line.length) return null;
+          return { source: lines.slice(start, index + 1).join('\n'), end: index };
+        }
+      }
+    }
+    return null;
+  }
+  const close = open === '$$' ? '$$' : '\\]';
+  if (first.length >= 4 && first.endsWith(close)) {
+    return { source: first.slice(2, -2), end: start };
+  }
+  const source = [first.slice(2)];
+  let size = source[0].length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index].trimEnd();
+    size += line.length + 1;
+    if (size > MATH_SOURCE_LIMIT || !line.trim() || matchFence(line)) return null;
+    if (line.endsWith(close)) {
+      source.push(line.slice(0, -2));
+      return { source: source.join('\n'), end: index };
+    }
+    source.push(line);
+  }
+  return null;
+}
+
+const CODE_KEYWORDS = new Set((
+  'abstract and as assert async await begin break case catch chan class const continue crate def default defer delete do done elif else elseif end enum esac except export extends extern false fi finally fn for foreach from func function global go if impl implements import in include instanceof interface is let local loop map match mod module mut namespace new nil none not null of on or package pass private protected pub public raise range ref require return select self set static struct super switch then this throw throws trait true try type typeof unless unsafe until use using var void when where while with yield'
+).split(' '));
+const CODE_HIGHLIGHT_CHARS = 20_000;
+const CODE_HIGHLIGHT_TOKENS = 4_000;
+const CODE_LINE_HASH = /^(?:py|py3|python3?|rb|ruby|sh|bash|zsh|shell|fish|yaml|yml|toml|perl|r|makefile|dockerfile|ini|conf|coffee|elixir|exs?)$/;
+const CODE_LINE_DASH = /^(?:sql|lua|hs|haskell|elm|ada)$/;
+const CODE_MARKUP = /^(?:html?|xml|svg|vue|svelte|jsx|tsx)$/;
+const CODE_PLAIN = /^(?:text|txt|plain|plaintext|none|markdown|md|diff|patch|log)$/;
+const CODE_CSS = /^(?:css|scss|less|sass|styl)$/;
+
+function codeLineComment(language) {
+  if (CODE_LINE_HASH.test(language)) return '#';
+  if (CODE_LINE_DASH.test(language)) return '--';
+  if (CODE_MARKUP.test(language) && !/^(?:jsx|tsx)$/.test(language)) return '';
+  return '//';
+}
+
+function codeTokens(source, language) {
+  const lang = String(language || '').toLowerCase().replace(/^language-/, '');
+  if (!lang || CODE_PLAIN.test(lang) || source.length > CODE_HIGHLIGHT_CHARS) return null;
+  const line = codeLineComment(lang);
+  const markup = CODE_MARKUP.test(lang);
+  const css = CODE_CSS.test(lang);
+  const parts = [
+    '/\\*[\\s\\S]*?\\*/',
+    '<!--[\\s\\S]*?-->',
+    line ? `${line}[^\\n]*` : '',
+    '"""[\\s\\S]*?"""',
+    "'''[\\s\\S]*?'''",
+    '"(?:\\\\[\\s\\S]|[^"\\\\\\n])*"',
+    "'(?:\\\\[\\s\\S]|[^'\\\\\\n])*'",
+    '`(?:\\\\[\\s\\S]|[^`\\\\])*`',
+    '@[A-Za-z_$][\\w$]*',
+    '\\$[A-Za-z_][\\w]*',
+    css ? '#[0-9a-fA-F]{3,8}\\b' : '',
+    '\\b(?:0[xX][\\da-fA-F]+|\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)\\b',
+    markup ? '</?[A-Za-z][\\w:-]*' : '',
+    '[A-Za-z_$][\\w$]*',
+  ].filter(Boolean);
+  const pattern = new RegExp(parts.join('|'), 'g');
+  const tokens = [];
+  let last = 0;
+  let match;
+  while ((match = pattern.exec(source))) {
+    if (tokens.length >= CODE_HIGHLIGHT_TOKENS) return null;
+    if (match.index > last) tokens.push(['', source.slice(last, match.index)]);
+    const text = match[0];
+    let kind = '';
+    if (text.startsWith('/*') || text.startsWith('<!--') || (line && text.startsWith(line))) {
+      kind = 'cmt';
+    } else if (/^["'`]/.test(text)) {
+      kind = 'str';
+    } else if (text.startsWith('@') || text.startsWith('$')) {
+      kind = 'fn';
+    } else if ((css && text.startsWith('#')) || /^(?:0[xX]|\d)/.test(text)) {
+      kind = 'num';
+    } else if (text.startsWith('<')) {
+      kind = 'tag';
+    } else if (CODE_KEYWORDS.has(text.toLowerCase())) {
+      kind = 'kw';
+    } else if (/^\s*\(/.test(source.slice(pattern.lastIndex, pattern.lastIndex + 8))) {
+      kind = 'fn';
+    }
+    tokens.push([kind, text]);
+    last = pattern.lastIndex;
+  }
+  if (last < source.length) tokens.push(['', source.slice(last)]);
+  return tokens;
+}
+
+function appendHighlightedCode(code, source, language) {
+  const tokens = codeTokens(source, language);
+  if (!tokens) {
+    code.textContent = source;
+    return;
+  }
+  for (const [kind, text] of tokens) {
+    if (kind) code.append(node('span', `md-${kind}`, text));
+    else code.append(document.createTextNode(text));
+  }
 }
 
 function appendMarkdownBlocks(parent, lines) {
@@ -2519,11 +3629,26 @@ function appendMarkdownBlocks(parent, lines) {
       const language = fence.info.split(/\s+/)[0];
       if (language) codeBlock.append(node('div', 'md-code-lang', language));
       const pre = node('pre');
-      const code = node('code', '', lines.slice(index + 1, end).join('\n'));
+      const code = node('code');
+      appendHighlightedCode(code, lines.slice(index + 1, end).join('\n'), language);
       pre.append(code);
       codeBlock.append(pre);
       parent.append(codeBlock);
       index = closed ? end + 1 : lines.length;
+      continue;
+    }
+
+    const displayMath = matchDisplayMath(lines, index);
+    if (displayMath) {
+      const math = buildMarkdownMath(displayMath.source, true);
+      if (math) {
+        const wrapper = node('div', 'md-math-display');
+        wrapper.append(math);
+        parent.append(wrapper);
+      } else {
+        parent.append(node('p', 'md-math-source', lines.slice(index, displayMath.end + 1).join('\n')));
+      }
+      index = displayMath.end + 1;
       continue;
     }
 
@@ -2654,10 +3779,11 @@ function appendMarkdownBlocks(parent, lines) {
   }
 }
 
-function renderMarkdown(container, text) {
+function renderMarkdown(container, text, projectSession = null) {
   flushText();
   container.replaceChildren();
   appendMarkdownBlocks(container, text.replace(/\r\n?/g, '\n').split('\n'));
+  if (projectSession && state.credential) observeProjectImages(container, projectSession);
 }
 
 function assistantWarning(record) {
@@ -2682,7 +3808,7 @@ function renderAssistant(record, final) {
   if (useMarkdown) {
     record.mdRendered = true;
     record.prose.classList.remove('plain-text');
-    renderMarkdown(record.prose, record.text);
+    renderMarkdown(record.prose, record.text, final ? state.session : null);
   } else {
     record.mdRendered = false;
     record.prose.classList.add('plain-text');
@@ -2728,6 +3854,7 @@ function appendAssistantText(detail) {
   if (!record) {
     markStreamingDone();
     const article = node('article', 'message assistant');
+    if (continuesAssistantReply()) article.dataset.continued = 'true';
     article.dataset.streaming = 'true';
     const head = node('div', 'message-head');
     head.append(node('span', '', 'NEXUS'));
@@ -2884,6 +4011,9 @@ function toolPresentation(tool, preview) {
     targetKnown: false,
     kind, sections: [],
   };
+  if (tool === 'delegate_start' || tool === 'delegate_await') {
+    return delegatePresentation(tool, args && typeof args === 'object' && !Array.isArray(args) ? args : {});
+  }
   if (!args || typeof args !== 'object' || Array.isArray(args)) return result;
   if (tool === 'host_exec' && Array.isArray(args.argv)
     && args.argv.length && args.argv.every((arg) => typeof arg === 'string')) {
@@ -2907,6 +4037,111 @@ function toolPresentation(tool, preview) {
     }
   }
   return result;
+}
+
+const DELEGATE_ROLES = { explore: 'Explore', propose: 'Propose' };
+
+function delegateRoleLabel(role) {
+  return DELEGATE_ROLES[role] || 'Helper';
+}
+
+function shortJob(id) {
+  const text = String(id || '');
+  return text.length > 14 ? `${text.slice(0, 12)}…` : text;
+}
+
+// Helper tools are shown as the task they delegate, not as raw JSON calls.
+function delegatePresentation(tool, args) {
+  if (tool === 'delegate_start') {
+    const task = typeof args.task === 'string' ? args.task : '';
+    const role = typeof args.role === 'string' ? args.role : '';
+    const facts = [];
+    if (typeof args.model === 'string') facts.push(`Model: ${args.model}`);
+    if (typeof args.thinking === 'string') facts.push(`Thinking: ${args.thinking}`);
+    facts.push(`Delivery: ${typeof args.delivery === 'string' ? args.delivery : 'default'}`);
+    return {
+      label: 'HELPER', kind: 'delegate', targetKnown: Boolean(task),
+      target: task ? `${delegateRoleLabel(role)} · ${task}` : `${delegateRoleLabel(role)} task`,
+      sections: task ? [{ label: 'Task', text: task }] : [],
+      facts,
+      delegate: { start: true, role, task },
+    };
+  }
+  const job = typeof args.job_id === 'string' ? args.job_id : '';
+  const known = job ? state.delegateJobs.get(job) : null;
+  return {
+    label: 'COLLECT', kind: 'delegate', targetKnown: Boolean(job),
+    target: known?.task ? `${delegateRoleLabel(known.role)} · ${known.task}` : job ? `Result of ${shortJob(job)}` : 'Helper result',
+    sections: [], facts: [],
+    delegate: { start: false, job },
+  };
+}
+
+function delegateStatusLabel(status) {
+  switch (status) {
+    case 'accepted': return 'Started';
+    case 'completed': return 'Completed';
+    case 'collected': return 'Already collected';
+    case 'timed-out': return 'Timed out';
+    case 'limit-reached': return 'Limit reached';
+    case 'cancelled': return 'Cancelled';
+    case 'failed': return 'Failed';
+    default: return status ? String(status) : 'Unknown';
+  }
+}
+
+function delegateUsageText(input, output) {
+  if (!Number.isFinite(input) && !Number.isFinite(output)) return '';
+  const part = (value) => Number.isFinite(value) ? formatCompactTokens(value) : '—';
+  return `Helper usage ${part(input)} in · ${part(output)} out`;
+}
+
+// Replaces the raw JSON output of a helper tool with its task state, result
+// text, or verified proposal. Unparseable output keeps the raw view.
+function finishDelegateTool(record, content, toolSucceeded) {
+  let value;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== 'object') return null;
+  const status = typeof value.status === 'string' ? value.status : '';
+  const job = typeof value.job_id === 'string' ? value.job_id : record.delegate.job;
+  if (record.delegate.start) {
+    if (toolSucceeded && status === 'accepted' && job) {
+      state.delegateJobs.set(job, {
+        role: record.delegate.role, task: record.delegate.task, state: 'running', run: state.run,
+        statusElement: record.status,
+      });
+    }
+  } else if (job) {
+    const known = state.delegateJobs.get(job);
+    if (known) known.state = status || 'unknown';
+    if (typeof value.text === 'string' && value.text) {
+      appendToolSection(record.resultSlot, { label: 'Result', text: value.text });
+    }
+    const proposal = value.proposal && typeof value.proposal === 'object' ? value.proposal : null;
+    if (proposal && typeof proposal.old_text === 'string' && typeof proposal.new_text === 'string') {
+      const diff = toolPatchDiff(proposal.old_text, proposal.new_text);
+      diff.label = `Proposed edit · ${typeof proposal.path === 'string' ? proposal.path : 'file'}`;
+      appendToolSection(record.resultSlot, diff);
+      record.resultSlot.append(node('p', 'tool-note', 'A proposal is data only; the agent applies it with its normal edit tool if it chooses to.'));
+    }
+    if (value.truncated === true) record.resultSlot.append(node('span', 'inline-warning', 'The helper result was truncated.'));
+  }
+  record.outputSection.hidden = true;
+  renderHelperStatus();
+  return {
+    label: delegateStatusLabel(status),
+    tone: !toolSucceeded || ['failed', 'cancelled', 'timed-out', 'limit-reached'].includes(status)
+      ? status === 'failed' || !toolSucceeded ? 'error' : 'busy'
+      : 'ok',
+    usage: delegateUsageText(value.input_tokens, value.output_tokens),
+    helperUsage: Number.isFinite(value.input_tokens) || Number.isFinite(value.output_tokens)
+      ? { input: value.input_tokens, output: value.output_tokens }
+      : null,
+  };
 }
 
 function toolPatchDiff(oldText, newText) {
@@ -2999,6 +4234,10 @@ function startTool(detail) {
   const body = node('div', 'tool-body');
   for (const section of presentation.sections) appendToolSection(body, section);
   if (presentation.directory) body.append(node('div', 'tool-meta', `Write directory: ${presentation.directory}`));
+  if (presentation.facts?.length) body.append(node('div', 'tool-meta', presentation.facts.join(' · ')));
+  // Parsed helper results go above the raw argument and output views.
+  const resultSlot = node('div', 'tool-result-slot');
+  body.append(resultSlot);
   if (!presentation.targetKnown && presentation.kind !== 'generic') {
     body.append(node(
       'p',
@@ -3031,6 +4270,8 @@ function startTool(detail) {
     target,
     targetKnown: presentation.targetKnown,
     kind: presentation.kind,
+    delegate: presentation.delegate || null,
+    resultSlot,
     outputSection,
     outputText,
     meta,
@@ -3082,12 +4323,14 @@ function finishTool(detail) {
     record.chars = record.outputText.data.length;
     if (content.length > MAX_TOOL_CHARS) record.truncated = true;
   }
-  const tone = status === 'Succeeded' ? 'ok'
+  let tone = status === 'Succeeded' ? 'ok'
     : status === 'Cancelled' || status === 'Interrupted' || status === 'TimedOut' ? 'busy'
       : 'error';
-  const label = status === 'Succeeded' ? 'Completed'
+  let label = status === 'Succeeded' ? 'Completed'
     : status === 'TimedOut' ? 'Timed out'
       : status;
+  const delegated = record.delegate && content ? finishDelegateTool(record, content, status === 'Succeeded') : null;
+  if (delegated) ({ label, tone } = delegated);
   setStatus(record.status, label, tone);
   record.root.dataset.state = tone;
   if (!record.targetKnown && record.target && (record.kind === 'write' || record.kind === 'patch')) {
@@ -3107,6 +4350,8 @@ function finishTool(detail) {
   if (typeof outcome.evidence === 'string') record.meta.append(node('span', '', `Evidence: ${outcome.evidence}`));
   if (outcome.truncated) record.meta.append(node('span', '', 'Server truncated output'));
   if (record.truncated) record.meta.append(node('span', '', 'View truncated output'));
+  if (delegated?.usage) record.meta.append(node('span', '', delegated.usage));
+  if (delegated?.helperUsage) record.helperUsage = delegated.helperUsage;
 }
 
 function markUnfinishedTools() {
@@ -3275,9 +4520,6 @@ function updateUsage(detail) {
     cacheWrite: Number.isFinite(detail.cache_write) ? detail.cache_write : null,
     finality: typeof detail.finality === 'string' ? detail.finality : '',
   };
-  const parts = usageParts();
-  dom.usage.textContent = parts.length ? `Usage: ${parts.join(' / ')}` : 'Usage: unknown';
-  dom.usage.hidden = false;
 }
 
 /* Terminal state */
@@ -3308,29 +4550,56 @@ function finishRun(detail, { fromSnapshot = false } = {}) {
   state.inFlightUnknown = false;
   state.retries = 0;
   state.lastOutcome = detail.outcome || null;
+  for (const job of state.delegateJobs.values()) {
+    if (job.state === 'running' && detail.outcome !== 'completed') job.state = 'cancelled';
+  }
   const outcome = selectedOutcome(detail.outcome);
   setRunStatus(outcome, outcomeTone(detail.outcome));
   appendRunSummary(detail, fromSnapshot);
+  renderHelperStatus();
   updateSessionDisplay();
   updateControls();
   scrollToBottomSoon();
   updateJumpLatest();
   void refreshSavedSessions();
   void verifyTerminalSnapshot(session, run, lastSeq, fromSnapshot);
+  if (fromSnapshot) void refreshPromptInbox(session, { adopt: true, follow: true });
+}
+
+function persistenceLabel(value) {
+  switch (value) {
+    case 'Saved':
+      return 'Saved';
+    case 'Ephemeral':
+      return 'Not saved';
+    case 'SaveFailed':
+      return 'Save failed';
+    default:
+      return `Persistence: ${value}`;
+  }
 }
 
 function appendRunSummary(detail, fromSnapshot) {
   const card = node('div', 'run-card');
-  const outcome = node('span', 'run-outcome', selectedOutcome(detail.outcome));
-  outcome.dataset.outcome = detail.outcome || 'unknown';
-  card.append(outcome);
-  card.append(node('span', '', fromSnapshot ? 'Confirmed by snapshot' : 'Run finished'));
-
-  if (detail.persistence) {
-    card.append(node('span', '', `Persistence: ${detail.persistence}`));
+  card.dataset.outcome = detail.outcome || 'unknown';
+  const actions = node('div', 'run-actions');
+  const text = [...state.assistantItems.values()].map((record) => record.text).filter(Boolean).join('\n\n');
+  if (text) actions.append(copyButton(text));
+  actions.append(usageChip(detail));
+  if (detail.outcome !== 'completed') {
+    const outcome = node('span', 'run-outcome', selectedOutcome(detail.outcome));
+    outcome.dataset.outcome = detail.outcome || 'unknown';
+    actions.append(outcome);
   }
-  const parts = usageParts();
-  card.append(node('span', '', parts.length ? `Usage: ${parts.join(' / ')}` : 'Usage: not reported'));
+  if (detail.persistence === 'SaveFailed') {
+    const persistence = node('span', 'run-outcome', persistenceLabel(detail.persistence));
+    persistence.dataset.outcome = 'failed';
+    actions.append(persistence);
+  }
+  if (fromSnapshot) actions.append(node('span', 'run-fact', 'Confirmed by snapshot'));
+  const time = node('time', 'run-time', new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  actions.append(time);
+  card.append(actions);
   if (detail.error && typeof detail.error === 'object') {
     const errorBlock = node('div', 'run-detail');
     errorBlock.append(node('div', '', `${detail.error.category || 'Error'} · ${retryLabel(detail.error.retry)}`));
@@ -3522,6 +4791,412 @@ async function reconcileAfterLoss(error) {
   );
 }
 
+/* Composer status, menus, and reply usage */
+
+const TEAMWORK_KEY = 'nexus.teamwork';
+const EFFORT_LABELS = { inherit: 'Default', low: 'Low', none: 'Off' };
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+// Compact token counts for chips: 57285 -> "57.3K", 1000000 -> "1M".
+function formatCompactTokens(value) {
+  if (!Number.isFinite(value)) return '—';
+  if (value < 1000) return String(Math.round(value));
+  if (value < 1_000_000) return `${Math.round(value / 100) / 10}K`;
+  return `${Math.round(value / 100_000) / 10}M`;
+}
+
+function icon(paths, size = 15) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', String(size));
+  svg.setAttribute('height', String(size));
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.8');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const d of paths) {
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
+}
+
+const ICONS = {
+  copy: ['M9 9h10v10H9z', 'M5 15V5h10'],
+  check: ['M5 12.5 10 17l9-10'],
+  usage: ['M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3Z', 'M4 7v5c0 1.7 3.6 3 8 3s8-1.3 8-3V7', 'M4 12v5c0 1.7 3.6 3 8 3s8-1.3 8-3v-5'],
+  shield: ['M12 3 5 6v5c0 4.5 3 8.3 7 10 4-1.7 7-5.5 7-10V6Z'],
+};
+
+function readTeamworkPreference() {
+  try {
+    return localStorage.getItem(TEAMWORK_KEY) !== 'off';
+  } catch {
+    return true;
+  }
+}
+
+function selectedModelEntry() {
+  const id = state.session ? state.sessionModel : state.selection?.model;
+  return state.config?.models?.find((entry) => entry.id === id) || null;
+}
+
+function sessionProviderEntry() {
+  const id = state.session ? state.sessionProvider : state.selection?.provider;
+  return state.config?.providers?.find((entry) => entry.id === id) || null;
+}
+
+// Effective task effort for the selected model: model, provider, then global.
+function effectiveEffort() {
+  if (!state.selection || state.selection.demo) return 'inherit';
+  const model = state.config?.models?.find((entry) => entry.id === state.selection.model);
+  const provider = state.config?.providers?.find((entry) => entry.id === state.selection.provider);
+  return model?.task_reasoning_effort || provider?.task_reasoning_effort
+    || state.config?.task_reasoning_effort || 'inherit';
+}
+
+// Teamwork needs a configured model and a bound local project. The server
+// makes the final decision and reports it when the session is created.
+function teamworkEligibility() {
+  if (!state.connected) return 'Connect to use agent teamwork.';
+  if (!state.selection || state.selection.demo) return 'Needs a configured model; the demo script cannot start helpers.';
+  if (!state.projects?.enabled) return 'Needs local project tools (start the server with --tools real).';
+  const project = state.session ? state.sessionProjectId : state.projectSelection?.id;
+  if (!project) return 'Needs a project for this session.';
+  return '';
+}
+
+function teamworkHelpText() {
+  const base = 'Lets the agent start read-only helper tasks that explore this project in the background and report back. Helpers cannot write files or run commands.';
+  const blocked = teamworkEligibility();
+  if (blocked) return `${base} ${blocked}`;
+  if (state.session && state.sessionDelegation === true && state.sessionDelegationActive === false) {
+    return `${base} The server did not enable helpers for this session's model.`;
+  }
+  if (state.session && (state.sessionDelegation ?? true) !== state.teamwork) {
+    return state.savedPersistence
+      ? `${base} The change applies when you send the next message.`
+      : `${base} Start a new session to apply the change (switching needs --session-store).`;
+  }
+  return base;
+}
+
+function updateModelTrigger() {
+  const label = state.selection ? state.selection.label : 'No model';
+  dom.modelTriggerName.textContent = label;
+  const effort = EFFORT_LABELS[effectiveEffort()] || 'Default';
+  dom.modelTriggerEffort.textContent = state.selection && !state.selection.demo ? effort : '';
+  dom.modelTrigger.title = state.selection ? `${state.selection.label} — ${state.selection.detail}` : 'No model';
+  dom.menuModelValue.textContent = label;
+  dom.menuEffortValue.textContent = effort;
+  const blocked = teamworkEligibility();
+  dom.teamworkSwitch.setAttribute('aria-checked', String(!blocked && state.teamwork !== false));
+  dom.teamworkSwitch.disabled = Boolean(blocked);
+  dom.teamworkHelp.textContent = teamworkHelpText();
+  dom.menuEffort.disabled = !state.selection || state.selection.demo;
+  updateToolsModeChip();
+  renderContextMeter();
+  renderHelperStatus();
+}
+
+function updateToolsModeChip() {
+  const mode = state.connected ? state.projects?.mode : '';
+  const labels = {
+    development: ['Auto in project', 'Project and temporary file changes and sandboxed commands run automatically. External paths ask first.'],
+    strict: ['Ask first', 'Edits and commands wait for your approval. Reads stay inside the project.'],
+    fakes: ['Demo tools', 'Scripted test tools; nothing touches your files.'],
+    container: ['Container', 'Tools run in the configured container.'],
+  };
+  const entry = labels[mode];
+  dom.toolsMode.hidden = !entry;
+  if (!entry) return;
+  dom.toolsMode.replaceChildren(icon(ICONS.shield, 13), document.createTextNode(entry[0]));
+  dom.toolsMode.title = entry[1];
+}
+
+function renderHelperStatus() {
+  let running = 0;
+  const tasks = [];
+  if (state.active) {
+    for (const job of state.delegateJobs.values()) {
+      if (job.state !== 'running' || job.run !== state.run) continue;
+      running += 1;
+      if (job.task) tasks.push(`${delegateRoleLabel(job.role)} · ${job.task}`);
+    }
+  } else {
+    running = Number(state.inbox?.pending_child_results) || 0;
+  }
+  dom.helperStatus.hidden = running === 0;
+  dom.helperStatus.textContent = `${running} helper${running === 1 ? '' : 's'} running`;
+  dom.helperStatus.title = tasks.length ? tasks.join('\n') : 'Background helper results arrive when they finish.';
+}
+
+function updateContextEstimate(detail) {
+  const estimated = Number(detail.estimated_input_tokens);
+  const window = Number(detail.context_window_tokens);
+  if (!Number.isFinite(estimated) || !Number.isFinite(window) || window <= 0) return;
+  state.context = {
+    estimated,
+    window,
+    trigger: Number.isFinite(detail.context_trigger_percent) ? detail.context_trigger_percent : null,
+    target: Number.isFinite(detail.context_target_percent) ? detail.context_target_percent : null,
+    maxOutput: Number.isFinite(detail.max_output_tokens) ? detail.max_output_tokens : null,
+    strategy: typeof detail.compaction_strategy === 'string' ? detail.compaction_strategy : '',
+  };
+  renderContextMeter();
+}
+
+function renderContextMeter() {
+  const context = state.context;
+  dom.contextMeter.hidden = !context;
+  if (!context) {
+    if (dom.contextPanel.matches?.(':popover-open')) dom.contextPanel.hidePopover();
+    return;
+  }
+  const ratio = Math.min(1, context.estimated / context.window);
+  const percent = Math.round(ratio * 100);
+  const label = context.estimated > 0 && percent === 0 ? '<1%' : `${percent}%`;
+  dom.contextPercent.textContent = label;
+  dom.contextPanelPercent.textContent = label;
+  dom.contextRing.setAttribute('stroke-dasharray', `${Math.max(ratio * 100, 0.5)} 100`);
+  const warnAt = context.trigger ?? 80;
+  dom.contextMeter.dataset.level = percent >= warnAt ? 'high' : percent >= warnAt - 15 ? 'medium' : 'low';
+  dom.contextMeter.setAttribute('aria-label', `Context usage: ${label} of ${formatCompactTokens(context.window)} tokens`);
+  dom.contextPanelTotal.textContent = `~${formatCompactTokens(context.estimated)} / ${formatCompactTokens(context.window)}`;
+  dom.contextBarFill.style.width = `${ratio * 100}%`;
+  dom.contextBarTrigger.hidden = context.trigger === null;
+  if (context.trigger !== null) dom.contextBarTrigger.style.left = `${Math.min(100, context.trigger)}%`;
+  const rows = [['Input estimate', `~${formatCompactTokens(context.estimated)}`]];
+  if (context.maxOutput !== null) rows.push(['Output reserve', `~${formatCompactTokens(context.maxOutput)}`]);
+  if (context.trigger !== null) {
+    const method = context.strategy === 'truncate' ? 'truncate' : 'summarize';
+    rows.push(['Compacts at', `${context.trigger}%${context.target !== null ? ` → ${context.target}%` : ''} · ${method}`]);
+  }
+  fillRows(dom.contextRows, rows);
+}
+
+function fillRows(list, rows) {
+  list.replaceChildren();
+  for (const [name, value, tone] of rows) {
+    const row = node('div', 'popover-row');
+    if (tone) row.dataset.tone = tone;
+    row.append(node('dt', '', name), node('dd', '', value));
+    list.append(row);
+  }
+}
+
+function copyButton(text) {
+  const button = node('button', 'reply-action');
+  button.type = 'button';
+  button.title = 'Copy reply';
+  button.setAttribute('aria-label', 'Copy reply');
+  button.append(icon(ICONS.copy));
+  button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      button.replaceChildren(icon(ICONS.check));
+      button.title = 'Copied';
+      setTimeout(() => {
+        button.replaceChildren(icon(ICONS.copy));
+        button.title = 'Copy reply';
+      }, 1500);
+    } catch {
+      button.title = 'Copy failed: clipboard access was refused';
+    }
+  });
+  return button;
+}
+
+let popoverSequence = 0;
+
+// Provider counters differ by protocol: Chat Completions and Responses
+// include cached tokens in input; Anthropic Messages reports them separately.
+function usageBreakdown(usage, protocol) {
+  if (!usage) return null;
+  const known = (value) => Number.isFinite(value);
+  const inclusive = protocol !== 'anthropic_messages';
+  const cacheRead = known(usage.cacheRead) ? usage.cacheRead : null;
+  const cacheWrite = known(usage.cacheWrite) ? usage.cacheWrite : null;
+  const input = known(usage.input) ? usage.input : null;
+  const output = known(usage.output) ? usage.output : null;
+  if (input === null && output === null) return null;
+  const promptTotal = input === null ? null
+    : inclusive ? input : input + (cacheRead || 0) + (cacheWrite || 0);
+  const uncached = input === null ? null : inclusive ? Math.max(0, input - (cacheRead || 0)) : input;
+  return {
+    total: (promptTotal || 0) + (output || 0),
+    promptTotal, uncached, cacheRead, cacheWrite, output,
+    hitRate: promptTotal && cacheRead !== null ? cacheRead / promptTotal : null,
+  };
+}
+
+function usageChip(detail) {
+  const provider = sessionProviderEntry();
+  const breakdown = usageBreakdown(state.lastUsage, provider?.protocol);
+  const button = node('button', 'reply-action usage-chip');
+  button.type = 'button';
+  button.append(icon(ICONS.usage));
+  button.append(node('span', '', breakdown ? `Usage ${formatCompactTokens(breakdown.total)} tok` : 'Usage not reported'));
+  const panel = node('div', 'popover-panel usage-panel');
+  panel.id = `usage-panel-${++popoverSequence}`;
+  panel.setAttribute('popover', '');
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Run usage');
+  button.setAttribute('popovertarget', panel.id);
+  button.setAttribute('aria-label', 'Show run usage');
+  const head = node('div', 'popover-head');
+  const title = node('span', 'popover-title');
+  title.append(icon(ICONS.usage), document.createTextNode('Run usage'));
+  head.append(title, node('span', '', breakdown ? `${breakdown.total.toLocaleString()} tok` : 'Not reported'));
+  panel.append(head);
+  const rows = [];
+  const model = selectedModelEntry();
+  if (state.sessionProvider) rows.push(['Provider / model', `${state.sessionProvider}/${model?.name || state.sessionModel || 'default'}`]);
+  else rows.push(['Model', 'Demo script']);
+  const tokens = (value) => value === null ? 'Not reported' : `${value.toLocaleString()} tok`;
+  if (breakdown) {
+    if (breakdown.hitRate !== null) rows.push(['Cache hit', `${Math.round(breakdown.hitRate * 1000) / 10}%`]);
+    rows.push(['Uncached input', tokens(breakdown.uncached)]);
+    if (breakdown.cacheRead !== null) rows.push(['Cached input', tokens(breakdown.cacheRead)]);
+    if (breakdown.cacheWrite !== null) rows.push(['Cache write', tokens(breakdown.cacheWrite)]);
+    rows.push(['Output', tokens(breakdown.output)]);
+  }
+  let helperInput = 0;
+  let helperOutput = 0;
+  let helperKnown = false;
+  for (const record of state.tools.values()) {
+    if (!record.helperUsage) continue;
+    helperKnown = true;
+    helperInput += record.helperUsage.input || 0;
+    helperOutput += record.helperUsage.output || 0;
+  }
+  if (helperKnown) rows.push(['Helpers (separate)', `${formatCompactTokens(helperInput)} in · ${formatCompactTokens(helperOutput)} out`]);
+  if (detail.persistence) {
+    rows.push(['History', persistenceLabel(detail.persistence), detail.persistence === 'SaveFailed' ? 'error' : '']);
+  }
+  const list = node('dl', 'popover-rows');
+  fillRows(list, rows);
+  panel.append(list);
+  if (!breakdown) panel.append(node('p', 'popover-note', 'The provider did not report token counts for this run.'));
+  const wrap = node('span', 'usage-wrap');
+  wrap.append(button, panel);
+  panel.addEventListener('toggle', (event) => {
+    if (event.newState === 'open') positionPopover(panel, button, 'start');
+  });
+  return wrap;
+}
+
+// Popovers sit in the top layer; place them above their trigger and keep
+// them on screen. Positions use CSSOM, which the style CSP allows.
+function positionPopover(panel, anchor, align = 'end') {
+  const rect = anchor.getBoundingClientRect();
+  const width = panel.offsetWidth;
+  const height = panel.offsetHeight;
+  const margin = 8;
+  let left = align === 'start' ? rect.left : rect.right - width;
+  left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+  let top = rect.top - height - margin;
+  if (top < margin) top = Math.min(rect.bottom + margin, window.innerHeight - height - margin);
+  panel.style.left = `${left}px`;
+  panel.style.top = `${Math.max(margin, top)}px`;
+}
+
+function showMenuView(view) {
+  for (const element of [dom.menuMain, dom.menuModels, dom.menuEfforts]) element.hidden = element !== view;
+  if (view === dom.menuModels) renderModelOptions();
+  if (view === dom.menuEfforts) renderEffortOptions();
+  positionPopover(dom.modelMenu, dom.modelTrigger);
+  (view.querySelector('[aria-checked="true"]') || view.querySelector('button:not(:disabled)'))?.focus();
+}
+
+function menuOption(label, detail, checked, disabled, onSelect) {
+  const button = node('button', 'menu-option');
+  button.type = 'button';
+  button.setAttribute('role', 'menuitemradio');
+  button.setAttribute('aria-checked', String(checked));
+  button.disabled = disabled;
+  const text = node('span', 'menu-option-text');
+  text.append(node('span', '', label));
+  if (detail) text.append(node('span', 'menu-option-detail', detail));
+  button.append(text);
+  button.addEventListener('click', onSelect);
+  return button;
+}
+
+function renderModelOptions() {
+  dom.menuModelOptions.replaceChildren();
+  const selected = state.selection ? choiceKey(state.selection) : '';
+  state.choices.forEach((choice, index) => {
+    dom.menuModelOptions.append(menuOption(choice.label, choice.detail, choiceKey(choice) === selected, dom.model.disabled, () => {
+      dom.model.value = String(index);
+      dom.model.dispatchEvent(new Event('change'));
+      showMenuView(dom.menuMain);
+    }));
+  });
+}
+
+function renderEffortOptions() {
+  dom.menuEffortOptions.replaceChildren();
+  const current = state.config?.task_reasoning_effort || 'inherit';
+  const busy = !state.connected || state.thinkingSaving || Boolean(state.configSaving);
+  for (const [value, detail] of [['inherit', 'Use each adapter\'s normal behavior'], ['low', 'Request low-effort thinking'], ['none', 'Turn thinking off']]) {
+    dom.menuEffortOptions.append(menuOption(EFFORT_LABELS[value], detail, value === current, busy, () => {
+      // Reuse the Settings form so validation, status, and refresh stay in one place.
+      dom.taskThinking.value = value;
+      dom.thinkingForm.requestSubmit();
+      showMenuView(dom.menuMain);
+    }));
+  }
+  const effective = effectiveEffort();
+  const override = effective !== current ? ` This model resolves to ${EFFORT_LABELS[effective] || effective} through its own or its provider's override.` : '';
+  dom.menuEffortHelp.textContent = `Global default for new sessions. Only detected Ollama Direct / Chat Completions endpoints accept Low or Off; other adapters refuse an override.${override}`;
+}
+
+/* Sidebar visibility */
+
+const SIDEBAR_KEY = 'nexus.sidebar';
+const narrowSidebar = window.matchMedia('(max-width: 720px)');
+
+// Wide layouts remember the collapsed state; narrow layouts use a drawer that
+// starts closed and is never persisted.
+function readSidebarPreference() {
+  try {
+    return localStorage.getItem(SIDEBAR_KEY) !== 'closed';
+  } catch {
+    return true;
+  }
+}
+
+function setSidebarOpen(open, { persist = false } = {}) {
+  document.body.dataset.sidebar = open ? 'open' : 'closed';
+  const label = open ? 'Hide sidebar' : 'Show sidebar';
+  dom.toggleSidebar.setAttribute('aria-expanded', String(open));
+  dom.toggleSidebar.setAttribute('aria-label', label);
+  dom.toggleSidebar.title = label;
+  dom.sidebarBackdrop.hidden = !(open && narrowSidebar.matches);
+  dom.sidebar.inert = !open;
+  if (!persist || narrowSidebar.matches) return;
+  try {
+    localStorage.setItem(SIDEBAR_KEY, open ? 'open' : 'closed');
+  } catch {
+    // The preference is a convenience; the toggle still works for this page.
+  }
+}
+
+function applySidebarLayout() {
+  setSidebarOpen(narrowSidebar.matches ? false : readSidebarPreference());
+}
+
+function closeNarrowSidebar() {
+  if (narrowSidebar.matches && document.body.dataset.sidebar === 'open') {
+    setSidebarOpen(false);
+    dom.toggleSidebar.focus();
+  }
+}
+
 /* Settings navigation */
 
 function selectSettingsSection(id) {
@@ -3549,6 +5224,61 @@ dom.openSettings.addEventListener('click', () => {
   });
 });
 dom.closeSettings.addEventListener('click', () => dom.settings.close());
+dom.welcomeConnect.addEventListener('click', () => dom.openSettings.click());
+dom.modelMenu.addEventListener('toggle', (event) => {
+  dom.modelTrigger.setAttribute('aria-expanded', String(event.newState === 'open'));
+  if (event.newState === 'open') {
+    dom.teamworkHelp.hidden = true;
+    dom.teamworkInfo.setAttribute('aria-expanded', 'false');
+    showMenuView(dom.menuMain);
+  }
+});
+dom.contextPanel.addEventListener('toggle', (event) => {
+  dom.contextMeter.setAttribute('aria-expanded', String(event.newState === 'open'));
+  if (event.newState === 'open') positionPopover(dom.contextPanel, dom.contextMeter);
+});
+dom.menuModel.addEventListener('click', () => showMenuView(dom.menuModels));
+dom.menuEffort.addEventListener('click', () => showMenuView(dom.menuEfforts));
+for (const back of dom.modelMenu.querySelectorAll('[data-menu-back]')) {
+  back.addEventListener('click', () => showMenuView(dom.menuMain));
+}
+dom.teamworkInfo.addEventListener('click', () => {
+  const open = dom.teamworkHelp.hidden;
+  dom.teamworkHelp.hidden = !open;
+  dom.teamworkInfo.setAttribute('aria-expanded', String(open));
+  positionPopover(dom.modelMenu, dom.modelTrigger);
+});
+dom.teamworkSwitch.addEventListener('click', () => {
+  if (dom.teamworkSwitch.disabled) return;
+  state.teamwork = state.teamwork === false;
+  try {
+    localStorage.setItem(TEAMWORK_KEY, state.teamwork ? 'on' : 'off');
+  } catch {
+    // The choice still applies to this page.
+  }
+  updateModelTrigger();
+  dom.teamworkHelp.hidden = false;
+  dom.teamworkInfo.setAttribute('aria-expanded', 'true');
+  positionPopover(dom.modelMenu, dom.modelTrigger);
+});
+state.teamwork = readTeamworkPreference();
+dom.toggleSidebar.addEventListener('click', () => {
+  const open = document.body.dataset.sidebar !== 'open';
+  setSidebarOpen(open, { persist: true });
+  if (open && narrowSidebar.matches) dom.newSession.focus();
+});
+dom.sidebarBackdrop.addEventListener('click', closeNarrowSidebar);
+narrowSidebar.addEventListener('change', applySidebarLayout);
+dom.sidebar.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeNarrowSidebar();
+});
+// Choosing something in the drawer returns to the conversation.
+dom.sidebar.addEventListener('click', (event) => {
+  if (event.target.closest('.tree-session-open, .tree-project-add, #new-session, #add-project-sidebar')) {
+    closeNarrowSidebar();
+  }
+});
+applySidebarLayout();
 dom.addProjectSidebar.addEventListener('click', () => {
   if (!dom.settings.open) dom.settings.showModal();
   selectSettingsSection('projects-block');
@@ -3558,6 +5288,28 @@ dom.addProjectSidebar.addEventListener('click', () => {
 });
 dom.settings.addEventListener('close', () => {
   dom.token.value = '';
+});
+
+dom.imageLightbox?.addEventListener('click', closeImageLightbox);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && dom.imageLightbox && !dom.imageLightbox.hidden) {
+    event.preventDefault();
+    closeImageLightbox();
+  }
+});
+dom.conversation.addEventListener('click', (event) => {
+  const image = imageFromEvent(event);
+  if (!image) return;
+  event.preventDefault();
+  event.stopPropagation();
+  enlargeImage(image);
+}, true);
+dom.conversation.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const image = imageFromEvent(event);
+  if (!image || event.target !== image) return;
+  event.preventDefault();
+  enlargeImage(image);
 });
 
 dom.connectionForm.addEventListener('submit', (event) => {
@@ -3806,6 +5558,7 @@ dom.composer.addEventListener('submit', (event) => {
   event.preventDefault();
   void sendMessage();
 });
+dom.steerRun.addEventListener('click', () => void sendMessage({ steer: true }));
 
 dom.cancel.addEventListener('click', () => void cancelRun());
 dom.newSession.addEventListener('click', () => startNewSession());

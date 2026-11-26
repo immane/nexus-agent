@@ -240,6 +240,7 @@ pub const fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -275,17 +276,18 @@ pub fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result
             reason(response.status),
             response.content_type,
             response.body.len(),
-            if matches!(
-                response.content_type,
+            match response.content_type {
                 "text/html; charset=utf-8"
-                    | "text/css; charset=utf-8"
-                    | "text/javascript; charset=utf-8"
-                    | "application/manifest+json; charset=utf-8"
-                    | "image/png"
-            ) {
-                crate::web::HEADERS
-            } else {
-                ""
+                | "text/css; charset=utf-8"
+                | "text/javascript; charset=utf-8"
+                | "application/manifest+json; charset=utf-8"
+                | "image/png" => crate::web::HEADERS,
+                "application/octet-stream" => concat!(
+                    "cache-control: no-store\r\n",
+                    "content-disposition: attachment\r\n",
+                    "x-content-type-options: nosniff\r\n",
+                ),
+                _ => "",
             },
         )?;
     }

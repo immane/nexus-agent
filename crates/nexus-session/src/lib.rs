@@ -1391,6 +1391,64 @@ impl SessionStore for FileSessionStore {
             .ok_or_else(|| store_error("session was not found"))
     }
 
+    fn delete_session(&mut self, session: &SessionId) -> Result<(), AgentError> {
+        self.ensure_available()?;
+        if !self
+            .sessions
+            .iter()
+            .any(|checkpoint| checkpoint.session() == session)
+        {
+            return Err(store_error("session was not found"));
+        }
+        // Fold the journal into the current snapshot before removing records.
+        // Otherwise a crash before journal cleanup could replay deleted items.
+        if open_operations(&self.operations_path, false, false)?.is_some() {
+            self.commit(
+                self.sessions.clone(),
+                self.intents.clone(),
+                self.outcomes.clone(),
+                self.source_records.clone(),
+            )?;
+        }
+        let mut runs = self
+            .source_records
+            .iter()
+            .filter(|record| record.session() == session)
+            .map(SourceRecord::run)
+            .collect::<HashSet<_>>();
+        // Older records may lack session attribution, or reuse a run id.
+        // Only remove operations whose ownership can be established.
+        for record in self
+            .source_records
+            .iter()
+            .filter(|record| record.session() != session)
+        {
+            runs.remove(record.run());
+        }
+        self.commit(
+            self.sessions
+                .iter()
+                .filter(|checkpoint| checkpoint.session() != session)
+                .cloned()
+                .collect(),
+            self.intents
+                .iter()
+                .filter(|record| !runs.contains(&record.run))
+                .cloned()
+                .collect(),
+            self.outcomes
+                .iter()
+                .filter(|record| !runs.contains(&record.run))
+                .cloned()
+                .collect(),
+            self.source_records
+                .iter()
+                .filter(|record| record.session() != session)
+                .cloned()
+                .collect(),
+        )
+    }
+
     fn save_checkpoint(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), AgentError> {
         self.ensure_available()?;
         nexus_core::store::check_format_revision(checkpoint.format_revision())?;
@@ -1817,6 +1875,26 @@ fn source_record_value(record: &SourceRecord) -> Value {
 fn context_item_value(item: &ModelContextItem) -> Value {
     match item {
         ModelContextItem::UserText(text) => json!({ "kind": "user_text", "text": text.as_str() }),
+        ModelContextItem::ChildCompletion(result) => {
+            let mut value = json!({
+                "kind": "child_completion",
+                "parent_run": result.parent().as_str(),
+                "job_id": result.job().as_str(),
+                "status": result.status().as_str(),
+                "text": result.text(),
+                "truncated": result.truncated(),
+                "follow_up": result.is_follow_up(),
+            });
+            if let Some(usage) = result.usage() {
+                if let Some(input) = usage.input_tokens() {
+                    value["usage_input"] = json!(input);
+                }
+                if let Some(output) = usage.output_tokens() {
+                    value["usage_output"] = json!(output);
+                }
+            }
+            value
+        }
         ModelContextItem::AssistantText {
             item_key,
             text,
@@ -1901,6 +1979,59 @@ fn parse_context_item(value: &Value) -> Result<ModelContextItem, AgentError> {
         "user_text" => {
             check_keys(value, &["kind", "text"])?;
             ModelContextItem::user_text(string(field(value, "text")?)?)
+        }
+        "child_completion" => {
+            use nexus_core::provider::{ChildCompletion, ChildStatus};
+
+            let mut keys = vec![
+                "kind",
+                "parent_run",
+                "job_id",
+                "status",
+                "text",
+                "truncated",
+            ];
+            if value.get("follow_up").is_some() {
+                keys.push("follow_up");
+            }
+            if value.get("usage_input").is_some() {
+                keys.push("usage_input");
+            }
+            if value.get("usage_output").is_some() {
+                keys.push("usage_output");
+            }
+            check_keys(value, &keys)?;
+            let item = ChildCompletion::new(
+                RunId::new(string(field(value, "parent_run")?)?)
+                    .map_err(|_| store_error("child completion parent identity is invalid"))?,
+                nexus_core::RequestId::new(string(field(value, "job_id")?)?)
+                    .map_err(|_| store_error("child completion job identity is invalid"))?,
+                ChildStatus::parse(&string(field(value, "status")?)?)?,
+                string(field(value, "text")?)?,
+                boolean(field(value, "truncated")?)?,
+            )?;
+            let item = if value
+                .get("follow_up")
+                .map(boolean)
+                .transpose()?
+                .unwrap_or(false)
+            {
+                item.into_follow_up()
+            } else {
+                item
+            };
+            let input = value.get("usage_input").map(number).transpose()?;
+            let output = value.get("usage_output").map(number).transpose()?;
+            let item = if input.is_some() || output.is_some() {
+                item.with_usage(nexus_core::Usage::new(
+                    input,
+                    output,
+                    nexus_core::UsageFinality::Final,
+                ))
+            } else {
+                item
+            };
+            Ok(ModelContextItem::ChildCompletion(item))
         }
         "assistant_text" => {
             check_keys(value, &["kind", "item_key", "text", "reasoning"])?;
@@ -2424,6 +2555,40 @@ fn capacity_error(message: &'static str) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_completion_source_round_trips_and_rejects_invalid_provenance() {
+        use nexus_core::provider::{ChildCompletion, ChildStatus};
+
+        let item = ModelContextItem::ChildCompletion(
+            ChildCompletion::new(
+                RunId::new("original-parent").unwrap(),
+                nexus_core::RequestId::new("job-one").unwrap(),
+                ChildStatus::Completed,
+                "untrusted evidence".into(),
+                true,
+            )
+            .unwrap()
+            .with_usage(nexus_core::Usage::new(
+                Some(7),
+                Some(3),
+                nexus_core::UsageFinality::Final,
+            )),
+        );
+        let mut value = context_item_value(&item);
+        assert_eq!(value["kind"], "child_completion");
+        assert_eq!(value["usage_input"], 7);
+        assert_eq!(value["usage_output"], 3);
+        assert_eq!(parse_context_item(&value).unwrap(), item);
+        value["job_id"] = json!("invalid identity!");
+        assert!(parse_context_item(&value).is_err());
+        value["job_id"] = json!("job-one");
+        value["status"] = json!("cancelled");
+        assert!(
+            parse_context_item(&value).is_err(),
+            "cancelled results cannot have answer text"
+        );
+    }
     use nexus_core::{M0_REVISION, NormalizedArgs, ToolCall, TurnId};
 
     fn directory(label: &str) -> PathBuf {
@@ -2462,6 +2627,50 @@ mod tests {
             "profile-a",
         )
         .expect("valid checkpoint")
+    }
+
+    #[test]
+    fn file_store_deletion_survives_reopen_with_journaled_history() {
+        let directory = directory("file-delete-journal");
+        let mut store = FileSessionStore::open(&directory).unwrap();
+        let deleted = checkpoint_for("session-delete", 1, "delete");
+        let kept = checkpoint_for("session-keep", 1, "keep");
+        for checkpoint in [&deleted, &kept] {
+            store.initialize_session(checkpoint).unwrap();
+        }
+        for (checkpoint, run) in [(&deleted, "delete-run"), (&kept, "keep-run")] {
+            let run = RunId::new(run).unwrap();
+            store
+                .append_source_items(
+                    checkpoint.session(),
+                    &run,
+                    &[ModelContextItem::user_text("original input").unwrap()],
+                )
+                .unwrap();
+            store
+                .record_intent(&ToolIntentRecord {
+                    run,
+                    call: CallId::new("call").unwrap(),
+                    tool: ToolId::new("write", M0_REVISION).unwrap(),
+                    args: NormalizedArgs::new("{}").unwrap(),
+                    scope: ApprovedScope::new("write").unwrap(),
+                })
+                .unwrap();
+        }
+        assert!(store.operations_path.exists());
+        store.delete_session(deleted.session()).unwrap();
+        assert!(store.delete_session(deleted.session()).is_err());
+        drop(store);
+
+        let store = FileSessionStore::open(&directory).unwrap();
+        assert!(store.load_session(deleted.session()).is_err());
+        assert_eq!(store.load_session(kept.session()).unwrap(), kept);
+        assert_eq!(store.source_records.len(), 1);
+        assert_eq!(store.source_records[0].session(), kept.session());
+        assert_eq!(store.intents.len(), 1);
+        assert_eq!(store.intents[0].run.as_str(), "keep-run");
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

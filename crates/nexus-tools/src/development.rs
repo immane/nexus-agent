@@ -2,7 +2,7 @@
 //! the runtime's exact canonical target scope. They never infer approval from
 //! arguments or maintain an independent session permission cache.
 
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use crate::{
@@ -40,6 +40,81 @@ pub fn strict_tools_with_settings(
             SandboxedExecutor::with_root(root)?.with_network_access(settings.network_access),
         )),
     ])
+}
+
+/// Supplies project-local reads for delegated exploration. Unlike development
+/// tools, these adapters never inherit temporary directories or external grants.
+pub fn project_read_tools(
+    root: &Path,
+    settings: &ToolsSettings,
+) -> Result<Vec<ToolRegistration>, AgentError> {
+    let policy = DirectoryPolicy::new(root).map_err(|_| {
+        AgentError::new(
+            nexus_core::ErrorCategory::InvalidInput,
+            "exploration project root is invalid",
+            nexus_core::RetryGuidance::DoNotRetry,
+        )
+        .expect("static permission error")
+    })?;
+    let root = policy.root();
+    let operations = [
+        DevelopmentOperation::Read(ScopedReader::with_root(root)?),
+        DevelopmentOperation::List(
+            ScopedLister::with_root(root)?
+                .with_settings(settings)?
+                .with_protected_paths(policy.clone()),
+        ),
+        DevelopmentOperation::Search(
+            ScopedSearcher::with_root(root)?
+                .with_settings(settings)?
+                .with_protected_paths(policy.clone()),
+        ),
+    ];
+    Ok(operations
+        .into_iter()
+        .map(|operation| {
+            let (spec, _) = operation.describe();
+            ToolRegistration::read(Arc::new(ProjectRead {
+                policy: policy.clone(),
+                operation,
+                spec,
+            }))
+        })
+        .collect())
+}
+
+struct ProjectRead {
+    policy: DirectoryPolicy,
+    operation: DevelopmentOperation,
+    spec: ToolSpec,
+}
+
+impl ToolPort for ProjectRead {
+    fn describe(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolOutcome {
+        let execute = || {
+            let args: serde_json::Value = serde_json::from_str(call.args().as_str()).ok()?;
+            let raw = args.get("path")?.as_str()?;
+            let path = Path::new(raw);
+            if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+                return None;
+            }
+            let target = self.policy.resolve(raw).ok()?;
+            if !target.starts_with(self.policy.root()) {
+                return None;
+            }
+            // Open the original path through the root descriptor. Opening the
+            // canonical target would bypass its no-symlink walk.
+            Some(
+                self.operation
+                    .execute(&self.policy.root().join(path), &args, context),
+            )
+        };
+        execute().unwrap_or_else(denied)
+    }
 }
 
 /// Constructs development file and exec tools shared by the TUI and server.
@@ -271,6 +346,91 @@ mod tests {
         ApprovedScope, CallId, M0_REVISION, NormalizedArgs, RunId, ToolAccess, ToolId, TurnId,
     };
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn exploration_tools_are_read_only_and_confined_to_the_project() {
+        let base =
+            std::env::temp_dir().join(format!("nexus-exploration-files-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(base.clone());
+        let root = base.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, "needle outside").unwrap();
+        std::fs::write(root.join("plain.txt"), "needle inside").unwrap();
+        std::fs::write(root.join(".env"), "needle protected").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&base, root.join("external-dir")).unwrap();
+        std::os::unix::fs::symlink(".env", root.join("secret-alias")).unwrap();
+        let tools = project_read_tools(&root, &ToolsSettings::default()).unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| (tool.port().describe().id().name().to_owned(), tool.access()))
+                .collect::<Vec<_>>(),
+            ["host_read", "host_list", "host_search"]
+                .map(|name| (name.to_owned(), ToolAccess::Read))
+        );
+        let run = |name: &str, path: &str| {
+            let mut args = serde_json::json!({ "path": path });
+            if name == "host_search" {
+                args["query"] = serde_json::json!("needle");
+            }
+            let call = ToolCall::new(
+                RunId::new("explore").unwrap(),
+                TurnId::new("turn-files").unwrap(),
+                CallId::new("call-files").unwrap(),
+                ToolId::new(name, M0_REVISION).unwrap(),
+                NormalizedArgs::new(args.to_string()).unwrap(),
+            );
+            let context = ToolContext::new(
+                4096,
+                Duration::ZERO,
+                false,
+                ApprovedScope::new(format!("path:{}", outside.display())).unwrap(),
+            )
+            .unwrap();
+            tools
+                .iter()
+                .find(|tool| tool.port().describe().id().name() == name)
+                .unwrap()
+                .port()
+                .execute(&call, &context)
+        };
+        assert_eq!(
+            run("host_read", "plain.txt").status(),
+            ExecutionStatus::Succeeded
+        );
+        for path in [
+            "../outside.txt",
+            outside.to_str().unwrap(),
+            "escape",
+            ".env",
+            "secret-alias",
+        ] {
+            assert_eq!(
+                run("host_read", path).status(),
+                ExecutionStatus::Denied,
+                "{path}"
+            );
+        }
+        for name in ["host_list", "host_search"] {
+            assert_eq!(run(name, "external-dir").status(), ExecutionStatus::Denied);
+            let result = run(name, ".");
+            assert_eq!(result.status(), ExecutionStatus::Succeeded);
+            assert!(result.content().contains("plain.txt"));
+            assert!(!result.content().contains(".env"));
+            assert!(!result.content().contains("secret-alias"));
+            assert!(!result.content().contains("needle outside"));
+        }
+    }
 
     #[test]
     fn development_files_require_exact_scope_and_filter_protected_content() {

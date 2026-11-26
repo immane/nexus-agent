@@ -17,74 +17,112 @@
 </head>
 <body>
   <a class="skip" href="#main">Skip to conversation</a>
-  <aside class="sidebar" aria-label="Workspace navigation">
+  <aside class="sidebar" id="sidebar" aria-label="Workspace navigation">
     <a class="brand" href="/" aria-label="Nexus home"><span class="mark" aria-hidden="true">N</span> nexus<span class="badge">WEB</span></a>
     <div class="sidebar-scroll" tabindex="0" role="region" aria-label="Projects and sessions">
-      <div class="workspace">
-        <span class="eyebrow">WORKSPACE</span>
-        <strong>Local workspace</strong>
-        <span class="muted">Served by nexus-server</span>
-      </div>
-      <button class="new-session" id="new-session" type="button" disabled>＋ New session</button>
-      <div class="section-label">PROJECTS <span class="section-actions"><span id="tree-count">0</span><button class="section-add" id="add-project-sidebar" type="button" aria-label="Add project" disabled>＋</button></span></div>
+      <button class="nav-row new-session" id="new-session" type="button" disabled><span class="nav-icon" aria-hidden="true"></span>New session</button>
+      <div class="section-label"><span id="tree-label">Projects</span><button class="section-add" id="add-project-sidebar" type="button" aria-label="Add project" title="Add project" disabled></button></div>
       <div class="project-tree" id="sidebar-tree" aria-label="Projects and sessions">
         <p class="sidebar-empty" id="sidebar-note">Connect to load projects.</p>
       </div>
     </div>
     <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span> Local only <span class="badge">ALPHA</span></div>
   </aside>
-  <div class="shell">
+  <div class="sidebar-backdrop" id="sidebar-backdrop" hidden></div>
+  <div class="shell" id="shell">
     <header class="topbar">
-      <nav class="crumb" aria-label="Current session"><span class="muted">Workspace</span><span class="separator">/</span><span class="project-crumb" id="project-badge">No project</span><span class="separator">/</span><strong id="conversation-title">New conversation</strong></nav>
+      <div class="topbar-start">
+        <button class="icon-button sidebar-toggle" id="toggle-sidebar" type="button" aria-controls="sidebar" aria-expanded="true" aria-label="Hide sidebar" title="Hide sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M9.5 4.5v15"/></svg></button>
+        <nav class="crumb" aria-label="Current session"><span class="project-crumb" id="project-badge">No project</span><span class="separator">/</span><strong id="conversation-title">New conversation</strong></nav>
+      </div>
       <div class="toolbar">
-        <span class="model-badge" id="model-badge" hidden></span>
-        <span class="status" id="connection-status" role="status">Not connected</span>
+        <span class="status connection-status" id="connection-status" role="status">Not connected</span>
         <button class="icon-button" id="new-session-mobile" type="button" aria-label="New session" disabled>＋</button>
-        <button class="settings-button" id="open-settings" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 3-1 3-3 1-2 3 2 2-1 3 2 3 3-1 3 2 3-2 3 1 2-3-1-3 2-2-2-3-3-1-1-3Z"/><circle cx="12" cy="11" r="3"/></svg><span>Settings</span></button>
+        <button class="settings-button" id="open-settings" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m9 3-1 3-3 1-2 3 2 2-1 3 2 3 3-1 3 2 3-2 3 1 2-3-1-3 2-2-2-3-3-1-1-3Z"/><circle cx="12" cy="11" r="3"/></svg><span class="settings-label">Settings</span></button>
       </div>
     </header>
     <main id="main" tabindex="-1">
       <div class="session-loading" id="session-loading" role="status" hidden><span class="loading-spinner" aria-hidden="true"></span><span>Loading session…</span></div>
       <section class="welcome" id="welcome" aria-labelledby="welcome-title">
-        <span class="eyebrow">A SMALL CORE. AN OPEN WORKSPACE.</span>
-        <h1 id="welcome-title">Space to build.</h1>
-        <p>A lightweight interface for your agent.<br>Everything runs through your local server.</p>
-        <span class="foundation">Live session client · saved history when enabled</span>
-        <div class="cards" aria-label="Workspace capabilities">
-          <article><span class="card-number">01 / CONVERSATION</span><h2>Follow the thread</h2><p>Stream responses and keep the current session in view.</p><span class="muted">Live</span></article>
-          <article><span class="card-number">02 / TOOLS</span><h2>See the work</h2><p>Inspect tool activity, bounded output, and reported outcomes.</p><span class="muted">Live</span></article>
-          <article><span class="card-number">03 / CONTROL</span><h2>Stay in charge</h2><p>Review approvals, cancel a run, and see its actual outcome.</p><span class="muted">Live</span></article>
-        </div>
+        <h1 id="welcome-title">What should we work on?</h1>
+        <p class="welcome-context" id="welcome-context">Connect to your local Nexus server to start.</p>
+        <button class="primary" id="welcome-connect" type="button">Connect…</button>
+        <ul class="welcome-tips" aria-label="Tips">
+          <li><kbd>Enter</kbd> sends, <kbd>Shift</kbd> + <kbd>Enter</kbd> adds a line.</li>
+          <li>Tool activity, approvals, and the final outcome stream into the conversation. You can cancel a run at any time.</li>
+          <li>Live session client · saved history when the server runs with <code>--session-store</code>.</li>
+        </ul>
       </section>
       <div class="conversation" id="conversation" hidden aria-label="Conversation"></div>
       <noscript><p class="noscript">JavaScript is required to connect, send tasks, and view runs.</p></noscript>
     </main>
     <section class="composer-region" aria-label="Message composer">
       <button class="jump-latest" id="jump-latest" type="button" hidden>Jump to latest ↓</button>
+      <div class="prompt-inbox" id="prompt-inbox" aria-label="Queued prompts" hidden></div>
       <form class="composer" id="composer">
         <label class="sr-only" for="message">Message</label>
-        <textarea id="message" rows="2" disabled placeholder="Connect to start a task…"></textarea>
+        <textarea id="message" rows="1" disabled placeholder="Connect to start a task…"></textarea>
         <div class="composer-footer">
           <div class="composer-context">
-            <span class="composer-activity" id="composer-activity" aria-hidden="true" hidden><i></i><i></i><i></i></span>
-            <span class="status" id="run-status" role="status" aria-live="polite">Not connected</span>
-            <span class="usage" id="usage-status" hidden></span>
-          </div>
-          <div class="composer-actions">
             <span class="composer-project">
               <label class="sr-only" for="project">Project</label>
               <select id="project" disabled aria-label="Project"></select>
               <span class="model-label" id="project-label" hidden></span>
             </span>
+            <span class="mode-chip" id="tools-mode" hidden></span>
+            <span class="composer-activity" id="composer-activity" aria-hidden="true" hidden><i></i><i></i><i></i></span>
+            <span class="status" id="run-status" role="status" aria-live="polite">Not connected</span>
+            <span class="helper-chip" id="helper-status" hidden></span>
+          </div>
+          <div class="composer-actions">
+            <button class="context-meter" id="context-meter" type="button" popovertarget="context-panel" aria-label="Context usage" hidden><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="context-track" cx="10" cy="10" r="7.5"/><circle class="context-fill" id="context-ring" cx="10" cy="10" r="7.5" pathLength="100"/></svg><span id="context-percent">0%</span></button>
+            <button class="model-trigger" id="model-trigger" type="button" popovertarget="model-menu" aria-haspopup="dialog" disabled><span class="model-trigger-name" id="model-trigger-name">No model</span><span class="model-trigger-effort" id="model-trigger-effort"></span><span class="chevron" aria-hidden="true"></span></button>
             <label class="sr-only" for="model">Model</label>
-            <select id="model" disabled aria-label="Model"></select>
+            <select id="model" disabled aria-label="Model" hidden></select>
             <span class="model-label" id="model-label" hidden></span>
-            <button class="danger" id="cancel-run" type="button" hidden disabled>Cancel</button>
-            <button class="primary" id="send" type="submit" disabled>Send ↑</button>
+            <button id="steer-run" type="button" hidden disabled>Steer</button>
+            <button class="round-button stop-button" id="cancel-run" type="button" aria-label="Cancel run" title="Cancel run" hidden disabled><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><rect x="1" y="1" width="10" height="10" rx="2" fill="currentColor"/></svg></button>
+            <button class="round-button send-button" id="send" type="submit" aria-label="Send" title="Send" disabled><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg></button>
           </div>
         </div>
       </form>
+      <div class="popover-panel context-panel" id="context-panel" popover role="dialog" aria-label="Context usage">
+        <div class="popover-head"><span><strong id="context-panel-percent">0%</strong> of context used</span><span id="context-panel-total"></span></div>
+        <div class="context-bar" aria-hidden="true"><span id="context-bar-fill"></span><i id="context-bar-trigger"></i></div>
+        <dl class="popover-rows" id="context-rows"></dl>
+        <p class="popover-note">Estimated by Nexus for the latest model request; provider usage is shown per reply.</p>
+      </div>
+      <div class="popover-panel model-menu" id="model-menu" popover role="dialog" aria-label="Model options">
+        <div class="menu-view" id="menu-main">
+          <button class="menu-row" id="menu-model" type="button"><span>Model</span><span class="menu-value" id="menu-model-value"></span><span class="chevron-right" aria-hidden="true"></span></button>
+          <button class="menu-row" id="menu-effort" type="button"><span>Effort</span><span class="menu-value" id="menu-effort-value"></span><span class="chevron-right" aria-hidden="true"></span></button>
+          <div class="menu-row menu-switch-row">
+            <span class="menu-switch-label" id="teamwork-label">Enable agent teamwork</span>
+            <button class="info-dot" id="teamwork-info" type="button" aria-label="About agent teamwork" aria-expanded="false" aria-controls="teamwork-help">i</button>
+            <button class="switch" id="teamwork-switch" type="button" role="switch" aria-checked="true" aria-labelledby="teamwork-label"><span></span></button>
+          </div>
+          <p class="menu-help" id="teamwork-help" hidden></p>
+        </div>
+        <div class="menu-view" id="menu-models" hidden>
+          <button class="menu-back" type="button" data-menu-back>Model</button>
+          <div class="menu-options" id="menu-model-options" role="group" aria-label="Models"></div>
+        </div>
+        <div class="menu-view" id="menu-efforts" hidden>
+          <button class="menu-back" type="button" data-menu-back>Effort</button>
+          <div class="menu-options" id="menu-effort-options" role="group" aria-label="Effort"></div>
+          <p class="menu-help" id="menu-effort-help"></p>
+        </div>
+      </div>
     </section>
+  </div>
+  <dialog id="side-question" aria-labelledby="side-question-title">
+    <div class="dialog-heading"><h2 id="side-question-title">Side question</h2></div>
+    <div class="prose" id="side-question-answer"></div>
+    <p id="side-question-usage"></p>
+    <form method="dialog"><button type="submit">Close</button></form>
+  </dialog>
+  <div id="image-lightbox" class="image-lightbox" hidden tabindex="-1">
+    <img id="image-lightbox-image" alt="">
   </div>
   <dialog id="settings" aria-labelledby="settings-title">
     <div class="dialog-heading">

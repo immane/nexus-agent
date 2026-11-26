@@ -8,6 +8,8 @@
     <string>Nexus Agent</string>
     <key>CFBundleIdentifier</key>
     <string>dev.nexus-agent.desktop</string>
+    <key>CFBundleIconFile</key>
+    <string>NexusAgent.icns</string>
     <key>CFBundleName</key>
     <string>Nexus Agent</string>
     <key>CFBundlePackageType</key>
@@ -22,7 +24,7 @@
         </dict>
     </array>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.9</string>
+    <string>0.3.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>LSMinimumSystemVersion</key>

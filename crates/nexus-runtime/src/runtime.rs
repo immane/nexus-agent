@@ -110,6 +110,34 @@ pub struct Runtime {
     shared: Arc<Shared>,
 }
 
+/// Non-owning reference for host tools registered inside the same runtime.
+pub struct WeakRuntime(std::sync::Weak<Shared>);
+
+impl WeakRuntime {
+    /// Returns the owning runtime if it is still live.
+    pub fn upgrade(&self) -> Option<Runtime> {
+        self.0.upgrade().map(|shared| Runtime { shared })
+    }
+}
+
+/// Receipt for a steering input. Accepted input becomes consumed at a model boundary.
+#[derive(Clone)]
+pub struct SteeringReceipt(Arc<std::sync::atomic::AtomicU8>);
+
+impl SteeringReceipt {
+    /// True once the host has taken the input for the active conversation.
+    pub fn consumed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 1
+    }
+
+    /// Withdraws input only if the model boundary has not claimed it.
+    pub fn withdraw(&self) -> bool {
+        self.0
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
 #[cfg(test)]
 type DispatchSample = (RunId, CallId, StdInstant, StdInstant);
 
@@ -145,6 +173,17 @@ struct Shared {
     control_closed: AtomicBool,
     incarnation: u64,
     run_counter: AtomicU64,
+    terminal_changed: Notify,
+    side_question_active: AtomicBool,
+    exploration_workers: crate::delegation::ExplorationWorkers,
+}
+
+struct SideQuestionGuard(Arc<Shared>);
+
+impl Drop for SideQuestionGuard {
+    fn drop(&mut self) {
+        self.0.side_question_active.store(false, Ordering::Release);
+    }
 }
 
 /// Cloneable owner for one session store shared by multiple runtime instances.
@@ -341,6 +380,7 @@ struct ActiveRun {
     /// tool dispatch, so a read-only run can never execute a write no
     /// matter which frontend submitted it.
     read_only: bool,
+    child_follow_up: bool,
     started: StdInstant,
     deadline: StdInstant,
     token: CancellationToken,
@@ -358,6 +398,8 @@ struct ActiveRun {
     access_failure_attempts: usize,
     continuation: Option<ContinuationData>,
     conversation: Vec<ModelContextItem>,
+    steering: VecDeque<(RequestId, ModelContextItem, SteeringReceipt)>,
+    explorations: crate::delegation::Explorations,
     /// Index of the first context item not yet committed to source history.
     source_cursor: usize,
     history_len: usize,
@@ -397,6 +439,7 @@ struct FinishedRun {
     outcomes: Vec<OutcomeSummary>,
     truncated: bool,
     terminal_delivered: bool,
+    explorations: crate::delegation::Explorations,
 }
 
 /// Terminal decision produced by one state-machine step.
@@ -799,6 +842,9 @@ impl Runtime {
             control_closed: AtomicBool::new(false),
             incarnation: next_incarnation(),
             run_counter: AtomicU64::new(1),
+            terminal_changed: Notify::new(),
+            side_question_active: AtomicBool::new(false),
+            exploration_workers: Default::default(),
         });
         Ok((
             Self { shared },
@@ -972,8 +1018,46 @@ impl Runtime {
         if command.validate().is_err() {
             return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
         }
+        let Ok(item) = ModelContextItem::user_text(command.input) else {
+            return CommandResponse::new(command.request, CommandReply::Rejected, None);
+        };
+        self.submit_source(
+            command.request,
+            command.session,
+            command.profile,
+            command.read_only,
+            item,
+        )
+        .await
+    }
+
+    /// Starts a read-only, tool-free follow-up using typed, host-owned input.
+    pub async fn submit_child_completion(
+        &self,
+        request: RequestId,
+        session: SessionId,
+        result: nexus_core::provider::ChildCompletion,
+    ) -> CommandResponse {
+        self.submit_source(
+            request,
+            session,
+            "child-follow-up".into(),
+            true,
+            ModelContextItem::ChildCompletion(result.into_follow_up()),
+        )
+        .await
+    }
+
+    async fn submit_source(
+        &self,
+        request: RequestId,
+        session: SessionId,
+        profile: String,
+        read_only: bool,
+        item: ModelContextItem,
+    ) -> CommandResponse {
         if self.shared.store_uncertain.load(Ordering::SeqCst) {
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None)
+            return CommandResponse::new(request, CommandReply::Rejected, None)
                 .with_error(runtime_error(
                     ErrorCategory::StorageFailure,
                     "session store write is unresolved; reopen the store and restore the saved session before continuing",
@@ -984,32 +1068,25 @@ impl Runtime {
             .expect("counter id is valid");
         let now = StdInstant::now();
         let Some(deadline) = now.checked_add(self.shared.limits.run_duration) else {
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
-        };
-        let Ok(user_item) = ModelContextItem::user_text(command.input.clone()) else {
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None);
+            return CommandResponse::new(request, CommandReply::Rejected, None);
         };
         let mut state = self.shared.state.lock().await;
         if let Some(active) = state.active.as_ref() {
-            return CommandResponse::new(
-                command.request.clone(),
-                CommandReply::Busy,
-                Some(active.run.clone()),
-            );
+            return CommandResponse::new(request, CommandReply::Busy, Some(active.run.clone()));
         }
         if state.restore_busy {
-            return CommandResponse::new(command.request.clone(), CommandReply::Busy, None);
+            return CommandResponse::new(request, CommandReply::Busy, None);
         }
         if let Some(quarantined) = state.quarantine.first() {
             return CommandResponse::new(
-                command.request.clone(),
+                request,
                 CommandReply::Busy,
                 Some(quarantined.run.clone()),
             );
         }
         if self.shared.outbox_events.load(Ordering::SeqCst) != 0 {
             let run = state.last.as_ref().map(|last| last.run.clone());
-            return CommandResponse::new(command.request.clone(), CommandReply::Busy, run);
+            return CommandResponse::new(request, CommandReply::Busy, run);
         }
         // Exhaustion belongs to the previous run. Its outbox is empty here,
         // so the next accepted run starts with a fresh control budget.
@@ -1021,27 +1098,24 @@ impl Runtime {
         for exchange in state
             .history
             .iter()
-            .filter(|exchange| exchange.session == command.session)
+            .filter(|exchange| exchange.session == session)
         {
             conversation.extend(exchange.items.iter().cloned());
         }
         let session_omitted_items = state
             .history_omissions
             .iter()
-            .filter(|omission| omission.session == command.session)
+            .filter(|omission| omission.session == session)
             .map(|omission| omission.removed_items)
             .sum::<usize>();
         let history_omitted_items =
             session_omitted_items.saturating_add(state.history_omission_fallback_items);
         let history_omitted = history_omitted_items > 0;
         let history_len = conversation.len();
-        conversation.push(user_item);
+        let child_follow_up = matches!(&item, ModelContextItem::ChildCompletion(_));
+        conversation.push(item.clone());
         let source_cursor = conversation.len();
-        let already_initialized = state.durable_sessions.contains(&command.session);
-        let source_input = conversation
-            .last()
-            .expect("the user item was appended")
-            .clone();
+        let already_initialized = state.durable_sessions.contains(&session);
         let context_note = if history_omitted {
             CONTEXT_NOTICE_TEXT.to_owned()
         } else {
@@ -1061,7 +1135,7 @@ impl Runtime {
             .history
             .iter()
             .rev()
-            .filter(|exchange| exchange.session == command.session)
+            .filter(|exchange| exchange.session == session)
             .find_map(|exchange| exchange.derived_memory.clone());
         let (context_management, discovery) = self.shared.provider.context_management_for_run();
         state.active = Some(ActiveRun {
@@ -1077,10 +1151,11 @@ impl Runtime {
             phase: RunState::Preparing,
             run: run.clone(),
             run_n,
-            session: command.session.clone(),
-            request: command.request.clone(),
-            profile: command.profile.clone(),
-            read_only: command.read_only,
+            session: session.clone(),
+            request: request.clone(),
+            profile: profile.clone(),
+            read_only,
+            child_follow_up,
             started: now,
             deadline,
             token: CancellationToken::new(),
@@ -1097,6 +1172,8 @@ impl Runtime {
             access_failure_attempts: 0,
             continuation: None,
             conversation,
+            steering: VecDeque::new(),
+            explorations: Default::default(),
             source_cursor,
             history_len,
             inherited_history: history_len > 0,
@@ -1127,19 +1204,30 @@ impl Runtime {
         // A caller abandoning its reply must not abandon the reserved slot or
         // detach the storage worker. Admission stays owned by the runtime.
         let admitting = self.clone();
-        let request = command.request.clone();
+        let fallback_request = request.clone();
         tokio::spawn(async move {
             admitting
-                .complete_admission(command, run, source_input, already_initialized, discovery)
+                .complete_admission(
+                    request,
+                    session,
+                    profile,
+                    run,
+                    item,
+                    already_initialized,
+                    discovery,
+                )
                 .await
         })
         .await
-        .unwrap_or_else(|_| CommandResponse::new(request, CommandReply::Rejected, None))
+        .unwrap_or_else(|_| CommandResponse::new(fallback_request, CommandReply::Rejected, None))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn complete_admission(
         &self,
-        command: SubmitCommand,
+        request: RequestId,
+        session: SessionId,
+        profile: String,
         run: RunId,
         source_input: ModelContextItem,
         already_initialized: bool,
@@ -1148,13 +1236,7 @@ impl Runtime {
         // Reserve the active slot before I/O, but never hold the state lock
         // while waiting for the blocking store. Concurrent commands stay live.
         if let Err(error) = self
-            .persist_session_input(
-                &command.session,
-                &command.profile,
-                &run,
-                &source_input,
-                already_initialized,
-            )
+            .persist_session_input(&session, &profile, &run, &source_input, already_initialized)
             .await
         {
             let mut state = self.shared.state.lock().await;
@@ -1165,8 +1247,7 @@ impl Runtime {
             {
                 state.active = None;
             }
-            return CommandResponse::new(command.request.clone(), CommandReply::Rejected, None)
-                .with_error(error);
+            return CommandResponse::new(request, CommandReply::Rejected, None).with_error(error);
         }
         if self.shared.session_store.is_some() {
             self.shared
@@ -1174,7 +1255,7 @@ impl Runtime {
                 .lock()
                 .await
                 .durable_sessions
-                .insert(command.session.clone());
+                .insert(session);
         }
         let driver = self.clone();
         let run_for_task = run.clone();
@@ -1190,7 +1271,7 @@ impl Runtime {
                 driver.on_driver_failure(&run_for_task, join).await;
             }
         });
-        CommandResponse::new(command.request.clone(), CommandReply::Accepted, Some(run))
+        CommandResponse::new(request, CommandReply::Accepted, Some(run))
     }
 
     /// Stops future dispatch and signals active work. Idempotent: repeats
@@ -1203,6 +1284,7 @@ impl Runtime {
             Some(active) if active.run == command.run => {
                 active.cancelled = true;
                 active.token.cancel();
+                active.explorations.cancel_all();
                 active.wake.notify_one();
                 CommandResponse::new(
                     command.request.clone(),
@@ -1400,12 +1482,485 @@ impl Runtime {
         )
     }
 
+    /// Waits for the named run to settle; returns `None` if it is no longer retained.
+    pub async fn wait_for_terminal(&self, run: &RunId) -> Option<RunOutcome> {
+        loop {
+            let changed = self.shared.terminal_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.shared.state.lock().await;
+                if let Some(last) = state.last.as_ref().filter(|last| &last.run == run) {
+                    return Some(last.outcome);
+                }
+                if !state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| &active.run == run)
+                {
+                    return None;
+                }
+            }
+            changed.await;
+        }
+    }
+
+    /// Creates a non-owning reference without forming a runtime/tool cycle.
+    pub fn downgrade(&self) -> WeakRuntime {
+        WeakRuntime(Arc::downgrade(&self.shared))
+    }
+
+    /// Starts a child runtime using a provider and project-local read tools chosen by the host.
+    /// The caller must supply project-jailed tool registrations and charge normal parent admission.
+    pub async fn start_exploration(
+        &self,
+        parent: &RunId,
+        job_id: RequestId,
+        brief: &str,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+    ) -> Result<(), AgentError> {
+        self.start_exploration_with_delivery(
+            parent,
+            job_id,
+            brief,
+            provider,
+            tools,
+            crate::ExplorationDelivery::Await,
+            crate::ExplorationRole::Explore,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Starts an exploration with an explicit host-authorized delivery mode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_exploration_with_delivery(
+        &self,
+        parent: &RunId,
+        job_id: RequestId,
+        brief: &str,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        delivery: crate::ExplorationDelivery,
+        role: crate::ExplorationRole,
+    ) -> Result<Option<crate::ExplorationHandoff>, AgentError> {
+        use crate::delegation::{Job, MAX_BRIEF_BYTES, MAX_DURATION, MAX_RESULT_BYTES};
+        if role == crate::ExplorationRole::Propose && delivery != crate::ExplorationDelivery::Await
+        {
+            return Err(runtime_error(
+                ErrorCategory::UnsupportedCapability,
+                "proposals require explicit collection",
+            ));
+        }
+        let brief = brief.trim();
+        if brief.is_empty() || brief.len() > MAX_BRIEF_BYTES {
+            return Err(runtime_error(
+                ErrorCategory::InvalidInput,
+                "exploration brief is invalid",
+            ));
+        }
+        if !provider.capabilities().text
+            || (!tools.is_empty() && !provider.capabilities().tool_calls)
+            || tools.iter().any(|tool| {
+                tool.access() != ToolAccess::Read
+                    || !matches!(
+                        tool.port().describe().id().name(),
+                        "host_read" | "host_list" | "host_search"
+                    )
+            })
+        {
+            return Err(runtime_error(
+                ErrorCategory::UnsupportedCapability,
+                "exploration requires read-only project tools and a supported model",
+            ));
+        }
+        let now = StdInstant::now();
+        let state = self.shared.state.lock().await;
+        let parent_deadline = state
+            .active
+            .as_ref()
+            .filter(|active| {
+                &active.run == parent && active.terminal.is_none() && !active.token.is_cancelled()
+            })
+            .map(|active| active.deadline)
+            .ok_or_else(|| {
+                runtime_error(
+                    ErrorCategory::InvalidInput,
+                    "exploration parent is not active",
+                )
+            })?;
+        drop(state);
+        let deadline = parent_deadline.min(now + MAX_DURATION);
+        let duration = deadline.saturating_duration_since(now);
+        if duration.is_zero() {
+            return Err(runtime_error(
+                ErrorCategory::Timeout,
+                "exploration deadline already elapsed",
+            ));
+        }
+        let mut limits = self.shared.limits;
+        limits.run_duration = duration.min(limits.run_duration);
+        limits.per_tool_timeout = limits
+            .per_tool_timeout
+            .min(Duration::from_secs(5))
+            .min(limits.run_duration);
+        limits.max_model_turns_per_run = limits.max_model_turns_per_run.min(4);
+        limits.max_tool_calls_per_run = limits.max_tool_calls_per_run.min(12);
+        limits.max_tool_calls_per_turn = limits
+            .max_tool_calls_per_turn
+            .min(limits.max_tool_calls_per_run);
+        limits.max_tool_output_bytes = limits.max_tool_output_bytes.min(MAX_RESULT_BYTES);
+        let (child, streams) = Self::try_new_with_instructions(
+            RuntimeConfig {
+                limits,
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            provider,
+            tools,
+            ModelInstructions::new(
+                "",
+                match role {
+                    crate::ExplorationRole::Explore => {
+                        "Explore the assigned task using read-only evidence. Return a short conclusion, project-relative file references, and uncertainty."
+                    }
+                    crate::ExplorationRole::Propose => {
+                        "Use only read-only evidence. Return exactly one JSON object with string fields path, old_text, and new_text. The path must be project-relative and existing, old_text must match exactly once, and new_text must differ. Do not include Markdown fences or apply the change."
+                    }
+                },
+            )?,
+        )?;
+        let child_session = SessionId::new(format!("explore-{:x}", child.shared.incarnation))
+            .expect("generated exploration session ID");
+        let command = SubmitCommand::new(job_id.clone(), child_session, brief, "explore")?
+            .with_read_only(true);
+        let job = Job::new();
+        let mut state = self.shared.state.lock().await;
+        let active = state
+            .active
+            .as_mut()
+            .filter(|active| {
+                &active.run == parent && active.terminal.is_none() && !active.token.is_cancelled()
+            })
+            .ok_or_else(|| {
+                runtime_error(
+                    ErrorCategory::InvalidInput,
+                    "exploration parent is not active",
+                )
+            })?;
+        if active.explorations.get(&job_id).is_some() {
+            return Err(runtime_error(
+                ErrorCategory::InvalidInput,
+                "exploration id already exists",
+            ));
+        }
+        if StdInstant::now() >= deadline {
+            return Err(runtime_error(
+                ErrorCategory::Timeout,
+                "exploration deadline already elapsed",
+            ));
+        }
+        let handoff = (delivery != crate::ExplorationDelivery::Await)
+            .then(|| crate::ExplorationHandoff::new(job.clone()));
+        let worker =
+            self.shared
+                .exploration_workers
+                .track(parent.clone(), job_id.clone(), job.clone());
+        active.explorations.insert(job_id, job.clone(), delivery);
+        tokio::spawn(job.run(child, streams, command, deadline, worker, role));
+        Ok(handoff)
+    }
+
+    /// Offers a child result to the inbox while its parent state is stable.
+    ///
+    /// The callback may accept or decline the result. It must not block,
+    /// start a run, or re-enter this runtime. Callers coordinating with
+    /// another lock must acquire that lock before calling this method.
+    pub async fn offer_exploration(
+        &self,
+        parent: &RunId,
+        job: &RequestId,
+        accept: impl FnOnce(crate::ExplorationParent, &crate::ExplorationResult) -> bool,
+    ) -> crate::ExplorationClaim {
+        use crate::{ExplorationClaim, ExplorationParent};
+
+        let state = self.shared.state.lock().await;
+        let (owner, jobs) = if let Some(active) =
+            state.active.as_ref().filter(|active| &active.run == parent)
+        {
+            if active.cancelled || active.token.is_cancelled() {
+                return ExplorationClaim::ParentStopped;
+            }
+            match active.terminal {
+                Some(RunOutcome::Completed) => return ExplorationClaim::Deferred,
+                Some(_) => return ExplorationClaim::ParentStopped,
+                None if StdInstant::now() >= active.deadline => return ExplorationClaim::Deferred,
+                None => {}
+            }
+            (ExplorationParent::Active, &active.explorations)
+        } else if let Some(last) = state.last.as_ref().filter(|last| &last.run == parent) {
+            if last.outcome != RunOutcome::Completed {
+                return ExplorationClaim::ParentStopped;
+            }
+            let owner = if state.active.is_some() {
+                ExplorationParent::NewerRunActive
+            } else {
+                ExplorationParent::IdleAfterSuccess
+            };
+            (owner, &last.explorations)
+        } else {
+            return ExplorationClaim::Unknown;
+        };
+        jobs.get(job).map_or(ExplorationClaim::Unknown, |job| {
+            job.try_deliver(|result| accept(owner, result))
+        })
+    }
+
+    /// Consumes one child result, only within its original parent run.
+    pub async fn await_exploration(
+        &self,
+        parent: &RunId,
+        job: &RequestId,
+    ) -> crate::ExplorationWait {
+        let owned = {
+            let state = self.shared.state.lock().await;
+            state
+                .active
+                .as_ref()
+                .filter(|active| &active.run == parent)
+                .and_then(|active| active.explorations.get(job))
+                .or_else(|| {
+                    state
+                        .last
+                        .as_ref()
+                        .filter(|last| &last.run == parent)
+                        .and_then(|last| last.explorations.get(job))
+                })
+        };
+        match owned {
+            Some(job) => job.take().await,
+            None => crate::ExplorationWait::Unknown,
+        }
+    }
+
+    pub(crate) async fn exploration_answer(
+        &self,
+        session: &SessionId,
+        limit: usize,
+    ) -> Option<(String, bool)> {
+        let state = self.shared.state.lock().await;
+        let exchange = state
+            .history
+            .iter()
+            .rev()
+            .find(|exchange| &exchange.session == session)?;
+        let start = exchange
+            .items
+            .iter()
+            .rposition(|item| !matches!(item, ModelContextItem::AssistantText { .. }))
+            .map_or(0, |index| index + 1);
+        let mut answer = String::new();
+        for item in &exchange.items[start..] {
+            if let ModelContextItem::AssistantText { text, .. } = item {
+                let text = text.as_str();
+                let remaining = limit.saturating_sub(answer.len());
+                let end = text.floor_char_boundary(remaining.min(text.len()));
+                answer.push_str(&text[..end]);
+                if end < text.len() {
+                    return Some((answer, true));
+                }
+            }
+        }
+        (!answer.trim().is_empty()).then_some((answer, false))
+    }
+
+    /// Stages bounded user input for the named run, without waking a provider or tool.
+    pub async fn steer(
+        &self,
+        run: &RunId,
+        request: RequestId,
+        text: &str,
+    ) -> Option<SteeringReceipt> {
+        if text.is_empty() || text.len() > nexus_core::commands::MAX_INPUT_BYTES {
+            return None;
+        }
+        let item = ModelContextItem::user_text(text).ok()?;
+        let mut state = self.shared.state.lock().await;
+        let active = state.active.as_mut()?;
+        active
+            .steering
+            .retain(|(_, _, receipt)| receipt.0.load(Ordering::Acquire) == 0);
+        if &active.run != run
+            || active.terminal.is_some()
+            || active.token.is_cancelled()
+            || StdInstant::now() >= active.deadline
+            || active.steering.len() >= 16
+        {
+            return None;
+        }
+        let receipt = SteeringReceipt(Arc::new(std::sync::atomic::AtomicU8::new(0)));
+        active.steering.push_back((request, item, receipt.clone()));
+        Some(receipt)
+    }
+
+    /// Answers a short side question without writing history or exposing tools.
+    pub async fn side_question(
+        &self,
+        session: &SessionId,
+        question: &str,
+    ) -> Result<(String, Usage), AgentError> {
+        const INPUT_BYTES: usize = 4096;
+        const CONTEXT_BYTES: usize = 24 * 1024;
+        const OUTPUT_BYTES: usize = 8192;
+        let question = question.trim();
+        if question.is_empty() || question.len() > INPUT_BYTES {
+            return Err(runtime_error(
+                ErrorCategory::InvalidInput,
+                "side question is invalid",
+            ));
+        }
+        if self
+            .shared
+            .side_question_active
+            .swap(true, Ordering::AcqRel)
+        {
+            return Err(runtime_error(
+                ErrorCategory::ResourceLimit,
+                "a side question is already running",
+            ));
+        }
+        let guard = SideQuestionGuard(Arc::clone(&self.shared));
+        let mut messages = Vec::new();
+        {
+            let state = self.shared.state.lock().await;
+            let mut bytes = question.len();
+            let active = state
+                .active
+                .as_ref()
+                .filter(|active| &active.session == session);
+            let history: Box<dyn DoubleEndedIterator<Item = &ModelContextItem> + '_> =
+                if let Some(active) = active {
+                    Box::new(active.conversation.iter())
+                } else {
+                    Box::new(
+                        state
+                            .history
+                            .iter()
+                            .filter(|exchange| &exchange.session == session)
+                            .flat_map(|exchange| exchange.items.iter()),
+                    )
+                };
+            for item in history.rev() {
+                let text = match item {
+                    ModelContextItem::UserText(text)
+                    | ModelContextItem::AssistantText { text, .. } => text,
+                    _ => continue,
+                };
+                bytes += text.as_str().len();
+                if bytes > CONTEXT_BYTES || messages.len() >= 32 {
+                    break;
+                }
+                let item = match item {
+                    ModelContextItem::UserText(_) => ModelContextItem::user_text(text.as_str())?,
+                    _ => ModelContextItem::assistant_text(
+                        format!("aside-{}", messages.len()),
+                        text.as_str(),
+                    )?,
+                };
+                messages.push(item);
+            }
+        }
+        messages.reverse();
+        messages.push(ModelContextItem::user_text(question)?);
+        let number = self.shared.run_counter.fetch_add(1, Ordering::Relaxed);
+        let identity = format!("aside-{:x}-{number}", self.shared.incarnation);
+        let run = RunId::new(&identity).expect("generated side question identity");
+        let turn = TurnId::new(identity).expect("generated side question turn");
+        let request = ModelRequest::new(run, turn, "side-question", Vec::new(), None, OUTPUT_BYTES)?
+            .with_session(session.clone())
+            .with_instructions(ModelInstructions::new("", "Answer the last question briefly using the provided conversation. Do not execute tasks or call tools.")?)?
+            .with_conversation(messages)?
+            .with_max_output_tokens(768)?;
+        let timeout = Duration::from_secs(30);
+        let token = CancellationToken::new();
+        let provider_context = ProviderContext::new(timeout, false, None)
+            .with_control(token.clone(), StdInstant::now() + timeout);
+        let provider = Arc::clone(&self.shared.provider);
+        let mut limits = self.shared.limits;
+        limits.max_tool_output_bytes = limits.max_tool_output_bytes.min(OUTPUT_BYTES);
+        let worker = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let events = provider.stream(&request, &provider_context);
+            provider_context.check_active()?;
+            crate::protocol::validate_batch(&events, &limits)?;
+            let mut answer = String::new();
+            for event in events {
+                match event {
+                    ProviderEvent::TextDelta { text, .. } => answer.push_str(&text),
+                    ProviderEvent::TurnFinished(done)
+                        if done.reason() == nexus_core::FinishReason::Stop
+                            && !answer.is_empty() =>
+                    {
+                        return Ok((answer, done.usage()));
+                    }
+                    ProviderEvent::Failed(error) => return Err(error),
+                    ProviderEvent::ToolCallReady(_) | ProviderEvent::ToolCallDelta { .. } => break,
+                    _ => {}
+                }
+            }
+            Err(runtime_error(
+                ErrorCategory::Protocol,
+                "side question did not produce a text answer",
+            ))
+        });
+        match tokio::time::timeout(timeout, worker).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(runtime_error(
+                ErrorCategory::Internal,
+                "side question worker failed",
+            )),
+            Err(_) => {
+                token.cancel();
+                Err(runtime_error(
+                    ErrorCategory::Timeout,
+                    "side question timed out",
+                ))
+            }
+        }
+    }
+
     /// Reports whether the runtime has active or unconfirmed worker
     /// ownership. A finalized snapshot alone is insufficient for safe
     /// session reclamation because timed-out workers may remain quarantined.
     pub async fn has_unconfirmed_work(&self) -> bool {
         let state = self.shared.state.lock().await;
-        state.active.is_some() || !state.quarantine.is_empty()
+        state.active.is_some()
+            || !state.quarantine.is_empty()
+            || self.shared.side_question_active.load(Ordering::Acquire)
+            || self.live_exploration_workers() > 0
+    }
+
+    /// Number of child supervisors still running or waiting for worker exit.
+    pub fn live_exploration_workers(&self) -> usize {
+        self.shared.exploration_workers.len()
+    }
+
+    /// Signals all live children on session shutdown, including older parents.
+    pub fn stop_explorations(&self) {
+        self.shared.exploration_workers.stop();
+    }
+
+    pub(crate) async fn wait_for_worker_exit(&self) {
+        loop {
+            let notified = self.shared.terminal_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.has_unconfirmed_work().await {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn stale_or_finalized(
@@ -1425,10 +1980,20 @@ impl Runtime {
     }
 
     async fn drive(&self, run: RunId, discovery: Option<nexus_core::ContextWindowDiscovery>) {
-        let request = {
+        let (request, child) = {
             let state = self.shared.state.lock().await;
             match state.active.as_ref() {
-                Some(active) if active.run == run => active.request.clone(),
+                Some(active) if active.run == run => (
+                    active.request.clone(),
+                    match active.conversation.get(active.history_len) {
+                        Some(ModelContextItem::ChildCompletion(result))
+                            if active.child_follow_up =>
+                        {
+                            Some(result.clone())
+                        }
+                        _ => None,
+                    },
+                ),
                 _ => return,
             }
         };
@@ -1436,6 +2001,15 @@ impl Runtime {
             .publish_control(&run, EventPayload::RunStarted { request })
             .await
             .is_err()
+        {
+            self.finish_run(&run, RunOutcome::Cancelled, None).await;
+            return;
+        }
+        if let Some(child) = child
+            && self
+                .publish_control(&run, EventPayload::ChildDelivered(child))
+                .await
+                .is_err()
         {
             self.finish_run(&run, RunOutcome::Cancelled, None).await;
             return;
@@ -1534,6 +2108,7 @@ impl Runtime {
     }
 
     async fn on_calling_model(&self, run: &RunId) -> Result<RunState, Terminal> {
+        self.deliver_steering(run).await?;
         let (mut request, context, mut turn, deadline, mut started_payload) = {
             let mut state = self.shared.state.lock().await;
             let Some(active) = state.active.as_mut() else {
@@ -2003,6 +2578,82 @@ impl Runtime {
                 }
             };
         }
+    }
+
+    async fn deliver_steering(&self, run: &RunId) -> Result<(), Terminal> {
+        let deliveries = {
+            let mut state = self.shared.state.lock().await;
+            let Some(active) = state.active.as_mut().filter(|active| &active.run == run) else {
+                return Ok(());
+            };
+            if active.continuation.is_some()
+                || (active.steering.is_empty() && !active.explorations.has_steering())
+                || active.terminal.is_some()
+                || active.token.is_cancelled()
+                || StdInstant::now() >= active.deadline
+                || self
+                    .shared
+                    .limits
+                    .check_model_turns(active.turns_used)
+                    .is_err()
+            {
+                return Ok(());
+            }
+            let mut deliveries = Vec::new();
+            for (request, item, receipt) in std::mem::take(&mut active.steering) {
+                if receipt
+                    .0
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                let ModelContextItem::UserText(text) = &item else {
+                    unreachable!()
+                };
+                deliveries.push(EventPayload::UserSteered {
+                    request,
+                    text: text.as_str().to_owned(),
+                });
+                active.conversation.push(item);
+            }
+            let conversation = &mut active.conversation;
+            let mut bytes = conversation
+                .iter()
+                .map(ModelContextItem::payload_bytes)
+                .sum::<usize>()
+                .saturating_add(active.instruction_bytes)
+                .saturating_add(active.context_note_bytes);
+            active.explorations.steer(run, |result| {
+                let item = ModelContextItem::ChildCompletion(result.clone());
+                let next = bytes.saturating_add(item.payload_bytes());
+                if conversation.len() >= self.shared.context_items_bound
+                    || next > nexus_core::provider::MAX_CONVERSATION_BYTES
+                {
+                    return false;
+                }
+                bytes = next;
+                conversation.push(item);
+                deliveries.push(EventPayload::ChildDelivered(result));
+                true
+            });
+            deliveries
+        };
+        if deliveries.is_empty() {
+            return Ok(());
+        }
+        // Do not replay inputs whose durable append has an uncertain outcome.
+        self.persist_pending_source(run)
+            .await
+            .map_err(Terminal::failed)?;
+        let mut state = self.shared.state.lock().await;
+        if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
+            for payload in deliveries {
+                let result = emit_control(&self.shared, active, run, payload);
+                apply_required_control_outcome(active, result);
+            }
+        }
+        Ok(())
     }
 
     async fn wait_provider_recovery(
@@ -2782,7 +3433,12 @@ impl Runtime {
             // including unknown-tool and invalid-argument denials.
             active.calls_used += 1;
             let call = self.next_call_id(active)?;
-            let Some(registered) = self.shared.tools.get(candidate.tool_name()) else {
+            let Some(registered) = self
+                .shared
+                .tools
+                .get(candidate.tool_name())
+                .filter(|_| !active.child_follow_up)
+            else {
                 let outcome = bound_outcome(&self.shared, denied_outcome("unknown tool"));
                 denied_results.push(denied_context(
                     active,
@@ -3981,6 +4637,7 @@ impl Runtime {
                 .await
                 .quarantine
                 .retain(|meta| !(meta.run == run && meta.call.is_none()));
+            shared.terminal_changed.notify_waiters();
         });
         Err(error)
     }
@@ -4072,6 +4729,9 @@ impl Runtime {
         } else {
             (outcome, error)
         };
+        if outcome != RunOutcome::Completed {
+            active.explorations.cancel_all();
+        }
         if let Some((call, decided)) = active.outcome_slot.take() {
             let dispatched = active
                 .current
@@ -4235,7 +4895,7 @@ impl Runtime {
                     })
                     .collect();
                 items.retain(|item| match item {
-                    ModelContextItem::UserText(_) => true,
+                    item if item.starts_exchange() => true,
                     ModelContextItem::AssistantCall { call, .. } => {
                         complete_dispatched_calls.contains(call.call())
                     }
@@ -4281,7 +4941,7 @@ impl Runtime {
                 }
                 let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
                 for item in items {
-                    if exchanges.is_empty() || matches!(item, ModelContextItem::UserText(_)) {
+                    if exchanges.is_empty() || item.starts_exchange() {
                         exchanges.push(Vec::new());
                     }
                     exchanges.last_mut().expect("exchange exists").push(item);
@@ -4367,6 +5027,9 @@ impl Runtime {
                 }
             }
         }
+        if outcome == RunOutcome::Completed {
+            active.explorations.parent_completed();
+        }
         state.last = Some(FinishedRun {
             run: active.run.clone(),
             session: active.session.clone(),
@@ -4375,7 +5038,9 @@ impl Runtime {
             outcomes: active.outcomes.clone(),
             truncated: active.data_dropped || delivery_truncated,
             terminal_delivered,
+            explorations: active.explorations,
         });
+        self.shared.terminal_changed.notify_waiters();
     }
 
     async fn on_driver_failure(&self, run: &RunId, join: tokio::task::JoinError) {
@@ -4432,6 +5097,7 @@ impl Runtime {
             state
                 .quarantine
                 .retain(|meta| !(meta.run == run && meta.call.as_ref() == Some(&call)));
+            shared.terminal_changed.notify_waiters();
             // A worker can return after the runtime stopped waiting. If its
             // shared backend is now unusable, stop an active run before it
             // dispatches again; a future run is also protected by the
@@ -4645,9 +5311,7 @@ fn restore_items(source: Vec<ModelContextItem>) -> Result<Vec<ModelContextItem>,
         }
     }
     if !context_calls_are_paired(&restored)
-        || restored
-            .first()
-            .is_some_and(|item| !matches!(item, ModelContextItem::UserText(_)))
+        || restored.first().is_some_and(|item| !item.starts_exchange())
     {
         return Err(());
     }
@@ -4687,7 +5351,7 @@ fn bounded_restored_history(
 fn split_history_exchanges(items: &[ModelContextItem]) -> Vec<Vec<ModelContextItem>> {
     let mut exchanges: Vec<Vec<ModelContextItem>> = Vec::new();
     for item in items {
-        if matches!(item, ModelContextItem::UserText(_)) {
+        if item.starts_exchange() {
             exchanges.push(Vec::new());
         }
         if let Some(exchange) = exchanges.last_mut() {
@@ -4960,6 +5624,13 @@ fn provisional_event_bytes(event: &ProviderEvent) -> usize {
 fn control_event_bytes(event: &RunEvent) -> usize {
     let payload_bytes = match event.payload() {
         EventPayload::RunStarted { request } => request.as_str().len(),
+        EventPayload::UserSteered { request, text } => request.as_str().len() + text.len(),
+        EventPayload::ChildDelivered(result) => {
+            result.parent().as_str().len()
+                + result.job().as_str().len()
+                + result.status().as_str().len()
+                + result.text().len()
+        }
         EventPayload::AssistantTextDelta(text) | EventPayload::AssistantReasoningDelta(text) => {
             text.turn.as_str().len() + text.item_key.len() + text.text.len()
         }
@@ -8169,6 +8840,284 @@ mod cov_runtime_private {
     /// channels; the covered helpers never invoke it.
     struct NoopProvider;
 
+    #[tokio::test]
+    async fn exploration_steering_claims_only_at_its_parent_boundary() {
+        use crate::delegation::Job;
+
+        let (runtime, mut streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        let parent = RunId::new("steer-parent").unwrap();
+        let unrelated = RunId::new("other-run").unwrap();
+        let job_id = RequestId::new("child-result").unwrap();
+        let job = Job::new();
+        let mut active = active_for(&parent);
+        active.explorations.insert(
+            job_id.clone(),
+            job.clone(),
+            crate::ExplorationDelivery::Steer,
+        );
+        runtime.shared.state.lock().await.active = Some(active);
+        job.finish(crate::ExplorationResult {
+            outcome: RunOutcome::Completed,
+            timed_out: false,
+            text: "child evidence".into(),
+            truncated: false,
+            role: crate::ExplorationRole::Explore,
+            usage: None,
+        });
+        assert!(runtime.deliver_steering(&unrelated).await.is_ok());
+        assert!(streams.control.try_recv().is_err());
+        assert!(runtime.deliver_steering(&parent).await.is_ok());
+        assert_eq!(
+            runtime.await_exploration(&parent, &job_id).await,
+            crate::ExplorationWait::Collected,
+        );
+        let state = runtime.shared.state.lock().await;
+        assert!(matches!(
+            state.active.as_ref().unwrap().conversation.last(),
+            Some(ModelContextItem::ChildCompletion(result))
+                if result.parent() == &parent && result.job() == &job_id && result.text() == "child evidence"
+        ));
+        drop(state);
+        assert!(matches!(
+            streams.control.try_recv().unwrap().payload(),
+            EventPayload::ChildDelivered(result) if result.job() == &job_id
+        ));
+        assert!(runtime.deliver_steering(&parent).await.is_ok());
+        assert!(streams.control.try_recv().is_err());
+    }
+
+    struct GatedExplorationProvider {
+        name: &'static str,
+        started: mpsc::UnboundedSender<&'static str>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ProviderPort for GatedExplorationProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            NoopProvider.capabilities()
+        }
+
+        fn stream(&self, request: &ModelRequest, context: &ProviderContext) -> Vec<ProviderEvent> {
+            assert!(request.enabled_tools().is_empty());
+            assert_eq!(request.conversation().len(), 1);
+            self.started.send(self.name).unwrap();
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+            if let Err(error) = context.check_active() {
+                return vec![ProviderEvent::Failed(error)];
+            }
+            vec![
+                ProviderEvent::TextDelta {
+                    item_key: "answer".into(),
+                    text: self.name.into(),
+                },
+                ProviderEvent::TurnFinished(
+                    nexus_core::TurnFinished::try_new(
+                        nexus_core::FinishReason::Stop,
+                        Usage::new(None, None, nexus_core::UsageFinality::Final),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            ]
+        }
+    }
+
+    #[test]
+    fn explorations_overlap_and_deliver_out_of_order_once_to_their_parent() {
+        let (runtime, _streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let parent = RunId::new("parent-exploration").unwrap();
+            let unrelated = RunId::new("unrelated-run").unwrap();
+            runtime.shared.state.lock().await.active = Some(active_for(&parent));
+            let (tx, mut started) = mpsc::unbounded_channel();
+            let gated = |name| {
+                let (release, rx) = std::sync::mpsc::channel();
+                (
+                    release,
+                    Arc::new(GatedExplorationProvider {
+                        name,
+                        started: tx.clone(),
+                        release: StdMutex::new(rx),
+                    }),
+                )
+            };
+            let a = RequestId::new("job-a").unwrap();
+            let b = RequestId::new("job-b").unwrap();
+            let c = RequestId::new("job-c").unwrap();
+            let (release_a, provider_a) = gated("answer-a");
+            let (release_b, provider_b) = gated("answer-b");
+            let (release_c, provider_c) = gated("answer-c");
+            runtime
+                .start_exploration(&parent, a.clone(), "explore a", provider_a, vec![])
+                .await
+                .unwrap();
+            runtime
+                .start_exploration(&parent, b.clone(), "explore b", provider_b, vec![])
+                .await
+                .unwrap();
+            assert!(
+                runtime
+                    .start_exploration(
+                        &parent,
+                        a.clone(),
+                        "duplicate",
+                        Arc::new(NoopProvider),
+                        vec![]
+                    )
+                    .await
+                    .is_err()
+            );
+            let first = tokio::time::timeout(Duration::from_secs(3), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let second = tokio::time::timeout(Duration::from_secs(3), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(first, second);
+            runtime
+                .start_exploration(&parent, c.clone(), "explore c", provider_c, vec![])
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(3), started.recv())
+                    .await
+                    .unwrap(),
+                Some("answer-c")
+            );
+            assert_eq!(
+                runtime.await_exploration(&unrelated, &b).await,
+                crate::ExplorationWait::Unknown
+            );
+            release_b.send(()).unwrap();
+            let crate::ExplorationWait::Finished(result) =
+                runtime.await_exploration(&parent, &b).await
+            else {
+                panic!("expected exploration result");
+            };
+            assert_eq!(result.outcome, RunOutcome::Completed);
+            assert_eq!(result.text, "answer-b");
+            assert_eq!(
+                runtime.await_exploration(&parent, &b).await,
+                crate::ExplorationWait::Collected
+            );
+            runtime
+                .cancel(CancelCommand {
+                    request: RequestId::new("cancel-parent").unwrap(),
+                    run: parent.clone(),
+                })
+                .await;
+            assert_eq!(
+                runtime.await_exploration(&parent, &a).await,
+                crate::ExplorationWait::ParentStopped
+            );
+            assert_eq!(
+                runtime.await_exploration(&parent, &c).await,
+                crate::ExplorationWait::ParentStopped
+            );
+            release_a.send(()).unwrap();
+            release_c.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn side_question_uses_accepted_text_without_mutating_the_run_or_starting_tools() {
+        struct AsideProvider;
+        impl ProviderPort for AsideProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                NoopProvider.capabilities()
+            }
+
+            fn stream(&self, request: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
+                assert!(request.enabled_tools().is_empty());
+                assert!(request.continuation().is_none());
+                assert_eq!(
+                    request.session().map(|session| session.as_str()),
+                    Some("sess-cov-private"),
+                    "side questions carry the owning session identity"
+                );
+                assert_eq!(
+                    request.conversation(),
+                    [
+                        ModelContextItem::user_text("accepted background").unwrap(),
+                        ModelContextItem::user_text("why?").unwrap(),
+                    ]
+                );
+                vec![
+                    ProviderEvent::TextDelta {
+                        item_key: "item".into(),
+                        text: "an aside".into(),
+                    },
+                    ProviderEvent::TurnFinished(
+                        nexus_core::TurnFinished::try_new(
+                            nexus_core::FinishReason::Stop,
+                            Usage::new(Some(12), None, nexus_core::UsageFinality::Final),
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                ]
+            }
+        }
+
+        let (runtime, _streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(AsideProvider),
+            Vec::new(),
+        );
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let run = RunId::new("run-aside-test").unwrap();
+            let mut active = active_for(&run);
+            let session = active.session.clone();
+            let accepted = ModelContextItem::user_text("accepted background").unwrap();
+            active.conversation.push(accepted.clone());
+            runtime.shared.state.lock().await.active = Some(active);
+            let (answer, usage) = runtime.side_question(&session, "why?").await.unwrap();
+            assert_eq!(answer, "an aside");
+            assert_eq!(usage.input_tokens(), Some(12));
+            assert_eq!(usage.output_tokens(), None);
+            let state = runtime.shared.state.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert_eq!(active.run, run);
+            assert_eq!(active.conversation, [accepted]);
+            assert_eq!(active.turns_used, 0);
+            assert!(state.history.is_empty());
+        });
+    }
+
     impl ProviderPort for NoopProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
@@ -8235,6 +9184,7 @@ mod cov_runtime_private {
             request: RequestId::new("req-cov-private").expect("valid request id"),
             profile: "cov-profile".to_owned(),
             read_only: false,
+            child_follow_up: false,
             started: StdInstant::now(),
             deadline: StdInstant::now() + Duration::from_secs(60),
             token: CancellationToken::new(),
@@ -8251,6 +9201,8 @@ mod cov_runtime_private {
             access_failure_attempts: 0,
             continuation: None,
             conversation: Vec::new(),
+            steering: VecDeque::new(),
+            explorations: Default::default(),
             source_cursor: 0,
             history_len: 0,
             inherited_history: false,
@@ -10039,6 +10991,7 @@ mod cov_runtime_topup_private {
             request: RequestId::new("req-cov-topup").expect("valid request id"),
             profile: "cov-profile".to_owned(),
             read_only: false,
+            child_follow_up: false,
             started: now,
             deadline: now + Duration::from_secs(60),
             token: CancellationToken::new(),
@@ -10055,6 +11008,8 @@ mod cov_runtime_topup_private {
             access_failure_attempts: 0,
             continuation: None,
             conversation: Vec::new(),
+            steering: VecDeque::new(),
+            explorations: Default::default(),
             source_cursor: 0,
             history_len: 0,
             inherited_history: false,

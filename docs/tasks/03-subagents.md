@@ -48,6 +48,8 @@ Require the subagent to stop and report when its brief conflicts with a contract
 
 ## Related Documents
 
+- [Background delegation](12-background-delegation.md) — a separate
+  plan for subagents as a Nexus product feature.
 - [Pipeline](01-pipeline.md)
 - [Workflow](02-workflow.md)
 - [M0 gates](04-m0-gates.md)

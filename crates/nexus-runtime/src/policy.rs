@@ -104,6 +104,7 @@ pub struct Policy {
     revision: u32,
     development: Option<nexus_permissions::DirectoryPolicy>,
     container: bool,
+    exploration: bool,
 }
 
 impl Policy {
@@ -134,6 +135,7 @@ impl Policy {
             revision,
             development: None,
             container: false,
+            exploration: false,
         }
     }
 
@@ -149,6 +151,7 @@ impl Policy {
             revision: M0_REVISION,
             development: None,
             container: true,
+            exploration: false,
         }
     }
 
@@ -169,6 +172,20 @@ impl Policy {
 
     pub fn is_container(&self) -> bool {
         self.container
+    }
+
+    /// Allows the host's two project-local exploration controls without approval.
+    #[must_use]
+    pub fn with_exploration(mut self) -> Self {
+        self.exploration = !self.container;
+        self
+    }
+
+    fn authorizes_exploration(&self, access: ToolAccess, tool: &ToolId) -> bool {
+        self.exploration
+            && tool.revision() == self.revision
+            && access == ToolAccess::Read
+            && matches!(tool.name(), "delegate_start" | "delegate_await")
     }
 
     /// Whether a host registration revision is allowed by this policy.
@@ -197,6 +214,10 @@ impl Policy {
         directories: &[std::path::PathBuf],
         access: ToolAccess,
     ) -> Result<bool, AgentError> {
+        if self.authorizes_exploration(access, call.tool()) {
+            self.validate()?;
+            return Ok(false);
+        }
         if self.container {
             self.validate_container_call(call, access)?;
             return Ok(false);
@@ -228,6 +249,10 @@ impl Policy {
         directories: &[std::path::PathBuf],
         access: ToolAccess,
     ) -> Result<ApprovedScope, AgentError> {
+        if self.authorizes_exploration(access, call.tool()) {
+            self.validate()?;
+            return bounded_scope("delegate:explore");
+        }
         if self.container {
             self.validate_container_call(call, access)?;
             return bounded_scope("/workspace");
@@ -390,6 +415,9 @@ impl Policy {
     /// authorization boundary.
     #[must_use]
     pub fn requires_approval(&self, access: ToolAccess, tool: &ToolId) -> bool {
+        if self.authorizes_exploration(access, tool) && self.validate().is_ok() {
+            return false;
+        }
         access != ToolAccess::Read || !self.auto_tools.iter().any(|name| name == tool.name())
     }
 
@@ -514,6 +542,9 @@ impl Policy {
     /// approval prompt must not make two different commands look identical.
     pub fn approval_scope(&self, call: &ToolCall) -> Result<ApprovedScope, AgentError> {
         self.validate()?;
+        if self.authorizes_exploration(ToolAccess::Read, call.tool()) {
+            return bounded_scope("delegate:explore");
+        }
         if self.container {
             let access = match call.tool().name() {
                 "host_read" | "host_list" | "host_search" => ToolAccess::Read,

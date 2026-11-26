@@ -108,6 +108,23 @@ Editor regressions cover separate list/create/edit states, unsaved draft protect
 duplicate-ID refusal, cross-editor save locking, failure preservation, and deletion
 dependency hints. Palette tests cover the radio-card inventory, restored selection,
 immediate application/persistence, system fallback, and unavailable browser storage.
+
+Background delegation has offline coverage in `nexus-runtime` (job claims,
+parent cancellation on both sides of completion, out-of-order results, and
+next-boundary steering), `nexus-session`/`nexus-openai` (typed child-result
+provenance, saved-history round trips, Chat Completions replay, and explicit
+protocol rejection elsewhere), `nexus-tools` (project-only read/list/search
+jails), and `nexus-config` (model/thinking allowlist resolution). The loopback
+`nexus-server` tests exercise `delegate_start`/`delegate_await`, explicit
+`queue` delivery waking an idle session with a read-only tool-free follow-up,
+and Propose returning a valid exact replacement or rejecting a stale one
+without modifying the file. The TUI binary tests verify that registrations
+require explicit collection (no delivery field) and that the awaited result
+channel is driven by the TUI's current-thread runtime. A manual live TUI run
+has exercised parent/child Chat Completions inference and explicit await;
+those tests do not run a live provider automatically, measure concurrency
+capacity, or verify restart recovery; unconsumed child results are in-memory
+only. `nexus-headless` remains fake/test-only and does not register delegation.
 Thinking also has a stylesheet contract
 check for the clipped preview and bounded expanded panel; these do not replace
 browser layout checks. Navigation tests cover direct session selection, restore

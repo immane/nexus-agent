@@ -289,7 +289,7 @@ pub fn conversation_with_memory(
     if let Some(memory) = memory {
         let index = conversation
             .iter()
-            .position(|item| matches!(item, ModelContextItem::UserText(_)))
+            .position(ModelContextItem::starts_exchange)
             .map_or(0, |index| index + 1);
         conversation.insert(
             index,
@@ -611,7 +611,7 @@ fn diagnostic_line(text: &str) -> String {
 /// removal of later, independently paired exchanges with certain effects.
 #[must_use]
 pub fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, usize)> {
-    if !matches!(items.first(), Some(ModelContextItem::UserText(_))) {
+    if !items.first().is_some_and(ModelContextItem::starts_exchange) {
         return None;
     }
     let mut start = if items.get(1).is_some_and(is_context_notice) {
@@ -657,7 +657,7 @@ pub fn oldest_removable_exchange(items: &[ModelContextItem]) -> Option<(usize, u
                     start = index + 1;
                 }
             }
-            ModelContextItem::UserText(_) => return None,
+            item if item.starts_exchange() => return None,
             _ => {}
         }
     }
@@ -674,10 +674,13 @@ pub fn removable_exchange(
     if history_len == 0 {
         return oldest_removable_exchange(items);
     }
-    if !matches!(items.get(history_len), Some(ModelContextItem::UserText(_))) {
+    if !items
+        .get(history_len)
+        .is_some_and(ModelContextItem::starts_exchange)
+    {
         return None;
     }
-    if !matches!(items.first(), Some(ModelContextItem::UserText(_))) {
+    if !items.first().is_some_and(ModelContextItem::starts_exchange) {
         return None;
     }
     if !context_calls_are_paired(&items[..history_len]) {
@@ -689,9 +692,7 @@ pub fn removable_exchange(
             .iter()
             .enumerate()
             .skip(1)
-            .find_map(|(index, item)| {
-                matches!(item, ModelContextItem::UserText(_)).then_some(start + index)
-            })
+            .find_map(|(index, item)| item.starts_exchange().then_some(start + index))
             .unwrap_or(history_len);
         if context_calls_are_paired(&items[start..end])
             && history_exchange_effects_certain(&items[start..end])
@@ -797,8 +798,10 @@ fn summary_removable_ranges(
     items: &[ModelContextItem],
     history_len: usize,
 ) -> Option<Vec<(usize, usize)>> {
-    if !matches!(items.first(), Some(ModelContextItem::UserText(_)))
-        || !matches!(items.get(history_len), Some(ModelContextItem::UserText(_)))
+    if !items.first().is_some_and(ModelContextItem::starts_exchange)
+        || !items
+            .get(history_len)
+            .is_some_and(ModelContextItem::starts_exchange)
         || !context_calls_are_paired(items)
     {
         return None;
@@ -808,7 +811,7 @@ fn summary_removable_ranges(
     let mut start = 1;
     for (index, item) in items.iter().enumerate() {
         match item {
-            ModelContextItem::UserText(_) => {
+            item if item.starts_exchange() => {
                 if !pending.is_empty() {
                     return None;
                 }
@@ -843,7 +846,7 @@ fn summary_removable_ranges(
     while task_start < items.len() {
         let end = items[task_start + 1..]
             .iter()
-            .position(|item| matches!(item, ModelContextItem::UserText(_)))
+            .position(ModelContextItem::starts_exchange)
             .map_or(items.len(), |offset| task_start + 1 + offset);
         if task_start < history_len
             && end <= history_len
@@ -1006,10 +1009,10 @@ pub fn project_bounded_history(
     let original_len = projected.len();
     projected.retain(|item| !is_context_notice(item));
     let mut history_len = history_len - historical_notices;
-    if !matches!(
-        projected.get(history_len),
-        Some(ModelContextItem::UserText(_))
-    ) {
+    if !projected
+        .get(history_len)
+        .is_some_and(ModelContextItem::starts_exchange)
+    {
         return None;
     }
     let mut bytes = projected.iter().fold(bounds.reserved_bytes, |bytes, item| {

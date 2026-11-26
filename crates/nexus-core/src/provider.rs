@@ -11,7 +11,7 @@ use crate::content::{
 };
 use crate::error::{AgentError, ErrorCategory, RetryGuidance};
 use crate::execution::CancellationToken;
-use crate::ids::{CallId, RunId, SessionId, ToolId, TurnId};
+use crate::ids::{CallId, RequestId, RunId, SessionId, ToolId, TurnId};
 use crate::limits::Limits;
 use crate::outcomes::{ToolOutcome, TurnFinished, Usage};
 use crate::tool::ToolSpec;
@@ -160,6 +160,9 @@ impl ProviderRef {
 pub enum ModelContextItem {
     /// User text.
     UserText(TextContent),
+    /// Untrusted background result delivered by the host, not by the user
+    /// or as a response to a provider tool call.
+    ChildCompletion(ChildCompletion),
     /// Assistant text for one provider turn-local item key.
     AssistantText {
         /// Turn-local item key.
@@ -213,7 +216,145 @@ pub enum ModelContextItem {
     },
 }
 
+/// Background result classification used by replay and presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildStatus {
+    /// The child returned a final answer.
+    Completed,
+    /// The child refused the task.
+    Refused,
+    /// The child failed.
+    Failed,
+    /// The child was cancelled.
+    Cancelled,
+    /// The child exceeded its deadline.
+    TimedOut,
+    /// The child exhausted another budget.
+    LimitReached,
+}
+
+impl ChildStatus {
+    /// Stable type label for persistence and transport.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed-out",
+            Self::LimitReached => "limit-reached",
+        }
+    }
+
+    /// Parses a stable type label.
+    pub fn parse(value: &str) -> Result<Self, AgentError> {
+        match value {
+            "completed" => Ok(Self::Completed),
+            "refused" => Ok(Self::Refused),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "timed-out" => Ok(Self::TimedOut),
+            "limit-reached" => Ok(Self::LimitReached),
+            _ => Err(port_error("child completion status is invalid")),
+        }
+    }
+}
+
+/// Bounded result with its original host identities; its text is data only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildCompletion {
+    parent: RunId,
+    job: RequestId,
+    status: ChildStatus,
+    text: String,
+    truncated: bool,
+    follow_up: bool,
+    usage: Option<Usage>,
+}
+
+impl ChildCompletion {
+    /// Maximum UTF-8 answer bytes, excluding provenance metadata.
+    pub const MAX_TEXT_BYTES: usize = 8192;
+
+    /// Constructs a bounded child result. Failed jobs cannot carry answer text.
+    pub fn new(
+        parent: RunId,
+        job: RequestId,
+        status: ChildStatus,
+        text: String,
+        truncated: bool,
+    ) -> Result<Self, AgentError> {
+        if text.len() > Self::MAX_TEXT_BYTES
+            || (status != ChildStatus::Completed && (!text.is_empty() || truncated))
+        {
+            return Err(port_error("child completion payload is invalid"));
+        }
+        Ok(Self {
+            parent,
+            job,
+            status,
+            text,
+            truncated,
+            follow_up: false,
+            usage: None,
+        })
+    }
+
+    /// Original parent, possibly different from the run receiving the result.
+    pub fn parent(&self) -> &RunId {
+        &self.parent
+    }
+    /// Job identity within that parent.
+    pub fn job(&self) -> &RequestId {
+        &self.job
+    }
+    /// Terminal child status.
+    pub fn status(&self) -> ChildStatus {
+        self.status
+    }
+    /// Bounded untrusted answer.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    /// Whether the answer had to be cut.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Marks the result as the typed input of a new background follow-up.
+    pub fn into_follow_up(mut self) -> Self {
+        self.follow_up = true;
+        self
+    }
+
+    /// Whether the result starts a new exchange rather than steering one.
+    pub fn is_follow_up(&self) -> bool {
+        self.follow_up
+    }
+
+    /// Attaches observed child inference usage; unknown counters stay null.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Observed child inference usage, independent of the parent's counters.
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage
+    }
+}
+
 impl ModelContextItem {
+    /// Starts a new task exchange, without treating background data as user text.
+    pub fn starts_exchange(&self) -> bool {
+        match self {
+            Self::UserText(_) => true,
+            Self::ChildCompletion(result) => result.is_follow_up(),
+            _ => false,
+        }
+    }
+
     /// Builds a reasoning-only assistant record without inventing content.
     pub fn assistant_reasoning(reasoning: String) -> Result<Self, AgentError> {
         validate_reasoning(Some(&reasoning))?;
@@ -296,7 +437,7 @@ impl ModelContextItem {
             Self::AssistantText { reasoning, .. }
             | Self::AssistantCall { reasoning, .. }
             | Self::AssistantDeniedCall { reasoning, .. } => reasoning.as_deref(),
-            Self::UserText(_) | Self::ToolResult { .. } => None,
+            Self::UserText(_) | Self::ToolResult { .. } | Self::ChildCompletion(_) => None,
         }
     }
 
@@ -342,6 +483,16 @@ impl ModelContextItem {
                     + reasoning.as_deref().map_or(0, str::len)
             }
             Self::UserText(text) => text.as_str().len(),
+            Self::ChildCompletion(result) => {
+                // Reserve the fixed provider envelope that labels the payload
+                // as untrusted background data on the wire.
+                const ENVELOPE_BYTES: usize = 512;
+                result.parent.as_str().len()
+                    + result.job.as_str().len()
+                    + result.status.as_str().len()
+                    + result.text.len()
+                    + ENVELOPE_BYTES
+            }
             Self::AssistantText {
                 item_key,
                 text,

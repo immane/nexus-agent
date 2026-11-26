@@ -1311,6 +1311,12 @@ impl AppState {
                 self.status = "running".to_owned();
                 self.push_system(format!("run {} started", event.run().as_str()));
             }
+            EventPayload::UserSteered { .. } => {
+                self.push_system("Additional user input was accepted.".to_owned());
+            }
+            EventPayload::ChildDelivered(result) => {
+                self.push_system(format!("Explore {} · {}", result.job().as_str(), result.status().as_str()));
+            }
             EventPayload::AssistantTextDelta(fragment) => {
                 self.streaming = true;
                 let clean = sanitize(&fragment.text);
@@ -1750,6 +1756,16 @@ impl AppState {
                     self.record_submitted(text.as_str());
                     continue;
                 }
+                ModelContextItem::ChildCompletion(result) => (
+                    EntryKind::Tool,
+                    format!(
+                        "Explore {} · {}",
+                        result.job().as_str(),
+                        result.status().as_str()
+                    ),
+                    result.text().to_owned(),
+                    true,
+                ),
                 ModelContextItem::AssistantText { text, .. } => (
                     EntryKind::Assistant,
                     "assistant · saved".to_owned(),
