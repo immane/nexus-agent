@@ -60,10 +60,13 @@ Every `Limits` field can be overridden: `max_model_turns_per_run`, `max_tool_cal
 Server lifecycle settings use `defaults.server` or `profiles.server.server`: `max_connections` defaults to 64 (range 1–64), `max_sessions` to 128 (1–128), `session_idle_seconds` to 1800, and `session_cleanup_interval_seconds` to 60 (durations 1–86,400 seconds). Admission caps may be reduced but cannot exceed the existing hard ceilings. Pending session reservations count toward admission. Settings are installed before session creation and are not hot-reloaded. Idle expiry is rechecked during removal; active work, streams, external owners, and concurrent activity still prevent eviction. Eligible sessions are removed on a subsequent periodic cleanup pass, not exactly at the expiry instant. Bind address, authentication, and tool policy are unchanged.
 
 `server.exploration_models` is an optional array of additional configured model
-IDs allowed for read-only Explore jobs in bound local Web/desktop projects.
-The default is empty: only the parent's bound model is allowed. An alternate
-model must be requested explicitly, and enabling a model on another provider
-permits sending the child brief and its project read results to that provider.
+IDs allowed for read-only Explore jobs in bound local Web/desktop projects and
+live local TUI sessions. The default is empty: only the parent's bound model is
+allowed. An alternate model must be requested explicitly, and enabling a model
+on another provider permits sending the child brief and its project read
+results to that provider. The TUI reads the active profile's `server` section;
+set `defaults.server` or `profiles.tui.server` to allow alternate TUI child
+models.
 
 Tool settings use `defaults.tools` or `profiles.tui.tools` / `profiles.server.tools`. `list_entry_limit` defaults to 10,000 (range 1–10,000); `search_file_bytes` defaults to 1,048,576 bytes per file (range 1–1,048,576). These are startup snapshots, not model-call arguments. Strict, development, and container file tools apply the same reductions without changing scope, protected paths, or approval policy. Listing beyond its entry budget reports truncation; enumeration precedes sorting, so no sorted-prefix guarantee is made. Search beyond its file budget reports truncation and omits an incomplete trailing UTF-8 character while retaining the valid prefix. Worker protocol version 2 carries mandatory validated budgets; stale workload images must be rebuilt and fail explicitly instead of ignoring reductions. See [container compatibility](../../containers/README.md#worker-protocol-compatibility).
 

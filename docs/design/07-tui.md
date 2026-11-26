@@ -89,6 +89,23 @@ Entry titles use role-specific colors: user green, assistant cyan, tools yellow,
 and system dark gray. Body text keeps its normal/Markdown styling; selection
 highlighting is preserved on colored titles, including wrapped and scrolled rows.
 
+## Background Delegation
+
+Live local TUI sessions register `delegate_start` and `delegate_await` when a
+model is selected and the session has a project root. The child can only
+read, list, and search that project. The parent model is the default; an
+alternate configured model must appear in the shared
+`server.exploration_models` allowlist. `thinking` is `inherit`, `off`, or
+`low` for one invocation.
+
+The TUI has no session inbox, so delegation is explicit-collection only:
+`delegate_start` returns a job ID and `delegate_await` consumes the result.
+No automatic Steer or Queue follow-up runs. A child result is displayed as a
+normal tool outcome with its own usage, and `propose` results are validated
+against a fresh project read before being returned. The child never writes;
+the parent applies any change through its ordinary tools. The scripted demo
+and container modes do not register delegation.
+
 ## Headless Entry Point
 
 Use the same runtime, providers, tools, storage policy, and default permissions without initializing the terminal. Accept a task and expose results or machine-readable events; concrete CLI flags and wire representations remain to be specified before release.

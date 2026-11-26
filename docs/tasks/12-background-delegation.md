@@ -2,7 +2,8 @@
 
 Status: eligible Web/desktop sessions expose read-only Explore and Propose via
 `delegate_start` and `delegate_await`, plus automatic Steer/Queue delivery on
-Chat Completions. Propose returns data only; the parent applies any edit
+Chat Completions. The live local TUI exposes the same tools with explicit
+`delegate_await` only. Propose returns data only; the parent applies any edit
 through its ordinary tools. This is product behavior;
 [03 - Subagents](03-subagents.md) describes how to divide development work on
 this repository.
@@ -23,6 +24,12 @@ array. A provider-only session needs an explicit allowed model because its
 parent has no configured model ID. `delegate_await` uses the ordinary tool
 deadline; a timed-out wait does not consume a pending result.
 
+Live local TUI sessions register the same tools when a model is selected and
+the session has a project root. The TUI has no inbox, so only explicit
+`delegate_await` collection is offered; there is no automatic Steer/Queue
+follow-up. Demo and container TUI sessions register nothing. Alternate TUI
+child models use the same `server.exploration_models` allowlist.
+
 On Chat Completions the default Explore delivery is `steer`: the result is
 offered at the parent's next safe model boundary. `queue` waits for the
 parent to complete successfully, then enters the session inbox as a typed
@@ -35,8 +42,11 @@ Other protocols remain await-only or explicit `steer` disabled until typed
 replay is supported.
 
 Still open: aggregate presentation of child status beyond inbox counts,
-live-provider validation, concurrency and resource measurements, and
-recovery after restart (unconsumed results are not durable).
+concurrency and resource measurements, and recovery after restart
+(unconsumed results are not durable). `nexus-headless` remains a
+fake/test-only runner and does not register delegation. Live validation now
+includes Chat Completions parent/child inference through the Web API and the
+interactive TUI; it is not an automated release gate.
 
 ## Goal and first release
 
@@ -249,7 +259,7 @@ Never present unavailable usage as zero. No billing integration.
 | Slice | Work and exit condition |
 | --- | --- |
 | A. Offline jobs and wait | Implemented. A runtime-owned registry and completion/wait path; overlapping scripted jobs; synchronous tool ports unchanged. |
-| B. Default read-only composition | Implemented for eligible local Web/desktop sessions, including multi-job ownership, cancellation, shutdown and idle cleanup. |
+| B. Default read-only composition | Implemented for eligible local Web/desktop and live TUI sessions, including multi-job ownership, cancellation, shutdown and idle cleanup. TUI and headless sessions without an inbox use explicit await only. |
 | C. Inbox handoff and proposals | Implemented for Chat Completions: explicit await cannot double-deliver; late results queue and wake an idle session; Propose is bounded data with host re-read validation and no write path. |
 | D. Verify readiness | Partially verified offline: package checks, scripted end-to-end delivery, cancellation, expiry and proposal tests. Live-provider, concurrency stress and lightweight resource gates are still outstanding. |
 
