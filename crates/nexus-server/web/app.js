@@ -3431,6 +3431,89 @@ function matchDisplayMath(lines, start) {
   return null;
 }
 
+const CODE_KEYWORDS = new Set((
+  'abstract and as assert async await begin break case catch chan class const continue crate def default defer delete do done elif else elseif end enum esac except export extends extern false fi finally fn for foreach from func function global go if impl implements import in include instanceof interface is let local loop map match mod module mut namespace new nil none not null of on or package pass private protected pub public raise range ref require return select self set static struct super switch then this throw throws trait true try type typeof unless unsafe until use using var void when where while with yield'
+).split(' '));
+const CODE_HIGHLIGHT_CHARS = 20_000;
+const CODE_HIGHLIGHT_TOKENS = 4_000;
+const CODE_LINE_HASH = /^(?:py|py3|python3?|rb|ruby|sh|bash|zsh|shell|fish|yaml|yml|toml|perl|r|makefile|dockerfile|ini|conf|coffee|elixir|exs?)$/;
+const CODE_LINE_DASH = /^(?:sql|lua|hs|haskell|elm|ada)$/;
+const CODE_MARKUP = /^(?:html?|xml|svg|vue|svelte|jsx|tsx)$/;
+const CODE_PLAIN = /^(?:text|txt|plain|plaintext|none|markdown|md|diff|patch|log)$/;
+const CODE_CSS = /^(?:css|scss|less|sass|styl)$/;
+
+function codeLineComment(language) {
+  if (CODE_LINE_HASH.test(language)) return '#';
+  if (CODE_LINE_DASH.test(language)) return '--';
+  if (CODE_MARKUP.test(language) && !/^(?:jsx|tsx)$/.test(language)) return '';
+  return '//';
+}
+
+function codeTokens(source, language) {
+  const lang = String(language || '').toLowerCase().replace(/^language-/, '');
+  if (!lang || CODE_PLAIN.test(lang) || source.length > CODE_HIGHLIGHT_CHARS) return null;
+  const line = codeLineComment(lang);
+  const markup = CODE_MARKUP.test(lang);
+  const css = CODE_CSS.test(lang);
+  const parts = [
+    '/\\*[\\s\\S]*?\\*/',
+    '<!--[\\s\\S]*?-->',
+    line ? `${line}[^\\n]*` : '',
+    '"""[\\s\\S]*?"""',
+    "'''[\\s\\S]*?'''",
+    '"(?:\\\\[\\s\\S]|[^"\\\\\\n])*"',
+    "'(?:\\\\[\\s\\S]|[^'\\\\\\n])*'",
+    '`(?:\\\\[\\s\\S]|[^`\\\\])*`',
+    '@[A-Za-z_$][\\w$]*',
+    '\\$[A-Za-z_][\\w]*',
+    css ? '#[0-9a-fA-F]{3,8}\\b' : '',
+    '\\b(?:0[xX][\\da-fA-F]+|\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)\\b',
+    markup ? '</?[A-Za-z][\\w:-]*' : '',
+    '[A-Za-z_$][\\w$]*',
+  ].filter(Boolean);
+  const pattern = new RegExp(parts.join('|'), 'g');
+  const tokens = [];
+  let last = 0;
+  let match;
+  while ((match = pattern.exec(source))) {
+    if (tokens.length >= CODE_HIGHLIGHT_TOKENS) return null;
+    if (match.index > last) tokens.push(['', source.slice(last, match.index)]);
+    const text = match[0];
+    let kind = '';
+    if (text.startsWith('/*') || text.startsWith('<!--') || (line && text.startsWith(line))) {
+      kind = 'cmt';
+    } else if (/^["'`]/.test(text)) {
+      kind = 'str';
+    } else if (text.startsWith('@') || text.startsWith('$')) {
+      kind = 'fn';
+    } else if ((css && text.startsWith('#')) || /^(?:0[xX]|\d)/.test(text)) {
+      kind = 'num';
+    } else if (text.startsWith('<')) {
+      kind = 'tag';
+    } else if (CODE_KEYWORDS.has(text.toLowerCase())) {
+      kind = 'kw';
+    } else if (/^\s*\(/.test(source.slice(pattern.lastIndex, pattern.lastIndex + 8))) {
+      kind = 'fn';
+    }
+    tokens.push([kind, text]);
+    last = pattern.lastIndex;
+  }
+  if (last < source.length) tokens.push(['', source.slice(last)]);
+  return tokens;
+}
+
+function appendHighlightedCode(code, source, language) {
+  const tokens = codeTokens(source, language);
+  if (!tokens) {
+    code.textContent = source;
+    return;
+  }
+  for (const [kind, text] of tokens) {
+    if (kind) code.append(node('span', `md-${kind}`, text));
+    else code.append(document.createTextNode(text));
+  }
+}
+
 function appendMarkdownBlocks(parent, lines) {
   let index = 0;
   while (index < lines.length) {
@@ -3457,7 +3540,8 @@ function appendMarkdownBlocks(parent, lines) {
       const language = fence.info.split(/\s+/)[0];
       if (language) codeBlock.append(node('div', 'md-code-lang', language));
       const pre = node('pre');
-      const code = node('code', '', lines.slice(index + 1, end).join('\n'));
+      const code = node('code');
+      appendHighlightedCode(code, lines.slice(index + 1, end).join('\n'), language);
       pre.append(code);
       codeBlock.append(pre);
       parent.append(codeBlock);

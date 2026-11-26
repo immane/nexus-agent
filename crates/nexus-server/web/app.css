@@ -1175,6 +1175,29 @@ kbd,
   text-transform: uppercase;
 }
 
+.md-cmt {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.md-str {
+  color: var(--warning);
+}
+
+.md-num {
+  color: var(--danger);
+}
+
+.md-kw {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.md-fn,
+.md-tag {
+  color: var(--accent);
+}
+
 .md-code-block pre {
   max-height: 420px;
   margin: 0;

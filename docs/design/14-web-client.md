@@ -73,7 +73,10 @@ The shell uses:
 The built-in Markdown renderer supports headings, paragraphs, emphasis, strong
 text, strikethrough, inline code, fenced code with a language label, ordered and
 unordered lists, task markers, blockquotes, horizontal rules, links, autolinks,
-and pipe tables. Link targets are limited to `http`, `https`, and `mailto`;
+and pipe tables. Labeled code blocks use a small built-in highlighter for
+comments, strings, numbers, keywords, function calls, and markup tags; `text`
+or unlabeled blocks stay plain. This is a compact heuristic, not a full parser,
+and it adds no third-party library. Link targets are limited to `http`, `https`, and `mailto`;
 unsafe or malformed targets remain plain text. Raw HTML is displayed as text.
 Inline Markdown images (`![alt](url)`) can display same-origin images; external
 HTTPS images require an explicit click and send no referrer. Completed replies
