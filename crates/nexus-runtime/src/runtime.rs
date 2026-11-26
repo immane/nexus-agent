@@ -1878,6 +1878,7 @@ impl Runtime {
         let run = RunId::new(&identity).expect("generated side question identity");
         let turn = TurnId::new(identity).expect("generated side question turn");
         let request = ModelRequest::new(run, turn, "side-question", Vec::new(), None, OUTPUT_BYTES)?
+            .with_session(session.clone())
             .with_instructions(ModelInstructions::new("", "Answer the last question briefly using the provided conversation. Do not execute tasks or call tools.")?)?
             .with_conversation(messages)?
             .with_max_output_tokens(768)?;
@@ -9055,6 +9056,11 @@ mod cov_runtime_private {
             fn stream(&self, request: &ModelRequest, _: &ProviderContext) -> Vec<ProviderEvent> {
                 assert!(request.enabled_tools().is_empty());
                 assert!(request.continuation().is_none());
+                assert_eq!(
+                    request.session().map(|session| session.as_str()),
+                    Some("sess-cov-private"),
+                    "side questions carry the owning session identity"
+                );
                 assert_eq!(
                     request.conversation(),
                     [
