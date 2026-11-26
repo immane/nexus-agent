@@ -105,7 +105,34 @@ const dom = {
   cancel: document.querySelector('#cancel-run'),
   jumpLatest: document.querySelector('#jump-latest'),
   runStatus: document.querySelector('#run-status'),
-  usage: document.querySelector('#usage-status'),
+  toolsMode: document.querySelector('#tools-mode'),
+  helperStatus: document.querySelector('#helper-status'),
+  contextMeter: document.querySelector('#context-meter'),
+  contextRing: document.querySelector('#context-ring'),
+  contextPercent: document.querySelector('#context-percent'),
+  contextPanel: document.querySelector('#context-panel'),
+  contextPanelPercent: document.querySelector('#context-panel-percent'),
+  contextPanelTotal: document.querySelector('#context-panel-total'),
+  contextBarFill: document.querySelector('#context-bar-fill'),
+  contextBarTrigger: document.querySelector('#context-bar-trigger'),
+  contextRows: document.querySelector('#context-rows'),
+  modelTrigger: document.querySelector('#model-trigger'),
+  modelTriggerName: document.querySelector('#model-trigger-name'),
+  modelTriggerEffort: document.querySelector('#model-trigger-effort'),
+  modelMenu: document.querySelector('#model-menu'),
+  menuMain: document.querySelector('#menu-main'),
+  menuModels: document.querySelector('#menu-models'),
+  menuEfforts: document.querySelector('#menu-efforts'),
+  menuModel: document.querySelector('#menu-model'),
+  menuModelValue: document.querySelector('#menu-model-value'),
+  menuModelOptions: document.querySelector('#menu-model-options'),
+  menuEffort: document.querySelector('#menu-effort'),
+  menuEffortValue: document.querySelector('#menu-effort-value'),
+  menuEffortOptions: document.querySelector('#menu-effort-options'),
+  menuEffortHelp: document.querySelector('#menu-effort-help'),
+  teamworkSwitch: document.querySelector('#teamwork-switch'),
+  teamworkInfo: document.querySelector('#teamwork-info'),
+  teamworkHelp: document.querySelector('#teamwork-help'),
   main: document.querySelector('#main'),
   sessionLoading: document.querySelector('#session-loading'),
   welcome: document.querySelector('#welcome'),
@@ -165,6 +192,14 @@ const state = {
   notices: new Map(),
   lastOutcome: null,
   lastUsage: null,
+  // Latest task-request estimate for the current session (not provider usage).
+  context: null,
+  // Background helper jobs started by the current run, keyed by job ID.
+  delegateJobs: new Map(),
+  // Browser preference for new bindings; the session keeps what it was bound with.
+  teamwork: true,
+  sessionDelegation: null,
+  sessionDelegationActive: null,
   pinned: true,
   connectGeneration: 0,
 };
@@ -307,6 +342,7 @@ function describeModelLabel() {
 function updateModelDisplay() {
   dom.modelLabel.textContent = describeModelLabel();
   updateWelcome();
+  updateModelTrigger();
 }
 
 // The empty state summarizes what the next task will use instead of
@@ -1679,20 +1715,50 @@ function renderHistoricalAssistant(text) {
   appendNode(article);
 }
 
+// A helper result delivered at a model boundary or as a follow-up. The text is
+// untrusted model output, rendered only through the DOM-building Markdown path.
 function renderChildCompletion(item) {
-  const result = node('details', 'message');
-  result.append(node('summary', '', `Explore ${item.job_id} · ${item.status}`));
-  if (Number.isFinite(item.input_tokens) || Number.isFinite(item.output_tokens)) {
-    const input = Number.isFinite(item.input_tokens) ? item.input_tokens : '—';
-    const output = Number.isFinite(item.output_tokens) ? item.output_tokens : '—';
-    result.append(node('div', 'meta', `Usage: ${input} / ${output} (in / out)`));
+  const status = typeof item.status === 'string' ? item.status : 'unknown';
+  const job = typeof item.job_id === 'string' ? item.job_id : '';
+  const known = job ? state.delegateJobs.get(job) : null;
+  // An adopted follow-up and its own event can both report the same job.
+  if (known?.shown) return;
+  if (job) {
+    state.delegateJobs.set(job, { ...known, state: status, shown: true });
+    if (known?.statusElement) {
+      known.statusElement.textContent = `Result ${delegateStatusLabel(status).toLowerCase()}`;
+    }
   }
-  result.append(node('pre', '', item.text));
+  const result = node('details', 'helper-card');
+  result.dataset.status = status;
+  const summary = node('summary');
+  summary.append(node('span', 'helper-card-icon'));
+  summary.append(node('span', 'helper-card-title', known?.task
+    ? `${delegateRoleLabel(known.role)} · ${known.task}`
+    : `Helper result${job ? ` · ${shortJob(job)}` : ''}`));
+  summary.append(node('span', 'helper-card-status', delegateStatusLabel(status)));
+  result.append(summary);
+  const body = node('div', 'helper-card-body');
+  if (typeof item.text === 'string' && item.text) {
+    const prose = node('div', 'prose');
+    renderMarkdown(prose, item.text);
+    body.append(prose);
+  } else {
+    body.append(node('p', 'tool-note', 'The result was delivered to the agent. Its text is available in saved history.'));
+  }
+  const facts = [];
+  const usage = delegateUsageText(item.input_tokens, item.output_tokens);
+  if (usage) facts.push(usage);
+  if (item.truncated === true) facts.push('Result truncated');
+  if (facts.length) body.append(node('div', 'tool-meta', facts.join(' · ')));
+  result.append(body);
   appendNode(result);
+  renderHelperStatus();
 }
 
 function renderHistory(items) {
   flushText();
+  for (const job of state.delegateJobs.values()) job.shown = false;
   projectImageObserver?.disconnect();
   dom.conversation.replaceChildren();
   dom.conversation.hidden = true;
@@ -1769,6 +1835,7 @@ async function openSavedSession(id) {
     body.model = choice.model;
   }
   if (state.projects?.enabled && project) body.project = project.id;
+  if (state.teamwork === false) body.delegation = false;
   state.historyLoading = true;
   dom.main.scrollTop = 0;
   setRunStatus('Restoring session…', 'busy');
@@ -1781,6 +1848,9 @@ async function openSavedSession(id) {
     state.sessionProvider = body.provider || null;
     state.sessionModel = body.model || null;
     state.sessionProjectId = project?.id || null;
+    state.sessionDelegation = state.teamwork !== false;
+    state.sessionDelegationActive = typeof reply?.delegation === 'boolean' ? reply.delegation : null;
+    state.context = null;
     state.selection = choice || state.selection;
     populateModels();
     if (project) state.projectSelection = project;
@@ -1828,15 +1898,19 @@ function updateControls() {
   dom.message.disabled = !connected || blocked || state.historyLoading;
   dom.send.disabled = !connected || state.submitting || state.connecting || state.historyLoading
     || blocked || (!state.session && !state.selection) || !dom.message.value.trim();
-  dom.send.textContent = state.active || state.inbox?.items?.length ? 'Queue ↑' : 'Send ↑';
+  const sendLabel = state.active || state.inbox?.items?.length ? 'Queue' : 'Send';
+  dom.send.setAttribute('aria-label', sendLabel);
+  dom.send.title = state.active ? 'Queue for after the current run' : sendLabel;
   if (dom.steerRun) {
     dom.steerRun.hidden = !state.active;
     dom.steerRun.disabled = dom.send.disabled || !state.run || state.cancelRequested;
   }
   const projectEnabled = Boolean(state.projects?.enabled);
   dom.model.disabled = !connected || state.connecting || state.historyLoading || state.submitting || blocked;
-  dom.model.hidden = false;
+  // The native select is the data source; the composer shows the model menu trigger.
+  dom.model.hidden = true;
   dom.model.title = 'Model for the next task; active runs keep their current model';
+  dom.modelTrigger.disabled = !connected || state.connecting || state.historyLoading;
   dom.modelLabel.hidden = true;
   dom.project.disabled = !connected || busy || Boolean(state.session) || !projectEnabled;
   dom.project.hidden = Boolean(state.session) || !projectEnabled;
@@ -1844,7 +1918,7 @@ function updateControls() {
   dom.composerProject.hidden = !projectEnabled;
   dom.cancel.hidden = !state.active;
   dom.cancel.disabled = !connected || !state.active || state.cancelling || state.cancelRequested || !state.run;
-  dom.cancel.textContent = state.cancelling || state.cancelRequested ? 'Cancelling…' : 'Cancel';
+  dom.cancel.title = state.cancelling || state.cancelRequested ? 'Cancelling…' : 'Cancel run';
   dom.connect.disabled = state.connecting;
   dom.disconnect.disabled = !connected || busy || state.projectPicking || state.projectSaving;
   dom.taskThinking.disabled = !connected || state.thinkingSaving || Boolean(state.configSaving);
@@ -1854,8 +1928,8 @@ function updateControls() {
     : blocked
       ? 'Resolve the previous submission first…'
       : state.active
-        ? 'A run is active. Send to queue the next task…'
-        : 'Describe a task…';
+        ? 'A run is active. Send to queue the next task, or Steer to redirect it…'
+        : 'Message or describe a task · /btw asks a side question';
   const savedBusy = state.active || state.submitting || state.connecting || state.historyLoading;
   for (const button of dom.sidebarTree.querySelectorAll('.tree-session-open')) {
     button.disabled = savedBusy;
@@ -1901,8 +1975,9 @@ function resetRunState() {
   state.approvals.clear();
   state.noticeKeys.clear();
   state.notices.clear();
-  dom.usage.hidden = true;
-  dom.usage.textContent = '';
+  for (const [id, job] of state.delegateJobs) {
+    if (job.state !== 'running') state.delegateJobs.delete(id);
+  }
 }
 
 function stopStream() {
@@ -1937,6 +2012,10 @@ function startNewSession({ force = false } = {}) {
   state.sessionProvider = null;
   state.sessionModel = null;
   state.sessionProjectId = null;
+  state.sessionDelegation = null;
+  state.sessionDelegationActive = null;
+  state.context = null;
+  state.delegateJobs.clear();
   state.sessionTitle = '';
   rememberCurrentSession('');
   if (state.connected) {
@@ -1972,17 +2051,22 @@ async function ensureSession() {
   if (state.session) {
     const provider = state.selection.demo ? null : state.selection.provider;
     const model = state.selection.demo ? null : state.selection.model;
-    if (provider === state.sessionProvider && model === state.sessionModel) return;
+    const delegation = state.teamwork !== false;
+    if (provider === state.sessionProvider && model === state.sessionModel
+        && delegation === (state.sessionDelegation ?? true)) return;
     if (!state.savedPersistence) {
-      throw new ApiError(409, 'Switching models in an existing session requires --session-store. Start a new session to use this model.');
+      throw new ApiError(409, 'Switching models or teamwork in an existing session requires --session-store. Start a new session to apply it.');
     }
     const body = {};
     if (provider) Object.assign(body, { provider, model });
     if (state.sessionProjectId) body.project = state.sessionProjectId;
-    await api(`/sessions/${encodeURIComponent(state.session)}/restore`, { method: 'POST', body });
+    if (!delegation) body.delegation = false;
+    const restored = await api(`/sessions/${encodeURIComponent(state.session)}/restore`, { method: 'POST', body });
     state.sessionProvider = provider;
     state.sessionModel = model;
-    rememberSession(state.session, { provider, model });
+    state.sessionDelegation = delegation;
+    state.sessionDelegationActive = typeof restored?.delegation === 'boolean' ? restored.delegation : null;
+    rememberSession(state.session, { provider, model, delegation });
     return;
   }
   const body = {};
@@ -1993,6 +2077,7 @@ async function ensureSession() {
   if (state.projects?.enabled && state.projectSelection) {
     body.project = state.projectSelection.id;
   }
+  if (state.teamwork === false) body.delegation = false;
   const reply = await api('/sessions', { method: 'POST', body });
   if (!reply || typeof reply.session !== 'string' || !reply.session) {
     throw new ApiError(200, 'Server did not return a session identity.');
@@ -2003,6 +2088,8 @@ async function ensureSession() {
   state.sessionProjectId = state.projects?.enabled && state.projectSelection
     ? state.projectSelection.id
     : null;
+  state.sessionDelegation = state.teamwork !== false;
+  state.sessionDelegationActive = typeof reply.delegation === 'boolean' ? reply.delegation : null;
   ensureProjectExpanded(state.sessionProjectId || '');
   rememberSession(state.session, {
     title: state.sessionTitle || 'New conversation',
@@ -2020,17 +2107,18 @@ async function ensureSession() {
 
 function renderPromptInbox(inbox) {
   state.inbox = inbox;
+  renderHelperStatus();
   const items = inbox?.items || [];
   const expired = inbox?.expired_child_results || 0;
   dom.promptInbox.replaceChildren();
   dom.promptInbox.hidden = !items.length && !expired;
-  if (expired) dom.promptInbox.append(node('div', '', `${expired} Explore result${expired === 1 ? '' : 's'} expired.`));
+  if (expired) dom.promptInbox.append(node('div', '', `${expired} helper result${expired === 1 ? '' : 's'} expired before delivery.`));
   if (!items.length) return;
   dom.promptInbox.append(node('div', '', inbox.paused || 'Pending prompts'));
   const session = state.session;
   for (const [index, item] of items.entries()) {
     const row = node('div', 'prompt-inbox-row');
-    const label = item.kind === 'child-completion' ? `Explore ${item.job_id} · ${item.status}`
+    const label = item.kind === 'child-completion' ? `Helper result · ${delegateStatusLabel(item.status)}`
       : item.delivery === 'steer' ? `Steer: ${item.input}` : item.input;
     row.append(node('span', '', label));
     const actions = node('span');
@@ -2408,6 +2496,7 @@ function handleEvent(event) {
       break;
     case 'model-request-started':
       setRunStatus(detail.purpose === 'summary' ? 'Preparing context…' : 'Waiting for model…', 'busy');
+      if (detail.purpose !== 'summary') updateContextEstimate(detail);
       break;
     case 'model-request-finished':
       setRunStatus('Model response received', 'busy');
@@ -3922,6 +4011,9 @@ function toolPresentation(tool, preview) {
     targetKnown: false,
     kind, sections: [],
   };
+  if (tool === 'delegate_start' || tool === 'delegate_await') {
+    return delegatePresentation(tool, args && typeof args === 'object' && !Array.isArray(args) ? args : {});
+  }
   if (!args || typeof args !== 'object' || Array.isArray(args)) return result;
   if (tool === 'host_exec' && Array.isArray(args.argv)
     && args.argv.length && args.argv.every((arg) => typeof arg === 'string')) {
@@ -3945,6 +4037,111 @@ function toolPresentation(tool, preview) {
     }
   }
   return result;
+}
+
+const DELEGATE_ROLES = { explore: 'Explore', propose: 'Propose' };
+
+function delegateRoleLabel(role) {
+  return DELEGATE_ROLES[role] || 'Helper';
+}
+
+function shortJob(id) {
+  const text = String(id || '');
+  return text.length > 14 ? `${text.slice(0, 12)}…` : text;
+}
+
+// Helper tools are shown as the task they delegate, not as raw JSON calls.
+function delegatePresentation(tool, args) {
+  if (tool === 'delegate_start') {
+    const task = typeof args.task === 'string' ? args.task : '';
+    const role = typeof args.role === 'string' ? args.role : '';
+    const facts = [];
+    if (typeof args.model === 'string') facts.push(`Model: ${args.model}`);
+    if (typeof args.thinking === 'string') facts.push(`Thinking: ${args.thinking}`);
+    facts.push(`Delivery: ${typeof args.delivery === 'string' ? args.delivery : 'default'}`);
+    return {
+      label: 'HELPER', kind: 'delegate', targetKnown: Boolean(task),
+      target: task ? `${delegateRoleLabel(role)} · ${task}` : `${delegateRoleLabel(role)} task`,
+      sections: task ? [{ label: 'Task', text: task }] : [],
+      facts,
+      delegate: { start: true, role, task },
+    };
+  }
+  const job = typeof args.job_id === 'string' ? args.job_id : '';
+  const known = job ? state.delegateJobs.get(job) : null;
+  return {
+    label: 'COLLECT', kind: 'delegate', targetKnown: Boolean(job),
+    target: known?.task ? `${delegateRoleLabel(known.role)} · ${known.task}` : job ? `Result of ${shortJob(job)}` : 'Helper result',
+    sections: [], facts: [],
+    delegate: { start: false, job },
+  };
+}
+
+function delegateStatusLabel(status) {
+  switch (status) {
+    case 'accepted': return 'Started';
+    case 'completed': return 'Completed';
+    case 'collected': return 'Already collected';
+    case 'timed-out': return 'Timed out';
+    case 'limit-reached': return 'Limit reached';
+    case 'cancelled': return 'Cancelled';
+    case 'failed': return 'Failed';
+    default: return status ? String(status) : 'Unknown';
+  }
+}
+
+function delegateUsageText(input, output) {
+  if (!Number.isFinite(input) && !Number.isFinite(output)) return '';
+  const part = (value) => Number.isFinite(value) ? formatCompactTokens(value) : '—';
+  return `Helper usage ${part(input)} in · ${part(output)} out`;
+}
+
+// Replaces the raw JSON output of a helper tool with its task state, result
+// text, or verified proposal. Unparseable output keeps the raw view.
+function finishDelegateTool(record, content, toolSucceeded) {
+  let value;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== 'object') return null;
+  const status = typeof value.status === 'string' ? value.status : '';
+  const job = typeof value.job_id === 'string' ? value.job_id : record.delegate.job;
+  if (record.delegate.start) {
+    if (toolSucceeded && status === 'accepted' && job) {
+      state.delegateJobs.set(job, {
+        role: record.delegate.role, task: record.delegate.task, state: 'running', run: state.run,
+        statusElement: record.status,
+      });
+    }
+  } else if (job) {
+    const known = state.delegateJobs.get(job);
+    if (known) known.state = status || 'unknown';
+    if (typeof value.text === 'string' && value.text) {
+      appendToolSection(record.resultSlot, { label: 'Result', text: value.text });
+    }
+    const proposal = value.proposal && typeof value.proposal === 'object' ? value.proposal : null;
+    if (proposal && typeof proposal.old_text === 'string' && typeof proposal.new_text === 'string') {
+      const diff = toolPatchDiff(proposal.old_text, proposal.new_text);
+      diff.label = `Proposed edit · ${typeof proposal.path === 'string' ? proposal.path : 'file'}`;
+      appendToolSection(record.resultSlot, diff);
+      record.resultSlot.append(node('p', 'tool-note', 'A proposal is data only; the agent applies it with its normal edit tool if it chooses to.'));
+    }
+    if (value.truncated === true) record.resultSlot.append(node('span', 'inline-warning', 'The helper result was truncated.'));
+  }
+  record.outputSection.hidden = true;
+  renderHelperStatus();
+  return {
+    label: delegateStatusLabel(status),
+    tone: !toolSucceeded || ['failed', 'cancelled', 'timed-out', 'limit-reached'].includes(status)
+      ? status === 'failed' || !toolSucceeded ? 'error' : 'busy'
+      : 'ok',
+    usage: delegateUsageText(value.input_tokens, value.output_tokens),
+    helperUsage: Number.isFinite(value.input_tokens) || Number.isFinite(value.output_tokens)
+      ? { input: value.input_tokens, output: value.output_tokens }
+      : null,
+  };
 }
 
 function toolPatchDiff(oldText, newText) {
@@ -4037,6 +4234,10 @@ function startTool(detail) {
   const body = node('div', 'tool-body');
   for (const section of presentation.sections) appendToolSection(body, section);
   if (presentation.directory) body.append(node('div', 'tool-meta', `Write directory: ${presentation.directory}`));
+  if (presentation.facts?.length) body.append(node('div', 'tool-meta', presentation.facts.join(' · ')));
+  // Parsed helper results go above the raw argument and output views.
+  const resultSlot = node('div', 'tool-result-slot');
+  body.append(resultSlot);
   if (!presentation.targetKnown && presentation.kind !== 'generic') {
     body.append(node(
       'p',
@@ -4069,6 +4270,8 @@ function startTool(detail) {
     target,
     targetKnown: presentation.targetKnown,
     kind: presentation.kind,
+    delegate: presentation.delegate || null,
+    resultSlot,
     outputSection,
     outputText,
     meta,
@@ -4120,12 +4323,14 @@ function finishTool(detail) {
     record.chars = record.outputText.data.length;
     if (content.length > MAX_TOOL_CHARS) record.truncated = true;
   }
-  const tone = status === 'Succeeded' ? 'ok'
+  let tone = status === 'Succeeded' ? 'ok'
     : status === 'Cancelled' || status === 'Interrupted' || status === 'TimedOut' ? 'busy'
       : 'error';
-  const label = status === 'Succeeded' ? 'Completed'
+  let label = status === 'Succeeded' ? 'Completed'
     : status === 'TimedOut' ? 'Timed out'
       : status;
+  const delegated = record.delegate && content ? finishDelegateTool(record, content, status === 'Succeeded') : null;
+  if (delegated) ({ label, tone } = delegated);
   setStatus(record.status, label, tone);
   record.root.dataset.state = tone;
   if (!record.targetKnown && record.target && (record.kind === 'write' || record.kind === 'patch')) {
@@ -4145,6 +4350,8 @@ function finishTool(detail) {
   if (typeof outcome.evidence === 'string') record.meta.append(node('span', '', `Evidence: ${outcome.evidence}`));
   if (outcome.truncated) record.meta.append(node('span', '', 'Server truncated output'));
   if (record.truncated) record.meta.append(node('span', '', 'View truncated output'));
+  if (delegated?.usage) record.meta.append(node('span', '', delegated.usage));
+  if (delegated?.helperUsage) record.helperUsage = delegated.helperUsage;
 }
 
 function markUnfinishedTools() {
@@ -4313,9 +4520,6 @@ function updateUsage(detail) {
     cacheWrite: Number.isFinite(detail.cache_write) ? detail.cache_write : null,
     finality: typeof detail.finality === 'string' ? detail.finality : '',
   };
-  const parts = usageParts();
-  dom.usage.textContent = parts.length ? `Usage: ${parts.join(' / ')}` : '';
-  dom.usage.hidden = !parts.length;
 }
 
 /* Terminal state */
@@ -4346,9 +4550,13 @@ function finishRun(detail, { fromSnapshot = false } = {}) {
   state.inFlightUnknown = false;
   state.retries = 0;
   state.lastOutcome = detail.outcome || null;
+  for (const job of state.delegateJobs.values()) {
+    if (job.state === 'running' && detail.outcome !== 'completed') job.state = 'cancelled';
+  }
   const outcome = selectedOutcome(detail.outcome);
   setRunStatus(outcome, outcomeTone(detail.outcome));
   appendRunSummary(detail, fromSnapshot);
+  renderHelperStatus();
   updateSessionDisplay();
   updateControls();
   scrollToBottomSoon();
@@ -4373,17 +4581,25 @@ function persistenceLabel(value) {
 
 function appendRunSummary(detail, fromSnapshot) {
   const card = node('div', 'run-card');
-  const outcome = node('span', 'run-outcome', selectedOutcome(detail.outcome));
-  outcome.dataset.outcome = detail.outcome || 'unknown';
-  card.append(outcome);
-  if (fromSnapshot) card.append(node('span', 'run-fact', 'Confirmed by snapshot'));
-  const parts = usageParts();
-  card.append(node('span', 'run-fact', parts.length ? parts.join(' / ') : 'Usage not reported'));
-  if (detail.persistence) {
-    const persistence = node('span', 'run-fact', persistenceLabel(detail.persistence));
-    persistence.dataset.persistence = detail.persistence;
-    card.append(persistence);
+  card.dataset.outcome = detail.outcome || 'unknown';
+  const actions = node('div', 'run-actions');
+  const text = [...state.assistantItems.values()].map((record) => record.text).filter(Boolean).join('\n\n');
+  if (text) actions.append(copyButton(text));
+  actions.append(usageChip(detail));
+  if (detail.outcome !== 'completed') {
+    const outcome = node('span', 'run-outcome', selectedOutcome(detail.outcome));
+    outcome.dataset.outcome = detail.outcome || 'unknown';
+    actions.append(outcome);
   }
+  if (detail.persistence === 'SaveFailed') {
+    const persistence = node('span', 'run-outcome', persistenceLabel(detail.persistence));
+    persistence.dataset.outcome = 'failed';
+    actions.append(persistence);
+  }
+  if (fromSnapshot) actions.append(node('span', 'run-fact', 'Confirmed by snapshot'));
+  const time = node('time', 'run-time', new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  actions.append(time);
+  card.append(actions);
   if (detail.error && typeof detail.error === 'object') {
     const errorBlock = node('div', 'run-detail');
     errorBlock.append(node('div', '', `${detail.error.category || 'Error'} · ${retryLabel(detail.error.retry)}`));
@@ -4575,6 +4791,370 @@ async function reconcileAfterLoss(error) {
   );
 }
 
+/* Composer status, menus, and reply usage */
+
+const TEAMWORK_KEY = 'nexus.teamwork';
+const EFFORT_LABELS = { inherit: 'Default', low: 'Low', none: 'Off' };
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+// Compact token counts for chips: 57285 -> "57.3K", 1000000 -> "1M".
+function formatCompactTokens(value) {
+  if (!Number.isFinite(value)) return '—';
+  if (value < 1000) return String(Math.round(value));
+  if (value < 1_000_000) return `${Math.round(value / 100) / 10}K`;
+  return `${Math.round(value / 100_000) / 10}M`;
+}
+
+function icon(paths, size = 15) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('width', String(size));
+  svg.setAttribute('height', String(size));
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '1.8');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const d of paths) {
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
+}
+
+const ICONS = {
+  copy: ['M9 9h10v10H9z', 'M5 15V5h10'],
+  check: ['M5 12.5 10 17l9-10'],
+  usage: ['M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3Z', 'M4 7v5c0 1.7 3.6 3 8 3s8-1.3 8-3V7', 'M4 12v5c0 1.7 3.6 3 8 3s8-1.3 8-3v-5'],
+  shield: ['M12 3 5 6v5c0 4.5 3 8.3 7 10 4-1.7 7-5.5 7-10V6Z'],
+};
+
+function readTeamworkPreference() {
+  try {
+    return localStorage.getItem(TEAMWORK_KEY) !== 'off';
+  } catch {
+    return true;
+  }
+}
+
+function selectedModelEntry() {
+  const id = state.session ? state.sessionModel : state.selection?.model;
+  return state.config?.models?.find((entry) => entry.id === id) || null;
+}
+
+function sessionProviderEntry() {
+  const id = state.session ? state.sessionProvider : state.selection?.provider;
+  return state.config?.providers?.find((entry) => entry.id === id) || null;
+}
+
+// Effective task effort for the selected model: model, provider, then global.
+function effectiveEffort() {
+  if (!state.selection || state.selection.demo) return 'inherit';
+  const model = state.config?.models?.find((entry) => entry.id === state.selection.model);
+  const provider = state.config?.providers?.find((entry) => entry.id === state.selection.provider);
+  return model?.task_reasoning_effort || provider?.task_reasoning_effort
+    || state.config?.task_reasoning_effort || 'inherit';
+}
+
+// Teamwork needs a configured model and a bound local project. The server
+// makes the final decision and reports it when the session is created.
+function teamworkEligibility() {
+  if (!state.connected) return 'Connect to use agent teamwork.';
+  if (!state.selection || state.selection.demo) return 'Needs a configured model; the demo script cannot start helpers.';
+  if (!state.projects?.enabled) return 'Needs local project tools (start the server with --tools real).';
+  const project = state.session ? state.sessionProjectId : state.projectSelection?.id;
+  if (!project) return 'Needs a project for this session.';
+  return '';
+}
+
+function teamworkHelpText() {
+  const base = 'Lets the agent start read-only helper tasks that explore this project in the background and report back. Helpers cannot write files or run commands.';
+  const blocked = teamworkEligibility();
+  if (blocked) return `${base} ${blocked}`;
+  if (state.session && state.sessionDelegation === true && state.sessionDelegationActive === false) {
+    return `${base} The server did not enable helpers for this session's model.`;
+  }
+  if (state.session && (state.sessionDelegation ?? true) !== state.teamwork) {
+    return state.savedPersistence
+      ? `${base} The change applies when you send the next message.`
+      : `${base} Start a new session to apply the change (switching needs --session-store).`;
+  }
+  return base;
+}
+
+function updateModelTrigger() {
+  const label = state.selection ? state.selection.label : 'No model';
+  dom.modelTriggerName.textContent = label;
+  const effort = EFFORT_LABELS[effectiveEffort()] || 'Default';
+  dom.modelTriggerEffort.textContent = state.selection && !state.selection.demo ? effort : '';
+  dom.modelTrigger.title = state.selection ? `${state.selection.label} — ${state.selection.detail}` : 'No model';
+  dom.menuModelValue.textContent = label;
+  dom.menuEffortValue.textContent = effort;
+  const blocked = teamworkEligibility();
+  dom.teamworkSwitch.setAttribute('aria-checked', String(!blocked && state.teamwork !== false));
+  dom.teamworkSwitch.disabled = Boolean(blocked);
+  dom.teamworkHelp.textContent = teamworkHelpText();
+  dom.menuEffort.disabled = !state.selection || state.selection.demo;
+  updateToolsModeChip();
+  renderContextMeter();
+  renderHelperStatus();
+}
+
+function updateToolsModeChip() {
+  const mode = state.connected ? state.projects?.mode : '';
+  const labels = {
+    development: ['Auto in project', 'Project and temporary file changes and sandboxed commands run automatically. External paths ask first.'],
+    strict: ['Ask first', 'Edits and commands wait for your approval. Reads stay inside the project.'],
+    fakes: ['Demo tools', 'Scripted test tools; nothing touches your files.'],
+    container: ['Container', 'Tools run in the configured container.'],
+  };
+  const entry = labels[mode];
+  dom.toolsMode.hidden = !entry;
+  if (!entry) return;
+  dom.toolsMode.replaceChildren(icon(ICONS.shield, 13), document.createTextNode(entry[0]));
+  dom.toolsMode.title = entry[1];
+}
+
+function renderHelperStatus() {
+  let running = 0;
+  const tasks = [];
+  if (state.active) {
+    for (const job of state.delegateJobs.values()) {
+      if (job.state !== 'running' || job.run !== state.run) continue;
+      running += 1;
+      if (job.task) tasks.push(`${delegateRoleLabel(job.role)} · ${job.task}`);
+    }
+  } else {
+    running = Number(state.inbox?.pending_child_results) || 0;
+  }
+  dom.helperStatus.hidden = running === 0;
+  dom.helperStatus.textContent = `${running} helper${running === 1 ? '' : 's'} running`;
+  dom.helperStatus.title = tasks.length ? tasks.join('\n') : 'Background helper results arrive when they finish.';
+}
+
+function updateContextEstimate(detail) {
+  const estimated = Number(detail.estimated_input_tokens);
+  const window = Number(detail.context_window_tokens);
+  if (!Number.isFinite(estimated) || !Number.isFinite(window) || window <= 0) return;
+  state.context = {
+    estimated,
+    window,
+    trigger: Number.isFinite(detail.context_trigger_percent) ? detail.context_trigger_percent : null,
+    target: Number.isFinite(detail.context_target_percent) ? detail.context_target_percent : null,
+    maxOutput: Number.isFinite(detail.max_output_tokens) ? detail.max_output_tokens : null,
+    strategy: typeof detail.compaction_strategy === 'string' ? detail.compaction_strategy : '',
+  };
+  renderContextMeter();
+}
+
+function renderContextMeter() {
+  const context = state.context;
+  dom.contextMeter.hidden = !context;
+  if (!context) {
+    if (dom.contextPanel.matches?.(':popover-open')) dom.contextPanel.hidePopover();
+    return;
+  }
+  const ratio = Math.min(1, context.estimated / context.window);
+  const percent = Math.round(ratio * 100);
+  const label = context.estimated > 0 && percent === 0 ? '<1%' : `${percent}%`;
+  dom.contextPercent.textContent = label;
+  dom.contextPanelPercent.textContent = label;
+  dom.contextRing.setAttribute('stroke-dasharray', `${Math.max(ratio * 100, 0.5)} 100`);
+  const warnAt = context.trigger ?? 80;
+  dom.contextMeter.dataset.level = percent >= warnAt ? 'high' : percent >= warnAt - 15 ? 'medium' : 'low';
+  dom.contextMeter.setAttribute('aria-label', `Context usage: ${label} of ${formatCompactTokens(context.window)} tokens`);
+  dom.contextPanelTotal.textContent = `~${formatCompactTokens(context.estimated)} / ${formatCompactTokens(context.window)}`;
+  dom.contextBarFill.style.width = `${ratio * 100}%`;
+  dom.contextBarTrigger.hidden = context.trigger === null;
+  if (context.trigger !== null) dom.contextBarTrigger.style.left = `${Math.min(100, context.trigger)}%`;
+  const rows = [['Input estimate', `~${formatCompactTokens(context.estimated)}`]];
+  if (context.maxOutput !== null) rows.push(['Output reserve', `~${formatCompactTokens(context.maxOutput)}`]);
+  if (context.trigger !== null) {
+    const method = context.strategy === 'truncate' ? 'truncate' : 'summarize';
+    rows.push(['Compacts at', `${context.trigger}%${context.target !== null ? ` → ${context.target}%` : ''} · ${method}`]);
+  }
+  fillRows(dom.contextRows, rows);
+}
+
+function fillRows(list, rows) {
+  list.replaceChildren();
+  for (const [name, value, tone] of rows) {
+    const row = node('div', 'popover-row');
+    if (tone) row.dataset.tone = tone;
+    row.append(node('dt', '', name), node('dd', '', value));
+    list.append(row);
+  }
+}
+
+function copyButton(text) {
+  const button = node('button', 'reply-action');
+  button.type = 'button';
+  button.title = 'Copy reply';
+  button.setAttribute('aria-label', 'Copy reply');
+  button.append(icon(ICONS.copy));
+  button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      button.replaceChildren(icon(ICONS.check));
+      button.title = 'Copied';
+      setTimeout(() => {
+        button.replaceChildren(icon(ICONS.copy));
+        button.title = 'Copy reply';
+      }, 1500);
+    } catch {
+      button.title = 'Copy failed: clipboard access was refused';
+    }
+  });
+  return button;
+}
+
+let popoverSequence = 0;
+
+// Provider counters differ by protocol: Chat Completions and Responses
+// include cached tokens in input; Anthropic Messages reports them separately.
+function usageBreakdown(usage, protocol) {
+  if (!usage) return null;
+  const known = (value) => Number.isFinite(value);
+  const inclusive = protocol !== 'anthropic_messages';
+  const cacheRead = known(usage.cacheRead) ? usage.cacheRead : null;
+  const cacheWrite = known(usage.cacheWrite) ? usage.cacheWrite : null;
+  const input = known(usage.input) ? usage.input : null;
+  const output = known(usage.output) ? usage.output : null;
+  if (input === null && output === null) return null;
+  const promptTotal = input === null ? null
+    : inclusive ? input : input + (cacheRead || 0) + (cacheWrite || 0);
+  const uncached = input === null ? null : inclusive ? Math.max(0, input - (cacheRead || 0)) : input;
+  return {
+    total: (promptTotal || 0) + (output || 0),
+    promptTotal, uncached, cacheRead, cacheWrite, output,
+    hitRate: promptTotal && cacheRead !== null ? cacheRead / promptTotal : null,
+  };
+}
+
+function usageChip(detail) {
+  const provider = sessionProviderEntry();
+  const breakdown = usageBreakdown(state.lastUsage, provider?.protocol);
+  const button = node('button', 'reply-action usage-chip');
+  button.type = 'button';
+  button.append(icon(ICONS.usage));
+  button.append(node('span', '', breakdown ? `Usage ${formatCompactTokens(breakdown.total)} tok` : 'Usage not reported'));
+  const panel = node('div', 'popover-panel usage-panel');
+  panel.id = `usage-panel-${++popoverSequence}`;
+  panel.setAttribute('popover', '');
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Run usage');
+  button.setAttribute('popovertarget', panel.id);
+  button.setAttribute('aria-label', 'Show run usage');
+  const head = node('div', 'popover-head');
+  const title = node('span', 'popover-title');
+  title.append(icon(ICONS.usage), document.createTextNode('Run usage'));
+  head.append(title, node('span', '', breakdown ? `${breakdown.total.toLocaleString()} tok` : 'Not reported'));
+  panel.append(head);
+  const rows = [];
+  const model = selectedModelEntry();
+  if (state.sessionProvider) rows.push(['Provider / model', `${state.sessionProvider}/${model?.name || state.sessionModel || 'default'}`]);
+  else rows.push(['Model', 'Demo script']);
+  const tokens = (value) => value === null ? 'Not reported' : `${value.toLocaleString()} tok`;
+  if (breakdown) {
+    if (breakdown.hitRate !== null) rows.push(['Cache hit', `${Math.round(breakdown.hitRate * 1000) / 10}%`]);
+    rows.push(['Uncached input', tokens(breakdown.uncached)]);
+    if (breakdown.cacheRead !== null) rows.push(['Cached input', tokens(breakdown.cacheRead)]);
+    if (breakdown.cacheWrite !== null) rows.push(['Cache write', tokens(breakdown.cacheWrite)]);
+    rows.push(['Output', tokens(breakdown.output)]);
+  }
+  let helperInput = 0;
+  let helperOutput = 0;
+  let helperKnown = false;
+  for (const record of state.tools.values()) {
+    if (!record.helperUsage) continue;
+    helperKnown = true;
+    helperInput += record.helperUsage.input || 0;
+    helperOutput += record.helperUsage.output || 0;
+  }
+  if (helperKnown) rows.push(['Helpers (separate)', `${formatCompactTokens(helperInput)} in · ${formatCompactTokens(helperOutput)} out`]);
+  if (detail.persistence) {
+    rows.push(['History', persistenceLabel(detail.persistence), detail.persistence === 'SaveFailed' ? 'error' : '']);
+  }
+  const list = node('dl', 'popover-rows');
+  fillRows(list, rows);
+  panel.append(list);
+  if (!breakdown) panel.append(node('p', 'popover-note', 'The provider did not report token counts for this run.'));
+  const wrap = node('span', 'usage-wrap');
+  wrap.append(button, panel);
+  panel.addEventListener('toggle', (event) => {
+    if (event.newState === 'open') positionPopover(panel, button, 'start');
+  });
+  return wrap;
+}
+
+// Popovers sit in the top layer; place them above their trigger and keep
+// them on screen. Positions use CSSOM, which the style CSP allows.
+function positionPopover(panel, anchor, align = 'end') {
+  const rect = anchor.getBoundingClientRect();
+  const width = panel.offsetWidth;
+  const height = panel.offsetHeight;
+  const margin = 8;
+  let left = align === 'start' ? rect.left : rect.right - width;
+  left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+  let top = rect.top - height - margin;
+  if (top < margin) top = Math.min(rect.bottom + margin, window.innerHeight - height - margin);
+  panel.style.left = `${left}px`;
+  panel.style.top = `${Math.max(margin, top)}px`;
+}
+
+function showMenuView(view) {
+  for (const element of [dom.menuMain, dom.menuModels, dom.menuEfforts]) element.hidden = element !== view;
+  if (view === dom.menuModels) renderModelOptions();
+  if (view === dom.menuEfforts) renderEffortOptions();
+  positionPopover(dom.modelMenu, dom.modelTrigger);
+  (view.querySelector('[aria-checked="true"]') || view.querySelector('button:not(:disabled)'))?.focus();
+}
+
+function menuOption(label, detail, checked, disabled, onSelect) {
+  const button = node('button', 'menu-option');
+  button.type = 'button';
+  button.setAttribute('role', 'menuitemradio');
+  button.setAttribute('aria-checked', String(checked));
+  button.disabled = disabled;
+  const text = node('span', 'menu-option-text');
+  text.append(node('span', '', label));
+  if (detail) text.append(node('span', 'menu-option-detail', detail));
+  button.append(text);
+  button.addEventListener('click', onSelect);
+  return button;
+}
+
+function renderModelOptions() {
+  dom.menuModelOptions.replaceChildren();
+  const selected = state.selection ? choiceKey(state.selection) : '';
+  state.choices.forEach((choice, index) => {
+    dom.menuModelOptions.append(menuOption(choice.label, choice.detail, choiceKey(choice) === selected, dom.model.disabled, () => {
+      dom.model.value = String(index);
+      dom.model.dispatchEvent(new Event('change'));
+      showMenuView(dom.menuMain);
+    }));
+  });
+}
+
+function renderEffortOptions() {
+  dom.menuEffortOptions.replaceChildren();
+  const current = state.config?.task_reasoning_effort || 'inherit';
+  const busy = !state.connected || state.thinkingSaving || Boolean(state.configSaving);
+  for (const [value, detail] of [['inherit', 'Use each adapter\'s normal behavior'], ['low', 'Request low-effort thinking'], ['none', 'Turn thinking off']]) {
+    dom.menuEffortOptions.append(menuOption(EFFORT_LABELS[value], detail, value === current, busy, () => {
+      // Reuse the Settings form so validation, status, and refresh stay in one place.
+      dom.taskThinking.value = value;
+      dom.thinkingForm.requestSubmit();
+      showMenuView(dom.menuMain);
+    }));
+  }
+  const effective = effectiveEffort();
+  const override = effective !== current ? ` This model resolves to ${EFFORT_LABELS[effective] || effective} through its own or its provider's override.` : '';
+  dom.menuEffortHelp.textContent = `Global default for new sessions. Only detected Ollama Direct / Chat Completions endpoints accept Low or Off; other adapters refuse an override.${override}`;
+}
+
 /* Sidebar visibility */
 
 const SIDEBAR_KEY = 'nexus.sidebar';
@@ -4645,6 +5225,43 @@ dom.openSettings.addEventListener('click', () => {
 });
 dom.closeSettings.addEventListener('click', () => dom.settings.close());
 dom.welcomeConnect.addEventListener('click', () => dom.openSettings.click());
+dom.modelMenu.addEventListener('toggle', (event) => {
+  dom.modelTrigger.setAttribute('aria-expanded', String(event.newState === 'open'));
+  if (event.newState === 'open') {
+    dom.teamworkHelp.hidden = true;
+    dom.teamworkInfo.setAttribute('aria-expanded', 'false');
+    showMenuView(dom.menuMain);
+  }
+});
+dom.contextPanel.addEventListener('toggle', (event) => {
+  dom.contextMeter.setAttribute('aria-expanded', String(event.newState === 'open'));
+  if (event.newState === 'open') positionPopover(dom.contextPanel, dom.contextMeter);
+});
+dom.menuModel.addEventListener('click', () => showMenuView(dom.menuModels));
+dom.menuEffort.addEventListener('click', () => showMenuView(dom.menuEfforts));
+for (const back of dom.modelMenu.querySelectorAll('[data-menu-back]')) {
+  back.addEventListener('click', () => showMenuView(dom.menuMain));
+}
+dom.teamworkInfo.addEventListener('click', () => {
+  const open = dom.teamworkHelp.hidden;
+  dom.teamworkHelp.hidden = !open;
+  dom.teamworkInfo.setAttribute('aria-expanded', String(open));
+  positionPopover(dom.modelMenu, dom.modelTrigger);
+});
+dom.teamworkSwitch.addEventListener('click', () => {
+  if (dom.teamworkSwitch.disabled) return;
+  state.teamwork = state.teamwork === false;
+  try {
+    localStorage.setItem(TEAMWORK_KEY, state.teamwork ? 'on' : 'off');
+  } catch {
+    // The choice still applies to this page.
+  }
+  updateModelTrigger();
+  dom.teamworkHelp.hidden = false;
+  dom.teamworkInfo.setAttribute('aria-expanded', 'true');
+  positionPopover(dom.modelMenu, dom.modelTrigger);
+});
+state.teamwork = readTeamworkPreference();
 dom.toggleSidebar.addEventListener('click', () => {
   const open = document.body.dataset.sidebar !== 'open';
   setSidebarOpen(open, { persist: true });

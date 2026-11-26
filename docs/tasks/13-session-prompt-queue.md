@@ -29,7 +29,8 @@ bound to a configured model; it opens a separate answer and usage display.
 `user-steered` identifies text accepted at a safe model boundary. Opaque
 provider continuation defers the input to the next run rather than being
 rewritten. A queued child result is listed with `kind: "child-completion"`,
-its job and originating parent, and no user `input`; the inbox also reports
+its job and originating parent, its bounded untrusted `text` and `truncated`
+flag, and no user `input`; the inbox also reports
 `pending_child_results` and cumulative `expired_child_results`.
 
 ## OpenCode reference and Nexus controls

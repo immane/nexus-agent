@@ -84,7 +84,7 @@ test('model selection remains available during a run and changes the next task o
   const f = fixture();
   f.state.active = true;
   f.run('updateControls()');
-  assert.equal(f.dom.model.hidden, false);
+  assert.equal(f.dom.modelTrigger.disabled, false);
   assert.equal(f.dom.model.disabled, false);
   assert.equal(f.state.sessionModel, 'slow');
   f.state.active = false;
@@ -107,4 +107,23 @@ test('failed model switches preserve the binding and missing persistence is expl
   f.state.savedPersistence = false;
   await assert.rejects(f.run('ensureSession()'), /requires --session-store/);
   assert.equal(f.requests.length, 1);
+});
+
+test('turning teamwork off is sent as a binding and rebinds an idle saved session', async () => {
+  const f = fixture();
+  f.state.sessionModel = 'fast';
+  f.state.sessionDelegation = true;
+  f.state.teamwork = false;
+  await f.run('ensureSession()');
+  assert.equal(f.requests[0].path, '/sessions/old/restore');
+  assert.equal(f.requests[0].body.delegation, false);
+  assert.equal(f.state.sessionDelegation, false);
+  await f.run('ensureSession()');
+  assert.equal(f.requests.length, 1, 'an unchanged binding is not restored again');
+
+  f.state.session = null;
+  f.state.projectSelection = { id: 'project-a' };
+  await f.run('ensureSession()');
+  assert.equal(f.requests[1].path, '/sessions');
+  assert.equal(f.requests[1].body.delegation, false);
 });

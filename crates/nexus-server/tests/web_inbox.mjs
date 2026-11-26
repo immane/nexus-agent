@@ -114,20 +114,33 @@ test('the explicit Steer action targets the current run without adding a prematu
   assert.deepEqual(f.messages, []);
 });
 
-test('child completion renders as a separate disclosure with plain text', () => {
-  const functions = source.slice(source.indexOf('function renderChildCompletion('), source.indexOf('function renderHistory('));
+test('child completion renders as a helper card through the safe Markdown path', () => {
+  const functions = source.slice(source.indexOf('function renderChildCompletion('), source.indexOf('function renderHistory('))
+    + source.slice(source.indexOf('const DELEGATE_ROLES'), source.indexOf('function finishDelegateTool('));
   const rendered = [];
+  const markdown = [];
+  const state = { delegateJobs: new Map([['job-1', { role: 'explore', task: 'find the parser', state: 'running' }]]) };
   const context = vm.createContext({
+    state,
     node(tag, css, text) {
-      return { tag, css, text, children: [], append(child) { this.children.push(child); } };
+      return { tag, css, text, dataset: {}, children: [], append(...children) { this.children.push(...children); } };
     },
     appendNode: element => rendered.push(element),
+    renderMarkdown: (element, text) => markdown.push(text),
+    renderHelperStatus() {},
+    formatCompactTokens: value => `${value}`,
   });
   vm.runInContext(functions, context);
-  vm.runInContext(`renderChildCompletion({job_id: 'job-1', status: 'completed', text: '<script>data</script>'})`, context);
+  vm.runInContext(`renderChildCompletion({job_id: 'job-1', status: 'completed', text: '<script>data</script>', input_tokens: 12, output_tokens: 3})`, context);
   assert.equal(rendered.length, 1);
   assert.equal(rendered[0].tag, 'details');
-  assert.equal(rendered[0].children[0].text, 'Explore job-1 · completed');
-  assert.equal(rendered[0].children[1].tag, 'pre');
-  assert.equal(rendered[0].children[1].text, '<script>data</script>');
+  assert.equal(rendered[0].dataset.status, 'completed');
+  const summary = rendered[0].children[0];
+  assert.equal(summary.children[1].text, 'Explore · find the parser');
+  assert.equal(summary.children[2].text, 'Completed');
+  assert.deepEqual(markdown, ['<script>data</script>']);
+  assert.equal(state.delegateJobs.get('job-1').state, 'completed');
+  assert.match(rendered[0].children[1].children[1].text, /Helper usage 12 in · 3 out/);
+  vm.runInContext(`renderChildCompletion({job_id: 'job-1', status: 'completed', text: 'again'})`, context);
+  assert.equal(rendered.length, 1, 'a job result renders once');
 });

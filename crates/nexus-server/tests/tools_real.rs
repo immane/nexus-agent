@@ -616,8 +616,132 @@ fn exploration_delivery_fixture(queue: bool) {
             .unwrap();
         assert_eq!(follow_up["parent_run"], parent);
         assert!(follow_up.get("input").is_none());
+        assert_eq!(follow_up["text"], "fixture confirmed");
         tool_outcomes(port, session, follow_up["run"].as_str().unwrap(), 0);
     }
+    web.join().unwrap();
+}
+
+#[test]
+fn delegation_can_be_turned_off_for_one_session() {
+    use nexus_config::{AdapterKind, CredentialRef, ModelEntry, ProviderProfile, UserConfig};
+    use serde_json::json;
+    use std::io::BufRead;
+
+    let root = FixtureRoot::new();
+    let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let endpoint = format!("http://{}/v1", upstream.local_addr().unwrap());
+    let mock = std::thread::spawn(move || {
+        let (mut socket, _) = upstream.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut input = std::io::BufReader::new(&mut socket);
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert_ne!(input.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = Some(value.trim().parse().unwrap());
+            }
+        }
+        let mut bytes = vec![0; length.unwrap()];
+        input.read_exact(&mut bytes).unwrap();
+        let request: Value = serde_json::from_slice(&bytes).unwrap();
+        let offered = request["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|tool| {
+                tool["function"]["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("delegate_"))
+            });
+        assert!(
+            !offered,
+            "a disabled session must not offer delegation tools"
+        );
+        let body = json!({"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]})
+            .to_string();
+        write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let mut server = nexus_server::Server::new(executor.handle().clone());
+    let mut config = UserConfig::default_config();
+    config
+        .add_provider(
+            ProviderProfile::new(
+                "mock",
+                "Mock",
+                AdapterKind::Direct,
+                Some(endpoint),
+                CredentialRef::stored("mock").unwrap(),
+                "parent-model",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    config
+        .add_model(ModelEntry::new("parent", "mock", "parent-model").unwrap())
+        .unwrap();
+    let private = FixtureRoot::new();
+    nexus_config::store_stored_credential_at(
+        &private.0.join("credentials.json"),
+        "mock",
+        "fixture-token",
+    )
+    .unwrap();
+    server.set_config(config, Some(private.0.join("config.json")));
+    server
+        .set_tools_mode(nexus_server::ToolsMode::Development {
+            root: root.0.clone(),
+        })
+        .unwrap();
+    server.set_auth_token(&"a".repeat(64)).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::sync::Arc::new(server);
+    let web = std::thread::spawn(move || {
+        for _ in 0..5 {
+            server.handle_connection(listener.accept().unwrap().0);
+        }
+    });
+    let (status, eligible) = post(
+        port,
+        "/sessions",
+        r#"{"provider":"mock","model":"parent","project":"default"}"#,
+    );
+    assert_eq!(status, 201, "{eligible}");
+    assert_eq!(eligible["delegation"], true);
+    let (status, invalid) = post(
+        port,
+        "/sessions",
+        r#"{"provider":"mock","model":"parent","project":"default","delegation":"no"}"#,
+    );
+    assert_eq!(status, 400, "{invalid}");
+    let (status, session) = post(
+        port,
+        "/sessions",
+        r#"{"provider":"mock","model":"parent","project":"default","delegation":false}"#,
+    );
+    assert_eq!(status, 201, "{session}");
+    assert_eq!(session["delegation"], false);
+    let session = session["session"].as_str().unwrap();
+    let (status, run) = post(
+        port,
+        &format!("/sessions/{session}/runs"),
+        r#"{"input":"no helpers"}"#,
+    );
+    assert_eq!(status, 201, "{run}");
+    tool_outcomes(port, session, run["run"].as_str().unwrap(), 0);
+    mock.join().unwrap();
     web.join().unwrap();
 }
 

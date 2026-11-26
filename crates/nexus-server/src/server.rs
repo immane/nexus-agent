@@ -205,6 +205,9 @@ pub struct Session {
     /// Project id selected at creation, when the client supplied one. The
     /// root is already captured by the session's tool registrations.
     project: Option<String>,
+    /// Whether the client asked for background delegation. Eligibility is
+    /// still decided by the host; `exploration` is the effective result.
+    delegation: bool,
     project_images: Option<ProjectImageReader>,
     runtime: Mutex<Runtime>,
     data: Mutex<mpsc::Receiver<nexus_core::RunEvent>>,
@@ -269,9 +272,13 @@ impl InboxInput {
     fn json(&self, id: &RequestId) -> Value {
         match self {
             Self::User(command) => serde_json::json!({"id": id.as_str(), "input": command.input}),
+            // The bounded result text lets the Web client show what an
+            // adopted follow-up run is about; it is the same untrusted text
+            // saved history already returns.
             Self::Child(result) => serde_json::json!({
                 "id":id.as_str(), "kind":"child-completion", "job_id":result.job().as_str(),
                 "parent_run":result.parent().as_str(), "status":result.status().as_str(),
+                "text":result.text(), "truncated":result.truncated(),
             }),
         }
     }
@@ -1026,7 +1033,7 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<String, SessionError> {
-        self.create_session_inner(provider, model, None)
+        self.create_session_inner(provider, model, None, true)
     }
 
     /// Creates a session bound to a configured project root. The reserved
@@ -1039,7 +1046,7 @@ impl Server {
         model: Option<&str>,
         project: &str,
     ) -> Result<String, SessionError> {
-        self.create_session_inner(provider, model, Some(project))
+        self.create_session_inner(provider, model, Some(project), true)
     }
 
     fn create_session_inner(
@@ -1047,6 +1054,7 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
         project: Option<&str>,
+        delegation: bool,
     ) -> Result<String, SessionError> {
         // Session identities outlive a server process when storage is enabled.
         // Use OS entropy rather than a process-local counter or wall clock;
@@ -1057,7 +1065,7 @@ impl Server {
             .map_err(|_| SessionError::new(500, "session identity could not be generated"))?;
         let token = format!("sess-web-{:032x}", u128::from_be_bytes(bytes));
         let session = SessionId::new(&token).expect("random session id is valid");
-        self.build_session(session, provider, model, project, false)
+        self.build_session(session, provider, model, project, delegation, false)
     }
 
     /// Opens one saved session under its existing identity and loads its
@@ -1069,6 +1077,7 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
         project: Option<&str>,
+        delegation: bool,
     ) -> Result<String, SessionError> {
         let Some(store) = self.session_store.clone() else {
             return Err(SessionError::new(409, "session persistence is not enabled"));
@@ -1085,6 +1094,7 @@ impl Server {
             if existing.provider.as_deref() != provider
                 || existing.model.as_deref() != model
                 || existing.project.as_deref() != project
+                || existing.delegation != delegation
             {
                 // A session is bound for its lifetime, but an idle runtime may
                 // be replaced under the same saved identity. Live work and SSE
@@ -1121,7 +1131,7 @@ impl Server {
         if store.load_session(&session).is_err() {
             return Err(SessionError::new(404, "saved session was not found"));
         }
-        self.build_session(session, provider, model, project, true)
+        self.build_session(session, provider, model, project, delegation, true)
     }
 
     fn build_session(
@@ -1130,6 +1140,7 @@ impl Server {
         provider: Option<&str>,
         model: Option<&str>,
         project: Option<&str>,
+        delegation: bool,
         restore: bool,
     ) -> Result<String, SessionError> {
         // Reserve capacity under the map lock, then release it before any
@@ -1185,7 +1196,8 @@ impl Server {
                 Some((adapter, binding)),
                 Some(_),
                 ToolsMode::Development { root } | ToolsMode::RealFiles { root },
-            ) if adapter.capabilities().text
+            ) if delegation
+                && adapter.capabilities().text
                 && adapter.capabilities().tool_calls
                 && (binding.is_some() || !self.server_settings.exploration_models.is_empty()) =>
             {
@@ -1276,6 +1288,7 @@ impl Server {
             provider: bound_provider,
             model: bound_model,
             project: bound_project,
+            delegation,
             project_images,
             runtime: Mutex::new(runtime),
             data: Mutex::new(streams.data),
@@ -1459,6 +1472,15 @@ impl Server {
     /// Whether an idle session owns no live work: no attached SSE subscriber,
     /// no unconfirmed worker, and no active run. Used before removing or
     /// replacing an idle runtime.
+    /// Reports whether a live session registered background delegation tools.
+    fn session_delegation(&self, id: &str) -> bool {
+        self.sessions
+            .lock()
+            .expect("sessions lockable")
+            .get(id)
+            .is_some_and(|session| session.exploration.is_some())
+    }
+
     fn session_is_reclaimable(&self, session: &Session) -> bool {
         if session.pending_handoffs.load(Ordering::Acquire) > 0
             || *session.streaming.lock().expect("stream flag lockable")
@@ -1654,13 +1676,16 @@ impl Server {
                     Ok(selection) => selection,
                     Err(response) => return Some(response),
                 };
-                let created = match project {
-                    Some(project) => self.create_session_in_project(provider, model, project),
-                    None => self.create_session_with(provider, model),
+                let delegation = match requested_delegation(body) {
+                    Ok(delegation) => delegation,
+                    Err(response) => return Some(response),
                 };
-                match created {
+                match self.create_session_inner(provider, model, project, delegation) {
                     Ok(token) => {
-                        let mut reply = serde_json::json!({ "session": token });
+                        let mut reply = serde_json::json!({
+                            "session": token,
+                            "delegation": self.session_delegation(&token),
+                        });
                         if let Some(id) = provider {
                             reply["provider"] = Value::String(id.to_owned());
                         }
@@ -1683,10 +1708,18 @@ impl Server {
                     Ok(selection) => selection,
                     Err(response) => return Some(response),
                 };
-                match self.restore_session(session, provider, model, project) {
+                let delegation = match requested_delegation(body) {
+                    Ok(delegation) => delegation,
+                    Err(response) => return Some(response),
+                };
+                match self.restore_session(session, provider, model, project, delegation) {
                     Ok(token) => Some(json_response(
                         200,
-                        &body_json(serde_json::json!({ "session": token, "restored": true })),
+                        &body_json(serde_json::json!({
+                            "session": token,
+                            "restored": true,
+                            "delegation": self.session_delegation(&token),
+                        })),
                     )),
                     Err(error) => Some(json_response(
                         error.status(),
@@ -3711,6 +3744,19 @@ fn selected_identities(body: &Value) -> Result<SelectedIdentities<'_>, Response>
     }
 }
 
+/// Parses the optional `delegation` request flag. Omitted keeps the default
+/// (enabled when the host finds the session eligible).
+fn requested_delegation(body: &Value) -> Result<bool, Response> {
+    match body.get("delegation") {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err(json_response(
+            400,
+            &json::error_body("delegation must be a boolean"),
+        )),
+    }
+}
+
 fn session_title(text: &str) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= 80 {
@@ -4211,7 +4257,7 @@ mod tests {
         assert_eq!(history["items"][0]["kind"], "user");
         assert_eq!(history["items"][1]["text"], "persisted answer");
 
-        let restored = match server.restore_session(session.as_str(), None, None, None) {
+        let restored = match server.restore_session(session.as_str(), None, None, None, true) {
             Ok(restored) => restored,
             Err(error) => panic!(
                 "saved session restores: HTTP {} {}",
@@ -4299,7 +4345,7 @@ mod tests {
                 root: workspace.clone(),
             })
             .unwrap();
-        let token = match server.restore_session(session.as_str(), None, None, None) {
+        let token = match server.restore_session(session.as_str(), None, None, None, true) {
             Ok(token) => token,
             Err(error) => panic!(
                 "initial restore failed: HTTP {} {}",
@@ -4314,7 +4360,7 @@ mod tests {
         // Repeating matching settings is a no-op, even with a live subscriber.
         *first.streaming.lock().unwrap() = true;
         assert_eq!(
-            match server.restore_session(session.as_str(), None, None, None) {
+            match server.restore_session(session.as_str(), None, None, None, true) {
                 Ok(token) => token,
                 Err(error) => panic!(
                     "matching restore failed: HTTP {} {}",
@@ -4331,7 +4377,7 @@ mod tests {
 
         // A live subscriber still blocks replacing the runtime's settings.
         let error = server
-            .restore_session(session.as_str(), None, None, Some(DEFAULT_PROJECT_ID))
+            .restore_session(session.as_str(), None, None, Some(DEFAULT_PROJECT_ID), true)
             .unwrap_err();
         assert_eq!(error.status(), 409);
         assert!(error.message().contains("active with different settings"));
@@ -4344,7 +4390,13 @@ mod tests {
         // Once idle, the differently-bound runtime is replaced under the same
         // saved identity; the reloaded history comes from the store.
         assert_eq!(
-            match server.restore_session(session.as_str(), None, None, Some(DEFAULT_PROJECT_ID)) {
+            match server.restore_session(
+                session.as_str(),
+                None,
+                None,
+                Some(DEFAULT_PROJECT_ID),
+                true
+            ) {
                 Ok(token) => token,
                 Err(error) => panic!(
                     "idle rebind failed: HTTP {} {}",
@@ -4367,7 +4419,7 @@ mod tests {
         assert_eq!(server.saved_history(&token, 0, 100).status, 404);
         assert_eq!(
             server
-                .restore_session(&token, None, None, None)
+                .restore_session(&token, None, None, None, true)
                 .unwrap_err()
                 .status(),
             404

@@ -35,11 +35,13 @@ function fixture() {
     setRunStatus() {},
     appendNode: (card) => cards.push(card),
     queueText: (node, text) => { node.data += text; },
+    renderHelperStatus() {},
+    formatCompactTokens: (value) => String(value),
   });
   vm.runInContext(`
     const MAX_TOOL_CHARS = 64000;
     const HIDDEN_TOOL_NAMES = new Set(['host_read', 'host_list']);
-    const state = { tools: new Map() };
+    const state = { tools: new Map(), delegateJobs: new Map(), run: 'run-1' };
     ${source.slice(source.indexOf('function node('), source.indexOf('function setRunStatus('))}
     ${source.slice(source.indexOf('function toolPresentation('), source.indexOf('/* Approvals */'))}
   `, context);
@@ -157,4 +159,40 @@ test('manual expansion survives success; failures and missing results stay visib
   run(`startTool({ call: 'lost', tool: 'host_exec', args_preview: '{}' }); markUnfinishedTools();`);
   assert.equal(cards[2].dataset.state, 'error');
   assert.equal(cards[2].open, true);
+});
+
+test('helper tools show the delegated task and record the running job', () => {
+  const { cards, run } = fixture();
+  run(`startTool({ call: 'start', tool: 'delegate_start', args_preview: 'delegate_start {"role":"explore","task":"find the parser","delivery":"steer"}' })`);
+  assert.equal(cards[0].dataset.kind, 'delegate');
+  assert.equal(cards[0].children[0].children[0].textContent, 'HELPER');
+  assert.match(cards[0].children[0].textContent, /Explore · find the parser/);
+  assert.match(cards[0].textContent, /Delivery: steer/);
+  run(`finishTool({ call: 'start', outcome: { status: 'Succeeded', content: '{"job_id":"job-1","status":"accepted"}' } })`);
+  assert.match(cards[0].children[0].textContent, /Started/);
+  assert.equal(run(`state.delegateJobs.get('job-1').state`), 'running');
+  assert.equal(run(`state.delegateJobs.get('job-1').run`), 'run-1');
+});
+
+test('collecting a helper result shows its text, usage, and verified proposal', () => {
+  const { cards, run } = fixture();
+  run(`state.delegateJobs.set('job-1', { role: 'propose', task: 'tidy parser', state: 'running' })`);
+  run(`startTool({ call: 'wait', tool: 'delegate_await', args_preview: 'delegate_await {"job_id":"job-1"}' })`);
+  assert.equal(cards[0].children[0].children[0].textContent, 'COLLECT');
+  assert.match(cards[0].children[0].textContent, /Propose · tidy parser/);
+  run(`finishTool({ call: 'wait', outcome: { status: 'Succeeded', content: JSON.stringify({
+    job_id: 'job-1', status: 'completed', input_tokens: 1200, output_tokens: 80,
+    proposal: { path: 'src/a.rs', old_text: 'a', new_text: 'b' } }) } })`);
+  assert.equal(run(`state.delegateJobs.get('job-1').state`), 'completed');
+  assert.match(cards[0].textContent, /Proposed edit · src\/a\.rs/);
+  assert.match(cards[0].textContent, /Helper usage 1200 in · 80 out/);
+  assert.equal(run(`state.tools.get('wait').outputSection.hidden`), true, 'raw JSON output is replaced');
+});
+
+test('unparseable helper output keeps the raw view', () => {
+  const { cards, run } = fixture();
+  run(`startTool({ call: 'wait', tool: 'delegate_await', args_preview: 'delegate_await {"job_id":"job-9"}' })`);
+  run(`finishTool({ call: 'wait', outcome: { status: 'Failed', content: 'parent run stopped' } })`);
+  assert.match(cards[0].textContent, /parent run stopped/);
+  assert.equal(cards[0].dataset.state, 'error');
 });

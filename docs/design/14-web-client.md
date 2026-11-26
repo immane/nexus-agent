@@ -340,6 +340,52 @@ A **Propose** child returns one suggested exact replacement; the parent
 re-reads the file and may apply it with its normal patch tool. The child
 never writes. See [background delegation](../tasks/12-background-delegation.md).
 
+`delegate_start` and `delegate_await` render as **HELPER** and **COLLECT**
+cards showing the role and task instead of raw JSON. A collected result shows
+its text, or a verified proposal as a diff, plus helper usage; output that is
+not valid JSON keeps the raw view. While the parent runs, the composer counts
+helpers it started that have not reported; after it ends, the count comes from
+the inbox's `pending_child_results`. Helper usage is listed separately from the
+parent's counters.
+
+**Enable agent teamwork** in the model menu is a browser preference sent as
+`"delegation": false` on `POST /sessions` and `POST /sessions/{id}/restore`
+when turned off; omitted means enabled. The server still decides eligibility
+and returns the effective `delegation` boolean, which the menu explains when
+the model cannot use helpers. Changing it in an existing session rebinds an
+idle runtime the same way a model switch does, so it needs `--session-store`;
+otherwise it applies to the next new session.
+
+## Composer
+
+The composer keeps text entry on top and controls in one row below: the
+project selector (narrow screens only), the tool-mode chip (`Auto in project`
+for development, `Ask first` for strict, `Demo tools`, or `Container`), run
+status, and the helper count on the left; the context meter, model menu,
+Steer (while running), a round stop button, and a round send/queue button on
+the right. The native model `<select>` is kept hidden as the data source.
+
+The **context meter** shows the latest task request's
+`estimated_input_tokens / context_window_tokens` as a ring and percentage. Its
+popover adds the output reserve and the compaction trigger/target from the same
+event. It is a Nexus estimate, not provider usage, and has no
+system/tool/message breakdown because the event does not carry one. It is
+hidden until the session's first request and resets on a new or restored
+session.
+
+The **model menu** has Model and Effort submenus and the teamwork switch.
+Effort edits the global default through the same form as Settings → Thinking;
+the trigger shows the effective value for the selected model (model, provider,
+then global override).
+
+After a run, the **reply footer** offers copy (assistant text of that run),
+a usage chip such as `Usage 57.3K tok`, and the local time. The usage popover
+lists provider/model, cache hit rate, uncached and cached input, cache write,
+output, helper usage, and history persistence. Chat Completions and Responses
+count cached tokens inside input; Anthropic Messages reports them separately,
+and the total follows the provider protocol. Popovers use the native Popover
+API and are positioned by script with CSSOM, which the CSP allows.
+
 The client consumes the existing event JSON without inventing additional wire
 contracts:
 
@@ -347,11 +393,11 @@ contracts:
 | --- | --- |
 | `run-started` | Running status |
 | `user-steered` | User text accepted at an active run's model boundary |
-| `child-completion` | Explore result displayed separately with its originating job and status |
+| `child-completion` | Helper result card with its task, status, and helper usage; each job renders once |
 | `assistant-text` | Incremental assistant text, keyed by turn and item |
 | `assistant-reasoning` | Live thinking, keyed by turn and item; collapsed last-line preview, expandable scrolling text |
 | `reasoning-redacted` | Compatibility status for older servers; no hidden content |
-| `model-request-started/finished` | Waiting/status transitions |
+| `model-request-started/finished` | Waiting/status transitions; a task request's estimate updates the context meter |
 | `model-response-discarded` | Warning notice |
 | `context-reduced` | Informational notice |
 | `tool-call-preview` | Preparing-tool status |
@@ -359,8 +405,8 @@ contracts:
 | `tool-output` | Incremental bounded output |
 | `tool-finished` | Typed status, effect, evidence, output, truncation |
 | `approval-required` | Approval card with exact approval/call identities |
-| `usage` | Inline usage counters, shown only once a counter is reported; unknown values are never filled in |
-| `run-finished` | Terminal outcome, reported usage or "Usage not reported", persistence (`Saved`, `Not saved`, `Save failed`), and optional typed error |
+| `usage` | Stored for the reply footer; unknown values are never filled in |
+| `run-finished` | Reply footer: copy, usage chip and breakdown, time; a non-completed outcome, `Save failed`, and any typed error are shown explicitly |
 
 Sequence numbers are tracked per run. Duplicate sequence numbers are ignored;
 gaps produce an explicit incomplete-transcript notice. A terminal event always
