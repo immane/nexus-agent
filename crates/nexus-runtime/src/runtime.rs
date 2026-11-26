@@ -1484,6 +1484,27 @@ impl Runtime {
         provider: Arc<dyn ProviderPort + Send + Sync>,
         tools: Vec<ToolRegistration>,
     ) -> Result<(), AgentError> {
+        self.start_exploration_with_delivery(
+            parent,
+            job_id,
+            brief,
+            provider,
+            tools,
+            crate::ExplorationDelivery::Await,
+        )
+        .await
+    }
+
+    /// Starts an exploration with an explicit host-authorized delivery mode.
+    pub async fn start_exploration_with_delivery(
+        &self,
+        parent: &RunId,
+        job_id: RequestId,
+        brief: &str,
+        provider: Arc<dyn ProviderPort + Send + Sync>,
+        tools: Vec<ToolRegistration>,
+        delivery: crate::ExplorationDelivery,
+    ) -> Result<(), AgentError> {
         use crate::delegation::{Job, MAX_BRIEF_BYTES, MAX_DURATION, MAX_RESULT_BYTES};
         let brief = brief.trim();
         if brief.is_empty() || brief.len() > MAX_BRIEF_BYTES {
@@ -1586,7 +1607,7 @@ impl Runtime {
                 "exploration deadline already elapsed",
             ));
         }
-        active.explorations.insert(job_id, job.clone());
+        active.explorations.insert(job_id, job.clone(), delivery);
         tokio::spawn(job.run(child, streams, command, deadline));
         Ok(())
     }
@@ -2462,8 +2483,8 @@ impl Runtime {
             let Some(active) = state.active.as_mut().filter(|active| &active.run == run) else {
                 return Ok(());
             };
-            if active.steering.is_empty()
-                || active.continuation.is_some()
+            if active.continuation.is_some()
+                || (active.steering.is_empty() && !active.explorations.has_steering())
                 || active.terminal.is_some()
                 || active.token.is_cancelled()
                 || StdInstant::now() >= active.deadline
@@ -2487,9 +2508,32 @@ impl Runtime {
                 let ModelContextItem::UserText(text) = &item else {
                     unreachable!()
                 };
-                deliveries.push((request, text.as_str().to_owned()));
+                deliveries.push(EventPayload::UserSteered {
+                    request,
+                    text: text.as_str().to_owned(),
+                });
                 active.conversation.push(item);
             }
+            let conversation = &mut active.conversation;
+            let mut bytes = conversation
+                .iter()
+                .map(ModelContextItem::payload_bytes)
+                .sum::<usize>()
+                .saturating_add(active.instruction_bytes)
+                .saturating_add(active.context_note_bytes);
+            active.explorations.steer(run, |result| {
+                let item = ModelContextItem::ChildCompletion(result.clone());
+                let next = bytes.saturating_add(item.payload_bytes());
+                if conversation.len() >= self.shared.context_items_bound
+                    || next > nexus_core::provider::MAX_CONVERSATION_BYTES
+                {
+                    return false;
+                }
+                bytes = next;
+                conversation.push(item);
+                deliveries.push(EventPayload::ChildDelivered(result));
+                true
+            });
             deliveries
         };
         if deliveries.is_empty() {
@@ -2501,13 +2545,8 @@ impl Runtime {
             .map_err(Terminal::failed)?;
         let mut state = self.shared.state.lock().await;
         if let Some(active) = state.active.as_mut().filter(|active| &active.run == run) {
-            for (request, text) in deliveries {
-                let result = emit_control(
-                    &self.shared,
-                    active,
-                    run,
-                    EventPayload::UserSteered { request, text },
-                );
+            for payload in deliveries {
+                let result = emit_control(&self.shared, active, run, payload);
                 apply_required_control_outcome(active, result);
             }
         }
@@ -5475,6 +5514,12 @@ fn control_event_bytes(event: &RunEvent) -> usize {
     let payload_bytes = match event.payload() {
         EventPayload::RunStarted { request } => request.as_str().len(),
         EventPayload::UserSteered { request, text } => request.as_str().len() + text.len(),
+        EventPayload::ChildDelivered(result) => {
+            result.parent().as_str().len()
+                + result.job().as_str().len()
+                + result.status().as_str().len()
+                + result.text().len()
+        }
         EventPayload::AssistantTextDelta(text) | EventPayload::AssistantReasoningDelta(text) => {
             text.turn.as_str().len() + text.item_key.len() + text.text.len()
         }
@@ -8683,6 +8728,58 @@ mod cov_runtime_private {
     /// Minimal provider only used to build a real `Shared` with its bounded
     /// channels; the covered helpers never invoke it.
     struct NoopProvider;
+
+    #[tokio::test]
+    async fn exploration_steering_claims_only_at_its_parent_boundary() {
+        use crate::delegation::Job;
+
+        let (runtime, mut streams) = Runtime::new(
+            RuntimeConfig {
+                limits: Limits::m0_test(),
+                policy: Policy::m0_test(),
+                has_approval_handler: false,
+            },
+            Arc::new(NoopProvider),
+            Vec::new(),
+        );
+        let parent = RunId::new("steer-parent").unwrap();
+        let unrelated = RunId::new("other-run").unwrap();
+        let job_id = RequestId::new("child-result").unwrap();
+        let job = Job::new();
+        let mut active = active_for(&parent);
+        active.explorations.insert(
+            job_id.clone(),
+            job.clone(),
+            crate::ExplorationDelivery::Steer,
+        );
+        runtime.shared.state.lock().await.active = Some(active);
+        job.finish(crate::ExplorationResult {
+            outcome: RunOutcome::Completed,
+            timed_out: false,
+            text: "child evidence".into(),
+            truncated: false,
+        });
+        assert!(runtime.deliver_steering(&unrelated).await.is_ok());
+        assert!(streams.control.try_recv().is_err());
+        assert!(runtime.deliver_steering(&parent).await.is_ok());
+        assert_eq!(
+            runtime.await_exploration(&parent, &job_id).await,
+            crate::ExplorationWait::Collected,
+        );
+        let state = runtime.shared.state.lock().await;
+        assert!(matches!(
+            state.active.as_ref().unwrap().conversation.last(),
+            Some(ModelContextItem::ChildCompletion(result))
+                if result.parent() == &parent && result.job() == &job_id && result.text() == "child evidence"
+        ));
+        drop(state);
+        assert!(matches!(
+            streams.control.try_recv().unwrap().payload(),
+            EventPayload::ChildDelivered(result) if result.job() == &job_id
+        ));
+        assert!(runtime.deliver_steering(&parent).await.is_ok());
+        assert!(streams.control.try_recv().is_err());
+    }
 
     struct GatedExplorationProvider {
         name: &'static str,

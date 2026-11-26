@@ -37,6 +37,7 @@ pub fn is_control_payload(payload: &EventPayload) -> bool {
         payload,
         EventPayload::RunStarted { .. }
             | EventPayload::UserSteered { .. }
+            | EventPayload::ChildDelivered(_)
             | EventPayload::ContextReduced { .. }
             | EventPayload::ApprovalRequired(_)
             | EventPayload::ToolStarted(_)
@@ -592,6 +593,7 @@ mod cov_transport_private {
             let expected = match payload {
                 EventPayload::RunStarted { .. }
                 | EventPayload::UserSteered { .. }
+                | EventPayload::ChildDelivered(_)
                 | EventPayload::ContextReduced { .. }
                 | EventPayload::ApprovalRequired(_)
                 | EventPayload::ToolStarted(_)

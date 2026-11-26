@@ -1,8 +1,9 @@
 # Background delegation
 
 Status: eligible Web/desktop sessions expose read-only Explore via
-`delegate_start` and `delegate_await`. Automatic result delivery and Propose
-remain planned. This is product behavior; [03 - Subagents](03-subagents.md)
+`delegate_start` and `delegate_await`, plus explicit next-boundary Steer on
+Chat Completions. Queue delivery, idle wake and Propose remain planned.
+This is product behavior; [03 - Subagents](03-subagents.md)
 describes how to divide development work on this repository.
 
 The runtime foundation uses an ephemeral child runtime for each accepted
@@ -19,8 +20,10 @@ configured providers in bound local projects. Additional models must be
 explicitly selected and listed in the operational `server.exploration_models`
 array. A provider-only session needs an explicit allowed model because its
 parent has no configured model ID. `delegate_await` uses the ordinary tool
-deadline; a timed-out wait does not consume a pending result. There is no
-`delivery` argument or automatic handoff in this slice.
+deadline; a timed-out wait does not consume a pending result. `delivery:
+"steer"` can hand off at a safe model boundary on Chat Completions; it does
+not yet queue or wake the session if the parent finishes first. Omission
+still requires an explicit wait.
 
 ## Goal and first release
 
@@ -67,8 +70,9 @@ work triggered by child-only input.
 
 ## Caller contract
 
-The table describes the target contract. `delivery` and the `propose` role
-are not accepted by the current Explore-only tools.
+The table describes the target contract. Only explicit `delivery: "steer"`
+on Chat Completions is implemented; `queue`, default Steer and `propose`
+are pending.
 
 | Operation | Inputs | Result |
 | --- | --- | --- |

@@ -8,11 +8,11 @@ use nexus_config::{
     resolve_credential_at,
 };
 use nexus_core::{
-    AgentError, EffectState, Evidence, ExecutionStatus, M0_REVISION, RequestId, RunOutcome,
-    ToolCall, ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
+    AgentError, EffectState, Evidence, ExecutionStatus, M0_REVISION, RequestId, ToolCall,
+    ToolContext, ToolId, ToolOutcome, ToolPort, ToolRegistration, ToolSpec,
 };
 use nexus_runtime::runtime::WeakRuntime;
-use nexus_runtime::{ExplorationWait, Runtime};
+use nexus_runtime::{ExplorationDelivery, ExplorationWait, Runtime};
 use serde_json::{Value, json};
 
 pub(super) struct Controls {
@@ -24,6 +24,7 @@ pub(super) struct Controls {
     provider_settings: ProviderSettings,
     credentials: Option<PathBuf>,
     reads: Vec<ToolRegistration>,
+    supports_child_completion: bool,
 }
 
 impl Controls {
@@ -37,6 +38,7 @@ impl Controls {
         credentials: Option<PathBuf>,
         root: &Path,
         settings: &ToolsSettings,
+        supports_child_completion: bool,
     ) -> Result<Arc<Self>, AgentError> {
         Ok(Arc::new(Self {
             handle,
@@ -47,6 +49,7 @@ impl Controls {
             provider_settings,
             credentials,
             reads: nexus_tools::project_read_tools(root, settings)?,
+            supports_child_completion,
         }))
     }
 
@@ -56,7 +59,7 @@ impl Controls {
 
     pub(super) fn registrations(self: &Arc<Self>) -> [ToolRegistration; 2] {
         [true, false].map(|start| {
-            let (name, description, schema) = if start {
+            let (name, description, mut schema) = if start {
                 (
                     "delegate_start",
                     "Start a background read-only task in this project. Role must be explore. Thinking may be inherit, off, or low. Starts immediately; use delegate_await to retrieve the result.",
@@ -84,6 +87,9 @@ impl Controls {
                     }),
                 )
             };
+            if start && self.supports_child_completion {
+                schema["properties"]["delivery"] = json!({"type":"string"});
+            }
             let spec = ToolSpec::new(
                 ToolId::new(name, M0_REVISION).expect("static tool id"),
                 description,
@@ -144,6 +150,15 @@ impl Control {
                 return Err("unsupported exploration role");
             }
             let task = args["task"].as_str().ok_or("missing exploration task")?;
+            let delivery = match args.get("delivery") {
+                None => ExplorationDelivery::Await,
+                Some(value)
+                    if value.as_str() == Some("steer") && controls.supports_child_completion =>
+                {
+                    ExplorationDelivery::Steer
+                }
+                Some(_) => return Err("unsupported exploration delivery"),
+            };
             let thinking = match args.get("thinking") {
                 None => ExplorationThinking::Inherit,
                 Some(value) => match value.as_str() {
@@ -194,12 +209,13 @@ impl Control {
                     .check_active()
                     .map_err(|_| "exploration call stopped")?;
                 runtime
-                    .start_exploration(
+                    .start_exploration_with_delivery(
                         call.run(),
                         job_id.clone(),
                         task,
                         Arc::new(adapter.with_resolved_credential(credential)),
                         tools,
+                        delivery,
                     )
                     .await
                     .map_err(|_| "exploration could not start")
@@ -222,17 +238,7 @@ impl Control {
         })?;
         let value = match result {
             ExplorationWait::Finished(result) => {
-                let status = if result.timed_out {
-                    "timed-out"
-                } else {
-                    match result.outcome {
-                        RunOutcome::Completed => "completed",
-                        RunOutcome::Cancelled => "cancelled",
-                        RunOutcome::Refused => "refused",
-                        RunOutcome::Failed => "failed",
-                        RunOutcome::LimitReached => "limit-reached",
-                    }
-                };
+                let status = result.status().as_str();
                 json!({
                     "job_id": id, "status": status, "text": result.text, "truncated": result.truncated,
                 })

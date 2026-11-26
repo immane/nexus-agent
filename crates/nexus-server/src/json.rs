@@ -126,6 +126,7 @@ pub fn event_json(event: &RunEvent) -> Value {
             "user-steered",
             json!({ "id": request.as_str(), "text": text }),
         ),
+        EventPayload::ChildDelivered(result) => ("child-completion", child_result_json(result)),
         EventPayload::AssistantTextDelta(fragment) => (
             "assistant-text",
             json!({ "turn": fragment.turn.as_str(), "item": fragment.item_key, "text": fragment.text }),
@@ -250,11 +251,11 @@ pub fn history_item_json(record: &SourceRecord) -> Value {
         }
         ModelContextItem::ChildCompletion(result) => {
             let mut value = base("child-completion");
-            value["parent_run"] = json!(result.parent().as_str());
-            value["job_id"] = json!(result.job().as_str());
-            value["status"] = json!(result.status().as_str());
-            value["text"] = json!(result.text());
-            value["truncated"] = json!(result.truncated());
+            if let (Some(value), Value::Object(result)) =
+                (value.as_object_mut(), child_result_json(result))
+            {
+                value.extend(result);
+            }
             value
         }
         ModelContextItem::AssistantText { text, .. } => {
@@ -296,6 +297,14 @@ pub fn history_item_json(record: &SourceRecord) -> Value {
             value
         }
     }
+}
+
+fn child_result_json(result: &nexus_core::provider::ChildCompletion) -> Value {
+    json!({
+        "parent_run": result.parent().as_str(), "job_id": result.job().as_str(),
+        "status": result.status().as_str(), "text": result.text(),
+        "truncated": result.truncated(),
+    })
 }
 
 /// Encodes a bounded snapshot: lifecycle, last sequence, pending approval

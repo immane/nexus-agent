@@ -1314,6 +1314,9 @@ impl AppState {
             EventPayload::UserSteered { .. } => {
                 self.push_system("Additional user input was accepted.".to_owned());
             }
+            EventPayload::ChildDelivered(result) => {
+                self.push_system(format!("Explore {} · {}", result.job().as_str(), result.status().as_str()));
+            }
             EventPayload::AssistantTextDelta(fragment) => {
                 self.streaming = true;
                 let clean = sanitize(&fragment.text);

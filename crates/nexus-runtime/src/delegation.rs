@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nexus_core::{CancelCommand, RequestId, RunOutcome, SessionId, SubmitCommand};
+use nexus_core::provider::{ChildCompletion, ChildStatus};
+use nexus_core::{CancelCommand, RequestId, RunId, RunOutcome, SessionId, SubmitCommand};
 use tokio::sync::watch;
 
 use crate::{EventStreams, Runtime};
 
 pub(crate) const MAX_BRIEF_BYTES: usize = 4096;
-pub(crate) const MAX_RESULT_BYTES: usize = 8192;
+pub(crate) const MAX_RESULT_BYTES: usize = ChildCompletion::MAX_TEXT_BYTES;
 pub(crate) const MAX_DURATION: Duration = Duration::from_secs(45);
 
 /// Terminal output of a read-only exploration. Non-completed jobs return no text.
@@ -24,6 +25,32 @@ pub struct ExplorationResult {
     pub text: String,
     /// The result was cut to its finite byte budget.
     pub truncated: bool,
+}
+
+impl ExplorationResult {
+    /// The terminal classification shared by explicit and automatic delivery.
+    pub fn status(&self) -> ChildStatus {
+        if self.timed_out {
+            return ChildStatus::TimedOut;
+        }
+        match self.outcome {
+            RunOutcome::Completed => ChildStatus::Completed,
+            RunOutcome::Refused => ChildStatus::Refused,
+            RunOutcome::Failed => ChildStatus::Failed,
+            RunOutcome::Cancelled => ChildStatus::Cancelled,
+            RunOutcome::LimitReached => ChildStatus::LimitReached,
+        }
+    }
+}
+
+/// How a child result may be collected.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ExplorationDelivery {
+    /// Only an explicit wait may collect this result.
+    #[default]
+    Await,
+    /// Offer at the next safe request boundary of the originating parent.
+    Steer,
 }
 
 /// Result of waiting for a job owned by the supplied parent run.
@@ -40,21 +67,55 @@ pub enum ExplorationWait {
 }
 
 #[derive(Default)]
-pub(crate) struct Explorations(HashMap<RequestId, Arc<Job>>);
+pub(crate) struct Explorations {
+    jobs: HashMap<RequestId, Arc<Job>>,
+    steering: Vec<RequestId>,
+}
 
 impl Explorations {
     pub(crate) fn get(&self, id: &RequestId) -> Option<Arc<Job>> {
-        self.0.get(id).cloned()
+        self.jobs.get(id).cloned()
     }
 
-    pub(crate) fn insert(&mut self, id: RequestId, job: Arc<Job>) {
-        self.0.insert(id, job);
+    pub(crate) fn insert(&mut self, id: RequestId, job: Arc<Job>, delivery: ExplorationDelivery) {
+        if delivery == ExplorationDelivery::Steer {
+            self.steering.push(id.clone());
+        }
+        self.jobs.insert(id, job);
     }
 
     pub(crate) fn cancel_all(&self) {
-        for job in self.0.values() {
+        for job in self.jobs.values() {
             job.stop();
         }
+    }
+
+    pub(crate) fn has_steering(&self) -> bool {
+        !self.steering.is_empty()
+    }
+
+    /// Offers completed jobs in registration order without waiting for pending jobs.
+    pub(crate) fn steer(
+        &mut self,
+        parent: &RunId,
+        mut accept: impl FnMut(ChildCompletion) -> bool,
+    ) {
+        self.steering.retain(|id| {
+            let job = &self.jobs[id];
+            matches!(
+                job.try_deliver(|result| {
+                    ChildCompletion::new(
+                        parent.clone(),
+                        id.clone(),
+                        result.status(),
+                        result.text.clone(),
+                        result.truncated,
+                    )
+                    .is_ok_and(&mut accept)
+                }),
+                ExplorationClaim::Pending | ExplorationClaim::Deferred
+            )
+        });
     }
 }
 
@@ -111,7 +172,7 @@ impl Job {
         self.cancel.send_replace(true);
     }
 
-    fn finish(&self, result: ExplorationResult) {
+    pub(crate) fn finish(&self, result: ExplorationResult) {
         self.completion.send_if_modified(|state| {
             if matches!(state, Completion::Pending) {
                 *state = Completion::Finished(result);

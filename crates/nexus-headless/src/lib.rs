@@ -608,6 +608,7 @@ fn is_mandatory(payload: &EventPayload) -> bool {
         payload,
         EventPayload::RunStarted { .. }
             | EventPayload::UserSteered { .. }
+            | EventPayload::ChildDelivered(_)
             | EventPayload::ContextReduced { .. }
             | EventPayload::ModelRequestStarted { .. }
             | EventPayload::ModelRequestFinished { .. }
@@ -928,6 +929,14 @@ fn format_event(event: &RunEvent) -> String {
         }
         EventPayload::UserSteered { request, .. } => {
             format!("{head}user-steered request={}", request.as_str())
+        }
+        EventPayload::ChildDelivered(result) => {
+            format!(
+                "{head}child-delivered parent={} job={} status={}",
+                result.parent(),
+                result.job().as_str(),
+                result.status().as_str()
+            )
         }
         EventPayload::AssistantTextDelta(text) => format!(
             "{}text item={} text-len={} text={}",

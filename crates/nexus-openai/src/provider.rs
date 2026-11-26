@@ -523,6 +523,11 @@ impl OpenAiProvider {
         &self.model
     }
 
+    /// Whether this adapter can replay typed background child results.
+    pub fn supports_child_completion(&self) -> bool {
+        self.protocol == ProtocolKind::ChatCompletions
+    }
+
     /// Returns true when this adapter bridges through TLS (`https`).
     #[must_use]
     pub fn uses_tls(&self) -> bool {

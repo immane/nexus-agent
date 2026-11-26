@@ -321,8 +321,11 @@ In a bound local project with an eligible configured model, the assistant can
 start background **Explore** jobs and explicitly collect them by job ID. The
 child can only read, list, and search that project. The parent model is the
 default; additional models require an administrator's `server.exploration_models`
-allowlist. Results appear as ordinary tool results when collected, not as
-automatic Steer or Queue entries. See [background delegation](../tasks/12-background-delegation.md).
+allowlist. Collected results appear as ordinary tool results. On Chat
+Completions, the assistant may instead request `delivery: "steer"`; a result
+that arrives before the originating task's next safe model boundary appears
+as a separate Explore record. It does not yet queue a follow-up after that
+task ends. See [background delegation](../tasks/12-background-delegation.md).
 
 The client consumes the existing event JSON without inventing additional wire
 contracts:
@@ -331,6 +334,7 @@ contracts:
 | --- | --- |
 | `run-started` | Running status |
 | `user-steered` | User text accepted at an active run's model boundary |
+| `child-completion` | Explore result displayed separately with its originating job and status |
 | `assistant-text` | Incremental assistant text, keyed by turn and item |
 | `assistant-reasoning` | Live thinking, keyed by turn and item; collapsed last-line preview, expandable scrolling text |
 | `reasoning-redacted` | Compatibility status for older servers; no hidden content |

@@ -94,3 +94,21 @@ test('the explicit Steer action targets the current run without adding a prematu
   assert.equal(f.dom.message.value, '');
   assert.deepEqual(f.messages, []);
 });
+
+test('child completion renders as a separate disclosure with plain text', () => {
+  const functions = source.slice(source.indexOf('function renderChildCompletion('), source.indexOf('function renderHistory('));
+  const rendered = [];
+  const context = vm.createContext({
+    node(tag, css, text) {
+      return { tag, css, text, children: [], append(child) { this.children.push(child); } };
+    },
+    appendNode: element => rendered.push(element),
+  });
+  vm.runInContext(functions, context);
+  vm.runInContext(`renderChildCompletion({job_id: 'job-1', status: 'completed', text: '<script>data</script>'})`, context);
+  assert.equal(rendered.length, 1);
+  assert.equal(rendered[0].tag, 'details');
+  assert.equal(rendered[0].children[0].text, 'Explore job-1 · completed');
+  assert.equal(rendered[0].children[1].tag, 'pre');
+  assert.equal(rendered[0].children[1].text, '<script>data</script>');
+});

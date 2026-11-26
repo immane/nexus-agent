@@ -609,6 +609,8 @@ pub enum EventPayload {
         /// Accepted user text.
         text: String,
     },
+    /// Background child result recorded at a safe model boundary.
+    ChildDelivered(crate::provider::ChildCompletion),
     /// Ordered presentation fragment.
     AssistantTextDelta(AssistantText),
     /// Sensitive provider reasoning, emitted only for explicitly opted-in local presentation.
@@ -701,6 +703,7 @@ impl EventPayload {
                 Err(command_error("steering input is invalid"))
             }
             Self::UserSteered { .. } => Ok(()),
+            Self::ChildDelivered(_) => Ok(()),
             Self::ContextReduced { .. }
             | Self::ModelRequestStarted { .. }
             | Self::ModelRequestFinished { .. }
