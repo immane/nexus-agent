@@ -146,7 +146,11 @@ legacy counter-based IDs remain valid inputs.
 is fixed at session creation, matching the server contract. The page remembers
 the current session id in browser storage and asks `POST /sessions/{id}/restore`
 to reopen it after a reload. Server idle cleanup can later remove the ephemeral
-runtime. Reloading or closing the page does not cancel an active run, and an
+runtime. If an idle conversation's next prompt is explicitly rejected because
+the runtime no longer exists, Web restores the same saved session and retries
+the prompt once with the same submission ID. If it cannot restore the session,
+the draft stays in the composer. A network failure does not trigger a retry.
+Reloading or closing the page does not cancel an active run, and an
 active run is not reattached merely by restoring its saved history.
 
 When the server starts with `--session-store DIRECTORY`, the sidebar lists saved

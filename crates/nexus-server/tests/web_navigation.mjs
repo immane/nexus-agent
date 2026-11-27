@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
 
-function fixture() {
+function fixture(respond) {
   const state = {
     connected: true, session: 'old', selection: { provider: 'local', model: 'fast' },
     connecting: false, historyLoading: false, submitting: false, inFlightUnknown: false,
@@ -20,6 +20,7 @@ function fixture() {
     };
   } });
   const requests = [];
+  const notices = [];
   let release;
   let failure;
   const context = vm.createContext({
@@ -28,25 +29,32 @@ function fixture() {
       requests.push({ path, ...options });
       if (release) await release.promise;
       if (failure) throw failure;
+      if (respond) return respond(path, requests.length, ApiError);
       return { session: 'saved' };
     },
     savedSessionMeta: () => ({}), rememberSession() {}, rememberCurrentSession() {},
     stopStream() {}, resetRunState() {}, ensureProjectExpanded() {}, renderSidebarTree() {},
     updateSessionDisplay() {}, populateModels() {}, loadSessionHistory: async () => {},
-    refreshSavedSessions: async () => {}, setRunStatus() {}, addNotice() {},
+    refreshSavedSessions: async () => {}, setRunStatus() {}, addNotice: (_, message) => notices.push(message),
+    crypto: { randomUUID: () => 'submission-1' },
+    startDisplayingRun: (run) => { state.run = run; },
     updateComposerActivity() {}, updateModelDisplay() {}, updateProjectDisplay() {},
     updateConfigBusy() {},
     updateProjectFormControls() {},
     updateSidebarProjectControls() {},
     window: { confirm() { throw new Error('Unexpected confirmation'); } },
-    ApiError: class ApiError extends Error { constructor(status, message) { super(message); this.status = status; } },
   });
+  const ApiError = vm.runInContext(
+    `${source.slice(source.indexOf('class ApiError'), source.indexOf('async function api('))}\nApiError`,
+    context,
+  );
   for (const [start, end] of [
     ['async function openSavedSession(', 'function resetRunState('],
     ['async function ensureSession(', '/* Sending */'],
+    ['async function sendMessage(', 'function appendUserMessage('],
   ]) vm.runInContext(source.slice(source.indexOf(start), source.indexOf(end)), context);
   return {
-    state, dom, requests, run: (code) => vm.runInContext(code, context),
+    state, dom, requests, notices, run: (code) => vm.runInContext(code, context),
     pause() { release = {}; release.promise = new Promise((resolve) => { release.resolve = resolve; }); },
     resume() { release.resolve(); },
     fail() { failure = new Error('offline'); },
@@ -127,3 +135,66 @@ test('turning teamwork off is sent as a binding and rebinds an idle saved sessio
   assert.equal(f.requests[1].path, '/sessions');
   assert.equal(f.requests[1].body.delegation, false);
 });
+
+test('sending to an expired idle session restores the same settings and retries the same submission', async () => {
+  const f = fixture((_, attempt, ApiError) => {
+    if (attempt === 1) throw new ApiError(404, 'unknown session');
+    if (attempt === 2) return { session: 'old', delegation: false };
+    return { reply: 'accepted', run: 'next-run' };
+  });
+  Object.assign(f.state, { sessionModel: 'fast', teamwork: false, sessionDelegation: false });
+
+  await f.run('sendMessage()');
+
+  assert.deepEqual(f.requests.map(({ path }) => path), [
+    '/sessions/old/runs', '/sessions/old/restore', '/sessions/old/runs',
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.requests[1].body)), {
+    provider: 'local', model: 'fast', project: 'project-a', delegation: false,
+  });
+  assert.equal(f.requests[2].body, f.requests[0].body);
+  assert.equal(f.requests[2].body.submission_id, 'submission-1');
+  assert.equal(f.state.session, 'old');
+  assert.equal(f.state.run, 'next-run');
+  assert.equal(f.dom.message.value, '');
+  assert.deepEqual(f.notices, []);
+});
+
+for (const { name, fail, requests, message, unknown = false, saved = true } of [
+  { name: 'missing saved history', fail: (attempt, E) => new E(404,
+    attempt === 1 ? 'unknown session' : 'saved session was not found'),
+  requests: 2, message: /saved session was not found/ },
+  { name: 'failed restore connection', fail: (attempt, E) => attempt === 1
+    ? new E(404, 'unknown session') : new Error('offline'),
+  requests: 2, message: /Could not restore the session/ },
+  { name: 'disabled persistence', fail: (_, E) => new E(404, 'unknown session'),
+    requests: 1, message: /Copy your draft before starting a new session/, saved: false },
+  { name: 'a second expiration', fail: (attempt, E) => attempt === 2
+    ? null : new E(404, 'unknown session'),
+  requests: 3, message: /unknown session/ },
+  { name: 'an unrelated 404', fail: (_, E) => new E(404, 'unknown route'),
+    requests: 1, message: /unknown route/ },
+  { name: 'an uncertain submission', fail: () => new Error('offline'),
+    requests: 1, message: /Do not resend blindly/, unknown: true },
+  { name: 'an uncertain retry', fail: (attempt, E) => {
+    if (attempt === 1) return new E(404, 'unknown session');
+    return attempt === 3 ? new Error('offline') : null;
+  }, requests: 3, message: /Do not resend blindly/, unknown: true },
+]) {
+  test(`${name} leaves the draft intact without further submissions`, async () => {
+    const f = fixture((_, attempt, ApiError) => {
+      const error = fail(attempt, ApiError);
+      if (error) throw error;
+      return { session: 'old' };
+    });
+    Object.assign(f.state, { sessionModel: 'fast', savedPersistence: saved });
+    await f.run('sendMessage()');
+
+    assert.equal(f.requests.length, requests);
+    assert.equal(f.dom.message.value, 'draft');
+    assert.equal(f.state.session, 'old');
+    assert.equal(f.state.inFlightUnknown, unknown);
+    assert.equal(f.state.submitting, false);
+    assert.match(f.notices[0], message);
+  });
+}
