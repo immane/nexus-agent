@@ -108,6 +108,13 @@ Editor regressions cover separate list/create/edit states, unsaved draft protect
 duplicate-ID refusal, cross-editor save locking, failure preservation, and deletion
 dependency hints. Palette tests cover the radio-card inventory, restored selection,
 immediate application/persistence, system fallback, and unavailable browser storage.
+The opt-in live context-endurance regression starts a real server using the default
+configured provider, grows a saved session past the local 1 MiB byte budget,
+restarts the server, and resumes the same session:
+`python3 tools/benchmarks/live_context_endurance.py`. It makes real model requests,
+so it is not part of the default suite; its report records run outcomes, request
+estimates, context reductions, and preserved source-history size. Offline helpers
+run with `python3 -B -m unittest discover -s tools/benchmarks -p 'test_*.py'`.
 
 Background delegation has offline coverage in `nexus-runtime` (job claims,
 parent cancellation on both sides of completion, out-of-order results, and

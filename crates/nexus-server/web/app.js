@@ -4032,9 +4032,12 @@ function appendContextNotice(detail) {
   const byteText = retainedBytes !== null && byteLimit !== null
     ? ` · ${retainedBytes}/${byteLimit} bytes retained`
     : '';
+  const reduction = method === 'bounded-history' && removed === 0
+    ? 'archived tool output shortened for the local limit'
+    : `${removed} item${removed === 1 ? '' : 's'} removed using ${method}`;
   addNotice(
     'info',
-    `Context reduced: ${removed} item${removed === 1 ? '' : 's'} removed using ${method}${itemText}${byteText}.`,
+    `Context reduced: ${reduction}${itemText}${byteText}.`,
     `context-${detail.removed_items ?? 'unknown'}`,
   );
 }
@@ -4649,7 +4652,13 @@ function appendRunSummary(detail, fromSnapshot) {
   if (detail.error && typeof detail.error === 'object') {
     const errorBlock = node('div', 'run-detail');
     errorBlock.append(node('div', '', `${detail.error.category || 'Error'} · ${retryLabel(detail.error.retry)}`));
-    if (detail.error.message) errorBlock.append(node('pre', '', String(detail.error.message)));
+    if (detail.error.message) {
+      const message = String(detail.error.message);
+      if (detail.error.category === 'ResourceLimit' && message.startsWith('context budget exhausted:')) {
+        errorBlock.append(node('div', '', 'Nexus reached its local context limit, not the model token window.'));
+      }
+      errorBlock.append(node('pre', '', message));
+    }
     card.append(errorBlock);
   }
   if (fromSnapshot) {

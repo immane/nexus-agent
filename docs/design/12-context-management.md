@@ -361,6 +361,16 @@ chunks remain staged until the complete candidate passes validation. Emergency
 tool-output previews preserve head/tail excerpts and outcome metadata without
 changing archived originals; they are not a semantic summarizer.
 
+The local byte ceiling is checked independently of the model token threshold.
+When ordinary whole-exchange reduction cannot fit, durable sessions can use
+shorter previews of completed tool output in the retained view, including on
+restore and when a completed run is admitted to the retained cache. Call
+identities, arguments, reasoning, and outcome status, effect and
+evidence stay intact. The open tool group is never rewritten, and the most
+recent completed group is shortened only if older previews do not suffice.
+Original captures remain in the archive. This does not increase the archive
+quota or permit rewriting an opaque continuation.
+
 Task request preparation now applies deterministic output previews before
 testing the soft compaction threshold, including when the model window is
 unknown. When archive retrieval is available, command (`host_exec`) output uses a
