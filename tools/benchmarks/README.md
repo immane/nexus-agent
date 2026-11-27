@@ -180,6 +180,27 @@ collects stdout/stderr until completion: these reports do not add live stdout
 streaming. A case log and framework stack diagnostics remain necessary to locate
 a hung test; silence alone never triggers automatic cancellation or retry.
 
+## Live context-endurance regression
+
+This opt-in check uses the provider and stored credential from the default
+`~/.config/nexus-agent/config.json`. It is not part of the offline suite and
+makes real model requests, so run it deliberately. It starts a real server with
+a temporary project and session store, asks the model to run a batch of large
+archived commands, verifies that the saved session exceeds the local 1 MiB
+context budget and still completes, restarts the server, and continues the same
+restored session.
+
+```sh
+cargo build --release --locked -p nexus-server --features nexus-server/container --bins
+python3 tools/benchmarks/live_context_endurance.py
+```
+
+The report under `logs/live-context-endurance-<timestamp>/report.json` records
+per-run outcomes, observed context reductions, request estimates, and the
+preserved source-history size. The script never prints the configured
+credential. Offline helper tests run with the rest of `tools/benchmarks`
+discovery.
+
 ## Task test execution guidance
 
 Benchmark-pilot and ordinary TUI/server calls share the runtime's timeout
