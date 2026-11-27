@@ -2071,15 +2071,16 @@ function setSessionTitleFromInput(text) {
   if (state.session) rememberSession(state.session, { title: state.sessionTitle });
 }
 
-async function ensureSession() {
+async function ensureSession({ restore = false } = {}) {
   if (!state.selection) throw new ApiError(400, 'Select a model before sending.');
   if (state.session) {
     const provider = state.selection.demo ? null : state.selection.provider;
     const model = state.selection.demo ? null : state.selection.model;
     const delegation = state.teamwork !== false;
-    if (provider === state.sessionProvider && model === state.sessionModel
+    if (!restore && provider === state.sessionProvider && model === state.sessionModel
         && delegation === (state.sessionDelegation ?? true)) return;
     if (!state.savedPersistence) {
+      if (restore) throw new ApiError(409, 'This session has expired and was not saved. Copy your draft before starting a new session.');
       throw new ApiError(409, 'Switching models or teamwork in an existing session requires --session-store. Start a new session to apply it.');
     }
     const body = {};
@@ -2276,13 +2277,33 @@ async function sendMessage({ steer = false } = {}) {
 
   try {
     await ensureSession();
-    if (!state.active) setRunStatus('Starting run…', 'busy');
-    submittingRun = true;
-    const reply = await api(`/sessions/${encodeURIComponent(state.session)}/runs`, {
+    const path = `/sessions/${encodeURIComponent(state.session)}/runs`;
+    const options = {
       method: 'POST',
       body: { input: text, delivery: steer ? 'steer' : 'queue', submission_id: crypto.randomUUID(),
         ...(steer ? { run: state.run } : {}) },
-    });
+    };
+    if (!state.active) setRunStatus('Starting run…', 'busy');
+    submittingRun = true;
+    let reply;
+    try {
+      reply = await api(path, options);
+    } catch (error) {
+      if (steer || state.active || !(error instanceof ApiError)
+          || error.status !== 404 || error.message !== 'unknown session') throw error;
+      // Session lookup rejected the request before a run could start.
+      submittingRun = false;
+      setRunStatus('Restoring session…', 'busy');
+      try {
+        await ensureSession({ restore: true });
+      } catch (restoreError) {
+        if (restoreError instanceof ApiError) throw restoreError;
+        throw new ApiError(0, 'Could not restore the session. Check the server connection and try again.');
+      }
+      setRunStatus('Starting run…', 'busy');
+      submittingRun = true;
+      reply = await api(path, options);
+    }
     if (reply?.reply === 'queued' || reply?.reply === 'steering') {
       if (dom.message.value === draft) dom.message.value = '';
       await refreshPromptInbox(state.session, { adopt: !state.active });
