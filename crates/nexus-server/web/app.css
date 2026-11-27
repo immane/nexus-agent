@@ -448,7 +448,7 @@ body {
   background: var(--bg);
   color: var(--fg);
   display: grid;
-  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-custom-width, var(--sidebar-width)) minmax(0, 1fr);
 }
 
 [hidden] {
@@ -590,6 +590,7 @@ body[data-sidebar="closed"] .sidebar {
 }
 
 .sidebar {
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -935,22 +936,13 @@ body[data-sidebar="closed"] .sidebar {
 }
 
 .sidebar-bottom {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   margin-top: auto;
-  padding: 10px 10px 0;
+  padding-top: 8px;
   border-top: 1px solid var(--line);
-  color: var(--muted);
-  font-size: 11px;
-  white-space: nowrap;
 }
 
-.local-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
+.settings-button svg {
+  flex: none;
 }
 
 .sidebar-backdrop {
@@ -1025,13 +1017,6 @@ body[data-sidebar="closed"] .sidebar {
   overflow: hidden;
   text-overflow: ellipsis;
   flex-shrink: 0;
-}
-
-.settings-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  background: transparent;
 }
 
 main { position: relative; }
@@ -3135,22 +3120,6 @@ dialog .theme-card {
     font-size: 0;
   }
 
-  .settings-button {
-    width: 34px;
-    height: 34px;
-    padding: 0;
-    justify-content: center;
-  }
-
-  .settings-label {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-  }
-
   #new-session-mobile {
     display: grid;
   }
@@ -3833,4 +3802,54 @@ body[data-backdrop="image"] .composer {
   margin-left: 4px;
   color: var(--muted);
   font-size: 11px;
+}
+
+/* Sidebar width handle (wide layouts only). */
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  z-index: 2;
+  width: 7px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.sidebar-resizer:hover::after,
+.sidebar-resizer:focus-visible::after,
+body[data-resizing="sidebar"] .sidebar-resizer::after {
+  width: 2px;
+  background: var(--accent);
+}
+
+.sidebar-resizer:focus-visible {
+  outline: none;
+}
+
+/* Dragging follows the pointer directly and must not select text. */
+body[data-resizing] {
+  transition: none;
+  user-select: none;
+}
+
+body[data-resizing="sidebar"] {
+  cursor: col-resize;
+}
+
+@media (max-width: 720px) {
+  .sidebar-resizer {
+    display: none;
+  }
 }

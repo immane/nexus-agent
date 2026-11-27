@@ -35,6 +35,7 @@ const dom = {
   sidebar: document.querySelector('#sidebar'),
   sidebarBackdrop: document.querySelector('#sidebar-backdrop'),
   toggleSidebar: document.querySelector('#toggle-sidebar'),
+  sidebarResizer: document.querySelector('#sidebar-resizer'),
   addProjectSidebar: document.querySelector('#add-project-sidebar'),
   projectsNote: document.querySelector('#projects-note'),
   projectList: document.querySelector('#project-list'),
@@ -5889,6 +5890,90 @@ function closeNarrowSidebar() {
   }
 }
 
+/* Sidebar width */
+
+const SIDEBAR_WIDTH_KEY = 'nexus.sidebar-width';
+const SIDEBAR_WIDTH = { min: 200, max: 480, step: 16 };
+
+// Keeps the sidebar within its limits and leaves room for the conversation.
+function clampSidebarWidth(width, viewport) {
+  const room = Number.isFinite(viewport) ? Math.max(SIDEBAR_WIDTH.min, Math.floor(viewport * 0.5)) : SIDEBAR_WIDTH.max;
+  const number = Number(width);
+  if (!Number.isFinite(number)) return null;
+  return Math.round(Math.min(SIDEBAR_WIDTH.max, room, Math.max(SIDEBAR_WIDTH.min, number)));
+}
+
+function viewportCssWidth() {
+  return window.innerWidth / interfaceZoom();
+}
+
+function setSidebarWidth(width, { persist = false } = {}) {
+  const value = width === null ? null : clampSidebarWidth(width, viewportCssWidth());
+  if (value === null) document.body.style.removeProperty('--sidebar-custom-width');
+  else document.body.style.setProperty('--sidebar-custom-width', `${value}px`);
+  dom.sidebarResizer.setAttribute('aria-valuenow', String(Math.round(currentSidebarWidth())));
+  if (!persist) return;
+  try {
+    if (value === null) localStorage.removeItem(SIDEBAR_WIDTH_KEY);
+    else localStorage.setItem(SIDEBAR_WIDTH_KEY, String(value));
+  } catch {
+    // The width still applies to this page.
+  }
+}
+
+function restoreSidebarWidth() {
+  let saved = null;
+  try {
+    saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+  } catch {
+    saved = null;
+  }
+  setSidebarWidth(saved === null ? null : Number(saved));
+}
+
+// The logical width, not the measured one: the column animates between values.
+function currentSidebarWidth() {
+  const style = getComputedStyle(document.body);
+  return parseFloat(style.getPropertyValue('--sidebar-custom-width'))
+    || parseFloat(style.getPropertyValue('--sidebar-width'))
+    || 260;
+}
+
+dom.sidebarResizer.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || narrowSidebar.matches) return;
+  event.preventDefault();
+  dom.sidebarResizer.setPointerCapture(event.pointerId);
+  document.body.dataset.resizing = 'sidebar';
+  const left = dom.sidebar.getBoundingClientRect().left;
+  const move = (moveEvent) => setSidebarWidth((moveEvent.clientX - left) / interfaceZoom());
+  const end = () => {
+    delete document.body.dataset.resizing;
+    dom.sidebarResizer.removeEventListener('pointermove', move);
+    setSidebarWidth(currentSidebarWidth(), { persist: true });
+  };
+  dom.sidebarResizer.addEventListener('pointermove', move);
+  dom.sidebarResizer.addEventListener('pointerup', end, { once: true });
+  dom.sidebarResizer.addEventListener('pointercancel', end, { once: true });
+});
+dom.sidebarResizer.addEventListener('dblclick', () => setSidebarWidth(null, { persist: true }));
+dom.sidebarResizer.addEventListener('keydown', (event) => {
+  const delta = { ArrowLeft: -SIDEBAR_WIDTH.step, ArrowRight: SIDEBAR_WIDTH.step }[event.key];
+  if (delta) {
+    event.preventDefault();
+    setSidebarWidth(currentSidebarWidth() + delta, { persist: true });
+  } else if (event.key === 'Home' || event.key === 'End') {
+    event.preventDefault();
+    setSidebarWidth(event.key === 'Home' ? SIDEBAR_WIDTH.min : SIDEBAR_WIDTH.max, { persist: true });
+  } else if (event.key === 'Enter') {
+    event.preventDefault();
+    setSidebarWidth(null, { persist: true });
+  }
+});
+window.addEventListener('resize', () => {
+  if (document.body.style.getPropertyValue('--sidebar-custom-width')) setSidebarWidth(currentSidebarWidth());
+});
+restoreSidebarWidth();
+
 /* Settings navigation */
 
 function selectSettingsSection(id) {
@@ -5966,7 +6051,7 @@ dom.sidebar.addEventListener('keydown', (event) => {
 });
 // Choosing something in the drawer returns to the conversation.
 dom.sidebar.addEventListener('click', (event) => {
-  if (event.target.closest('.tree-session-open, .tree-project-add, #new-session, #add-project-sidebar')) {
+  if (event.target.closest('.tree-session-open, .tree-project-add, #new-session, #add-project-sidebar, #open-settings')) {
     closeNarrowSidebar();
   }
 });

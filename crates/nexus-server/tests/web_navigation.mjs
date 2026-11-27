@@ -198,3 +198,15 @@ for (const { name, fail, requests, message, unknown = false, saved = true } of [
     assert.match(f.notices[0], message);
   });
 }
+
+test('sidebar width stays within its limits and leaves half the window for the conversation', () => {
+  const context = vm.createContext({});
+  vm.runInContext(source.slice(source.indexOf('const SIDEBAR_WIDTH_KEY'), source.indexOf('function viewportCssWidth(')), context);
+  const clamp = (width, viewport) => vm.runInContext(`clampSidebarWidth(${width}, ${viewport})`, context);
+  assert.equal(clamp(379.4, 1440), 379);
+  assert.equal(clamp(100, 1440), 200);
+  assert.equal(clamp(900, 1440), 480);
+  assert.equal(clamp(450, 800), 400);
+  assert.equal(clamp(300, 300), 200);
+  assert.equal(clamp(NaN, 1440), null);
+});

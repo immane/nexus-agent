@@ -200,15 +200,21 @@ session has a filled row, a running session shows a spinner, and a saved
 session whose runtime is still loaded on the server shows a small dot; model and status text stay in the
 row tooltip and accessible name. Add and delete actions appear on hover or focus.
 Without projects, sessions are listed directly under a Sessions label. Rows show
-no timestamps because `GET /sessions` does not report one.
+no timestamps because `GET /sessions` does not report one. **Settings** is the
+last row of the sidebar; with the sidebar collapsed it is reached by expanding
+the sidebar again (or from the Connect button while disconnected).
 
 A panel-icon button at the start of the top bar toggles the sidebar. On wide
 screens it collapses the sidebar and the choice is kept in `localStorage`
 (`nexus.sidebar`). At 720px and below the sidebar is an overlay drawer that
-starts closed; the backdrop, Escape, or choosing a session closes it. Consecutive assistant items after one user message share
+starts closed; the backdrop, Escape, or choosing a session or Settings closes it. On wide
+screens the sidebar's right edge is a resize handle (200–480 px, and at most half
+the window). Dragging, or arrow keys while it is focused, changes the width;
+double-click or Enter restores the default. The width is kept in `localStorage`
+(`nexus.sidebar-width`). Consecutive assistant items after one user message share
 a single speaker label. Approval cards compact after a decision. On narrow
-screens the top bar stays on one row, with icon-only New session and Settings
-buttons and a status dot whose text remains available to assistive technology.
+screens the top bar stays on one row, with an icon-only New session button
+and a status dot whose text remains available to assistive technology.
 
 ## Installed web app
 
