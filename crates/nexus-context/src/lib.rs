@@ -364,6 +364,10 @@ pub fn history_exchange_effects_certain(items: &[ModelContextItem]) -> bool {
 /// Verifies call/result pairing before moving or removing a complete exchange.
 #[must_use]
 pub fn context_calls_are_paired(items: &[ModelContextItem]) -> bool {
+    valid_context_calls(items, false)
+}
+
+fn valid_context_calls(items: &[ModelContextItem], allow_pending: bool) -> bool {
     let mut seen = HashSet::new();
     let mut pending = HashSet::new();
     for item in items {
@@ -379,10 +383,11 @@ pub fn context_calls_are_paired(items: &[ModelContextItem]) -> bool {
                 }
             }
             ModelContextItem::ToolResult { call, .. } if !pending.remove(call) => return false,
+            item if allow_pending && item.starts_exchange() && !pending.is_empty() => return false,
             _ => {}
         }
     }
-    pending.is_empty()
+    allow_pending || pending.is_empty()
 }
 
 /// Model-only projection of old completed output bodies. The source records,
@@ -404,7 +409,7 @@ pub fn project_tool_outputs(
     output_bytes: usize,
     preserve_latest: bool,
 ) -> Result<Vec<ModelContextItem>, AgentError> {
-    project_tool_outputs_with(items, output_bytes, |_, latest| {
+    project_tool_outputs_with(items, output_bytes, false, |_, latest| {
         (!preserve_latest || !latest).then_some(output_bytes)
     })
 }
@@ -423,19 +428,32 @@ pub fn project_tool_outputs_for_request(
     command_output_bytes: usize,
     archive_available: bool,
 ) -> Result<Vec<ModelContextItem>, AgentError> {
-    project_tool_outputs_with(items, old_output_bytes, |tool, _| {
+    project_tool_outputs_with(items, old_output_bytes, false, |tool, _| {
         (tool.name() == "host_exec" && archive_available)
             .then_some(command_output_bytes.max(old_output_bytes))
+    })
+}
+
+/// Emergency byte-budget projection for durable history. An open tool group
+/// may follow completed groups; its calls and any partial results stay intact.
+pub fn project_archived_outputs(
+    items: &[ModelContextItem],
+    preserve_latest: bool,
+) -> Result<Vec<ModelContextItem>, AgentError> {
+    const PREVIEW_BYTES: usize = 512;
+    project_tool_outputs_with(items, PREVIEW_BYTES, true, |_, latest| {
+        (!preserve_latest || !latest).then_some(PREVIEW_BYTES)
     })
 }
 
 fn project_tool_outputs_with(
     items: &[ModelContextItem],
     output_bytes: usize,
+    emergency: bool,
     mut budget: impl FnMut(&nexus_core::ToolId, bool) -> Option<usize>,
 ) -> Result<Vec<ModelContextItem>, AgentError> {
     let mut projected = items.to_vec();
-    if output_bytes == 0 || !context_calls_are_paired(items) {
+    if output_bytes == 0 || !valid_context_calls(items, emergency) {
         return Ok(projected);
     }
     let mut pending = HashSet::new();
@@ -474,11 +492,16 @@ fn project_tool_outputs_with(
         else {
             continue;
         };
+        if emergency && !pending.is_empty() && index >= group_start {
+            continue;
+        }
         let latest = index >= latest_start;
         let Some(limit) = budget(tool, latest) else {
             continue;
         };
-        if limit == 0 || outcome.content().len() <= limit {
+        if limit == 0 || outcome.content().len() <= limit
+            || (outcome.is_truncated() && outcome.content().contains("\n[Nexus model-context projection: middle of tool output omitted; not a complete result. output_ref="))
+        {
             continue;
         }
         let mut prefix_end = limit / 2;
@@ -489,7 +512,7 @@ fn project_tool_outputs_with(
         while !outcome.content().is_char_boundary(suffix_start) {
             suffix_start += 1;
         }
-        let diagnostics = if tool.name() == "host_exec" {
+        let diagnostics = if !emergency && tool.name() == "host_exec" {
             diagnostic_digest(&outcome.content()[prefix_end..suffix_start])
         } else {
             String::new()
@@ -1729,6 +1752,70 @@ mod tests {
         let mut pending = items.clone();
         pending.push(exchange("pending", EffectState::KnownNotApplied).remove(0));
         assert_eq!(project_old_tool_outputs(&pending, 2048).unwrap(), pending);
+    }
+
+    #[test]
+    fn emergency_projection_shortens_pinned_outputs_and_keeps_pending_calls() {
+        let pinned = |id: &str, bytes: usize| {
+            let mut items = exchange_with("host_exec", "{}", id, EffectState::Unknown);
+            if let ModelContextItem::ToolResult { outcome, .. } = &mut items[1] {
+                *outcome = nexus_core::ToolOutcome::new(
+                    ExecutionStatus::Succeeded,
+                    EffectState::Unknown,
+                    Evidence::HostObserved,
+                    "x".repeat(bytes),
+                    false,
+                )
+                .unwrap();
+            }
+            items
+        };
+        let mut items = vec![ModelContextItem::user_text("task").unwrap()];
+        items.extend(pinned("first", 9000));
+        items.extend(pinned("latest", 9000));
+        let pending = pinned("pending", 1).remove(0);
+        items.push(pending.clone());
+        let original = items.clone();
+        // A pending call makes normal pairing checks reject the transcript;
+        // the emergency path keeps that group intact instead of rewriting it.
+        assert!(!context_calls_are_paired(&items));
+        assert_eq!(project_old_tool_outputs(&items, 512).unwrap(), items);
+
+        let preserved = project_archived_outputs(&items, true).unwrap();
+        assert_eq!(preserved.len(), items.len());
+        assert_eq!(preserved.last(), Some(&pending));
+        assert!(
+            matches!(&preserved[2], ModelContextItem::ToolResult { outcome, .. }
+            if outcome.is_truncated() && outcome.content().len() < 1000)
+        );
+        assert!(
+            matches!(&preserved[4], ModelContextItem::ToolResult { outcome, .. }
+            if !outcome.is_truncated() && outcome.content().len() == 9000)
+        );
+
+        let shortened = project_archived_outputs(&items, false).unwrap();
+        assert!(
+            matches!(&shortened[4], ModelContextItem::ToolResult { outcome, .. }
+            if outcome.is_truncated() && outcome.content().len() < 1000)
+        );
+        for index in [2, 4] {
+            let ModelContextItem::ToolResult { call, outcome, .. } = &shortened[index] else {
+                panic!("expected tool result");
+            };
+            assert_eq!(outcome.effect(), EffectState::Unknown);
+            assert_eq!(outcome.evidence(), Evidence::HostObserved);
+            assert!(
+                outcome
+                    .content()
+                    .contains(&format!("output_ref={}", call.as_str()))
+            );
+            assert!(
+                outcome
+                    .content()
+                    .contains("original_output_truncated=false")
+            );
+        }
+        assert_eq!(items, original, "source records stay unchanged");
     }
 
     #[test]

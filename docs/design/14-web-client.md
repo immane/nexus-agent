@@ -158,8 +158,12 @@ sessions from `GET /sessions`, reads bounded pages from
 `GET /sessions/{id}/history`, restores context without replaying tools, and can
 delete a saved session with `DELETE /sessions/{id}`. This also closes an open
 runtime if it is idle; a run or attached event stream returns `409` without
-deleting history. Titles come from the first saved user item. History rendering
-is bounded; filesystem effects and old
+deleting history. Titles come from the first saved user item. The Web client
+initially shows up to 500 saved records in chronological order, anchored at the
+latest message. For longer sessions it reserves the latest 100 records for full
+detail and prioritizes user messages, assistant replies, edits and writes in the
+older portion. Earlier tool details can be loaded in pages without changing
+the saved records or model context. Filesystem effects and old
 approval grants are never replayed. The provider/model/project binding is kept
 in browser storage because the session checkpoint format does not carry Web
 bindings; a different browser must select valid bindings before restoring.
@@ -200,15 +204,21 @@ session has a filled row, a running session shows a spinner, and a saved
 session whose runtime is still loaded on the server shows a small dot; model and status text stay in the
 row tooltip and accessible name. Add and delete actions appear on hover or focus.
 Without projects, sessions are listed directly under a Sessions label. Rows show
-no timestamps because `GET /sessions` does not report one.
+no timestamps because `GET /sessions` does not report one. **Settings** is the
+last row of the sidebar; with the sidebar collapsed it is reached by expanding
+the sidebar again (or from the Connect button while disconnected).
 
 A panel-icon button at the start of the top bar toggles the sidebar. On wide
 screens it collapses the sidebar and the choice is kept in `localStorage`
 (`nexus.sidebar`). At 720px and below the sidebar is an overlay drawer that
-starts closed; the backdrop, Escape, or choosing a session closes it. Consecutive assistant items after one user message share
+starts closed; the backdrop, Escape, or choosing a session or Settings closes it. On wide
+screens the sidebar's right edge is a resize handle (200–480 px, and at most half
+the window). Dragging, or arrow keys while it is focused, changes the width;
+double-click or Enter restores the default. The width is kept in `localStorage`
+(`nexus.sidebar-width`). Consecutive assistant items after one user message share
 a single speaker label. Approval cards compact after a decision. On narrow
-screens the top bar stays on one row, with icon-only New session and Settings
-buttons and a status dot whose text remains available to assistive technology.
+screens the top bar stays on one row, with an icon-only New session button
+and a status dot whose text remains available to assistive technology.
 
 ## Installed web app
 
@@ -357,7 +367,10 @@ its target run ends; if that run did not succeed, the queue pauses. Adapters
 using opaque continuation defer steering rather than rewriting continuation.
 
 `/btw <question>` in an existing session with a configured model opens a
-standalone answer based on accepted conversation text. It does not use tools,
+standalone answer based on accepted conversation text. The answer dialog shows the
+question, a loading state, the Markdown answer at message text size, usage, and
+Copy answer / Done; a failure is shown in the dialog and the draft is kept.
+Escape, the close button, or the backdrop dismisses it. It does not use tools,
 enter session history, interrupt the current run, or enqueue a prompt.
 
 In a bound local project with an eligible configured model, the assistant can

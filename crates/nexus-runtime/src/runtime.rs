@@ -34,7 +34,7 @@ use nexus_context::CONTEXT_NOTICE_ITEM_KEY;
 use nexus_context::{
     CONTEXT_NOTICE_TEXT, ContextBounds, TokenEstimator, context_calls_are_paired,
     history_exchange_effects_certain, is_context_notice, is_retained_evidence, memory_bytes,
-    project_bounded_history,
+    project_archived_outputs, project_bounded_history,
 };
 use nexus_core::commands::{EventSequence, MAX_TEXT_FRAGMENT_BYTES};
 use nexus_core::{
@@ -2131,7 +2131,7 @@ impl Runtime {
             {
                 return Err(Terminal::limit("model turn budget exhausted"));
             }
-            let compacted = compact_context(active, self.shared.context_items_bound)?;
+            let compacted = compact_live_context(&self.shared, active)?;
             let initial = active.initial_context_reduction.take();
             let combined_reduction = compacted.is_some() && initial.is_some();
             let mut reduction = match (compacted, initial) {
@@ -2507,7 +2507,7 @@ impl Runtime {
                             else {
                                 return Err(Terminal::cancelled());
                             };
-                            compact_context(active, self.shared.context_items_bound)?
+                            compact_live_context(&self.shared, active)?
                         };
                         if let Some(reduction) = reduction {
                             let mut state = self.shared.state.lock().await;
@@ -4359,7 +4359,7 @@ impl Runtime {
         if active.terminal.is_some() {
             return Ok(RunState::Finished);
         }
-        if let Some(reduction) = compact_context(active, self.shared.context_items_bound)? {
+        if let Some(reduction) = compact_live_context(&self.shared, active)? {
             publish_context_reduction(&self.shared, active, run, reduction);
         }
         active.source_cursor = active.conversation.len();
@@ -4910,6 +4910,21 @@ impl Runtime {
                     state.history_safety_exhausted = true;
                 }
             }
+            // The final answer is already persisted. Keep the next run's
+            // retained cache within the local byte budget without publishing
+            // another nonterminal event during finalization; source records
+            // and outcome uncertainty stay unchanged.
+            let memory = memory_bytes(active.derived_memory.as_deref());
+            if outcome == RunOutcome::Completed
+                && source_is_archived(&self.shared, &active)
+                && conversation_bytes(&items).saturating_add(memory)
+                    > nexus_core::provider::MAX_CONVERSATION_BYTES
+                && let Ok(previews) = project_archived_outputs(&items, false)
+                && conversation_bytes(&previews).saturating_add(memory)
+                    <= nexus_core::provider::MAX_CONVERSATION_BYTES
+            {
+                items = previews;
+            }
             // The completed request can contain inherited exchanges plus the
             // new answer. Admit the current exchange as before, then let the
             // cache's whole-exchange eviction enforce its aggregate ceiling.
@@ -5194,14 +5209,38 @@ fn mark_history_omitted(state: &mut State, session: SessionId, removed_items: us
     }
 }
 
-/// Bounded request projection, also used after accepting a turn/result so
-/// active state cannot grow into an unbounded source transcript. A single
-/// bounded provider batch/tool result may transiently exceed the budget.
-/// Inherited user exchanges go first, then oldest complete tool exchanges;
-/// the current user task, newest complete exchange and pending calls stay.
+fn source_is_archived(shared: &Shared, active: &ActiveRun) -> bool {
+    shared.session_store.is_some()
+        && active.source_cursor == active.conversation.len()
+        && active.persistence_error.is_none()
+        && !shared.store_uncertain.load(Ordering::SeqCst)
+}
+
+fn compact_live_context(
+    shared: &Shared,
+    active: &mut ActiveRun,
+) -> Result<Option<ContextReduction>, Terminal> {
+    compact_context_with_archive(
+        active,
+        shared.context_items_bound,
+        source_is_archived(shared, active),
+    )
+}
+
+#[cfg(test)]
 fn compact_context(
     active: &mut ActiveRun,
     bound: usize,
+) -> Result<Option<ContextReduction>, Terminal> {
+    compact_context_with_archive(active, bound, false)
+}
+
+/// Bounds retained context after accepting a turn/result as well as before
+/// dispatch. A single bounded batch can transiently exceed the byte budget.
+fn compact_context_with_archive(
+    active: &mut ActiveRun,
+    bound: usize,
+    archived: bool,
 ) -> Result<Option<ContextReduction>, Terminal> {
     // Stage reductions so a context that ultimately cannot fit is not left
     // partially altered before its explicit limit terminal.
@@ -5238,7 +5277,7 @@ fn compact_context(
         .instruction_bytes
         .saturating_add(note_bytes)
         .saturating_add(context_compaction::projection_overhead(active, note));
-    let projection = project_bounded_history(
+    let projection = bounded_context_projection(
         items,
         active.history_len,
         ContextBounds {
@@ -5247,6 +5286,7 @@ fn compact_context(
             reserved_items: memory_items,
             reserved_bytes,
         },
+        archived,
     )
     .ok_or_else(|| context_limit(active, bound))?;
 
@@ -5263,8 +5303,36 @@ fn compact_context(
         method: nexus_core::ContextReductionMethod::BoundedHistory,
         removed_items: projection.removed_items,
         retained_items: active.conversation.len() + memory_items,
-        retained_bytes: projection.retained_bytes,
+        retained_bytes: conversation_bytes(&active.conversation)
+            .saturating_add(active.instruction_bytes)
+            .saturating_add(active.context_note_bytes)
+            .saturating_add(context_compaction::projection_overhead(
+                active,
+                &active.context_note,
+            )),
     }))
+}
+
+fn bounded_context_projection(
+    items: &[ModelContextItem],
+    history_len: usize,
+    bounds: ContextBounds,
+    archived: bool,
+) -> Option<nexus_context::BoundedProjection> {
+    if let Some(projection) = project_bounded_history(items, history_len, bounds) {
+        return Some(projection);
+    }
+    if archived
+        && conversation_bytes(items).saturating_add(bounds.reserved_bytes) > bounds.max_bytes
+    {
+        for preserve_latest in [true, false] {
+            let previews = project_archived_outputs(items, preserve_latest).ok()?;
+            if let Some(projection) = project_bounded_history(&previews, history_len, bounds) {
+                return Some(projection);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -5330,7 +5398,7 @@ fn bounded_restored_history(
     // turn. A temporary sentinel provides that boundary and is removed before
     // anything is installed into runtime state.
     items.push(ModelContextItem::user_text("restore-boundary").ok()?);
-    let projection = project_bounded_history(
+    let projection = bounded_context_projection(
         &items,
         original_len,
         ContextBounds {
@@ -5339,6 +5407,7 @@ fn bounded_restored_history(
             reserved_items: 0,
             reserved_bytes: 0,
         },
+        true,
     )?;
     let mut retained = projection.items;
     if !matches!(retained.pop(), Some(ModelContextItem::UserText(_))) {
@@ -9361,6 +9430,110 @@ mod cov_runtime_private {
         );
         assert!(reduction.retained_bytes <= nexus_core::MAX_CONVERSATION_BYTES);
         assert_eq!(active.instruction_bytes, nexus_core::MAX_INSTRUCTIONS_BYTES);
+    }
+
+    fn uncertain_context_exchange(run: &RunId, n: usize) -> Vec<ModelContextItem> {
+        let mut items = context_exchange(run, n, 20_000);
+        let ModelContextItem::ToolResult { outcome, .. } = &mut items[1] else {
+            unreachable!();
+        };
+        *outcome = ToolOutcome::new(
+            ExecutionStatus::Succeeded,
+            EffectState::Unknown,
+            Evidence::HostObserved,
+            "x".repeat(20_000),
+            false,
+        )
+        .unwrap();
+        items
+    }
+
+    #[test]
+    fn archived_context_previews_pinned_outputs_with_a_pending_call() {
+        let mut active = context_run();
+        for n in 0..53 {
+            active
+                .conversation
+                .extend(uncertain_context_exchange(&active.run, n));
+        }
+        let pending = uncertain_context_exchange(&active.run, 53).remove(0);
+        active.conversation.push(pending.clone());
+        let original = active.conversation.clone();
+        assert!(compact_context(&mut active, 8192).is_err());
+        assert_eq!(active.conversation, original);
+
+        let reduction = compact_context_with_archive(&mut active, 8192, true)
+            .unwrap_or_else(|_| panic!("durable output previews should fit"))
+            .unwrap();
+        assert_eq!(reduction.removed_items, 0);
+        assert!(reduction.retained_bytes < nexus_core::MAX_CONVERSATION_BYTES);
+        assert_eq!(active.source_cursor, original.len());
+        assert_eq!(active.conversation.last(), Some(&pending));
+        assert_eq!(
+            active.conversation[106], original[106],
+            "latest complete result"
+        );
+        for (before, after) in original.iter().zip(&active.conversation) {
+            match (before, after) {
+                (
+                    ModelContextItem::ToolResult {
+                        outcome: original, ..
+                    },
+                    ModelContextItem::ToolResult { call, outcome, .. },
+                ) => {
+                    assert_eq!(outcome.effect(), EffectState::Unknown);
+                    assert_eq!(outcome.status(), original.status());
+                    assert_eq!(outcome.evidence(), original.evidence());
+                    if outcome.is_truncated() {
+                        assert!(
+                            outcome
+                                .content()
+                                .contains(&format!("output_ref={}", call.as_str()))
+                        );
+                        assert!(
+                            outcome
+                                .content()
+                                .contains("original_output_truncated=false")
+                        );
+                    }
+                }
+                _ => assert_eq!(before, after),
+            }
+        }
+    }
+
+    #[test]
+    fn archived_context_bounds_two_hundred_exchanges_and_restores_original_history() {
+        let mut active = context_run();
+        active.conversation.clear();
+        let mut archive = Vec::new();
+        let mut reductions = 0;
+        for n in 0..200 {
+            active.history_len = active.conversation.len();
+            let mut exchange = vec![ModelContextItem::user_text("next task").unwrap()];
+            exchange.extend(uncertain_context_exchange(&active.run, n));
+            archive.extend(exchange.clone());
+            active.conversation.extend(exchange);
+            active.source_cursor = active.conversation.len();
+            reductions += usize::from(
+                compact_context_with_archive(&mut active, 8192, true)
+                    .unwrap_or_else(|_| panic!("archived exchange {n} should fit"))
+                    .is_some(),
+            );
+            assert!(conversation_bytes(&active.conversation) <= nexus_core::MAX_CONVERSATION_BYTES);
+        }
+        assert!(reductions > 1);
+        assert_eq!(active.conversation.len(), 600);
+        assert!(conversation_bytes(&archive) > 3 * nexus_core::MAX_CONVERSATION_BYTES);
+        let (restored, removed) =
+            bounded_restored_history(archive.clone(), 8192).expect("same history restores");
+        assert_eq!(removed, 0);
+        assert_eq!(restored.len(), archive.len());
+        assert!(context_calls_are_paired(&restored));
+        assert!(conversation_bytes(&restored) < nexus_core::MAX_CONVERSATION_BYTES);
+        assert!(
+            matches!(&archive[2], ModelContextItem::ToolResult { outcome, .. } if outcome.content().len() == 20_000)
+        );
     }
 
     #[test]

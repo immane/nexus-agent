@@ -35,6 +35,7 @@ const dom = {
   sidebar: document.querySelector('#sidebar'),
   sidebarBackdrop: document.querySelector('#sidebar-backdrop'),
   toggleSidebar: document.querySelector('#toggle-sidebar'),
+  sidebarResizer: document.querySelector('#sidebar-resizer'),
   addProjectSidebar: document.querySelector('#add-project-sidebar'),
   projectsNote: document.querySelector('#projects-note'),
   projectList: document.querySelector('#project-list'),
@@ -98,6 +99,10 @@ const dom = {
   sideQuestion: document.querySelector('#side-question'),
   sideQuestionAnswer: document.querySelector('#side-question-answer'),
   sideQuestionUsage: document.querySelector('#side-question-usage'),
+  sideQuestionText: document.querySelector('#side-question-text'),
+  sideQuestionLoading: document.querySelector('#side-question-loading'),
+  sideQuestionClose: document.querySelector('#side-question-close'),
+  sideQuestionCopy: document.querySelector('#side-question-copy'),
   imageLightbox: document.querySelector('#image-lightbox'),
   imageLightboxImage: document.querySelector('#image-lightbox-image'),
   composerActivity: document.querySelector('#composer-activity'),
@@ -352,6 +357,7 @@ function setStatus(element, text, stateName) {
 }
 
 function setRunStatus(text, stateName) {
+  if (state.historyRender) return;
   setStatus(dom.runStatus, text, stateName);
 }
 
@@ -473,6 +479,11 @@ function queueText(textNode, text) {
 }
 
 function appendNode(element) {
+  if (state.historyRender) {
+    element.dataset.historySequence = String(state.historyRender.sequence);
+    state.historyRender.target.append(element);
+    return;
+  }
   flushText();
   dom.conversation.append(element);
   dom.welcome.hidden = true;
@@ -1696,21 +1707,8 @@ async function deleteSavedSession(id) {
 }
 
 async function loadSessionHistory(id) {
-  let after = 0;
-  let complete = false;
-  let pages = 0;
-  const items = [];
-  while (!complete && pages < 5) {
-    const reply = await api(
-      `/sessions/${encodeURIComponent(id)}/history?after=${after}&limit=100`,
-    );
-    const page = Array.isArray(reply?.items) ? reply.items : [];
-    items.push(...page);
-    const next = Number(reply?.next_after);
-    complete = reply?.complete === true || !Number.isInteger(next) || next <= after;
-    if (!complete) after = next;
-    pages += 1;
-  }
+  const path = `/sessions/${encodeURIComponent(id)}/history`;
+  const history = await loadHistoryPreview(path);
   let inbox = null;
   try {
     inbox = await api(`/sessions/${encodeURIComponent(id)}/inbox`);
@@ -1720,11 +1718,72 @@ async function loadSessionHistory(id) {
   if (state.session !== id) return;
   renderPromptInbox(inbox);
   const active = inbox?.recent?.find(item => item.run === inbox.active_run);
-  renderHistory(active ? items.filter(item => item.run !== active.run) : items);
+  const section = node('div', 'saved-history');
+  const content = node('div', 'saved-history');
+  const more = node('button', 'history-more', 'Load earlier history and tool details');
+  more.type = 'button';
+  section.append(more, content);
+  const visible = (records) => active ? records.filter(item => item.run !== active.run) : records;
+  renderHistory(visible(history.items), content);
+  more.hidden = history.cursor <= 1;
+  dom.conversation.hidden = !content.childElementCount && more.hidden;
+  dom.conversation.replaceChildren(...(dom.conversation.hidden ? [] : [section]));
+  dom.welcome.hidden = !dom.conversation.hidden;
+  state.pinned = true;
+  scrollToBottomSoon();
   if (active) startDisplayingRun(active.run, active.input);
-  if (!complete) {
-    addNotice('warning', 'Only the first 500 saved history items were loaded.', 'history-truncated');
+  more.addEventListener('click', async () => {
+    more.disabled = true;
+    try {
+      const page = await loadOlderHistory(path, history.cursor, 1, false);
+      if (state.session !== id || !section.isConnected) return;
+      const top = dom.main.getBoundingClientRect().top;
+      const anchor = [...content.children].find(element => element.getBoundingClientRect().bottom >= top);
+      const position = anchor?.getBoundingClientRect().top;
+      history.items = mergeHistoryItems(history.items, page.items);
+      history.cursor = page.cursor;
+      state.pinned = false;
+      renderHistory(visible(history.items), content);
+      more.hidden = history.cursor <= 1;
+      more.textContent = 'Load earlier history and tool details';
+      const replacement = anchor && [...content.children].find(element =>
+        element.dataset.historySequence === anchor.dataset.historySequence);
+      if (replacement) dom.main.scrollTop += replacement.getBoundingClientRect().top - position;
+      updateJumpLatest();
+    } catch {
+      more.textContent = 'Could not load earlier history. Retry';
+    } finally {
+      more.disabled = false;
+    }
+  });
+}
+
+async function loadHistoryPreview(path) {
+  const latest = await api(`${path}?before=latest&limit=100`);
+  const condensed = latest.last_sequence > 500;
+  const older = await loadOlderHistory(path, latest.next_before, 4, condensed);
+  return {
+    items: mergeHistoryItems(older.items, latest.items),
+    cursor: condensed ? latest.next_before : older.cursor,
+  };
+}
+
+async function loadOlderHistory(path, cursor, pages, important) {
+  const items = [];
+  for (let i = 0; cursor > 1 && i < pages; i += 1) {
+    const reply = await api(`${path}?before=${cursor}&limit=100${important ? '&view=important' : ''}`);
+    if (!Number.isSafeInteger(reply.next_before) || reply.next_before < 1 || reply.next_before >= cursor) {
+      throw new Error('Invalid history pagination response.');
+    }
+    items.push(...reply.items);
+    cursor = reply.next_before;
   }
+  return { items, cursor };
+}
+
+function mergeHistoryItems(...pages) {
+  return [...new Map(pages.flat().map(item => [item.sequence, item])).values()]
+    .sort((left, right) => left.sequence - right.sequence);
 }
 
 function renderHistoricalAssistant(text) {
@@ -1781,16 +1840,26 @@ function renderChildCompletion(item) {
   renderHelperStatus();
 }
 
-function renderHistory(items) {
+function renderHistory(items, target) {
   flushText();
-  for (const job of state.delegateJobs.values()) job.shown = false;
-  projectImageObserver?.disconnect();
-  dom.conversation.replaceChildren();
-  dom.conversation.hidden = true;
-  dom.welcome.hidden = false;
-  state.pinned = true;
+  const { tools, delegateJobs } = state;
+  state.tools = new Map();
+  state.delegateJobs = new Map();
+  target.replaceChildren();
+  state.historyRender = { target, sequence: 0 };
+  try {
+    renderHistoryItems(items);
+  } finally {
+    state.historyRender = null;
+    state.tools = tools;
+    state.delegateJobs = delegateJobs;
+  }
+}
+
+function renderHistoryItems(items) {
   for (const item of items) {
     if (!item || typeof item.kind !== 'string') continue;
+    state.historyRender.sequence = item.sequence;
     if (item.kind === 'user' && typeof item.text === 'string') {
       appendUserMessage(item.text);
     } else if (item.kind === 'assistant' && typeof item.text === 'string') {
@@ -1826,12 +1895,6 @@ function renderHistory(items) {
     }
   }
   markUnfinishedTools();
-  if (dom.conversation.childElementCount) {
-    dom.conversation.hidden = false;
-    dom.welcome.hidden = true;
-  }
-  scrollToBottomSoon();
-  updateJumpLatest();
 }
 
 async function openSavedSession(id) {
@@ -2238,23 +2301,35 @@ async function askSideQuestion(draft, question) {
   if (!state.session || state.askingAside) return;
   const session = state.session;
   state.askingAside = true;
-  dom.sideQuestionAnswer.textContent = 'Asking the model…';
+  state.sideAnswer = '';
+  dom.sideQuestion.dataset.state = 'loading';
+  dom.sideQuestionText.textContent = question;
+  dom.sideQuestionAnswer.textContent = '';
+  dom.sideQuestionLoading.hidden = false;
   dom.sideQuestionUsage.textContent = '';
+  dom.sideQuestionCopy.disabled = true;
   if (!dom.sideQuestion.open) dom.sideQuestion.showModal();
   try {
     const reply = await api(`/sessions/${encodeURIComponent(session)}/side-question`, {
       method: 'POST', body: { question },
     });
     if (state.session !== session) return;
-    renderMarkdown(dom.sideQuestionAnswer, reply.answer || '');
-    const usage = [reply.usage?.input, reply.usage?.output];
-    dom.sideQuestionUsage.textContent = usage.every(value => !Number.isFinite(value))
+    state.sideAnswer = reply.answer || '';
+    renderMarkdown(dom.sideQuestionAnswer, state.sideAnswer);
+    dom.sideQuestion.dataset.state = 'done';
+    dom.sideQuestionCopy.disabled = !state.sideAnswer;
+    const [input, output] = [reply.usage?.input, reply.usage?.output];
+    dom.sideQuestionUsage.textContent = !Number.isFinite(input) && !Number.isFinite(output)
       ? 'Usage not reported'
-      : `Usage: ${usage.map(value => Number.isFinite(value) ? formatTokenCount(value) : '—').join(' / ')} (in / out)`;
+      : `${Number.isFinite(input) ? formatCompactTokens(input) : '—'} in · ${Number.isFinite(output) ? formatCompactTokens(output) : '—'} out`;
     if (dom.message.value === draft) dom.message.value = '';
   } catch (error) {
-    if (state.session === session) dom.sideQuestionAnswer.textContent = error.message;
+    if (state.session === session) {
+      dom.sideQuestion.dataset.state = 'error';
+      dom.sideQuestionAnswer.textContent = `Could not answer: ${error.message}`;
+    }
   } finally {
+    dom.sideQuestionLoading.hidden = true;
     state.askingAside = false;
     updateControls();
   }
@@ -2353,7 +2428,8 @@ function appendUserMessage(text) {
 // True when an assistant message already follows the latest user message,
 // so a new assistant item continues the same reply visually.
 function continuesAssistantReply() {
-  for (let element = dom.conversation.lastElementChild; element; element = element.previousElementSibling) {
+  const target = state.historyRender?.target || dom.conversation;
+  for (let element = target.lastElementChild; element; element = element.previousElementSibling) {
     if (element.classList.contains('user')) return false;
     if (element.classList.contains('assistant')) return true;
   }
@@ -4032,9 +4108,12 @@ function appendContextNotice(detail) {
   const byteText = retainedBytes !== null && byteLimit !== null
     ? ` · ${retainedBytes}/${byteLimit} bytes retained`
     : '';
+  const reduction = method === 'bounded-history' && removed === 0
+    ? 'archived tool output shortened for the local limit'
+    : `${removed} item${removed === 1 ? '' : 's'} removed using ${method}`;
   addNotice(
     'info',
-    `Context reduced: ${removed} item${removed === 1 ? '' : 's'} removed using ${method}${itemText}${byteText}.`,
+    `Context reduced: ${reduction}${itemText}${byteText}.`,
     `context-${detail.removed_items ?? 'unknown'}`,
   );
 }
@@ -4248,7 +4327,7 @@ function startTool(detail) {
   const call = String(detail.call ?? '');
   if (!call || state.tools.has(call)) return;
   flushText();
-  markStreamingDone();
+  if (!state.historyRender) markStreamingDone();
   const toolName = typeof detail.tool === 'string' ? detail.tool : 'tool';
   if (HIDDEN_TOOL_NAMES.has(toolName)) {
     setRunStatus(toolName === 'host_list' ? 'Listing project files…' : 'Reading project file…', 'busy');
@@ -4406,7 +4485,9 @@ function markUnfinishedTools() {
       setStatus(record.status, 'No final result received', 'error');
       record.root.dataset.state = 'error';
       record.root.open = true;
-      record.meta.append(node('span', '', 'The run finished before this call reported a result'));
+      record.meta.append(node('span', '', state.historyRender
+        ? 'No result in the loaded history'
+        : 'The run finished before this call reported a result'));
     }
   }
 }
@@ -4649,7 +4730,13 @@ function appendRunSummary(detail, fromSnapshot) {
   if (detail.error && typeof detail.error === 'object') {
     const errorBlock = node('div', 'run-detail');
     errorBlock.append(node('div', '', `${detail.error.category || 'Error'} · ${retryLabel(detail.error.retry)}`));
-    if (detail.error.message) errorBlock.append(node('pre', '', String(detail.error.message)));
+    if (detail.error.message) {
+      const message = String(detail.error.message);
+      if (detail.error.category === 'ResourceLimit' && message.startsWith('context budget exhausted:')) {
+        errorBlock.append(node('div', '', 'Nexus reached its local context limit, not the model token window.'));
+      }
+      errorBlock.append(node('pre', '', message));
+    }
     card.append(errorBlock);
   }
   if (fromSnapshot) {
@@ -5599,6 +5686,7 @@ function updateToolsModeChip() {
 }
 
 function renderHelperStatus() {
+  if (state.historyRender) return;
   let running = 0;
   const tasks = [];
   if (state.active) {
@@ -5880,6 +5968,90 @@ function closeNarrowSidebar() {
   }
 }
 
+/* Sidebar width */
+
+const SIDEBAR_WIDTH_KEY = 'nexus.sidebar-width';
+const SIDEBAR_WIDTH = { min: 200, max: 480, step: 16 };
+
+// Keeps the sidebar within its limits and leaves room for the conversation.
+function clampSidebarWidth(width, viewport) {
+  const room = Number.isFinite(viewport) ? Math.max(SIDEBAR_WIDTH.min, Math.floor(viewport * 0.5)) : SIDEBAR_WIDTH.max;
+  const number = Number(width);
+  if (!Number.isFinite(number)) return null;
+  return Math.round(Math.min(SIDEBAR_WIDTH.max, room, Math.max(SIDEBAR_WIDTH.min, number)));
+}
+
+function viewportCssWidth() {
+  return window.innerWidth / interfaceZoom();
+}
+
+function setSidebarWidth(width, { persist = false } = {}) {
+  const value = width === null ? null : clampSidebarWidth(width, viewportCssWidth());
+  if (value === null) document.body.style.removeProperty('--sidebar-custom-width');
+  else document.body.style.setProperty('--sidebar-custom-width', `${value}px`);
+  dom.sidebarResizer.setAttribute('aria-valuenow', String(Math.round(currentSidebarWidth())));
+  if (!persist) return;
+  try {
+    if (value === null) localStorage.removeItem(SIDEBAR_WIDTH_KEY);
+    else localStorage.setItem(SIDEBAR_WIDTH_KEY, String(value));
+  } catch {
+    // The width still applies to this page.
+  }
+}
+
+function restoreSidebarWidth() {
+  let saved = null;
+  try {
+    saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+  } catch {
+    saved = null;
+  }
+  setSidebarWidth(saved === null ? null : Number(saved));
+}
+
+// The logical width, not the measured one: the column animates between values.
+function currentSidebarWidth() {
+  const style = getComputedStyle(document.body);
+  return parseFloat(style.getPropertyValue('--sidebar-custom-width'))
+    || parseFloat(style.getPropertyValue('--sidebar-width'))
+    || 260;
+}
+
+dom.sidebarResizer.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || narrowSidebar.matches) return;
+  event.preventDefault();
+  dom.sidebarResizer.setPointerCapture(event.pointerId);
+  document.body.dataset.resizing = 'sidebar';
+  const left = dom.sidebar.getBoundingClientRect().left;
+  const move = (moveEvent) => setSidebarWidth((moveEvent.clientX - left) / interfaceZoom());
+  const end = () => {
+    delete document.body.dataset.resizing;
+    dom.sidebarResizer.removeEventListener('pointermove', move);
+    setSidebarWidth(currentSidebarWidth(), { persist: true });
+  };
+  dom.sidebarResizer.addEventListener('pointermove', move);
+  dom.sidebarResizer.addEventListener('pointerup', end, { once: true });
+  dom.sidebarResizer.addEventListener('pointercancel', end, { once: true });
+});
+dom.sidebarResizer.addEventListener('dblclick', () => setSidebarWidth(null, { persist: true }));
+dom.sidebarResizer.addEventListener('keydown', (event) => {
+  const delta = { ArrowLeft: -SIDEBAR_WIDTH.step, ArrowRight: SIDEBAR_WIDTH.step }[event.key];
+  if (delta) {
+    event.preventDefault();
+    setSidebarWidth(currentSidebarWidth() + delta, { persist: true });
+  } else if (event.key === 'Home' || event.key === 'End') {
+    event.preventDefault();
+    setSidebarWidth(event.key === 'Home' ? SIDEBAR_WIDTH.min : SIDEBAR_WIDTH.max, { persist: true });
+  } else if (event.key === 'Enter') {
+    event.preventDefault();
+    setSidebarWidth(null, { persist: true });
+  }
+});
+window.addEventListener('resize', () => {
+  if (document.body.style.getPropertyValue('--sidebar-custom-width')) setSidebarWidth(currentSidebarWidth());
+});
+restoreSidebarWidth();
+
 /* Settings navigation */
 
 function selectSettingsSection(id) {
@@ -5908,6 +6080,20 @@ dom.openSettings.addEventListener('click', () => {
 });
 dom.closeSettings.addEventListener('click', () => dom.settings.close());
 dom.welcomeConnect.addEventListener('click', () => dom.openSettings.click());
+dom.sideQuestionClose.addEventListener('click', () => dom.sideQuestion.close());
+// Clicking the dimmed backdrop (the dialog element itself) dismisses it.
+dom.sideQuestion.addEventListener('click', (event) => {
+  if (event.target === dom.sideQuestion) dom.sideQuestion.close();
+});
+dom.sideQuestionCopy.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(state.sideAnswer || '');
+    dom.sideQuestionCopy.textContent = 'Copied';
+  } catch {
+    dom.sideQuestionCopy.textContent = 'Copy failed';
+  }
+  setTimeout(() => { dom.sideQuestionCopy.textContent = 'Copy answer'; }, 1500);
+});
 dom.modelMenu.addEventListener('toggle', (event) => {
   dom.modelTrigger.setAttribute('aria-expanded', String(event.newState === 'open'));
   if (event.newState === 'open') {
@@ -5957,7 +6143,7 @@ dom.sidebar.addEventListener('keydown', (event) => {
 });
 // Choosing something in the drawer returns to the conversation.
 dom.sidebar.addEventListener('click', (event) => {
-  if (event.target.closest('.tree-session-open, .tree-project-add, #new-session, #add-project-sidebar')) {
+  if (event.target.closest('.tree-session-open, .tree-project-add, #new-session, #add-project-sidebar, #open-settings')) {
     closeNarrowSidebar();
   }
 });

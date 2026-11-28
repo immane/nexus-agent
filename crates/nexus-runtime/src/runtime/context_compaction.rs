@@ -560,10 +560,7 @@ pub(super) fn prepare_context_request(
     let output = active.context_management.output_reserve_tokens(window);
     // Only archived sources may be replaced with compact execution facts.
     // Ephemeral runs retain the existing uncertainty-pinning behavior.
-    let archived = shared.session_store.is_some()
-        && active.source_cursor == active.conversation.len()
-        && active.persistence_error.is_none()
-        && !shared.store_uncertain.load(Ordering::SeqCst);
+    let archived = source_is_archived(shared, active);
     if (needs_compaction(input, window, policy.trigger_percent())
         || input.saturating_add(output) > window)
         && active.continuation.is_none()
