@@ -66,6 +66,26 @@ use nexus_tools::{ProjectImageReader, ScopedReader};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+fn important_history_item(item: &nexus_core::ModelContextItem) -> bool {
+    use nexus_core::ModelContextItem::*;
+    let is_edit = |name: &str| matches!(name, "host_patch" | "host_write");
+    match item {
+        UserText(_) | AssistantText { .. } | ChildCompletion(_) => true,
+        AssistantCall { call, .. } => is_edit(call.tool().name()),
+        AssistantDeniedCall { candidate, .. } => is_edit(candidate.tool_name()),
+        ToolResult { tool, outcome, .. } => {
+            is_edit(tool.name())
+                || matches!(
+                    outcome.status(),
+                    nexus_core::ExecutionStatus::Failed
+                        | nexus_core::ExecutionStatus::Interrupted
+                        | nexus_core::ExecutionStatus::TimedOut
+                )
+        }
+        _ => false,
+    }
+}
+
 #[path = "exploration.rs"]
 mod exploration;
 
@@ -1736,7 +1756,29 @@ impl Server {
                     .query("limit")
                     .and_then(|value| value.parse::<usize>().ok())
                     .map_or(100, |value| value.clamp(1, 100));
-                Some(self.saved_history(session, after, limit))
+                if let Some(before) = request.query("before") {
+                    let before = match before {
+                        "latest" => u64::MAX,
+                        value => match value.parse::<u64>() {
+                            Ok(cursor) if cursor > 0 => cursor,
+                            _ => {
+                                return Some(json_response(
+                                    400,
+                                    &json::error_body("invalid history cursor"),
+                                ));
+                            }
+                        },
+                    };
+                    Some(self.saved_history_page(
+                        session,
+                        after,
+                        limit,
+                        Some(before),
+                        request.query("view") == Some("important"),
+                    ))
+                } else {
+                    Some(self.saved_history(session, after, limit))
+                }
             }
             Route::ProjectImage { session } => self.with_session(session, |entry| {
                 let Some(path) = body_str(body, "path") else {
@@ -1934,6 +1976,17 @@ impl Server {
     /// Reads one bounded page of durable source history for display. It never
     /// dispatches tools or restores a runtime.
     fn saved_history(&self, session: &str, after: u64, limit: usize) -> Response {
+        self.saved_history_page(session, after, limit, None, false)
+    }
+
+    fn saved_history_page(
+        &self,
+        session: &str,
+        after: u64,
+        limit: usize,
+        before: Option<u64>,
+        important: bool,
+    ) -> Response {
         let Some(store) = self.session_store.clone() else {
             return json_response(409, &json::error_body("session persistence is not enabled"));
         };
@@ -1949,13 +2002,64 @@ impl Server {
                 return json_response(404, &json::error_body("saved session was not found"));
             }
         };
+        let last = match store.last_source_sequence(&session) {
+            Ok(last) => last,
+            Err(_) => {
+                return json_response(503, &json::error_body("session history is unavailable"));
+            }
+        };
+        if let Some(before) = before {
+            let mut cursor = before.min(last.saturating_add(1));
+            let mut items = Vec::new();
+            while cursor > 1 && items.len() < limit {
+                let start = cursor.saturating_sub(101).max(1);
+                let count = (cursor - start) as usize;
+                let Ok(records) = store.load_source_records(&session, start - 1, count) else {
+                    return json_response(503, &json::error_body("session history is unavailable"));
+                };
+                let end = cursor;
+                cursor = start;
+                for record in records
+                    .iter()
+                    .rev()
+                    .filter(|record| record.sequence() < end)
+                {
+                    cursor = record.sequence();
+                    if !important || important_history_item(record.item()) {
+                        let mut item = json::history_item_json(record);
+                        if important
+                            && item["kind"] == "tool-result"
+                            && !matches!(item["tool"].as_str(), Some("host_patch" | "host_write"))
+                        {
+                            item.as_object_mut()
+                                .expect("history item is an object")
+                                .remove("content");
+                        }
+                        items.push(item);
+                        if items.len() == limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            items.reverse();
+            return json_response(
+                200,
+                &body_json(serde_json::json!({
+                    "session": session.as_str(),
+                    "items": items,
+                    "last_sequence": last,
+                    "next_before": cursor,
+                    "complete": cursor <= 1,
+                })),
+            );
+        }
         let records = match store.load_source_records(&session, after, limit) {
             Ok(records) => records,
             Err(_) => {
                 return json_response(503, &json::error_body("session history is unavailable"));
             }
         };
-        let last = store.last_source_sequence(&session).unwrap_or(0);
         let next_after = records.last().map_or(after, |record| record.sequence());
         let items: Vec<Value> = records.iter().map(json::history_item_json).collect();
         json_response(
@@ -3573,7 +3677,7 @@ enum Route<'a> {
     CreateSession,
     /// `POST /sessions/{sid}/restore`: open a saved session.
     RestoreSaved { session: &'a str },
-    /// `GET /sessions/{sid}/history?after=<seq>&limit=<n>`.
+    /// `GET /sessions/{sid}/history?after=<seq>&limit=<n>` or `before=latest|<seq>`.
     SavedHistory { session: &'a str },
     /// `POST /sessions/{sid}/project-image` with a project-local image path.
     ProjectImage { session: &'a str },
@@ -4256,6 +4360,23 @@ mod tests {
         assert_eq!(history["complete"], true);
         assert_eq!(history["items"][0]["kind"], "user");
         assert_eq!(history["items"][1]["text"], "persisted answer");
+        let latest: Value = serde_json::from_slice(
+            &server
+                .saved_history_page(session.as_str(), 0, 1, Some(u64::MAX), false)
+                .body,
+        )
+        .unwrap();
+        assert_eq!(latest["last_sequence"], 2);
+        assert_eq!(latest["items"][0]["sequence"], 2);
+        assert_eq!(latest["next_before"], 2);
+        let older: Value = serde_json::from_slice(
+            &server
+                .saved_history_page(session.as_str(), 0, 1, Some(2), true)
+                .body,
+        )
+        .unwrap();
+        assert_eq!(older["items"][0]["sequence"], 1);
+        assert_eq!(older["complete"], true);
 
         let restored = match server.restore_session(session.as_str(), None, None, None, true) {
             Ok(restored) => restored,

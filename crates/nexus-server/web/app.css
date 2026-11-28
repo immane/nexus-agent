@@ -1215,6 +1215,16 @@ kbd,
   gap: 22px;
 }
 
+.saved-history {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.history-more {
+  align-self: center;
+}
+
 .message {
   display: flex;
   flex-direction: column;

@@ -353,6 +353,7 @@ function setStatus(element, text, stateName) {
 }
 
 function setRunStatus(text, stateName) {
+  if (state.historyRender) return;
   setStatus(dom.runStatus, text, stateName);
 }
 
@@ -474,6 +475,11 @@ function queueText(textNode, text) {
 }
 
 function appendNode(element) {
+  if (state.historyRender) {
+    element.dataset.historySequence = String(state.historyRender.sequence);
+    state.historyRender.target.append(element);
+    return;
+  }
   flushText();
   dom.conversation.append(element);
   dom.welcome.hidden = true;
@@ -1697,21 +1703,8 @@ async function deleteSavedSession(id) {
 }
 
 async function loadSessionHistory(id) {
-  let after = 0;
-  let complete = false;
-  let pages = 0;
-  const items = [];
-  while (!complete && pages < 5) {
-    const reply = await api(
-      `/sessions/${encodeURIComponent(id)}/history?after=${after}&limit=100`,
-    );
-    const page = Array.isArray(reply?.items) ? reply.items : [];
-    items.push(...page);
-    const next = Number(reply?.next_after);
-    complete = reply?.complete === true || !Number.isInteger(next) || next <= after;
-    if (!complete) after = next;
-    pages += 1;
-  }
+  const path = `/sessions/${encodeURIComponent(id)}/history`;
+  const history = await loadHistoryPreview(path);
   let inbox = null;
   try {
     inbox = await api(`/sessions/${encodeURIComponent(id)}/inbox`);
@@ -1721,11 +1714,72 @@ async function loadSessionHistory(id) {
   if (state.session !== id) return;
   renderPromptInbox(inbox);
   const active = inbox?.recent?.find(item => item.run === inbox.active_run);
-  renderHistory(active ? items.filter(item => item.run !== active.run) : items);
+  const section = node('div', 'saved-history');
+  const content = node('div', 'saved-history');
+  const more = node('button', 'history-more', 'Load earlier history and tool details');
+  more.type = 'button';
+  section.append(more, content);
+  const visible = (records) => active ? records.filter(item => item.run !== active.run) : records;
+  renderHistory(visible(history.items), content);
+  more.hidden = history.cursor <= 1;
+  dom.conversation.hidden = !content.childElementCount && more.hidden;
+  dom.conversation.replaceChildren(...(dom.conversation.hidden ? [] : [section]));
+  dom.welcome.hidden = !dom.conversation.hidden;
+  state.pinned = true;
+  scrollToBottomSoon();
   if (active) startDisplayingRun(active.run, active.input);
-  if (!complete) {
-    addNotice('warning', 'Only the first 500 saved history items were loaded.', 'history-truncated');
+  more.addEventListener('click', async () => {
+    more.disabled = true;
+    try {
+      const page = await loadOlderHistory(path, history.cursor, 1, false);
+      if (state.session !== id || !section.isConnected) return;
+      const top = dom.main.getBoundingClientRect().top;
+      const anchor = [...content.children].find(element => element.getBoundingClientRect().bottom >= top);
+      const position = anchor?.getBoundingClientRect().top;
+      history.items = mergeHistoryItems(history.items, page.items);
+      history.cursor = page.cursor;
+      state.pinned = false;
+      renderHistory(visible(history.items), content);
+      more.hidden = history.cursor <= 1;
+      more.textContent = 'Load earlier history and tool details';
+      const replacement = anchor && [...content.children].find(element =>
+        element.dataset.historySequence === anchor.dataset.historySequence);
+      if (replacement) dom.main.scrollTop += replacement.getBoundingClientRect().top - position;
+      updateJumpLatest();
+    } catch {
+      more.textContent = 'Could not load earlier history. Retry';
+    } finally {
+      more.disabled = false;
+    }
+  });
+}
+
+async function loadHistoryPreview(path) {
+  const latest = await api(`${path}?before=latest&limit=100`);
+  const condensed = latest.last_sequence > 500;
+  const older = await loadOlderHistory(path, latest.next_before, 4, condensed);
+  return {
+    items: mergeHistoryItems(older.items, latest.items),
+    cursor: condensed ? latest.next_before : older.cursor,
+  };
+}
+
+async function loadOlderHistory(path, cursor, pages, important) {
+  const items = [];
+  for (let i = 0; cursor > 1 && i < pages; i += 1) {
+    const reply = await api(`${path}?before=${cursor}&limit=100${important ? '&view=important' : ''}`);
+    if (!Number.isSafeInteger(reply.next_before) || reply.next_before < 1 || reply.next_before >= cursor) {
+      throw new Error('Invalid history pagination response.');
+    }
+    items.push(...reply.items);
+    cursor = reply.next_before;
   }
+  return { items, cursor };
+}
+
+function mergeHistoryItems(...pages) {
+  return [...new Map(pages.flat().map(item => [item.sequence, item])).values()]
+    .sort((left, right) => left.sequence - right.sequence);
 }
 
 function renderHistoricalAssistant(text) {
@@ -1782,16 +1836,26 @@ function renderChildCompletion(item) {
   renderHelperStatus();
 }
 
-function renderHistory(items) {
+function renderHistory(items, target) {
   flushText();
-  for (const job of state.delegateJobs.values()) job.shown = false;
-  projectImageObserver?.disconnect();
-  dom.conversation.replaceChildren();
-  dom.conversation.hidden = true;
-  dom.welcome.hidden = false;
-  state.pinned = true;
+  const { tools, delegateJobs } = state;
+  state.tools = new Map();
+  state.delegateJobs = new Map();
+  target.replaceChildren();
+  state.historyRender = { target, sequence: 0 };
+  try {
+    renderHistoryItems(items);
+  } finally {
+    state.historyRender = null;
+    state.tools = tools;
+    state.delegateJobs = delegateJobs;
+  }
+}
+
+function renderHistoryItems(items) {
   for (const item of items) {
     if (!item || typeof item.kind !== 'string') continue;
+    state.historyRender.sequence = item.sequence;
     if (item.kind === 'user' && typeof item.text === 'string') {
       appendUserMessage(item.text);
     } else if (item.kind === 'assistant' && typeof item.text === 'string') {
@@ -1827,12 +1891,6 @@ function renderHistory(items) {
     }
   }
   markUnfinishedTools();
-  if (dom.conversation.childElementCount) {
-    dom.conversation.hidden = false;
-    dom.welcome.hidden = true;
-  }
-  scrollToBottomSoon();
-  updateJumpLatest();
 }
 
 async function openSavedSession(id) {
@@ -2354,7 +2412,8 @@ function appendUserMessage(text) {
 // True when an assistant message already follows the latest user message,
 // so a new assistant item continues the same reply visually.
 function continuesAssistantReply() {
-  for (let element = dom.conversation.lastElementChild; element; element = element.previousElementSibling) {
+  const target = state.historyRender?.target || dom.conversation;
+  for (let element = target.lastElementChild; element; element = element.previousElementSibling) {
     if (element.classList.contains('user')) return false;
     if (element.classList.contains('assistant')) return true;
   }
@@ -4252,7 +4311,7 @@ function startTool(detail) {
   const call = String(detail.call ?? '');
   if (!call || state.tools.has(call)) return;
   flushText();
-  markStreamingDone();
+  if (!state.historyRender) markStreamingDone();
   const toolName = typeof detail.tool === 'string' ? detail.tool : 'tool';
   if (HIDDEN_TOOL_NAMES.has(toolName)) {
     setRunStatus(toolName === 'host_list' ? 'Listing project files…' : 'Reading project file…', 'busy');
@@ -4410,7 +4469,9 @@ function markUnfinishedTools() {
       setStatus(record.status, 'No final result received', 'error');
       record.root.dataset.state = 'error';
       record.root.open = true;
-      record.meta.append(node('span', '', 'The run finished before this call reported a result'));
+      record.meta.append(node('span', '', state.historyRender
+        ? 'No result in the loaded history'
+        : 'The run finished before this call reported a result'));
     }
   }
 }
@@ -5609,6 +5670,7 @@ function updateToolsModeChip() {
 }
 
 function renderHelperStatus() {
+  if (state.historyRender) return;
   let running = 0;
   const tasks = [];
   if (state.active) {

@@ -5,6 +5,31 @@ import vm from 'node:vm';
 
 const source = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
 
+test('long histories load the latest page and prioritize older important records', async () => {
+  const paths = [];
+  const context = vm.createContext({
+    api: async (path) => {
+      paths.push(path);
+      if (paths.length === 1) return { last_sequence: 700, next_before: 601, items: [{ sequence: 700 }] };
+      if (paths.length === 2) return { next_before: 1, items: [{ sequence: 4 }, { sequence: 2 }] };
+      return { next_before: 3, items: [{ sequence: 3 }, { sequence: 4, content: 'full result' }] };
+    },
+  });
+  vm.runInContext(source.slice(source.indexOf('async function loadHistoryPreview('),
+    source.indexOf('function renderHistoricalAssistant(')), context);
+  const preview = await vm.runInContext(`loadHistoryPreview('/history')`, context);
+  assert.deepEqual(paths, ['/history?before=latest&limit=100', '/history?before=601&limit=100&view=important']);
+  assert.deepEqual(Array.from(preview.items, item => item.sequence), [2, 4, 700]);
+  assert.equal(preview.cursor, 601, 'hidden tool details remain available from the recent boundary');
+  const result = await vm.runInContext(`(async () => {
+    const page = await loadOlderHistory('/history', 5, 1, false);
+    return mergeHistoryItems([{ sequence: 4 }, { sequence: 9 }], page.items);
+  })()`, context);
+  assert.equal(paths.at(-1), '/history?before=5&limit=100');
+  assert.deepEqual(Array.from(result, item => item.sequence), [3, 4, 9]);
+  assert.equal(result[1].content, 'full result');
+});
+
 function fixture(respond) {
   const state = {
     connected: true, session: 'old', selection: { provider: 'local', model: 'fast' },
