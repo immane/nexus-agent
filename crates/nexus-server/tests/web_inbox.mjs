@@ -14,9 +14,12 @@ function fixture() {
   const state = { session: 'session', run: 'first', active: true, connected: true };
   const dom = {
     message: { value: 'second task' },
-    sideQuestion: { open: false, showModal() { this.open = true; } },
+    sideQuestion: { open: false, dataset: {}, showModal() { this.open = true; } },
     sideQuestionAnswer: { textContent: '' },
     sideQuestionUsage: { textContent: '' },
+    sideQuestionText: { textContent: '' },
+    sideQuestionLoading: { hidden: true },
+    sideQuestionCopy: { disabled: true },
   };
   const inbox = {
     items: [{ id: 'draft', input: 'second task' }],
@@ -101,6 +104,10 @@ test('/btw opens a separate answer without queueing or adding a user turn', asyn
   assert.equal(f.dom.sideQuestion.open, true);
   assert.equal(f.dom.sideQuestionAnswer.textContent, 'An aside.');
   assert.equal(f.dom.sideQuestionUsage.textContent, 'Usage not reported');
+  assert.equal(f.dom.sideQuestionText.textContent, 'why?');
+  assert.equal(f.dom.sideQuestion.dataset.state, 'done');
+  assert.equal(f.dom.sideQuestionLoading.hidden, true);
+  assert.equal(f.dom.sideQuestionCopy.disabled, false);
   assert.equal(f.state.run, 'first');
   assert.deepEqual(f.messages, []);
 });
@@ -143,4 +150,17 @@ test('child completion renders as a helper card through the safe Markdown path',
   assert.match(rendered[0].children[1].children[1].text, /Helper usage 12 in · 3 out/);
   vm.runInContext(`renderChildCompletion({job_id: 'job-1', status: 'completed', text: 'again'})`, context);
   assert.equal(rendered.length, 1, 'a job result renders once');
+});
+
+test('/btw failures show an error state and keep the draft for another try', async () => {
+  const f = fixture();
+  f.dom.message.value = '/btw why?';
+  f.run("api = async () => { throw new Error('provider unavailable'); }");
+  await f.run('sendMessage()');
+  assert.equal(f.dom.sideQuestion.open, true);
+  assert.equal(f.dom.sideQuestion.dataset.state, 'error');
+  assert.equal(f.dom.sideQuestionAnswer.textContent, 'Could not answer: provider unavailable');
+  assert.equal(f.dom.sideQuestionLoading.hidden, true);
+  assert.equal(f.dom.sideQuestionCopy.disabled, true);
+  assert.equal(f.dom.message.value, '/btw why?');
 });

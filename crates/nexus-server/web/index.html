@@ -116,11 +116,27 @@
       </div>
     </section>
   </div>
-  <dialog id="side-question" aria-labelledby="side-question-title">
-    <div class="dialog-heading"><h2 id="side-question-title">Side question</h2></div>
-    <div class="prose" id="side-question-answer"></div>
-    <p id="side-question-usage"></p>
-    <form method="dialog"><button type="submit">Close</button></form>
+  <dialog class="side-question" id="side-question" aria-labelledby="side-question-title" aria-describedby="side-question-note">
+    <header class="side-question-head">
+      <span class="side-question-icon" aria-hidden="true"></span>
+      <div class="side-question-titles">
+        <h2 id="side-question-title">Side question</h2>
+        <p class="muted" id="side-question-note">Answered from this conversation. Not added to history and does not affect the current run.</p>
+      </div>
+      <button class="icon-button" id="side-question-close" type="button" aria-label="Close side question">✕</button>
+    </header>
+    <div class="side-question-body">
+      <p class="side-question-asked" id="side-question-text"></p>
+      <div class="side-question-loading" id="side-question-loading" role="status" hidden><span class="loading-spinner" aria-hidden="true"></span><span>Asking the model…</span></div>
+      <div class="prose side-question-answer" id="side-question-answer" aria-live="polite"></div>
+    </div>
+    <footer class="side-question-foot">
+      <span class="side-question-usage" id="side-question-usage"></span>
+      <div class="side-question-actions">
+        <button id="side-question-copy" type="button" disabled>Copy answer</button>
+        <form method="dialog"><button class="primary" type="submit">Done</button></form>
+      </div>
+    </footer>
   </dialog>
   <div id="image-lightbox" class="image-lightbox" hidden tabindex="-1">
     <img id="image-lightbox-image" alt="">

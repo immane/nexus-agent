@@ -99,6 +99,10 @@ const dom = {
   sideQuestion: document.querySelector('#side-question'),
   sideQuestionAnswer: document.querySelector('#side-question-answer'),
   sideQuestionUsage: document.querySelector('#side-question-usage'),
+  sideQuestionText: document.querySelector('#side-question-text'),
+  sideQuestionLoading: document.querySelector('#side-question-loading'),
+  sideQuestionClose: document.querySelector('#side-question-close'),
+  sideQuestionCopy: document.querySelector('#side-question-copy'),
   imageLightbox: document.querySelector('#image-lightbox'),
   imageLightboxImage: document.querySelector('#image-lightbox-image'),
   composerActivity: document.querySelector('#composer-activity'),
@@ -2297,23 +2301,35 @@ async function askSideQuestion(draft, question) {
   if (!state.session || state.askingAside) return;
   const session = state.session;
   state.askingAside = true;
-  dom.sideQuestionAnswer.textContent = 'Asking the model…';
+  state.sideAnswer = '';
+  dom.sideQuestion.dataset.state = 'loading';
+  dom.sideQuestionText.textContent = question;
+  dom.sideQuestionAnswer.textContent = '';
+  dom.sideQuestionLoading.hidden = false;
   dom.sideQuestionUsage.textContent = '';
+  dom.sideQuestionCopy.disabled = true;
   if (!dom.sideQuestion.open) dom.sideQuestion.showModal();
   try {
     const reply = await api(`/sessions/${encodeURIComponent(session)}/side-question`, {
       method: 'POST', body: { question },
     });
     if (state.session !== session) return;
-    renderMarkdown(dom.sideQuestionAnswer, reply.answer || '');
-    const usage = [reply.usage?.input, reply.usage?.output];
-    dom.sideQuestionUsage.textContent = usage.every(value => !Number.isFinite(value))
+    state.sideAnswer = reply.answer || '';
+    renderMarkdown(dom.sideQuestionAnswer, state.sideAnswer);
+    dom.sideQuestion.dataset.state = 'done';
+    dom.sideQuestionCopy.disabled = !state.sideAnswer;
+    const [input, output] = [reply.usage?.input, reply.usage?.output];
+    dom.sideQuestionUsage.textContent = !Number.isFinite(input) && !Number.isFinite(output)
       ? 'Usage not reported'
-      : `Usage: ${usage.map(value => Number.isFinite(value) ? formatTokenCount(value) : '—').join(' / ')} (in / out)`;
+      : `${Number.isFinite(input) ? formatCompactTokens(input) : '—'} in · ${Number.isFinite(output) ? formatCompactTokens(output) : '—'} out`;
     if (dom.message.value === draft) dom.message.value = '';
   } catch (error) {
-    if (state.session === session) dom.sideQuestionAnswer.textContent = error.message;
+    if (state.session === session) {
+      dom.sideQuestion.dataset.state = 'error';
+      dom.sideQuestionAnswer.textContent = `Could not answer: ${error.message}`;
+    }
   } finally {
+    dom.sideQuestionLoading.hidden = true;
     state.askingAside = false;
     updateControls();
   }
@@ -6064,6 +6080,20 @@ dom.openSettings.addEventListener('click', () => {
 });
 dom.closeSettings.addEventListener('click', () => dom.settings.close());
 dom.welcomeConnect.addEventListener('click', () => dom.openSettings.click());
+dom.sideQuestionClose.addEventListener('click', () => dom.sideQuestion.close());
+// Clicking the dimmed backdrop (the dialog element itself) dismisses it.
+dom.sideQuestion.addEventListener('click', (event) => {
+  if (event.target === dom.sideQuestion) dom.sideQuestion.close();
+});
+dom.sideQuestionCopy.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(state.sideAnswer || '');
+    dom.sideQuestionCopy.textContent = 'Copied';
+  } catch {
+    dom.sideQuestionCopy.textContent = 'Copy failed';
+  }
+  setTimeout(() => { dom.sideQuestionCopy.textContent = 'Copy answer'; }, 1500);
+});
 dom.modelMenu.addEventListener('toggle', (event) => {
   dom.modelTrigger.setAttribute('aria-expanded', String(event.newState === 'open'));
   if (event.newState === 'open') {

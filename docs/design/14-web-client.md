@@ -367,7 +367,10 @@ its target run ends; if that run did not succeed, the queue pauses. Adapters
 using opaque continuation defer steering rather than rewriting continuation.
 
 `/btw <question>` in an existing session with a configured model opens a
-standalone answer based on accepted conversation text. It does not use tools,
+standalone answer based on accepted conversation text. The answer dialog shows the
+question, a loading state, the Markdown answer at message text size, usage, and
+Copy answer / Done; a failure is shown in the dialog and the draft is kept.
+Escape, the close button, or the backdrop dismisses it. It does not use tools,
 enter session history, interrupt the current run, or enqueue a prompt.
 
 In a bound local project with an eligible configured model, the assistant can
